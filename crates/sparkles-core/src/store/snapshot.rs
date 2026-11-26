@@ -20,7 +20,7 @@ pub(crate) struct Shared<'a> {
     pub aggregate_errors: crate::sparql::AggregateErrors,
     pub geo_op_vertices: u64,
     pub change_log: Option<Arc<ChangeLog>>,
-    pub managed: Option<Arc<arc_swap::ArcSwapOption<crate::managed::ManagedState>>>,
+    pub managed: Option<Arc<super::family::ManagedSlot>>,
     pub history_origin: Option<evidence_view::HistoryOriginHandle>,
 }
 
@@ -61,6 +61,7 @@ impl SnapshotBuilder {
             change_log: shared.change_log,
             managed: shared.managed,
             pinned_evidence: None,
+            pinned_managed_generation: None,
             history_origin: shared.history_origin,
         })
     }
@@ -94,6 +95,7 @@ impl SnapshotBuilder {
             change_log: base.change_log.clone(),
             managed: base.managed.clone(),
             pinned_evidence: None,
+            pinned_managed_generation: None,
             history_origin: base.history_origin.clone(),
         })
     }

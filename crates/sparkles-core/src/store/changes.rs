@@ -188,6 +188,15 @@ impl Store {
                     .into(),
             ));
         }
+        // Bound the upper commit BEFORE checking family evidence admission. Because
+        // `enable_managed` publishes `OwnerKind::Evidence` strictly before any accepted
+        // projection commit can advance `head`, reading `head` first guarantees either
+        // that `head` predates any evidence projection (bounding the raw log range to
+        // commits <= `head.seq`) or that the subsequent Acquire load below observes
+        // `OwnerKind::Evidence` and refuses.
+        let head = self.head_commit();
+        #[cfg(test)]
+        changes_admission_tests::observe(changes_admission_tests::Phase::BeforeAdmission);
         if o.graphs
             .as_ref()
             .is_some_and(|a| self.has_evidence_visibility_for_access(a))
@@ -198,7 +207,8 @@ impl Store {
                     .into(),
             ));
         }
-        let head = self.head_commit();
+        #[cfg(test)]
+        changes_admission_tests::observe(changes_admission_tests::Phase::AfterAdmission);
         if after > head.seq {
             return Err(Error::NotFound(format!(
                 "no commit {after} (head is {})",
@@ -445,5 +455,194 @@ impl Store {
             head,
             commits: page.commits,
         }))
+    }
+}
+
+#[cfg(test)]
+mod changes_admission_tests {
+    use super::*;
+    use crate::access::{GraphAccess, GraphRule, Graphs};
+    use crate::managed::{OwnerEntry, OwnerKind};
+    use crate::task::Control;
+    use oxrdf::{NamedNode, Term};
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase {
+        BeforeAdmission,
+        AfterAdmission,
+    }
+
+    type Hook = Box<dyn FnMut(Phase)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn observe(phase: Phase) {
+        HOOK.with(|h| {
+            if let Some(cb) = h.borrow_mut().as_mut() {
+                cb(phase);
+            }
+        });
+    }
+
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            HOOK.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    fn set_hook(cb: impl FnMut(Phase) + 'static) -> HookGuard {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(cb)));
+        HookGuard
+    }
+
+    fn enable_evidence_and_project(store: &Store, output_iri: &str) {
+        use crate::evidence::{ClaimKind, ConflictMode, Policy};
+        let settings = crate::evidence::Settings {
+            enabled: true,
+            source_records: vec!["urn:ev:sources".to_string()],
+            proposals: vec!["urn:ev:proposals".to_string()],
+            decisions: vec!["urn:ev:decisions".to_string()],
+            supports: vec!["urn:ev:supports".to_string()],
+            projections: vec![output_iri.to_string()],
+            policies: [(
+                "main".to_string(),
+                Policy {
+                    version: 1,
+                    admitted_kinds: vec![ClaimKind::Reported],
+                    required_scope: Vec::new(),
+                    conflicts: ConflictMode::AdmitLabelled,
+                    boundary: vec!["urn:ev:sources".to_string(), "urn:ev:proposals".to_string()],
+                    decisions: "urn:ev:decisions".to_string(),
+                    supports: "urn:ev:supports".to_string(),
+                    output: output_iri.to_string(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let canonical = settings.canonical(&Control::none()).unwrap();
+        let bytes = canonical.bytes().to_vec();
+        store
+            .enable_managed(
+                OwnerKind::Evidence,
+                OwnerEntry::for_settings(1, settings.managed_graphs(), &bytes),
+                &bytes,
+            )
+            .unwrap();
+        let cap = store
+            .managed_writer(OwnerKind::Evidence, uuid::Uuid::new_v4())
+            .unwrap();
+        let mut txn = store.write();
+        txn.set_managed(cap).unwrap();
+        let s = txn
+            .intern(&Term::NamedNode(NamedNode::new_unchecked("urn:secret:s")))
+            .unwrap();
+        let p = txn
+            .intern(&Term::NamedNode(NamedNode::new_unchecked("urn:secret:p")))
+            .unwrap();
+        let o = txn
+            .intern(&Term::NamedNode(NamedNode::new_unchecked("urn:secret:o")))
+            .unwrap();
+        let g = txn
+            .intern(&Term::NamedNode(NamedNode::new_unchecked(output_iri)))
+            .unwrap();
+        txn.insert([s, p, o, g]).unwrap();
+        txn.commit().unwrap();
+    }
+
+    #[test]
+    fn changes_bounds_head_before_evidence_admission() {
+        const OUTPUT: &str = "urn:ev:accepted";
+        const PUBLIC: &str = "urn:public";
+        let access = Arc::new(GraphAccess::graphs(
+            Graphs::Only(GraphRule::new([OUTPUT, PUBLIC], &[])),
+            Graphs::none(),
+        ));
+
+        // Interleaving A: Evidence is enabled and a projection commits between
+        // `head_commit()` and `has_evidence_visibility_for_access()`. Admission MUST refuse.
+        let dir_a = tempfile::tempdir().unwrap();
+        let store_a = Arc::new(Store::open(dir_a.path(), StoreOptions::default()).unwrap());
+        crate::sparql::update::update(
+            &store_a,
+            &format!("INSERT DATA {{ GRAPH <{PUBLIC}> {{ <urn:a> <urn:p> 1 }} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        {
+            let s = store_a.clone();
+            let mut fired = false;
+            let _g = set_hook(move |phase| {
+                if phase == Phase::BeforeAdmission && !fired {
+                    fired = true;
+                    enable_evidence_and_project(&s, OUTPUT);
+                }
+            });
+            let err = store_a
+                .changes(
+                    0,
+                    &ChangesOptions {
+                        graphs: Some(access.clone()),
+                        ..Default::default()
+                    },
+                )
+                .err();
+            assert!(
+                matches!(err, Some(Error::NotPermitted(_))),
+                "expected NotPermitted when Evidence enables before admission, got {err:?}"
+            );
+        }
+
+        // Interleaving B: Evidence is enabled and a projection commits immediately AFTER
+        // `has_evidence_visibility_for_access()`. Because `head` was bounded beforehand,
+        // the WAL scan MUST stop at pre-enablement head `c1` and never leak the projection.
+        let dir_b = tempfile::tempdir().unwrap();
+        let store_b = Arc::new(Store::open(dir_b.path(), StoreOptions::default()).unwrap());
+        crate::sparql::update::update(
+            &store_b,
+            &format!("INSERT DATA {{ GRAPH <{PUBLIC}> {{ <urn:b> <urn:p> 1 }} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        let c1 = store_b.head_commit().seq;
+        {
+            let s = store_b.clone();
+            let mut fired = false;
+            let _g = set_hook(move |phase| {
+                if phase == Phase::AfterAdmission && !fired {
+                    fired = true;
+                    enable_evidence_and_project(&s, OUTPUT);
+                }
+            });
+            let page = store_b
+                .changes(
+                    0,
+                    &ChangesOptions {
+                        graphs: Some(access),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(page.head.seq, c1);
+            assert!(
+                store_b.head_commit().seq > c1,
+                "post-admission projection commit must have advanced store head"
+            );
+            for cc in &page.commits {
+                assert!(
+                    cc.commit.seq <= c1,
+                    "bounded change page must not include post-enablement commit {}",
+                    cc.commit.seq
+                );
+                for (_, q) in cc.iter() {
+                    assert_ne!(q.subject.to_string(), "<urn:secret:s>");
+                }
+            }
+        }
     }
 }

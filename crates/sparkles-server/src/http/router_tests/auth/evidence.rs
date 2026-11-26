@@ -1884,12 +1884,22 @@ async fn production_graphrag_build_ask_history_and_live_sse_evidence_visibility(
     const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
 
     let h = |pw: &str| hash_password_with(pw, 8, 1, 1).unwrap();
-    let s = build(Fixture {
-        extra: format!(
+    let rout_hash = h("rout-pw");
+    let ra_hash = h("ra-pw");
+    let evnarrow_hash = h("evnarrow-pw");
+    let make_extra = |narrow_evnarrow: bool| -> String {
+        let evnarrow_graphs = if narrow_evnarrow {
+            format!(
+                r#"graphs = ["default", "{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"]"#
+            )
+        } else {
+            String::new()
+        };
+        format!(
             r#"
 [[users]]
 name = "rout"
-password = "{rout}"
+password = "{rout_hash}"
 [[users.grants]]
 dataset = "ev"
 level = "read"
@@ -1897,19 +1907,36 @@ graphs = ["{ACCEPTED}", "urn:x-sparkles:graphrag:*"]
 
 [[users]]
 name = "ra"
-password = "{ra}"
+password = "{ra_hash}"
 [[users.grants]]
 dataset = "ev"
 level = "read"
 graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}", "urn:x-sparkles:graphrag:*"]
 [[users.grants]]
+dataset = "evask1"
+level = "read"
+graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"]
+[[users.grants]]
+dataset = "evask2"
+level = "read"
+graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"]
+[[users.grants]]
 dataset = "evlive"
 level = "read"
 graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"]
-"#,
-            rout = h("rout-pw"),
-            ra = h("ra-pw"),
-        ),
+
+[[users]]
+name = "evnarrow"
+password = "{evnarrow_hash}"
+[[users.grants]]
+dataset = "evask_hist"
+level = "read"
+{evnarrow_graphs}
+"#
+        )
+    };
+    let s = build(Fixture {
+        extra: make_extra(false),
         ..Default::default()
     });
     let ds = s.state.attach("ev", DbType::Memory, None).unwrap();
@@ -2054,9 +2081,12 @@ graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"
     )
     .unwrap();
 
-    // Shared toggle to make the mock model remove the evidence policy mid-operation (same commit!).
+    // Shared toggle + target dataset so the mock model can remove the active evidence policy
+    // mid-operation (same commit!) on whichever dataset is under test.
     let remove_mid_call = Arc::new(AtomicBool::new(false));
-    let ds_hook = ds.clone();
+    let remove_target: Arc<parking_lot::Mutex<Arc<crate::state::Dataset>>> =
+        Arc::new(parking_lot::Mutex::new(ds.clone()));
+    let target_hook = remove_target.clone();
     let cleared_hook = cleared.clone();
     let remove_flag = remove_mid_call.clone();
     let mock = MockModel::start(move |r, _| {
@@ -2065,11 +2095,12 @@ graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"
         let is_community = body.contains("community") && body.contains("findings");
         if is_community {
             if remove_flag.swap(false, Ordering::AcqRel) {
-                ds_hook
+                let target = target_hook.lock().clone();
+                target
                     .store
                     .detach_managed(sparkles::managed::OwnerKind::Evidence, ACCEPTED)
                     .unwrap();
-                ev_api::configure(&ds_hook.dataset, &cleared_hook, &Control::none()).unwrap();
+                ev_api::configure(&target.dataset, &cleared_hook, &Control::none()).unwrap();
             }
             return (
                 200,
@@ -2086,11 +2117,12 @@ graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"
         }
         if is_summary {
             if remove_flag.swap(false, Ordering::AcqRel) {
-                ds_hook
+                let target = target_hook.lock().clone();
+                target
                     .store
                     .detach_managed(sparkles::managed::OwnerKind::Evidence, ACCEPTED)
                     .unwrap();
-                ev_api::configure(&ds_hook.dataset, &cleared_hook, &Control::none()).unwrap();
+                ev_api::configure(&target.dataset, &cleared_hook, &Control::none()).unwrap();
             }
             return (
                 200,
@@ -2276,15 +2308,104 @@ graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"
         rout_rep.text()
     );
 
-    // 2. Production HTTP Ask + persisted `GET /$/asks/ev` retrieval.
+    // 2. Production HTTP Ask + persisted `GET /$/asks/<ds>` retrieval.
+    //    Give each Ask phase a fresh dataset with fresh authenticated acceptance receipts so
+    //    restricted `ra`'s SELECT actually returns projected rows and invokes summarization.
+    let setup_ask_ds = |name: &str| -> Arc<crate::state::Dataset> {
+        let d = s.state.attach(name, DbType::Memory, None).unwrap();
+        d.store
+            .activate_memory_configuration_history(
+                &sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap(),
+            )
+            .unwrap();
+        ev_api::configure(&d.dataset, &settings, &Control::none()).unwrap();
+        let p = ev_api::propose(
+            None,
+            &d.dataset,
+            &d.dataset,
+            &EvidenceInput {
+                revisions: vec![SourceRevisionInput {
+                    version: RecordVersion::V1,
+                    key: RecordKey::new("rev-ask").unwrap(),
+                    source: iri("urn:source:ask"),
+                    source_key: RecordKey::new("src-ask").unwrap(),
+                    upstream_version: None,
+                    content: SourceContent::MetadataOnly {
+                        digest: sha("src-ask"),
+                    },
+                    metadata: Default::default(),
+                    times: Default::default(),
+                    lineage: Default::default(),
+                }],
+                claims: vec![ClaimInput {
+                    version: RecordVersion::V1,
+                    key: RecordKey::new("claim-ask").unwrap(),
+                    occurrence_key: RecordKey::new("cask").unwrap(),
+                    revision: RecordRef::Local(RecordKey::new("rev-ask").unwrap()),
+                    proposition: oxrdf::Triple::new(
+                        iri("urn:ask:a"),
+                        iri("http://ex/knows"),
+                        iri("urn:ask:b"),
+                    ),
+                    kind: ClaimKind::Reported,
+                    polarity: Polarity::Positive,
+                    attributed_author: iri("urn:author"),
+                    scope: Default::default(),
+                    confidence: Default::default(),
+                    validity: None,
+                }],
+                ..Default::default()
+            },
+            &po,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+        let rec = p.records.iter().find(|r| r.key == "claim-ask").unwrap();
+        let mut ro_ask = ReviewOptions::new(iri("urn:reviewer"));
+        ro_ask.if_head = Some(d.store.head_commit().seq);
+        ev_api::review(
+            None,
+            &d.dataset,
+            &d.dataset,
+            "main",
+            1,
+            &[DecisionInput {
+                key: "dask".into(),
+                target: rec.iri.clone(),
+                target_digest: rec.digest,
+                disposition: Disposition::Accepted,
+                supersedes: None,
+            }],
+            &ro_ask,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+        d
+    };
+
     // 2a. Restricted `ra` asks while policy is active (and `alice` also asks), then remove policy
-    //     AFTER Ask completes -> `GET /$/asks/ev` for restricted `ra` must return `answerWithheld: true`
-    //     with no answer text, while `alice` sees her stored answer.
-    ev_api::configure(&ds.dataset, &settings, &Control::none()).unwrap();
+    //     AFTER Ask completes -> `GET /$/asks/evask1` for restricted `ra` must return
+    //     `answerWithheld: true` with no answer text, while `alice` sees her stored answer.
+    let ds_ask1 = setup_ask_ds("evask1");
+    let assist_put1 = call(
+        &s.app,
+        "PUT",
+        "/$/assistant/evask1",
+        &[
+            ("authorization", &b("alice")),
+            ("content-type", "application/json"),
+        ],
+        &serde_json::json!({ "enabled": true, "send": "rows" }).to_string(),
+    )
+    .await;
+    assert_eq!(assist_put1.status, StatusCode::OK, "{}", assist_put1.text());
+
     let ask_alice = call(
         &s.app,
         "POST",
-        "/ev/ask",
+        "/evask1/ask",
         &[
             ("authorization", &b("alice")),
             ("content-type", "application/json"),
@@ -2294,10 +2415,15 @@ graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"
     )
     .await;
     assert_eq!(ask_alice.status, StatusCode::OK, "{}", ask_alice.text());
+    assert!(
+        ask_alice.text().contains("Secret projected ask answer"),
+        "alice ask response must contain data-derived summary: {}",
+        ask_alice.text()
+    );
     let ask_ra = call(
         &s.app,
         "POST",
-        "/ev/ask",
+        "/evask1/ask",
         &[
             ("authorization", &b("ra")),
             ("content-type", "application/json"),
@@ -2307,16 +2433,22 @@ graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"
     )
     .await;
     assert_eq!(ask_ra.status, StatusCode::OK, "{}", ask_ra.text());
+    assert!(
+        ask_ra.text().contains("Secret projected ask answer"),
+        "restricted ra ask response must see authenticated rows and contain data-derived summary: {}",
+        ask_ra.text()
+    );
 
-    ds.store
+    ds_ask1
+        .store
         .detach_managed(sparkles::managed::OwnerKind::Evidence, ACCEPTED)
         .unwrap();
-    ev_api::configure(&ds.dataset, &cleared, &Control::none()).unwrap();
+    ev_api::configure(&ds_ask1.dataset, &cleared, &Control::none()).unwrap();
 
     let asks_alice = call(
         &s.app,
         "GET",
-        "/$/asks/ev",
+        "/$/asks/evask1",
         &[("authorization", &b("alice"))],
         "",
     )
@@ -2330,7 +2462,7 @@ graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"
     let asks_ra = call(
         &s.app,
         "GET",
-        "/$/asks/ev",
+        "/$/asks/evask1",
         &[("authorization", &b("ra"))],
         "",
     )
@@ -2349,14 +2481,30 @@ graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"
     );
 
     // 2b. Same-commit policy removal DURING Ask (after SPARQL reads ACCEPTED, before finish
-    //     captures the footprint) must withhold the footprint so `ra` still cannot see it!
-    ev_api::configure(&ds.dataset, &settings, &Control::none()).unwrap();
-    let commit_before_ask = ds.store.head_commit().seq;
+    //     captures the footprint) must genuinely run the summarize callback, consume the
+    //     toggle, advance managed_generation at the same RDF commit, and withhold the
+    //     footprint so `ra` cannot see its stored answer.
+    let ds_ask2 = setup_ask_ds("evask2");
+    let assist_put2 = call(
+        &s.app,
+        "PUT",
+        "/$/assistant/evask2",
+        &[
+            ("authorization", &b("alice")),
+            ("content-type", "application/json"),
+        ],
+        &serde_json::json!({ "enabled": true, "send": "rows" }).to_string(),
+    )
+    .await;
+    assert_eq!(assist_put2.status, StatusCode::OK, "{}", assist_put2.text());
+    *remove_target.lock() = ds_ask2.clone();
+    let commit_before_ask = ds_ask2.store.head_commit().seq;
+    let gen_before_ask = ds_ask2.store.managed_generation();
     remove_mid_call.store(true, Ordering::Release);
     let ask_mid = call(
         &s.app,
         "POST",
-        "/ev/ask",
+        "/evask2/ask",
         &[
             ("authorization", &b("ra")),
             ("content-type", "application/json"),
@@ -2366,33 +2514,141 @@ graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"
     )
     .await;
     assert_eq!(ask_mid.status, StatusCode::OK, "{}", ask_mid.text());
+    assert!(
+        ask_mid.text().contains("Secret projected ask answer"),
+        "mid-ask response must contain data-derived summary (proving non-empty SELECT): {}",
+        ask_mid.text()
+    );
+    assert!(
+        !remove_mid_call.load(Ordering::Acquire),
+        "summarize callback must have consumed remove_mid_call toggle"
+    );
     assert_eq!(
-        ds.store.head_commit().seq,
+        ds_ask2.store.head_commit().seq,
         commit_before_ask,
         "policy removal during ask must be same-commit"
+    );
+    assert!(
+        ds_ask2.store.managed_generation() > gen_before_ask,
+        "mid-ask policy removal must advance managed_generation"
     );
     let asks_ra_mid = call(
         &s.app,
         "GET",
-        "/$/asks/ev",
+        "/$/asks/evask2",
         &[("authorization", &b("ra"))],
         "",
     )
     .await;
     assert_eq!(asks_ra_mid.status, StatusCode::OK, "{}", asks_ra_mid.text());
     let asks_list = asks_ra_mid.json()["asks"].as_array().unwrap().clone();
-    assert!(
-        asks_list.len() >= 2,
-        "expected both ask records for ra: {asks_list:?}"
+    assert_eq!(
+        asks_list.len(),
+        1,
+        "expected ask record for ra: {asks_list:?}"
     );
-    for rec in &asks_list {
-        assert_eq!(
-            rec["answerWithheld"],
-            serde_json::json!(true),
-            "every ask informed under active or mid-flight removed policy must be withheld from ra: {rec}"
-        );
-        assert!(rec.get("answer").is_none());
-    }
+    assert_eq!(
+        asks_list[0]["answerWithheld"],
+        serde_json::json!(true),
+        "mid-flight policy removal must withhold footprint from ra: {}",
+        asks_list[0]
+    );
+    assert!(asks_list[0].get("answer").is_none());
+
+    // 2c. Explicit historical selector `at: commit:<head>` on an activated family where the
+    //     commit's historical binding has an active policy while the live policy was removed
+    //     at the same RDF commit BEFORE the Ask began: the stable unrestricted Ask must
+    //     withhold its footprint so narrowing the SAME account's grants (while still
+    //     covering every recorded graph) withholds the saved answer on `GET /$/asks`.
+    let ds_hist = setup_ask_ds("evask_hist");
+    let assist_put_h = call(
+        &s.app,
+        "PUT",
+        "/$/assistant/evask_hist",
+        &[
+            ("authorization", &b("alice")),
+            ("content-type", "application/json"),
+        ],
+        &serde_json::json!({ "enabled": true, "send": "rows" }).to_string(),
+    )
+    .await;
+    assert_eq!(
+        assist_put_h.status,
+        StatusCode::OK,
+        "{}",
+        assist_put_h.text()
+    );
+    let hist_commit = ds_hist.store.head_commit().seq;
+    // Clear live policy at the SAME RDF commit `hist_commit` before the Ask starts.
+    ds_hist
+        .store
+        .detach_managed(sparkles::managed::OwnerKind::Evidence, ACCEPTED)
+        .unwrap();
+    ev_api::configure(&ds_hist.dataset, &cleared, &Control::none()).unwrap();
+    assert_eq!(ds_hist.store.head_commit().seq, hist_commit);
+    assert!(ds_hist.store.snapshot().evidence_visibility_key().is_none());
+
+    let gen_hist_before = ds_hist.store.managed_generation();
+    let ask_hist = call(
+        &s.app,
+        "POST",
+        "/evask_hist/ask",
+        &[
+            ("authorization", &basic("evnarrow", "evnarrow-pw")),
+            ("content-type", "application/json"),
+            ("accept", "application/json"),
+        ],
+        &serde_json::json!({
+            "question": "What releases know each other at head commit?",
+            "at": format!("commit:{hist_commit}"),
+            "drafts": 1,
+            "shapeCheck": false
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(ask_hist.status, StatusCode::OK, "{}", ask_hist.text());
+    assert!(
+        ask_hist.text().contains("Secret projected ask answer"),
+        "unrestricted explicit-commit Ask must contain data-derived summary: {}",
+        ask_hist.text()
+    );
+    assert_eq!(ds_hist.store.head_commit().seq, hist_commit);
+    assert_eq!(ds_hist.store.managed_generation(), gen_hist_before);
+
+    // Narrow `evnarrow` from unrestricted to restricted (still covering EVERY graph in
+    // `evask_hist`) and verify `GET /$/asks/evask_hist` withholds the saved answer.
+    s.write_config(&Fixture {
+        extra: make_extra(true),
+        ..Default::default()
+    });
+    s.state.auth.as_ref().unwrap().reload().unwrap();
+
+    let asks_narrowed = call(
+        &s.app,
+        "GET",
+        "/$/asks/evask_hist",
+        &[("authorization", &basic("evnarrow", "evnarrow-pw"))],
+        "",
+    )
+    .await;
+    assert_eq!(
+        asks_narrowed.status,
+        StatusCode::OK,
+        "{}",
+        asks_narrowed.text()
+    );
+    assert!(
+        !asks_narrowed.text().contains("Secret projected ask answer"),
+        "explicit-commit Ask over historical active policy leaked after grants narrowed: {}",
+        asks_narrowed.text()
+    );
+    assert_eq!(
+        asks_narrowed.json()["asks"][0]["answerWithheld"],
+        serde_json::json!(true),
+        "expected answerWithheld: true after evnarrow's grants narrowed: {}",
+        asks_narrowed.text()
+    );
 
     // 3. HTTP SSE `GET /evlive/live` must terminate with `access-changed` on same-commit detach
     //    and return a fresh empty `reset` on reconnect with `Last-Event-ID`.

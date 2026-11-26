@@ -904,6 +904,41 @@ impl WalIndex {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod cursor_stats {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LIVE: Cell<usize> = const { Cell::new(0) };
+        static PEAK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn reset() {
+        LIVE.with(|l| l.set(0));
+        PEAK.with(|p| p.set(0));
+    }
+
+    pub(crate) fn peak() -> usize {
+        PEAK.with(Cell::get)
+    }
+
+    pub(super) fn on_open() {
+        LIVE.with(|l| {
+            let next = l.get() + 1;
+            l.set(next);
+            PEAK.with(|p| {
+                if next > p.get() {
+                    p.set(next);
+                }
+            });
+        });
+    }
+
+    pub(super) fn on_drop() {
+        LIVE.with(|l| l.set(l.get().saturating_sub(1)));
+    }
+}
+
 /// Reads the transactions of a log forward from a [`WalPoint`].
 pub(crate) struct WalCursor {
     r: BufReader<File>,
@@ -914,6 +949,13 @@ pub(crate) struct WalCursor {
     txn: Vec<u8>,
     version: u32,
     configuration: Option<crate::evidence::Sha256Digest>,
+}
+
+#[cfg(test)]
+impl Drop for WalCursor {
+    fn drop(&mut self) {
+        cursor_stats::on_drop();
+    }
 }
 
 impl WalCursor {
@@ -949,6 +991,8 @@ impl WalCursor {
     fn new_with(mut file: File, path: &Path, from: WalPoint, capacity: usize) -> Result<WalCursor> {
         let version = descriptor_version(&mut file, path)?;
         file.seek(SeekFrom::Start(from.offset))?;
+        #[cfg(test)]
+        cursor_stats::on_open();
         Ok(WalCursor {
             r: BufReader::with_capacity(capacity, file),
             path: path.to_path_buf(),

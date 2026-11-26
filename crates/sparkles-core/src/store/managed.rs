@@ -813,7 +813,7 @@ impl Store {
         &self,
         graphs: impl Iterator<Item = &'k [u8]>,
     ) -> Result<()> {
-        let state = self.family.managed.load();
+        let state = self.family.managed.load_full();
         let Some(admission) = Admission::start(state.as_ref(), None)? else {
             return Ok(());
         };

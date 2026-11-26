@@ -1432,10 +1432,16 @@ fn limited_history_apis_and_inherited_named_snapshot_preserve_pinned_config() {
     assert!(!ask_in(unbounded_fork_snap, reader_meta.clone()));
 
     // 6. Distinguish logical branch binding from physical commit binding at the SAME RDF commit
-    //    (and under `At::Time`): commit `fork_cleared_seq` on `feature` is recorded under the
-    //    cleared (no-policy) settings so `reader_meta` CAN see `cve-1` via its physical binding,
-    //    while a named pin at the SAME RDF commit after re-enabling the policy binds the active
-    //    policy so a branch forked from that pin HIDES `cve-1` at both `At::Commit` and `At::Time`.
+    //    (and under `At::Time`): use a controlled clock so consecutive commits have strictly
+    //    distinct timestamps, clear the policy before `feature_active`'s child commit so the
+    //    child commit exposes `cve-1` while the fork commit hides it, and assert the resolved
+    //    commit sequence on every `At::Time` call.
+    let clock_ms = Arc::new(std::sync::atomic::AtomicI64::new(1_700_000_010_000));
+    let clk = clock_ms.clone();
+    feature.set_clock(Arc::new(move || {
+        clk.load(std::sync::atomic::Ordering::Acquire)
+    }));
+
     let feature_ds = ds.branch("feature").unwrap();
     feature_ds
         .update(&format!(
@@ -1462,8 +1468,9 @@ fn limited_history_apis_and_inherited_named_snapshot_preserve_pinned_config() {
         )
         .unwrap();
 
-    // Fork `feature_active` from `feature` at `pin-fork-active-same-seq` and advance it by one
-    // commit so `fork_cleared_seq` is non-head on `feature_active`.
+    // Fork `feature_active` from `feature` at `pin-fork-active-same-seq`, clear the live
+    // policy BEFORE advancing `feature_active` at a strictly later controlled timestamp so
+    // `feature_active`'s child commit exposes `cve-1` while `fork_cleared_seq` hides it.
     ds.store()
         .create_branch(
             "feature_active",
@@ -1474,17 +1481,41 @@ fn limited_history_apis_and_inherited_named_snapshot_preserve_pinned_config() {
             },
         )
         .unwrap();
+    ds.store()
+        .detach_managed(sparkles::managed::OwnerKind::Evidence, OUTPUT)
+        .unwrap();
+    let mut cleared_step3 = two_boundary_settings();
+    cleared_step3.policies.clear();
+    cleared_step3.projections.clear();
+    evidence::configure(&ds, &cleared_step3, &Control::none()).unwrap();
+
+    let feature_active = ds.store().branch("feature_active").unwrap();
+    clock_ms.store(
+        fork_cleared_ts + 10_000,
+        std::sync::atomic::Ordering::Release,
+    );
+    let clk_active = clock_ms.clone();
+    feature_active.set_clock(Arc::new(move || {
+        clk_active.load(std::sync::atomic::Ordering::Acquire)
+    }));
     let feature_active_ds = ds.branch("feature_active").unwrap();
     feature_active_ds
         .update(&format!(
             "INSERT DATA {{ GRAPH <{PUBLIC}> {{ <urn:marker> <urn:step> 3 }} }}"
         ))
         .unwrap();
-    let feature_active = ds.store().branch("feature_active").unwrap();
+    assert!(
+        feature_active.head_commit().timestamp_ms > fork_cleared_ts,
+        "child commit timestamp must strictly exceed fork_cleared_ts"
+    );
+    assert!(
+        ask_in(feature_active.snapshot(), reader_meta.clone()),
+        "child commit written under cleared settings must expose cve-1 so At::Time hiding proves fork binding"
+    );
 
     // On `feature` itself, the physical commit `fork_cleared_seq` was written with no policy ->
     // `reader_meta` sees `cve-1` (`true`).
-    let (phys_commit_snap, _, _) = ds
+    let (phys_commit_snap, phys_commit_res, _) = ds
         .store()
         .snapshot_at_with_branch(
             &feature,
@@ -1492,11 +1523,12 @@ fn limited_history_apis_and_inherited_named_snapshot_preserve_pinned_config() {
             &HistoryOptions::default(),
         )
         .unwrap();
+    assert_eq!(phys_commit_res.commit.seq, fork_cleared_seq);
     assert!(
         ask_in(phys_commit_snap, reader_meta.clone()),
         "physical commit written without policy must expose cve-1 to reader_meta"
     );
-    let (phys_time_snap, _, _) = ds
+    let (phys_time_snap, phys_time_res, _) = ds
         .store()
         .snapshot_at_with_branch(
             &feature,
@@ -1504,6 +1536,10 @@ fn limited_history_apis_and_inherited_named_snapshot_preserve_pinned_config() {
             &HistoryOptions::default(),
         )
         .unwrap();
+    assert_eq!(
+        phys_time_res.commit.seq, fork_cleared_seq,
+        "At::Time on feature must resolve to fork_cleared_seq"
+    );
     assert!(
         ask_in(phys_time_snap, reader_meta.clone()),
         "At::Time resolving to physical no-policy commit on feature must expose cve-1"
@@ -1512,7 +1548,7 @@ fn limited_history_apis_and_inherited_named_snapshot_preserve_pinned_config() {
     // On `feature_active`, the SAME RDF commit `fork_cleared_seq` (selected by `At::Commit` and
     // `At::Time`) carries `feature_active`'s logical branch binding from `pin-fork-active-same-seq`
     // (active policy) -> `reader_meta` must NOT see `cve-1` (`false`)!
-    let (branch_commit_snap, _, _) = ds
+    let (branch_commit_snap, branch_commit_res, _) = ds
         .store()
         .snapshot_at_with_branch(
             &feature_active,
@@ -1520,11 +1556,12 @@ fn limited_history_apis_and_inherited_named_snapshot_preserve_pinned_config() {
             &HistoryOptions::default(),
         )
         .unwrap();
+    assert_eq!(branch_commit_res.commit.seq, fork_cleared_seq);
     assert!(
         !ask_in(branch_commit_snap, reader_meta.clone()),
         "logical branch binding at fork_cleared_seq must hide cve-1 from reader_meta"
     );
-    let (branch_time_snap, _, _) = ds
+    let (branch_time_snap, branch_time_res, _) = ds
         .store()
         .snapshot_at_with_branch(
             &feature_active,
@@ -1532,6 +1569,10 @@ fn limited_history_apis_and_inherited_named_snapshot_preserve_pinned_config() {
             &HistoryOptions::default(),
         )
         .unwrap();
+    assert_eq!(
+        branch_time_res.commit.seq, fork_cleared_seq,
+        "At::Time on feature_active must resolve to fork_cleared_seq (not child commit)"
+    );
     assert!(
         !ask_in(branch_time_snap, reader_meta),
         "At::Time resolving to logical branch fork_cleared_seq must hide cve-1 from reader_meta"
@@ -2995,50 +3036,78 @@ fn skolem_map_rejection_pin_budget_combined_max_hidden_and_secondary_surface() {
         "StoredFact with ev:skolemMap must be rejected"
     );
 
-    // 2. Combined memory cap on snapshot_at_limited: pick a cap that admits BOTH the
-    //    historical configuration pin alone (measured on the live commit with only 4 KiB
-    //    snapshot charge) AND the non-live historical delta alone, yet fails when their
-    //    combined charge exceeds the cap.
+    // 2. Combined memory cap on snapshot_at_limited: pick a cap that independently admits BOTH
+    //    the historical configuration pin alone (measured on the live commit with only 4 KiB
+    //    snapshot charge) AND the identical historical data charge alone (measured on an
+    //    unactivated control store with the exact same historical commits), yet fails when
+    //    their combined charge exceeds the cap.
     let mut bulk = String::from("INSERT DATA { GRAPH <");
     bulk.push_str(PUBLIC);
     bulk.push_str("> { ");
-    for i in 0..80 {
+    for i in 0..250 {
         bulk.push_str(&format!("<urn:hist:s{i}> <urn:hist:p> <urn:hist:o{i}> . "));
     }
     bulk.push_str("} }");
     ds.update(&bulk).unwrap();
     let hist_seq = ds.store().head_commit().seq;
     // Advance head so `hist_seq` is a non-live historical commit with a non-trivial delta.
-    ds.update(&format!(
-        "INSERT DATA {{ GRAPH <{PUBLIC}> {{ <urn:hist:after> <urn:hist:p> 1 }} }}"
-    ))
-    .unwrap();
+    let follow_up =
+        format!("INSERT DATA {{ GRAPH <{PUBLIC}> {{ <urn:hist:after> <urn:hist:p> 1 }} }}");
+    ds.update(&follow_up).unwrap();
     let head_seq = ds.store().head_commit().seq;
+
+    // Identical unactivated control dataset carrying the same historical data without
+    // configuration-history pinning.
+    let ds_ctrl = Dataset::memory();
+    ds_ctrl
+        .store()
+        .set_retention(sparkles::history::Retention {
+            keep_commits: Some(64),
+            ..Default::default()
+        })
+        .unwrap();
+    ds_ctrl.update(&bulk).unwrap();
+    let ctrl_hist_seq = ds_ctrl.store().head_commit().seq;
+    ds_ctrl.update(&follow_up).unwrap();
+
     let ho = HistoryOptions::default();
-    let mut lo = 0u64;
-    let mut hi = 4 << 20;
-    while lo + 256 < hi {
-        let mid = lo + (hi - lo) / 2;
-        if ds
-            .store()
-            .snapshot_at_limited(&At::Commit(head_seq), &ho, mid)
-            .is_ok()
-        {
-            hi = mid;
-        } else {
-            lo = mid;
+    let min_cap = |store: &sparkles::store::Store, seq: u64| -> u64 {
+        let mut lo = 0u64;
+        let mut hi = 4 << 20;
+        while lo + 256 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if store
+                .snapshot_at_limited(&At::Commit(seq), &ho, mid)
+                .is_ok()
+            {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
         }
-    }
-    let live_plus_pin_min = hi;
-    // `live_plus_pin_min` strictly covers configuration decoding + pinning (> 64 KiB).
-    // Adding 2 KiB guarantees pinning alone fits comfortably, while `hist_seq`'s non-live
-    // snapshot delta pushes `delta + pin_peak` past `combined_cap`.
-    let combined_cap = live_plus_pin_min + 2048;
+        hi
+    };
+    let live_plus_pin_min = min_cap(ds.store(), head_seq);
+    let hist_data_only_min = min_cap(ds_ctrl.store(), ctrl_hist_seq);
+    assert!(
+        hist_data_only_min > 4096,
+        "historical data charge alone must exceed the 4 KiB live handle charge: {hist_data_only_min}"
+    );
+    // `combined_cap` sits comfortably above BOTH individual minimums while staying below
+    // their combined peak (`hist_data_only_min` + pin peak).
+    let combined_cap = live_plus_pin_min.max(hist_data_only_min) + 2048;
     assert!(
         ds.store()
             .snapshot_at_limited(&At::Commit(head_seq), &ho, combined_cap)
             .is_ok(),
-        "configuration pinning alone must succeed at {combined_cap}"
+        "configuration pinning alone must succeed at {combined_cap} (min {live_plus_pin_min})"
+    );
+    assert!(
+        ds_ctrl
+            .store()
+            .snapshot_at_limited(&At::Commit(ctrl_hist_seq), &ho, combined_cap)
+            .is_ok(),
+        "identical historical data alone must succeed at {combined_cap} (min {hist_data_only_min})"
     );
     let cap_err = ds
         .store()
@@ -3046,7 +3115,7 @@ fn skolem_map_rejection_pin_budget_combined_max_hidden_and_secondary_surface() {
         .err();
     assert!(
         matches!(cap_err, Some(Error::BudgetExceeded(_))),
-        "cap {combined_cap} (admitting pin alone at {live_plus_pin_min}) must fail combined delta + pin on hist_seq, got {cap_err:?}"
+        "cap {combined_cap} (admitting pin alone at {live_plus_pin_min} and data alone at {hist_data_only_min}) must fail combined delta + pin on hist_seq, got {cap_err:?}"
     );
     assert!(
         ds.store()
@@ -3590,31 +3659,40 @@ fn named_pin_replacement_expiry_and_missing_config_document_fail_closed() {
         "expired named pin must be rejected rather than falling back to live settings"
     );
 
-    // 4. Deleting the persisted configuration-history generation documents must cause
-    //    restricted historical reads at `At::Commit(c1)` to fail closed (NOT fall back to
-    //    the cleared live settings!).
+    // 4. Deleting ONLY the persisted generation document(s) inside
+    //    `evidence-history/<lineage>/generations/` while keeping `origin.json` and
+    //    `coverage.json` intact must cause restricted historical reads at `At::Commit(c1)`
+    //    to fail closed during generation lookup (NOT fall back to the cleared live settings!).
     let ev_hist_dir = dir.path().join("evidence-history");
     assert!(ev_hist_dir.exists(), "expected evidence-history directory");
-    let mut removed_any = false;
+    let mut removed_generations = 0usize;
+    let mut coverage_files = Vec::new();
     for entry in std::fs::read_dir(&ev_hist_dir).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
+        let path = entry.unwrap().path();
         if path.is_dir() {
-            for sub in std::fs::read_dir(&path).unwrap() {
-                let sub = sub.unwrap().path();
-                if sub.is_file() {
-                    std::fs::remove_file(&sub).unwrap();
-                    removed_any = true;
+            let coverage = path.join("coverage.json");
+            if coverage.is_file() {
+                coverage_files.push(coverage);
+            }
+            let gens = path.join("generations");
+            if gens.is_dir() {
+                for gen_entry in std::fs::read_dir(&gens).unwrap() {
+                    let gen_path = gen_entry.unwrap().path();
+                    if gen_path.is_file() {
+                        std::fs::remove_file(&gen_path).unwrap();
+                        removed_generations += 1;
+                    }
                 }
             }
-        } else if path.is_file() {
-            std::fs::remove_file(&path).unwrap();
-            removed_any = true;
         }
     }
     assert!(
-        removed_any,
-        "expected at least one configuration document to delete"
+        !coverage_files.is_empty() && coverage_files.iter().all(|p| p.is_file()),
+        "coverage.json must remain intact while testing missing generation documents"
+    );
+    assert!(
+        removed_generations > 0,
+        "expected at least one generation document under evidence-history/<lineage>/generations/"
     );
 
     let missing_doc_err = ask_at(ds.store(), &At::Commit(c1)).err();
@@ -3622,4 +3700,190 @@ fn named_pin_replacement_expiry_and_missing_config_document_fail_closed() {
         missing_doc_err.is_some(),
         "missing configuration generation document must fail closed for restricted reader (not fall back to cleared live settings)"
     );
+}
+
+#[test]
+fn live_query_unread_event_and_rebased_building_cell_refuse_superseded_rows() {
+    use sparkles::incr::{Host, LiveEvent, LiveOptions, Runtime, RuntimeOptions};
+    use sparkles::sparql::AggregateErrors;
+    use std::sync::Mutex;
+
+    struct SwitchHost(Mutex<AggregateErrors>);
+    impl Host for SwitchHost {
+        fn access(&self, _: Option<&str>) -> sparkles::Result<Option<Arc<GraphAccess>>> {
+            Ok(None)
+        }
+        fn stored_query(&self, _: &str) -> sparkles::Result<String> {
+            Err(Error::NotFound("none".into()))
+        }
+        fn aggregate_errors(&self) -> AggregateErrors {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    let reader_a = reading(&[OUTPUT, DECISIONS, SUPPORTS, CLAIMS_A, SOURCES_A]);
+    let q =
+        format!("SELECT ?o WHERE {{ GRAPH <{OUTPUT}> {{ <urn:release> <urn:affectedBy> ?o }} }}");
+
+    // 1. Unread queued initial event on a core `LiveQuery`: detach and rotate protection at
+    //    the SAME RDF commit with NO `rt.round(...)` and NO fresh attach, then call
+    //    `try_next()`. Consumption-time verification must reject the superseded queued
+    //    snapshot and terminate with `access-changed`.
+    let ds = configured(false);
+    let ca = propose_in(&ds, SOURCES_A, CLAIMS_A, "src-a", "a1", affected());
+    decide(&ds, &ca, Disposition::Accepted, None);
+    let c1 = ds.store().head_commit().seq;
+    let rt = Runtime::open(None, ds.store().dataset_id(), RuntimeOptions::default());
+
+    let sub_unread = rt
+        .live(
+            ds.store(),
+            &q,
+            Some(reader_a.clone()),
+            &LiveOptions::default(),
+        )
+        .unwrap();
+    // Leave initial snapshot unread, then detach and re-enable policy at the SAME commit.
+    ds.store()
+        .detach_managed(sparkles::managed::OwnerKind::Evidence, OUTPUT)
+        .unwrap();
+    evidence::configure(&ds, &two_boundary_settings(), &Control::none()).unwrap();
+    assert_eq!(ds.store().head_commit().seq, c1);
+
+    match sub_unread
+        .try_next()
+        .expect("unread subscriber must receive terminal access-changed error")
+    {
+        LiveEvent::Error { code, .. } => assert_eq!(code, "access-changed"),
+        other => panic!("superseded unread event must not be delivered, got {other:?}"),
+    }
+    assert!(
+        sub_unread.try_next().is_none(),
+        "subscription must close after access-changed"
+    );
+
+    // 2. Rebased `Building` cell (via aggregate-errors switch) combined with an evidence
+    //    change at the same commit: leave an unread diff queued, switch `aggregate_errors`,
+    //    detach/rotate policy, and run `rt.round(...)`. `Runtime::build` must preserve the
+    //    prior evidence identity across `sync_inference`, route through queue replacement,
+    //    and deliver ONLY a fresh empty `reset` (never a `Diff` with removed rows or the
+    //    earlier unread diff).
+    let ds2 = configured(false);
+    let ca2 = propose_in(&ds2, SOURCES_A, CLAIMS_A, "src-a", "a1", affected());
+    decide(&ds2, &ca2, Disposition::Accepted, None);
+    let rt2 = Runtime::open(None, ds2.store().dataset_id(), RuntimeOptions::default());
+    let host = Arc::new(SwitchHost(Mutex::new(AggregateErrors::Jena)));
+    rt2.set_host(host.clone());
+
+    let sub_rebased = rt2
+        .live(
+            ds2.store(),
+            &q,
+            Some(reader_a.clone()),
+            &LiveOptions::default(),
+        )
+        .unwrap();
+    match sub_rebased
+        .next_timeout(std::time::Duration::from_secs(2))
+        .expect("initial snapshot")
+    {
+        LiveEvent::Snapshot { rows, .. } => assert_eq!(rows.len(), 1),
+        other => panic!("expected initial Snapshot, got {other:?}"),
+    }
+
+    // Queue a second event (accepting cve-2) and leave it UNREAD in `sub_rebased`.
+    let ca2_b = propose_in(
+        &ds2,
+        SOURCES_A,
+        CLAIMS_A,
+        "src-a2",
+        "a2",
+        Triple::new(iri("urn:release"), iri("urn:affectedBy"), iri("urn:cve-2")),
+    );
+    decide(&ds2, &ca2_b, Disposition::Accepted, None);
+    let c2 = ds2.store().head_commit().seq;
+    assert!(rt2.round(ds2.store()));
+
+    // Flip `aggregate_errors` (putting the cell into `Building` on next round) AND detach +
+    // rotate the evidence policy at the SAME commit `c2`.
+    *host.0.lock().unwrap() = AggregateErrors::Sparkles;
+    ds2.store()
+        .detach_managed(sparkles::managed::OwnerKind::Evidence, OUTPUT)
+        .unwrap();
+    evidence::configure(&ds2, &two_boundary_settings(), &Control::none()).unwrap();
+    assert_eq!(ds2.store().head_commit().seq, c2);
+    assert!(rt2.round(ds2.store()));
+
+    match sub_rebased
+        .next_timeout(std::time::Duration::from_secs(2))
+        .expect("rebased boundary-crossing reset")
+    {
+        LiveEvent::Snapshot { rows, reset, .. } => {
+            assert!(
+                reset,
+                "boundary-crossing rebuild must emit a reset snapshot"
+            );
+            assert!(
+                rows.is_empty(),
+                "rebased reset must carry only the new empty result, got {rows:?}"
+            );
+        }
+        other => panic!(
+            "boundary-crossing rebuild after sync_inference must replace queue with reset (not Diff or stale event), got {other:?}"
+        ),
+    }
+    assert!(
+        sub_rebased.try_next().is_none(),
+        "no trailing events may remain after queue replacement"
+    );
+}
+
+#[test]
+fn in_memory_configuration_activation_advances_managed_generation_and_invalidates_live_fence() {
+    use sparkles::incr::{LiveEvent, LiveOptions, Runtime, RuntimeOptions};
+
+    let ds = Dataset::memory();
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{PUBLIC}> {{ <urn:s> <urn:p> <urn:o> }} }}"
+    ))
+    .unwrap();
+    let commit_before = ds.store().head_commit().seq;
+    let gen_before = ds.store().managed_generation();
+    let ev_key_before = ds.store().snapshot().evidence_visibility_key();
+    assert!(ev_key_before.is_none());
+
+    let reader = reading(&[PUBLIC]);
+    let rt = Runtime::open(None, ds.store().dataset_id(), RuntimeOptions::default());
+    let sub = rt
+        .live(
+            ds.store(),
+            &format!("SELECT ?s WHERE {{ GRAPH <{PUBLIC}> {{ ?s <urn:p> <urn:o> }} }}"),
+            Some(reader),
+            &LiveOptions::default(),
+        )
+        .unwrap();
+
+    // Activate in-memory configuration history with NO RDF commit and unchanged live
+    // `evidence_visibility_key()` (`None`).
+    ds.store()
+        .activate_memory_configuration_history(&prep(64 << 20))
+        .unwrap();
+    assert_eq!(ds.store().head_commit().seq, commit_before);
+    assert_eq!(
+        ds.store().snapshot().evidence_visibility_key(),
+        ev_key_before
+    );
+    assert!(
+        ds.store().managed_generation() > gen_before,
+        "activate_memory_configuration_history must advance managed_generation"
+    );
+
+    // Unread restricted live subscription must observe the generation change.
+    match sub
+        .try_next()
+        .expect("restricted live subscription must observe activation generation change")
+    {
+        LiveEvent::Error { code, .. } => assert_eq!(code, "access-changed"),
+        other => panic!("expected access-changed after activation, got {other:?}"),
+    }
 }

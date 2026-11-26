@@ -43,7 +43,7 @@ mod describe;
 mod diff;
 mod diff_groups;
 mod embed;
-mod family;
+pub(crate) mod family;
 #[cfg(test)]
 mod family_tests;
 mod geo;
@@ -665,9 +665,11 @@ pub struct Snapshot {
     /// the store's change log, which history queries read (see [`ChangeLog`])
     pub change_log: Option<Arc<ChangeLog>>,
     /// Live family managed-graph registry, shared without holding `Family` or its lock.
-    pub(crate) managed: Option<Arc<arc_swap::ArcSwapOption<crate::managed::ManagedState>>>,
+    pub(crate) managed: Option<Arc<family::ManagedSlot>>,
     /// Pinned historical evidence visibility config resolved from configuration history.
     pub(crate) pinned_evidence: Option<crate::access::triples::evidence::EvidenceConfig>,
+    /// Managed publication generation paired with `pinned_evidence` when pinned from live head.
+    pub(crate) pinned_managed_generation: Option<u64>,
     /// Non-owning handle to the originating branch's retained history for exact
     /// same-branch `ev:StoredFact` verification without retaining `Family`.
     pub(crate) history_origin: Option<evidence_view::HistoryOriginHandle>,
@@ -733,44 +735,90 @@ impl Snapshot {
     pub(crate) fn evidence_projection_config(
         &self,
     ) -> crate::access::triples::evidence::EvidenceConfig {
-        use crate::access::triples::evidence::EvidenceConfig;
         if let Some(pinned) = &self.pinned_evidence {
             return pinned.clone();
         }
-        let Some(state) = self.managed.as_ref().and_then(|m| m.load_full()) else {
-            return EvidenceConfig::None;
-        };
-        match state.as_ref() {
-            crate::managed::ManagedState::Installed(installed) => installed.evidence_visibility(),
-            crate::managed::ManagedState::Unavailable { reason, .. } => {
+        let state = self.managed.as_ref().and_then(|m| m.load_full());
+        Self::evidence_config_of_state(state.as_deref())
+    }
+
+    pub(crate) fn evidence_config_of_state(
+        state: Option<&crate::managed::ManagedState>,
+    ) -> crate::access::triples::evidence::EvidenceConfig {
+        use crate::access::triples::evidence::EvidenceConfig;
+        match state {
+            None => EvidenceConfig::None,
+            Some(crate::managed::ManagedState::Installed(installed)) => {
+                installed.evidence_visibility()
+            }
+            Some(crate::managed::ManagedState::Unavailable { reason, .. }) => {
                 EvidenceConfig::Unavailable(reason.clone())
             }
         }
     }
 
-    /// Freeze this snapshot's live evidence projection visibility configuration into
-    /// `pinned_evidence` so subsequent reads and disclosure captures observe the exact
-    /// configuration governing the read even if live settings change later.
+    pub(crate) fn evidence_key_of_config(
+        cfg: &crate::access::triples::evidence::EvidenceConfig,
+    ) -> Option<String> {
+        use crate::access::triples::evidence::EvidenceConfig;
+        match cfg {
+            EvidenceConfig::None => None,
+            EvidenceConfig::Active(cfg) => Some(cfg.fingerprint.clone()),
+            EvidenceConfig::Unavailable(_) => Some("unavailable".to_string()),
+        }
+    }
+
+    /// Freeze this snapshot's live evidence projection visibility configuration and its
+    /// paired managed publication generation into `pinned_evidence` /
+    /// `pinned_managed_generation` from a single atomic registry load so subsequent reads
+    /// and disclosure captures observe the exact coherent configuration governing the read.
     pub fn pin_live_evidence(self: &Arc<Self>) -> Arc<Self> {
         if self.pinned_evidence.is_some() {
             return Arc::clone(self);
         }
-        let config = self.evidence_projection_config();
+        let (generation, config) = match self.managed.as_ref().map(|m| m.load_version()) {
+            Some(version) => (
+                version.generation,
+                Self::evidence_config_of_state(version.state.as_deref()),
+            ),
+            None => (0, crate::access::triples::evidence::EvidenceConfig::None),
+        };
         Arc::new(Snapshot {
             pinned_evidence: Some(config),
+            pinned_managed_generation: Some(generation),
             ..(**self).clone()
         })
+    }
+
+    /// Managed publication generation pinned on this snapshot, or the live family's current
+    /// managed generation when unpinned.
+    pub fn managed_generation(&self) -> u64 {
+        if let Some(generation) = self.pinned_managed_generation {
+            return generation;
+        }
+        self.managed.as_ref().map_or(0, |m| m.generation())
+    }
+
+    /// Atomically sample `(managed_generation, evidence_visibility_key)` from this
+    /// snapshot's pinned configuration or a single live `ManagedVersion` load.
+    pub fn evidence_visibility_stamp(&self) -> (u64, Option<String>) {
+        if let Some(pinned) = &self.pinned_evidence {
+            let generation = self
+                .pinned_managed_generation
+                .unwrap_or_else(|| self.managed.as_ref().map_or(0, |m| m.generation()));
+            return (generation, Self::evidence_key_of_config(pinned));
+        }
+        let Some(version) = self.managed.as_ref().map(|m| m.load_version()) else {
+            return (0, None);
+        };
+        let cfg = Self::evidence_config_of_state(version.state.as_deref());
+        (version.generation, Self::evidence_key_of_config(&cfg))
     }
 
     /// Stable cache-key suffix capturing this snapshot's active support-aware projection
     /// visibility configuration, if any (or `"unavailable"` when fail-closed).
     pub fn evidence_visibility_key(&self) -> Option<String> {
-        use crate::access::triples::evidence::EvidenceConfig;
-        match self.evidence_projection_config() {
-            EvidenceConfig::None => None,
-            EvidenceConfig::Active(cfg) => Some(cfg.fingerprint.clone()),
-            EvidenceConfig::Unavailable(_) => Some("unavailable".to_string()),
-        }
+        Self::evidence_key_of_config(&self.evidence_projection_config())
     }
 
     /// Whether support-aware projection visibility is active or unavailable (requiring
@@ -2997,7 +3045,7 @@ impl Store {
         let wal = wal::open_for_append(
             &wal_path,
             wal::version_with(
-                managed_history::activated(family.managed.load().as_deref(), Some(root)),
+                managed_history::activated(family.managed.load().state.as_deref(), Some(root)),
                 control_on,
             ),
         )?;
@@ -3565,6 +3613,10 @@ impl Store {
                 !installed.evidence_visibility().is_none()
             }
         }
+    }
+
+    pub(crate) fn family_managed(&self) -> Arc<family::ManagedSlot> {
+        self.family.managed.clone()
     }
 
     /// Whether support-aware projection visibility restricts a caller with `access` on
@@ -5786,7 +5838,7 @@ impl Store {
     /// an in-memory store's limit also counts.
     fn memory_with_configuration(&self, size: u64) -> Result<u64> {
         let history = self.family.managed.load();
-        let configuration = match history.as_deref() {
+        let configuration = match history.state.as_deref() {
             Some(crate::managed::ManagedState::Installed(i)) => {
                 i.history_memory.as_ref().map_or(0, |m| m.retained())
             }
@@ -5854,7 +5906,7 @@ impl Store {
             managed: None,
             configuration: crate::history::ConfigurationBinding::LegacyUnbound,
             managed_admission: None,
-            configuration_expected: matches!(self.family.managed.load().as_deref(),
+            configuration_expected: matches!(self.family.managed.load().state.as_deref(),
                 Some(crate::managed::ManagedState::Installed(i)) if i.configuration_history.is_some()),
             stamp: None,
             control: None,

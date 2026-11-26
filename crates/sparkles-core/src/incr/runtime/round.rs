@@ -159,24 +159,37 @@ impl Runtime {
     ) {
         let snap = store.snapshot();
         let before = st.circuit.applied;
+        let had_snap = st.circuit.snap.is_some();
+        let restricted = st
+            .circuit
+            .access
+            .as_ref()
+            .is_some_and(|a| !a.reads_everything());
+        let prev_stamp = st.circuit.evidence_stamp();
+        let ev_mismatch = had_snap && st.evidence_mismatch(&snap);
         let t0 = Instant::now();
         // a rebuild's change reaches live queries
         match st.evaluate(snap, &self.control()) {
             Ok(change) => {
                 cell.info.lock().status = Status::Ready;
                 self.note_pass(cell, st, t0.elapsed(), false);
-                self.live_budgets(st, deferred);
-                if let Some((c, c_lease)) = change {
-                    self.publish(st, before, c, c_lease, true, deferred);
-                }
-                let ev_restricted = st
-                    .circuit
-                    .access
-                    .as_ref()
-                    .is_some_and(|a| !a.reads_everything())
-                    && st.circuit.evidence_key().is_some();
-                if std::mem::take(&mut st.rebased) || ev_restricted {
-                    st.clear_history();
+                let ev_boundary_crossed = restricted
+                    && had_snap
+                    && (ev_mismatch || st.circuit.evidence_stamp() != prev_stamp);
+                if ev_boundary_crossed {
+                    drop(change);
+                    st.rebased = false;
+                    self.live_budgets_inner(st, true, deferred);
+                    self.publish_evidence_reset(st, deferred);
+                } else {
+                    self.live_budgets(st, deferred);
+                    if let Some((c, c_lease)) = change {
+                        self.publish(st, before, c, c_lease, true, deferred);
+                    }
+                    let ev_restricted = restricted && st.circuit.evidence_key().is_some();
+                    if std::mem::take(&mut st.rebased) || ev_restricted {
+                        st.clear_history();
+                    }
                 }
             }
             Err(e) => self.fail(cell, st, &e, deferred),
@@ -201,14 +214,8 @@ impl Runtime {
             .access
             .as_ref()
             .is_some_and(|a| !a.reads_everything());
-        let head_ev = if restricted {
-            head.evidence_visibility_key()
-        } else {
-            None
-        };
-        let ev_changed = restricted
-            && (st.circuit.evidence_key() != head_ev.as_deref()
-                || head_ev.as_deref() == Some("unavailable"));
+        let prev_stamp = st.circuit.evidence_stamp();
+        let ev_changed = st.evidence_mismatch(&head);
         if from >= head.commit && !ev_changed {
             return false;
         }
@@ -228,6 +235,7 @@ impl Runtime {
                     self.counters.resets.fetch_add(1, Ordering::Relaxed);
                     cell.info.lock().status = Status::Ready;
                     self.note_pass(cell, st, t0.elapsed(), false);
+                    self.live_budgets_inner(st, true, deferred);
                     self.publish_evidence_reset(st, deferred);
                 }
                 Err(e) => {
@@ -236,10 +244,8 @@ impl Runtime {
                     return true;
                 }
             }
-            self.live_budgets(st, deferred);
             return true;
         }
-        let prev_ev = st.circuit.evidence_key().map(str::to_string);
         let d = deltas
             .entry(from)
             .or_insert_with(|| Arc::new(DeltaSet::read(store, from, &Control::none())))
@@ -277,10 +283,11 @@ impl Runtime {
                 cell.info.lock().status = Status::Ready;
                 self.note_pass(cell, st, took, false);
                 let ev_now_changed =
-                    restricted && (ev_changed || st.circuit.evidence_key() != prev_ev.as_deref());
+                    restricted && (ev_changed || st.circuit.evidence_stamp() != prev_stamp);
                 if ev_now_changed {
                     drop(c);
                     drop(c_lease);
+                    self.live_budgets_inner(st, true, deferred);
                     self.publish_evidence_reset(st, deferred);
                 } else {
                     self.publish(st, from, c, c_lease, true, deferred);
@@ -314,6 +321,15 @@ impl Runtime {
 
     /// End the live queries of the circuit whose budget its state passed.
     pub(super) fn live_budgets(&self, st: &mut Slot, deferred: &mut DeferredDrops) {
+        self.live_budgets_inner(st, false, deferred);
+    }
+
+    pub(super) fn live_budgets_inner(
+        &self,
+        st: &mut Slot,
+        replace: bool,
+        deferred: &mut DeferredDrops,
+    ) {
         let bytes = st.circuit.bytes();
         let before = st.subs.len();
         st.subs.retain(|s| {
@@ -321,16 +337,19 @@ impl Runtime {
                 return true;
             }
             if let Some(sh) = s.shared.upgrade() {
-                deferred.queued.extend(sh.push_leased(
-                    LiveEvent::Error {
-                        code: "over-budget".into(),
-                        message: format!(
-                            "the live query's state of {bytes} bytes passed its budget of {} bytes",
-                            s.budget
-                        ),
-                    },
-                    None,
-                ));
+                let err = LiveEvent::Error {
+                    code: "over-budget".into(),
+                    message: format!(
+                        "the live query's state of {bytes} bytes passed its budget of {} bytes",
+                        s.budget
+                    ),
+                };
+                let displaced = if replace {
+                    sh.replace_leased(err, None, None)
+                } else {
+                    sh.push_leased(err, None, None)
+                };
+                deferred.queued.extend(displaced);
             }
             false
         });
@@ -435,12 +454,15 @@ impl Runtime {
             }
         };
         let shared_lease = st.detach_event_lease(&mut event_lease);
+        let stamp = Some(st.circuit.evidence_stamp());
         for s in &mut st.subs {
             if let Some(sh) = s.shared.upgrade() {
                 s.last = to;
-                deferred
-                    .queued
-                    .extend(sh.replace_leased(event.clone(), shared_lease.clone()));
+                deferred.queued.extend(sh.replace_leased(
+                    event.clone(),
+                    shared_lease.clone(),
+                    stamp.clone(),
+                ));
                 self.counters.live_events.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -641,6 +663,7 @@ impl Runtime {
             }
         };
         let shared_lease = st.detach_event_lease(&mut event_lease);
+        let stamp = Some(st.circuit.evidence_stamp());
         for s in &mut st.subs {
             if let Some(sh) = s.shared.upgrade() {
                 // a diff starts from the subscriber's latest event, which commits that
@@ -653,7 +676,7 @@ impl Runtime {
                 s.last = to;
                 deferred
                     .queued
-                    .extend(sh.push_leased(e, shared_lease.clone()));
+                    .extend(sh.push_leased(e, shared_lease.clone(), stamp.clone()));
                 self.counters.live_events.fetch_add(1, Ordering::Relaxed);
             }
         }

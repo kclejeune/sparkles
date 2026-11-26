@@ -276,8 +276,9 @@ impl Slot {
         )))
     }
 
-    /// Whether `snap`'s support-aware evidence visibility configuration differs from the
-    /// key this restricted circuit was built with, or is currently unavailable.
+    /// Whether `snap`'s support-aware evidence visibility configuration or managed
+    /// publication generation differs from what this restricted circuit was built with,
+    /// or is currently unavailable.
     pub(super) fn evidence_mismatch(&self, snap: &crate::store::Snapshot) -> bool {
         let restricted = self
             .circuit
@@ -287,9 +288,19 @@ impl Slot {
         if !restricted {
             return false;
         }
-        let snap_ev = snap.evidence_visibility_key();
-        self.circuit.evidence_key() != snap_ev.as_deref()
+        let (snap_gen, snap_ev) = snap.evidence_visibility_stamp();
+        self.circuit.managed_generation() != snap_gen
+            || self.circuit.evidence_key() != snap_ev.as_deref()
             || snap_ev.as_deref() == Some("unavailable")
+    }
+
+    /// Detach a single live subscriber from this slot, update the active local limit, and
+    /// return any retired memory leases to drop outside locks.
+    pub(crate) fn detach_sub(&mut self, shared: &Arc<Shared>) -> Vec<MemoryLease> {
+        self.subs
+            .retain(|s| !std::ptr::eq(s.shared.as_ptr(), Arc::as_ptr(shared)));
+        self.recompute_local_limit();
+        self.circuit.drain_retired()
     }
 
     /// End all active live subscribers on this slot with an error event and lower
@@ -303,6 +314,7 @@ impl Slot {
                         code: code.clone(),
                         message: message.clone(),
                     },
+                    None,
                     None,
                 ));
             }
@@ -364,8 +376,12 @@ impl Slot {
                     }
                 }
                 let detached = self.detach_event_lease(&mut lease);
+                let stamp = Some(self.circuit.evidence_stamp());
                 let retired = self.circuit.drain_retired();
-                (crate::incr::live::QueuedEvent::new(ev, detached), retired)
+                (
+                    crate::incr::live::QueuedEvent::stamped(ev, detached, stamp),
+                    retired,
+                )
             }
             Err(e) => {
                 self.subs

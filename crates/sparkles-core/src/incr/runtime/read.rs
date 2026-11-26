@@ -323,16 +323,17 @@ impl Runtime {
                                     .access
                                     .as_ref()
                                     .is_some_and(|a| !a.reads_everything());
-                                let target_ev = if restricted {
-                                    r.snap
-                                        .or(st.circuit.snap.as_ref())
-                                        .and_then(|s| s.evidence_visibility_key())
+                                let ev_mismatch = if restricted {
+                                    r.snap.or(st.circuit.snap.as_ref()).is_some_and(|s| {
+                                        let (snap_gen, snap_ev) = s.evidence_visibility_stamp();
+                                        snap_ev.as_deref() != st.circuit.evidence_key()
+                                            || snap_ev.as_deref() == Some("unavailable")
+                                            || (s.pinned_evidence.is_none()
+                                                && snap_gen != st.circuit.managed_generation())
+                                    })
                                 } else {
-                                    None
+                                    false
                                 };
-                                let ev_mismatch = restricted
-                                    && (target_ev.as_deref() != st.circuit.evidence_key()
-                                        || target_ev.as_deref() == Some("unavailable"));
                                 if ev_mismatch {
                                     // A pinned historical snapshot with a distinct evidence
                                     // configuration evaluates directly rather than waiting

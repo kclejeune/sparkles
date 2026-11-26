@@ -457,3 +457,45 @@ fn persistent_and_cold_inherited_evidence_selection_respects_sub_ceiling_pool() 
     }
     assert_eq!(pool.granted(), 0);
 }
+
+#[test]
+fn wal_replay_drops_boundary_cursor_before_apply_forward() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let c1 = {
+        let store = Store::open(&path, Default::default()).unwrap();
+        let mut bulk = String::from("INSERT DATA { ");
+        for i in 0..200 {
+            bulk.push_str(&format!("<urn:wal:s{i}> <urn:wal:p> <urn:wal:o{i}> . "));
+        }
+        bulk.push('}');
+        crate::sparql::update::update(&store, &bulk, &Default::default()).unwrap();
+        let c1 = store.head_commit().seq;
+        update(&store, "after-bulk");
+        c1
+    };
+
+    // Reopen so the history cache is cold and `HistoryOrigin::snapshot_at_commit` must
+    // scan `wal.log` for the commit boundary and then replay it with `wal::apply_forward`.
+    let reopened = Store::open(&path, Default::default()).unwrap();
+    let snap = reopened.snapshot();
+    let prep = preparation();
+
+    crate::store::wal::cursor_stats::reset();
+    let origin = snap
+        .history_origin
+        .as_ref()
+        .expect("resident history origin")
+        .upgrade()
+        .expect("live history origin");
+    let (replayed, _held) = origin
+        .snapshot_at_commit(c1, &prep)
+        .unwrap()
+        .expect("replayed historical snapshot for c1");
+    assert_eq!(replayed.commit, c1);
+    assert_eq!(
+        crate::store::wal::cursor_stats::peak(),
+        1,
+        "boundary scan WalCursor must drop before wal::apply_forward opens its replay cursor"
+    );
+}

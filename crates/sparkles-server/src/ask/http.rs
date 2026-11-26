@@ -332,17 +332,17 @@ async fn ask_route(
         .filter(|b| *b != sparkles::branch::MAIN)
         .and_then(|b| st.branch_dataset(&ds, b).ok())
         .unwrap_or_else(|| ds.clone());
-    let start_managed_gen = target.store.managed_generation();
     let start = target.store.snapshot().pin_live_evidence();
-    let start_ev_key = start.evidence_visibility_key();
+    // Explicit historical selectors (including `At::Commit(head)`) resolve against
+    // historical configuration bindings when configuration history is activated rather
+    // than live head, so only `None` and `At::Head` prove that every contributing read
+    // observed `start`'s live evidence binding.
     let pinned_to_head = match &o.at {
         None => true,
-        Some(Value::String(s)) => match s.parse::<sparkles::history::At>() {
-            Ok(sparkles::history::At::Head) => true,
-            Ok(sparkles::history::At::Commit(c)) => c == start.commit,
-            _ => false,
-        },
-        Some(Value::Number(n)) => n.as_u64() == Some(start.commit),
+        Some(Value::String(s)) => matches!(
+            s.parse::<sparkles::history::At>(),
+            Ok(sparkles::history::At::Head)
+        ),
         Some(_) => false,
     };
     let start = pinned_to_head.then_some(start);
@@ -370,10 +370,10 @@ async fn ask_route(
             // configuration did not change while the ask read it, and the result's
             // commit, if any, is that state's; otherwise the record keeps no footprint
             let read = start.clone().filter(|s| {
-                let now = target.store.snapshot();
+                let now = target.store.snapshot().pin_live_evidence();
                 now.commit == s.commit
-                    && target.store.managed_generation() == start_managed_gen
-                    && now.evidence_visibility_key() == start_ev_key
+                    && now.managed_generation() == s.managed_generation()
+                    && now.evidence_visibility_key() == s.evidence_visibility_key()
                     && out["result"]["commit"]
                         .as_u64()
                         .is_none_or(|c| c == s.commit)

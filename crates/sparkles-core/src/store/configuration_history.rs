@@ -192,8 +192,7 @@ impl Store {
         next.history_memory = Some(memory);
         preparation.check()?;
         self.family
-            .managed
-            .store(Some(Arc::new(crate::managed::ManagedState::Installed(
+            .store_managed(Some(Arc::new(crate::managed::ManagedState::Installed(
                 next,
             ))));
         Ok(root.identity(self.owner_dataset_id()))

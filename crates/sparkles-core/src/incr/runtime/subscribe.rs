@@ -22,7 +22,12 @@ impl Runtime {
         let budget = o
             .max_memory_bytes
             .unwrap_or(self.opts.read().live_memory_bytes);
-        let shared = Arc::new(Shared::new(budget));
+        let restricted = access.as_ref().is_some_and(|a| !a.reads_everything());
+        let shared = Arc::new(Shared::new(
+            budget,
+            restricted,
+            Some(store.family_managed()),
+        ));
         let mut deferred_reg = DeferredDrops::default();
         let cell = {
             let mut reg = self.reg.lock();
@@ -103,9 +108,10 @@ impl Runtime {
                 // overtakes it
                 if let Some((e, mut lease)) = first {
                     let shared_lease = st.detach_event_lease(&mut lease);
+                    let stamp = Some(st.circuit.evidence_stamp());
                     deferred_state
                         .queued
-                        .extend(shared.push_leased(e, shared_lease));
+                        .extend(shared.push_leased(e, shared_lease, stamp));
                 }
                 let last = st.circuit.applied;
                 st.subs.push(Sub {
@@ -186,6 +192,13 @@ impl Runtime {
     ) -> Result<()> {
         let snap = store.snapshot();
         let had_snap = st.circuit.snap.is_some();
+        let restricted = st
+            .circuit
+            .access
+            .as_ref()
+            .is_some_and(|a| !a.reads_everything());
+        let prev_stamp = st.circuit.evidence_stamp();
+        let ev_mismatch = ev_mismatch || (had_snap && st.evidence_mismatch(&snap));
         let t0 = Instant::now();
         if let Err(e) = st.evaluate(snap, &self.control()) {
             if ev_mismatch {
@@ -198,24 +211,31 @@ impl Runtime {
         }
         cell.info.lock().status = Status::Ready;
         self.note_pass(cell, st, t0.elapsed(), false);
-        if std::mem::take(&mut st.rebased) || ev_mismatch {
+        let ev_boundary_crossed =
+            restricted && had_snap && (ev_mismatch || st.circuit.evidence_stamp() != prev_stamp);
+        if std::mem::take(&mut st.rebased) || ev_boundary_crossed {
             st.clear_history();
         }
-        self.live_budgets(st, deferred);
+        self.live_budgets_inner(st, ev_boundary_crossed, deferred);
         st.prune_dead_subs();
         if !st.subs.is_empty() {
             // other subscribers see the new result as a reset
             let applied = st.circuit.applied;
+            let stamp = Some(st.circuit.evidence_stamp());
             match st.event_budgeted(true) {
                 Ok((reset, mut lease)) => {
                     let shared_lease = st.detach_event_lease(&mut lease);
                     for s in &mut st.subs {
                         if let Some(sh) = s.shared.upgrade() {
                             s.last = applied;
-                            let displaced = if ev_mismatch {
-                                sh.replace_leased(reset.clone(), shared_lease.clone())
+                            let displaced = if ev_boundary_crossed {
+                                sh.replace_leased(
+                                    reset.clone(),
+                                    shared_lease.clone(),
+                                    stamp.clone(),
+                                )
                             } else {
-                                sh.push_leased(reset.clone(), shared_lease.clone())
+                                sh.push_leased(reset.clone(), shared_lease.clone(), stamp.clone())
                             };
                             deferred.queued.extend(displaced);
                         }

@@ -536,10 +536,8 @@ impl Run<'_> {
             ));
         }
         if let Some((start_gen, start_ev_key)) = evidence_guard {
-            let live_snap = self.ds.store.snapshot();
-            if self.ds.store.managed_generation() != *start_gen
-                || live_snap.evidence_visibility_key() != *start_ev_key
-            {
+            let (now_gen, now_ev_key) = self.ds.store.snapshot().evidence_visibility_stamp();
+            if now_gen != *start_gen || now_ev_key != *start_ev_key {
                 return Err(RunError::Refused(
                     "the principal's view or the access policy changed during the run; start a new run"
                         .into(),
@@ -637,8 +635,8 @@ impl Run<'_> {
                 None,
             ),
             None => {
-                let managed_gen = self.ds.store.managed_generation();
                 let snap = self.ds.store.snapshot().pin_live_evidence();
+                let managed_gen = snap.managed_generation();
                 let ev_key = snap.evidence_visibility_key();
                 (BuildView::Snapshot(snap), Some((managed_gen, ev_key)))
             }

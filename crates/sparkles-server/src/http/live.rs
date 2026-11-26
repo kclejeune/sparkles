@@ -166,9 +166,10 @@ impl Stream {
         if !self.restricted {
             return true;
         }
-        self.ds.store.managed_generation() == self.managed_gen
+        let (now_gen, now_ev_key) = self.ds.store.snapshot().evidence_visibility_stamp();
+        now_gen == self.managed_gen
             && self.evidence_key.as_deref() != Some("unavailable")
-            && self.ds.store.snapshot().evidence_visibility_key() == self.evidence_key
+            && now_ev_key == self.evidence_key
     }
 
     async fn recv(&mut self) -> Option<LiveEvent> {
@@ -291,11 +292,10 @@ pub(super) async fn live(
     };
     let access = p.view(&ds.name, crate::auth::Endpoint::Query);
     let restricted = access.as_ref().is_some_and(|a| !a.reads_everything());
-    let managed_gen = ds.store.managed_generation();
-    let evidence_key = if restricted {
-        ds.store.snapshot().evidence_visibility_key()
+    let (managed_gen, evidence_key) = if restricted {
+        ds.store.snapshot().evidence_visibility_stamp()
     } else {
-        None
+        (ds.store.managed_generation(), None)
     };
     let o = LiveOptions {
         after,

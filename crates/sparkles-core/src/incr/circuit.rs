@@ -286,6 +286,8 @@ pub struct Circuit {
     pub snap: Option<Arc<Snapshot>>,
     /// evidence projection visibility key of the latest pass
     evidence_key: Option<String>,
+    /// managed publication generation paired with `evidence_key` on the latest pass
+    managed_generation: u64,
     /// whose view of the dataset the circuit reads
     pub access: Option<Arc<GraphAccess>>,
     /// counters of the latest pass
@@ -523,6 +525,7 @@ impl Circuit {
             applied: 0,
             snap: None,
             evidence_key: None,
+            managed_generation: 0,
             access,
             last: PassStats::default(),
             max_memory_bytes: None,
@@ -1157,9 +1160,31 @@ impl Circuit {
         self.evidence_key.as_deref()
     }
 
-    /// Record the evidence visibility key restored alongside a recovered checkpoint.
-    pub(crate) fn set_evidence_key(&mut self, key: Option<String>) {
-        self.evidence_key = key;
+    /// Managed publication generation when this circuit was last evaluated.
+    pub(crate) fn managed_generation(&self) -> u64 {
+        self.managed_generation
+    }
+
+    /// Coherent `(managed_generation, evidence_key)` stamp from the latest evaluation.
+    pub(crate) fn evidence_stamp(&self) -> super::live::EvidenceStamp {
+        super::live::EvidenceStamp {
+            managed_gen: self.managed_generation,
+            key: self.evidence_key.clone(),
+        }
+    }
+
+    /// Record the evidence stamp restored alongside a recovered checkpoint or rebased result.
+    pub(crate) fn set_evidence_stamp(&mut self, stamp: super::live::EvidenceStamp) {
+        self.managed_generation = stamp.managed_gen;
+        self.evidence_key = stamp.key;
+    }
+
+    /// Move the evidence stamp out alongside a rebased circuit's retained result.
+    pub(crate) fn take_evidence_stamp(&mut self) -> super::live::EvidenceStamp {
+        super::live::EvidenceStamp {
+            managed_gen: std::mem::take(&mut self.managed_generation),
+            key: self.evidence_key.take(),
+        }
     }
 
     fn pass<'a>(
@@ -1350,37 +1375,53 @@ impl Circuit {
         // the schema may have changed in changes no pass saw
         self.inferred = InferredFootprint::default();
         self.budget.shrink_state_to(0);
-        // When support-aware projection visibility is active or unavailable for a
-        // restricted caller, mask `snap` (or fail closed) under the circuit's own
-        // cancellation/deadline controls and memory budget before initializing operators.
-        let ev_key = snap.evidence_visibility_key();
+        // Freeze the live evidence configuration and its managed generation once before
+        // deciding whether to mask so `evidence_key`, `managed_generation`, and the
+        // prepared mask all come from the exact same `ManagedVersion`. Unrestricted
+        // circuits and non-evidence states skip cloning the `Snapshot` so they add zero
+        // peak memory overhead.
         let mut _prepared_mask: Option<crate::access::PreparedView> = None;
-        let eval_snap = match self.access.as_ref().filter(|a| !a.reads_everything()) {
-            Some(a) if snap.has_evidence_projection_or_unavailable() => {
-                self.budget.set_local_limit(self.max_memory_bytes);
-                let local_limit = self
-                    .budget
-                    .handle()
-                    .remaining_local()
-                    .or(self.max_memory_bytes)
-                    .unwrap_or(u64::MAX);
-                let (parent, grant) = self
-                    .budget
-                    .handle()
-                    .preparation_parent(self.pool.as_ref())?;
-                let prep = crate::access::Preparation::with_parent(
-                    control.clone(),
-                    local_limit,
-                    parent,
-                    grant,
-                )?;
-                let prepared = a.masked_controlled(&snap, &prep)?;
-                let masked = prepared.snapshot_arc();
-                _prepared_mask = Some(prepared);
-                masked
-            }
-            _ => snap.clone(),
-        };
+        let (ev_gen, ev_key, eval_snap) =
+            match self.access.as_ref().filter(|a| !a.reads_everything()) {
+                Some(a) => {
+                    let (ev_gen, ev_key) = snap.evidence_visibility_stamp();
+                    if ev_key.is_some() {
+                        let frozen_snap = snap.pin_live_evidence();
+                        let ev_gen = frozen_snap.managed_generation();
+                        let ev_key = frozen_snap.evidence_visibility_key();
+                        let eval_snap = if frozen_snap.has_evidence_projection_or_unavailable() {
+                            self.budget.set_local_limit(self.max_memory_bytes);
+                            let local_limit = self
+                                .budget
+                                .handle()
+                                .remaining_local()
+                                .or(self.max_memory_bytes)
+                                .unwrap_or(u64::MAX);
+                            let (parent, grant) = self
+                                .budget
+                                .handle()
+                                .preparation_parent(self.pool.as_ref())?;
+                            let prep = crate::access::Preparation::with_parent(
+                                control.clone(),
+                                local_limit,
+                                parent,
+                                grant,
+                            )?;
+                            let prepared = a.masked_controlled(&frozen_snap, &prep)?;
+                            let masked = prepared.snapshot_arc();
+                            _prepared_mask = Some(prepared);
+                            masked
+                        } else {
+                            snap.clone()
+                        };
+                        drop(frozen_snap);
+                        (ev_gen, ev_key, eval_snap)
+                    } else {
+                        (ev_gen, None, snap.clone())
+                    }
+                }
+                None => (0, None, snap.clone()),
+            };
         let vis = Vis::new(self.access.as_ref(), &eval_snap);
         let (mut p, root) = self.pass(eval_snap, None, &[], &[], &vis, control);
         let width = root.schema.len();
@@ -1435,6 +1476,7 @@ impl Circuit {
         self.applied = snap.commit;
         self.snap = Some(snap);
         self.evidence_key = ev_key;
+        self.managed_generation = ev_gen;
         self.last = stats;
         if let Err(e) = self.publish_fresh_version_budgeted() {
             self.applied = prev_applied;
@@ -1763,9 +1805,11 @@ impl Circuit {
             }
         }
         let ev_restricted = self.access.as_ref().is_some_and(|a| !a.reads_everything());
-        let new_ev_key = snap.evidence_visibility_key();
-        let ev_active_or_changed =
-            ev_restricted && (new_ev_key.is_some() || self.evidence_key.is_some());
+        let (new_gen, new_ev_key) = snap.evidence_visibility_stamp();
+        let ev_active_or_changed = ev_restricted
+            && (new_ev_key.is_some()
+                || self.evidence_key.is_some()
+                || self.managed_generation != new_gen);
         let whole = super::runtime::whole_reason(self.access.as_ref()).is_some();
         // If support-aware projection visibility is active or unavailable (or just turned
         // off) on a restricted circuit, rebuild over the controlled masked snapshot so
@@ -1791,7 +1835,12 @@ impl Circuit {
                     &d.removed,
                     &vis,
                 )?,
-                _ => d.added.is_empty() && d.removed.is_empty() && self.evidence_key == new_ev_key,
+                _ => {
+                    d.added.is_empty()
+                        && d.removed.is_empty()
+                        && self.evidence_key == new_ev_key
+                        && (!ev_restricted || self.managed_generation == new_gen)
+                }
             };
             if skip {
                 let commit = snap.commit;
@@ -1813,6 +1862,7 @@ impl Circuit {
             drop(p);
             let out = self.finish_delta_pass(res, snap, stats, remapped)?;
             self.evidence_key = new_ev_key;
+            self.managed_generation = new_gen;
             return Ok(out);
         }
         let (added, removed): (Vec<[Id; 4]>, Vec<[Id; 4]>) = if vis.everything() {
