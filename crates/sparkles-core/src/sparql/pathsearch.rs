@@ -1342,14 +1342,18 @@ impl PrefixCost {
 }
 
 /// Outcome of a one-ended length-bounded weighted search: either a Pareto-pruned parent
-/// tree or, for a reverse search whose wide weights or overflow could make target-to-source
-/// sums disagree with source-order sums, backward BFS distances and reachable sources for
-/// per-source forward evaluation.
+/// tree or, for a reverse search where wide weights or overflow occurred alongside at least
+/// one multi-route node, the reverse tree together with exact minimum backward edge
+/// distances (`bwd_dist`) and the nodes reached by multiple reverse relaxations
+/// (`direct_multi`) so unique-route sources still reconstruct directly while multi-route
+/// sources (and sources whose reverse tree path passes through one) re-solve in source order.
 enum BoundedTreeOutcome {
     Tree(ChargedBoundedTree),
     ReverseWide {
+        order: Vec<(u64, u32)>,
+        parent: HbMap<(u64, u32), Parent>,
         bwd_dist: HbMap<u64, u32>,
-        sources: Vec<u64>,
+        direct_multi: HbSet<u64>,
     },
 }
 
@@ -1362,6 +1366,34 @@ fn bounded_weights_too_wide(max_len: u32, wmin: f64, wmax: f64) -> bool {
     }
     let ratio = wmax / wmin;
     ratio > WIDE_WEIGHTS || (max_len as f64) * ratio > ((1u64 << 51) as f64)
+}
+
+/// Whether any node along the reverse parent chain from `(m, len)` back to `(root, 0)`
+/// (excluding `root`) was reached by more than one reverse relaxation. When this returns
+/// `false`, `m` has a unique route of length `<= max_len` to `root` and needs no
+/// source-order re-ranking.
+fn bounded_chain_has_multi(
+    ctx: &Ctx,
+    parent: &HbMap<(u64, u32), Parent>,
+    direct_multi: &HbSet<u64>,
+    m: u64,
+    len: u32,
+) -> Result<bool> {
+    let mut cur = m;
+    let mut l = len;
+    let mut steps = 0usize;
+    while l > 0 {
+        steps += 1;
+        if steps.is_multiple_of(4096) {
+            ctx.check()?;
+        }
+        if direct_multi.contains(&cur) {
+            return Ok(true);
+        }
+        cur = parent[&(cur, l)].node;
+        l -= 1;
+    }
+    Ok(false)
 }
 
 /// Reconstruct a single path of `len` edges from `(m, len)` back to `(root, 0)` in a
@@ -3145,21 +3177,25 @@ impl<'a> Engine<'a> {
         let mut parent: HbMap<(u64, u32), Parent> = HbMap::default();
         let mut order: Vec<(u64, u32)> = Vec::new();
         let mut heap: BoundedHeap = BinaryHeap::new();
+        let mut direct_multi: HbSet<u64> = HbSet::default();
         let mut best_virt: Option<(Cost, u32)> = None;
         let (mut wmin, mut wmax) = (f64::INFINITY, 0.0f64);
         let mut wide = false;
+        let track_reverse_wide = !forward && max_len > 1;
         let local_bytes = |best_len: &HbMap<u64, u32>,
                            dist: &HbMap<u64, Vec<(u32, Cost)>>,
                            dist_vec_bytes: u64,
                            parent: &HbMap<(u64, u32), Parent>,
                            order: &Vec<(u64, u32)>,
-                           heap: &BoundedHeap| {
+                           heap: &BoundedHeap,
+                           direct_multi: &HbSet<u64>| {
             map_bytes(best_len)
                 .saturating_add(map_bytes(dist))
                 .saturating_add(dist_vec_bytes)
                 .saturating_add(map_bytes(parent))
                 .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
                 .saturating_add(vec_bytes::<Reverse<(Cost, u32, u64)>>(heap.capacity()))
+                .saturating_add(set_bytes(direct_multi))
         };
         let mut base = 0u64;
         (_, base) = pareto_insert_charged(
@@ -3173,7 +3209,7 @@ impl<'a> Engine<'a> {
         )?;
         let _ = push_heap(&mut heap, Reverse((Cost::ZERO, 0, root)), &mut work, base)?;
         let mut n = 0u64;
-        'search: while let Some(Reverse((d, l, u))) = heap.pop() {
+        while let Some(Reverse((d, l, u))) = heap.pop() {
             n += 1;
             if n.is_multiple_of(4096) {
                 self.ctx.check()?;
@@ -3181,7 +3217,15 @@ impl<'a> Engine<'a> {
             if best_len.get(&u).is_some_and(|&bl| u == VIRT || l >= bl) {
                 continue;
             }
-            let cur_base = local_bytes(&best_len, &dist, dist_vec_bytes, &parent, &order, &heap);
+            let cur_base = local_bytes(
+                &best_len,
+                &dist,
+                dist_vec_bytes,
+                &parent,
+                &order,
+                &heap,
+                &direct_multi,
+            );
             let (prev, next_base) = insert_hb_map(&mut best_len, u, l, &mut work, cur_base)?;
             if prev.is_none() && u != root {
                 let _ = push_vec(&mut order, (u, l), &mut work, next_base)?;
@@ -3190,7 +3234,15 @@ impl<'a> Engine<'a> {
             if u == VIRT || l >= max_len {
                 continue;
             }
-            let loc = local_bytes(&best_len, &dist, dist_vec_bytes, &parent, &order, &heap);
+            let loc = local_bytes(
+                &best_len,
+                &dist,
+                dist_vec_bytes,
+                &parent,
+                &order,
+                &heap,
+                &direct_multi,
+            );
             let mut out_steps = Vec::new();
             self.expand_one_charged(u, forward, &mut out_steps, &mut work, loc)?;
             let out_bytes = vec_bytes::<(u64, Step)>(out_steps.capacity());
@@ -3202,6 +3254,26 @@ impl<'a> Engine<'a> {
                     self.ctx.check()?;
                 }
                 let y = if st.node == root { VIRT } else { st.node };
+                if track_reverse_wide {
+                    let already_seen = if y == VIRT {
+                        best_virt.is_some()
+                    } else {
+                        dist.contains_key(&y)
+                    };
+                    if already_seen && !direct_multi.contains(&y) {
+                        let cur_base = local_bytes(
+                            &best_len,
+                            &dist,
+                            dist_vec_bytes,
+                            &parent,
+                            &order,
+                            &heap,
+                            &direct_multi,
+                        )
+                        .saturating_add(out_bytes);
+                        let _ = insert_hb_set(&mut direct_multi, y, &mut work, cur_base)?;
+                    }
+                }
                 if best_len.get(&y).is_some_and(|&bl| y == VIRT || nl >= bl) {
                     continue;
                 }
@@ -3221,22 +3293,27 @@ impl<'a> Engine<'a> {
                     }
                 };
                 let wv = self.weight(&e.map(real))?;
-                if !forward && wv > 0.0 {
+                if track_reverse_wide && !wide && wv > 0.0 {
                     wmin = wmin.min(wv);
                     wmax = wmax.max(wv);
                     if bounded_weights_too_wide(max_len, wmin, wmax) {
                         wide = true;
-                        break 'search;
                     }
                 }
                 let nd = d.add(Cost::of(wv));
-                if !forward && max_len > 1 && nd.hi.is_infinite() {
+                if track_reverse_wide && !wide && nd.hi.is_infinite() {
                     wide = true;
-                    break 'search;
                 }
-                let mut cur_base =
-                    local_bytes(&best_len, &dist, dist_vec_bytes, &parent, &order, &heap)
-                        .saturating_add(out_bytes);
+                let mut cur_base = local_bytes(
+                    &best_len,
+                    &dist,
+                    dist_vec_bytes,
+                    &parent,
+                    &order,
+                    &heap,
+                    &direct_multi,
+                )
+                .saturating_add(out_bytes);
                 if y == VIRT {
                     if best_virt.is_some_and(|(bc, bl)| (nd, nl) >= (bc, bl)) {
                         continue;
@@ -3278,95 +3355,32 @@ impl<'a> Engine<'a> {
                 &parent,
                 &order,
                 &heap,
+                &direct_multi,
             ))?;
         }
-        drop(best_len);
         drop(dist);
         drop(heap);
-        if wide {
-            drop(parent);
-            drop(order);
-            work.resize(0)?;
-            let (bwd_dist, sources) = self.reverse_bounded_bfs(root, max_len, &mut work)?;
-            return Ok((BoundedTreeOutcome::ReverseWide { bwd_dist, sources }, work));
+        if wide && !direct_multi.is_empty() {
+            work.resize(
+                map_bytes(&parent)
+                    .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
+                    .saturating_add(map_bytes(&best_len))
+                    .saturating_add(set_bytes(&direct_multi)),
+            )?;
+            return Ok((
+                BoundedTreeOutcome::ReverseWide {
+                    order,
+                    parent,
+                    bwd_dist: best_len,
+                    direct_multi,
+                },
+                work,
+            ));
         }
+        drop(best_len);
+        drop(direct_multi);
         work.resize(map_bytes(&parent).saturating_add(vec_bytes::<(u64, u32)>(order.capacity())))?;
         Ok((BoundedTreeOutcome::Tree((order, parent)), work))
-    }
-
-    /// Backward unweighted BFS from `root` up to `max_len` edges, returning each
-    /// reachable node's minimum edge distance to `root` and the ordered list of reachable
-    /// sources (including `VIRT` when a cycle of length `<= max_len` closes at `root`).
-    fn reverse_bounded_bfs(
-        &self,
-        root: u64,
-        max_len: u32,
-        work: &mut Charge<'a>,
-    ) -> Result<(HbMap<u64, u32>, Vec<u64>)> {
-        self.set_roots(&[root]);
-        let mut bwd_dist: HbMap<u64, u32> = HbMap::default();
-        let mut sources: Vec<u64> = Vec::new();
-        let mut frontier: Vec<u64> = Vec::new();
-        let mut seen_virt = false;
-        let bfs_bytes = |bwd_dist: &HbMap<u64, u32>,
-                         sources: &Vec<u64>,
-                         frontier: &Vec<u64>,
-                         next: &Vec<u64>| {
-            map_bytes(bwd_dist)
-                .saturating_add(vec_bytes::<u64>(sources.capacity()))
-                .saturating_add(vec_bytes::<u64>(frontier.capacity()))
-                .saturating_add(vec_bytes::<u64>(next.capacity()))
-        };
-        let empty_next: Vec<u64> = Vec::new();
-        let mut base = 0u64;
-        (_, base) = insert_hb_map(&mut bwd_dist, root, 0, work, base)?;
-        let _ = push_vec(&mut frontier, root, work, base)?;
-        for depth in 1..=max_len {
-            if frontier.is_empty() {
-                break;
-            }
-            let mut next: Vec<u64> = Vec::new();
-            for &u in &frontier {
-                self.ctx.check()?;
-                self.visit_count(1)?;
-                let loc = bfs_bytes(&bwd_dist, &sources, &frontier, &next);
-                let mut out_steps = Vec::new();
-                self.expand_one_charged(u, false, &mut out_steps, work, loc)?;
-                let out_bytes = vec_bytes::<(u64, Step)>(out_steps.capacity());
-                for (idx, (_, st)) in out_steps.iter().copied().enumerate() {
-                    if idx.is_multiple_of(4096) {
-                        #[cfg(any(test, feature = "failpoints"))]
-                        test_hooks::fire_traversal_poll();
-                        self.ctx.check()?;
-                    }
-                    let y = if st.node == root { VIRT } else { st.node };
-                    let cur_base =
-                        bfs_bytes(&bwd_dist, &sources, &frontier, &next).saturating_add(out_bytes);
-                    if y == VIRT {
-                        if !seen_virt {
-                            seen_virt = true;
-                            let _ = push_vec(&mut sources, VIRT, work, cur_base)?;
-                        }
-                        continue;
-                    }
-                    if bwd_dist.contains_key(&y) {
-                        continue;
-                    }
-                    let (_, next_base) = insert_hb_map(&mut bwd_dist, y, depth, work, cur_base)?;
-                    let next_base = push_vec(&mut sources, y, work, next_base)?;
-                    if depth < max_len {
-                        let _ = push_vec(&mut next, y, work, next_base)?;
-                    }
-                }
-                drop(out_steps);
-                work.resize(bfs_bytes(&bwd_dist, &sources, &frontier, &next))?;
-            }
-            frontier = next;
-            work.resize(bfs_bytes(&bwd_dist, &sources, &frontier, &empty_next))?;
-        }
-        drop(frontier);
-        work.resize(map_bytes(&bwd_dist).saturating_add(vec_bytes::<u64>(sources.capacity())))?;
-        Ok((bwd_dist, sources))
     }
 
     /// One cheapest simple path from `from` to `to` of at most `max_len` edges by
@@ -4044,10 +4058,16 @@ impl<'a> Engine<'a> {
                 return Ok(());
             }
             let nodes: Vec<u64> = std::iter::once(s).chain(cur.iter().map(|e| e.to)).collect();
+            let track_prefix = self.spec.weighted() && budget.is_some();
             let mut prefix_cost = Cost::ZERO;
             let (mut prefix_wmin, mut prefix_wmax) = (f64::INFINITY, 0.0f64);
             for i in 0..cur.len() {
-                if i > 0 && self.spec.weighted() {
+                let step_budget = match budget {
+                    Some(m) if m <= i as u32 => break,
+                    Some(m) => Some(m - i as u32),
+                    None => None,
+                };
+                if i > 0 && track_prefix {
                     let w = self.weight(&cur[i - 1].map(real))?;
                     if w > 0.0 {
                         prefix_wmin = prefix_wmin.min(w);
@@ -4063,11 +4083,6 @@ impl<'a> Engine<'a> {
                     }
                 }
                 let banned_nodes: FxHashSet<u64> = nodes[..i].iter().copied().collect();
-                let step_budget = match budget {
-                    Some(m) if m <= i as u32 => continue,
-                    Some(m) => Some(m - i as u32),
-                    None => None,
-                };
                 let prefix = PrefixCost {
                     cost: prefix_cost,
                     wmin: prefix_wmin,
@@ -4686,8 +4701,21 @@ pub fn run(
                                 }
                             }
                         }
-                        (BoundedTreeOutcome::ReverseWide { bwd_dist, sources }, _bfs_charge) => {
-                            for m in sources {
+                        (
+                            BoundedTreeOutcome::ReverseWide {
+                                order,
+                                parent,
+                                bwd_dist,
+                                direct_multi,
+                            },
+                            tree_charge,
+                        ) => {
+                            let _tree_charge = tree_charge;
+                            let tree_bytes = map_bytes(&parent)
+                                .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
+                                .saturating_add(map_bytes(&bwd_dist))
+                                .saturating_add(set_bytes(&direct_multi));
+                            for (m, l) in order {
                                 if eng.full() {
                                     break 'targets;
                                 }
@@ -4695,6 +4723,18 @@ pub fn run(
                                     continue;
                                 }
                                 let start = if m == VIRT { t } else { m };
+                                if !bounded_chain_has_multi(eng.ctx, &parent, &direct_multi, m, l)?
+                                {
+                                    let edge_bytes = vec_bytes::<Edge>(l as usize);
+                                    _tree_charge.resize(tree_bytes.saturating_add(edge_bytes))?;
+                                    let p = reconstruct_bounded(eng.ctx, t, false, &parent, m, l)?;
+                                    let added = add(&mut found, start, t, p, None, false)?;
+                                    _tree_charge.resize(tree_bytes)?;
+                                    if !added {
+                                        break 'targets;
+                                    }
+                                    continue;
+                                }
                                 let to = if m == VIRT { VIRT } else { t };
                                 let real = |x: u64| if x == VIRT { start } else { x };
                                 if let Some((mut p, path_charge)) = eng
@@ -7917,21 +7957,25 @@ impl SearchContext {
         let mut parent: HbMap<(u64, u32), Parent> = HbMap::default();
         let mut order: Vec<(u64, u32)> = Vec::new();
         let mut heap: BoundedHeap = BinaryHeap::new();
+        let mut direct_multi: HbSet<u64> = HbSet::default();
         let mut best_virt: Option<(Cost, u32)> = None;
         let (mut wmin, mut wmax) = (f64::INFINITY, 0.0f64);
         let mut wide = false;
+        let track_reverse_wide = !forward && max_len > 1;
         let local_bytes = |best_len: &HbMap<u64, u32>,
                            dist: &HbMap<u64, Vec<(u32, Cost)>>,
                            dist_vec_bytes: u64,
                            parent: &HbMap<(u64, u32), Parent>,
                            order: &Vec<(u64, u32)>,
-                           heap: &BoundedHeap| {
+                           heap: &BoundedHeap,
+                           direct_multi: &HbSet<u64>| {
             map_bytes(best_len)
                 .saturating_add(map_bytes(dist))
                 .saturating_add(dist_vec_bytes)
                 .saturating_add(map_bytes(parent))
                 .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
                 .saturating_add(vec_bytes::<Reverse<(Cost, u32, u64)>>(heap.capacity()))
+                .saturating_add(set_bytes(direct_multi))
         };
         let mut base = self.retained_bytes().saturating_add(outer_bytes);
         (_, base) = pareto_insert_charged(
@@ -7945,7 +7989,7 @@ impl SearchContext {
         )?;
         let _ = push_heap(&mut heap, Reverse((Cost::ZERO, 0, root)), charge, base)?;
         let mut n = 0u64;
-        'search: while let Some(Reverse((d, l, u))) = heap.pop() {
+        while let Some(Reverse((d, l, u))) = heap.pop() {
             n += 1;
             if n.is_multiple_of(4096) {
                 ctx.check()?;
@@ -7963,6 +8007,7 @@ impl SearchContext {
                     &parent,
                     &order,
                     &heap,
+                    &direct_multi,
                 ));
             let (prev, next_base) = insert_hb_map(&mut best_len, u, l, charge, cur_base)?;
             if prev.is_none() && u != root {
@@ -7979,6 +8024,7 @@ impl SearchContext {
                 &parent,
                 &order,
                 &heap,
+                &direct_multi,
             ));
             let mut out_steps: Vec<(u64, Step)> = Vec::new();
             self.expand(ctx, spec, &[u], forward, &mut out_steps, charge, loc)?;
@@ -7991,6 +8037,29 @@ impl SearchContext {
                     ctx.check()?;
                 }
                 let y = if st.node == root { VIRT } else { st.node };
+                if track_reverse_wide {
+                    let already_seen = if y == VIRT {
+                        best_virt.is_some()
+                    } else {
+                        dist.contains_key(&y)
+                    };
+                    if already_seen && !direct_multi.contains(&y) {
+                        let cur_base = self
+                            .retained_bytes()
+                            .saturating_add(outer_bytes)
+                            .saturating_add(local_bytes(
+                                &best_len,
+                                &dist,
+                                dist_vec_bytes,
+                                &parent,
+                                &order,
+                                &heap,
+                                &direct_multi,
+                            ))
+                            .saturating_add(out_bytes);
+                        let _ = insert_hb_set(&mut direct_multi, y, charge, cur_base)?;
+                    }
+                }
                 if best_len.get(&y).is_some_and(|&bl| y == VIRT || nl >= bl) {
                     continue;
                 }
@@ -8017,21 +8086,20 @@ impl SearchContext {
                         &parent,
                         &order,
                         &heap,
+                        &direct_multi,
                     ))
                     .saturating_add(out_bytes);
                 let w = self.weight(ctx, spec, &e.map(real), charge, step_outer)?;
-                if !forward && w > 0.0 {
+                if track_reverse_wide && !wide && w > 0.0 {
                     wmin = wmin.min(w);
                     wmax = wmax.max(w);
                     if bounded_weights_too_wide(max_len, wmin, wmax) {
                         wide = true;
-                        break 'search;
                     }
                 }
                 let nd = d.add(Cost::of(w));
-                if !forward && max_len > 1 && nd.hi.is_infinite() {
+                if track_reverse_wide && !wide && nd.hi.is_infinite() {
                     wide = true;
-                    break 'search;
                 }
                 let mut cur_base = self.retained_bytes().saturating_add(step_outer);
                 if y == VIRT {
@@ -8078,20 +8146,30 @@ impl SearchContext {
                         &parent,
                         &order,
                         &heap,
+                        &direct_multi,
                     )),
             )?;
         }
-        drop(best_len);
         drop(dist);
         drop(heap);
-        if wide {
-            drop(parent);
-            drop(order);
-            charge.resize(self.retained_bytes().saturating_add(outer_bytes))?;
-            let (bwd_dist, sources) =
-                self.run_reverse_bounded_bfs(ctx, spec, root, max_len, charge, outer_bytes)?;
-            return Ok(BoundedTreeOutcome::ReverseWide { bwd_dist, sources });
+        if wide && !direct_multi.is_empty() {
+            charge.resize(
+                self.retained_bytes()
+                    .saturating_add(outer_bytes)
+                    .saturating_add(map_bytes(&parent))
+                    .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
+                    .saturating_add(map_bytes(&best_len))
+                    .saturating_add(set_bytes(&direct_multi)),
+            )?;
+            return Ok(BoundedTreeOutcome::ReverseWide {
+                order,
+                parent,
+                bwd_dist: best_len,
+                direct_multi,
+            });
         }
+        drop(best_len);
+        drop(direct_multi);
         charge.resize(
             self.retained_bytes()
                 .saturating_add(outer_bytes)
@@ -8099,99 +8177,6 @@ impl SearchContext {
                 .saturating_add(vec_bytes::<(u64, u32)>(order.capacity())),
         )?;
         Ok(BoundedTreeOutcome::Tree((order, parent)))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn run_reverse_bounded_bfs(
-        &mut self,
-        ctx: &Ctx,
-        spec: &PathSearchSpec,
-        root: u64,
-        max_len: u32,
-        charge: &mut super::ctx::OwnedCharge,
-        outer_bytes: u64,
-    ) -> Result<(HbMap<u64, u32>, Vec<u64>)> {
-        self.set_roots(spec, &[root], charge, outer_bytes)?;
-        let mut bwd_dist: HbMap<u64, u32> = HbMap::default();
-        let mut sources: Vec<u64> = Vec::new();
-        let mut frontier: Vec<u64> = Vec::new();
-        let mut seen_virt = false;
-        let bfs_bytes = |bwd_dist: &HbMap<u64, u32>,
-                         sources: &Vec<u64>,
-                         frontier: &Vec<u64>,
-                         next: &Vec<u64>| {
-            map_bytes(bwd_dist)
-                .saturating_add(vec_bytes::<u64>(sources.capacity()))
-                .saturating_add(vec_bytes::<u64>(frontier.capacity()))
-                .saturating_add(vec_bytes::<u64>(next.capacity()))
-        };
-        let empty_next: Vec<u64> = Vec::new();
-        let mut base = self.retained_bytes().saturating_add(outer_bytes);
-        (_, base) = insert_hb_map(&mut bwd_dist, root, 0, charge, base)?;
-        let _ = push_vec(&mut frontier, root, charge, base)?;
-        for depth in 1..=max_len {
-            if frontier.is_empty() {
-                break;
-            }
-            let mut next: Vec<u64> = Vec::new();
-            for &u in &frontier {
-                ctx.check()?;
-                self.visit(spec, 1)?;
-                let loc =
-                    outer_bytes.saturating_add(bfs_bytes(&bwd_dist, &sources, &frontier, &next));
-                let mut out_steps: Vec<(u64, Step)> = Vec::new();
-                self.expand(ctx, spec, &[u], false, &mut out_steps, charge, loc)?;
-                let out_bytes = vec_bytes::<(u64, Step)>(out_steps.capacity());
-                for (idx, (_, st)) in out_steps.iter().copied().enumerate() {
-                    if idx.is_multiple_of(4096) {
-                        #[cfg(any(test, feature = "failpoints"))]
-                        test_hooks::fire_traversal_poll();
-                        ctx.check()?;
-                    }
-                    let y = if st.node == root { VIRT } else { st.node };
-                    let cur_base = self
-                        .retained_bytes()
-                        .saturating_add(outer_bytes)
-                        .saturating_add(bfs_bytes(&bwd_dist, &sources, &frontier, &next))
-                        .saturating_add(out_bytes);
-                    if y == VIRT {
-                        if !seen_virt {
-                            seen_virt = true;
-                            let _ = push_vec(&mut sources, VIRT, charge, cur_base)?;
-                        }
-                        continue;
-                    }
-                    if bwd_dist.contains_key(&y) {
-                        continue;
-                    }
-                    let (_, next_base) = insert_hb_map(&mut bwd_dist, y, depth, charge, cur_base)?;
-                    let next_base = push_vec(&mut sources, y, charge, next_base)?;
-                    if depth < max_len {
-                        let _ = push_vec(&mut next, y, charge, next_base)?;
-                    }
-                }
-                drop(out_steps);
-                charge.resize(
-                    self.retained_bytes()
-                        .saturating_add(outer_bytes)
-                        .saturating_add(bfs_bytes(&bwd_dist, &sources, &frontier, &next)),
-                )?;
-            }
-            frontier = next;
-            charge.resize(
-                self.retained_bytes()
-                    .saturating_add(outer_bytes)
-                    .saturating_add(bfs_bytes(&bwd_dist, &sources, &frontier, &empty_next)),
-            )?;
-        }
-        drop(frontier);
-        charge.resize(
-            self.retained_bytes()
-                .saturating_add(outer_bytes)
-                .saturating_add(map_bytes(&bwd_dist))
-                .saturating_add(vec_bytes::<u64>(sources.capacity())),
-        )?;
-        Ok((bwd_dist, sources))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10020,11 +10005,17 @@ impl YenJob {
                     nodes.push(e.to);
                 }
                 let nodes_cap_bytes = vec_bytes::<u64>(nodes.capacity());
+                let track_prefix = spec.weighted() && budget.is_some();
                 let mut prefix_cost = Cost::ZERO;
                 let (mut prefix_wmin, mut prefix_wmax) = (f64::INFINITY, 0.0f64);
                 for i in 0..cur_len {
                     ctx.check()?;
-                    if i > 0 && spec.weighted() {
+                    let step_budget = match budget {
+                        Some(m) if m <= i as u32 => break,
+                        Some(m) => Some(m - i as u32),
+                        None => None,
+                    };
+                    if i > 0 && track_prefix {
                         let edge = self.a.last().unwrap().0[i - 1].map(real);
                         let w = search.weight(
                             ctx,
@@ -10041,11 +10032,6 @@ impl YenJob {
                         }
                         prefix_cost = prefix_cost.add(Cost::of(w));
                     }
-                    let step_budget = match budget {
-                        Some(m) if m <= i as u32 => continue,
-                        Some(m) => Some(m - i as u32),
-                        None => None,
-                    };
                     let mut banned_edges: HbSet<Edge> = HbSet::default();
                     let mut banned_nodes: HbSet<u64> = HbSet::default();
                     let mut loop_base = search
@@ -10656,17 +10642,20 @@ enum BoundedShortestState {
         idx: usize,
     },
     ReverseWide {
+        parent: HbMap<(u64, u32), Parent>,
+        order: Vec<(u64, u32)>,
         bwd_dist: HbMap<u64, u32>,
-        sources: Vec<u64>,
+        direct_multi: HbSet<u64>,
         idx: usize,
         max_len: u32,
     },
 }
 
 /// Resumable job for length-bounded weighted `path:shortest` with an unbound end
-/// (ROADMAP item 275): runs one Pareto-pruned search (or, for reverse wide weights,
-/// per-source forward searches pruned by backward BFS distances) and emits each reached
-/// node's optimal path within `max_len` on demand.
+/// (ROADMAP item 275): runs one Pareto-pruned search (and, for reverse wide weights with
+/// multi-route nodes, re-solves only multi-route sources and sources whose reverse tree
+/// path passes through one in source order pruned by the reverse search's minimum edge
+/// distances) and emits each reached node's optimal path within `max_len` on demand.
 struct BoundedShortestJob {
     root: u64,
     forward: bool,
@@ -10703,14 +10692,19 @@ impl BoundedShortestJob {
                 order,
                 idx: 0,
             },
-            BoundedTreeOutcome::ReverseWide { bwd_dist, sources } => {
-                BoundedShortestState::ReverseWide {
-                    bwd_dist,
-                    sources,
-                    idx: 0,
-                    max_len,
-                }
-            }
+            BoundedTreeOutcome::ReverseWide {
+                order,
+                parent,
+                bwd_dist,
+                direct_multi,
+            } => BoundedShortestState::ReverseWide {
+                parent,
+                order,
+                bwd_dist,
+                direct_multi,
+                idx: 0,
+                max_len,
+            },
         };
         let pending_zero = spec.min_len == 0;
         Ok(Self {
@@ -10729,8 +10723,15 @@ impl BoundedShortestJob {
                 map_bytes(parent).saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
             }
             BoundedShortestState::ReverseWide {
-                bwd_dist, sources, ..
-            } => map_bytes(bwd_dist).saturating_add(vec_bytes::<u64>(sources.capacity())),
+                parent,
+                order,
+                bwd_dist,
+                direct_multi,
+                ..
+            } => map_bytes(parent)
+                .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
+                .saturating_add(map_bytes(bwd_dist))
+                .saturating_add(set_bytes(direct_multi)),
         }
     }
 
@@ -10829,43 +10830,55 @@ impl BoundedShortestJob {
                 Ok(None)
             }
             BoundedShortestState::ReverseWide {
+                parent,
+                order,
                 bwd_dist,
-                sources,
+                direct_multi,
                 idx,
                 max_len,
             } => {
-                while *idx < sources.len() {
-                    let m = sources[*idx];
+                while *idx < order.len() {
+                    let (m, len) = order[*idx];
                     *idx += 1;
                     if self.skip_virt && m == VIRT {
                         continue;
                     }
                     let start = if m == VIRT { self.root } else { m };
-                    let to = if m == VIRT { VIRT } else { self.root };
-                    let real = |x: u64| if x == VIRT { start } else { x };
-                    let Some(mut edges) = search.run_dijkstra_pair_bounded_forward(
-                        ctx,
-                        spec,
-                        start,
-                        to,
-                        start,
-                        None,
-                        None,
-                        *max_len,
-                        Cost::ZERO,
-                        Some(bwd_dist),
-                        charge,
-                        job_outer,
-                    )?
-                    else {
-                        continue;
-                    };
-                    for (i, edge) in edges.iter_mut().enumerate() {
-                        if i.is_multiple_of(4096) {
-                            ctx.check()?;
-                        }
-                        *edge = edge.map(real);
-                    }
+                    let (edges, len) =
+                        if !bounded_chain_has_multi(ctx, parent, direct_multi, m, len)? {
+                            let base = search.retained_bytes().saturating_add(job_outer);
+                            charge.resize(base.saturating_add(vec_bytes::<Edge>(len as usize)))?;
+                            let edges = reconstruct_bounded(ctx, self.root, false, parent, m, len)?;
+                            (edges, len as usize)
+                        } else {
+                            let to = if m == VIRT { VIRT } else { self.root };
+                            let real = |x: u64| if x == VIRT { start } else { x };
+                            let Some(mut edges) = search.run_dijkstra_pair_bounded_forward(
+                                ctx,
+                                spec,
+                                start,
+                                to,
+                                start,
+                                None,
+                                None,
+                                *max_len,
+                                Cost::ZERO,
+                                Some(bwd_dist),
+                                charge,
+                                job_outer,
+                            )?
+                            else {
+                                continue;
+                            };
+                            for (i, edge) in edges.iter_mut().enumerate() {
+                                if i.is_multiple_of(4096) {
+                                    ctx.check()?;
+                                }
+                                *edge = edge.map(real);
+                            }
+                            let len = edges.len();
+                            (edges, len)
+                        };
                     let cost = search.path_cost(
                         ctx,
                         spec,
@@ -10873,7 +10886,6 @@ impl BoundedShortestJob {
                         charge,
                         job_outer.saturating_add(vec_bytes::<Edge>(edges.capacity())),
                     )?;
-                    let len = edges.len();
                     let edges = if self.need_edges { edges } else { Vec::new() };
                     charge.resize(
                         search

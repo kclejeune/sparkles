@@ -1589,3 +1589,96 @@ fn path_search_r1_parity_cancellation_and_release() {
         );
     }
 }
+
+/// Regression for Sol r3 P2 in the streaming cursor entry point: unique-route sources in a
+/// reverse wide-weight search stay within the reverse search's exact visit budget, preserve
+/// eager/streaming parity, and release every charged byte on completion and early close.
+#[test]
+fn bounded_weighted_reverse_wide_unique_routes_visit_budget() {
+    let opts = QueryOptions::default();
+    let strict = CursorOptions {
+        batch_rows: 16,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+
+    // Two separate single-edge paths with weights 1 and 1e12, maxLength 2, maxVisited 3.
+    let two_store = Store::in_memory(StoreOptions::default());
+    load(
+        &two_store,
+        "@prefix ex: <http://example.org/> .\n\
+         ex:a ex:p ex:t {| ex:w 1.0e0 |} .\n\
+         ex:b ex:p ex:t {| ex:w 1.0e12 |} .\n",
+        RdfFormat::Turtle,
+    );
+    let two_snap = two_store.snapshot();
+    let q_two = "SELECT ?src ?c ?l { SERVICE path:search { [] path:source ?src ; \
+        path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+        path:maxLength 2 ; path:maxVisited 3 ; path:cost ?c ; path:length ?l } }";
+    assert_parity(&two_snap, q_two, &opts, true);
+    let (rows_two, _, _) = drain_strict(&two_snap, &format!("{P}{q_two}"), &opts, 16);
+    assert_eq!(rows_two.len(), 2);
+
+    // Hybrid graph: 500-edge unique-route chain ending in 1e12 plus the wide-weight
+    // diamond on the same target `ex:t`.
+    let chain_len = 500usize;
+    let m = 2f64.powi(-53);
+    let d = 2f64.powi(-105);
+    let e = d / 2.0;
+    let dbl = |w: f64| format!("\"{w:?}\"^^<http://www.w3.org/2001/XMLSchema#double>");
+    let mut ttl = String::from(
+        "@prefix ex: <http://example.org/> .\n\
+         ex:c1 ex:p ex:t {| ex:w 1.0e12 |} .\n",
+    );
+    for i in 2..=chain_len {
+        ttl += &format!("ex:c{i} ex:p ex:c{} {{| ex:w 1.0e0 |}} .\n", i - 1);
+    }
+    ttl += &format!(
+        "ex:s ex:p ex:pnode {{| ex:w {} |}} . ex:pnode ex:p ex:v {{| ex:w {} |}} .\n\
+         ex:v ex:p2 ex:t {{| ex:w {} |}} .\n\
+         ex:v ex:p ex:x1 {{| ex:w {} |}} . ex:x1 ex:p ex:x2 {{| ex:w {} |}} .\n\
+         ex:x2 ex:p ex:t {{| ex:w {} |}} .\n",
+        dbl(1.0),
+        dbl(m),
+        dbl(d),
+        dbl(e),
+        dbl(e),
+        dbl(e),
+    );
+    let hybrid_store = Store::in_memory(StoreOptions::default());
+    load(&hybrid_store, &ttl, RdfFormat::Turtle);
+    let hybrid_snap = hybrid_store.snapshot();
+    let q_hybrid = format!(
+        "SELECT ?src ?c ?l {{ SERVICE path:search {{ [] path:source ?src ; \
+         path:target ex:t ; path:predicate ex:p , ex:p2 ; path:weight ex:w ; \
+         path:maxLength {chain_len} ; path:maxVisited 600 ; path:cost ?c ; path:length ?l }} }}"
+    );
+    assert_parity(&hybrid_snap, &q_hybrid, &opts, true);
+
+    // Early close while ReverseWide cursor state is live releases all operator bytes on
+    // cursor drop and returns every byte (including Ctx's value cache) to the pool on
+    // context drop.
+    let pool = sparkles_core::sparql::pool::QueryPool::new(1 << 24);
+    let early_opts = QueryOptions {
+        no_cache: true,
+        pool: Some(pool.clone()),
+        ..Default::default()
+    };
+    let mut c =
+        select_cursor(hybrid_snap, &format!("{P}{q_hybrid}"), &early_opts, &strict).unwrap();
+    let meter = c.memory_meter();
+    assert!(c.next_batch().unwrap().is_some());
+    let live_while_open = meter.live_bytes();
+    assert!(
+        live_while_open > 65_536,
+        "expected live ReverseWide state above value cache, got {live_while_open}"
+    );
+    drop(c);
+    let live_after_cursor_drop = meter.live_bytes();
+    assert!(
+        live_after_cursor_drop < live_while_open && live_after_cursor_drop <= 65_536,
+        "expected ReverseWide state released on early drop (open={live_while_open}, after={live_after_cursor_drop})"
+    );
+    drop(meter);
+    assert_eq!(pool.granted(), 0);
+}

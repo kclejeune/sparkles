@@ -2674,3 +2674,132 @@ fn weighted_bounded_eager_high_reifier_weight_lookup_streams() {
         res.mem_peak_bytes
     );
 }
+
+/// Regression for Sol r3 P2: reverse wide-weight handling must preserve the reverse
+/// traversal's visit bound on unique-route sources rather than re-running BFS and
+/// per-source forward searches when each source has only one route, while still re-solving
+/// multi-route wide-weight sources in source order.
+#[test]
+fn weighted_bounded_variable_source_wide_weight_unique_routes_visit_budget() {
+    // 1. Two separate single-edge paths with weights 1 and 1e12, maxLength 2, maxVisited 3:
+    //    both streaming and eager (with and without `path:limit 1`) must settle exactly
+    //    `t`, `a`, and `b` without exceeding `maxVisited 3`.
+    let two_edges = store_of(
+        "ex:a ex:p ex:t {| ex:w 1.0e0 |} . \
+         ex:b ex:p ex:t {| ex:w 1.0e12 |} .",
+    );
+    for (lim, expected_count) in [
+        ("", 2usize),
+        (" ; path:limit 1", 1),
+        (" ; path:limit 10", 2),
+    ] {
+        let r = rows(
+            &two_edges,
+            &format!(
+                "SELECT ?src ?c ?l WHERE {{ SERVICE path:search {{ [] path:source ?src ; \
+                 path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+                 path:maxLength 2 ; path:maxVisited 3{lim} ; path:cost ?c ; path:length ?l }} }}"
+            ),
+        );
+        assert_eq!(
+            r.len(),
+            expected_count,
+            "two-edge visit budget ({lim}): {r:?}"
+        );
+        if expected_count == 2 {
+            let by_src: BTreeMap<String, f64> = r
+                .iter()
+                .map(|row| (row["src"].clone(), row["c"].parse::<f64>().unwrap()))
+                .collect();
+            assert_eq!(by_src.get("a"), Some(&1.0));
+            assert_eq!(by_src.get("b"), Some(&1e12));
+        } else {
+            assert_eq!(r[0]["src"], "a");
+            assert_eq!(r[0]["c"].parse::<f64>().unwrap(), 1.0);
+        }
+    }
+
+    // 2. A 500-edge directed chain ending in a 1e12 edge (all other edges weight 1) has a
+    //    unique route from every source: it must stay within `maxVisited 501` rather than
+    //    spending O(n^2) visits (> 125,000) in per-source forward fallback.
+    let chain_len = 500usize;
+    let mut chain_ttl = String::from("ex:c1 ex:p ex:t {| ex:w 1.0e12 |} .\n");
+    for i in 2..=chain_len {
+        chain_ttl += &format!("ex:c{i} ex:p ex:c{} {{| ex:w 1.0e0 |}} .\n", i - 1);
+    }
+    let chain_store = store_of(&chain_ttl);
+    for lim in ["", " ; path:limit 600"] {
+        let r = rows(
+            &chain_store,
+            &format!(
+                "SELECT ?src ?c ?l WHERE {{ SERVICE path:search {{ [] path:source ?src ; \
+                 path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+                 path:maxLength {chain_len} ; path:maxVisited {} {lim} ; \
+                 path:cost ?c ; path:length ?l }} }}",
+                chain_len + 1
+            ),
+        );
+        assert_eq!(r.len(), chain_len, "chain visit budget ({lim})");
+        let far = r
+            .iter()
+            .find(|row| row["src"] == format!("c{chain_len}"))
+            .unwrap();
+        assert_eq!(far["l"], chain_len.to_string());
+        assert_eq!(
+            far["c"].parse::<f64>().unwrap(),
+            1e12 + (chain_len - 1) as f64
+        );
+    }
+
+    // 3. Hybrid graph: the 500-edge unique-route chain shares target `ex:t` with the
+    //    wide-weight multi-route diamond (`s -> p -> v -> {t, x1 -> x2 -> t}`). Unique
+    //    chain sources still reconstruct directly while `s` and `v` re-solve in source
+    //    order, staying well within `maxVisited 600`.
+    let m = 2f64.powi(-53);
+    let d = 2f64.powi(-105);
+    let e = d / 2.0;
+    let dbl = |w: f64| format!("\"{w:?}\"^^<http://www.w3.org/2001/XMLSchema#double>");
+    let mut hybrid_ttl = chain_ttl;
+    hybrid_ttl += &format!(
+        "ex:s ex:p ex:pnode {{| ex:w {} |}} . ex:pnode ex:p ex:v {{| ex:w {} |}} . \
+         ex:v ex:p2 ex:t {{| ex:w {} |}} . \
+         ex:v ex:p ex:x1 {{| ex:w {} |}} . ex:x1 ex:p ex:x2 {{| ex:w {} |}} . \
+         ex:x2 ex:p ex:t {{| ex:w {} |}} .\n",
+        dbl(1.0),
+        dbl(m),
+        dbl(d),
+        dbl(e),
+        dbl(e),
+        dbl(e),
+    );
+    let hybrid_store = store_of(&hybrid_ttl);
+    for lim in ["", " ; path:limit 600"] {
+        let r = rows(
+            &hybrid_store,
+            &format!(
+                "SELECT ?src ?c ?l WHERE {{ SERVICE path:search {{ [] path:source ?src ; \
+                 path:target ex:t ; path:predicate ex:p , ex:p2 ; path:weight ex:w ; \
+                 path:maxLength {chain_len} ; path:maxVisited 600{lim} ; \
+                 path:cost ?c ; path:length ?l }} }}"
+            ),
+        );
+        assert_eq!(r.len(), chain_len + 5, "hybrid total sources ({lim})");
+        let row_s = r.iter().find(|row| row["src"] == "s").unwrap();
+        assert_eq!(
+            row_s["l"], "5",
+            "hybrid ({lim}): ex:s must take 5-edge source-order suffix"
+        );
+        assert_eq!(row_s["c"].parse::<f64>().unwrap(), 1.0);
+        let row_v = r.iter().find(|row| row["src"] == "v").unwrap();
+        assert_eq!(
+            row_v["l"], "1",
+            "hybrid ({lim}): ex:v must take direct edge"
+        );
+        assert_eq!(row_v["c"].parse::<f64>().unwrap(), d);
+        let row_far = r
+            .iter()
+            .find(|row| row["src"] == format!("c{chain_len}"))
+            .unwrap();
+        assert_eq!(row_far["l"], chain_len.to_string());
+    }
+}

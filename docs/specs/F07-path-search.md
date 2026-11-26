@@ -276,11 +276,13 @@ split the edge budget into `ceil(L / 2)` forward and `floor(L / 2)` backward hal
 fall back to a source-order bounded search when wide weights or overflow could affect
 ranking, with Yen's spurs carrying their accumulated prefix cost and weight range into that
 check and fallback. Unbound ends in weighted `path:shortest` with `path:maxLength` run a
-one-ended Pareto-pruned search, and an unbound-source search falls back to source-order
-bounded forward searches pruned by backward BFS distances when wide weights or overflow
-could make reverse sums disagree with source-order costs. Weighted `path:allShortest` with
-`path:maxLength` requires both ends bound because it enumerates tied short paths through
-Yen's algorithm. Lengths still count edges.
+one-ended Pareto-pruned search. When a reverse search for an unbound source encounters wide
+weights or overflow, it finishes the reverse search to record each node's minimum backward
+edge distance and which nodes were reached by multiple reverse relaxations, reconstructs
+unique-route sources directly, and re-solves only multi-route sources and sources whose
+reverse tree path passes through one in source order pruned by those backward edge
+distances. Weighted `path:allShortest` with `path:maxLength` requires both ends bound because
+it enumerates tied short paths through Yen's algorithm. Lengths still count edges.
 
 The cost of a path is the sum of its weights, added in double-double arithmetic, and
 `path:cost` is that sum rounded to the nearest double. Two paths tie in the shortest modes
@@ -952,11 +954,15 @@ both the eager engine and the streaming cursor reader.
   one-ended Pareto-pruned search over `(node, length)` up to `maxLength`, so weighted
   `path:shortest` with `path:maxLength` now answers unbound targets and unbound sources as
   well as bound pairs. When a reverse search for an unbound source encounters wide weights
-  or overflow with `maxLength > 1`, both engines drop the reverse frontier, collect
-  reachable sources and minimum edge distances by backward BFS, and run source-order
-  bounded forward searches per source so reported costs match bound-pair and forward
-  searches. Weighted `path:allShortest` with `path:maxLength` continues to run
-  Yen's algorithm with length-bounded spurs and therefore still requires both ends bound.
+  or overflow with `maxLength > 1`, both engines finish the reverse search to obtain each
+  reached node's exact minimum edge distance to the target and the set of nodes reached by
+  multiple reverse relaxations. When no node is reached more than once, or for any source
+  whose reverse parent chain avoids those nodes, the unique route reconstructs directly from
+  the reverse tree without extra visits; only multi-route sources and sources whose reverse
+  tree path passes through one run source-order bounded forward searches pruned by those
+  minimum backward edge distances so reported costs match bound-pair and forward searches.
+  Weighted `path:allShortest` with `path:maxLength` continues to run Yen's algorithm with
+  length-bounded spurs and therefore still requires both ends bound.
 * **Tests.** `pathsearch.rs` adds unit tests for Pareto frontier pruning and lower-bound
   arithmetic. In `crates/sparkles-core/tests/path_search.rs`,
   `weighted_shortest_under_max_length_skips_many_cheap_long_paths` verifies that 262,144
@@ -971,13 +977,16 @@ both the eager engine and the streaming cursor reader.
   against brute-force enumeration for bound pairs, unbound targets, unbound sources,
   `path:allShortest`, and `path:kShortest`. Additional regressions verify wide-weight
   four-edge cycle ranking, shared-prefix Yen spur ranking, variable-source wide-weight
-  cross-form ranking, streaming eager weight lookups on a 5,000-reifier edge, eager
-  frontier memory pre-admission and release across repeated pairs, single-visit `VIRT`
-  pruning, and eager mid-relaxation cancellation.
+  cross-form ranking, visit-budget preservation on unique-route reverse wide-weight graphs
+  (separate single-edge paths, a 500-edge chain, and a chain beside a wide-weight diamond),
+  streaming eager weight lookups on a 5,000-reifier edge, eager frontier memory
+  pre-admission and release across repeated pairs, single-visit `VIRT` pruning, and eager
+  mid-relaxation cancellation.
   `crates/sparkles-core/tests/cursor_pathsearch.rs` verifies eager and streaming parity,
   counter equality across `maxLength` 0 and 1, cycles, unbound ends, `VALUES`, `kShortest`,
-  and `allShortest`, and memory release after bounded weighted admission failure, early
-  close, and within-pull relaxation cancellation.
+  and `allShortest`, visit-budget preservation on reverse wide-weight unique-route graphs,
+  and memory release after bounded weighted admission failure, early close, and within-pull
+  relaxation cancellation.
   `crates/sparkles-core/tests/cursor_memory_audit.rs` audits bounded weighted `shortest` on
   bound, unbound, and reverse wide-weight fallback forms and `kShortest` at
   `Allowance::EXACT`, plus bounded scratch heap for eager high-reifier weight lookup.
