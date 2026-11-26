@@ -4136,6 +4136,14 @@ async fn patterns_r2_triple_limit_parity_dry_run_precondition_prefix_etag_and_re
     );
     assert_eq!(prev_multi.json()["code"], "triple-limit");
 
+    *s._state.pattern_test_limits.lock() = None;
+}
+
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn patterns_r4_shacl_warn_receipt_respects_response_cap() {
+    let s = persistent();
+
     // Oversized SHACL warn-mode validation receipt on apply?receipt=true must preserve
     // the committed outcome and stay strictly within the response byte ceiling.
     let huge_shacl_msg = "V".repeat(2_000);

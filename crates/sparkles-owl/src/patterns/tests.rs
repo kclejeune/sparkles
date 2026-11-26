@@ -1682,12 +1682,14 @@ fn failed_parses_and_per_template_refusals_debit_request_budget() {
         ..Limits::default()
     };
 
-    // 1. Malformed Manchester expression resolves `'lbl'` (~475 bytes) then fails on trailing
-    //    tokens. Three rows spend > 1,200 bytes and must trip `budget_exceeded`.
+    // 1. Malformed Manchester expression resolves `'lbl'` (~474 bytes) and `Thing` (35 bytes),
+    //    staying under the 800-byte per-template cap until `done()` fails on trailing tokens.
+    //    Rows 1-2 must emit ordinary syntax errors while debiting ~509 bytes each so row 3
+    //    trips `max_total_expanded_bytes` (1,200).
     let malformed_manch = PatternSpec {
         mode: TemplateMode::Pattern {
             declarations: Vec::new(),
-            rules: vec![PatternRule::manchester("'lbl' SubClassOf 'lbl' ???")],
+            rules: vec![PatternRule::manchester("'lbl' SubClassOf Thing ???")],
         },
         base_iri: None,
         prefixes: BTreeMap::new(),
@@ -1704,10 +1706,18 @@ fn failed_parses_and_per_template_refusals_debit_request_budget() {
         res_malformed.budget_exceeded,
         "repeated failed Manchester parses bypassed request budget: {res_malformed:?}"
     );
+    assert!(
+        res_malformed
+            .diagnostics
+            .iter()
+            .any(|d| d.row == 2 && d.code != "expansion-bytes-limit" && d.message.contains("???")),
+        "first data row (row 2) must fail at trailing-token syntax check (ordinary error), not budget: {:?}",
+        res_malformed.diagnostics
+    );
 
-    // 2. Per-template refusal after resolving one `'lbl'` (~475 bytes) and overflowing
-    //    `max_expanded_bytes_per_template` (800) on the second `'lbl'` (~950 bytes).
-    //    Repeating across rows must still debit the spent 475 bytes per row and hit
+    // 2. Per-template refusal after resolving one `'lbl'` (~474 bytes) and overflowing
+    //    `max_expanded_bytes_per_template` (800) on the second `'lbl'` (~948 bytes).
+    //    Repeating across rows must still debit the spent 474 bytes per row and hit
     //    `max_total_expanded_bytes` (1,200).
     let per_tmpl_spec = PatternSpec {
         mode: TemplateMode::Pattern {
@@ -1729,21 +1739,28 @@ fn failed_parses_and_per_template_refusals_debit_request_budget() {
         res_per_tmpl.budget_exceeded,
         "repeated per-template refusals bypassed request budget: {res_per_tmpl:?}"
     );
-
-    // 3. Malformed OFN expression with a `# "` comment-hidden prefix expansion followed by
-    //    trailing garbage must still debit bytes spent by the OFN parser before the error.
-    let mut ofn_prefixes = BTreeMap::new();
-    ofn_prefixes.insert(
-        "p".to_string(),
-        format!("http://ex.org/{}/", "y".repeat(300)),
+    assert!(
+        res_per_tmpl
+            .diagnostics
+            .iter()
+            .any(|d| d.row == 2 && d.message.contains("800 byte limit")),
+        "first data row (row 2) must hit per-template limit before total request budget: {:?}",
+        res_per_tmpl.diagnostics
     );
+
+    // 3. Malformed OFN expression using full `<IRI>` terms (so `charge_prefixed_expansions`
+    //    precharges 0 bytes) stays below the 800-byte per-template cap (~490 bytes) until
+    //    `r.end("axiom")` fails on trailing garbage. Rows 1-2 must emit ordinary parse errors
+    //    while debiting ~490 bytes each so row 3 trips `max_total_expanded_bytes` (1,200).
     let malformed_ofn = PatternSpec {
         mode: TemplateMode::Pattern {
             declarations: Vec::new(),
-            rules: vec![PatternRule::functional("# \"\nSubClassOf(p:A p:B) ???")],
+            rules: vec![PatternRule::functional(format!(
+                "SubClassOf(<{long_iri}> <http://ex.org/B>) ???"
+            ))],
         },
         base_iri: None,
-        prefixes: ofn_prefixes,
+        prefixes: BTreeMap::new(),
     };
     let res_ofn = evaluate(
         "r\n1\n2\n3\n4\n",
@@ -1756,6 +1773,13 @@ fn failed_parses_and_per_template_refusals_debit_request_budget() {
     assert!(
         res_ofn.budget_exceeded,
         "repeated failed OFN parses bypassed request budget: {res_ofn:?}"
+    );
+    assert!(
+        res_ofn.diagnostics.iter().any(|d| d.row == 2
+            && d.code != "expansion-bytes-limit"
+            && d.message.contains("expected the end")),
+        "first data row (row 2) must fail at OFN trailing-token check (ordinary error), not precharge: {:?}",
+        res_ofn.diagnostics
     );
 }
 

@@ -136,6 +136,16 @@ impl<'v> Parser<'v> {
     fn done(&self) -> Result<(), Error> {
         if self.pos < self.end {
             let (t, s) = &self.toks[self.pos];
+            if let Some(max_bytes) = self.max_error_bytes {
+                let mut msg = String::with_capacity(max_bytes.min(160));
+                push_tok_described_bounded(&mut msg, t, BOUNDED_SNIPPET_BYTES, max_bytes);
+                push_capped(
+                    &mut msg,
+                    " does not continue the expression; join expressions with and, or or parentheses",
+                    max_bytes,
+                );
+                return Err(Error::syntax(*s, msg));
+            }
             let what = match t.word() {
                 Some(w) if KEYWORDS.contains(&w) => format!("the keyword '{w}'"),
                 _ => format!("'{}'", t.shown()),
@@ -199,6 +209,21 @@ impl<'v> Parser<'v> {
     }
 
     fn expected(&self, what: &str) -> Error {
+        if let Some(max_bytes) = self.max_error_bytes {
+            let mut msg = String::with_capacity(max_bytes.min(160));
+            push_capped(&mut msg, "expected ", max_bytes);
+            push_capped(&mut msg, what, max_bytes);
+            match self.peek() {
+                None => {
+                    push_capped(&mut msg, ", but the expression ends", max_bytes);
+                }
+                Some(t) => {
+                    push_capped(&mut msg, ", found ", max_bytes);
+                    push_tok_described_bounded(&mut msg, t, BOUNDED_SNIPPET_BYTES, max_bytes);
+                }
+            }
+            return Error::syntax(self.here(), msg);
+        }
         match self.peek() {
             None => Error::syntax(
                 self.here(),
@@ -211,6 +236,49 @@ impl<'v> Parser<'v> {
                 };
                 Error::syntax(self.here(), format!("expected {what}, found {found}"))
             }
+        }
+    }
+
+    fn parse_iri_checked(&self, span: Span, iri: &str) -> Result<Iri, Error> {
+        if let Some(max_bytes) = self.max_error_bytes {
+            oxrdf::NamedNode::new(iri).map_err(|e| {
+                use std::fmt::Write as _;
+                let mut msg = String::with_capacity(max_bytes.min(160));
+                push_capped(&mut msg, "invalid IRI <", max_bytes);
+                push_snippet(&mut msg, iri, BOUNDED_SNIPPET_BYTES, max_bytes);
+                push_capped(&mut msg, ">: ", max_bytes);
+                let mut reason = String::new();
+                let _ = write!(&mut reason, "{e}");
+                push_capped(&mut msg, &reason, max_bytes);
+                Error::syntax(span, msg)
+            })
+        } else {
+            crate::model::parse_iri(iri).map_err(|e| Error::syntax(span, e.0))
+        }
+    }
+
+    fn parse_lang_literal_checked(
+        &self,
+        span: Span,
+        value: String,
+        lang: &str,
+    ) -> Result<Literal, Error> {
+        if let Some(max_bytes) = self.max_error_bytes {
+            oxrdf::Literal::new_language_tagged_literal(value, lang)
+                .map(Literal)
+                .map_err(|e| {
+                    use std::fmt::Write as _;
+                    let mut msg = String::with_capacity(max_bytes.min(160));
+                    push_capped(&mut msg, "invalid language tag '", max_bytes);
+                    push_snippet(&mut msg, lang, BOUNDED_SNIPPET_BYTES, max_bytes);
+                    push_capped(&mut msg, "': ", max_bytes);
+                    let mut reason = String::new();
+                    let _ = write!(&mut reason, "{e}");
+                    push_capped(&mut msg, &reason, max_bytes);
+                    Error::syntax(span, msg)
+                })
+        } else {
+            Literal::lang(value, lang).map_err(|e| Error::syntax(span, e.0))
         }
     }
 
@@ -359,10 +427,9 @@ impl<'v> Parser<'v> {
                     });
                 }
                 match iri {
-                    Some(iri) => match crate::model::parse_iri(&iri) {
-                        Ok(i) => Ok(vec![Entity::of_kind(want[0], i)]),
-                        Err(e) => Err(Error::syntax(span, e.0)),
-                    },
+                    Some(iri) => self
+                        .parse_iri_checked(span, &iri)
+                        .map(|i| vec![Entity::of_kind(want[0], i)]),
                     None => {
                         let message = if let Some(max_bytes) = self.max_error_bytes {
                             let mut msg = String::with_capacity(max_bytes.min(160));
@@ -582,16 +649,9 @@ impl<'v> Parser<'v> {
             Some(Tok::Name(Name::Word(w))) if w == "true" || w == "false" => true,
             Some(Tok::LBrace) => self.literal_ahead(k + 1),
             Some(Tok::Name(n)) => {
-                let max_exp = self.budget.map(|b| b.limit);
                 self.tok(k + 1) == Some(&Tok::LBracket)
-                    || self
-                        .v
-                        .lookup_kinds(n, &[K::Datatype], max_exp)
-                        .contains(K::Datatype)
-                        && !self
-                            .v
-                            .lookup_kinds(n, &[K::Class], max_exp)
-                            .contains(K::Class)
+                    || self.v.lookup_kinds(n, &[K::Datatype]).contains(K::Datatype)
+                        && !self.v.lookup_kinds(n, &[K::Class]).contains(K::Class)
             }
             _ => false,
         }
@@ -798,11 +858,16 @@ impl<'v> Parser<'v> {
                     .find(|f| super::local_name(f) == w.as_str())
                     .map(|f| f.to_string())
                     .or_else(|| {
-                        self.v
-                            .expanded_len(w)
-                            .filter(|&len| len <= 256)
-                            .and_then(|_| self.v.expand(w))
-                            .filter(|i| vocab::FACETS.contains(&i.as_str()))
+                        self.v.expand_parts(w).and_then(|(ns, local)| {
+                            vocab::FACETS
+                                .iter()
+                                .find(|f| {
+                                    f.len() == ns.len().saturating_add(local.len())
+                                        && f.starts_with(ns)
+                                        && &f[ns.len()..] == local
+                                })
+                                .map(|f| (*f).to_string())
+                        })
                     });
                 match found {
                     Some(f) => f,
@@ -851,7 +916,7 @@ impl<'v> Parser<'v> {
             }) => {
                 self.bump();
                 if let Some(lang) = lang {
-                    return Literal::lang(value, &lang).map_err(|e| Error::syntax(span, e.0));
+                    return self.parse_lang_literal_checked(span, value, &lang);
                 }
                 if let Some((n, dspan)) = datatype {
                     let d = self.resolve(&n, dspan, &[K::Datatype], "a datatype")?;
@@ -862,10 +927,22 @@ impl<'v> Parser<'v> {
             Some(Tok::Number(n)) => {
                 self.bump();
                 number(&n).ok_or_else(|| {
-                    Error::syntax(
-                        span,
-                        format!("'{n}' is not an integer, a decimal or a floating-point number with an f suffix"),
-                    )
+                    if let Some(max_bytes) = self.max_error_bytes {
+                        let mut msg = String::with_capacity(max_bytes.min(160));
+                        push_capped(&mut msg, "'", max_bytes);
+                        push_snippet(&mut msg, &n, BOUNDED_SNIPPET_BYTES, max_bytes);
+                        push_capped(
+                            &mut msg,
+                            "' is not an integer, a decimal or a floating-point number with an f suffix",
+                            max_bytes,
+                        );
+                        Error::syntax(span, msg)
+                    } else {
+                        Error::syntax(
+                            span,
+                            format!("'{n}' is not an integer, a decimal or a floating-point number with an f suffix"),
+                        )
+                    }
                 })
             }
             Some(Tok::Name(Name::Word(w))) if w == "true" || w == "false" => {
@@ -1081,11 +1158,9 @@ impl<'v> Parser<'v> {
             }
         }
         if let Some(Tok::Name(n)) = self.tok(self.pos) {
-            let max_exp = self.budget.map(|b| b.limit);
             let right_kinds = self.v.lookup_kinds(
                 n,
                 &[K::ObjectProperty, K::DataProperty, K::AnnotationProperty],
-                max_exp,
             );
             if let Some(e) = es.iter().find(|e| right_kinds.contains(e.kind())) {
                 return Left::of(e.clone());
@@ -1146,7 +1221,7 @@ impl<'v> Parser<'v> {
             _ => return Err(self.expected("an IRI")),
         };
         self.bump();
-        crate::model::parse_iri(&iri).map_err(|e| Error::syntax(span, e.0))
+        self.parse_iri_checked(span, &iri)
     }
 
     /// An axiom without a keyword between its sides: a characteristic such as
@@ -1374,6 +1449,90 @@ fn push_name_bounded(out: &mut String, n: &Name, snippet_cap: usize, max_bytes: 
         Name::Word(w) => push_snippet(out, w, snippet_cap, max_bytes),
         Name::Quoted(q) => push_snippet(out, q, snippet_cap, max_bytes),
     }
+}
+
+fn push_debug_snippet(out: &mut String, s: &str, snippet_cap: usize, max_bytes: usize) {
+    let ellipsis = "...";
+    let body_cap = snippet_cap.saturating_sub(ellipsis.len());
+    let mut escaped_bytes = 0usize;
+    let mut cut_len = out.len();
+    for c in s.chars() {
+        let mut buf = [0u8; 16];
+        let mut n = 0usize;
+        for ec in c.escape_debug() {
+            n += ec.encode_utf8(&mut buf[n..]).len();
+        }
+        let piece = std::str::from_utf8(&buf[..n]).expect("valid utf8");
+        let next_bytes = escaped_bytes.saturating_add(piece.len());
+        if next_bytes > snippet_cap {
+            out.truncate(cut_len);
+            push_capped(out, ellipsis, max_bytes);
+            return;
+        }
+        if !push_capped(out, piece, max_bytes) {
+            return;
+        }
+        escaped_bytes = next_bytes;
+        if escaped_bytes <= body_cap {
+            cut_len = out.len();
+        }
+    }
+}
+
+fn push_tok_described_bounded(out: &mut String, t: &Tok, snippet_cap: usize, max_bytes: usize) {
+    if let Some(w) = t.word()
+        && KEYWORDS.contains(&w)
+    {
+        push_capped(out, "the keyword '", max_bytes);
+        push_capped(out, w, max_bytes);
+        push_capped(out, "'", max_bytes);
+        return;
+    }
+    push_capped(out, "'", max_bytes);
+    match t {
+        Tok::LParen => {
+            push_capped(out, "(", max_bytes);
+        }
+        Tok::RParen => {
+            push_capped(out, ")", max_bytes);
+        }
+        Tok::LBrace => {
+            push_capped(out, "{", max_bytes);
+        }
+        Tok::RBrace => {
+            push_capped(out, "}", max_bytes);
+        }
+        Tok::LBracket => {
+            push_capped(out, "[", max_bytes);
+        }
+        Tok::RBracket => {
+            push_capped(out, "]", max_bytes);
+        }
+        Tok::Comma => {
+            push_capped(out, ",", max_bytes);
+        }
+        Tok::Op(o) => {
+            push_capped(out, o, max_bytes);
+        }
+        Tok::Name(Name::Iri(i)) => {
+            push_capped(out, "<", max_bytes);
+            push_snippet(out, i, snippet_cap, max_bytes);
+            push_capped(out, ">", max_bytes);
+        }
+        Tok::Name(Name::Word(w)) => push_snippet(out, w, snippet_cap, max_bytes),
+        Tok::Name(Name::Quoted(q)) => {
+            push_capped(out, "'", max_bytes);
+            push_snippet(out, q, snippet_cap, max_bytes);
+            push_capped(out, "'", max_bytes);
+        }
+        Tok::Str { value, .. } => {
+            push_capped(out, "\"", max_bytes);
+            push_debug_snippet(out, value, snippet_cap, max_bytes);
+            push_capped(out, "\"", max_bytes);
+        }
+        Tok::Number(n) => push_snippet(out, n, snippet_cap, max_bytes),
+    }
+    push_capped(out, "'", max_bytes);
 }
 
 fn push_short_iri_bounded(

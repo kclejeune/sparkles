@@ -231,12 +231,131 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Borrowed view of an IRI represented as one or two concatenated string slices,
+/// enabling allocation-free `FxHashMap` lookups for `(namespace, local)` pairs.
+trait IriLookup {
+    fn parts(&self) -> (&str, &str);
+}
+
+#[derive(Clone, Debug)]
+struct IriKey(String);
+
+impl IriLookup for IriKey {
+    fn parts(&self) -> (&str, &str) {
+        (self.0.as_str(), "")
+    }
+}
+
+struct IriPair<'a>(&'a str, &'a str);
+
+impl IriLookup for IriPair<'_> {
+    fn parts(&self) -> (&str, &str) {
+        (self.0, self.1)
+    }
+}
+
+impl<'a> std::borrow::Borrow<dyn IriLookup + 'a> for IriKey {
+    fn borrow(&self) -> &(dyn IriLookup + 'a) {
+        self
+    }
+}
+
+fn parts_eq(a: (&str, &str), b: (&str, &str)) -> bool {
+    let len_a = a.0.len() + a.1.len();
+    let len_b = b.0.len() + b.1.len();
+    if len_a != len_b {
+        return false;
+    }
+    if a.1.is_empty() && b.1.is_empty() {
+        return a.0 == b.0;
+    }
+    let (mut a_cur, mut a_next) = (a.0.as_bytes(), a.1.as_bytes());
+    let (mut b_cur, mut b_next) = (b.0.as_bytes(), b.1.as_bytes());
+    loop {
+        if a_cur.is_empty() {
+            a_cur = a_next;
+            a_next = &[];
+        }
+        if b_cur.is_empty() {
+            b_cur = b_next;
+            b_next = &[];
+        }
+        if a_cur.is_empty() {
+            return b_cur.is_empty();
+        }
+        let n = a_cur.len().min(b_cur.len());
+        if a_cur[..n] != b_cur[..n] {
+            return false;
+        }
+        a_cur = &a_cur[n..];
+        b_cur = &b_cur[n..];
+    }
+}
+
+fn hash_parts<H: std::hash::Hasher>(a: &str, b: &str, state: &mut H) {
+    // Split-invariant chunked hashing so `(ns, local)` and `(full, "")` hash identically
+    // under `FxHasher`, which hashes per `write` call.
+    let mut buf = [0u8; 64];
+    let mut fill = 0usize;
+    for mut s in [a.as_bytes(), b.as_bytes()] {
+        while !s.is_empty() {
+            if fill == 0 && s.len() >= buf.len() {
+                state.write(&s[..buf.len()]);
+                s = &s[buf.len()..];
+            } else {
+                let take = (buf.len() - fill).min(s.len());
+                buf[fill..fill + take].copy_from_slice(&s[..take]);
+                fill += take;
+                s = &s[take..];
+                if fill == buf.len() {
+                    state.write(&buf);
+                    fill = 0;
+                }
+            }
+        }
+    }
+    if fill > 0 {
+        state.write(&buf[..fill]);
+    }
+    state.write_u8(0xff);
+}
+
+impl PartialEq for dyn IriLookup + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        parts_eq(self.parts(), other.parts())
+    }
+}
+
+impl Eq for dyn IriLookup + '_ {}
+
+impl std::hash::Hash for dyn IriLookup + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let (a, b) = self.parts();
+        hash_parts(a, b, state);
+    }
+}
+
+impl PartialEq for IriKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for IriKey {}
+
+impl std::hash::Hash for IriKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        hash_parts(self.0.as_str(), "", state);
+    }
+}
+
 /// The prefixes, entity kinds and names that Manchester text is read against.
 #[derive(Clone, Debug, Default)]
 pub struct Vocabulary {
     /// `(prefix, namespace)`, the standard ones included
     prefixes: Vec<(String, String)>,
-    kinds: FxHashMap<String, Vec<EntityKind>>,
+    kinds: FxHashMap<IriKey, Vec<EntityKind>>,
+    max_kind_iri_len: usize,
     /// labels and local names, to the IRIs that carry them
     names: FxHashMap<String, BTreeSet<String>>,
     /// the same by their lower case, for a name typed in another case
@@ -341,9 +460,14 @@ impl Vocabulary {
     }
 
     fn kind(&mut self, iri: &str, k: EntityKind) {
-        let ks = self.kinds.entry(iri.to_string()).or_default();
-        if !ks.contains(&k) {
-            ks.push(k);
+        self.max_kind_iri_len = self.max_kind_iri_len.max(iri.len());
+        let key: &dyn IriLookup = &IriPair(iri, "");
+        if let Some(ks) = self.kinds.get_mut(key) {
+            if !ks.contains(&k) {
+                ks.push(k);
+            }
+        } else {
+            self.kinds.insert(IriKey(iri.to_string()), vec![k]);
         }
     }
 
@@ -394,7 +518,21 @@ impl Vocabulary {
 
     /// The kinds of the entity `iri`, as declared or built in.
     pub fn kinds(&self, iri: &str) -> &[EntityKind] {
-        self.kinds.get(iri).map_or(&[], |k| k.as_slice())
+        if iri.len() > self.max_kind_iri_len {
+            return &[];
+        }
+        let key: &dyn IriLookup = &IriPair(iri, "");
+        self.kinds.get(key).map_or(&[], Vec::as_slice)
+    }
+
+    /// The kinds of the entity whose IRI is `prefix` concatenated with `local`, checked
+    /// without allocating the expanded string.
+    pub(crate) fn kinds_concat(&self, prefix: &str, local: &str) -> &[EntityKind] {
+        if prefix.len().saturating_add(local.len()) > self.max_kind_iri_len {
+            return &[];
+        }
+        let key: &dyn IriLookup = &IriPair(prefix, local);
+        self.kinds.get(key).map_or(&[], Vec::as_slice)
     }
 
     /// What the name `token`, written as Manchester text writes a name, may stand for
@@ -459,8 +597,8 @@ impl Vocabulary {
         }
     }
 
-    /// The IRI a prefixed name expands to, when its prefix is known.
-    pub fn expand(&self, word: &str) -> Option<String> {
+    /// The `(namespace, local)` slices a prefixed name expands to, without allocating.
+    pub(crate) fn expand_parts<'a>(&'a self, word: &'a str) -> Option<(&'a str, &'a str)> {
         let (p, local) = word.split_once(':')?;
         if local.starts_with("//") {
             return None;
@@ -468,19 +606,22 @@ impl Vocabulary {
         self.prefixes
             .iter()
             .find(|(q, _)| q == p)
-            .map(|(_, ns)| format!("{ns}{local}"))
+            .map(|(_, ns)| (ns.as_str(), local))
+    }
+
+    /// The IRI a prefixed name expands to, when its prefix is known.
+    pub fn expand(&self, word: &str) -> Option<String> {
+        let (ns, local) = self.expand_parts(word)?;
+        let mut iri = String::with_capacity(ns.len() + local.len());
+        iri.push_str(ns);
+        iri.push_str(local);
+        Some(iri)
     }
 
     /// The byte length `word` would expand to via [`Self::expand`], without allocating.
     pub(crate) fn expanded_len(&self, word: &str) -> Option<usize> {
-        let (p, local) = word.split_once(':')?;
-        if local.starts_with("//") {
-            return None;
-        }
-        self.prefixes
-            .iter()
-            .find(|(q, _)| q == p)
-            .map(|(_, ns)| ns.len().saturating_add(local.len()))
+        let (ns, local) = self.expand_parts(word)?;
+        Some(ns.len().saturating_add(local.len()))
     }
 
     /// Whether `label` (which belongs to `iri`) uniquely names `iri` across all entity
@@ -517,15 +658,9 @@ impl Vocabulary {
     /// Return the subset of `want` kinds that `n` matches under the same stage precedence
     /// as [`Self::lookup`] (exact match across all wanted kinds outranks built-ins, which
     /// outrank folded names, which outrank the empty-prefix fallback), without allocating
-    /// [`Entity`] values or expanding prefixed names beyond `max_expand_bytes`.
-    pub(crate) fn lookup_kinds(
-        &self,
-        n: &lex::Name,
-        want: &[EntityKind],
-        max_expand_bytes: Option<usize>,
-    ) -> EntityKindMask {
-        let mask_iri = |iri: &str| {
-            let have = self.kinds(iri);
+    /// [`Entity`] values or expanded prefix strings.
+    pub(crate) fn lookup_kinds(&self, n: &lex::Name, want: &[EntityKind]) -> EntityKindMask {
+        let mask_slice = |have: &[EntityKind]| {
             let mut mask = EntityKindMask::default();
             for &k in want {
                 if have.contains(&k) {
@@ -534,6 +669,7 @@ impl Vocabulary {
             }
             mask
         };
+        let mask_iri = |iri: &str| mask_slice(self.kinds(iri));
         let mask_iris = |iris: Option<&BTreeSet<String>>| {
             let mut mask = EntityKindMask::default();
             for iri in iris.into_iter().flatten() {
@@ -549,14 +685,10 @@ impl Vocabulary {
         let simple = match n {
             lex::Name::Iri(i) => return mask_iri(i),
             lex::Name::Word(w) => {
-                if let Some(len) = self.expanded_len(w) {
-                    if max_expand_bytes.is_none_or(|m| len <= m)
-                        && let Some(iri) = self.expand(w)
-                    {
-                        if !self.kinds(&iri).is_empty() {
-                            return mask_iri(&iri);
-                        }
-                        return mask_iris(self.names.get(w));
+                if let Some((ns, local)) = self.expand_parts(w) {
+                    let have = self.kinds_concat(ns, local);
+                    if !have.is_empty() {
+                        return mask_slice(have);
                     }
                     return mask_iris(self.names.get(w));
                 }
@@ -574,20 +706,20 @@ impl Vocabulary {
                 return b;
             }
         }
-        let folded = mask_iris(self.folded.get(&simple.to_lowercase()));
+        let folded_key: std::borrow::Cow<'_, str> =
+            if simple.is_ascii() && !simple.bytes().any(|b| b.is_ascii_uppercase()) {
+                std::borrow::Cow::Borrowed(simple)
+            } else {
+                std::borrow::Cow::Owned(simple.to_lowercase())
+            };
+        let folded = mask_iris(self.folded.get(folded_key.as_ref()));
         if !folded.is_empty() {
             return folded;
         }
         if matches!(n, lex::Name::Word(_))
             && let Some((_, ns)) = self.prefixes.iter().find(|(p, _)| p.is_empty())
         {
-            let len = ns.len().saturating_add(simple.len());
-            if max_expand_bytes.is_none_or(|m| len <= m) {
-                let mut iri = String::with_capacity(len);
-                iri.push_str(ns);
-                iri.push_str(simple);
-                return mask_iri(&iri);
-            }
+            return mask_slice(self.kinds_concat(ns, simple));
         }
         EntityKindMask::default()
     }
@@ -683,15 +815,14 @@ impl Vocabulary {
         }
         if matches!(n, lex::Name::Word(_))
             && let Some((_, ns)) = self.prefixes.iter().find(|(p, _)| p.is_empty())
+            && !self.kinds_concat(ns, simple).is_empty()
         {
             let exp_len = ns.len().saturating_add(simple.len());
             charge_one(exp_len, budget)?;
             let mut iri = String::with_capacity(exp_len);
             iri.push_str(ns);
             iri.push_str(simple);
-            if !self.kinds(&iri).is_empty() {
-                return Ok(self.by_iri(&iri, want));
-            }
+            return Ok(self.by_iri(&iri, want));
         }
         Ok(Found::Unknown { iri: None, others })
     }
