@@ -1209,6 +1209,27 @@ pub struct GraphQuadsDiff {
     pub more: bool,
 }
 
+/// Instrumentation returned by [`Reads::has_live_accepted_in_graphs_counted`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BoundaryScanStats {
+    pub outer_rows: usize,
+    pub count_calls: usize,
+    pub metadata_reads: usize,
+    pub edge_decodes: usize,
+}
+
+impl BoundaryScanStats {
+    fn record_count(&mut self, work: crate::index::PreparedCountWork) {
+        self.count_calls += work.count_calls;
+        self.metadata_reads += work.metadata_reads;
+        self.edge_decodes += work.edge_decodes;
+    }
+}
+
+/// Added graphs with at most this many rows under their current protection nonces are
+/// scanned directly without counting or touching global proposal/decision prefixes.
+const SMALL_PROTECTED_LIMIT: u64 = 64;
+
 impl<'a> Reads<'a> {
     /// The preparation the reads are charged to.
     pub fn preparation(&self) -> &'a Preparation {
@@ -1403,10 +1424,12 @@ impl<'a> Reads<'a> {
     /// `ev:IdentityProposal` with a current authenticated `ev:Accepted` decision under
     /// `policy` in `decisions`.
     ///
-    /// Uses exact `Perm::Pos` prefix counts to scan the smallest selective candidate set
-    /// (current protection nonces on the added graphs, `ev:IdentityProposal` types,
-    /// `ev:Accepted` dispositions, or policy decisions) without walking unrelated quads in
-    /// the added graphs or populating per-proposal / per-graph entries in `Reads.ids`.
+    /// Uses `Preparation`-controlled `Perm::Pos` prefix counts (O(log B) block search,
+    /// O(1) interior block sum, at most two prepared edge decodes) to pick the smallest
+    /// selective candidate set without walking unrelated quads in the added graphs or
+    /// populating per-proposal / per-graph entries in `Reads.ids`. When the added graphs
+    /// carry at most `SMALL_PROTECTED_LIMIT` rows under their current protection nonces,
+    /// those rows are scanned directly without touching global proposal/decision ranges.
     pub fn has_live_accepted_in_graphs(
         &mut self,
         graphs: &[ProtectedGraph],
@@ -1422,12 +1445,13 @@ impl<'a> Reads<'a> {
         graphs: &[ProtectedGraph],
         decisions: &ProtectedGraph,
         policy: &NamedNode,
-    ) -> Result<(bool, usize)> {
+    ) -> Result<(bool, BoundaryScanStats)> {
+        let mut stats = BoundaryScanStats::default();
         let Some(decisions_nonce) = decisions.1 else {
-            return Ok((false, 0));
+            return Ok((false, stats));
         };
         let Some(decisions_g) = self.id(decisions.0.as_str())? else {
-            return Ok((false, 0));
+            return Ok((false, stats));
         };
         let (
             Some(rdf_type),
@@ -1458,7 +1482,7 @@ impl<'a> Reads<'a> {
                 .lookup_term(self.snap, &string(&decisions_nonce.to_string()))?,
         )
         else {
-            return Ok((false, 0));
+            return Ok((false, stats));
         };
         let supersedes_pred = self.id(&format!("{EV}supersedes"))?;
         let prep = self.preparation;
@@ -1484,7 +1508,9 @@ impl<'a> Reads<'a> {
         for i in 0..active.len() {
             prep.check()?;
             let (g_id, g_nonce_id) = active[i];
-            let n = snap.count(Perm::Pos, &[protection_pred.0, g_nonce_id.0])?;
+            let (n, work) =
+                snap.count_prepared_with_work(Perm::Pos, &[protection_pred.0, g_nonce_id.0], prep)?;
+            stats.record_count(work);
             if n > 0 {
                 c_protected = c_protected.saturating_add(n);
                 active[keep] = (g_id, g_nonce_id);
@@ -1493,20 +1519,50 @@ impl<'a> Reads<'a> {
         }
         active.truncate(keep);
         if active.is_empty() {
-            return Ok((false, 0));
+            return Ok((false, stats));
         }
-        let c_proposals = snap.count(Perm::Pos, &[rdf_type.0, identity_proposal.0])?;
-        if c_proposals == 0 {
-            return Ok((false, 0));
+        #[derive(Clone, Copy)]
+        enum CandidatePlan {
+            Protected,
+            Proposals,
+            Accepted,
+            Policy,
         }
-        let c_accepted = snap.count(Perm::Pos, &[disposition_pred.0, accepted_obj.0])?;
-        if c_accepted == 0 {
-            return Ok((false, 0));
-        }
-        let c_policy = snap.count(Perm::Pos, &[review_policy.0, policy_id.0])?;
-        if c_policy == 0 {
-            return Ok((false, 0));
-        }
+        let plan = if c_protected <= SMALL_PROTECTED_LIMIT {
+            CandidatePlan::Protected
+        } else {
+            let (c_proposals, work) =
+                snap.count_prepared_with_work(Perm::Pos, &[rdf_type.0, identity_proposal.0], prep)?;
+            stats.record_count(work);
+            if c_proposals == 0 {
+                return Ok((false, stats));
+            }
+            let (c_accepted, work) = snap.count_prepared_with_work(
+                Perm::Pos,
+                &[disposition_pred.0, accepted_obj.0],
+                prep,
+            )?;
+            stats.record_count(work);
+            if c_accepted == 0 {
+                return Ok((false, stats));
+            }
+            let (c_policy, work) =
+                snap.count_prepared_with_work(Perm::Pos, &[review_policy.0, policy_id.0], prep)?;
+            stats.record_count(work);
+            if c_policy == 0 {
+                return Ok((false, stats));
+            }
+            let min_count = c_protected.min(c_proposals).min(c_accepted).min(c_policy);
+            if c_protected == min_count {
+                CandidatePlan::Protected
+            } else if c_proposals == min_count {
+                CandidatePlan::Proposals
+            } else if c_accepted == min_count {
+                CandidatePlan::Accepted
+            } else {
+                CandidatePlan::Policy
+            }
+        };
         let one_id = |g_id: Id, s_id: Id, p_id: Id| -> Result<Option<Id>> {
             let mut found = None;
             let mut count = 0u8;
@@ -1529,7 +1585,7 @@ impl<'a> Reads<'a> {
             let Some(op_id) = one_id(g_id, s_id, receipt_pred)? else {
                 return Ok(false);
             };
-            if !snap.contains(&[op_id, rdf_type, operation_class, g_id])? {
+            if !snap.contains_prepared(&[op_id, rdf_type, operation_class, g_id], prep)? {
                 return Ok(false);
             }
             if one_id(g_id, op_id, protection_pred)? != Some(nonce_id)
@@ -1549,7 +1605,7 @@ impl<'a> Reads<'a> {
                     return Ok(true);
                 }
                 let later = q[0];
-                if snap.contains(&[later, rdf_type, review_decision, decisions_g])?
+                if snap.contains_prepared(&[later, rdf_type, review_decision, decisions_g], prep)?
                     && id_authenticated(later, decisions_g, decisions_nonce_id)?
                     && is_named(later)?
                 {
@@ -1567,8 +1623,9 @@ impl<'a> Reads<'a> {
                     return Ok(true);
                 }
                 let d_id = dq[0];
-                if !snap.contains(&[d_id, rdf_type, review_decision, decisions_g])?
-                    || !snap.contains(&[d_id, review_policy, policy_id, decisions_g])?
+                if !snap.contains_prepared(&[d_id, rdf_type, review_decision, decisions_g], prep)?
+                    || !snap
+                        .contains_prepared(&[d_id, review_policy, policy_id, decisions_g], prep)?
                     || one_id(decisions_g, d_id, disposition_pred)? != Some(accepted_obj)
                 {
                     return Ok(true);
@@ -1588,8 +1645,8 @@ impl<'a> Reads<'a> {
             Ok(p_live)
         };
         let decision_targets_added_proposal = |d_id: Id| -> Result<bool> {
-            if !snap.contains(&[d_id, rdf_type, review_decision, decisions_g])?
-                || !snap.contains(&[d_id, review_policy, policy_id, decisions_g])?
+            if !snap.contains_prepared(&[d_id, rdf_type, review_decision, decisions_g], prep)?
+                || !snap.contains_prepared(&[d_id, review_policy, policy_id, decisions_g], prep)?
                 || one_id(decisions_g, d_id, disposition_pred)? != Some(accepted_obj)
             {
                 return Ok(false);
@@ -1636,53 +1693,70 @@ impl<'a> Reads<'a> {
             )?;
             Ok(targets_added)
         };
-        let min_count = c_protected.min(c_proposals).min(c_accepted).min(c_policy);
-        let mut outer_rows = 0usize;
         let mut found_live = false;
-        if c_protected == min_count {
-            for &(g_id, g_nonce_id) in &active {
-                prep.check()?;
-                prep.scan(snap, Perm::Pos, &[protection_pred.0, g_nonce_id.0], |q| {
-                    outer_rows += 1;
-                    if q[3] != g_id {
-                        return Ok(true);
+        match plan {
+            CandidatePlan::Protected => {
+                for &(g_id, g_nonce_id) in &active {
+                    prep.check()?;
+                    prep.scan(snap, Perm::Pos, &[protection_pred.0, g_nonce_id.0], |q| {
+                        stats.outer_rows += 1;
+                        if q[3] != g_id {
+                            return Ok(true);
+                        }
+                        let p_id = q[0];
+                        if !snap
+                            .contains_prepared(&[p_id, rdf_type, identity_proposal, g_id], prep)?
+                        {
+                            return Ok(true);
+                        }
+                        if proposal_has_live_accepted(p_id, g_id, g_nonce_id)? {
+                            found_live = true;
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    })?;
+                    if found_live {
+                        return Ok((true, stats));
                     }
-                    let p_id = q[0];
-                    if !snap.contains(&[p_id, rdf_type, identity_proposal, g_id])? {
-                        return Ok(true);
-                    }
-                    if proposal_has_live_accepted(p_id, g_id, g_nonce_id)? {
-                        found_live = true;
-                        return Ok(false);
+                }
+            }
+            CandidatePlan::Proposals => {
+                prep.scan(snap, Perm::Pos, &[rdf_type.0, identity_proposal.0], |q| {
+                    stats.outer_rows += 1;
+                    let g_id = q[3];
+                    let mut idx = active.partition_point(|&(id, _)| id < g_id);
+                    while idx < active.len() && active[idx].0 == g_id {
+                        let g_nonce_id = active[idx].1;
+                        idx += 1;
+                        if proposal_has_live_accepted(q[0], g_id, g_nonce_id)? {
+                            found_live = true;
+                            return Ok(false);
+                        }
                     }
                     Ok(true)
                 })?;
-                if found_live {
-                    return Ok((true, outer_rows));
-                }
             }
-        } else if c_proposals == min_count {
-            prep.scan(snap, Perm::Pos, &[rdf_type.0, identity_proposal.0], |q| {
-                outer_rows += 1;
-                let g_id = q[3];
-                let mut idx = active.partition_point(|&(id, _)| id < g_id);
-                while idx < active.len() && active[idx].0 == g_id {
-                    let g_nonce_id = active[idx].1;
-                    idx += 1;
-                    if proposal_has_live_accepted(q[0], g_id, g_nonce_id)? {
-                        found_live = true;
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            })?;
-        } else if c_accepted == min_count {
-            prep.scan(
-                snap,
-                Perm::Pos,
-                &[disposition_pred.0, accepted_obj.0],
-                |q| {
-                    outer_rows += 1;
+            CandidatePlan::Accepted => {
+                prep.scan(
+                    snap,
+                    Perm::Pos,
+                    &[disposition_pred.0, accepted_obj.0],
+                    |q| {
+                        stats.outer_rows += 1;
+                        if q[3] != decisions_g {
+                            return Ok(true);
+                        }
+                        if decision_targets_added_proposal(q[0])? {
+                            found_live = true;
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    },
+                )?;
+            }
+            CandidatePlan::Policy => {
+                prep.scan(snap, Perm::Pos, &[review_policy.0, policy_id.0], |q| {
+                    stats.outer_rows += 1;
                     if q[3] != decisions_g {
                         return Ok(true);
                     }
@@ -1691,22 +1765,10 @@ impl<'a> Reads<'a> {
                         return Ok(false);
                     }
                     Ok(true)
-                },
-            )?;
-        } else {
-            prep.scan(snap, Perm::Pos, &[review_policy.0, policy_id.0], |q| {
-                outer_rows += 1;
-                if q[3] != decisions_g {
-                    return Ok(true);
-                }
-                if decision_targets_added_proposal(q[0])? {
-                    found_live = true;
-                    return Ok(false);
-                }
-                Ok(true)
-            })?;
+                })?;
+            }
         }
-        Ok((found_live, outer_rows))
+        Ok((found_live, stats))
     }
 
     /// Scan all quads in `g`, up to `limit`, returning:

@@ -2569,6 +2569,18 @@ impl WarmColumns<'_> {
     }
 }
 
+/// Work performed by [`PermIndex::count_between_prepared_with_work`] and
+/// [`crate::store::Snapshot::count_prepared_with_work`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PreparedCountWork {
+    /// Number of prepared count calls included in this total.
+    pub count_calls: usize,
+    /// Number of [`BlockMeta`] entries inspected after the binary search.
+    pub metadata_reads: usize,
+    /// Number of partial edge segments (or unsegmented edge blocks) decoded.
+    pub edge_decodes: usize,
+}
+
 impl PermIndex {
     #[cfg(test)]
     pub(crate) fn trace_hints(&self) -> HintTrace {
@@ -2838,6 +2850,281 @@ impl PermIndex {
         Ok(true)
     }
 
+    /// Decode one admitted block or segment with only the columns in `mask` under
+    /// `preparation`, keeping the workspace reservation alive across `each` and releasing
+    /// the decoded block before releasing the reservation.
+    fn with_part_prepared<R, E: From<Error>>(
+        &self,
+        cache: &BlockCache,
+        b: usize,
+        segment: Option<usize>,
+        mask: ColMask,
+        preparation: &crate::access::Preparation,
+        each: impl FnOnce(&Block) -> std::result::Result<R, E>,
+    ) -> std::result::Result<R, E> {
+        let rows = segment.map_or(self.blocks[b].rows as usize, |s| {
+            let (start, end) = self.segment_rows(b, s);
+            end - start
+        });
+        let col_count = (mask & ALL_COLS).count_ones() as u64;
+        let workspace = (rows as u64)
+            .saturating_mul(col_count.saturating_mul(8).saturating_add(20))
+            .saturating_add(1024);
+        // This reservation participates in the caller's single ledger.
+        let _held = preparation.reserve(workspace)?;
+        let limit = crate::history::ReadLimit {
+            options: preparation,
+            memory: Some(workspace),
+            held: 0,
+        };
+        let mut scratch = Vec::new();
+        let mut columns = std::array::from_fn(|_| empty_col());
+        for (column, output) in columns.iter_mut().enumerate() {
+            if mask & (1 << column) == 0 {
+                continue;
+            }
+            preparation.check()?;
+            let cache_key = cache.key(self, b, column, segment.map_or(WHOLE, |s| s as u32 + 1));
+            if let Ok(Some(cached)) = cache.cache.try_get(&cache_key) {
+                cache.count_hits(1);
+                *output = cached;
+                continue;
+            }
+            let metadata = &self.blocks[b];
+            let mut offset = usize::try_from(metadata.offset)
+                .ok()
+                .and_then(|base| {
+                    metadata.col_len[..column]
+                        .iter()
+                        .try_fold(base, |sum, length| sum.checked_add(*length as usize))
+                })
+                .ok_or_else(|| Error::Corrupt("prepared column offset overflow".into()))?;
+            let mut length = metadata.col_len[column] as usize;
+            if let (Some(s), Some(directory)) = (segment, &self.segs) {
+                let mut before = 0usize;
+                for prior in 0..s {
+                    preparation.check()?;
+                    before = before
+                        .checked_add(directory.frame_len(b, prior, column))
+                        .ok_or_else(|| Error::Corrupt("prepared segment offset overflow".into()))?;
+                }
+                let frame = directory.frame_len(b, s, column);
+                if before.checked_add(frame).is_none_or(|end| end > length) {
+                    return Err(
+                        Error::Corrupt("prepared segment ends past its column".into()).into(),
+                    );
+                }
+                offset = offset
+                    .checked_add(before)
+                    .ok_or_else(|| Error::Corrupt("prepared segment offset overflow".into()))?;
+                length = frame;
+            }
+            let end = offset
+                .checked_add(length)
+                .ok_or_else(|| Error::Corrupt("prepared column length overflow".into()))?;
+            let frame = self
+                .data
+                .as_ref()
+                .and_then(|data| data.get(offset..end))
+                .ok_or_else(|| Error::Corrupt("prepared column ends past the index".into()))?;
+            *output = decode_point_column_limited(frame, rows, &mut scratch, &limit, workspace)
+                .map_err(|error| preparation.sanitize(error))?;
+            crate::ioacct::column_decoded(self.perm, rows, length);
+            preparation.check()?;
+            if cache.fill {
+                let _ = cache.cache.try_insert(cache_key, output.clone());
+            }
+        }
+        let block = Block {
+            cols: columns,
+            rows,
+        };
+        let out = each(&block);
+        drop(block);
+        drop(_held);
+        out
+    }
+
+    /// Exact number of base rows with keys in `[lo_key, hi_key]`, summing fully covered
+    /// interior blocks and segments in O(1) from their cumulative offsets and obeying
+    /// `preparation` controls and memory reservations on any partial edge decode.
+    pub(crate) fn count_between_prepared_with_work(
+        &self,
+        cache: &BlockCache,
+        lo_key: &Key,
+        hi_key: &Key,
+        preparation: &crate::access::Preparation,
+    ) -> Result<(u64, PreparedCountWork)> {
+        preparation.check()?;
+        let mut work = PreparedCountWork {
+            count_calls: 1,
+            ..PreparedCountWork::default()
+        };
+        if lo_key > hi_key {
+            return Ok((0, work));
+        }
+        let (lo, hi) = self.key_block_range(lo_key, hi_key);
+        if lo >= hi {
+            return Ok((0, work));
+        }
+        let hi_last = hi - 1;
+        work.metadata_reads += 1;
+        let lo_meta = &self.blocks[lo];
+        let lo_full = lo_meta.first >= *lo_key && lo_meta.last <= *hi_key;
+        let hi_full = if hi_last == lo {
+            lo_full
+        } else {
+            work.metadata_reads += 1;
+            let hi_meta = &self.blocks[hi_last];
+            hi_meta.first >= *lo_key && hi_meta.last <= *hi_key
+        };
+        let first_full = if lo_full { lo } else { lo + 1 };
+        let last_full_excl = if hi_full { hi } else { hi_last };
+        let mut total = if first_full < last_full_excl {
+            work.metadata_reads += 2;
+            let first = &self.blocks[first_full];
+            let last = &self.blocks[last_full_excl - 1];
+            last.row_start + last.rows as u64 - first.row_start
+        } else {
+            0
+        };
+        let mask = bound_cols(lo_key, hi_key);
+        if !lo_full {
+            total += self.count_edge_block_prepared(
+                cache,
+                lo,
+                lo_key,
+                hi_key,
+                mask,
+                preparation,
+                &mut work,
+            )?;
+        }
+        if hi_last > lo && !hi_full {
+            total += self.count_edge_block_prepared(
+                cache,
+                hi_last,
+                lo_key,
+                hi_key,
+                mask,
+                preparation,
+                &mut work,
+            )?;
+        }
+        preparation.check()?;
+        Ok((total, work))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn count_edge_block_prepared(
+        &self,
+        cache: &BlockCache,
+        b: usize,
+        lo_key: &Key,
+        hi_key: &Key,
+        mask: ColMask,
+        preparation: &crate::access::Preparation,
+        work: &mut PreparedCountWork,
+    ) -> Result<u64> {
+        preparation.check()?;
+        if let Some(directory) = &self.segs {
+            let n = directory.count(b);
+            let s0 = partition(n, |s| directory.first_key(b, s) <= *lo_key).saturating_sub(1);
+            let s1 = partition(n, |s| directory.first_key(b, s) <= *hi_key).max(1);
+            let s_last = s1 - 1;
+            let seg_full = |s: usize| {
+                let first_ge = directory.first_key(b, s) >= *lo_key;
+                let last_le = if s + 1 < n {
+                    directory.first_key(b, s + 1) <= *hi_key
+                } else {
+                    self.blocks[b].last <= *hi_key
+                };
+                first_ge && last_le
+            };
+            let s0_full = seg_full(s0);
+            let s_last_full = if s_last == s0 {
+                s0_full
+            } else {
+                seg_full(s_last)
+            };
+            let first_full = if s0_full { s0 } else { s0 + 1 };
+            let last_full_excl = if s_last_full { s1 } else { s_last };
+            let mut total = if first_full < last_full_excl {
+                let (start_row, _) = self.segment_rows(b, first_full);
+                let (_, end_row) = self.segment_rows(b, last_full_excl - 1);
+                (end_row - start_row) as u64
+            } else {
+                0
+            };
+            if !s0_full {
+                work.edge_decodes += 1;
+                let rows = self.with_part_prepared::<u64, Error>(
+                    cache,
+                    b,
+                    Some(s0),
+                    mask,
+                    preparation,
+                    |block| {
+                        let (s, e) = block.key_range(lo_key, hi_key);
+                        Ok((e - s) as u64)
+                    },
+                )?;
+                total += rows;
+            }
+            if s_last > s0 && !s_last_full {
+                work.edge_decodes += 1;
+                let rows = self.with_part_prepared::<u64, Error>(
+                    cache,
+                    b,
+                    Some(s_last),
+                    mask,
+                    preparation,
+                    |block| {
+                        let (s, e) = block.key_range(lo_key, hi_key);
+                        Ok((e - s) as u64)
+                    },
+                )?;
+                total += rows;
+            }
+            return Ok(total);
+        }
+        work.edge_decodes += 1;
+        self.with_part_prepared::<u64, Error>(cache, b, None, mask, preparation, |block| {
+            let (s, e) = block.key_range(lo_key, hi_key);
+            Ok((e - s) as u64)
+        })
+    }
+
+    /// Point lookup of a full key under `preparation` controls and memory reservation.
+    pub(crate) fn contains_prepared(
+        &self,
+        cache: &BlockCache,
+        key: &Key,
+        preparation: &crate::access::Preparation,
+    ) -> Result<bool> {
+        preparation.check()?;
+        let b = self.blocks.partition_point(|m| m.last < *key);
+        if b >= self.blocks.len() || self.blocks[b].first > *key {
+            return Ok(false);
+        }
+        let segment = self.segs.as_ref().map(|directory| {
+            partition(directory.count(b), |s| directory.first_key(b, s) <= *key).saturating_sub(1)
+        });
+        let found = self.with_part_prepared::<bool, Error>(
+            cache,
+            b,
+            segment,
+            ALL_COLS,
+            preparation,
+            |block| {
+                let (start, end) = block.prefix_range(key);
+                Ok(start < end)
+            },
+        )?;
+        preparation.check()?;
+        Ok(found)
+    }
+
     /// A permission preparation reads one admitted segment at a time. Cache access
     /// is nonblocking; contention causes a controlled local decode, never a wait
     /// inside the shared cache. Dense-reader hints do not enlarge the segment.
@@ -2881,87 +3168,17 @@ impl PermIndex {
                     }
                 }
                 let segment = self.segs.as_ref().map(|_| part);
-                let rows = segment.map_or(self.blocks[b].rows as usize, |s| {
-                    let (start, end) = self.segment_rows(b, s);
-                    end - start
-                });
-                let workspace = (rows as u64).saturating_mul(52).saturating_add(1024);
-                // This reservation participates in the caller's single ledger.
-                let _held = preparation.reserve(workspace)?;
-                let limit = crate::history::ReadLimit {
-                    options: preparation,
-                    memory: Some(workspace),
-                    held: 0,
-                };
-                let mut scratch = Vec::new();
-                let mut columns = std::array::from_fn(|_| empty_col());
-                for (column, output) in columns.iter_mut().enumerate() {
-                    preparation.check()?;
-                    let cache_key =
-                        cache.key(self, b, column, segment.map_or(WHOLE, |s| s as u32 + 1));
-                    if let Ok(Some(cached)) = cache.cache.try_get(&cache_key) {
-                        cache.count_hits(1);
-                        *output = cached;
-                        continue;
-                    }
-                    let metadata = &self.blocks[b];
-                    let mut offset = usize::try_from(metadata.offset)
-                        .ok()
-                        .and_then(|base| {
-                            metadata.col_len[..column]
-                                .iter()
-                                .try_fold(base, |sum, length| sum.checked_add(*length as usize))
-                        })
-                        .ok_or_else(|| Error::Corrupt("prepared column offset overflow".into()))?;
-                    let mut length = metadata.col_len[column] as usize;
-                    if let (Some(s), Some(directory)) = (segment, &self.segs) {
-                        let mut before = 0usize;
-                        for prior in 0..s {
-                            preparation.check()?;
-                            before = before
-                                .checked_add(directory.frame_len(b, prior, column))
-                                .ok_or_else(|| {
-                                    Error::Corrupt("prepared segment offset overflow".into())
-                                })?;
+                let cont =
+                    self.with_part_prepared(cache, b, segment, ALL_COLS, preparation, |block| {
+                        let (start, end) = block.key_range(lo, hi);
+                        preparation.check()?;
+                        if start < end {
+                            each(block, start, end)
+                        } else {
+                            Ok(true)
                         }
-                        let frame = directory.frame_len(b, s, column);
-                        if before.checked_add(frame).is_none_or(|end| end > length) {
-                            return Err(Error::Corrupt(
-                                "prepared segment ends past its column".into(),
-                            )
-                            .into());
-                        }
-                        offset = offset.checked_add(before).ok_or_else(|| {
-                            Error::Corrupt("prepared segment offset overflow".into())
-                        })?;
-                        length = frame;
-                    }
-                    let end = offset
-                        .checked_add(length)
-                        .ok_or_else(|| Error::Corrupt("prepared column length overflow".into()))?;
-                    let frame = self
-                        .data
-                        .as_ref()
-                        .and_then(|data| data.get(offset..end))
-                        .ok_or_else(|| {
-                            Error::Corrupt("prepared column ends past the index".into())
-                        })?;
-                    *output =
-                        decode_point_column_limited(frame, rows, &mut scratch, &limit, workspace)
-                            .map_err(|error| preparation.sanitize(error))?;
-                    crate::ioacct::column_decoded(self.perm, rows, length);
-                    preparation.check()?;
-                    if cache.fill {
-                        let _ = cache.cache.try_insert(cache_key, output.clone());
-                    }
-                }
-                let block = Block {
-                    cols: columns,
-                    rows,
-                };
-                let (start, end) = block.key_range(lo, hi);
-                preparation.check()?;
-                if start < end && !each(&block, start, end)? {
+                    })?;
+                if !cont {
                     preparation.check()?;
                     return Ok(());
                 }
@@ -4782,6 +4999,124 @@ mod tests {
             .unwrap();
         let idx = PermIndex::open(dir.path(), Perm::Spo).unwrap();
         assert!(idx.decode_block(0).is_err());
+    }
+
+    #[test]
+    fn count_between_prepared_bounds_metadata_and_obeys_preparation() {
+        use crate::access::Preparation;
+        use crate::error::BudgetKind;
+        use crate::task::Control;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // 180,000 keys across 6 blocks (BLOCK_ROWS = 32,768), with a single prefix p=2
+        // spanning 5+ blocks so interior block metadata would grow linearly if walked.
+        for segmented in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = PermWriter::create_format(dir.path(), Perm::Pos, segmented).unwrap();
+            // 10,000 rows for (1, 10)
+            for s in 0..10_000u64 {
+                w.push([1, 10, s, 0]).unwrap();
+            }
+            // 160,000 rows for (2, 20) — spans 5+ blocks, starting and ending mid-block
+            for s in 0..160_000u64 {
+                w.push([2, 20, s, 0]).unwrap();
+            }
+            // 10,000 rows for (3, 30)
+            for s in 0..10_000u64 {
+                w.push([3, 30, s, 0]).unwrap();
+            }
+            w.finish(dir.path(), Perm::Pos).unwrap();
+
+            let idx = if segmented {
+                PermIndex::open(dir.path(), Perm::Pos).unwrap()
+            } else {
+                PermIndex::open_whole_columns(dir.path(), Perm::Pos).unwrap()
+            };
+            assert_eq!(idx.segmented(), segmented);
+            let (b0, b1) = idx.block_range(&[2, 20]);
+            assert!(
+                b1 - b0 >= 5,
+                "expected multi-block prefix range, got {} blocks",
+                b1 - b0
+            );
+
+            let cache = BlockCache::new(1 << 24);
+            let prep = Preparation::new(Control::none(), 16 << 20).unwrap();
+
+            // Multi-block prefix count matches exact count_between with O(1) metadata reads
+            // and at most 2 edge decodes.
+            let lo = pad(&[2, 20], 0);
+            let hi = pad(&[2, 20], u64::MAX);
+            let (got, work) = idx
+                .count_between_prepared_with_work(&cache, &lo, &hi, &prep)
+                .unwrap();
+            assert_eq!(got, 160_000);
+            assert_eq!(got, idx.count_between(&cache, &lo, &hi).unwrap());
+            assert_eq!(work.count_calls, 1);
+            assert!(
+                work.metadata_reads <= 4,
+                "expected O(1) metadata reads across {} blocks, got {}",
+                b1 - b0,
+                work.metadata_reads
+            );
+            assert!(
+                work.edge_decodes <= 2,
+                "expected at most 2 edge decodes, got {}",
+                work.edge_decodes
+            );
+
+            // Sub-ranges inside one block (single-segment, cross-segment) and empty range.
+            for (rlo, rhi, expected) in [
+                ([2, 20, 500, 0], [2, 20, 510, 0], 11u64),
+                ([2, 20, 1_000, 0], [2, 20, 9_500, 0], 8_501u64),
+                ([2, 21, 0, 0], [2, 21, u64::MAX, u64::MAX], 0u64),
+                ([3, 30, 0, 0], [3, 30, u64::MAX, u64::MAX], 10_000u64),
+            ] {
+                let (n, w_sub) = idx
+                    .count_between_prepared_with_work(&cache, &rlo, &rhi, &prep)
+                    .unwrap();
+                assert_eq!(n, expected);
+                assert_eq!(n, idx.count_between(&cache, &rlo, &rhi).unwrap());
+                assert!(w_sub.metadata_reads <= 4);
+                assert!(w_sub.edge_decodes <= 2);
+            }
+
+            // contains_prepared agrees with contains.
+            assert!(
+                idx.contains_prepared(&cache, &[2, 20, 42_000, 0], &prep)
+                    .unwrap()
+            );
+            assert!(
+                !idx.contains_prepared(&cache, &[2, 20, 200_000, 0], &prep)
+                    .unwrap()
+            );
+
+            // Cancelled preparation is rejected.
+            let flag = Arc::new(AtomicBool::new(false));
+            let cancelled = Preparation::new(Control::with_cancel(flag.clone()), 16 << 20).unwrap();
+            flag.store(true, Ordering::Relaxed);
+            assert!(matches!(
+                idx.count_between_prepared_with_work(&cache, &lo, &hi, &cancelled),
+                Err(Error::Cancelled)
+            ));
+            assert!(matches!(
+                idx.contains_prepared(&cache, &[2, 20, 42_000, 0], &cancelled),
+                Err(Error::Cancelled)
+            ));
+
+            // Tight memory budget is enforced on partial edge decode (cold cache).
+            let cold = BlockCache::new(1 << 24);
+            let tiny = Preparation::new(Control::none(), 4096).unwrap();
+            assert!(matches!(
+                idx.count_between_prepared_with_work(&cold, &lo, &hi, &tiny),
+                Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+            ));
+            assert!(matches!(
+                idx.contains_prepared(&cold, &[2, 20, 42_000, 0], &tiny),
+                Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+            ));
+        }
     }
 }
 

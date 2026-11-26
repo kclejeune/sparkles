@@ -2688,6 +2688,7 @@ fn triple_masked_caller_cannot_infer_hidden_acceptance_on_added_boundary_graph()
 #[test]
 fn added_boundary_graph_with_many_unrelated_quads_and_few_proposals() {
     let ds = Dataset::memory();
+    let admin = ReviewOptions::new(iri("urn:principal:admin"));
     evidence::configure(
         &ds,
         &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
@@ -2714,7 +2715,7 @@ fn added_boundary_graph_with_many_unrelated_quads_and_few_proposals() {
         &Control::none(),
     )
     .unwrap();
-    let _unreviewed = propose_in(
+    let xy = propose_in(
         &ds,
         HIDDEN,
         proposal("xy", IdentityRelation::PossibleMatch, &["x", "y"], None),
@@ -2728,4 +2729,53 @@ fn added_boundary_graph_with_many_unrelated_quads_and_few_proposals() {
     let cd = matched(&ds, "cd", &["c", "d"], None);
     accept(&ds, "cd", &cd);
     assert_eq!(map(&ds), pairs(&["a a", "b a", "c c", "d c"]));
+
+    // Accept the proposal on HIDDEN, remove HIDDEN and rebuild, then add HIDDEN back
+    // (still carrying its 5,000 unrelated quads plus the accepted proposal). Both reads
+    // and reviews must now refuse, and the refused review must leave the head intact.
+    accept(&ds, "xy", &xy);
+    assert_eq!(map(&ds), pairs(&["a a", "b a", "c c", "d c", "x x", "y x"]));
+    evidence::configure(
+        &ds,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    evidence::rebuild_resolution_map(&ds, &ds, "people", None, &admin, &Control::none()).unwrap();
+    let ef = matched(&ds, "ef", &["e", "f"], None);
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+
+    assert_eq!(
+        code(evidence::resolve_entities(
+            &ds,
+            &ds,
+            "people",
+            &[e("x")],
+            all(),
+            &Control::none()
+        )),
+        "projection-unavailable"
+    );
+    let head = ds.store().head_commit().seq;
+    let mut review_opts = ReviewOptions::new(iri("urn:principal:reviewer"));
+    review_opts.if_head = Some(head);
+    assert_eq!(
+        code(evidence::review(
+            None,
+            &ds,
+            &ds,
+            "people",
+            1,
+            &[decision("ef", &ef, Disposition::Accepted, None)],
+            &review_opts,
+            &mut |_, _| all(),
+            &Control::none(),
+        )),
+        "projection-unavailable"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Rebuilding restores reads and includes the accepted proposal from HIDDEN.
+    evidence::rebuild_resolution_map(&ds, &ds, "people", None, &admin, &Control::none()).unwrap();
+    assert_eq!(map(&ds), pairs(&["a a", "b a", "c c", "d c", "x x", "y x"]));
 }

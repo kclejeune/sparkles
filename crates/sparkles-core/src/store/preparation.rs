@@ -14,6 +14,57 @@ impl Snapshot {
         self.scan_prepared_inner::<E, false>(perm, prefix, preparation, each)
     }
 
+    /// Exact number of quads with a key prefix under `preparation`, returning both the
+    /// count and the base-index selection work performed.
+    pub(crate) fn count_prepared_with_work(
+        &self,
+        perm: Perm,
+        prefix: &[u64],
+        preparation: &Preparation,
+    ) -> Result<(u64, crate::index::PreparedCountWork)> {
+        preparation.check()?;
+        let (base, work) = if prefix.is_empty() {
+            (
+                self.perm(perm).rows,
+                crate::index::PreparedCountWork {
+                    count_calls: 1,
+                    ..crate::index::PreparedCountWork::default()
+                },
+            )
+        } else {
+            self.perm(perm).count_between_prepared_with_work(
+                &self.cache,
+                &pad(prefix, 0),
+                &pad(prefix, u64::MAX),
+                preparation,
+            )?
+        };
+        let pi = perm.index();
+        let ins = Delta::count_prefix(&self.delta.ins[pi], prefix);
+        let del = Delta::count_prefix(&self.delta.del[pi], prefix);
+        preparation.check()?;
+        Ok(((base + ins).saturating_sub(del), work))
+    }
+
+    /// Exact point lookup of a quad under `preparation` controls and memory reservation.
+    pub(crate) fn contains_prepared(
+        &self,
+        quad: &[Id; 4],
+        preparation: &Preparation,
+    ) -> Result<bool> {
+        preparation.check()?;
+        let k = Perm::Spo.to_key(quad);
+        let pi = Perm::Spo.index();
+        if self.delta.ins[pi].contains(&k) {
+            return Ok(true);
+        }
+        if self.delta.del[pi].contains(&k) {
+            return Ok(false);
+        }
+        self.perm(Perm::Spo)
+            .contains_prepared(&self.cache, &k, preparation)
+    }
+
     /// Check one physical graph without scanning past its first surviving quad.
     pub(crate) fn graph_exists_prepared(&self, id: Id, preparation: &Preparation) -> Result<bool> {
         let mut exists = false;
