@@ -1484,3 +1484,510 @@ fn random_graphs_with_mixed_directions() {
         assert_eq!(got, want_nodes, "case {case}: nested pattern");
     }
 }
+
+/// Item 275: a graph with hundreds of thousands of cheap long paths (length 7, cost 7)
+/// and a few more expensive short paths within `path:maxLength`. Pareto-pruned search
+/// over `(node, length)` pairs finds the optimal short paths and Yen's top-k within a
+/// tight `path:maxVisited` budget without enumerating the cheap long paths.
+#[test]
+fn weighted_shortest_under_max_length_skips_many_cheap_long_paths() {
+    // 6 intermediate layers of width 8 => 8^6 = 262,144 paths of length 7, cost 7.
+    let mut ttl = String::new();
+    let width = 8usize;
+    let layers = 6usize;
+    for j in 0..width {
+        ttl += &format!("ex:s ex:p ex:l0_{j} {{| ex:w 1 |}} .\n");
+        ttl += &format!("ex:l{}_{j} ex:p ex:t {{| ex:w 1 |}} .\n", layers - 1);
+    }
+    for layer in 0..(layers - 1) {
+        for i in 0..width {
+            for j in 0..width {
+                ttl += &format!(
+                    "ex:l{layer}_{i} ex:p ex:l{}_{j} {{| ex:w 1 |}} .\n",
+                    layer + 1
+                );
+            }
+        }
+    }
+    // Expensive short paths:
+    // - len 2, cost 100: s -> m -> t
+    // - len 3, cost 90 (two tied): s -> p1 -> q1 -> t and s -> p2 -> q2 -> t
+    // - len 4, cost 80: s -> r1 -> r2 -> r3 -> t
+    ttl += "ex:s ex:p ex:m {| ex:w 50 |} . ex:m ex:p ex:t {| ex:w 50 |} .\n";
+    ttl += "ex:s ex:p ex:p1 {| ex:w 30 |} . ex:p1 ex:p ex:q1 {| ex:w 30 |} . ex:q1 ex:p ex:t {| ex:w 30 |} .\n";
+    ttl += "ex:s ex:p ex:p2 {| ex:w 20 |} . ex:p2 ex:p ex:q2 {| ex:w 35 |} . ex:q2 ex:p ex:t {| ex:w 35 |} .\n";
+    ttl += "ex:s ex:p ex:r1 {| ex:w 20 |} . ex:r1 ex:p ex:r2 {| ex:w 20 |} . \
+            ex:r2 ex:p ex:r3 {| ex:w 20 |} . ex:r3 ex:p ex:t {| ex:w 20 |} .\n";
+    let s = store_of(&ttl);
+
+    let run = |extra: &str| -> Vec<(f64, String)> {
+        let r = rows(
+            &s,
+            &format!(
+                "SELECT ?path ?i ?s ?o ?c WHERE {{ SERVICE path:search {{ [] path:source ex:s ; \
+                 path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; path:maxVisited 500 ; \
+                 {extra} ; path:cost ?c ; path:pathIndex ?path ; path:edgeIndex ?i ; \
+                 path:edgeSubject ?s ; path:edgeObject ?o }} }}"
+            ),
+        );
+        let mut by: BTreeMap<usize, (f64, String)> = BTreeMap::new();
+        for (k, nodes) in node_paths(&r) {
+            let cost: f64 = r.iter().find(|x| x["path"] == k).unwrap()["c"]
+                .parse()
+                .unwrap();
+            by.insert(k.parse().unwrap(), (cost, nodes.join(" ")));
+        }
+        by.into_values().collect()
+    };
+
+    // No path of length <= 1 exists; finishes immediately within maxVisited 500.
+    assert!(run("path:algorithm path:shortest ; path:maxLength 1").is_empty());
+    assert!(run("path:algorithm path:allShortest ; path:maxLength 1").is_empty());
+    assert!(run("path:algorithm path:kShortest ; path:k 3 ; path:maxLength 1").is_empty());
+
+    // Shortest under maxLength 2, 3, 4.
+    assert_eq!(
+        run("path:algorithm path:shortest ; path:maxLength 2"),
+        vec![(100.0, "s m t".into())]
+    );
+    let len3 = run("path:algorithm path:shortest ; path:maxLength 3");
+    assert_eq!(len3.len(), 1);
+    assert_eq!(len3[0].0, 90.0);
+    assert!(
+        len3[0].1 == "s p1 q1 t" || len3[0].1 == "s p2 q2 t",
+        "{len3:?}"
+    );
+    assert_eq!(
+        run("path:algorithm path:shortest ; path:maxLength 4"),
+        vec![(80.0, "s r1 r2 r3 t".into())]
+    );
+
+    // allShortest under maxLength 3 finds both tied cost-90 paths.
+    let mut all3 = run("path:algorithm path:allShortest ; path:maxLength 3");
+    all3.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(
+        all3,
+        vec![(90.0, "s p1 q1 t".into()), (90.0, "s p2 q2 t".into()),]
+    );
+
+    // kShortest under maxLength 4 finds all 4 short paths in cost order (80, 90, 90, 100).
+    let k4 = run("path:algorithm path:kShortest ; path:k 4 ; path:maxLength 4");
+    assert_eq!(
+        k4.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+        vec![80.0, 90.0, 90.0, 100.0]
+    );
+    assert_eq!(k4[0].1, "s r1 r2 r3 t");
+    assert_eq!(k4[3].1, "s m t");
+
+    // Unbounded still finds a cheap length-7 path of cost 7.
+    let unbounded = run("path:algorithm path:shortest");
+    assert_eq!(unbounded.len(), 1);
+    assert_eq!(unbounded[0].0, 7.0);
+}
+
+/// Edge cases for length-bounded weighted search (item 275): `maxLength 0` and `1`,
+/// equal cost with different lengths, zero-weight edges and cycles, `minLength > 1` with
+/// `kShortest`, unbound target/source in `path:shortest`, bad weight errors, and visit
+/// limit enforcement.
+#[test]
+fn weighted_bounded_edge_cases() {
+    // 1. maxLength 0 and 1, parallel edges, self-loops, equal cost / different lengths.
+    let s = store_of(
+        "ex:s ex:p ex:t {| ex:w 5 |} .
+         ex:s ex:q ex:t {| ex:w 5 |} .
+         ex:s ex:p ex:a {| ex:w 2 |} . ex:a ex:p ex:t {| ex:w 3 |} .
+         ex:s ex:p ex:b {| ex:w 1 |} . ex:b ex:p ex:c {| ex:w 2 |} . ex:c ex:p ex:t {| ex:w 2 |} .
+         ex:s ex:p ex:s {| ex:w 4 |} .
+         ex:s ex:q ex:s {| ex:w 1.5 |} .",
+    );
+    // maxLength 0 with minLength 0 vs minLength 1
+    let r = rows(
+        &s,
+        "SELECT ?len ?c WHERE { SERVICE path:search { [] path:source ex:s ; path:target ex:s ; \
+         path:weight ex:w ; path:minLength 0 ; path:maxLength 0 ; path:length ?len ; path:cost ?c } }",
+    );
+    assert_eq!(r.len(), 1);
+    assert_eq!((r[0]["len"].as_str(), r[0]["c"].as_str()), ("0", "0"));
+    assert!(
+        rows(
+            &s,
+            "SELECT ?len WHERE { SERVICE path:search { [] path:source ex:s ; path:target ex:s ; \
+             path:weight ex:w ; path:maxLength 0 ; path:length ?len } }"
+        )
+        .is_empty()
+    );
+    assert!(
+        rows(
+            &s,
+            "SELECT ?len WHERE { SERVICE path:search { [] path:source ex:s ; path:target ex:t ; \
+             path:weight ex:w ; path:minLength 0 ; path:maxLength 0 ; path:length ?len } }"
+        )
+        .is_empty()
+    );
+    // maxLength 1 self-loop picks cheaper parallel self-loop (1.5 via ex:q)
+    let r = rows(
+        &s,
+        "SELECT ?p ?c WHERE { SERVICE path:search { [] path:source ex:s ; path:target ex:s ; \
+         path:weight ex:w ; path:maxLength 1 ; path:edgePredicate ?p ; path:cost ?c } }",
+    );
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0]["p"], "q");
+    assert_eq!(r[0]["c"].parse::<f64>().unwrap(), 1.5);
+
+    // Equal cost (5) at lengths 1, 2, and 3 (over ex:p only):
+    assert_eq!(
+        sequences(
+            &s,
+            "path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+             path:algorithm path:allShortest ; path:maxLength 1"
+        ),
+        ["s t"].map(String::from).into()
+    );
+    assert_eq!(
+        sequences(
+            &s,
+            "path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+             path:algorithm path:allShortest ; path:maxLength 2"
+        ),
+        ["s t", "s a t"].map(String::from).into()
+    );
+    assert_eq!(
+        sequences(
+            &s,
+            "path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+             path:algorithm path:allShortest ; path:maxLength 3"
+        ),
+        ["s t", "s a t", "s b c t"].map(String::from).into()
+    );
+
+    // 2. Zero-weight edges and zero-weight cycle under maxLength.
+    let z = store_of(
+        "ex:s ex:p ex:a {| ex:w 0 |} . ex:a ex:p ex:b {| ex:w 0 |} .
+         ex:b ex:p ex:a {| ex:w 0 |} . ex:b ex:p ex:c {| ex:w 0 |} .
+         ex:c ex:p ex:t {| ex:w 0 |} .
+         ex:s ex:p ex:x {| ex:w 5 |} . ex:x ex:p ex:t {| ex:w 5 |} .",
+    );
+    // maxLength 3 cannot reach the 4-hop zero-weight path -> returns cost-10 2-hop path.
+    assert_eq!(
+        sequences(
+            &z,
+            "path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+             path:maxLength 3"
+        ),
+        ["s x t"].map(String::from).into()
+    );
+    // maxLength 4 reaches the zero-weight path without looping on a <-> b.
+    assert_eq!(
+        sequences(
+            &z,
+            "path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+             path:maxLength 4"
+        ),
+        ["s a b c t"].map(String::from).into()
+    );
+    assert_eq!(
+        sequences(
+            &z,
+            "path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+             path:algorithm path:allShortest ; path:maxLength 4"
+        ),
+        ["s a b c t"].map(String::from).into()
+    );
+
+    // 3. kShortest with minLength > 1 and maxLength: excludes cheap len-1 and len-5 paths.
+    let km = store_of(
+        "ex:s ex:p ex:t {| ex:w 1 |} .
+         ex:s ex:p ex:a {| ex:w 5 |} . ex:a ex:p ex:t {| ex:w 5 |} .
+         ex:s ex:p ex:b {| ex:w 3 |} . ex:b ex:p ex:c {| ex:w 3 |} . ex:c ex:p ex:t {| ex:w 3 |} .
+         ex:s ex:p ex:d1 {| ex:w 0.1 |} . ex:d1 ex:p ex:d2 {| ex:w 0.1 |} .
+         ex:d2 ex:p ex:d3 {| ex:w 0.1 |} . ex:d3 ex:p ex:d4 {| ex:w 0.1 |} .
+         ex:d4 ex:p ex:t {| ex:w 0.1 |} .",
+    );
+    let r = rows(
+        &km,
+        "SELECT ?path ?c ?len WHERE { SERVICE path:search { [] path:source ex:s ; \
+         path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+         path:algorithm path:kShortest ; path:k 3 ; path:minLength 2 ; path:maxLength 3 ; \
+         path:pathIndex ?path ; path:cost ?c ; path:length ?len } } ORDER BY ?path",
+    );
+    assert_eq!(r.len(), 2);
+    assert_eq!(
+        (r[0]["c"].parse::<f64>().unwrap(), r[0]["len"].as_str()),
+        (9.0, "3")
+    );
+    assert_eq!(
+        (r[1]["c"].parse::<f64>().unwrap(), r[1]["len"].as_str()),
+        (10.0, "2")
+    );
+
+    // 4. Unbound target and unbound source in weighted path:shortest with maxLength.
+    let u = store_of(
+        "ex:s ex:p ex:a {| ex:w 1 |} . ex:a ex:p ex:b {| ex:w 1 |} . ex:b ex:p ex:t {| ex:w 1 |} .
+         ex:s ex:p ex:t {| ex:w 10 |} . ex:t ex:p ex:s {| ex:w 2 |} .",
+    );
+    let fwd: BTreeMap<String, f64> = rows(
+        &u,
+        "SELECT ?t ?c WHERE { SERVICE path:search { [] path:source ex:s ; path:target ?t ; \
+         path:predicate ex:p ; path:weight ex:w ; path:maxLength 2 ; path:cost ?c } }",
+    )
+    .into_iter()
+    .map(|r| (r["t"].clone(), r["c"].parse().unwrap()))
+    .collect();
+    assert_eq!(
+        fwd,
+        BTreeMap::from([
+            ("a".into(), 1.0),
+            ("b".into(), 2.0),
+            ("t".into(), 10.0),
+            ("s".into(), 12.0),
+        ])
+    );
+    let bwd: BTreeMap<String, f64> = rows(
+        &u,
+        "SELECT ?s ?c WHERE { SERVICE path:search { [] path:source ?s ; path:target ex:t ; \
+         path:predicate ex:p ; path:weight ex:w ; path:maxLength 2 ; path:cost ?c } }",
+    )
+    .into_iter()
+    .map(|r| (r["s"].clone(), r["c"].parse().unwrap()))
+    .collect();
+    assert_eq!(
+        bwd,
+        BTreeMap::from([
+            ("b".into(), 1.0),
+            ("a".into(), 2.0),
+            ("s".into(), 10.0),
+            ("t".into(), 12.0),
+        ])
+    );
+
+    // 5. allShortest with weight + maxLength still requires bound target / source.
+    let e = error(
+        &u,
+        "SELECT ?t WHERE { SERVICE path:search { [] path:source ex:s ; path:target ?t ; \
+         path:weight ex:w ; path:algorithm path:allShortest ; path:maxLength 2 } }",
+    );
+    assert!(e.contains("bound target"), "{e}");
+    let e = error(
+        &u,
+        "SELECT ?s WHERE { SERVICE path:search { [] path:source ?s ; path:target ex:t ; \
+         path:weight ex:w ; path:algorithm path:allShortest ; path:maxLength 2 } }",
+    );
+    assert!(e.contains("bound source"), "{e}");
+
+    // 6. Negative weight fails under maxLength, and maxVisited fails when exceeded.
+    let neg = store_of("ex:s ex:p ex:a {| ex:w -1 |} . ex:a ex:p ex:t {| ex:w 2 |} .");
+    let e = error(
+        &neg,
+        "SELECT ?c WHERE { SERVICE path:search { [] path:source ex:s ; path:target ex:t ; \
+         path:weight ex:w ; path:maxLength 2 ; path:cost ?c } }",
+    );
+    assert!(e.contains("weight"), "{e}");
+
+    let e = error(
+        &u,
+        "SELECT ?c WHERE { SERVICE path:search { [] path:source ex:s ; path:target ex:t ; \
+         path:predicate ex:p ; path:weight ex:w ; path:maxLength 4 ; path:maxVisited 1 ; path:cost ?c } }",
+    );
+    assert!(e.contains("path:maxVisited"), "{e}");
+}
+
+/// Differential test for item 275: random weighted graphs with zero weights, decimal
+/// weights, parallel edges, self-loops, all three directions, excluded predicates, hubs,
+/// and `maxLength` in 1..=5, compared against brute-force simple-path enumeration for
+/// `path:shortest` (bound pairs, unbound target, unbound source), `path:allShortest`, and
+/// `path:kShortest`.
+#[test]
+fn random_weighted_bounded_against_brute_force() {
+    let mut r = Rng(0x0275_b0ed_cafe);
+    let weights: [Option<f64>; 8] = [
+        None,
+        Some(0.0),
+        Some(0.1),
+        Some(0.2),
+        Some(0.3),
+        Some(1.0),
+        Some(2.0),
+        Some(5.0),
+    ];
+    let exact = |w: f64| -> i128 { (w * (1u64 << 60) as f64) as i128 };
+    let rounded = |x: i128| -> f64 { x as f64 / (1u64 << 60) as f64 };
+    for case in 0..45 {
+        let n = 5 + r.below(4);
+        let m = n + r.below(3 * n);
+        let mut triples: BTreeMap<E, Option<f64>> = BTreeMap::new();
+        for _ in 0..m {
+            let w = weights[r.below(weights.len())];
+            triples.insert((r.below(n), r.below(3), r.below(n)), w);
+        }
+        let ttl: String = triples
+            .iter()
+            .map(|((a, p, b), w)| match w {
+                Some(w) => format!("ex:n{a} ex:p{p} ex:n{b} {{| ex:w {w:?}e0 |}} .\n"),
+                None => format!("ex:n{a} ex:p{p} ex:n{b} .\n"),
+            })
+            .collect();
+        let s = store_of(&ttl);
+        let weight = |t: &E| exact(triples[t].unwrap_or(1.0));
+        let skip_p2 = r.below(3) == 0;
+        let max_degree = [None, None, Some(2), Some(3)][r.below(4)];
+        let (dir, back, both) = [
+            ("path:forward", false, false),
+            ("path:backward", true, false),
+            ("path:both", false, true),
+        ][r.below(3)];
+        let max_len = 1 + r.below(5);
+        let mut adj: BTreeMap<usize, Vec<(usize, usize, E)>> = BTreeMap::new();
+        for &(a, p, b) in triples.keys() {
+            if skip_p2 && p == 2 {
+                continue;
+            }
+            let t = (a, p, b);
+            if back || both {
+                adj.entry(b).or_default().push((p, a, t));
+            }
+            if !back && !(both && a == b) {
+                adj.entry(a).or_default().push((p, b, t));
+            }
+        }
+        let degree = |x: usize| adj.get(&x).map_or(0, Vec::len);
+        let src = r.below(n);
+        let nodes_of = |start: usize, path: &[E]| -> Vec<usize> {
+            let mut out = vec![start];
+            for &(a, _, b) in path {
+                let x = *out.last().unwrap();
+                let fwd = !back && a == x;
+                out.push(if fwd || (both && a == x) { b } else { a });
+            }
+            out
+        };
+        let mut extra = format!("path:direction {dir} ; path:maxLength {max_len}");
+        if skip_p2 {
+            extra.push_str(" ; path:excludePredicate ex:p2");
+        }
+        if let Some(l) = max_degree {
+            extra.push_str(&format!(" ; path:maxDegree {l}"));
+        }
+        let all_from_src: Vec<(usize, Vec<E>, i128)> = brute(&adj, src, max_len)
+            .into_iter()
+            .filter(|(_, p)| {
+                let ns = nodes_of(src, p);
+                ns[1..ns.len() - 1]
+                    .iter()
+                    .all(|&x| max_degree.is_none_or(|l| degree(x) <= l))
+            })
+            .map(|(end, p)| {
+                let c = p.iter().map(weight).sum();
+                (end, p, c)
+            })
+            .collect();
+
+        // Check unbound target in weighted path:shortest + maxLength.
+        let unbound_fwd: BTreeMap<usize, f64> = rows(
+            &s,
+            &format!(
+                "SELECT ?t ?c WHERE {{ SERVICE path:search {{ [] path:source ex:n{src} ; \
+                 path:target ?t ; path:weight ex:w ; {extra} ; path:cost ?c }} }}"
+            ),
+        )
+        .into_iter()
+        .map(|row| {
+            let t = row["t"]
+                .trim_start_matches(|c: char| !c.is_ascii_digit())
+                .parse::<usize>()
+                .unwrap();
+            (t, row["c"].parse::<f64>().unwrap())
+        })
+        .collect();
+
+        let extract_paths = |q: &str| -> Vec<(Vec<E>, f64)> {
+            let mut by: BTreeMap<usize, (BTreeMap<usize, E>, f64)> = BTreeMap::new();
+            for row in rows(&s, q) {
+                let num = |k: &str| {
+                    row[k]
+                        .trim_start_matches(|c: char| !c.is_ascii_digit())
+                        .parse::<usize>()
+                        .unwrap()
+                };
+                let e = by
+                    .entry(row["path"].parse().unwrap())
+                    .or_insert_with(|| (BTreeMap::new(), row["c"].parse().unwrap()));
+                e.0.insert(row["i"].parse().unwrap(), (num("s"), num("p"), num("o")));
+            }
+            by.into_values()
+                .map(|(es, c)| (es.into_values().collect(), c))
+                .collect()
+        };
+
+        for t in 0..n {
+            let ctx = format!("case {case} {extra} n{src}→n{t}");
+            let mut to_t: Vec<(&Vec<E>, i128)> = all_from_src
+                .iter()
+                .filter(|(e, _, _)| *e == t)
+                .map(|(_, p, c)| (p, *c))
+                .collect();
+            to_t.sort_by_key(|&(_, c)| c);
+            let least = to_t.first().map(|&(_, c)| c);
+            let best_set: BTreeSet<&Vec<E>> = to_t
+                .iter()
+                .filter(|&&(_, c)| Some(c) == least)
+                .map(|&(p, _)| p)
+                .collect();
+
+            // Unbound target matches exact least cost.
+            assert_eq!(
+                unbound_fwd.get(&t).copied(),
+                least.map(rounded),
+                "{ctx}: unbound target cost"
+            );
+
+            // Bound shortest
+            let one = extract_paths(&format!(
+                "SELECT * WHERE {{ SERVICE path:search {{ [] path:source ex:n{src} ; \
+                 path:target ex:n{t} ; path:weight ex:w ; {extra} ; path:cost ?c ; \
+                 path:pathIndex ?path ; path:edgeIndex ?i ; path:edgeSubject ?s ; \
+                 path:edgePredicate ?p ; path:edgeObject ?o }} }}"
+            ));
+            assert_eq!(one.len(), usize::from(least.is_some()), "{ctx}: shortest");
+            if let Some((p, c)) = one.first() {
+                assert!(
+                    best_set.contains(p),
+                    "{ctx}: shortest {p:?} not in {best_set:?}"
+                );
+                assert_eq!(*c, rounded(least.unwrap()), "{ctx}: shortest cost");
+            }
+
+            // Bound allShortest
+            let all_s = extract_paths(&format!(
+                "SELECT * WHERE {{ SERVICE path:search {{ [] path:source ex:n{src} ; \
+                 path:target ex:n{t} ; path:weight ex:w ; path:algorithm path:allShortest ; \
+                 {extra} ; path:cost ?c ; path:pathIndex ?path ; path:edgeIndex ?i ; \
+                 path:edgeSubject ?s ; path:edgePredicate ?p ; path:edgeObject ?o }} }}"
+            ));
+            let all_set: BTreeSet<&Vec<E>> = all_s.iter().map(|(p, _)| p).collect();
+            assert_eq!(
+                all_set.len(),
+                all_s.len(),
+                "{ctx}: duplicate in allShortest"
+            );
+            assert_eq!(all_set, best_set, "{ctx}: allShortest paths");
+
+            // Bound kShortest (k = 4)
+            let k = 4;
+            let ks = extract_paths(&format!(
+                "SELECT * WHERE {{ SERVICE path:search {{ [] path:source ex:n{src} ; \
+                 path:target ex:n{t} ; path:weight ex:w ; path:algorithm path:kShortest ; \
+                 path:k {k} ; {extra} ; path:cost ?c ; path:pathIndex ?path ; path:edgeIndex ?i ; \
+                 path:edgeSubject ?s ; path:edgePredicate ?p ; path:edgeObject ?o }} }}"
+            ));
+            let want_costs: Vec<f64> = to_t.iter().take(k).map(|&(_, c)| rounded(c)).collect();
+            let got_costs: Vec<f64> = ks.iter().map(|(_, c)| *c).collect();
+            assert_eq!(got_costs, want_costs, "{ctx}: kShortest costs");
+            let all_valid: BTreeSet<&Vec<E>> = to_t.iter().map(|&(p, _)| p).collect();
+            let distinct: BTreeSet<&Vec<E>> = ks.iter().map(|(p, _)| p).collect();
+            assert_eq!(distinct.len(), ks.len(), "{ctx}: kShortest distinct");
+            for (p, _) in &ks {
+                assert!(all_valid.contains(p), "{ctx}: kShortest invalid path {p:?}");
+            }
+        }
+    }
+}

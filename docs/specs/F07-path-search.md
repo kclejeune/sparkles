@@ -907,3 +907,42 @@ this screen with a spread of 92 to 131% between server processes. A rerun of fou
 30 requests measured it 1.9% slower, at 1.20 and 1.23 ms, and the weighted cheapest pair
 0.5% slower, at 24.1 and 24.3 ms, so neither change is above the noise. Item 276 rechecks
 both on forge.
+
+### Weighted searches under a length limit (2026-11-26)
+
+[ROADMAP](../ROADMAP.md) item 275 replaced unbounded cost-order enumeration for weighted
+searches with `path:maxLength` with a Pareto-pruned search over `(node, length)` states in
+both the eager engine and the streaming cursor reader.
+
+* **Single pairs and Yen's spurs.** `Engine::dijkstra_pair_bounded` and
+  `SearchContext::run_dijkstra_pair_bounded` run a bidirectional Pareto-pruned search from
+  both ends, splitting the edge budget `L` into `ceil(L / 2)` forward and `floor(L / 2)`
+  backward (including cycles through the source via the virtual end id). Each side keeps a
+  node's reached `(length, cost)` labels sorted by strictly increasing length and strictly
+  decreasing cost, discarding any label when another label at the same node is both
+  cheaper-or-equal and shorter-or-equal. Labels at a side's half-length boundary record
+  their least cost in `bounds[side]` without entering that side's heap, and the search
+  stops once `min(top[0] + min(top[1], bound[1]), top[1] + min(top[0], bound[0]))` reaches
+  the cheapest valid meeting (or becomes empty). `path:shortest` with bound ends runs this
+  search directly, and Yen's algorithm passes the remaining length `maxLength - i` into
+  this search for every weighted spur in both `path:kShortest` and length-bounded
+  `path:allShortest`.
+* **Unbound ends in `path:shortest`.** `Engine::dijkstra_bounded` and
+  `SearchContext::run_dijkstra_bounded` (streamed by `BoundedShortestJob`) run a
+  one-ended Pareto-pruned search over `(node, length)` up to `maxLength`, so weighted
+  `path:shortest` with `path:maxLength` now answers unbound targets and unbound sources as
+  well as bound pairs. Weighted `path:allShortest` with `path:maxLength` continues to run
+  Yen's algorithm with length-bounded spurs and therefore still requires both ends bound.
+* **Tests.** `pathsearch.rs` adds unit tests for Pareto frontier pruning and lower-bound
+  arithmetic. `crates/sparkles-core/tests/path_search.rs` adds
+  `weighted_shortest_under_max_length_skips_many_cheap_long_paths` (262,144 cheap
+  length-7 paths beside dearer short paths under `path:maxVisited 500`),
+  `weighted_bounded_edge_cases` (`maxLength` 0 and 1, equal cost at different lengths,
+  zero-weight edges and cycles, `minLength > 1` in `kShortest`, unbound target and source,
+  negative weight refusal, and `path:maxVisited` enforcement), and
+  `random_weighted_bounded_against_brute_force` (45 random graphs across all directions,
+  excluded predicates, hubs, zero and decimal weights, and lengths 1 to 5).
+  `crates/sparkles-core/tests/cursor_pathsearch.rs` verifies eager/streaming parity and
+  counter equality across bound pairs, cycles, unbound ends, `VALUES`, `kShortest`, and
+  `allShortest`, and `crates/sparkles-core/tests/cursor_memory_audit.rs` audits bounded
+  weighted `shortest` (bound and unbound ends) and `kShortest` at `Allowance::EXACT`.

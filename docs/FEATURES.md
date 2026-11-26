@@ -171,7 +171,7 @@ instruction counts, and the limits of attributing them to layout.
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
 | [Full-text and vector search](search/README.md#search) | Core complete | BM25 full-text search, HNSW vector indexes, hybrid ranking and local or remote embeddings on write are available. Historical search, multi-field documents, more analyzers and vector quantization remain planned. |
-| [Paths and graph algorithms](search/README.md#search) | Core complete | Shortest, k-shortest and bounded path search run beside community detection, centrality, similarity and graph embeddings. Weighted length bounds, background progress and Graphalytics acceptance remain under items 8, 275 and 276. |
+| [Paths and graph algorithms](search/README.md#search) | Core complete | Shortest, k-shortest, length-bounded weighted and bounded all-paths search run beside community detection, centrality, similarity and graph embeddings. Background progress, control-cost follow-up and Graphalytics acceptance remain under items 8 and 276. |
 | [GeoSPARQL](search/README.md#geosparql) | Core complete | OGC GeoSPARQL 1.1 functions, spatial indexes, joins, constant-geometry nearest-neighbour ordering, custom CRSs and map views are available. Per-row nearest-neighbour joins, polygon approximations, datum shifts and extra syntax remain under item 24. |
 
 ### Reasoning and validation

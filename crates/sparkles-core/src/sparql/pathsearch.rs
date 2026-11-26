@@ -27,8 +27,8 @@
 //!
 //! The searches: bidirectional breadth-first search for one unweighted pair, one
 //! breadth-first search per source (or per target) for several or unbound ends,
-//! Dijkstra's algorithm with weights, from both ends for the cheapest path of one pair and
-//! for the spur searches of Yen's algorithm for the k shortest paths, and a
+//! Dijkstra's algorithm with weights (from both ends for one pair and for Yen's spurs,
+//! and Pareto-pruned over `(node, length)` pairs when `path:maxLength` is set), and a
 //! depth-first enumeration pruned by the distance to the targets for all paths.
 
 use super::ctx::{Charge, Ctx};
@@ -1246,6 +1246,118 @@ fn without_loops(s: u64, edges: Vec<Edge>) -> Vec<Edge> {
     out
 }
 
+/// Locate where `(len, cost)` belongs in a Pareto frontier sorted by strictly increasing
+/// `len` and strictly decreasing `cost`. Returns `None` when an existing label has
+/// `l <= len` and `c <= cost`, `Some((pos, true))` to replace `v[pos]` (same length,
+/// strictly cheaper), or `Some((pos, false))` to insert at `pos`.
+fn pareto_locate(v: &[(u32, Cost)], len: u32, cost: Cost) -> Option<(usize, bool)> {
+    let pos = v.partition_point(|&(l, _)| l < len);
+    if pos > 0 && v[pos - 1].1 <= cost {
+        return None;
+    }
+    if pos < v.len() && v[pos].0 == len {
+        return (cost < v[pos].1).then_some((pos, true));
+    }
+    Some((pos, false))
+}
+
+/// Insert `(len, cost)` into a Pareto frontier, pruning any longer labels with cost
+/// `>= cost`. Returns `true` when the label is not dominated and was kept.
+fn pareto_insert(v: &mut Vec<(u32, Cost)>, len: u32, cost: Cost) -> bool {
+    let Some((pos, replace)) = pareto_locate(v, len, cost) else {
+        return false;
+    };
+    if replace {
+        v[pos].1 = cost;
+        let mut end = pos + 1;
+        while end < v.len() && v[end].1 >= cost {
+            end += 1;
+        }
+        if end > pos + 1 {
+            v.drain(pos + 1..end);
+        }
+        return true;
+    }
+    let mut end = pos;
+    while end < v.len() && v[end].1 >= cost {
+        end += 1;
+    }
+    if end > pos {
+        v[pos] = (len, cost);
+        if end > pos + 1 {
+            v.drain(pos + 1..end);
+        }
+    } else {
+        v.insert(pos, (len, cost));
+    }
+    true
+}
+
+/// The cheapest label in a Pareto frontier with length `<= max_l`. Because lengths
+/// strictly increase and costs strictly decrease, this is the last entry with `l <= max_l`.
+#[inline]
+fn pareto_best_within(v: &[(u32, Cost)], max_l: u32) -> Option<(u32, Cost)> {
+    let pos = v.partition_point(|&(l, _)| l <= max_l);
+    (pos > 0).then(|| v[pos - 1])
+}
+
+#[inline]
+fn opt_cost_min(a: Option<Cost>, b: Option<Cost>) -> Option<Cost> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+#[inline]
+fn opt_cost_add(a: Option<Cost>, b: Option<Cost>) -> Option<Cost> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.add(y)),
+        _ => None,
+    }
+}
+
+/// Reconstruct a single path of `len` edges from `(m, len)` back to `(root, 0)` in a
+/// length-indexed parent map, mapping `VIRT` back to `root`.
+fn reconstruct_bounded(
+    root: u64,
+    forward: bool,
+    parent: &FxHashMap<(u64, u32), Parent>,
+    m: u64,
+    len: u32,
+) -> Vec<Edge> {
+    let real = |x: u64| if x == VIRT { root } else { x };
+    let mut edges = Vec::with_capacity(len as usize);
+    let mut cur = m;
+    let mut l = len;
+    while l > 0 {
+        let q = parent[&(cur, l)];
+        let e = if forward {
+            Edge {
+                from: q.node,
+                to: cur,
+                p: q.p,
+                rev: q.rev,
+            }
+        } else {
+            Edge {
+                from: cur,
+                to: q.node,
+                p: q.p,
+                rev: q.rev,
+            }
+        };
+        edges.push(e.map(real));
+        cur = q.node;
+        l -= 1;
+    }
+    if forward {
+        edges.reverse();
+    }
+    edges
+}
+
 /// One index range that holds edges: `perm` with the predicate fixed or not, or the
 /// edges of a nested pattern (`pattern`).
 #[derive(Clone, Copy)]
@@ -1339,6 +1451,10 @@ struct Bans<'b> {
 
 /// The neighbours of each node (and direction) a search looked up.
 type Neighbours = FxHashMap<(u64, bool), Rc<[Step]>>;
+/// Result of a one-ended Pareto-pruned bounded search: `(order, parent)` maps.
+type BoundedTree = (Vec<(u64, u32)>, FxHashMap<(u64, u32), Parent>);
+/// Min-heap of `(cost, len, node)` labels for Pareto-pruned bounded search.
+type BoundedHeap = BinaryHeap<Reverse<(Cost, u32, u64)>>;
 
 /// A path found: its ends, edges and cost.
 struct Found {
@@ -2748,8 +2864,300 @@ impl<'a> Engine<'a> {
         Ok(true)
     }
 
+    /// Pareto-pruned weighted shortest paths of at most `max_len` edges from `root`
+    /// (`forward`) or into `root` (`!forward`) to every reachable node (ROADMAP item 275).
+    /// Labels are popped in non-decreasing `(cost, len)` order and kept only when no
+    /// already-settled label at the node is shorter or equal in length (since it is also
+    /// cheaper or equal in cost). Because lengths strictly increase along every edge,
+    /// parent links form a DAG and each node's first settled label yields a simple path of
+    /// minimum cost within `max_len`.
+    fn dijkstra_bounded(&self, root: u64, forward: bool, max_len: u32) -> Result<BoundedTree> {
+        self.set_roots(&[root]);
+        if max_len == 0 {
+            return Ok((Vec::new(), FxHashMap::default()));
+        }
+        let real = |x: u64| if x == VIRT { root } else { x };
+        let mut best_len: FxHashMap<u64, u32> = FxHashMap::default();
+        let mut dist: FxHashMap<u64, Vec<(u32, Cost)>> = FxHashMap::default();
+        let mut parent: FxHashMap<(u64, u32), Parent> = FxHashMap::default();
+        let mut order: Vec<(u64, u32)> = Vec::new();
+        let mut heap: BoundedHeap = BinaryHeap::new();
+        dist.insert(root, vec![(0, Cost::ZERO)]);
+        heap.push(Reverse((Cost::ZERO, 0, root)));
+        let mut n = 0u64;
+        while let Some(Reverse((d, l, u))) = heap.pop() {
+            n += 1;
+            if n.is_multiple_of(4096) {
+                self.ctx.check()?;
+            }
+            if best_len.get(&u).is_some_and(|&bl| l >= bl) {
+                continue;
+            }
+            let first = best_len.insert(u, l).is_none();
+            if first && u != root {
+                order.push((u, l));
+            }
+            self.visit(1)?;
+            if u == VIRT || l >= max_len {
+                continue;
+            }
+            let mut out = Vec::new();
+            self.expand(&[u], forward, &mut out)?;
+            let nl = l + 1;
+            for (_, st) in out {
+                let y = if st.node == root { VIRT } else { st.node };
+                if best_len.get(&y).is_some_and(|&bl| nl >= bl) {
+                    continue;
+                }
+                let e = if forward {
+                    Edge {
+                        from: u,
+                        to: y,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                } else {
+                    Edge {
+                        from: y,
+                        to: u,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                };
+                let nd = d.add(Cost::of(self.weight(&e.map(real))?));
+                if !pareto_insert(dist.entry(y).or_default(), nl, nd) {
+                    continue;
+                }
+                let is_new = parent
+                    .insert(
+                        (y, nl),
+                        Parent {
+                            node: u,
+                            p: st.p,
+                            rev: st.rev,
+                        },
+                    )
+                    .is_none();
+                if is_new {
+                    self.charge.add(STEP_BYTES)?;
+                }
+                heap.push(Reverse((nd, nl, y)));
+            }
+        }
+        Ok((order, parent))
+    }
+
+    /// One cheapest simple path from `from` to `to` of at most `max_len` edges by
+    /// bidirectional Pareto-pruned search over `(node, length)` pairs (ROADMAP item 275).
+    /// When `to == VIRT` the path closes a cycle at `virt`, and the returned edges keep
+    /// `VIRT` as the final target. Each side searches up to half the length budget
+    /// (`max_f = ceil(max_len / 2)`, `max_b = floor(max_len / 2)`), keeping a label only
+    /// when no other label at the node is both cheaper-or-equal and shorter-or-equal.
+    /// Labels at a side's half-length boundary are never expanded and never enter its heap;
+    /// `bounds[side]` records the least cost relaxed at that boundary so the lower bound
+    /// `min(top[0] + min(top[1], bound[1]), top[1] + min(top[0], bound[0]))` remains exact.
+    #[allow(clippy::too_many_arguments)]
+    fn dijkstra_pair_bounded(
+        &self,
+        from: u64,
+        to: u64,
+        virt: u64,
+        banned_nodes: Option<&FxHashSet<u64>>,
+        banned_edges: Option<&FxHashSet<Edge>>,
+        max_len: u32,
+    ) -> Result<Option<Vec<Edge>>> {
+        debug_assert!(from != to);
+        let cycle = to == VIRT;
+        let real = |x: u64| if x == VIRT { virt } else { x };
+        self.set_roots(&[from, real(to)]);
+        if max_len == 0 {
+            return Ok(None);
+        }
+        let max_side = [max_len.div_ceil(2), max_len / 2];
+        let mut dist: [FxHashMap<u64, Vec<(u32, Cost)>>; 2] = Default::default();
+        let mut best_len: [FxHashMap<u64, u32>; 2] = Default::default();
+        let mut parent: [FxHashMap<(u64, u32), Parent>; 2] = Default::default();
+        let mut heaps: [BoundedHeap; 2] = Default::default();
+        let mut bounds: [Option<Cost>; 2] = [None, None];
+        for (i, r) in [from, to].into_iter().enumerate() {
+            dist[i].insert(r, vec![(0, Cost::ZERO)]);
+            if max_side[i] > 0 {
+                heaps[i].push(Reverse((Cost::ZERO, 0, r)));
+            } else {
+                best_len[i].insert(r, 0);
+                bounds[i] = Some(Cost::ZERO);
+            }
+        }
+        let mut best: Option<(Cost, u64, (u32, u32))> = None;
+        let mut n = 0u64;
+        loop {
+            let mut tops: [Option<Cost>; 2] = [None, None];
+            for i in 0..2 {
+                while let Some(&Reverse((_, l, u))) = heaps[i].peek() {
+                    if best_len[i].get(&u).is_none_or(|&bl| l < bl) {
+                        break;
+                    }
+                    heaps[i].pop();
+                    n += 1;
+                    if n.is_multiple_of(4096) {
+                        self.ctx.check()?;
+                    }
+                }
+                tops[i] = heaps[i].peek().map(|r| r.0.0);
+            }
+            let lb = opt_cost_min(
+                opt_cost_add(tops[0], opt_cost_min(tops[1], bounds[1])),
+                opt_cost_add(tops[1], opt_cost_min(tops[0], bounds[0])),
+            );
+            let Some(lb) = lb else {
+                break;
+            };
+            if best.is_some_and(|(mu, _, _)| lb >= mu) {
+                break;
+            }
+            let side = if heaps[0].is_empty() || heaps[1].is_empty() {
+                usize::from(heaps[0].is_empty())
+            } else {
+                usize::from(heaps[0].len() > heaps[1].len())
+            };
+            let forward = side == 0;
+            let other = 1 - side;
+            let Reverse((d, l, u)) = heaps[side].pop().unwrap();
+            best_len[side].insert(u, l);
+            self.visit(1)?;
+            n += 1;
+            if n.is_multiple_of(4096) {
+                self.ctx.check()?;
+            }
+            let my_root = if forward { from } else { to };
+            let other_root = if forward { to } else { from };
+            if u == other_root {
+                continue;
+            }
+            let scan = real(u);
+            let steps: Rc<[Step]> = if banned_nodes.is_some() {
+                self.neighbours(scan, forward)?
+            } else {
+                let mut out = Vec::new();
+                self.expand(&[scan], forward, &mut out)?;
+                out.into_iter().map(|(_, s)| s).collect()
+            };
+            let nl = l + 1;
+            let at_boundary = nl == max_side[side];
+            for st in steps.iter() {
+                let y = if forward && cycle && st.node == virt {
+                    VIRT
+                } else {
+                    st.node
+                };
+                if y == my_root || banned_nodes.is_some_and(|b| b.contains(&y)) {
+                    continue;
+                }
+                if max_side[other] == 0 && y != other_root {
+                    continue;
+                }
+                if best_len[side].get(&y).is_some_and(|&bl| nl >= bl) {
+                    continue;
+                }
+                let e = if forward {
+                    Edge {
+                        from: u,
+                        to: y,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                } else {
+                    Edge {
+                        from: y,
+                        to: u,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                };
+                if banned_edges.is_some_and(|b| b.contains(&e)) {
+                    continue;
+                }
+                let nd = d.add(Cost::of(self.weight(&e.map(real))?));
+                if !pareto_insert(dist[side].entry(y).or_default(), nl, nd) {
+                    continue;
+                }
+                let is_new = parent[side]
+                    .insert(
+                        (y, nl),
+                        Parent {
+                            node: u,
+                            p: st.p,
+                            rev: st.rev,
+                        },
+                    )
+                    .is_none();
+                if is_new {
+                    self.charge.add(STEP_BYTES)?;
+                }
+                if y != other_root {
+                    if !at_boundary {
+                        heaps[side].push(Reverse((nd, nl, y)));
+                    } else {
+                        bounds[side] = opt_cost_min(bounds[side], Some(nd));
+                    }
+                }
+                if let Some(other_v) = dist[other].get(&y)
+                    && let Some((l_other, c_other)) = pareto_best_within(other_v, max_len - nl)
+                {
+                    let total = if forward {
+                        nd.add(c_other)
+                    } else {
+                        c_other.add(nd)
+                    };
+                    if best.is_none_or(|(mu, _, _)| total < mu)
+                        && (y == from || y == to || !(self.sink(y, true) || self.blocked(y)?))
+                    {
+                        let lens = if forward {
+                            (nl, l_other)
+                        } else {
+                            (l_other, nl)
+                        };
+                        best = Some((total, y, lens));
+                    }
+                }
+            }
+        }
+        let Some((_, m, (lf, lb))) = best else {
+            return Ok(None);
+        };
+        let mut a = Vec::with_capacity(lf as usize + lb as usize);
+        let mut cur = m;
+        let mut l = lf;
+        while l > 0 {
+            let q = parent[0][&(cur, l)];
+            a.push(Edge {
+                from: q.node,
+                to: cur,
+                p: q.p,
+                rev: q.rev,
+            });
+            cur = q.node;
+            l -= 1;
+        }
+        a.reverse();
+        let mut cur = m;
+        let mut l = lb;
+        while l > 0 {
+            let q = parent[1][&(cur, l)];
+            a.push(Edge {
+                from: cur,
+                to: q.node,
+                p: q.p,
+                rev: q.rev,
+            });
+            cur = q.node;
+            l -= 1;
+        }
+        Ok(Some(without_loops(from, a)))
+    }
+
     /// The shortest path from `from` to `to` (forward) that avoids the banned nodes and
-    /// edges, of at most `budget` edges without weights: Yen's spur search.
+    /// edges, of at most `budget` edges: Yen's spur search.
     fn spur(
         &self,
         from: u64,
@@ -2759,10 +3167,22 @@ impl<'a> Engine<'a> {
         banned_edges: &FxHashSet<Edge>,
         budget: Option<u32>,
     ) -> Result<Option<(Vec<Edge>, f64)>> {
-        if self.spec.weighted() && to != VIRT && from != to {
-            return self.dijkstra_pair(from, to, Some(banned_nodes), Some(banned_edges));
-        }
         if self.spec.weighted() {
+            if let Some(max) = budget {
+                return Ok(self
+                    .dijkstra_pair_bounded(
+                        from,
+                        to,
+                        virt,
+                        Some(banned_nodes),
+                        Some(banned_edges),
+                        max,
+                    )?
+                    .map(|p| (p, 0.0)));
+            }
+            if to != VIRT && from != to {
+                return self.dijkstra_pair(from, to, Some(banned_nodes), Some(banned_edges));
+            }
             // a spur that closes a cycle searches from one end
             let close = to == VIRT;
             let targets: FxHashSet<u64> = [if close { virt } else { to }].into_iter().collect();
@@ -2825,7 +3245,7 @@ impl<'a> Engine<'a> {
         let max = self.spec.max_len;
         let none_n = FxHashSet::default();
         let none_e = FxHashSet::default();
-        let budget = if self.spec.weighted() { None } else { max };
+        let budget = max;
         let Some((first, _)) = self.spur(s, tt, s, &none_n, &none_e, budget)? else {
             return Ok(());
         };
@@ -3123,10 +3543,12 @@ pub fn run(
         Ok(true)
     };
     let cap = |eng: &Engine| eng.left.get();
-    // the shortest modes with weights and a length limit enumerate in cost order
-    let yen_shortest = weighted
-        && spec.max_len.is_some()
-        && matches!(spec.algorithm, Algorithm::Shortest | Algorithm::AllShortest);
+    let bounded_weighted_shortest =
+        weighted && spec.max_len.is_some() && matches!(spec.algorithm, Algorithm::Shortest);
+    // weighted `allShortest` with a length limit enumerates optimal short paths via Yen
+    // whose spurs run the length-bounded Pareto-pruned search
+    let yen_all_shortest =
+        weighted && spec.max_len.is_some() && matches!(spec.algorithm, Algorithm::AllShortest);
     'sources: for (&s, targets) in &forward {
         if eng.full() {
             break;
@@ -3135,10 +3557,48 @@ pub fn run(
         want_pairs.set(!targets.set.is_empty());
         want_sources.set(targets.any);
         match spec.algorithm {
-            Algorithm::Shortest | Algorithm::AllShortest if yen_shortest => {
+            Algorithm::Shortest if bounded_weighted_shortest => {
+                let max = spec.max_len.unwrap();
+                if targets.any {
+                    eng.begin();
+                    let (order, parent) = eng.dijkstra_bounded(s, true, max)?;
+                    if spec.min_len == 0 && !add(&mut found, s, s, Vec::new(), None, true)? {
+                        break 'sources;
+                    }
+                    for (m, l) in order {
+                        if spec.min_len == 0 && m == VIRT {
+                            continue;
+                        }
+                        let end = if m == VIRT { s } else { m };
+                        let p = reconstruct_bounded(s, true, &parent, m, l);
+                        if !add(&mut found, s, end, p, None, true)? {
+                            break 'sources;
+                        }
+                    }
+                } else {
+                    for &t in &targets.set {
+                        eng.begin();
+                        if spec.min_len == 0 && s == t {
+                            if !add(&mut found, s, t, Vec::new(), None, true)? {
+                                break 'sources;
+                            }
+                            continue;
+                        }
+                        let tt = if s == t { VIRT } else { t };
+                        let real = |x: u64| if x == VIRT { s } else { x };
+                        if let Some(p) = eng.dijkstra_pair_bounded(s, tt, s, None, None, max)? {
+                            let p = p.into_iter().map(|e| e.map(real)).collect();
+                            if !add(&mut found, s, t, p, None, true)? {
+                                break 'sources;
+                            }
+                        }
+                    }
+                }
+            }
+            Algorithm::AllShortest if yen_all_shortest => {
                 if targets.any {
                     return Err(bad(
-                        "path:maxLength with path:weight needs a bound target in the shortest modes",
+                        "path:maxLength with path:weight needs a bound target in path:allShortest",
                     ));
                 }
                 for &t in &targets.set {
@@ -3165,7 +3625,7 @@ pub fn run(
                             best = Some(c);
                         }
                         out.push(p.to_vec());
-                        Ok(all)
+                        Ok(out.len() < cap(&eng))
                     })?;
                     for p in out {
                         if !add(&mut found, s, t, p, None, true)? {
@@ -3348,10 +3808,27 @@ pub fn run(
         match spec.algorithm {
             Algorithm::KShortest => return Err(bad("path:kShortest needs a bound source")),
             Algorithm::Shortest | Algorithm::AllShortest => {
-                if yen_shortest {
+                if yen_all_shortest {
                     return Err(bad(
-                        "path:maxLength with path:weight needs a bound source in the shortest modes",
+                        "path:maxLength with path:weight needs a bound source in path:allShortest",
                     ));
+                }
+                if bounded_weighted_shortest {
+                    let (order, parent) = eng.dijkstra_bounded(t, false, spec.max_len.unwrap())?;
+                    if spec.min_len == 0 && !add(&mut found, t, t, Vec::new(), None, false)? {
+                        break 'targets;
+                    }
+                    for (m, l) in order {
+                        if spec.min_len == 0 && m == VIRT {
+                            continue;
+                        }
+                        let start = if m == VIRT { t } else { m };
+                        let p = reconstruct_bounded(t, false, &parent, m, l);
+                        if !add(&mut found, start, t, p, None, false)? {
+                            break 'targets;
+                        }
+                    }
+                    continue;
                 }
                 let (tree, cost) = if weighted {
                     let (tree, cost) = eng.dijkstra(t, false, None, all, true, None, None, t)?;
@@ -3557,6 +4034,8 @@ pub(crate) fn stream_eligible(spec: &PathSearchSpec) -> bool {
 
 type HbMap<K, V> = hashbrown::HashMap<K, V, FxBuildHasher>;
 type HbSet<T> = hashbrown::HashSet<T, FxBuildHasher>;
+/// Pre-admitted `(order, parent)` result of `SearchContext::run_dijkstra_bounded`.
+type ChargedBoundedTree = (Vec<(u64, u32)>, HbMap<(u64, u32), Parent>);
 
 #[inline]
 fn vec_bytes<T>(cap: usize) -> u64 {
@@ -3812,6 +4291,83 @@ fn push_hb_map_vec<K: Eq + std::hash::Hash, V>(
             .saturating_add(actual_v);
         charge.resize(next)?;
         Ok(next)
+    }
+}
+
+fn pareto_insert_charged(
+    m: &mut HbMap<u64, Vec<(u32, Cost)>>,
+    vec_bytes_total: &mut u64,
+    key: u64,
+    len: u32,
+    cost: Cost,
+    charge: &mut super::ctx::OwnedCharge,
+    base: u64,
+) -> Result<(bool, u64)> {
+    if let Some(v) = m.get_mut(&key) {
+        let Some((pos, replace)) = pareto_locate(v, len, cost) else {
+            return Ok((false, base));
+        };
+        if replace {
+            v[pos].1 = cost;
+            let mut end = pos + 1;
+            while end < v.len() && v[end].1 >= cost {
+                end += 1;
+            }
+            if end > pos + 1 {
+                v.drain(pos + 1..end);
+            }
+            return Ok((true, base));
+        }
+        let mut end = pos;
+        while end < v.len() && v[end].1 >= cost {
+            end += 1;
+        }
+        if end > pos {
+            v[pos] = (len, cost);
+            if end > pos + 1 {
+                v.drain(pos + 1..end);
+            }
+            return Ok((true, base));
+        }
+        if v.len() == v.capacity() {
+            let old_v = vec_bytes::<(u32, Cost)>(v.capacity());
+            let new_cap = vec_grown(v.capacity(), v.len(), 1, size_of::<(u32, Cost)>());
+            let new_v = vec_bytes::<(u32, Cost)>(new_cap);
+            charge.resize(base.saturating_add(new_v))?;
+            v.insert(pos, (len, cost));
+            let actual_v = vec_bytes::<(u32, Cost)>(v.capacity());
+            *vec_bytes_total = vec_bytes_total
+                .saturating_sub(old_v)
+                .saturating_add(actual_v);
+            let next = base.saturating_sub(old_v).saturating_add(actual_v);
+            charge.resize(next)?;
+            Ok((true, next))
+        } else {
+            v.insert(pos, (len, cost));
+            Ok((true, base))
+        }
+    } else {
+        let old_m = map_bytes(m);
+        let m_growth = hb_growth_for_one::<(u64, Vec<(u32, Cost)>)>(m.len(), m.capacity(), old_m);
+        let v_cap = vec_grown(0, 0, 1, size_of::<(u32, Cost)>());
+        let new_v = vec_bytes::<(u32, Cost)>(v_cap);
+        charge.resize(base.saturating_add(m_growth).saturating_add(new_v))?;
+        let mut v = Vec::with_capacity(v_cap);
+        v.push((len, cost));
+        let actual_v = vec_bytes::<(u32, Cost)>(v.capacity());
+        m.insert(key, v);
+        let actual_m = map_bytes(m);
+        debug_assert!(
+            actual_m <= old_m.max(m_growth),
+            "hashbrown pareto map grew to {actual_m} bytes beyond predicted {m_growth}"
+        );
+        *vec_bytes_total = vec_bytes_total.saturating_add(actual_v);
+        let next = base
+            .saturating_sub(old_m)
+            .saturating_add(actual_m)
+            .saturating_add(actual_v);
+        charge.resize(next)?;
+        Ok((true, next))
     }
 }
 
@@ -6437,6 +6993,507 @@ impl SearchContext {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn run_dijkstra_bounded(
+        &mut self,
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        root: u64,
+        forward: bool,
+        max_len: u32,
+        charge: &mut super::ctx::OwnedCharge,
+        outer_bytes: u64,
+    ) -> Result<ChargedBoundedTree> {
+        self.set_roots(spec, &[root], charge, outer_bytes)?;
+        if max_len == 0 {
+            return Ok((Vec::new(), HbMap::default()));
+        }
+        let real = |x: u64| if x == VIRT { root } else { x };
+        let mut best_len: HbMap<u64, u32> = HbMap::default();
+        let mut dist: HbMap<u64, Vec<(u32, Cost)>> = HbMap::default();
+        let mut dist_vec_bytes = 0u64;
+        let mut parent: HbMap<(u64, u32), Parent> = HbMap::default();
+        let mut order: Vec<(u64, u32)> = Vec::new();
+        let mut heap: BoundedHeap = BinaryHeap::new();
+        let local_bytes = |best_len: &HbMap<u64, u32>,
+                           dist: &HbMap<u64, Vec<(u32, Cost)>>,
+                           dist_vec_bytes: u64,
+                           parent: &HbMap<(u64, u32), Parent>,
+                           order: &Vec<(u64, u32)>,
+                           heap: &BoundedHeap| {
+            map_bytes(best_len)
+                .saturating_add(map_bytes(dist))
+                .saturating_add(dist_vec_bytes)
+                .saturating_add(map_bytes(parent))
+                .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
+                .saturating_add(vec_bytes::<Reverse<(Cost, u32, u64)>>(heap.capacity()))
+        };
+        let mut base = self.retained_bytes().saturating_add(outer_bytes);
+        (_, base) = pareto_insert_charged(
+            &mut dist,
+            &mut dist_vec_bytes,
+            root,
+            0,
+            Cost::ZERO,
+            charge,
+            base,
+        )?;
+        let _ = push_heap(&mut heap, Reverse((Cost::ZERO, 0, root)), charge, base)?;
+        let mut n = 0u64;
+        while let Some(Reverse((d, l, u))) = heap.pop() {
+            n += 1;
+            if n.is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            if best_len.get(&u).is_some_and(|&bl| l >= bl) {
+                continue;
+            }
+            let cur_base = self
+                .retained_bytes()
+                .saturating_add(outer_bytes)
+                .saturating_add(local_bytes(
+                    &best_len,
+                    &dist,
+                    dist_vec_bytes,
+                    &parent,
+                    &order,
+                    &heap,
+                ));
+            let (prev, next_base) = insert_hb_map(&mut best_len, u, l, charge, cur_base)?;
+            if prev.is_none() && u != root {
+                let _ = push_vec(&mut order, (u, l), charge, next_base)?;
+            }
+            self.visit(spec, 1)?;
+            if u == VIRT || l >= max_len {
+                continue;
+            }
+            let loc = outer_bytes.saturating_add(local_bytes(
+                &best_len,
+                &dist,
+                dist_vec_bytes,
+                &parent,
+                &order,
+                &heap,
+            ));
+            let mut out_steps: Vec<(u64, Step)> = Vec::new();
+            self.expand(ctx, spec, &[u], forward, &mut out_steps, charge, loc)?;
+            let out_bytes = vec_bytes::<(u64, Step)>(out_steps.capacity());
+            let nl = l + 1;
+            for (idx, (_, st)) in out_steps.iter().copied().enumerate() {
+                if idx.is_multiple_of(4096) {
+                    ctx.check()?;
+                }
+                let y = if st.node == root { VIRT } else { st.node };
+                if best_len.get(&y).is_some_and(|&bl| nl >= bl) {
+                    continue;
+                }
+                let e = if forward {
+                    Edge {
+                        from: u,
+                        to: y,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                } else {
+                    Edge {
+                        from: y,
+                        to: u,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                };
+                let step_outer = outer_bytes
+                    .saturating_add(local_bytes(
+                        &best_len,
+                        &dist,
+                        dist_vec_bytes,
+                        &parent,
+                        &order,
+                        &heap,
+                    ))
+                    .saturating_add(out_bytes);
+                let w = self.weight(ctx, spec, &e.map(real), charge, step_outer)?;
+                let nd = d.add(Cost::of(w));
+                let mut cur_base = self.retained_bytes().saturating_add(step_outer);
+                let (kept, next_base) = pareto_insert_charged(
+                    &mut dist,
+                    &mut dist_vec_bytes,
+                    y,
+                    nl,
+                    nd,
+                    charge,
+                    cur_base,
+                )?;
+                if !kept {
+                    continue;
+                }
+                cur_base = next_base;
+                (_, cur_base) = insert_hb_map(
+                    &mut parent,
+                    (y, nl),
+                    Parent {
+                        node: u,
+                        p: st.p,
+                        rev: st.rev,
+                    },
+                    charge,
+                    cur_base,
+                )?;
+                let _ = push_heap(&mut heap, Reverse((nd, nl, y)), charge, cur_base)?;
+            }
+            drop(out_steps);
+            charge.resize(
+                self.retained_bytes()
+                    .saturating_add(outer_bytes)
+                    .saturating_add(local_bytes(
+                        &best_len,
+                        &dist,
+                        dist_vec_bytes,
+                        &parent,
+                        &order,
+                        &heap,
+                    )),
+            )?;
+        }
+        drop(best_len);
+        drop(dist);
+        drop(heap);
+        charge.resize(
+            self.retained_bytes()
+                .saturating_add(outer_bytes)
+                .saturating_add(map_bytes(&parent))
+                .saturating_add(vec_bytes::<(u64, u32)>(order.capacity())),
+        )?;
+        Ok((order, parent))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_dijkstra_pair_bounded(
+        &mut self,
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        from: u64,
+        to: u64,
+        virt: u64,
+        banned_nodes: Option<&HbSet<u64>>,
+        banned_edges: Option<&HbSet<Edge>>,
+        max_len: u32,
+        charge: &mut super::ctx::OwnedCharge,
+        outer_bytes: u64,
+    ) -> Result<Option<Vec<Edge>>> {
+        debug_assert!(from != to);
+        let cycle = to == VIRT;
+        let real = |x: u64| if x == VIRT { virt } else { x };
+        self.set_roots(spec, &[from, real(to)], charge, outer_bytes)?;
+        if max_len == 0 {
+            return Ok(None);
+        }
+        let max_side = [max_len.div_ceil(2), max_len / 2];
+        let mut dist: [HbMap<u64, Vec<(u32, Cost)>>; 2] = Default::default();
+        let mut dist_vec_bytes = [0u64; 2];
+        let mut best_len: [HbMap<u64, u32>; 2] = Default::default();
+        let mut parent: [HbMap<(u64, u32), Parent>; 2] = Default::default();
+        let mut heaps: [BoundedHeap; 2] = Default::default();
+        let mut bounds: [Option<Cost>; 2] = [None, None];
+        let local_bytes = |dist: &[HbMap<u64, Vec<(u32, Cost)>>; 2],
+                           dist_vec_bytes: &[u64; 2],
+                           best_len: &[HbMap<u64, u32>; 2],
+                           parent: &[HbMap<(u64, u32), Parent>; 2],
+                           heaps: &[BoundedHeap; 2]| {
+            map_bytes(&dist[0])
+                .saturating_add(map_bytes(&dist[1]))
+                .saturating_add(dist_vec_bytes[0])
+                .saturating_add(dist_vec_bytes[1])
+                .saturating_add(map_bytes(&best_len[0]))
+                .saturating_add(map_bytes(&best_len[1]))
+                .saturating_add(map_bytes(&parent[0]))
+                .saturating_add(map_bytes(&parent[1]))
+                .saturating_add(vec_bytes::<Reverse<(Cost, u32, u64)>>(heaps[0].capacity()))
+                .saturating_add(vec_bytes::<Reverse<(Cost, u32, u64)>>(heaps[1].capacity()))
+        };
+        let mut base = self.retained_bytes().saturating_add(outer_bytes);
+        for (i, r) in [from, to].into_iter().enumerate() {
+            (_, base) = pareto_insert_charged(
+                &mut dist[i],
+                &mut dist_vec_bytes[i],
+                r,
+                0,
+                Cost::ZERO,
+                charge,
+                base,
+            )?;
+            if max_side[i] > 0 {
+                base = push_heap(&mut heaps[i], Reverse((Cost::ZERO, 0, r)), charge, base)?;
+            } else {
+                (_, base) = insert_hb_map(&mut best_len[i], r, 0, charge, base)?;
+                bounds[i] = Some(Cost::ZERO);
+            }
+        }
+        let mut best: Option<(Cost, u64, (u32, u32))> = None;
+        let mut n = 0u64;
+        loop {
+            let mut tops: [Option<Cost>; 2] = [None, None];
+            for i in 0..2 {
+                while let Some(&Reverse((_, l, u))) = heaps[i].peek() {
+                    if best_len[i].get(&u).is_none_or(|&bl| l < bl) {
+                        break;
+                    }
+                    heaps[i].pop();
+                    n += 1;
+                    if n.is_multiple_of(4096) {
+                        ctx.check()?;
+                    }
+                }
+                tops[i] = heaps[i].peek().map(|r| r.0.0);
+            }
+            let lb = opt_cost_min(
+                opt_cost_add(tops[0], opt_cost_min(tops[1], bounds[1])),
+                opt_cost_add(tops[1], opt_cost_min(tops[0], bounds[0])),
+            );
+            let Some(lb) = lb else {
+                break;
+            };
+            if best.is_some_and(|(mu, _, _)| lb >= mu) {
+                break;
+            }
+            let side = if heaps[0].is_empty() || heaps[1].is_empty() {
+                usize::from(heaps[0].is_empty())
+            } else {
+                usize::from(heaps[0].len() > heaps[1].len())
+            };
+            let forward = side == 0;
+            let other = 1 - side;
+            let Reverse((d, l, u)) = heaps[side].pop().unwrap();
+            base = self
+                .retained_bytes()
+                .saturating_add(outer_bytes)
+                .saturating_add(local_bytes(
+                    &dist,
+                    &dist_vec_bytes,
+                    &best_len,
+                    &parent,
+                    &heaps,
+                ));
+            let _ = insert_hb_map(&mut best_len[side], u, l, charge, base)?;
+            self.visit(spec, 1)?;
+            n += 1;
+            if n.is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            let my_root = if forward { from } else { to };
+            let other_root = if forward { to } else { from };
+            if u == other_root {
+                continue;
+            }
+            let scan = real(u);
+            let loc = outer_bytes.saturating_add(local_bytes(
+                &dist,
+                &dist_vec_bytes,
+                &best_len,
+                &parent,
+                &heaps,
+            ));
+            let mut cached_steps: Option<std::sync::Arc<[Step]>> = None;
+            let mut out_steps: Vec<(u64, Step)> = Vec::new();
+            if banned_nodes.is_some() {
+                cached_steps = Some(self.neighbours(ctx, spec, scan, forward, charge, loc)?);
+            } else {
+                self.expand(ctx, spec, &[scan], forward, &mut out_steps, charge, loc)?;
+            }
+            let out_bytes = vec_bytes::<(u64, Step)>(out_steps.capacity());
+            let step_count = cached_steps.as_ref().map_or(out_steps.len(), |s| s.len());
+            let nl = l + 1;
+            let at_boundary = nl == max_side[side];
+            for idx in 0..step_count {
+                if idx.is_multiple_of(4096) {
+                    ctx.check()?;
+                }
+                let st = match &cached_steps {
+                    Some(s) => s[idx],
+                    None => out_steps[idx].1,
+                };
+                let y = if forward && cycle && st.node == virt {
+                    VIRT
+                } else {
+                    st.node
+                };
+                if y == my_root || banned_nodes.is_some_and(|b| b.contains(&y)) {
+                    continue;
+                }
+                if max_side[other] == 0 && y != other_root {
+                    continue;
+                }
+                if best_len[side].get(&y).is_some_and(|&bl| nl >= bl) {
+                    continue;
+                }
+                let e = if forward {
+                    Edge {
+                        from: u,
+                        to: y,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                } else {
+                    Edge {
+                        from: y,
+                        to: u,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                };
+                if banned_edges.is_some_and(|b| b.contains(&e)) {
+                    continue;
+                }
+                let step_outer = outer_bytes
+                    .saturating_add(local_bytes(
+                        &dist,
+                        &dist_vec_bytes,
+                        &best_len,
+                        &parent,
+                        &heaps,
+                    ))
+                    .saturating_add(out_bytes);
+                let w = self.weight(ctx, spec, &e.map(real), charge, step_outer)?;
+                let nd = d.add(Cost::of(w));
+                let mut cur_base = self.retained_bytes().saturating_add(step_outer);
+                let (kept, next_base) = pareto_insert_charged(
+                    &mut dist[side],
+                    &mut dist_vec_bytes[side],
+                    y,
+                    nl,
+                    nd,
+                    charge,
+                    cur_base,
+                )?;
+                if !kept {
+                    continue;
+                }
+                cur_base = next_base;
+                (_, cur_base) = insert_hb_map(
+                    &mut parent[side],
+                    (y, nl),
+                    Parent {
+                        node: u,
+                        p: st.p,
+                        rev: st.rev,
+                    },
+                    charge,
+                    cur_base,
+                )?;
+                if y != other_root {
+                    if !at_boundary {
+                        let _ =
+                            push_heap(&mut heaps[side], Reverse((nd, nl, y)), charge, cur_base)?;
+                    } else {
+                        bounds[side] = opt_cost_min(bounds[side], Some(nd));
+                    }
+                }
+                if let Some(other_v) = dist[other].get(&y)
+                    && let Some((l_other, c_other)) = pareto_best_within(other_v, max_len - nl)
+                {
+                    let total = if forward {
+                        nd.add(c_other)
+                    } else {
+                        c_other.add(nd)
+                    };
+                    if best.is_none_or(|(mu, _, _)| total < mu) {
+                        let block_outer = outer_bytes
+                            .saturating_add(local_bytes(
+                                &dist,
+                                &dist_vec_bytes,
+                                &best_len,
+                                &parent,
+                                &heaps,
+                            ))
+                            .saturating_add(out_bytes);
+                        let pass = y == from
+                            || y == to
+                            || !(self.sink(ctx, y, true)
+                                || self.blocked(ctx, spec, y, charge, block_outer)?);
+                        if pass {
+                            let lens = if forward {
+                                (nl, l_other)
+                            } else {
+                                (l_other, nl)
+                            };
+                            best = Some((total, y, lens));
+                        }
+                    }
+                }
+            }
+            drop(out_steps);
+            drop(cached_steps);
+            charge.resize(
+                self.retained_bytes()
+                    .saturating_add(outer_bytes)
+                    .saturating_add(local_bytes(
+                        &dist,
+                        &dist_vec_bytes,
+                        &best_len,
+                        &parent,
+                        &heaps,
+                    )),
+            )?;
+        }
+        drop(dist);
+        drop(best_len);
+        drop(heaps);
+        let Some((_, m, (lf, lb))) = best else {
+            drop(parent);
+            charge.resize(self.retained_bytes().saturating_add(outer_bytes))?;
+            return Ok(None);
+        };
+        let combined_len = (lf as usize).saturating_add(lb as usize);
+        let parent_bytes = map_bytes(&parent[0]).saturating_add(map_bytes(&parent[1]));
+        let base_no_parent = self.retained_bytes().saturating_add(outer_bytes);
+        charge.resize(
+            base_no_parent
+                .saturating_add(parent_bytes)
+                .saturating_add(vec_bytes::<Edge>(combined_len)),
+        )?;
+        let mut a = Vec::with_capacity(combined_len);
+        let mut cur = m;
+        let mut l = lf;
+        let mut steps = 0usize;
+        while l > 0 {
+            steps += 1;
+            if steps.is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            let q = parent[0][&(cur, l)];
+            a.push(Edge {
+                from: q.node,
+                to: cur,
+                p: q.p,
+                rev: q.rev,
+            });
+            cur = q.node;
+            l -= 1;
+        }
+        a.reverse();
+        let mut cur = m;
+        let mut l = lb;
+        while l > 0 {
+            steps += 1;
+            if steps.is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            let q = parent[1][&(cur, l)];
+            a.push(Edge {
+                from: cur,
+                to: q.node,
+                p: q.p,
+                rev: q.rev,
+            });
+            cur = q.node;
+            l -= 1;
+        }
+        drop(parent);
+        let path = without_loops_charged(ctx, from, a, charge, base_no_parent)?;
+        charge.resize(base_no_parent.saturating_add(vec_bytes::<Edge>(path.capacity())))?;
+        Ok(Some(path))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn run_spur(
         &mut self,
         ctx: &Ctx,
@@ -6450,19 +7507,35 @@ impl SearchContext {
         charge: &mut super::ctx::OwnedCharge,
         outer_bytes: u64,
     ) -> Result<Option<(Vec<Edge>, f64)>> {
-        if spec.weighted() && to != VIRT && from != to {
-            return self.run_dijkstra_pair(
-                ctx,
-                spec,
-                from,
-                to,
-                Some(banned_nodes),
-                Some(banned_edges),
-                charge,
-                outer_bytes,
-            );
-        }
         if spec.weighted() {
+            if let Some(max) = budget {
+                return Ok(self
+                    .run_dijkstra_pair_bounded(
+                        ctx,
+                        spec,
+                        from,
+                        to,
+                        virt,
+                        Some(banned_nodes),
+                        Some(banned_edges),
+                        max,
+                        charge,
+                        outer_bytes,
+                    )?
+                    .map(|p| (p, 0.0)));
+            }
+            if to != VIRT && from != to {
+                return self.run_dijkstra_pair(
+                    ctx,
+                    spec,
+                    from,
+                    to,
+                    Some(banned_nodes),
+                    Some(banned_edges),
+                    charge,
+                    outer_bytes,
+                );
+            }
             let close = to == VIRT;
             let target_id = if close { virt } else { to };
             let (tree, dist) = self.run_dijkstra(
@@ -7364,12 +8437,9 @@ impl BidiWeightedAllJob {
     }
 }
 
-/// Resumable Yen's algorithm for `path:kShortest` and weighted `path:shortest` /
-/// `path:allShortest` with `path:maxLength`.
+/// Resumable Yen's algorithm for `path:kShortest` and weighted `path:allShortest` with
+/// `path:maxLength`.
 enum YenMode {
-    Shortest {
-        max_len: u32,
-    },
     AllShortest {
         max_len: u32,
         best: Option<Cost>,
@@ -7457,9 +8527,6 @@ impl YenJob {
     fn open(spec: &PathSearchSpec, search: &mut SearchContext, s: u64, t: u64) -> Self {
         search.begin();
         let mode = match spec.algorithm {
-            Algorithm::Shortest => YenMode::Shortest {
-                max_len: spec.max_len.unwrap_or(u32::MAX),
-            },
             Algorithm::AllShortest => YenMode::AllShortest {
                 max_len: spec.max_len.unwrap_or(u32::MAX),
                 best: None,
@@ -7469,7 +8536,9 @@ impl YenJob {
                 emitted: 0,
                 k: spec.k,
             },
-            Algorithm::All => unreachable!("YenJob handles Shortest, AllShortest and KShortest"),
+            Algorithm::Shortest | Algorithm::All => {
+                unreachable!("YenJob handles AllShortest and KShortest")
+            }
         };
         let pending_zero = spec.min_len == 0 && s == t;
         Self {
@@ -7520,7 +8589,7 @@ impl YenJob {
         if self.pending_zero {
             self.pending_zero = false;
             match &mut self.mode {
-                YenMode::Shortest { .. } | YenMode::AllShortest { .. } => {
+                YenMode::AllShortest { .. } => {
                     self.done = true;
                 }
                 YenMode::KShortest { emitted, k, .. } => {
@@ -7542,7 +8611,7 @@ impl YenJob {
         let s = self.s;
         let tt = self.tt;
         let real = |x: u64| if x == VIRT { s } else { x };
-        let budget = if spec.weighted() { None } else { spec.max_len };
+        let budget = spec.max_len;
         if !self.initialized {
             self.initialized = true;
             let none_n = HbSet::default();
@@ -7753,12 +8822,6 @@ impl YenJob {
             self.need_expand = true;
             let len_u32 = cur_len as u32;
             match &mut self.mode {
-                YenMode::Shortest { max_len } => {
-                    if len_u32 < self.min_len || len_u32 > *max_len {
-                        continue;
-                    }
-                    self.done = true;
-                }
                 YenMode::AllShortest { max_len, best } => {
                     if let Some(b) = *best
                         && cur_cost > b
@@ -8211,11 +9274,152 @@ impl AllPathsJob {
 }
 
 /// Active resumable search stream for one scheduled job.
+/// Resumable job for length-bounded weighted `path:shortest` with an unbound end
+/// (ROADMAP item 275): runs one Pareto-pruned search and emits each reached node's
+/// optimal path within `max_len` on demand.
+struct BoundedShortestJob {
+    root: u64,
+    forward: bool,
+    parent: HbMap<(u64, u32), Parent>,
+    order: Vec<(u64, u32)>,
+    idx: usize,
+    pending_zero: bool,
+    skip_virt: bool,
+    need_edges: bool,
+}
+
+impl BoundedShortestJob {
+    #[allow(clippy::too_many_arguments)]
+    fn open(
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        search: &mut SearchContext,
+        root: u64,
+        forward: bool,
+        max_len: u32,
+        charge: &mut super::ctx::OwnedCharge,
+        outer_bytes: u64,
+    ) -> Result<Self> {
+        search.begin();
+        let (order, parent) =
+            search.run_dijkstra_bounded(ctx, spec, root, forward, max_len, charge, outer_bytes)?;
+        let pending_zero = spec.min_len == 0;
+        Ok(Self {
+            root,
+            forward,
+            parent,
+            order,
+            idx: 0,
+            pending_zero,
+            skip_virt: pending_zero,
+            need_edges: spec.per_edge() || spec.weighted(),
+        })
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        map_bytes(&self.parent).saturating_add(vec_bytes::<(u64, u32)>(self.order.capacity()))
+    }
+
+    fn next_path(
+        &mut self,
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        search: &mut SearchContext,
+        charge: &mut super::ctx::OwnedCharge,
+        outer_bytes: u64,
+    ) -> Result<Option<Found>> {
+        if self.pending_zero {
+            self.pending_zero = false;
+            search.paths_found += 1;
+            return Ok(Some(Found {
+                start: self.root,
+                end: self.root,
+                edges: Vec::new(),
+                len: 0,
+                cost: 0.0,
+            }));
+        }
+        while self.idx < self.order.len() {
+            let (m, len) = self.order[self.idx];
+            self.idx += 1;
+            if self.skip_virt && m == VIRT {
+                continue;
+            }
+            let real = |x: u64| if x == VIRT { self.root } else { x };
+            let job_outer = outer_bytes.saturating_add(self.retained_bytes());
+            let base = search.retained_bytes().saturating_add(job_outer);
+            charge.resize(base.saturating_add(vec_bytes::<Edge>(len as usize)))?;
+            let mut edges = Vec::with_capacity(len as usize);
+            let mut cur = m;
+            let mut l = len;
+            let mut steps = 0usize;
+            while l > 0 {
+                steps += 1;
+                if steps.is_multiple_of(4096) {
+                    ctx.check()?;
+                }
+                let q = self.parent[&(cur, l)];
+                let e = if self.forward {
+                    Edge {
+                        from: q.node,
+                        to: cur,
+                        p: q.p,
+                        rev: q.rev,
+                    }
+                } else {
+                    Edge {
+                        from: cur,
+                        to: q.node,
+                        p: q.p,
+                        rev: q.rev,
+                    }
+                };
+                edges.push(e.map(real));
+                cur = q.node;
+                l -= 1;
+            }
+            if self.forward {
+                edges.reverse();
+            }
+            let cost = search.path_cost(
+                ctx,
+                spec,
+                &edges,
+                charge,
+                job_outer.saturating_add(vec_bytes::<Edge>(edges.capacity())),
+            )?;
+            let edges = if self.need_edges { edges } else { Vec::new() };
+            charge.resize(
+                search
+                    .retained_bytes()
+                    .saturating_add(job_outer)
+                    .saturating_add(vec_bytes::<Edge>(edges.capacity())),
+            )?;
+            let other = real(m);
+            let (start, end) = if self.forward {
+                (self.root, other)
+            } else {
+                (other, self.root)
+            };
+            search.paths_found += 1;
+            return Ok(Some(Found {
+                start,
+                end,
+                edges,
+                len: len as usize,
+                cost,
+            }));
+        }
+        Ok(None)
+    }
+}
+
 enum ActiveJob {
     None,
     One(Option<Found>),
     All(Box<AllPathsJob>),
     Tree(Box<TreeStreamJob>),
+    BoundedShortest(Box<BoundedShortestJob>),
     BidiUnweighted(Box<BidiUnweightedJob>),
     BidiWeightedAll(Box<BidiWeightedAllJob>),
     Yen(Box<YenJob>),
@@ -8233,6 +9437,9 @@ impl ActiveJob {
             }
             ActiveJob::Tree(st) => {
                 (size_of::<TreeStreamJob>() as u64).saturating_add(st.retained_bytes())
+            }
+            ActiveJob::BoundedShortest(st) => {
+                (size_of::<BoundedShortestJob>() as u64).saturating_add(st.retained_bytes())
             }
             ActiveJob::BidiUnweighted(st) => {
                 (size_of::<BidiUnweightedJob>() as u64).saturating_add(st.retained_bytes())
@@ -8268,6 +9475,13 @@ impl ActiveJob {
                 search,
                 charge,
                 outer_bytes.saturating_add(size_of::<TreeStreamJob>() as u64),
+            ),
+            ActiveJob::BoundedShortest(st) => st.next_path(
+                ctx,
+                spec,
+                search,
+                charge,
+                outer_bytes.saturating_add(size_of::<BoundedShortestJob>() as u64),
             ),
             ActiveJob::BidiUnweighted(st) => st.next_path(
                 ctx,
@@ -8766,18 +9980,117 @@ impl Reader {
         let weighted = spec.weighted();
         let all = matches!(spec.algorithm, Algorithm::AllShortest);
         let need_edges = spec.per_edge() || weighted;
-        let yen_shortest = weighted
-            && spec.max_len.is_some()
-            && matches!(spec.algorithm, Algorithm::Shortest | Algorithm::AllShortest);
+        let bounded_weighted_shortest =
+            weighted && spec.max_len.is_some() && matches!(spec.algorithm, Algorithm::Shortest);
+        let yen_all_shortest =
+            weighted && spec.max_len.is_some() && matches!(spec.algorithm, Algorithm::AllShortest);
         if self.fwd_idx < self.forward.len() {
             self.active_is_forward = true;
             let s = self.forward[self.fwd_idx].source;
             let any = self.forward[self.fwd_idx].any;
             match spec.algorithm {
-                Algorithm::Shortest | Algorithm::AllShortest if yen_shortest => {
+                Algorithm::Shortest if bounded_weighted_shortest => {
+                    let max = spec.max_len.unwrap();
+                    if any {
+                        let old = std::mem::take(&mut self.forward[self.fwd_idx].targets);
+                        self.forward_target_bytes = self
+                            .forward_target_bytes
+                            .saturating_sub(vec_bytes::<u64>(old.capacity()));
+                        drop(old);
+                        self.fwd_idx += 1;
+                        self.fwd_target_idx = 0;
+                        let outer = self.fixed_bytes_excluding_active();
+                        self.charge
+                            .resize(self.search.retained_bytes().saturating_add(outer))?;
+                        let job = BoundedShortestJob::open(
+                            ctx,
+                            spec,
+                            &mut self.search,
+                            s,
+                            true,
+                            max,
+                            &mut self.charge,
+                            outer,
+                        )?;
+                        self.charge.resize(
+                            self.search
+                                .retained_bytes()
+                                .saturating_add(outer)
+                                .saturating_add(job.retained_bytes())
+                                .saturating_add(size_of::<BoundedShortestJob>() as u64),
+                        )?;
+                        self.active = ActiveJob::BoundedShortest(Box::new(job));
+                    } else {
+                        let t = self.forward[self.fwd_idx].targets[self.fwd_target_idx];
+                        self.fwd_target_idx += 1;
+                        if self.fwd_target_idx >= self.forward[self.fwd_idx].targets.len() {
+                            let old = std::mem::take(&mut self.forward[self.fwd_idx].targets);
+                            self.forward_target_bytes = self
+                                .forward_target_bytes
+                                .saturating_sub(vec_bytes::<u64>(old.capacity()));
+                            drop(old);
+                            self.fwd_idx += 1;
+                            self.fwd_target_idx = 0;
+                        }
+                        let outer = self.fixed_bytes_excluding_active();
+                        self.charge
+                            .resize(self.search.retained_bytes().saturating_add(outer))?;
+                        self.search.begin();
+                        if spec.min_len == 0 && s == t {
+                            self.search.paths_found += 1;
+                            self.active = ActiveJob::One(Some(Found {
+                                start: s,
+                                end: t,
+                                edges: Vec::new(),
+                                len: 0,
+                                cost: 0.0,
+                            }));
+                        } else {
+                            let tt = if s == t { VIRT } else { t };
+                            let real = |x: u64| if x == VIRT { s } else { x };
+                            if let Some(mut edges) = self.search.run_dijkstra_pair_bounded(
+                                ctx,
+                                spec,
+                                s,
+                                tt,
+                                s,
+                                None,
+                                None,
+                                max,
+                                &mut self.charge,
+                                outer,
+                            )? {
+                                for (idx, edge) in edges.iter_mut().enumerate() {
+                                    if idx.is_multiple_of(4096) {
+                                        ctx.check()?;
+                                    }
+                                    *edge = edge.map(real);
+                                }
+                                let cost = self.search.path_cost(
+                                    ctx,
+                                    spec,
+                                    &edges,
+                                    &mut self.charge,
+                                    outer.saturating_add(vec_bytes::<Edge>(edges.capacity())),
+                                )?;
+                                let len = edges.len();
+                                let edges = if need_edges { edges } else { Vec::new() };
+                                self.search.paths_found += 1;
+                                self.active = ActiveJob::One(Some(Found {
+                                    start: s,
+                                    end: t,
+                                    edges,
+                                    len,
+                                    cost,
+                                }));
+                            }
+                        }
+                    }
+                }
+                Algorithm::AllShortest if yen_all_shortest => {
                     if any {
                         return Err(bad(
-                            "path:maxLength with path:weight needs a bound target in the shortest modes",
+                            "path:maxLength with path:weight needs a bound target in path:allShortest",
                         ));
                     }
                     let t = self.forward[self.fwd_idx].targets[self.fwd_target_idx];
@@ -9167,10 +10480,32 @@ impl Reader {
                     return Err(bad("path:kShortest needs a bound source"));
                 }
                 Algorithm::Shortest | Algorithm::AllShortest => {
-                    if yen_shortest {
+                    if yen_all_shortest {
                         return Err(bad(
-                            "path:maxLength with path:weight needs a bound source in the shortest modes",
+                            "path:maxLength with path:weight needs a bound source in path:allShortest",
                         ));
+                    }
+                    if bounded_weighted_shortest {
+                        let job = BoundedShortestJob::open(
+                            ctx,
+                            spec,
+                            &mut self.search,
+                            t,
+                            false,
+                            spec.max_len.unwrap(),
+                            &mut self.charge,
+                            outer,
+                        )?;
+                        self.charge.resize(
+                            self.search
+                                .retained_bytes()
+                                .saturating_add(outer)
+                                .saturating_add(job.retained_bytes())
+                                .saturating_add(size_of::<BoundedShortestJob>() as u64),
+                        )?;
+                        self.active = ActiveJob::BoundedShortest(Box::new(job));
+                        self.update_charge()?;
+                        return Ok(true);
                     }
                     let job = TreeStreamJob::open(
                         ctx,
@@ -11173,5 +12508,67 @@ mod tree_tests {
                 "run_dijkstra_pair_all(all={all}) stale heap pops must add polls: stale={all_stale_checks}, base={all_base_checks}"
             );
         }
+    }
+
+    #[test]
+    fn pareto_frontier_pruning_and_lookup() {
+        let mut v = Vec::new();
+        assert!(pareto_insert(&mut v, 3, Cost::of(10.0)));
+        assert_eq!(v, vec![(3, Cost::of(10.0))]);
+
+        // Dominated: longer and equal/more expensive.
+        assert!(!pareto_insert(&mut v, 3, Cost::of(10.0)));
+        assert!(!pareto_insert(&mut v, 3, Cost::of(12.0)));
+        assert!(!pareto_insert(&mut v, 5, Cost::of(10.0)));
+        assert!(!pareto_insert(&mut v, 5, Cost::of(15.0)));
+
+        // Shorter and more expensive: kept on frontier.
+        assert!(pareto_insert(&mut v, 1, Cost::of(20.0)));
+        assert_eq!(v, vec![(1, Cost::of(20.0)), (3, Cost::of(10.0))]);
+
+        // Longer and strictly cheaper: kept on frontier.
+        assert!(pareto_insert(&mut v, 5, Cost::of(4.0)));
+        assert_eq!(
+            v,
+            vec![(1, Cost::of(20.0)), (3, Cost::of(10.0)), (5, Cost::of(4.0))]
+        );
+
+        // Lookup cheapest within length budget.
+        assert_eq!(pareto_best_within(&v, 0), None);
+        assert_eq!(pareto_best_within(&v, 1), Some((1, Cost::of(20.0))));
+        assert_eq!(pareto_best_within(&v, 2), Some((1, Cost::of(20.0))));
+        assert_eq!(pareto_best_within(&v, 3), Some((3, Cost::of(10.0))));
+        assert_eq!(pareto_best_within(&v, 4), Some((3, Cost::of(10.0))));
+        assert_eq!(pareto_best_within(&v, 5), Some((5, Cost::of(4.0))));
+        assert_eq!(pareto_best_within(&v, 99), Some((5, Cost::of(4.0))));
+
+        // Shorter and cheaper than several longer entries prunes them all.
+        assert!(pareto_insert(&mut v, 2, Cost::of(4.0)));
+        assert_eq!(v, vec![(1, Cost::of(20.0)), (2, Cost::of(4.0))]);
+
+        // Same-length improvement replaces in place and prunes dominated tail.
+        assert!(pareto_insert(&mut v, 4, Cost::of(2.0)));
+        assert!(pareto_insert(&mut v, 2, Cost::of(1.5)));
+        assert_eq!(v, vec![(1, Cost::of(20.0)), (2, Cost::of(1.5))]);
+    }
+
+    #[test]
+    fn opt_cost_lower_bound_handles_empty_and_infinite() {
+        assert_eq!(opt_cost_min(None, None), None);
+        assert_eq!(opt_cost_min(Some(Cost::of(3.0)), None), Some(Cost::of(3.0)));
+        assert_eq!(opt_cost_min(None, Some(Cost::of(2.0))), Some(Cost::of(2.0)));
+        assert_eq!(
+            opt_cost_min(Some(Cost::of(3.0)), Some(Cost::of(2.0))),
+            Some(Cost::of(2.0))
+        );
+        assert_eq!(opt_cost_add(None, Some(Cost::of(1.0))), None);
+        assert_eq!(
+            opt_cost_add(Some(Cost::of(1.0)), Some(Cost::INFINITE)),
+            Some(Cost::INFINITE)
+        );
+        assert_eq!(
+            opt_cost_min(Some(Cost::INFINITE), Some(Cost::of(5.0))),
+            Some(Cost::of(5.0))
+        );
     }
 }

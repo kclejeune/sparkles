@@ -1409,6 +1409,30 @@ fn native_path_search_1122_1123_forms_hold_exact_ledger() {
             ),
         ),
         (
+            "shortest const weighted maxLength",
+            format!(
+                "{P}SELECT ?i ?c {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target <urn:d:8> ; path:predicate <urn:d> ; path:weight <urn:w> ; path:maxLength 16 ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
+            "shortest variable target weighted maxLength",
+            format!(
+                "{P}SELECT ?t ?c ?l {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target ?t ; path:predicate <urn:d> ; path:weight <urn:w> ; path:maxLength 6 ; path:cost ?c ; path:length ?l }} }}"
+            ),
+        ),
+        (
+            "shortest variable source weighted maxLength",
+            format!(
+                "{P}SELECT ?s ?c ?l {{ SERVICE path:search {{ [] path:source ?s ; path:target <urn:d:8> ; path:predicate <urn:d> ; path:weight <urn:w> ; path:maxLength 6 ; path:cost ?c ; path:length ?l }} }}"
+            ),
+        ),
+        (
+            "kShortest const weighted maxLength",
+            format!(
+                "{P}SELECT ?p ?i ?c {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target <urn:d:3> ; path:predicate <urn:d> ; path:algorithm path:kShortest ; path:k 6 ; path:weight <urn:w> ; path:maxLength 6 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
             "allShortest wide-weight fallback",
             format!(
                 "{P}SELECT ?p ?i ?c {{ SERVICE path:search {{ [] path:source <urn:w:0> ; path:target <urn:w:2> ; path:predicate <urn:we> ; path:algorithm path:allShortest ; path:weight <urn:w> ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c }} }}"

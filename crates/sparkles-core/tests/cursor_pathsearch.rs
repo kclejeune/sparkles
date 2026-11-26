@@ -815,6 +815,57 @@ fn path_search_item_1122_all_shortest_and_variable_end_parity() {
         true,
         false,
     );
+    // Weighted shortest / allShortest / kShortest with maxLength (item 275): const pairs,
+    // cycle, VALUES, unbound target, unbound source, minLength 0, maxLength 0 and 1.
+    assert_parity_batches(
+        &snap,
+        "SELECT ?i ?es ?eo ?c { SERVICE path:search { [] path:source ex:d0 ; path:target ex:d3 ; path:predicate ex:e ; path:weight ex:w ; path:maxLength 6 ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo ; path:cost ?c } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?i ?es ?eo ?c { SERVICE path:search { [] path:source ex:d0 ; path:target ex:d0 ; path:predicate ex:e ; path:weight ex:w ; path:maxLength 7 ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo ; path:cost ?c } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?t ?c ?len { SERVICE path:search { [] path:source ex:d0 ; path:target ?t ; path:predicate ex:e ; path:weight ex:w ; path:maxLength 4 ; path:cost ?c ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?t ?c ?len { SERVICE path:search { [] path:source ex:d0 ; path:target ?t ; path:predicate ex:e ; path:weight ex:w ; path:minLength 0 ; path:maxLength 2 ; path:cost ?c ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?s ?c ?len { SERVICE path:search { [] path:source ?s ; path:target ex:d3 ; path:predicate ex:e ; path:weight ex:w ; path:maxLength 4 ; path:cost ?c ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?s ?t ?c ?len { VALUES (?s ?t) { (ex:d0 ex:d2) (ex:d0 UNDEF) (ex:d1 ex:d3) } SERVICE path:search { [] path:source ?s ; path:target ?t ; path:predicate ex:e ; path:weight ex:w ; path:maxLength 3 ; path:cost ?c ; path:length ?len } }",
+        &opts,
+        true,
+        true,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?p ?i ?c { SERVICE path:search { [] path:source ex:d0 ; path:target ex:d3 ; path:predicate ex:e ; path:algorithm path:kShortest ; path:k 4 ; path:weight ex:w ; path:maxLength 6 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c } }",
+        &opts,
+        true,
+        false,
+    );
     assert_parity_batches(
         &snap,
         "SELECT ?p ?i ?c { SERVICE path:search { [] path:source ex:d0 ; path:target ex:d3 ; path:predicate ex:e ; path:algorithm path:allShortest ; path:weight ex:w ; path:maxLength 6 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c } }",
@@ -1143,35 +1194,35 @@ fn path_search_r1_parity_cancellation_and_release() {
         true,
         false,
     );
-    // `maxVisited 3`: both eager and streaming stop at cost 2 > best 1 and succeed with
-    // identical `visited` counters.
+    // `maxVisited 2`: bounded `maxLength 1` visits only `s` in each of the two spurs,
+    // so both eager and streaming succeed with identical `visited` counters.
     assert_parity_batches(
         &snap3,
-        "SELECT ?p ?c { SERVICE path:search { [] path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:algorithm path:allShortest ; path:weight ex:w ; path:maxLength 1 ; path:maxVisited 3 ; path:pathIndex ?p ; path:cost ?c } }",
+        "SELECT ?p ?c { SERVICE path:search { [] path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:algorithm path:allShortest ; path:weight ex:w ; path:maxLength 1 ; path:maxVisited 2 ; path:pathIndex ?p ; path:cost ?c } }",
         &opts,
         true,
         false,
     );
-    // `maxVisited 2`: both eager and streaming fail with the exact same `path:maxVisited`
+    // `maxVisited 1`: both eager and streaming fail with the exact same `path:maxVisited`
     // error on full drain.
-    let q_mv2 = format!(
-        "{P}SELECT ?p ?c {{ SERVICE path:search {{ [] path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:algorithm path:allShortest ; path:weight ex:w ; path:maxLength 1 ; path:maxVisited 2 ; path:pathIndex ?p ; path:cost ?c }} }}"
+    let q_mv1 = format!(
+        "{P}SELECT ?p ?c {{ SERVICE path:search {{ [] path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:algorithm path:allShortest ; path:weight ex:w ; path:maxLength 1 ; path:maxVisited 1 ; path:pathIndex ?p ; path:cost ?c }} }}"
     );
     let strict = CursorOptions {
         batch_rows: 1,
         fallback: FallbackPolicy::RejectMaterialization,
         ..Default::default()
     };
-    let eager_mv2 = query(snap3.clone(), &q_mv2, &opts)
+    let eager_mv1 = query(snap3.clone(), &q_mv1, &opts)
         .err()
         .expect("expected eager maxVisited error");
-    let stream_mv2 = select_cursor(snap3.clone(), &q_mv2, &opts, &strict)
+    let stream_mv1 = select_cursor(snap3.clone(), &q_mv1, &opts, &strict)
         .and_then(|mut c| {
             while c.next_batch()?.is_some() {}
             Ok(())
         })
         .unwrap_err();
-    assert_eq!(format!("{stream_mv2}"), format!("{eager_mv2}"));
+    assert_eq!(format!("{stream_mv1}"), format!("{eager_mv1}"));
 
     // 2. Grouped output with two VALUES rows binding the same source and two tied shortest
     //    paths: full multiset + `pathIndex` parity and exact ordered parity under ORDER BY.

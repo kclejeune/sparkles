@@ -406,10 +406,11 @@ and the five cheapest paths stop at the default limit of 10 million visited node
 pair and Yen's weighted spur searches run from both ends, as
 [F07](F07-path-search.md#weighted-searches-from-both-ends-2026-10-24) describes. On forge
 the weighted pair search now takes 3.5 ms on the 10.5M-triple data and the five cheapest
-paths 69 ms. The panel always sends `path:maxLength`, so its weighted shortest search lists
-paths by cost until one is short enough. It answers quickly when the cheapest path is
-within the limit, and a pair whose short paths are all dear still runs to the panel's
-limit of a million visits, which ROADMAP item 275 addresses.
+paths 69 ms. The panel always sends `path:maxLength`, and ROADMAP item 275 replaced
+cost-order enumeration with a bidirectional Pareto-pruned search over `(node, length)`
+pairs for `path:shortest` and for Yen's spurs, so pairs whose short paths are expensive no
+longer enumerate longer paths to the panel's visit limit
+([F07](F07-path-search.md#weighted-searches-under-a-length-limit-2026-11-26)).
 
 **Phase 3 decisions.** The spec left these open, and each was decided here. The weight
 picker offers reifier properties only, with no free IRI field, since a weight that no
