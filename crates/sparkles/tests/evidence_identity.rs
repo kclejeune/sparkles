@@ -2266,4 +2266,290 @@ fn rebuilding_refuses_maps_numbering_gaps_and_stray_minted_slots() {
         "immutable-record-conflict"
     );
     assert_eq!(ds3.store().head_commit().seq, head3);
+
+    // 4. Deleted intermediate revision 3 among 1..=4 replaced by a junk-only subject at
+    //    revision 3's minted IRI must still refuse as a numbering gap with no commit.
+    let ds4 = configured();
+    let mut revs4 = Vec::new();
+    for i in 0..4 {
+        let p = matched(
+            &ds4,
+            &format!("j{i}"),
+            &[&format!("g{i}"), &format!("h{i}")],
+            None,
+        );
+        let r = review(&ds4, &[decision("x", &p, Disposition::Accepted, None)]).unwrap();
+        revs4.push(r.map_revision.unwrap());
+    }
+    evidence::detach(&ds4, MAPS).unwrap();
+    ds4.update(&format!(
+        "DELETE WHERE {{ GRAPH <{MAPS}> {{ <{}> ?p ?o }} }}",
+        revs4[2].as_str()
+    ))
+    .unwrap();
+    ds4.update(&format!(
+        "INSERT DATA {{ GRAPH <{MAPS}> {{ <{}> <urn:junk> \"occupant\" }} }}",
+        revs4[2].as_str()
+    ))
+    .unwrap();
+    evidence::configure(&ds4, &settings(1), &Control::none()).unwrap();
+    let head4 = ds4.store().head_commit().seq;
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &ds4,
+            &ds4,
+            "people",
+            None,
+            &admin,
+            &Control::none()
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(ds4.store().head_commit().seq, head4);
+}
+
+/// Adding a new identity graph with more than 10,000 unreviewed proposals when the policy
+/// already holds more than 10,000 unrelated historical decisions keeps the map available
+/// for ordinary reads and reviews.
+#[test]
+fn added_boundary_graph_with_over_bound_unreviewed_proposals_and_unrelated_decisions_keeps_map_available()
+ {
+    let ds = Dataset::memory();
+    evidence::configure(
+        &ds,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    let ab = matched(&ds, "ab", &["a", "b"], None);
+    accept(&ds, "ab", &ab);
+    assert_eq!(map(&ds), pairs(&["a a", "b a"]));
+
+    // Build 10,500 unrelated historical decisions in DECISIONS targeting proposals in
+    // IDENTITY (21 batches of 500 rejected decisions) and 10,500 unreviewed proposals in
+    // HIDDEN (21 batches of 500).
+    for batch in 0..21usize {
+        let mut id_inputs = Vec::with_capacity(500);
+        let mut hidden_inputs = Vec::with_capacity(500);
+        for j in 0..500usize {
+            let idx = batch * 500 + j;
+            id_inputs.push(IdentityInput {
+                version: RecordVersion::V1,
+                key: key(&format!("p{j}")),
+                occurrence_key: key(&format!("hist-{idx}")),
+                entities: vec![e(&format!("hx{idx}")), e(&format!("hy{idx}"))],
+                relation: IdentityRelation::PossibleMatch,
+                preferred: None,
+                attributed_author: iri("urn:matcher"),
+                method: Some(evidence::MethodRef {
+                    method: iri("urn:method:names"),
+                    version: key("1"),
+                }),
+            });
+            hidden_inputs.push(IdentityInput {
+                version: RecordVersion::V1,
+                key: key(&format!("h{j}")),
+                occurrence_key: key(&format!("new-{idx}")),
+                entities: vec![e(&format!("nx{idx}")), e(&format!("ny{idx}"))],
+                relation: IdentityRelation::PossibleMatch,
+                preferred: None,
+                attributed_author: iri("urn:matcher"),
+                method: Some(evidence::MethodRef {
+                    method: iri("urn:method:names"),
+                    version: key("1"),
+                }),
+            });
+        }
+        let mut o_id = ProposeOptions::new(iri("urn:principal:matcher"));
+        o_id.identity_graph = Some(iri(IDENTITY));
+        let proposed = evidence::propose(
+            None,
+            &ds,
+            &ds,
+            &EvidenceInput {
+                identities: id_inputs,
+                ..Default::default()
+            },
+            &o_id,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+        let decs: Vec<DecisionInput> = proposed
+            .records
+            .iter()
+            .filter(|r| r.kind == evidence::RecordKind::IdentityProposal)
+            .map(|r| DecisionInput {
+                key: r.key.clone(),
+                target: r.iri.clone(),
+                target_digest: r.digest,
+                disposition: Disposition::Rejected,
+                supersedes: None,
+            })
+            .collect();
+        review(&ds, &decs).unwrap();
+
+        let mut o_hid = ProposeOptions::new(iri("urn:principal:matcher"));
+        o_hid.identity_graph = Some(iri(HIDDEN));
+        evidence::propose(
+            None,
+            &ds,
+            &ds,
+            &EvidenceInput {
+                identities: hidden_inputs,
+                ..Default::default()
+            },
+            &o_hid,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+    }
+
+    // Add HIDDEN to the boundary. Neither the >10,000 unrelated historical decisions nor
+    // the >10,000 unreviewed proposals in HIDDEN may make the map unavailable.
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+    let res =
+        evidence::resolve_entities(&ds, &ds, "people", &[e("a")], all(), &Control::none()).unwrap();
+    assert_eq!(res.entities[0].representative, e("a"));
+    assert_eq!(res.entities[0].members, vec![e("a"), e("b")]);
+
+    let cd = matched(&ds, "cd", &["c", "d"], None);
+    accept(&ds, "cd", &cd);
+    assert_eq!(map(&ds), pairs(&["a a", "b a", "c c", "d c"]));
+}
+
+/// Two-state non-disclosure regression for a triple-masked acceptance on a re-added
+/// boundary graph: a caller whose view masks proposals in the added graph or decisions in
+/// the policy's decisions graph receives the exact same `projection-unavailable` refusal
+/// on unrelated reads and reviews whether or not the added graph holds a hidden current
+/// acceptance, and cannot publish a stale map revision, while an unrestricted caller
+/// keeps availability when no acceptance exists and still refuses a stale map.
+#[test]
+fn triple_masked_caller_cannot_infer_hidden_acceptance_on_added_boundary_graph() {
+    let admin = ReviewOptions::new(iri("urn:principal:admin"));
+
+    // State 1: HIDDEN removed, rebuilt, then re-added with an unreviewed proposal only.
+    let s1 = configured();
+    let _unreviewed = propose_in(
+        &s1,
+        HIDDEN,
+        proposal("ab-1", IdentityRelation::PossibleMatch, &["a", "b"], None),
+    );
+    let cd1 = matched(&s1, "cd", &["c", "d"], None);
+    let ef1 = matched(&s1, "ef", &["e", "f"], None);
+    accept(&s1, "cd", &cd1);
+    evidence::configure(
+        &s1,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    evidence::rebuild_resolution_map(&s1, &s1, "people", None, &admin, &Control::none()).unwrap();
+    evidence::configure(&s1, &settings(1), &Control::none()).unwrap();
+
+    // State 2: Identical visible state, except HIDDEN holds a live accepted proposal.
+    let s2 = configured();
+    let ab2 = propose_in(
+        &s2,
+        HIDDEN,
+        proposal("ab-2", IdentityRelation::PossibleMatch, &["a", "b"], None),
+    );
+    let cd2 = matched(&s2, "cd", &["c", "d"], None);
+    let ef2 = matched(&s2, "ef", &["e", "f"], None);
+    accept(&s2, "ab", &ab2);
+    accept(&s2, "cd", &cd2);
+    evidence::configure(
+        &s2,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    evidence::rebuild_resolution_map(&s2, &s2, "people", None, &admin, &Control::none()).unwrap();
+    evidence::configure(&s2, &settings(1), &Control::none()).unwrap();
+
+    // Unrestricted caller: State 1 stays available, State 2 refuses as stale.
+    let ok1 =
+        evidence::resolve_entities(&s1, &s1, "people", &[e("c")], all(), &Control::none()).unwrap();
+    assert_eq!(ok1.entities[0].representative, e("c"));
+    assert_eq!(
+        code(evidence::resolve_entities(
+            &s2,
+            &s2,
+            "people",
+            &[e("c")],
+            all(),
+            &Control::none()
+        )),
+        "projection-unavailable"
+    );
+
+    let err_pair = |r: sparkles::Result<evidence::EntityResolution>| {
+        let e = r.unwrap_err();
+        (e.code().to_string(), e.to_string())
+    };
+    let review_err_pair = |ds: &Dataset, target: &Target, access: Option<Arc<GraphAccess>>| {
+        let head = ds.store().head_commit().seq;
+        let mut opts = ReviewOptions::new(iri("urn:principal:reviewer"));
+        opts.if_head = Some(head);
+        let r = evidence::review(
+            None,
+            ds,
+            ds,
+            "people",
+            1,
+            &[decision("ef", target, Disposition::Accepted, None)],
+            &opts,
+            &mut |_, _| access.clone(),
+            &Control::none(),
+        );
+        let e = r.unwrap_err();
+        assert_eq!(ds.store().head_commit().seq, head);
+        (e.code().to_string(), e.to_string())
+    };
+
+    // Both a proposal mask on HIDDEN and a decision mask on DECISIONS must produce
+    // byte-identical `projection-unavailable` refusals across State 1 and State 2.
+    for mask in [
+        masking(&format!("{EV}entity"), HIDDEN),
+        masking(&format!("{EV}disposition"), DECISIONS),
+    ] {
+        let r1 = err_pair(evidence::resolve_entities(
+            &s1,
+            &s1,
+            "people",
+            &[e("c")],
+            mask.clone(),
+            &Control::none(),
+        ));
+        let r2 = err_pair(evidence::resolve_entities(
+            &s2,
+            &s2,
+            "people",
+            &[e("c")],
+            mask.clone(),
+            &Control::none(),
+        ));
+        assert_eq!(r1.0, "projection-unavailable");
+        assert_eq!(r1, r2);
+
+        let w1 = review_err_pair(&s1, &ef1, mask.clone());
+        let w2 = review_err_pair(&s2, &ef2, mask);
+        assert_eq!(w1.0, "projection-unavailable");
+        assert_eq!(w1, w2);
+    }
+
+    // After an admin rebuild records HIDDEN on the latest revision, masked reads resume.
+    evidence::rebuild_resolution_map(&s2, &s2, "people", None, &admin, &Control::none()).unwrap();
+    let resumed = evidence::resolve_entities(
+        &s2,
+        &s2,
+        "people",
+        &[e("c")],
+        masking(&format!("{EV}entity"), HIDDEN),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(resumed.entities[0].representative, e("c"));
+    assert_eq!(resumed.entities[0].members, vec![e("c"), e("d")]);
 }

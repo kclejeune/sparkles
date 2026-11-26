@@ -881,15 +881,16 @@ struct Commit {
     preview: Option<Box<crate::preview::Preview>>,
 }
 
-/// Publish `batch`, `raw_deletes` (physical quad IDs from the snapshot at `expected`) and
-/// `changes` as one commit of the evidence owner, from the head `expected` that the
-/// operation read.
+/// Publish `batch`, `raw_deletes` (physical quad IDs from the snapshot at `expected` in
+/// `expected_generation`) and `changes` as one commit of the evidence owner, from the
+/// head `expected` that the operation read.
 #[allow(clippy::too_many_arguments)]
 fn publish(
     main: &Dataset,
     logical: &Dataset,
     capability: ManagedWrite,
     expected: u64,
+    expected_generation: Option<u64>,
     batch: &Batch,
     skip: &[bool],
     raw_deletes: &[[sparkles_core::id::Id; 4]],
@@ -897,6 +898,10 @@ fn publish(
     options: &Options,
     control: &Control,
 ) -> Result<Commit> {
+    debug_assert!(
+        raw_deletes.is_empty() || expected_generation.is_some(),
+        "physical raw_deletes require fencing expected_generation"
+    );
     let store = logical.store();
     let (release, before_publish) = publish_hook(options.authority.clone(), || Ok(None));
     let opts = crate::guard::WriteOptions {
@@ -918,6 +923,18 @@ fn publish(
             format!(
                 "the head of the branch moved from commit {expected} to {} while the operation read it; retry",
                 t.base().commit
+            ),
+        ));
+    }
+    // Physical-ID deletions belong to `expected_generation`; a compaction at the same
+    // commit switches generations and renumbers vocabulary IDs.
+    if let Some(expected_gen) = expected_generation
+        && t.base().generation.uid != expected_gen
+    {
+        return Err(managed(
+            ManagedErrorKind::HeadChanged,
+            format!(
+                "the store generation changed at commit {expected} while the operation read it; retry"
             ),
         ));
     }
@@ -1585,6 +1602,7 @@ pub fn review(
         logical,
         capability,
         if_head,
+        None,
         &batch,
         &skip,
         &[],
@@ -1998,6 +2016,7 @@ pub fn withdraw(
         logical,
         capability,
         head.commit,
+        None,
         &batch,
         &skip,
         &[],

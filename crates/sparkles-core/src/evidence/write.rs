@@ -1399,6 +1399,166 @@ impl<'a> Reads<'a> {
         self.id(iri)
     }
 
+    /// Whether any protected identity graph in `graphs` holds an authenticated
+    /// `ev:IdentityProposal` with a current authenticated `ev:Accepted` decision under
+    /// `policy` in `decisions`.
+    ///
+    /// Streams directly over physical term IDs without decoding unreviewed proposals or
+    /// caching per-proposal IRIs, so unrelated decision history and large unreviewed
+    /// proposal populations neither hit record limits nor exhaust the reader's cache.
+    pub fn has_live_accepted_in_graphs(
+        &mut self,
+        graphs: &[ProtectedGraph],
+        decisions: &ProtectedGraph,
+        policy: &NamedNode,
+    ) -> Result<bool> {
+        let Some(decisions_nonce) = decisions.1 else {
+            return Ok(false);
+        };
+        let Some(decisions_g) = self.id(decisions.0.as_str())? else {
+            return Ok(false);
+        };
+        let (
+            Some(rdf_type),
+            Some(identity_proposal),
+            Some(review_decision),
+            Some(review_policy),
+            Some(policy_id),
+            Some(target_pred),
+            Some(disposition_pred),
+            Some(accepted_obj),
+            Some(receipt_pred),
+            Some(protection_pred),
+            Some(operation_class),
+            Some(decisions_nonce_id),
+        ) = (
+            self.id(RDF_TYPE)?,
+            self.id(&format!("{EV}IdentityProposal"))?,
+            self.id(&format!("{EV}ReviewDecision"))?,
+            self.id(&format!("{EV}reviewPolicy"))?,
+            self.id(policy.as_str())?,
+            self.id(&format!("{EV}target"))?,
+            self.id(&format!("{EV}disposition"))?,
+            self.id(&format!("{EV}Accepted"))?,
+            self.id(&format!("{EV}availabilityReceipt"))?,
+            self.id(&format!("{EV}graphProtection"))?,
+            self.id(&format!("{EV}Operation"))?,
+            self.preparation
+                .lookup_term(self.snap, &string(&decisions_nonce.to_string()))?,
+        )
+        else {
+            return Ok(false);
+        };
+        let supersedes_pred = self.id(&format!("{EV}supersedes"))?;
+        let prep = self.preparation;
+        let snap = self.snap;
+        let one_id = |g_id: Id, s_id: Id, p_id: Id| -> Result<Option<Id>> {
+            let mut found = None;
+            let mut count = 0u8;
+            prep.scan(snap, Perm::Gspo, &[g_id.0, s_id.0, p_id.0], |q| {
+                count += 1;
+                if count == 1 {
+                    found = Some(q[2]);
+                    Ok(true)
+                } else {
+                    found = None;
+                    Ok(false)
+                }
+            })?;
+            Ok(found)
+        };
+        let is_named = |id: Id| -> Result<bool> {
+            prep.with_term(snap, id, |t| Ok(matches!(t, Some(Term::NamedNode(_)))))
+        };
+        let id_authenticated = |s_id: Id, g_id: Id, nonce_id: Id| -> Result<bool> {
+            let Some(op_id) = one_id(g_id, s_id, receipt_pred)? else {
+                return Ok(false);
+            };
+            if !snap.contains(&[op_id, rdf_type, operation_class, g_id])? {
+                return Ok(false);
+            }
+            if one_id(g_id, op_id, protection_pred)? != Some(nonce_id)
+                || one_id(g_id, s_id, protection_pred)? != Some(nonce_id)
+            {
+                return Ok(false);
+            }
+            is_named(op_id)
+        };
+        let is_superseded = |d_id: Id| -> Result<bool> {
+            let Some(sup_pred) = supersedes_pred else {
+                return Ok(false);
+            };
+            let mut superseded = false;
+            prep.scan(snap, Perm::Pos, &[sup_pred.0, d_id.0], |q| {
+                if q[3] != decisions_g {
+                    return Ok(true);
+                }
+                let later = q[0];
+                if snap.contains(&[later, rdf_type, review_decision, decisions_g])?
+                    && id_authenticated(later, decisions_g, decisions_nonce_id)?
+                    && is_named(later)?
+                {
+                    superseded = true;
+                    return Ok(false);
+                }
+                Ok(true)
+            })?;
+            Ok(superseded)
+        };
+        for (g, nonce) in graphs {
+            prep.check()?;
+            let Some(nonce) = nonce else {
+                continue;
+            };
+            let (Some(g_id), Some(g_nonce_id)) = (
+                prep.lookup_iri(snap, g.as_str())?,
+                prep.lookup_term(snap, &string(&nonce.to_string()))?,
+            ) else {
+                continue;
+            };
+            let mut found_live = false;
+            prep.scan(snap, Perm::Gspo, &[g_id.0], |q| {
+                if q[1] != rdf_type || q[2] != identity_proposal {
+                    return Ok(true);
+                }
+                let p_id = q[0];
+                let mut p_live = false;
+                prep.scan(snap, Perm::Pos, &[target_pred.0, p_id.0], |dq| {
+                    if dq[3] != decisions_g {
+                        return Ok(true);
+                    }
+                    let d_id = dq[0];
+                    if !snap.contains(&[d_id, rdf_type, review_decision, decisions_g])?
+                        || !snap.contains(&[d_id, review_policy, policy_id, decisions_g])?
+                        || one_id(decisions_g, d_id, disposition_pred)? != Some(accepted_obj)
+                    {
+                        return Ok(true);
+                    }
+                    if !id_authenticated(d_id, decisions_g, decisions_nonce_id)?
+                        || !is_named(d_id)?
+                        || is_superseded(d_id)?
+                    {
+                        return Ok(true);
+                    }
+                    if id_authenticated(p_id, g_id, g_nonce_id)? && is_named(p_id)? {
+                        p_live = true;
+                        return Ok(false);
+                    }
+                    Ok(true)
+                })?;
+                if p_live {
+                    found_live = true;
+                    return Ok(false);
+                }
+                Ok(true)
+            })?;
+            if found_live {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Scan all quads in `g`, up to `limit`, returning:
     /// - the non-matching quads `([s, p, o, g], Triple)` whose `[s, p, o]` is not in `keep`,
     /// - the subset of `keep` that is present in `g`, and

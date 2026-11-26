@@ -13847,9 +13847,12 @@ A map follows the matches of the identity graphs it was built from. When one of 
 leaves the boundary, or is detached and protected again so that its proposals no longer
 authenticate, reviews and reads under the policy answer `503 projection-unavailable`
 until the boundary is restored or an administrator rebuilds the map. A new graph added
-to the boundary with no current accepted proposals keeps the map available, while
-re-adding a boundary graph that holds current accepted proposals answers
-`503 projection-unavailable` until rebuilt.
+to the boundary with no current accepted proposals keeps the map available for unmasked
+callers, while an added boundary graph that holds current accepted proposals answers
+`503 projection-unavailable` until rebuilt. A caller whose view masks triples also
+receives `503 projection-unavailable` whenever the boundary includes an added identity
+graph not yet recorded on the latest revision, so the map status never discloses
+whether a masked acceptance exists in the added graph.
 
 `POST /$/evidence/{ds}/identities/rebuild` rebuilds a matching policy's resolution map
 on `main` or on a selected `?branch=NAME`. It needs unrestricted `admin` on the dataset
@@ -13902,7 +13905,7 @@ it.
 | `400` | The body is malformed or the policy is unknown. |
 | `403` | The caller may not read a graph of the policy. |
 | `422 incomplete-evidence` | A cluster's records exceed 10,000. |
-| `503 projection-unavailable` | A graph of the policy was detached and protected again, an identity graph the map was built from left the boundary, or the output holds a map without a revision. |
+| `503 projection-unavailable` | A graph of the policy was detached and protected again, an identity graph the map was built from left the boundary, an added boundary graph holds current accepted proposals or is unrecorded under a triple-masked view, or the output holds a map without a revision. |
 
 `GET /$/server` lists the route in `capabilities.claims.identities`.
 

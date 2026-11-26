@@ -1212,10 +1212,13 @@ an identity graph that has left the boundary or carries another nonce, and an ou
 that holds triples while no revision exists answer `projection-unavailable`. The
 clusters before an operation are recomputed from the boundary, so a map whose matches
 are no longer read would otherwise keep stale triples for entities the operation does
-not reach. A new graph added to the boundary with no current accepted proposals under
-the policy keeps the map available, while re-adding a boundary graph that holds
+not reach. A new graph added to the boundary with no current accepted proposals under the policy
+keeps the map available for unmasked callers, while an added boundary graph that holds
 authenticated proposals with current accepted decisions answers `projection-unavailable`
-until a rebuild reconciles the map. An administrator can rebuild a map
+until a rebuild reconciles the map. A caller whose view masks triples also receives
+`projection-unavailable` whenever the boundary includes an added identity graph not yet
+recorded on the latest revision, so the status depends only on caller-visible boundary
+state and never discloses whether a masked acceptance exists. An administrator can rebuild a map
 after a boundary or protection change through `sparkles::evidence::rebuild_resolution_map`
 and `POST /$/evidence/{ds}/identities/rebuild`, as described in
 [Rebuilding a resolution map after a boundary change](#rebuilding-a-resolution-map-after-a-boundary-change). A split is a superseding rejection, and accepting the
