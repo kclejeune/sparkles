@@ -375,6 +375,10 @@ pub(crate) fn write_git_tree_tracked(
         if meta_candidate.is_dir() {
             preflight_optional_child_dir_no_symlink(&meta_candidate, STAGING_SUBDIR)?;
         }
+        let graphs_candidate = clean_dir.join(GRAPHS_DIR);
+        if graphs_candidate.is_dir() {
+            preflight_optional_child_dir_no_symlink(&graphs_candidate, GRAPH_STAGING_SUBDIR)?;
+        }
         let manifest_path = resolve_safe_path(&clean_dir, MANIFEST_REL_PATH)?;
         let prior = read_prior_owned_graph_paths(&manifest_path, options.max_manifest_bytes)?;
         let pending_path = resolve_safe_path(&clean_dir, PENDING_WRITE_REL_PATH)?;
@@ -507,17 +511,41 @@ pub(crate) fn write_git_tree_tracked(
     }
 
     // 6. Now create target and managed directories safely. Staging temporaries live under
-    //    `.sparkles-git/staging/` (outside `graphs/`) so an abrupt process crash never leaves
-    //    unlisted temp files inside `graphs/`.
+    //    `.sparkles-git/staging/` (outside `graphs/`) on single-mount trees so an abrupt
+    //    process crash never leaves unlisted temp files inside `graphs/`. When `graphs/` is
+    //    on a separate mount, stage graphs in `graphs/.sparkles-staging/` so atomic rename
+    //    stays same-filesystem and retry still cleans up orphaned temporaries.
     let clean_dir = ensure_dir_no_symlink(&clean_dir)?;
     let meta_dir = ensure_child_dir_no_symlink(&clean_dir, METADATA_DIR)?;
     let staging_dir = ensure_child_dir_no_symlink(&meta_dir, STAGING_SUBDIR)?;
     cleanup_stale_staging_files(&staging_dir)?;
     let graphs_dir = ensure_child_dir_no_symlink(&clean_dir, GRAPHS_DIR)?;
+    let graph_local_staging_candidate = graphs_dir.join(GRAPH_STAGING_SUBDIR);
+    match fs::symlink_metadata(&graph_local_staging_candidate) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                return Err(GitError::UnsafePath {
+                    path: format!("{GRAPHS_DIR}/{GRAPH_STAGING_SUBDIR}"),
+                    reason: "graph staging path must be a real directory".into(),
+                });
+            }
+            cleanup_stale_staging_files(&graph_local_staging_candidate)?;
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(GitError::io(&graph_local_staging_candidate, e)),
+    }
+    let graphs_same_fs = same_filesystem(&staging_dir, &graphs_dir)?;
+    let mut used_graph_local_staging = !graphs_same_fs;
+    let graph_staging_dir = if graphs_same_fs {
+        let _ = fs::remove_dir(&graph_local_staging_candidate);
+        staging_dir.clone()
+    } else {
+        ensure_child_dir_no_symlink(&graphs_dir, GRAPH_STAGING_SUBDIR)?
+    };
     let manifest_path = resolve_safe_path(&clean_dir, MANIFEST_REL_PATH)?;
 
     // 7. Stream each graph into an exclusively created temp file (`TempPath`, closing the
-    //    descriptor immediately) inside `.sparkles-git/staging/` while enforcing per-file
+    //    descriptor immediately) inside `graph_staging_dir` while enforcing per-file
     //    and aggregate byte limits so an over-limit write fails atomically without leaving
     //    partial files in `graphs/`.
     let mut total_bytes_written = 0u64;
@@ -530,15 +558,18 @@ pub(crate) fn write_git_tree_tracked(
         let remaining = options.max_total_bytes.saturating_sub(total_bytes_written);
         let file_cap = options.max_graph_file_bytes.min(remaining);
 
-        let (temp_path, written, digest) =
-            stage_atomic_stream_hashed_in(&staging_dir, &full_path, &rel_path, file_cap, |w| {
-                match options.syntax {
-                    CanonicalSyntax::Turtle => {
-                        write_canonical_turtle(&graph_quads, &merged_prefixes, w)
-                    }
-                    CanonicalSyntax::NQuads => write_canonical_nquads(&graph_quads, w),
+        let (temp_path, written, digest) = stage_atomic_stream_hashed_in(
+            &graph_staging_dir,
+            &full_path,
+            &rel_path,
+            file_cap,
+            |w| match options.syntax {
+                CanonicalSyntax::Turtle => {
+                    write_canonical_turtle(&graph_quads, &merged_prefixes, w)
                 }
-            })?;
+                CanonicalSyntax::NQuads => write_canonical_nquads(&graph_quads, w),
+            },
+        )?;
         drop(graph_quads);
         total_bytes_written = total_bytes_written.saturating_add(written);
         staged_graphs.push((temp_path, full_path));
@@ -616,15 +647,23 @@ pub(crate) fn write_git_tree_tracked(
             in_flight_graphs.insert(rel, sha);
         }
     }
-    let pending_write = PendingTreeWrite {
-        format_version: PENDING_WRITE_FORMAT_VERSION,
-        prior_graphs: pending_prior_graphs,
-        target_graphs,
-        in_flight_graphs,
-    };
-    let pending_bytes = serde_json::to_vec(&pending_write).map_err(|e| {
-        GitError::InvalidManifest(format!("failed to serialize pending write: {e}"))
-    })?;
+    let pending_bytes = if in_flight_graphs.is_empty() {
+        let v1 = PendingTreeWriteV1 {
+            format_version: PENDING_WRITE_FORMAT_VERSION_V1,
+            prior_graphs: pending_prior_graphs,
+            target_graphs,
+        };
+        serde_json::to_vec(&v1)
+    } else {
+        let v2 = PendingTreeWrite {
+            format_version: PENDING_WRITE_FORMAT_VERSION,
+            prior_graphs: pending_prior_graphs,
+            target_graphs,
+            in_flight_graphs,
+        };
+        serde_json::to_vec(&v2)
+    }
+    .map_err(|e| GitError::InvalidManifest(format!("failed to serialize pending write: {e}")))?;
     let pending_cap = max_pending_write_bytes(options.max_manifest_bytes);
     if pending_bytes.len() as u64 > pending_cap {
         return Err(GitError::Format(format!(
@@ -641,9 +680,48 @@ pub(crate) fn write_git_tree_tracked(
     let wrote_graphs = !staged_graphs.is_empty();
     for (idx, (temp_path, full_path)) in staged_graphs.into_iter().enumerate() {
         check_dest_file_not_symlink(&full_path)?;
-        temp_path
-            .persist(&full_path)
-            .map_err(|e| GitError::io(&full_path, e.error))?;
+        let persist_res = {
+            #[cfg(test)]
+            let inject_exdev = profile_test_hooks::take_inject_graph_persist_exdev();
+            #[cfg(not(test))]
+            let inject_exdev = false;
+            if inject_exdev {
+                Err(tempfile::PathPersistError {
+                    error: io::Error::from(io::ErrorKind::CrossesDevices),
+                    path: temp_path,
+                })
+            } else {
+                temp_path.persist(&full_path)
+            }
+        };
+        match persist_res {
+            Ok(()) => {}
+            Err(e) if e.error.kind() == io::ErrorKind::CrossesDevices => {
+                // `graphs/` is on a separate mount from `.sparkles-git/staging/`: restage
+                // inside `graphs/.sparkles-staging/` so the rename stays same-filesystem and
+                // retry cleanup can reclaim any temporary left by an abrupt crash.
+                let local_staging = ensure_child_dir_no_symlink(&graphs_dir, GRAPH_STAGING_SUBDIR)?;
+                used_graph_local_staging = true;
+                let mut src = File::open(&e.path).map_err(|err| GitError::io(&e.path, err))?;
+                let (local_tmp, _, _) = stage_atomic_stream_hashed_in(
+                    &local_staging,
+                    &full_path,
+                    &full_path.display().to_string(),
+                    options.max_graph_file_bytes,
+                    |w| {
+                        io::copy(&mut src, w).map_err(|err| GitError::io(&full_path, err))?;
+                        Ok(())
+                    },
+                )?;
+                drop(src);
+                drop(e.path);
+                check_dest_file_not_symlink(&full_path)?;
+                local_tmp
+                    .persist(&full_path)
+                    .map_err(|err| GitError::io(&full_path, err.error))?;
+            }
+            Err(e) => return Err(GitError::io(&full_path, e.error)),
+        }
         #[cfg(test)]
         if idx == 0 {
             profile_test_hooks::after_first_graph_persist()?;
@@ -680,7 +758,10 @@ pub(crate) fn write_git_tree_tracked(
             }
         }
     }
-    if wrote_graphs || !pruned_paths.is_empty() {
+    if used_graph_local_staging {
+        let _ = fs::remove_dir(graphs_dir.join(GRAPH_STAGING_SUBDIR));
+    }
+    if wrote_graphs || !pruned_paths.is_empty() || used_graph_local_staging {
         fsutil::sync_dir(&graphs_dir).map_err(|e| GitError::io(&graphs_dir, e))?;
     }
 
@@ -704,8 +785,18 @@ pub(crate) fn write_git_tree_tracked(
 }
 
 const PENDING_WRITE_REL_PATH: &str = ".sparkles-git/pending-write.json";
-const PENDING_WRITE_FORMAT_VERSION: u32 = 1;
+const PENDING_WRITE_FORMAT_VERSION_V1: u32 = 1;
+const PENDING_WRITE_FORMAT_VERSION: u32 = 2;
 const STAGING_SUBDIR: &str = "staging";
+const GRAPH_STAGING_SUBDIR: &str = ".sparkles-staging";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingTreeWriteV1 {
+    format_version: u32,
+    prior_graphs: BTreeMap<String, String>,
+    target_graphs: BTreeMap<String, String>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -715,6 +806,21 @@ struct PendingTreeWrite {
     target_graphs: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     in_flight_graphs: BTreeMap<String, String>,
+}
+
+fn same_filesystem(a: &Path, b: &Path) -> GitResult<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let ma = fs::symlink_metadata(a).map_err(|e| GitError::io(a, e))?;
+        let mb = fs::symlink_metadata(b).map_err(|e| GitError::io(b, e))?;
+        Ok(ma.dev() == mb.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        Ok(true)
+    }
 }
 
 fn max_pending_write_bytes(max_manifest_bytes: u64) -> u64 {
@@ -734,7 +840,7 @@ fn cleanup_stale_staging_files(staging_dir: &Path) -> GitResult<()> {
         if meta.file_type().is_symlink() {
             return Err(GitError::UnsafePath {
                 path: path.display().to_string(),
-                reason: "symlink inside .sparkles-git/staging/ is not allowed".into(),
+                reason: "symlink inside staging directory is not allowed".into(),
             });
         }
         if meta.file_type().is_file() && name.to_string_lossy().starts_with(".sparkles-tmp-") {
@@ -792,15 +898,29 @@ fn read_pending_tree_write(
             )
         })?;
     let found = u32::try_from(version_val).unwrap_or(u32::MAX);
-    if found != PENDING_WRITE_FORMAT_VERSION {
-        return Err(GitError::UnsupportedFormatVersion {
-            file: PENDING_WRITE_REL_PATH.to_string(),
-            found,
-            supported: PENDING_WRITE_FORMAT_VERSION,
-        });
-    }
-    let pending: PendingTreeWrite = serde_json::from_value(raw)
-        .map_err(|e| GitError::InvalidManifest(format!("invalid pending write fields: {e}")))?;
+    let pending = match found {
+        PENDING_WRITE_FORMAT_VERSION_V1 => {
+            let v1: PendingTreeWriteV1 = serde_json::from_value(raw).map_err(|e| {
+                GitError::InvalidManifest(format!("invalid v1 pending write fields: {e}"))
+            })?;
+            PendingTreeWrite {
+                format_version: v1.format_version,
+                prior_graphs: v1.prior_graphs,
+                target_graphs: v1.target_graphs,
+                in_flight_graphs: BTreeMap::new(),
+            }
+        }
+        PENDING_WRITE_FORMAT_VERSION => serde_json::from_value(raw).map_err(|e| {
+            GitError::InvalidManifest(format!("invalid v2 pending write fields: {e}"))
+        })?,
+        _ => {
+            return Err(GitError::UnsupportedFormatVersion {
+                file: PENDING_WRITE_REL_PATH.to_string(),
+                found,
+                supported: PENDING_WRITE_FORMAT_VERSION,
+            });
+        }
+    };
     for (rel, sha) in pending
         .prior_graphs
         .iter()
@@ -3619,6 +3739,7 @@ mod profile_test_hooks {
         pub exit_after_first_graph_persist: Option<i32>,
         pub fail_after_first_graph_prune: bool,
         pub fail_after_manifest_persist: bool,
+        pub inject_graph_persist_exdev: bool,
     }
 
     thread_local! {
@@ -3694,6 +3815,13 @@ mod profile_test_hooks {
                 });
             }
             Ok(())
+        })
+    }
+
+    pub(super) fn take_inject_graph_persist_exdev() -> bool {
+        FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            std::mem::take(&mut s.inject_graph_persist_exdev)
         })
     }
 }
@@ -3956,7 +4084,7 @@ mod tests {
                 err_ver,
                 GitError::UnsupportedFormatVersion {
                     found: 99,
-                    supported: 1,
+                    supported: PENDING_WRITE_FORMAT_VERSION,
                     ..
                 }
             ),
@@ -4220,5 +4348,183 @@ mod tests {
         let report = verify_git_tree(dir.path()).unwrap();
         assert_eq!(report.graph_count, 2);
         assert_eq!(report.quad_count, 2);
+    }
+
+    #[test]
+    fn pending_write_versions_v1_and_v2_are_strictly_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        let q1 = Quad::new(
+            NamedNode::new_unchecked("http://example.org/s1"),
+            NamedNode::new_unchecked("http://example.org/p"),
+            Literal::from(1i64),
+            GraphName::DefaultGraph,
+        );
+        let q2 = Quad::new(
+            NamedNode::new_unchecked("http://example.org/s2"),
+            NamedNode::new_unchecked("http://example.org/p"),
+            Literal::from(2i64),
+            GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/g2")),
+        );
+        let m1 = write_git_tree(
+            vec![q1.clone()],
+            &BTreeMap::new(),
+            dir.path(),
+            &WriteOptions::default(),
+        )
+        .unwrap();
+        let prior_map: BTreeMap<String, String> = m1
+            .graphs
+            .iter()
+            .map(|g| (g.path.clone(), g.sha256.clone()))
+            .collect();
+
+        // 1. Legacy v1 record (without `in_flight_graphs`) is accepted and recovered.
+        let legacy_v1 = serde_json::json!({
+            "format_version": 1,
+            "prior_graphs": prior_map,
+            "target_graphs": prior_map,
+        });
+        fs::write(
+            dir.path().join(PENDING_WRITE_REL_PATH),
+            serde_json::to_vec(&legacy_v1).unwrap(),
+        )
+        .unwrap();
+        write_git_tree(
+            vec![q1.clone()],
+            &BTreeMap::new(),
+            dir.path(),
+            &WriteOptions::default(),
+        )
+        .unwrap();
+        assert!(!dir.path().join(PENDING_WRITE_REL_PATH).exists());
+
+        // 2. A v1 record carrying the v2-only `in_flight_graphs` field must be rejected.
+        let bad_v1 = serde_json::json!({
+            "format_version": 1,
+            "prior_graphs": prior_map,
+            "target_graphs": prior_map,
+            "in_flight_graphs": prior_map,
+        });
+        fs::write(
+            dir.path().join(PENDING_WRITE_REL_PATH),
+            serde_json::to_vec(&bad_v1).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            write_git_tree(
+                vec![q1.clone()],
+                &BTreeMap::new(),
+                dir.path(),
+                &WriteOptions::default(),
+            ),
+            Err(GitError::InvalidManifest(_))
+        ));
+        fs::remove_file(dir.path().join(PENDING_WRITE_REL_PATH)).unwrap();
+
+        // 3. Chained interruption with surviving in-flight graph writes format_version 2.
+        {
+            let _g = profile_test_hooks::install(profile_test_hooks::FaultState {
+                fail_after_first_graph_persist: true,
+                ..Default::default()
+            });
+            assert!(
+                write_git_tree(
+                    vec![q2.clone()],
+                    &BTreeMap::new(),
+                    dir.path(),
+                    &WriteOptions::default(),
+                )
+                .is_err()
+            );
+        }
+        {
+            let _g = profile_test_hooks::install(profile_test_hooks::FaultState {
+                fail_after_pending_write: true,
+                ..Default::default()
+            });
+            assert!(
+                write_git_tree(
+                    vec![q1.clone()],
+                    &BTreeMap::new(),
+                    dir.path(),
+                    &WriteOptions::default(),
+                )
+                .is_err()
+            );
+        }
+        let pending_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.path().join(PENDING_WRITE_REL_PATH)).unwrap())
+                .unwrap();
+        assert_eq!(pending_json["format_version"], PENDING_WRITE_FORMAT_VERSION);
+        assert!(
+            !pending_json["in_flight_graphs"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+
+        // Recovery of v2 succeeds cleanly.
+        write_git_tree(
+            vec![q1],
+            &BTreeMap::new(),
+            dir.path(),
+            &WriteOptions::default(),
+        )
+        .unwrap();
+        verify_git_tree(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn direct_write_handles_cross_device_graph_persist_and_cleans_local_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let q1 = Quad::new(
+            NamedNode::new_unchecked("http://example.org/s1"),
+            NamedNode::new_unchecked("http://example.org/p"),
+            Literal::from(1i64),
+            GraphName::DefaultGraph,
+        );
+        let q2 = Quad::new(
+            NamedNode::new_unchecked("http://example.org/s2"),
+            NamedNode::new_unchecked("http://example.org/p"),
+            Literal::from(2i64),
+            GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/g2")),
+        );
+
+        // 1. Injected EXDEV at graph persist succeeds via `graphs/.sparkles-staging/` and
+        //    removes the temporary staging directory before returning.
+        {
+            let _g = profile_test_hooks::install(profile_test_hooks::FaultState {
+                inject_graph_persist_exdev: true,
+                ..Default::default()
+            });
+            write_git_tree(
+                vec![q1.clone(), q2.clone()],
+                &BTreeMap::new(),
+                dir.path(),
+                &WriteOptions::default(),
+            )
+            .unwrap();
+        }
+        let local_staging = dir.path().join(GRAPHS_DIR).join(GRAPH_STAGING_SUBDIR);
+        assert!(
+            !local_staging.exists(),
+            "temporary graph staging directory must be removed after EXDEV fallback"
+        );
+        let report = verify_git_tree(dir.path()).unwrap();
+        assert_eq!(report.graph_count, 2);
+
+        // 2. Orphaned temp file left inside `graphs/.sparkles-staging/` after an abrupt crash
+        //    is cleaned up on retry and passes strict verification.
+        fs::create_dir(&local_staging).unwrap();
+        fs::write(local_staging.join(".sparkles-tmp-orphan"), b"partial").unwrap();
+        write_git_tree(
+            vec![q1, q2],
+            &BTreeMap::new(),
+            dir.path(),
+            &WriteOptions::default(),
+        )
+        .unwrap();
+        assert!(!local_staging.exists());
+        verify_git_tree(dir.path()).unwrap();
     }
 }

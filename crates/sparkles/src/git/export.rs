@@ -10,14 +10,16 @@
 use crate::Dataset;
 use crate::branch::{CommitRef, MAIN, NamedCommitRef};
 use crate::commit::{CommitInfo, CommitKind, CommitRange, rfc3339_ms};
+#[cfg(not(unix))]
+use crate::git::profile::open_regular_file_no_symlink;
 use crate::git::profile::{
     CanonicalSyntax, DEFAULT_MAX_MANIFEST_BYTES, GRAPHS_DIR, MANIFEST_FORMAT_VERSION,
     MANIFEST_REL_PATH, METADATA_DIR, WriteOptions, check_dest_file_not_symlink, effective_parent,
     ensure_child_dir_no_symlink, ensure_dir_no_symlink, normalize_dir_for_lstat,
-    open_regular_file_no_symlink, read_bounded_regular_file, reject_duplicate_json_keys,
-    resolve_safe_path, resolve_safe_path_allow_leaf_symlink, sanitize_slug, sha256_hex,
-    validate_relative_path, verify_existing_dir_no_symlink, verify_no_symlink_components,
-    write_atomic_safe, write_snapshot_git_tree_tracked,
+    read_bounded_regular_file, reject_duplicate_json_keys, resolve_safe_path,
+    resolve_safe_path_allow_leaf_symlink, sanitize_slug, sha256_hex, validate_relative_path,
+    verify_existing_dir_no_symlink, verify_no_symlink_components, write_atomic_safe,
+    write_snapshot_git_tree_tracked,
 };
 use crate::git::{GitError, GitResult};
 use crate::history::{At, HistoryOptions};
@@ -26,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use sparkles_core::jobs::Sha256Stream;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -2408,20 +2410,16 @@ struct GitIndexLock {
 }
 
 impl GitIndexLock {
-    fn acquire(git_dir: &Path, lock_token: &str, allow_reclaim: bool) -> GitResult<Self> {
-        let lock_path = git_dir.join("index.lock");
-        let payload = index_lock_payload(lock_token);
-        let sparkles_dir = ensure_child_dir_no_symlink(git_dir, DEFAULT_SPARKLES_GIT_SUBDIR)?;
-        let staging_dir = ensure_child_dir_no_symlink(&sparkles_dir, DEFAULT_STAGING_SUBDIR)?;
-
-        // Stage the ownership payload into a temp file, sync it, and lock its inode BEFORE
-        // linking it into `.git/index.lock` so `.git/index.lock` is never visible empty.
+    fn stage_initialized_lock_file(
+        dir: &Path,
+        payload: &[u8],
+    ) -> GitResult<tempfile::NamedTempFile> {
         let mut tmp = tempfile::Builder::new()
-            .prefix("index-lock-")
-            .tempfile_in(&staging_dir)
-            .map_err(|e| GitError::io(&staging_dir, e))?;
+            .prefix(".sparkles-index-lock-")
+            .tempfile_in(dir)
+            .map_err(|e| GitError::io(dir, e))?;
         tmp.as_file_mut()
-            .write_all(&payload)
+            .write_all(payload)
             .map_err(|e| GitError::io(tmp.path(), e))?;
         tmp.as_file()
             .sync_all()
@@ -2429,17 +2427,65 @@ impl GitIndexLock {
         tmp.as_file()
             .try_lock()
             .map_err(|e| GitError::io(tmp.path(), io::Error::other(e.to_string())))?;
+        Ok(tmp)
+    }
 
-        match fs::hard_link(tmp.path(), &lock_path) {
+    fn try_hard_link_lock(src: &Path, dst: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        if test_hooks::simulate_index_lock_hard_link_unsupported() {
+            return Err(io::Error::from(io::ErrorKind::Unsupported));
+        }
+        fs::hard_link(src, dst)
+    }
+
+    fn try_rename_noreplace_lock(src: &Path, dst: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        if test_hooks::simulate_index_lock_noreplace_unsupported() {
+            return Err(io::Error::from(io::ErrorKind::Unsupported));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            renameat2_noreplace_path(src, dst)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (src, dst);
+            Err(io::Error::from(io::ErrorKind::Unsupported))
+        }
+    }
+
+    fn acquire(git_dir: &Path, lock_token: &str, allow_reclaim: bool) -> GitResult<Self> {
+        let lock_path = git_dir.join("index.lock");
+        let payload = index_lock_payload(lock_token);
+        let sparkles_dir = ensure_child_dir_no_symlink(git_dir, DEFAULT_SPARKLES_GIT_SUBDIR)?;
+        let staging_dir = ensure_child_dir_no_symlink(&sparkles_dir, DEFAULT_STAGING_SUBDIR)?;
+
+        // Stage the ownership payload into a temp file, sync it, and lock its inode BEFORE
+        // publishing it into `.git/index.lock` so `.git/index.lock` is never visible empty or
+        // unlocked.
+        let mut tmp = Self::stage_initialized_lock_file(&staging_dir, &payload)?;
+        let mut link_res = Self::try_hard_link_lock(tmp.path(), &lock_path);
+        if let Err(ref e) = link_res
+            && e.kind() == io::ErrorKind::CrossesDevices
+        {
+            drop(tmp);
+            tmp = Self::stage_initialized_lock_file(git_dir, &payload)?;
+            link_res = Self::try_hard_link_lock(tmp.path(), &lock_path);
+        }
+
+        match link_res {
             Ok(()) => {
                 let (file, tmp_path) = tmp.into_parts();
-                let _ = fs::remove_file(&tmp_path);
-                crate::fsutil::sync_dir(git_dir).map_err(|e| GitError::io(git_dir, e))?;
-                Ok(Self {
+                // Arm the guard immediately on publication so a later `sync_dir` error still
+                // cleans up our owned `.git/index.lock`.
+                let guard = Self {
                     lock_path,
                     _file: Some(file),
                     committed: false,
-                })
+                };
+                let _ = fs::remove_file(&tmp_path);
+                crate::fsutil::sync_dir(git_dir).map_err(|e| GitError::io(git_dir, e))?;
+                Ok(guard)
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 drop(tmp);
@@ -2452,52 +2498,52 @@ impl GitIndexLock {
             Err(e)
                 if matches!(
                     e.kind(),
-                    io::ErrorKind::Unsupported
-                        | io::ErrorKind::CrossesDevices
-                        | io::ErrorKind::PermissionDenied
+                    io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
                 ) =>
             {
-                drop(tmp);
-                Self::acquire_create_new(git_dir, &lock_path, &payload, allow_reclaim)
+                // Fallback only via atomic no-replace publication of the ALREADY written,
+                // synced, and locked inode. Never create an empty unlocked `.git/index.lock`.
+                let mut rename_res = Self::try_rename_noreplace_lock(tmp.path(), &lock_path);
+                if let Err(ref e2) = rename_res
+                    && e2.kind() == io::ErrorKind::CrossesDevices
+                {
+                    drop(tmp);
+                    tmp = Self::stage_initialized_lock_file(git_dir, &payload)?;
+                    rename_res = Self::try_rename_noreplace_lock(tmp.path(), &lock_path);
+                }
+                match rename_res {
+                    Ok(()) => {
+                        let (file, tmp_path) = tmp.into_parts();
+                        let _ = tmp_path.keep();
+                        let guard = Self {
+                            lock_path,
+                            _file: Some(file),
+                            committed: false,
+                        };
+                        crate::fsutil::sync_dir(git_dir)
+                            .map_err(|err| GitError::io(git_dir, err))?;
+                        Ok(guard)
+                    }
+                    Err(e2) if e2.kind() == io::ErrorKind::AlreadyExists => {
+                        drop(tmp);
+                        if allow_reclaim {
+                            Self::try_reclaim(&lock_path, &payload)
+                        } else {
+                            Err(Self::busy_error(&lock_path))
+                        }
+                    }
+                    Err(e2) => {
+                        drop(tmp);
+                        Err(GitError::InvalidMapping(format!(
+                            "cannot atomically publish initialized Git index lock at {} without \
+                             hard links ({e}) or RENAME_NOREPLACE ({e2})",
+                            lock_path.display()
+                        )))
+                    }
+                }
             }
             Err(e) => Err(GitError::io(&lock_path, e)),
         }
-    }
-
-    fn acquire_create_new(
-        git_dir: &Path,
-        lock_path: &Path,
-        payload: &[u8],
-        allow_reclaim: bool,
-    ) -> GitResult<Self> {
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.custom_flags(libc::O_NOFOLLOW);
-        }
-        let mut file = match opts.open(lock_path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                if allow_reclaim {
-                    return Self::try_reclaim(lock_path, payload);
-                }
-                return Err(Self::busy_error(lock_path));
-            }
-            Err(e) => return Err(GitError::io(lock_path, e)),
-        };
-        file.try_lock()
-            .map_err(|e| GitError::io(lock_path, io::Error::other(e.to_string())))?;
-        file.write_all(payload)
-            .map_err(|e| GitError::io(lock_path, e))?;
-        file.sync_all().map_err(|e| GitError::io(lock_path, e))?;
-        crate::fsutil::sync_dir(git_dir).map_err(|e| GitError::io(git_dir, e))?;
-        Ok(Self {
-            lock_path: lock_path.to_path_buf(),
-            _file: Some(file),
-            committed: false,
-        })
     }
 
     fn try_reclaim(lock_path: &Path, expected_payload: &[u8]) -> GitResult<Self> {
@@ -2593,9 +2639,13 @@ impl GitIndexLock {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(GitError::io(&self.lock_path, e)),
         }
-        crate::fsutil::sync_dir(git_dir).map_err(|e| GitError::io(git_dir, e))?;
+        // Retire lock-guard authority immediately once `.git/index.lock` is unlinked so a
+        // post-unlink `sync_dir` failure cannot unlink a successor lock acquired by Git.
         self.committed = true;
         self._file.take();
+        #[cfg(test)]
+        test_hooks::after_index_lock_unlink_before_sync(&self.lock_path)?;
+        crate::fsutil::sync_dir(git_dir).map_err(|e| GitError::io(git_dir, e))?;
         Ok(())
     }
 }
@@ -2952,8 +3002,10 @@ fn drain_and_hash_reader(reader: &mut dyn Read, hasher: &mut Sha256Stream) -> io
 /// Stream-compare a working-tree path against a raw Git blob reader in bounded chunks while
 /// computing the blob's SHA-256 digest.
 ///
-/// Uses [`resolve_safe_path_allow_leaf_symlink`] for tracked `120000` symlinks and
-/// [`resolve_safe_path`] for regular files, and checks Git's owner execute bit (`0o100`).
+/// On Unix, walks ancestor directories via `VerifiedDir` (`O_DIRECTORY | O_NOFOLLOW`) and
+/// reads leaves with `fstatat` / `readlinkat` / `openat(..., O_NOFOLLOW | O_NONBLOCK)` so
+/// changed ancestor symlinks cannot escape the verified worktree. Checks Git's owner
+/// execute bit (`0o100`).
 fn stream_compare_and_hash_worktree_entry(
     clean_repo: &Path,
     rel: &str,
@@ -2962,81 +3014,92 @@ fn stream_compare_and_hash_worktree_entry(
     blob_reader: &mut dyn Read,
     check_filemode: bool,
 ) -> GitResult<(bool, String)> {
-    let mut hasher = Sha256Stream::new();
-    if expected.mode == "120000" {
-        const MAX_SYMLINK_TARGET_BYTES: u64 = 64 * 1024;
-        if blob_size > MAX_SYMLINK_TARGET_BYTES {
-            let _ = drain_and_hash_reader(blob_reader, &mut hasher);
-            return Ok((false, hasher.finalize_hex()));
-        }
-        let mut target_blob = Vec::with_capacity(blob_size as usize);
-        blob_reader
-            .read_to_end(&mut target_blob)
-            .map_err(|e| GitError::GitCommand {
-                args: vec!["cat-file".into(), "--batch".into()],
-                status: None,
-                stderr: e.to_string(),
-            })?;
-        hasher.update(&target_blob);
-        let digest = hasher.finalize_hex();
-        let full = resolve_safe_path_allow_leaf_symlink(clean_repo, rel)?;
-        let meta = match fs::symlink_metadata(&full) {
-            Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((false, digest)),
-            Err(e) => return Err(GitError::io(&full, e)),
-        };
-        if !meta.file_type().is_symlink() {
-            return Ok((false, digest));
-        }
-        let target = fs::read_link(&full).map_err(|e| GitError::io(&full, e))?;
-        return Ok((
-            target.as_os_str().as_encoded_bytes() == target_blob.as_slice(),
-            digest,
-        ));
-    }
-
-    if expected.mode != "100644" && expected.mode != "100755" {
-        let _ = drain_and_hash_reader(blob_reader, &mut hasher);
-        return Ok((false, hasher.finalize_hex()));
-    }
-
-    let full = resolve_safe_path(clean_repo, rel)?;
-    let meta = match fs::symlink_metadata(&full) {
-        Ok(m) => m,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let _ = drain_and_hash_reader(blob_reader, &mut hasher);
-            return Ok((false, hasher.finalize_hex()));
-        }
-        Err(e) => return Err(GitError::io(&full, e)),
-    };
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-        let _ = drain_and_hash_reader(blob_reader, &mut hasher);
-        return Ok((false, hasher.finalize_hex()));
-    }
     #[cfg(unix)]
-    if check_filemode {
-        use std::os::unix::fs::PermissionsExt;
-        // Git maps regular files to 100755 vs 100644 strictly using the owner execute bit.
-        let is_exec = (meta.permissions().mode() & 0o100) != 0;
-        let expect_exec = expected.mode == "100755";
-        if is_exec != expect_exec {
-            let _ = drain_and_hash_reader(blob_reader, &mut hasher);
-            return Ok((false, hasher.finalize_hex()));
-        }
+    {
+        let root_dir = dirfd_ops::VerifiedDir::open_root(clean_repo)?;
+        dirfd_ops::stream_compare_and_hash_worktree_entry_at(
+            &root_dir,
+            rel,
+            expected,
+            blob_size,
+            blob_reader,
+            check_filemode,
+        )
     }
     #[cfg(not(unix))]
-    let _ = check_filemode;
+    {
+        let mut hasher = Sha256Stream::new();
+        if expected.mode == "120000" {
+            const MAX_SYMLINK_TARGET_BYTES: u64 = 64 * 1024;
+            if blob_size > MAX_SYMLINK_TARGET_BYTES {
+                let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+                return Ok((false, hasher.finalize_hex()));
+            }
+            let mut target_blob = Vec::with_capacity(blob_size as usize);
+            blob_reader
+                .read_to_end(&mut target_blob)
+                .map_err(|e| GitError::GitCommand {
+                    args: vec!["cat-file".into(), "--batch".into()],
+                    status: None,
+                    stderr: e.to_string(),
+                })?;
+            hasher.update(&target_blob);
+            let digest = hasher.finalize_hex();
+            let full = resolve_safe_path_allow_leaf_symlink(clean_repo, rel)?;
+            let meta = match fs::symlink_metadata(&full) {
+                Ok(m) => m,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((false, digest)),
+                Err(e) => return Err(GitError::io(&full, e)),
+            };
+            if !meta.file_type().is_symlink() {
+                return Ok((false, digest));
+            }
+            let target = fs::read_link(&full).map_err(|e| GitError::io(&full, e))?;
+            return Ok((
+                target.as_os_str().as_encoded_bytes() == target_blob.as_slice(),
+                digest,
+            ));
+        }
 
-    if meta.len() != blob_size {
-        let _ = drain_and_hash_reader(blob_reader, &mut hasher);
-        return Ok((false, hasher.finalize_hex()));
-    }
-    let (mut file, actual_len) = open_regular_file_no_symlink(&full, rel)?;
-    if actual_len != blob_size {
-        let _ = drain_and_hash_reader(blob_reader, &mut hasher);
-        return Ok((false, hasher.finalize_hex()));
-    }
+        if expected.mode != "100644" && expected.mode != "100755" {
+            let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+            return Ok((false, hasher.finalize_hex()));
+        }
 
+        let full = resolve_safe_path(clean_repo, rel)?;
+        let meta = match fs::symlink_metadata(&full) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+                return Ok((false, hasher.finalize_hex()));
+            }
+            Err(e) => return Err(GitError::io(&full, e)),
+        };
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+            let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+            return Ok((false, hasher.finalize_hex()));
+        }
+        let _ = check_filemode;
+
+        if meta.len() != blob_size {
+            let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+            return Ok((false, hasher.finalize_hex()));
+        }
+        let (mut file, actual_len) = open_regular_file_no_symlink(&full, rel)?;
+        if actual_len != blob_size {
+            let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+            return Ok((false, hasher.finalize_hex()));
+        }
+        stream_compare_open_file_and_blob(&mut file, &full, blob_reader, hasher)
+    }
+}
+
+fn stream_compare_open_file_and_blob(
+    file: &mut File,
+    path_for_err: &Path,
+    blob_reader: &mut dyn Read,
+    mut hasher: Sha256Stream,
+) -> GitResult<(bool, String)> {
     let mut blob_buf = [0u8; 64 * 1024];
     let mut file_buf = [0u8; 64 * 1024];
     let mut matched = true;
@@ -3057,7 +3120,7 @@ fn stream_compare_and_hash_worktree_entry(
             while got < n {
                 let r = file
                     .read(&mut file_buf[got..n])
-                    .map_err(|e| GitError::io(&full, e))?;
+                    .map_err(|e| GitError::io(path_for_err, e))?;
                 if r == 0 {
                     matched = false;
                     break;
@@ -3071,20 +3134,1203 @@ fn stream_compare_and_hash_worktree_entry(
     }
     if matched {
         let mut extra = [0u8; 1];
-        if file.read(&mut extra).map_err(|e| GitError::io(&full, e))? != 0 {
+        if file
+            .read(&mut extra)
+            .map_err(|e| GitError::io(path_for_err, e))?
+            != 0
+        {
             matched = false;
         }
     }
     Ok((matched, hasher.finalize_hex()))
 }
 
-/// Stream-verify an on-disk path against an [`ExpectedFileContent`] without buffering the
-/// full file in memory.
+#[cfg(target_os = "linux")]
+fn renameat2_noreplace_path(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let ca = CString::new(src.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let cb = CString::new(dst.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: `ca` and `cb` are valid NUL-terminated C strings passed to Linux `renameat2`
+    // with `AT_FDCWD` and `RENAME_NOREPLACE`.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            ca.as_ptr(),
+            libc::AT_FDCWD,
+            cb.as_ptr(),
+            libc::RENAME_NOREPLACE as libc::c_uint,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+mod dirfd_ops {
+    use super::*;
+    use std::ffi::{CStr, CString};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    const MAX_SYMLINK_TARGET_BYTES: usize = 64 * 1024;
+
+    /// Verified directory file descriptor pinned via `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`.
+    /// All descendant traversals and leaf mutations execute relative to this descriptor so a
+    /// concurrent parent-directory symlink swap cannot escape the verified worktree.
+    pub(super) struct VerifiedDir {
+        fd: OwnedFd,
+        pub(super) display_path: PathBuf,
+    }
+
+    impl VerifiedDir {
+        pub(super) fn open_root(path: &Path) -> GitResult<Self> {
+            let cpath =
+                CString::new(path.as_os_str().as_bytes()).map_err(|_| GitError::UnsafePath {
+                    path: path.display().to_string(),
+                    reason: "directory path contains NUL".into(),
+                })?;
+            // SAFETY: `cpath` is a valid NUL-terminated path passed to `open`.
+            let raw = unsafe {
+                libc::open(
+                    cpath.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if raw < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ELOOP) {
+                    return Err(GitError::UnsafePath {
+                        path: path.display().to_string(),
+                        reason: "directory root must not be a symlink".into(),
+                    });
+                }
+                return Err(GitError::io(path, err));
+            }
+            // SAFETY: `raw` is a newly opened valid file descriptor.
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            Ok(Self {
+                fd,
+                display_path: path.to_path_buf(),
+            })
+        }
+
+        pub(super) fn try_clone(&self) -> GitResult<Self> {
+            let fd = self
+                .fd
+                .try_clone()
+                .map_err(|e| GitError::io(&self.display_path, e))?;
+            Ok(Self {
+                fd,
+                display_path: self.display_path.clone(),
+            })
+        }
+
+        pub(super) fn dev(&self) -> GitResult<u64> {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: `self.fd` is a valid open directory fd and `st` is valid writable memory.
+            let rc = unsafe { libc::fstat(self.fd.as_raw_fd(), &mut st) };
+            if rc != 0 {
+                return Err(GitError::io(&self.display_path, io::Error::last_os_error()));
+            }
+            Ok(st.st_dev as u64)
+        }
+
+        pub(super) fn sync(&self) -> GitResult<()> {
+            // SAFETY: `self.fd` is a valid open directory descriptor.
+            let rc = unsafe { libc::fsync(self.fd.as_raw_fd()) };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(GitError::io(&self.display_path, io::Error::last_os_error()))
+            }
+        }
+
+        fn open_child_dir(
+            &self,
+            segment: &str,
+            create: bool,
+            rel_for_err: &str,
+        ) -> GitResult<Option<Self>> {
+            let cname = CString::new(segment.as_bytes()).map_err(|_| GitError::UnsafePath {
+                path: rel_for_err.to_string(),
+                reason: "path segment contains NUL".into(),
+            })?;
+            let open_once = || {
+                // SAFETY: `self.fd` is a valid directory fd and `cname` is a NUL-terminated segment.
+                unsafe {
+                    libc::openat(
+                        self.fd.as_raw_fd(),
+                        cname.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                }
+            };
+            let mut raw = open_once();
+            if raw < 0 {
+                let err = io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::ELOOP) => {
+                        return Err(GitError::UnsafePath {
+                            path: rel_for_err.to_string(),
+                            reason: format!("symlink component {segment:?} is not allowed"),
+                        });
+                    }
+                    Some(libc::ENOTDIR) => {
+                        return Err(GitError::UnsafePath {
+                            path: rel_for_err.to_string(),
+                            reason: format!("ancestor component {segment:?} is not a directory"),
+                        });
+                    }
+                    Some(libc::ENOENT) => {
+                        if !create {
+                            return Ok(None);
+                        }
+                        // SAFETY: `self.fd` is a valid directory fd and `cname` is NUL-terminated.
+                        let mrc =
+                            unsafe { libc::mkdirat(self.fd.as_raw_fd(), cname.as_ptr(), 0o777) };
+                        if mrc == 0 {
+                            self.sync()?;
+                        } else {
+                            let merr = io::Error::last_os_error();
+                            if merr.kind() != io::ErrorKind::AlreadyExists {
+                                return Err(GitError::io(self.display_path.join(segment), merr));
+                            }
+                        }
+                        raw = open_once();
+                        if raw < 0 {
+                            let err2 = io::Error::last_os_error();
+                            return match err2.raw_os_error() {
+                                Some(libc::ELOOP) => Err(GitError::UnsafePath {
+                                    path: rel_for_err.to_string(),
+                                    reason: format!("symlink component {segment:?} is not allowed"),
+                                }),
+                                Some(libc::ENOTDIR) => Err(GitError::UnsafePath {
+                                    path: rel_for_err.to_string(),
+                                    reason: format!(
+                                        "ancestor component {segment:?} is not a directory"
+                                    ),
+                                }),
+                                _ => Err(GitError::io(self.display_path.join(segment), err2)),
+                            };
+                        }
+                    }
+                    _ => return Err(GitError::io(self.display_path.join(segment), err)),
+                }
+            }
+            // SAFETY: `raw` is a newly opened valid directory fd.
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            Ok(Some(Self {
+                fd,
+                display_path: self.display_path.join(segment),
+            }))
+        }
+
+        pub(super) fn open_parent_for_rel(
+            &self,
+            rel: &str,
+            create: bool,
+        ) -> GitResult<Option<(Self, CString)>> {
+            validate_relative_path(rel)?;
+            let segments: Vec<&str> = rel.split('/').collect();
+            let (leaf, ancestors) = segments.split_last().ok_or_else(|| GitError::UnsafePath {
+                path: rel.to_string(),
+                reason: "relative path must not be empty".into(),
+            })?;
+            let leaf_c = CString::new(leaf.as_bytes()).map_err(|_| GitError::UnsafePath {
+                path: rel.to_string(),
+                reason: "file name contains NUL".into(),
+            })?;
+            let mut cur = self.try_clone()?;
+            for &seg in ancestors {
+                let Some(next) = cur.open_child_dir(seg, create, rel)? else {
+                    return Ok(None);
+                };
+                cur = next;
+            }
+            Ok(Some((cur, leaf_c)))
+        }
+
+        pub(super) fn lstat_at(&self, name: &CStr) -> io::Result<libc::stat> {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: `self.fd` is a valid directory fd, `name` is NUL-terminated, `st` is writable.
+            let rc = unsafe {
+                libc::fstatat(
+                    self.fd.as_raw_fd(),
+                    name.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc == 0 {
+                Ok(st)
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+
+        pub(super) fn open_regular_file_at(
+            &self,
+            name: &CStr,
+            label: &str,
+        ) -> GitResult<(File, u64)> {
+            // SAFETY: `self.fd` is a valid directory fd and `name` is NUL-terminated.
+            let raw = unsafe {
+                libc::openat(
+                    self.fd.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if raw < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ELOOP) {
+                    return Err(GitError::UnsafePath {
+                        path: label.to_string(),
+                        reason: "symlink is not allowed".into(),
+                    });
+                }
+                return Err(GitError::io(self.child_display(name), err));
+            }
+            // SAFETY: `raw` is a newly opened valid file descriptor.
+            let file = unsafe { File::from_raw_fd(raw) };
+            let meta = file
+                .metadata()
+                .map_err(|e| GitError::io(self.child_display(name), e))?;
+            if !meta.file_type().is_file() {
+                return Err(GitError::UnsafePath {
+                    path: label.to_string(),
+                    reason: "path must be a regular file".into(),
+                });
+            }
+            Ok((file, meta.len()))
+        }
+
+        pub(super) fn readlink_at(&self, name: &CStr) -> io::Result<Option<Vec<u8>>> {
+            let mut cap = 256usize;
+            loop {
+                let mut buf = vec![0u8; cap];
+                // SAFETY: `self.fd` is a valid directory fd, `name` is NUL-terminated, and
+                // `buf` has length `cap`.
+                let n = unsafe {
+                    libc::readlinkat(
+                        self.fd.as_raw_fd(),
+                        name.as_ptr(),
+                        buf.as_mut_ptr().cast(),
+                        buf.len(),
+                    )
+                };
+                if n < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let n = n as usize;
+                if n < buf.len() {
+                    buf.truncate(n);
+                    return Ok(Some(buf));
+                }
+                if cap > MAX_SYMLINK_TARGET_BYTES {
+                    return Ok(None);
+                }
+                cap = (cap * 2).min(MAX_SYMLINK_TARGET_BYTES + 1);
+            }
+        }
+
+        pub(super) fn create_staged_file(
+            &self,
+            prefix: &str,
+            target_mode: &str,
+            blob_reader: &mut dyn Read,
+        ) -> GitResult<StagedAtFile> {
+            let name_str = format!("{prefix}{}", Uuid::new_v4());
+            let cname = CString::new(name_str.as_bytes()).map_err(|_| GitError::UnsafePath {
+                path: name_str.clone(),
+                reason: "staging name contains NUL".into(),
+            })?;
+            // SAFETY: `self.fd` is a valid directory fd and `cname` is NUL-terminated.
+            let raw = unsafe {
+                libc::openat(
+                    self.fd.as_raw_fd(),
+                    cname.as_ptr(),
+                    libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o666 as libc::c_uint,
+                )
+            };
+            if raw < 0 {
+                return Err(GitError::io(
+                    self.display_path.join(&name_str),
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: `raw` is a newly created valid file descriptor.
+            let mut file = unsafe { File::from_raw_fd(raw) };
+            let staged_dir = self.try_clone()?;
+            let mut handle = StagedAtFile {
+                dir: staged_dir,
+                name: cname,
+                dev: 0,
+                ino: 0,
+                auto_unlink: true,
+            };
+            {
+                let mut bw = BufWriter::with_capacity(64 * 1024, &mut file);
+                io::copy(blob_reader, &mut bw).map_err(|e| GitError::io(&self.display_path, e))?;
+                bw.flush()
+                    .map_err(|e| GitError::io(&self.display_path, e))?;
+            }
+            if target_mode == "100755" {
+                file.set_permissions(fs::Permissions::from_mode(0o755))
+                    .map_err(|e| GitError::io(self.display_path.join(&name_str), e))?;
+            }
+            file.sync_all()
+                .map_err(|e| GitError::io(self.display_path.join(&name_str), e))?;
+            let meta = file
+                .metadata()
+                .map_err(|e| GitError::io(self.display_path.join(&name_str), e))?;
+            handle.dev = meta.dev();
+            handle.ino = meta.ino();
+            drop(file);
+            Ok(handle)
+        }
+
+        pub(super) fn link_at(
+            &self,
+            old_name: &CStr,
+            new_dir: &VerifiedDir,
+            new_name: &CStr,
+        ) -> io::Result<()> {
+            // SAFETY: Both directory fds are valid and both names are NUL-terminated.
+            let rc = unsafe {
+                libc::linkat(
+                    self.fd.as_raw_fd(),
+                    old_name.as_ptr(),
+                    new_dir.fd.as_raw_fd(),
+                    new_name.as_ptr(),
+                    0,
+                )
+            };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+
+        pub(super) fn rename_at(
+            &self,
+            old_name: &CStr,
+            new_dir: &VerifiedDir,
+            new_name: &CStr,
+        ) -> io::Result<()> {
+            // SAFETY: Both directory fds are valid and both names are NUL-terminated.
+            let rc = unsafe {
+                libc::renameat(
+                    self.fd.as_raw_fd(),
+                    old_name.as_ptr(),
+                    new_dir.fd.as_raw_fd(),
+                    new_name.as_ptr(),
+                )
+            };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+
+        pub(super) fn rename_exchange_at(
+            &self,
+            old_name: &CStr,
+            new_dir: &VerifiedDir,
+            new_name: &CStr,
+        ) -> io::Result<()> {
+            #[cfg(target_os = "linux")]
+            {
+                // SAFETY: Both directory fds are valid and both names are NUL-terminated.
+                let rc = unsafe {
+                    libc::syscall(
+                        libc::SYS_renameat2,
+                        self.fd.as_raw_fd(),
+                        old_name.as_ptr(),
+                        new_dir.fd.as_raw_fd(),
+                        new_name.as_ptr(),
+                        libc::RENAME_EXCHANGE as libc::c_uint,
+                    )
+                };
+                if rc == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (old_name, new_dir, new_name);
+                Err(io::Error::from_raw_os_error(libc::ENOSYS))
+            }
+        }
+
+        pub(super) fn rename_noreplace_at(
+            &self,
+            old_name: &CStr,
+            new_dir: &VerifiedDir,
+            new_name: &CStr,
+        ) -> io::Result<()> {
+            #[cfg(target_os = "linux")]
+            {
+                // SAFETY: Both directory fds are valid and both names are NUL-terminated.
+                let rc = unsafe {
+                    libc::syscall(
+                        libc::SYS_renameat2,
+                        self.fd.as_raw_fd(),
+                        old_name.as_ptr(),
+                        new_dir.fd.as_raw_fd(),
+                        new_name.as_ptr(),
+                        libc::RENAME_NOREPLACE as libc::c_uint,
+                    )
+                };
+                if rc == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (old_name, new_dir, new_name);
+                Err(io::Error::from_raw_os_error(libc::ENOSYS))
+            }
+        }
+
+        pub(super) fn unlink_at(&self, name: &CStr) -> io::Result<()> {
+            // SAFETY: `self.fd` is a valid directory fd and `name` is NUL-terminated.
+            let rc = unsafe { libc::unlinkat(self.fd.as_raw_fd(), name.as_ptr(), 0) };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+
+        /// Move an entry under `self` to a durable `preserved-<uuid>` name so it is never
+        /// discarded by temporary-file cleanup when restoration fails or collides.
+        pub(super) fn preserve_entry(&self, name: &CStr) -> PathBuf {
+            let preserved_str = format!("preserved-{}", Uuid::new_v4());
+            if let Ok(preserved_c) = CString::new(preserved_str.as_bytes())
+                && self.rename_at(name, self, &preserved_c).is_ok()
+            {
+                let _ = self.sync();
+                return self.display_path.join(preserved_str);
+            }
+            let _ = self.sync();
+            self.child_display(name)
+        }
+
+        pub(super) fn child_display(&self, name: &CStr) -> PathBuf {
+            self.display_path
+                .join(std::ffi::OsStr::from_bytes(name.to_bytes()))
+        }
+    }
+
+    pub(super) struct StagedAtFile {
+        pub(super) dir: VerifiedDir,
+        pub(super) name: CString,
+        pub(super) dev: u64,
+        pub(super) ino: u64,
+        auto_unlink: bool,
+    }
+
+    impl StagedAtFile {
+        pub(super) fn disarm(&mut self) {
+            self.auto_unlink = false;
+        }
+
+        pub(super) fn unlink_confirmed(mut self) -> io::Result<()> {
+            self.auto_unlink = false;
+            self.dir.unlink_at(&self.name)
+        }
+
+        pub(super) fn preserve(mut self) -> PathBuf {
+            self.auto_unlink = false;
+            self.dir.preserve_entry(&self.name)
+        }
+    }
+
+    impl Drop for StagedAtFile {
+        fn drop(&mut self) {
+            if self.auto_unlink {
+                let _ = self.dir.unlink_at(&self.name);
+            }
+        }
+    }
+
+    pub(super) fn stream_compare_and_hash_worktree_entry_at(
+        root_dir: &VerifiedDir,
+        rel: &str,
+        expected: &TreeBlobEntry,
+        blob_size: u64,
+        blob_reader: &mut dyn Read,
+        check_filemode: bool,
+    ) -> GitResult<(bool, String)> {
+        let mut hasher = Sha256Stream::new();
+        if expected.mode == "120000" {
+            if blob_size > MAX_SYMLINK_TARGET_BYTES as u64 {
+                let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+                return Ok((false, hasher.finalize_hex()));
+            }
+            let mut target_blob = Vec::with_capacity(blob_size as usize);
+            blob_reader
+                .read_to_end(&mut target_blob)
+                .map_err(|e| GitError::GitCommand {
+                    args: vec!["cat-file".into(), "--batch".into()],
+                    status: None,
+                    stderr: e.to_string(),
+                })?;
+            hasher.update(&target_blob);
+            let digest = hasher.finalize_hex();
+            let Some((parent, leaf)) = root_dir.open_parent_for_rel(rel, false)? else {
+                return Ok((false, digest));
+            };
+            let st = match parent.lstat_at(&leaf) {
+                Ok(s) => s,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((false, digest)),
+                Err(e) => return Err(GitError::io(parent.child_display(&leaf), e)),
+            };
+            if (st.st_mode & libc::S_IFMT) != libc::S_IFLNK {
+                return Ok((false, digest));
+            }
+            let Some(raw_target) = parent
+                .readlink_at(&leaf)
+                .map_err(|e| GitError::io(parent.child_display(&leaf), e))?
+            else {
+                return Ok((false, digest));
+            };
+            return Ok((raw_target == target_blob, digest));
+        }
+
+        if expected.mode != "100644" && expected.mode != "100755" {
+            let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+            return Ok((false, hasher.finalize_hex()));
+        }
+
+        let Some((parent, leaf)) = root_dir.open_parent_for_rel(rel, false)? else {
+            let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+            return Ok((false, hasher.finalize_hex()));
+        };
+        let st = match parent.lstat_at(&leaf) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+                return Ok((false, hasher.finalize_hex()));
+            }
+            Err(e) => return Err(GitError::io(parent.child_display(&leaf), e)),
+        };
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+            return Ok((false, hasher.finalize_hex()));
+        }
+        if check_filemode {
+            // Git maps regular files to 100755 vs 100644 strictly using the owner execute bit.
+            let is_exec = (st.st_mode & 0o100) != 0;
+            let expect_exec = expected.mode == "100755";
+            if is_exec != expect_exec {
+                let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+                return Ok((false, hasher.finalize_hex()));
+            }
+        }
+        if st.st_size < 0 || (st.st_size as u64) != blob_size {
+            let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+            return Ok((false, hasher.finalize_hex()));
+        }
+        let (mut file, actual_len) = parent.open_regular_file_at(&leaf, rel)?;
+        if actual_len != blob_size {
+            let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+            return Ok((false, hasher.finalize_hex()));
+        }
+        stream_compare_open_file_and_blob(
+            &mut file,
+            &parent.child_display(&leaf),
+            blob_reader,
+            hasher,
+        )
+    }
+
+    pub(super) fn verify_at_matches_expected(
+        dir: &VerifiedDir,
+        name: &CStr,
+        rel: &str,
+        expected: &ExpectedFileContent,
+        check_filemode: bool,
+    ) -> GitResult<bool> {
+        let st = match dir.lstat_at(name) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(GitError::io(dir.child_display(name), e)),
+        };
+        let ftype = st.st_mode & libc::S_IFMT;
+        if expected.mode == "120000" {
+            if ftype != libc::S_IFLNK {
+                return Ok(false);
+            }
+            let Some(raw) = dir
+                .readlink_at(name)
+                .map_err(|e| GitError::io(dir.child_display(name), e))?
+            else {
+                return Ok(false);
+            };
+            return Ok(raw.len() as u64 == expected.len && sha256_hex(&raw) == expected.sha256);
+        }
+        if expected.mode != "100644" && expected.mode != "100755" {
+            return Ok(false);
+        }
+        if ftype != libc::S_IFREG {
+            return Ok(false);
+        }
+        if check_filemode {
+            let is_exec = (st.st_mode & 0o100) != 0;
+            let expect_exec = expected.mode == "100755";
+            if is_exec != expect_exec {
+                return Ok(false);
+            }
+        }
+        if st.st_size < 0 || (st.st_size as u64) != expected.len {
+            return Ok(false);
+        }
+        let (mut file, actual_len) = dir.open_regular_file_at(name, rel)?;
+        if actual_len != expected.len {
+            return Ok(false);
+        }
+        let mut hasher = Sha256Stream::new();
+        let total = drain_and_hash_reader(&mut file, &mut hasher)
+            .map_err(|e| GitError::io(dir.child_display(name), e))?;
+        Ok(total == expected.len && hasher.finalize_hex() == expected.sha256)
+    }
+
+    fn restage_staged_into_dir(
+        staged: StagedAtFile,
+        dest_dir: &VerifiedDir,
+        target_mode: &str,
+        rel: &str,
+    ) -> GitResult<StagedAtFile> {
+        let (mut src, _) = staged.dir.open_regular_file_at(&staged.name, rel)?;
+        let next = dest_dir.create_staged_file(".sparkles-wt-", target_mode, &mut src)?;
+        drop(src);
+        drop(staged);
+        Ok(next)
+    }
+
+    #[derive(Clone, Copy)]
+    enum NoClobberKind {
+        RenameNoReplace,
+        HardLink,
+    }
+
+    fn is_unsupported_os_err(e: &io::Error) -> bool {
+        matches!(
+            e.raw_os_error(),
+            Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
+        ) || matches!(
+            e.kind(),
+            io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
+        )
+    }
+
+    fn probe_noclobber_support(
+        parent: &VerifiedDir,
+        staged: &mut StagedAtFile,
+    ) -> GitResult<NoClobberKind> {
+        let probe_str = format!(".sparkles-probe-{}", Uuid::new_v4());
+        let probe_c = CString::new(probe_str.as_bytes()).map_err(|_| GitError::UnsafePath {
+            path: probe_str.clone(),
+            reason: "probe name contains NUL".into(),
+        })?;
+        match staged
+            .dir
+            .rename_noreplace_at(&staged.name, parent, &probe_c)
+        {
+            Ok(()) => {
+                staged.dir = parent.try_clone()?;
+                staged.name = probe_c;
+                return Ok(NoClobberKind::RenameNoReplace);
+            }
+            Err(e) if is_unsupported_os_err(&e) => {}
+            Err(e) => return Err(GitError::io(parent.child_display(&probe_c), e)),
+        }
+        match staged.dir.link_at(&staged.name, parent, &probe_c) {
+            Ok(()) => {
+                let _ = parent.unlink_at(&probe_c);
+                Ok(NoClobberKind::HardLink)
+            }
+            Err(e) if is_unsupported_os_err(&e) => Err(GitError::InvalidMapping(format!(
+                "refusing worktree replacement in {}: filesystem supports neither \
+                 RENAME_EXCHANGE nor non-clobbering install primitives ({e})",
+                parent.display_path.display()
+            ))),
+            Err(e) => Err(GitError::io(parent.child_display(&probe_c), e)),
+        }
+    }
+
+    fn install_with_noclobber_kind(
+        staged: &mut StagedAtFile,
+        parent: &VerifiedDir,
+        leaf: &CStr,
+        kind: NoClobberKind,
+    ) -> io::Result<()> {
+        match kind {
+            NoClobberKind::RenameNoReplace => {
+                staged.dir.rename_noreplace_at(&staged.name, parent, leaf)?;
+                staged.disarm();
+                Ok(())
+            }
+            NoClobberKind::HardLink => {
+                staged.dir.link_at(&staged.name, parent, leaf)?;
+                let _ = staged.dir.unlink_at(&staged.name);
+                staged.disarm();
+                Ok(())
+            }
+        }
+    }
+
+    /// Restore a displaced entry back to `(parent, leaf)` strictly without clobbering any
+    /// entry that concurrently appeared at `(parent, leaf)`.
+    fn restore_without_clobber_at(
+        src_dir: &VerifiedDir,
+        src_name: &CStr,
+        parent: &VerifiedDir,
+        leaf: &CStr,
+    ) -> io::Result<()> {
+        match src_dir.rename_noreplace_at(src_name, parent, leaf) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e),
+            Err(e) if is_unsupported_os_err(&e) => {}
+            Err(e) => return Err(e),
+        }
+        src_dir.link_at(src_name, parent, leaf)?;
+        let _ = src_dir.unlink_at(src_name);
+        Ok(())
+    }
+
+    pub(super) fn install_absent_noclobber_at(
+        mut staged: StagedAtFile,
+        parent: &VerifiedDir,
+        leaf: &CStr,
+        rel: &str,
+        target_mode: &str,
+    ) -> GitResult<()> {
+        let try_once = |s: &mut StagedAtFile| -> io::Result<()> {
+            match s.dir.rename_noreplace_at(&s.name, parent, leaf) {
+                Ok(()) => {
+                    s.disarm();
+                    return Ok(());
+                }
+                Err(e) if is_unsupported_os_err(&e) => {}
+                Err(e) => return Err(e),
+            }
+            s.dir.link_at(&s.name, parent, leaf)?;
+            let _ = s.dir.unlink_at(&s.name);
+            s.disarm();
+            Ok(())
+        };
+
+        let mut res = try_once(&mut staged);
+        if let Err(ref e) = res
+            && e.kind() == io::ErrorKind::CrossesDevices
+        {
+            staged = restage_staged_into_dir(staged, parent, target_mode, rel)?;
+            res = try_once(&mut staged);
+        }
+        match res {
+            Ok(()) => {
+                parent.sync()?;
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(GitError::UnsafePath {
+                path: rel.to_string(),
+                reason: format!(
+                    "refusing to overwrite file created concurrently at {rel:?} in repository \
+                     working tree"
+                ),
+            }),
+            Err(e) => Err(GitError::io(parent.child_display(leaf), e)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn replace_existing_preserving_concurrent_edits_at(
+        mut staged: StagedAtFile,
+        parent: &VerifiedDir,
+        leaf: &CStr,
+        staging_dir: &VerifiedDir,
+        rel: &str,
+        target_mode: &str,
+        old: &ExpectedFileContent,
+        recovery_target: Option<&ExpectedFileContent>,
+        check_filemode: bool,
+    ) -> GitResult<()> {
+        // 1. Mutation-boundary ownership re-check BEFORE touching `(parent, leaf)`.
+        if let Some(rt) = recovery_target
+            && verify_at_matches_expected(parent, leaf, rel, rt, check_filemode)?
+        {
+            return Ok(());
+        }
+        if !verify_at_matches_expected(parent, leaf, rel, old, check_filemode)? {
+            return Err(GitError::InvalidMapping(format!(
+                "refusing to overwrite locally modified tracked file {rel:?}"
+            )));
+        }
+
+        #[cfg(test)]
+        test_hooks::before_existing_replace_mutation(&parent.display_path, leaf);
+
+        // 2. On Linux, attempt an atomic `RENAME_EXCHANGE` relative to verified dirfds.
+        let try_exchange = |s: &StagedAtFile| -> io::Result<()> {
+            #[cfg(test)]
+            if test_hooks::force_disable_rename_exchange() {
+                return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+            }
+            s.dir.rename_exchange_at(&s.name, parent, leaf)
+        };
+        let mut exchanged = try_exchange(&staged);
+        if let Err(ref e) = exchanged
+            && e.kind() == io::ErrorKind::CrossesDevices
+        {
+            staged = restage_staged_into_dir(staged, parent, target_mode, rel)?;
+            exchanged = try_exchange(&staged);
+        }
+        match exchanged {
+            Ok(()) => {
+                // Immediately disarm automatic unlinking: `staged` now names the displaced
+                // worktree entry and must stay under recoverable ownership until either
+                // verification succeeds or restoration is confirmed.
+                staged.disarm();
+                let old_check =
+                    verify_at_matches_expected(&staged.dir, &staged.name, rel, old, check_filemode);
+                let swapped_ok = matches!(old_check, Ok(true))
+                    || recovery_target.is_some_and(|rt| {
+                        matches!(
+                            verify_at_matches_expected(
+                                &staged.dir,
+                                &staged.name,
+                                rel,
+                                rt,
+                                check_filemode,
+                            ),
+                            Ok(true)
+                        )
+                    });
+                if swapped_ok {
+                    let _ = staged.unlink_confirmed();
+                    parent.sync()?;
+                    return Ok(());
+                }
+
+                // Intervening edit, atomic replacement, or verification error (e.g. chmod 000):
+                // attempt atomic reverse exchange back to `(parent, leaf)`.
+                let rev_res = {
+                    #[cfg(test)]
+                    let injected = test_hooks::take_fail_reverse_exchange();
+                    #[cfg(not(test))]
+                    let injected = false;
+                    if injected {
+                        Err(io::Error::other("injected reverse exchange failure"))
+                    } else {
+                        staged.dir.rename_exchange_at(&staged.name, parent, leaf)
+                    }
+                };
+                match rev_res {
+                    Ok(()) => {
+                        // Only unlink `staged` if the reverse exchange returned our exact
+                        // staged inode; if a third party replaced `leaf` before reverse
+                        // exchange, preserve what came back instead of unlinking it.
+                        let returned_ours = staged.dir.lstat_at(&staged.name).is_ok_and(|st| {
+                            #[allow(clippy::unnecessary_cast)]
+                            {
+                                st.st_dev as u64 == staged.dev && st.st_ino as u64 == staged.ino
+                            }
+                        });
+                        if returned_ours {
+                            let _ = staged.unlink_confirmed();
+                            let _ = parent.sync();
+                            return Err(GitError::InvalidMapping(format!(
+                                "refusing to overwrite concurrently modified tracked file {rel:?}"
+                            )));
+                        }
+                        let preserved = staged.preserve();
+                        let _ = parent.sync();
+                        return Err(GitError::InvalidMapping(format!(
+                            "refusing to overwrite concurrently modified tracked file {rel:?}; \
+                             intervening replacement preserved at {}",
+                            preserved.display()
+                        )));
+                    }
+                    Err(rev_err) => {
+                        let preserved = staged.preserve();
+                        let _ = parent.sync();
+                        return Err(GitError::InvalidMapping(format!(
+                            "refusing to overwrite concurrently modified tracked file {rel:?}; \
+                             reverse exchange failed ({rev_err}), displaced file preserved at {}",
+                            preserved.display()
+                        )));
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(GitError::InvalidMapping(format!(
+                    "refusing worktree sync: tracked file {rel:?} disappeared concurrently"
+                )));
+            }
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
+                ) =>
+            {
+                // Filesystem lacks `RENAME_EXCHANGE`: fall through to move-out + verify +
+                // non-clobbering install.
+            }
+            Err(e) => return Err(GitError::io(parent.child_display(leaf), e)),
+        }
+
+        // 3. Fallback path without `RENAME_EXCHANGE`:
+        //    Probe non-clobbering install support BEFORE mutating `leaf`; refuse if the
+        //    filesystem cannot preserve an intervening atomic replacement.
+        if staged.dir.dev()? != parent.dev()? {
+            staged = restage_staged_into_dir(staged, parent, target_mode, rel)?;
+        }
+        let noclobber_kind = probe_noclobber_support(parent, &mut staged)?;
+
+        let backup_name_str = format!(".sparkles-backup-{}", Uuid::new_v4());
+        let backup_name =
+            CString::new(backup_name_str.as_bytes()).map_err(|_| GitError::UnsafePath {
+                path: backup_name_str.clone(),
+                reason: "backup name contains NUL".into(),
+            })?;
+        let backup_dir = match parent.rename_at(leaf, staging_dir, &backup_name) {
+            Ok(()) => staging_dir.try_clone()?,
+            Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+                parent
+                    .rename_at(leaf, parent, &backup_name)
+                    .map_err(|err| GitError::io(parent.child_display(leaf), err))?;
+                parent.try_clone()?
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(GitError::InvalidMapping(format!(
+                    "refusing worktree sync: tracked file {rel:?} disappeared concurrently"
+                )));
+            }
+            Err(e) => return Err(GitError::io(parent.child_display(leaf), e)),
+        };
+
+        // `backup_dir/backup_name` now holds whatever was at `(parent, leaf)` at rename time
+        // and is NEVER auto-unlinked until verified unmodified.
+        let backup_check =
+            verify_at_matches_expected(&backup_dir, &backup_name, rel, old, check_filemode);
+        let backup_ok = matches!(backup_check, Ok(true))
+            || recovery_target.is_some_and(|rt| {
+                matches!(
+                    verify_at_matches_expected(&backup_dir, &backup_name, rel, rt, check_filemode),
+                    Ok(true)
+                )
+            });
+        if !backup_ok {
+            match restore_without_clobber_at(&backup_dir, &backup_name, parent, leaf) {
+                Ok(()) => {
+                    let _ = parent.sync();
+                    return Err(GitError::InvalidMapping(format!(
+                        "refusing to overwrite concurrently modified tracked file {rel:?}"
+                    )));
+                }
+                Err(restore_err) => {
+                    let preserved = backup_dir.preserve_entry(&backup_name);
+                    let _ = parent.sync();
+                    return Err(GitError::InvalidMapping(format!(
+                        "refusing to overwrite concurrently modified tracked file {rel:?}; \
+                         could not restore without clobbering ({restore_err}), displaced file \
+                         preserved at {}",
+                        preserved.display()
+                    )));
+                }
+            }
+        }
+
+        #[cfg(test)]
+        test_hooks::after_fallback_move_out_before_install(&parent.display_path, leaf);
+
+        match install_with_noclobber_kind(&mut staged, parent, leaf, noclobber_kind) {
+            Ok(()) => {
+                // Re-verify the moved backup inode before unlinking it to catch an in-place
+                // write that raced with the install.
+                let still_ok = matches!(
+                    verify_at_matches_expected(&backup_dir, &backup_name, rel, old, check_filemode),
+                    Ok(true)
+                ) || recovery_target.is_some_and(|rt| {
+                    matches!(
+                        verify_at_matches_expected(
+                            &backup_dir,
+                            &backup_name,
+                            rel,
+                            rt,
+                            check_filemode,
+                        ),
+                        Ok(true)
+                    )
+                });
+                if still_ok {
+                    let _ = backup_dir.unlink_at(&backup_name);
+                    parent.sync()?;
+                    Ok(())
+                } else {
+                    let preserved = backup_dir.preserve_entry(&backup_name);
+                    let _ = parent.sync();
+                    Err(GitError::InvalidMapping(format!(
+                        "refusing to discard tracked file {rel:?} modified in place during \
+                         replacement; preserved at {}",
+                        preserved.display()
+                    )))
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // An editor atomically saved a new file at `(parent, leaf)` after move-out:
+                // leave the new file completely untouched and only unlink `backup` if it still
+                // matches `old`.
+                let still_ok = matches!(
+                    verify_at_matches_expected(&backup_dir, &backup_name, rel, old, check_filemode),
+                    Ok(true)
+                );
+                if still_ok {
+                    let _ = backup_dir.unlink_at(&backup_name);
+                } else {
+                    let _ = backup_dir.preserve_entry(&backup_name);
+                }
+                let _ = parent.sync();
+                Err(GitError::InvalidMapping(format!(
+                    "refusing to overwrite concurrently replaced tracked file {rel:?}"
+                )))
+            }
+            Err(e) => {
+                if restore_without_clobber_at(&backup_dir, &backup_name, parent, leaf).is_err() {
+                    let _ = backup_dir.preserve_entry(&backup_name);
+                }
+                let _ = parent.sync();
+                Err(GitError::io(parent.child_display(leaf), e))
+            }
+        }
+    }
+
+    pub(super) fn remove_verified_preserving_concurrent_edits_at(
+        parent: &VerifiedDir,
+        leaf: &CStr,
+        staging_dir: &VerifiedDir,
+        rel: &str,
+        expected: &ExpectedFileContent,
+        mode: SyncMode,
+        check_filemode: bool,
+    ) -> GitResult<bool> {
+        match parent.lstat_at(leaf) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if mode == SyncMode::Recovery {
+                    return Ok(false);
+                }
+                return Err(GitError::InvalidMapping(format!(
+                    "refusing to remove missing tracked file {rel:?}"
+                )));
+            }
+            Err(e) => return Err(GitError::io(parent.child_display(leaf), e)),
+            Ok(_) => {}
+        }
+
+        // 1. Mutation-boundary ownership re-check BEFORE moving `(parent, leaf)`.
+        if !verify_at_matches_expected(parent, leaf, rel, expected, check_filemode)? {
+            return Err(GitError::InvalidMapping(format!(
+                "refusing to remove locally modified tracked file {rel:?}"
+            )));
+        }
+
+        #[cfg(test)]
+        test_hooks::before_removal_move(&parent.display_path, leaf);
+
+        // 2. Atomically move `(parent, leaf)` into `staging_dir` (or same-filesystem temp in
+        //    `parent` on `EXDEV`, never falling back to verify-then-unlink-by-name), verify the
+        //    moved entry, and restore strictly without clobbering any newly created entry.
+        let trash_name_str = format!(".sparkles-remove-{}", Uuid::new_v4());
+        let trash_name =
+            CString::new(trash_name_str.as_bytes()).map_err(|_| GitError::UnsafePath {
+                path: trash_name_str.clone(),
+                reason: "trash name contains NUL".into(),
+            })?;
+        let trash_dir = match parent.rename_at(leaf, staging_dir, &trash_name) {
+            Ok(()) => staging_dir.try_clone()?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound && mode == SyncMode::Recovery => {
+                return Ok(false);
+            }
+            Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+                match parent.rename_at(leaf, parent, &trash_name) {
+                    Ok(()) => parent.try_clone()?,
+                    Err(err)
+                        if err.kind() == io::ErrorKind::NotFound && mode == SyncMode::Recovery =>
+                    {
+                        return Ok(false);
+                    }
+                    Err(err) => return Err(GitError::io(parent.child_display(leaf), err)),
+                }
+            }
+            Err(e) => return Err(GitError::io(parent.child_display(leaf), e)),
+        };
+
+        #[cfg(test)]
+        test_hooks::after_removal_move_before_verify(&parent.display_path, leaf);
+
+        let still_matches = matches!(
+            verify_at_matches_expected(&trash_dir, &trash_name, rel, expected, check_filemode),
+            Ok(true)
+        );
+        if !still_matches {
+            match restore_without_clobber_at(&trash_dir, &trash_name, parent, leaf) {
+                Ok(()) => {
+                    let _ = parent.sync();
+                    return Err(GitError::InvalidMapping(format!(
+                        "refusing to remove concurrently modified tracked file {rel:?}"
+                    )));
+                }
+                Err(restore_err) => {
+                    let preserved = trash_dir.preserve_entry(&trash_name);
+                    let _ = parent.sync();
+                    return Err(GitError::InvalidMapping(format!(
+                        "refusing to remove concurrently modified tracked file {rel:?}; could \
+                         not restore without overwriting new entry ({restore_err}), displaced \
+                         file preserved at {}",
+                        preserved.display()
+                    )));
+                }
+            }
+        }
+
+        match trash_dir.unlink_at(&trash_name) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(GitError::io(trash_dir.child_display(&trash_name), e)),
+        }
+        parent.sync()?;
+        Ok(true)
+    }
+}
+
+#[cfg(not(unix))]
 fn verify_path_matches_expected(
     full: &Path,
     rel: &str,
     expected: &ExpectedFileContent,
-    check_filemode: bool,
+    _check_filemode: bool,
 ) -> GitResult<bool> {
     let meta = match fs::symlink_metadata(full) {
         Ok(m) => m,
@@ -3105,18 +4351,6 @@ fn verify_path_matches_expected(
     if meta.file_type().is_symlink() || !meta.file_type().is_file() {
         return Ok(false);
     }
-    #[cfg(unix)]
-    if check_filemode {
-        use std::os::unix::fs::PermissionsExt;
-        let is_exec = (meta.permissions().mode() & 0o100) != 0;
-        let expect_exec = expected.mode == "100755";
-        if is_exec != expect_exec {
-            return Ok(false);
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = check_filemode;
-
     if meta.len() != expected.len {
         return Ok(false);
     }
@@ -3127,66 +4361,6 @@ fn verify_path_matches_expected(
     let mut hasher = Sha256Stream::new();
     let total = drain_and_hash_reader(&mut file, &mut hasher).map_err(|e| GitError::io(full, e))?;
     Ok(total == expected.len && hasher.finalize_hex() == expected.sha256)
-}
-
-fn verify_open_file_matches_expected(
-    file: &mut File,
-    path_for_err: &Path,
-    expected: &ExpectedFileContent,
-    check_filemode: bool,
-) -> GitResult<bool> {
-    let meta = file.metadata().map_err(|e| GitError::io(path_for_err, e))?;
-    if !meta.file_type().is_file() {
-        return Ok(false);
-    }
-    #[cfg(unix)]
-    if check_filemode {
-        use std::os::unix::fs::PermissionsExt;
-        let is_exec = (meta.permissions().mode() & 0o100) != 0;
-        let expect_exec = expected.mode == "100755";
-        if is_exec != expect_exec {
-            return Ok(false);
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = check_filemode;
-
-    if meta.len() != expected.len {
-        return Ok(false);
-    }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| GitError::io(path_for_err, e))?;
-    let mut hasher = Sha256Stream::new();
-    let total =
-        drain_and_hash_reader(file, &mut hasher).map_err(|e| GitError::io(path_for_err, e))?;
-    Ok(total == expected.len && hasher.finalize_hex() == expected.sha256)
-}
-
-#[cfg(target_os = "linux")]
-fn renameat2_exchange(a: &Path, b: &Path) -> io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let ca = CString::new(a.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-    let cb = CString::new(b.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-    // SAFETY: `ca` and `cb` are valid NUL-terminated C strings passed to the Linux
-    // `renameat2` syscall with `AT_FDCWD` and `RENAME_EXCHANGE`.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            ca.as_ptr(),
-            libc::AT_FDCWD,
-            cb.as_ptr(),
-            libc::RENAME_EXCHANGE as libc::c_uint,
-        )
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
 }
 
 /// Verify that the repository has no in-progress Git operation, that `.git/index` matches
@@ -3314,9 +4488,10 @@ struct PlannedRemoval {
     expected: ExpectedFileContent,
 }
 
+#[cfg(not(unix))]
 fn stage_blob_into_temp(
     staging_dir: &Path,
-    target_mode: &str,
+    _target_mode: &str,
     blob_reader: &mut dyn Read,
 ) -> GitResult<tempfile::TempPath> {
     let mut tmp = tempfile::Builder::new()
@@ -3328,22 +4503,13 @@ fn stage_blob_into_temp(
         io::copy(blob_reader, &mut bw).map_err(|e| GitError::io(staging_dir, e))?;
         bw.flush().map_err(|e| GitError::io(staging_dir, e))?;
     }
-    #[cfg(unix)]
-    if target_mode == "100755" {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o755);
-        tmp.as_file()
-            .set_permissions(perms)
-            .map_err(|e| GitError::io(tmp.path(), e))?;
-    }
-    #[cfg(not(unix))]
-    let _ = target_mode;
     tmp.as_file()
         .sync_all()
         .map_err(|e| GitError::io(tmp.path(), e))?;
     Ok(tmp.into_temp_path())
 }
 
+#[cfg(not(unix))]
 fn restage_temp_in_dir(
     temp_path: tempfile::TempPath,
     dest_dir: &Path,
@@ -3355,6 +4521,7 @@ fn restage_temp_in_dir(
     Ok(next)
 }
 
+#[cfg(not(unix))]
 fn install_absent_noclobber(
     temp_path: tempfile::TempPath,
     full: &Path,
@@ -3397,18 +4564,19 @@ fn install_absent_noclobber(
     }
 }
 
+#[cfg(not(unix))]
 #[allow(clippy::too_many_arguments)]
 fn replace_existing_preserving_concurrent_edits(
     mut temp_path: tempfile::TempPath,
     full: &Path,
     parent: &Path,
+    staging_dir: &Path,
     rel: &str,
     target_mode: &str,
     old: &ExpectedFileContent,
     recovery_target: Option<&ExpectedFileContent>,
     check_filemode: bool,
 ) -> GitResult<()> {
-    // 1. Mutation-boundary ownership re-check BEFORE touching `full`.
     if let Some(rt) = recovery_target
         && verify_path_matches_expected(full, rel, rt, check_filemode)?
     {
@@ -3419,95 +4587,60 @@ fn replace_existing_preserving_concurrent_edits(
             "refusing to overwrite locally modified tracked file {rel:?}"
         )));
     }
-
-    // 2. On Linux, perform an atomic `RENAME_EXCHANGE` swap so any concurrent edit or
-    //    atomic replacement that raced with the mutation lands in `temp_path`, where we
-    //    verify it and swap back immediately if it changed.
-    #[cfg(target_os = "linux")]
-    {
-        let mut exchanged = renameat2_exchange(temp_path.as_ref(), full);
-        if let Err(ref e) = exchanged
-            && e.kind() == io::ErrorKind::CrossesDevices
-        {
-            temp_path = restage_temp_in_dir(temp_path, parent, target_mode)?;
-            exchanged = renameat2_exchange(temp_path.as_ref(), full);
+    let backup_path = staging_dir.join(format!("backup-{}", Uuid::new_v4()));
+    let backup_path = match fs::rename(full, &backup_path) {
+        Ok(()) => backup_path,
+        Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+            let local_backup = parent.join(format!(".sparkles-backup-{}", Uuid::new_v4()));
+            fs::rename(full, &local_backup).map_err(|err| GitError::io(full, err))?;
+            local_backup
         }
-        match exchanged {
-            Ok(()) => {
-                let swapped_ok =
-                    verify_path_matches_expected(temp_path.as_ref(), rel, old, check_filemode)?
-                        || recovery_target.is_some_and(|rt| {
-                            verify_path_matches_expected(
-                                temp_path.as_ref(),
-                                rel,
-                                rt,
-                                check_filemode,
-                            )
-                            .unwrap_or(false)
-                        });
-                if !swapped_ok {
-                    // Intervening edit or replacement detected right at the mutation boundary:
-                    // atomically restore the user's file back to `full` and refuse.
-                    let _ = renameat2_exchange(temp_path.as_ref(), full);
-                    let _ = crate::fsutil::sync_dir(parent);
-                    return Err(GitError::InvalidMapping(format!(
-                        "refusing to overwrite concurrently modified tracked file {rel:?}"
-                    )));
-                }
-                drop(temp_path);
-                crate::fsutil::sync_dir(parent).map_err(|e| GitError::io(parent, e))?;
-                return Ok(());
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Err(GitError::InvalidMapping(format!(
-                    "refusing worktree sync: tracked file {rel:?} disappeared concurrently"
-                )));
-            }
-            Err(e)
-                if matches!(
-                    e.raw_os_error(),
-                    Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
-                ) =>
-            {
-                // Filesystem does not support RENAME_EXCHANGE; fall through to open-fd fallback.
-            }
-            Err(e) => return Err(GitError::io(full, e)),
+        Err(e) => return Err(GitError::io(full, e)),
+    };
+    let backup_ok = matches!(
+        verify_path_matches_expected(&backup_path, rel, old, check_filemode),
+        Ok(true)
+    ) || recovery_target.is_some_and(|rt| {
+        matches!(
+            verify_path_matches_expected(&backup_path, rel, rt, check_filemode),
+            Ok(true)
+        )
+    });
+    if !backup_ok {
+        if fs::hard_link(&backup_path, full).is_ok() {
+            let _ = fs::remove_file(&backup_path);
         }
-    }
-
-    // 3. Portable fallback: hold an open fd on the original inode across rename, and re-check
-    //    its contents immediately after rename to detect and restore any in-place write.
-    let (mut orig_fd, _) = open_regular_file_no_symlink(full, rel)?;
-    if !verify_open_file_matches_expected(&mut orig_fd, full, old, check_filemode)? {
-        return Err(GitError::InvalidMapping(format!(
-            "refusing to overwrite locally modified tracked file {rel:?}"
-        )));
-    }
-    match temp_path.persist(full) {
-        Ok(_) => {}
-        Err(err) if err.error.kind() == io::ErrorKind::CrossesDevices => {
-            let local_tmp = restage_temp_in_dir(err.path, parent, target_mode)?;
-            local_tmp
-                .persist(full)
-                .map_err(|e| GitError::io(full, e.error))?;
-        }
-        Err(err) => return Err(GitError::io(full, err.error)),
-    }
-    if !verify_open_file_matches_expected(&mut orig_fd, full, old, check_filemode)? {
-        orig_fd
-            .seek(SeekFrom::Start(0))
-            .map_err(|e| GitError::io(full, e))?;
-        let restored = stage_blob_into_temp(parent, &old.mode, &mut orig_fd)?;
-        let _ = restored.persist(full);
-        let _ = crate::fsutil::sync_dir(parent);
         return Err(GitError::InvalidMapping(format!(
             "refusing to overwrite concurrently modified tracked file {rel:?}"
         )));
     }
+    if let Err(err) = temp_path.persist_noclobber(full) {
+        if err.error.kind() == io::ErrorKind::CrossesDevices {
+            temp_path = restage_temp_in_dir(err.path, parent, target_mode)?;
+            if let Err(e2) = temp_path.persist_noclobber(full) {
+                if e2.error.kind() == io::ErrorKind::AlreadyExists {
+                    let _ = fs::remove_file(&backup_path);
+                    return Err(GitError::InvalidMapping(format!(
+                        "refusing to overwrite concurrently replaced tracked file {rel:?}"
+                    )));
+                }
+                return Err(GitError::io(full, e2.error));
+            }
+        } else if err.error.kind() == io::ErrorKind::AlreadyExists {
+            let _ = fs::remove_file(&backup_path);
+            return Err(GitError::InvalidMapping(format!(
+                "refusing to overwrite concurrently replaced tracked file {rel:?}"
+            )));
+        } else {
+            return Err(GitError::io(full, err.error));
+        }
+    }
+    let _ = fs::remove_file(&backup_path);
     crate::fsutil::sync_dir(parent).map_err(|e| GitError::io(parent, e))?;
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn remove_verified_preserving_concurrent_edits(
     full: &Path,
     staging_dir: &Path,
@@ -3528,64 +4661,46 @@ fn remove_verified_preserving_concurrent_edits(
         Err(e) => return Err(GitError::io(full, e)),
         Ok(_) => {}
     }
-
-    // 1. Mutation-boundary ownership re-check BEFORE moving or unlinking `full`.
     if !verify_path_matches_expected(full, rel, expected, check_filemode)? {
         return Err(GitError::InvalidMapping(format!(
             "refusing to remove locally modified tracked file {rel:?}"
         )));
     }
-
-    // 2. Atomically move `full` out of the worktree into `.git/sparkles/staging/`, re-verify
-    //    the moved entry still matches `expected`, and restore it immediately if an
-    //    intervening edit raced with the move.
     let trash_path = staging_dir.join(format!("remove-{}", Uuid::new_v4()));
-    match fs::rename(full, &trash_path) {
-        Ok(()) => {
-            let still_matches =
-                verify_path_matches_expected(&trash_path, rel, expected, check_filemode)?;
-            if !still_matches {
-                // Restore the concurrently edited file back to `full` without clobbering any
-                // newly created file at `full`.
-                let restored = fs::hard_link(&trash_path, full)
-                    .map(|()| {
-                        let _ = fs::remove_file(&trash_path);
-                    })
-                    .or_else(|_| fs::rename(&trash_path, full));
-                let _ = restored;
-                if let Some(p) = full.parent() {
-                    let _ = crate::fsutil::sync_dir(p);
-                }
-                return Err(GitError::InvalidMapping(format!(
-                    "refusing to remove concurrently modified tracked file {rel:?}"
-                )));
-            }
-            match fs::remove_file(&trash_path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(GitError::io(&trash_path, e)),
-            }
-            if let Some(p) = full.parent() {
-                let _ = crate::fsutil::sync_dir(p);
-            }
-            Ok(true)
+    let trash_path = match fs::rename(full, &trash_path) {
+        Ok(()) => trash_path,
+        Err(e) if e.kind() == io::ErrorKind::NotFound && mode == SyncMode::Recovery => {
+            return Ok(false);
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound && mode == SyncMode::Recovery => Ok(false),
         Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
-            // Different mount: verify once more and unlink.
-            if !verify_path_matches_expected(full, rel, expected, check_filemode)? {
-                return Err(GitError::InvalidMapping(format!(
-                    "refusing to remove locally modified tracked file {rel:?}"
-                )));
-            }
-            fs::remove_file(full).map_err(|err| GitError::io(full, err))?;
-            if let Some(p) = full.parent() {
-                let _ = crate::fsutil::sync_dir(p);
-            }
-            Ok(true)
+            let parent = effective_parent(full)?;
+            let local_trash = parent.join(format!(".sparkles-remove-{}", Uuid::new_v4()));
+            fs::rename(full, &local_trash).map_err(|err| GitError::io(full, err))?;
+            local_trash
         }
-        Err(e) => Err(GitError::io(full, e)),
+        Err(e) => return Err(GitError::io(full, e)),
+    };
+    let still_matches = matches!(
+        verify_path_matches_expected(&trash_path, rel, expected, check_filemode),
+        Ok(true)
+    );
+    if !still_matches {
+        if fs::hard_link(&trash_path, full).is_ok() {
+            let _ = fs::remove_file(&trash_path);
+        }
+        return Err(GitError::InvalidMapping(format!(
+            "refusing to remove concurrently modified tracked file {rel:?}"
+        )));
     }
+    match fs::remove_file(&trash_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(GitError::io(&trash_path, e)),
+    }
+    if let Some(p) = full.parent() {
+        let _ = crate::fsutil::sync_dir(p);
+    }
+    Ok(true)
 }
 
 /// Synchronize `HEAD`, `.git/index`, and `clean_repo`'s working tree to `commit_sha` on
@@ -3968,40 +5083,92 @@ fn sync_worktree_to_commit_no_filters(
     let staging_parent = ensure_child_dir_no_symlink(&sparkles_dir, DEFAULT_STAGING_SUBDIR)?;
 
     // Stream and install every changed tracked blob byte-exact without Git checkout/smudge
-    // filters, checking ownership at each mutation boundary.
+    // filters, holding verified directory handles and checking ownership at each mutation
+    // boundary.
+    #[cfg(unix)]
+    let root_dir = dirfd_ops::VerifiedDir::open_root(clean_repo)?;
+    #[cfg(unix)]
+    let staging_dir = dirfd_ops::VerifiedDir::open_root(&staging_parent)?;
+
     if !to_write.is_empty() {
         let write_oids: Vec<&str> = to_write.iter().map(|w| w.target_oid.as_str()).collect();
         stream_git_blobs(clean_repo, &write_oids, |idx, _, _, blob_reader| {
             let planned = &to_write[idx];
-            let full = resolve_safe_path(clean_repo, &planned.rel)?;
-            let parent = effective_parent(&full)?;
-            ensure_dir_no_symlink(&parent)?;
-            let temp_path =
-                stage_blob_into_temp(&staging_parent, &planned.target_mode, blob_reader)?;
-            match &planned.expectation {
-                WriteExpectation::Absent => {
-                    install_absent_noclobber(
-                        temp_path,
-                        &full,
-                        &parent,
-                        &planned.rel,
-                        &planned.target_mode,
-                    )?;
-                }
-                WriteExpectation::Existing {
-                    old,
-                    recovery_target,
-                } => {
-                    replace_existing_preserving_concurrent_edits(
-                        temp_path,
-                        &full,
-                        &parent,
-                        &planned.rel,
-                        &planned.target_mode,
+            #[cfg(unix)]
+            {
+                let staged = staging_dir.create_staged_file(
+                    "worktree-",
+                    &planned.target_mode,
+                    blob_reader,
+                )?;
+                #[cfg(test)]
+                test_hooks::after_blob_staged_before_parent_open(clean_repo, &planned.rel);
+                let (parent_dir, leaf) = root_dir
+                    .open_parent_for_rel(&planned.rel, true)?
+                    .expect("create=true always yields a verified parent handle");
+                #[cfg(test)]
+                test_hooks::after_parent_open_before_install(clean_repo, &planned.rel);
+                match &planned.expectation {
+                    WriteExpectation::Absent => {
+                        dirfd_ops::install_absent_noclobber_at(
+                            staged,
+                            &parent_dir,
+                            &leaf,
+                            &planned.rel,
+                            &planned.target_mode,
+                        )?;
+                    }
+                    WriteExpectation::Existing {
                         old,
-                        recovery_target.as_ref(),
-                        check_filemode,
-                    )?;
+                        recovery_target,
+                    } => {
+                        dirfd_ops::replace_existing_preserving_concurrent_edits_at(
+                            staged,
+                            &parent_dir,
+                            &leaf,
+                            &staging_dir,
+                            &planned.rel,
+                            &planned.target_mode,
+                            old,
+                            recovery_target.as_ref(),
+                            check_filemode,
+                        )?;
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let temp_path =
+                    stage_blob_into_temp(&staging_parent, &planned.target_mode, blob_reader)?;
+                let full = resolve_safe_path(clean_repo, &planned.rel)?;
+                let parent = effective_parent(&full)?;
+                ensure_dir_no_symlink(&parent)?;
+                match &planned.expectation {
+                    WriteExpectation::Absent => {
+                        install_absent_noclobber(
+                            temp_path,
+                            &full,
+                            &parent,
+                            &planned.rel,
+                            &planned.target_mode,
+                        )?;
+                    }
+                    WriteExpectation::Existing {
+                        old,
+                        recovery_target,
+                    } => {
+                        replace_existing_preserving_concurrent_edits(
+                            temp_path,
+                            &full,
+                            &parent,
+                            &staging_parent,
+                            &planned.rel,
+                            &planned.target_mode,
+                            old,
+                            recovery_target.as_ref(),
+                            check_filemode,
+                        )?;
+                    }
                 }
             }
             #[cfg(test)]
@@ -4012,24 +5179,54 @@ fn sync_worktree_to_commit_no_filters(
         })?;
     }
 
-    // Remove verified previously tracked files absent from the target commit, checking
-    // ownership at each mutation boundary and preserving any concurrent edit.
+    // Remove verified previously tracked files absent from the target commit, holding
+    // verified directory handles and preserving any concurrent edit or recreated entry.
     let mut removed_count = 0usize;
     for planned in to_remove {
-        let is_tracked_symlink = planned.expected.mode == "120000";
-        let full = if is_tracked_symlink {
-            resolve_safe_path_allow_leaf_symlink(clean_repo, &planned.rel)?
-        } else {
-            resolve_safe_path(clean_repo, &planned.rel)?
+        #[cfg(unix)]
+        let removed = {
+            match root_dir.open_parent_for_rel(&planned.rel, false)? {
+                None => {
+                    if mode == SyncMode::Recovery {
+                        false
+                    } else {
+                        return Err(GitError::InvalidMapping(format!(
+                            "refusing to remove missing tracked file {:?}",
+                            planned.rel
+                        )));
+                    }
+                }
+                Some((parent_dir, leaf)) => {
+                    dirfd_ops::remove_verified_preserving_concurrent_edits_at(
+                        &parent_dir,
+                        &leaf,
+                        &staging_dir,
+                        &planned.rel,
+                        &planned.expected,
+                        mode,
+                        check_filemode,
+                    )?
+                }
+            }
         };
-        if remove_verified_preserving_concurrent_edits(
-            &full,
-            &staging_parent,
-            &planned.rel,
-            &planned.expected,
-            mode,
-            check_filemode,
-        )? {
+        #[cfg(not(unix))]
+        let removed = {
+            let is_tracked_symlink = planned.expected.mode == "120000";
+            let full = if is_tracked_symlink {
+                resolve_safe_path_allow_leaf_symlink(clean_repo, &planned.rel)?
+            } else {
+                resolve_safe_path(clean_repo, &planned.rel)?
+            };
+            remove_verified_preserving_concurrent_edits(
+                &full,
+                &staging_parent,
+                &planned.rel,
+                &planned.expected,
+                mode,
+                check_filemode,
+            )?
+        };
+        if removed {
             removed_count += 1;
             #[cfg(test)]
             if removed_count == 1 {
@@ -4207,6 +5404,12 @@ mod test_hooks {
     use super::*;
     use std::cell::RefCell;
 
+    type IndexLockUnlinkHook = Box<dyn FnOnce(&Path) -> io::Result<()>>;
+    #[cfg(unix)]
+    type LeafMutationHook = (String, Box<dyn FnOnce(&Path, &std::ffi::CStr)>);
+    #[cfg(unix)]
+    type RelPathHook = (String, Box<dyn FnOnce(&Path, &str)>);
+
     #[derive(Default)]
     pub(super) struct FaultState {
         pub fail_before_update_ref: bool,
@@ -4222,6 +5425,23 @@ mod test_hooks {
         pub inject_tracked_edit_after_clean: Option<(String, Vec<u8>)>,
         pub inject_tracked_edit_before_sync: Option<(String, Vec<u8>)>,
         pub inject_edit_after_preflight: Option<(String, Vec<u8>)>,
+        pub simulate_index_lock_hard_link_unsupported: bool,
+        pub simulate_index_lock_noreplace_unsupported: bool,
+        pub after_index_lock_unlink_action: Option<IndexLockUnlinkHook>,
+        pub force_disable_rename_exchange: bool,
+        pub fail_reverse_exchange: bool,
+        #[cfg(unix)]
+        pub before_existing_replace_action: Option<LeafMutationHook>,
+        #[cfg(unix)]
+        pub after_fallback_move_out_action: Option<LeafMutationHook>,
+        #[cfg(unix)]
+        pub before_removal_move_action: Option<LeafMutationHook>,
+        #[cfg(unix)]
+        pub after_removal_move_action: Option<LeafMutationHook>,
+        #[cfg(unix)]
+        pub after_blob_staged_action: Option<RelPathHook>,
+        #[cfg(unix)]
+        pub after_parent_open_action: Option<RelPathHook>,
     }
 
     thread_local! {
@@ -4308,6 +5528,154 @@ mod test_hooks {
                 fs::create_dir_all(parent).unwrap();
             }
             fs::write(&p, bytes).unwrap();
+        }
+    }
+
+    pub(super) fn simulate_index_lock_hard_link_unsupported() -> bool {
+        FAULTS.with(|f| f.borrow().simulate_index_lock_hard_link_unsupported)
+    }
+
+    pub(super) fn simulate_index_lock_noreplace_unsupported() -> bool {
+        FAULTS.with(|f| f.borrow().simulate_index_lock_noreplace_unsupported)
+    }
+
+    pub(super) fn after_index_lock_unlink_before_sync(lock_path: &Path) -> GitResult<()> {
+        let action = FAULTS.with(|f| f.borrow_mut().after_index_lock_unlink_action.take());
+        if let Some(f) = action {
+            f(lock_path).map_err(|e| GitError::io(lock_path, e))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(super) fn force_disable_rename_exchange() -> bool {
+        FAULTS.with(|f| f.borrow().force_disable_rename_exchange)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn take_fail_reverse_exchange() -> bool {
+        FAULTS.with(|f| std::mem::take(&mut f.borrow_mut().fail_reverse_exchange))
+    }
+
+    #[cfg(unix)]
+    pub(super) fn before_existing_replace_mutation(parent_dir: &Path, leaf: &std::ffi::CStr) {
+        let action = FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            let matches = s
+                .before_existing_replace_action
+                .as_ref()
+                .is_some_and(|(target, _)| {
+                    target.is_empty() || leaf.to_bytes() == target.as_bytes()
+                });
+            if matches {
+                s.before_existing_replace_action.take().map(|(_, cb)| cb)
+            } else {
+                None
+            }
+        });
+        if let Some(f) = action {
+            f(parent_dir, leaf);
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn after_fallback_move_out_before_install(parent_dir: &Path, leaf: &std::ffi::CStr) {
+        let action = FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            let matches = s
+                .after_fallback_move_out_action
+                .as_ref()
+                .is_some_and(|(target, _)| {
+                    target.is_empty() || leaf.to_bytes() == target.as_bytes()
+                });
+            if matches {
+                s.after_fallback_move_out_action.take().map(|(_, cb)| cb)
+            } else {
+                None
+            }
+        });
+        if let Some(f) = action {
+            f(parent_dir, leaf);
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn before_removal_move(parent_dir: &Path, leaf: &std::ffi::CStr) {
+        let action = FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            let matches = s
+                .before_removal_move_action
+                .as_ref()
+                .is_some_and(|(target, _)| {
+                    target.is_empty() || leaf.to_bytes() == target.as_bytes()
+                });
+            if matches {
+                s.before_removal_move_action.take().map(|(_, cb)| cb)
+            } else {
+                None
+            }
+        });
+        if let Some(f) = action {
+            f(parent_dir, leaf);
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn after_removal_move_before_verify(parent_dir: &Path, leaf: &std::ffi::CStr) {
+        let action = FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            let matches = s
+                .after_removal_move_action
+                .as_ref()
+                .is_some_and(|(target, _)| {
+                    target.is_empty() || leaf.to_bytes() == target.as_bytes()
+                });
+            if matches {
+                s.after_removal_move_action.take().map(|(_, cb)| cb)
+            } else {
+                None
+            }
+        });
+        if let Some(f) = action {
+            f(parent_dir, leaf);
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn after_blob_staged_before_parent_open(repo_dir: &Path, rel: &str) {
+        let action = FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            let matches = s
+                .after_blob_staged_action
+                .as_ref()
+                .is_some_and(|(prefix, _)| rel.starts_with(prefix.as_str()));
+            if matches {
+                s.after_blob_staged_action.take().map(|(_, cb)| cb)
+            } else {
+                None
+            }
+        });
+        if let Some(f) = action {
+            f(repo_dir, rel);
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn after_parent_open_before_install(repo_dir: &Path, rel: &str) {
+        let action = FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            let matches = s
+                .after_parent_open_action
+                .as_ref()
+                .is_some_and(|(prefix, _)| rel.starts_with(prefix.as_str()));
+            if matches {
+                s.after_parent_open_action.take().map(|(_, cb)| cb)
+            } else {
+                None
+            }
+        });
+        if let Some(f) = action {
+            f(repo_dir, rel);
         }
     }
 
@@ -5371,5 +6739,455 @@ mod tests {
         .unwrap();
         assert!(fs::symlink_metadata(&link).is_err());
         verify_git_tree(repo.path()).unwrap();
+    }
+
+    #[test]
+    fn index_lock_refuses_without_creating_empty_lock_and_preserves_successor_on_post_unlink_sync_error()
+     {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-q", "-b", "main"], &[]).unwrap();
+        let git_dir = resolve_exact_git_dir(repo.path()).unwrap();
+        let lock_path = git_dir.join("index.lock");
+
+        // 1. When neither hard links nor RENAME_NOREPLACE are available, acquire refuses
+        //    WITHOUT creating `.git/index.lock`.
+        {
+            let _g = test_hooks::install(test_hooks::FaultState {
+                simulate_index_lock_hard_link_unsupported: true,
+                simulate_index_lock_noreplace_unsupported: true,
+                ..Default::default()
+            });
+            let err = match GitIndexLock::acquire(&git_dir, "tok-unavail", false) {
+                Err(e) => e,
+                Ok(_) => {
+                    panic!("expected refusal when atomic initialized lock publish is unavailable")
+                }
+            };
+            assert!(
+                err.to_string().contains("index lock"),
+                "unexpected error: {err}"
+            );
+        }
+        assert!(
+            !lock_path.exists(),
+            "refused acquire must never leave an empty .git/index.lock behind"
+        );
+
+        // 2. When `commit_index_from_path` unlinks `.git/index.lock` and a legitimate
+        //    successor Git process immediately acquires `.git/index.lock` before a failing
+        //    post-unlink `sync_dir`, dropping `GitIndexLock` must NOT unlink the successor lock.
+        let staged_index = git_dir.join("staged-index.tmp");
+        fs::write(&staged_index, b"DIRC-test-index").unwrap();
+        let successor_bytes = b"DIRC-successor-git-lock";
+        let lock = GitIndexLock::acquire(&git_dir, "tok-commit", false).unwrap();
+        {
+            let _g = test_hooks::install(test_hooks::FaultState {
+                after_index_lock_unlink_action: Some(Box::new(move |lp| {
+                    assert!(!lp.exists(), "lock should already be unlinked");
+                    fs::write(lp, successor_bytes)?;
+                    Err(io::Error::other("injected post-unlink sync_dir failure"))
+                })),
+                ..Default::default()
+            });
+            let err = lock
+                .commit_index_from_path(&git_dir, &staged_index)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("post-unlink sync_dir failure"),
+                "unexpected error: {err}"
+            );
+        }
+        assert_eq!(
+            fs::read(&lock_path).unwrap(),
+            successor_bytes,
+            "GitIndexLock drop after unlink must never remove a successor lock"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_rollback_preserves_unreadable_exchanged_file_failed_reverse_exchange_and_recreated_removal()
+     {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+        let insert_quad = |s: &str, g: Option<&str>| {
+            ds.transaction(|tx| {
+                tx.insert(
+                    Quad::new(
+                        NamedNode::new_unchecked(s),
+                        NamedNode::new_unchecked("http://example.org/p"),
+                        Literal::from(s),
+                        match g {
+                            Some(iri) => GraphName::NamedNode(NamedNode::new_unchecked(iri)),
+                            None => GraphName::DefaultGraph,
+                        },
+                    )
+                    .as_ref(),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        };
+
+        insert_quad("http://example.org/s1", None);
+        insert_quad(
+            "http://example.org/drop1",
+            Some("http://example.org/drop-me"),
+        );
+        let repo = tempfile::tempdir().unwrap();
+        export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
+
+        let drop_rel = fs::read_dir(repo.path().join(GRAPHS_DIR))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .find(|n| n.contains("drop-me"))
+            .map(|n| format!("{GRAPHS_DIR}/{n}"))
+            .unwrap();
+
+        // Commit 2 modifies `graphs/default.ttl`.
+        insert_quad("http://example.org/s2", None);
+        let orig_default = fs::read(repo.path().join("graphs/default.ttl")).unwrap();
+        let same_len_secret: Vec<u8> = vec![b'X'; orig_default.len()];
+
+        // 1. Unreadable same-length replacement right before RENAME_EXCHANGE (mode 0o000):
+        //    post-exchange verify returns PermissionDenied, which must reverse-exchange and
+        //    preserve the unreadable user file at `graphs/default.ttl` (never unlink it).
+        {
+            let secret_clone = same_len_secret.clone();
+            let _g = test_hooks::install(test_hooks::FaultState {
+                before_existing_replace_action: Some((
+                    "default.ttl".into(),
+                    Box::new(move |parent, leaf| {
+                        let target = parent.join(std::ffi::OsStr::from_bytes(leaf.to_bytes()));
+                        let tmp = parent.join(".editor-atomic-save");
+                        fs::write(&tmp, &secret_clone).unwrap();
+                        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o000)).unwrap();
+                        fs::rename(&tmp, &target).unwrap();
+                    }),
+                )),
+                ..Default::default()
+            });
+            assert!(export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).is_err());
+        }
+        let default_path = repo.path().join("graphs/default.ttl");
+        assert!(
+            default_path.is_file(),
+            "unreadable exchanged file must be restored at destination, not unlinked"
+        );
+        fs::set_permissions(&default_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(fs::read(&default_path).unwrap(), same_len_secret);
+        fs::write(&default_path, &orig_default).unwrap();
+
+        // 2. Failed reverse exchange after mismatch: displaced file must be preserved on disk
+        //    under `.git/sparkles/staging/preserved-*`, NEVER unlinked.
+        let displaced_edit = b"# user edit when reverse exchange fails\n".to_vec();
+        let preserved_path_str: String;
+        {
+            let edit_clone = displaced_edit.clone();
+            let _g = test_hooks::install(test_hooks::FaultState {
+                before_existing_replace_action: Some((
+                    "default.ttl".into(),
+                    Box::new(move |parent, leaf| {
+                        let target = parent.join(std::ffi::OsStr::from_bytes(leaf.to_bytes()));
+                        fs::write(&target, &edit_clone).unwrap();
+                    }),
+                )),
+                fail_reverse_exchange: true,
+                ..Default::default()
+            });
+            let err =
+                export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("preserved at "),
+                "failed reverse exchange must report preserved path, got {msg}"
+            );
+            preserved_path_str = msg.split("preserved at ").nth(1).unwrap().to_string();
+        }
+        assert_eq!(
+            fs::read(&preserved_path_str).unwrap(),
+            displaced_edit,
+            "displaced file must remain intact on disk when reverse exchange fails"
+        );
+        fs::remove_file(&preserved_path_str).unwrap();
+        fs::write(&default_path, &orig_default).unwrap();
+        export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
+
+        // 3. Recreated removal destination: modified tracked file moved to trash, meanwhile a
+        //    brand-new file appears at the removal destination -> new file must NOT be
+        //    clobbered AND the displaced modified file must be preserved on disk.
+        let orig_drop = fs::read(repo.path().join(&drop_rel)).unwrap();
+        ds.update("DROP GRAPH <http://example.org/drop-me>")
+            .unwrap();
+        let drop_edit = b"# user edited drop file right before move\n".to_vec();
+        let newly_created = b"# brand new file created at same path\n".to_vec();
+        let preserved_removed: String;
+        {
+            let edit_clone = drop_edit.clone();
+            let new_clone = newly_created.clone();
+            let _g = test_hooks::install(test_hooks::FaultState {
+                before_removal_move_action: Some((
+                    String::new(),
+                    Box::new(move |parent, leaf| {
+                        let target = parent.join(std::ffi::OsStr::from_bytes(leaf.to_bytes()));
+                        fs::write(&target, &edit_clone).unwrap();
+                    }),
+                )),
+                after_removal_move_action: Some((
+                    String::new(),
+                    Box::new(move |parent, leaf| {
+                        let target = parent.join(std::ffi::OsStr::from_bytes(leaf.to_bytes()));
+                        fs::write(&target, &new_clone).unwrap();
+                    }),
+                )),
+                ..Default::default()
+            });
+            let err =
+                export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("preserved at "),
+                "recreated removal collision must report preserved path, got {msg}"
+            );
+            preserved_removed = msg.split("preserved at ").nth(1).unwrap().to_string();
+        }
+        assert_eq!(
+            fs::read(repo.path().join(&drop_rel)).unwrap(),
+            newly_created,
+            "newly created file at removal destination must not be clobbered"
+        );
+        assert_eq!(
+            fs::read(&preserved_removed).unwrap(),
+            drop_edit,
+            "displaced modified file must be preserved when destination was recreated"
+        );
+        fs::remove_file(&preserved_removed).unwrap();
+
+        // 4. Unreadable (chmod 000) file moved during removal -> must restore cleanly without
+        //    leaving it stranded in staging (Neon P3-1).
+        fs::write(repo.path().join(&drop_rel), &orig_drop).unwrap();
+        {
+            let same_len_drop = vec![b'Y'; orig_drop.len()];
+            let _g = test_hooks::install(test_hooks::FaultState {
+                before_removal_move_action: Some((
+                    String::new(),
+                    Box::new(move |parent, leaf| {
+                        let target = parent.join(std::ffi::OsStr::from_bytes(leaf.to_bytes()));
+                        let tmp = parent.join(".editor-drop-save");
+                        fs::write(&tmp, &same_len_drop).unwrap();
+                        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o000)).unwrap();
+                        fs::rename(&tmp, &target).unwrap();
+                    }),
+                )),
+                ..Default::default()
+            });
+            assert!(export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).is_err());
+        }
+        let drop_full = repo.path().join(&drop_rel);
+        assert!(
+            drop_full.is_file(),
+            "unreadable moved file must be restored back to destination"
+        );
+        fs::set_permissions(&drop_full, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(fs::read(&drop_full).unwrap(), vec![b'Y'; orig_drop.len()]);
+        fs::write(&drop_full, &orig_drop).unwrap();
+        export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
+        assert!(!drop_full.exists());
+        verify_git_tree(repo.path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_fallback_path_preserves_atomic_save_without_rename_exchange() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+        let insert_quad = |s: &str| {
+            ds.transaction(|tx| {
+                tx.insert(
+                    Quad::new(
+                        NamedNode::new_unchecked(s),
+                        NamedNode::new_unchecked("http://example.org/p"),
+                        Literal::from(s),
+                        GraphName::DefaultGraph,
+                    )
+                    .as_ref(),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        };
+
+        insert_quad("http://example.org/s1");
+        let repo = tempfile::tempdir().unwrap();
+        export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
+
+        insert_quad("http://example.org/s2");
+        let orig_default = fs::read(repo.path().join("graphs/default.ttl")).unwrap();
+        let default_path = repo.path().join("graphs/default.ttl");
+
+        // 1. Atomic save replacing destination BEFORE fallback move-out: fallback moves the
+        //    editor's new inode into backup, detects mismatch, restores it without clobbering,
+        //    and refuses.
+        let atomic_before = b"# editor atomic save before move-out\n".to_vec();
+        {
+            let bytes = atomic_before.clone();
+            let _g = test_hooks::install(test_hooks::FaultState {
+                force_disable_rename_exchange: true,
+                before_existing_replace_action: Some((
+                    "default.ttl".into(),
+                    Box::new(move |parent, leaf| {
+                        let target = parent.join(std::ffi::OsStr::from_bytes(leaf.to_bytes()));
+                        let tmp = parent.join(".editor-atomic-1");
+                        fs::write(&tmp, &bytes).unwrap();
+                        fs::rename(&tmp, &target).unwrap();
+                    }),
+                )),
+                ..Default::default()
+            });
+            let err =
+                export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap_err();
+            assert!(
+                err.to_string().contains("default.ttl"),
+                "expected refusal on default.ttl, got {err}"
+            );
+        }
+        assert_eq!(
+            fs::read(&default_path).unwrap(),
+            atomic_before,
+            "fallback path must preserve atomic save racing before move-out"
+        );
+        fs::write(&default_path, &orig_default).unwrap();
+
+        // 2. Atomic save replacing destination BETWEEN fallback move-out and no-clobber
+        //    install: no-clobber install sees EEXIST, refuses, and preserves editor's file.
+        let atomic_between = b"# editor atomic save between move-out and install\n".to_vec();
+        {
+            let bytes = atomic_between.clone();
+            let _g = test_hooks::install(test_hooks::FaultState {
+                force_disable_rename_exchange: true,
+                after_fallback_move_out_action: Some((
+                    "default.ttl".into(),
+                    Box::new(move |parent, leaf| {
+                        let target = parent.join(std::ffi::OsStr::from_bytes(leaf.to_bytes()));
+                        let tmp = parent.join(".editor-atomic-2");
+                        fs::write(&tmp, &bytes).unwrap();
+                        fs::rename(&tmp, &target).unwrap();
+                    }),
+                )),
+                ..Default::default()
+            });
+            let err =
+                export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap_err();
+            assert!(
+                err.to_string().contains("default.ttl"),
+                "expected refusal on default.ttl, got {err}"
+            );
+        }
+        assert_eq!(
+            fs::read(&default_path).unwrap(),
+            atomic_between,
+            "fallback path must preserve atomic save racing between move-out and install"
+        );
+
+        // Restoring original file lets the fallback path complete cleanly.
+        fs::write(&default_path, &orig_default).unwrap();
+        {
+            let _g = test_hooks::install(test_hooks::FaultState {
+                force_disable_rename_exchange: true,
+                ..Default::default()
+            });
+            export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
+        }
+        verify_git_tree(repo.path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_parent_swapped_to_symlink_after_staging_never_touches_outside_dir() {
+        use std::os::unix::fs::symlink;
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+        ds.transaction(|tx| {
+            tx.insert(
+                Quad::new(
+                    NamedNode::new_unchecked("http://example.org/s1"),
+                    NamedNode::new_unchecked("http://example.org/p"),
+                    Literal::from(1i64),
+                    GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let repo = tempfile::tempdir().unwrap();
+        let outside1 = tempfile::tempdir().unwrap();
+
+        // 1. Replace parent directory `graphs` with a symlink to `outside1` right after blob
+        //    staging starts (for an absent destination) -> must refuse with UnsafePath and
+        //    leave `outside1` completely empty.
+        {
+            let out_path = outside1.path().to_path_buf();
+            let _g = test_hooks::install(test_hooks::FaultState {
+                after_blob_staged_action: Some((
+                    "graphs/".into(),
+                    Box::new(move |repo_dir, _rel| {
+                        let graphs = repo_dir.join(GRAPHS_DIR);
+                        if graphs.is_dir() {
+                            fs::remove_dir_all(&graphs).unwrap();
+                        }
+                        symlink(&out_path, &graphs).unwrap();
+                    }),
+                )),
+                ..Default::default()
+            });
+            let err =
+                export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap_err();
+            assert!(
+                matches!(err, GitError::UnsafePath { .. }),
+                "expected UnsafePath when parent becomes symlink after staging, got {err:?}"
+            );
+        }
+        assert_eq!(
+            fs::read_dir(outside1.path()).unwrap().count(),
+            0,
+            "outside symlink target must remain completely untouched"
+        );
+        fs::remove_file(repo.path().join(GRAPHS_DIR)).unwrap();
+
+        // 2. Replace parent directory `graphs` with a symlink to `outside2` AFTER the verified
+        //    `parent_dir` handle has already been opened and right before install -> dirfd-
+        //    relative mutation must NEVER follow the new symlink into `outside2`.
+        let outside2 = tempfile::tempdir().unwrap();
+        {
+            let out_path = outside2.path().to_path_buf();
+            let _g = test_hooks::install(test_hooks::FaultState {
+                after_parent_open_action: Some((
+                    "graphs/".into(),
+                    Box::new(move |repo_dir, _rel| {
+                        let graphs = repo_dir.join(GRAPHS_DIR);
+                        let moved_path = repo_dir.join("orig-graphs-moved");
+                        fs::rename(&graphs, &moved_path).unwrap();
+                        symlink(&out_path, &graphs).unwrap();
+                    }),
+                )),
+                ..Default::default()
+            });
+            // The dirfd-pinned write lands in the original verified directory inode (now moved
+            // to `orig-graphs-moved`), never touching `outside2`.
+            let _ = export_branch_to_git(&ds, repo.path(), &GitExportOptions::default());
+        }
+        assert_eq!(
+            fs::read_dir(outside2.path()).unwrap().count(),
+            0,
+            "dirfd-relative install must never write into a concurrently swapped symlink target"
+        );
     }
 }
