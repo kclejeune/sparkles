@@ -10,7 +10,7 @@
 use super::Reader;
 use super::link::unavailable;
 use super::recall::{ResolutionDoc, ResolvedDoc, policy_error, rank_terms};
-use super::text::plain_query;
+use super::text::{terms, words};
 use crate::graphrag::read::{self, Filter, ReportRef};
 use crate::mcp::Outcome;
 use crate::mcp::errors::{ErrorContext, ToolError};
@@ -549,34 +549,10 @@ impl Tools<'_> {
                     .collect())
             };
         let mut lists: Vec<HashMap<String, usize>> = Vec::new();
-        if ds.dataset.indexes().text().enabled()
-            && let Some(plain) = plain_query(q)
+        if let Some(hits) = self.eligible_text_hits(ds, r, q, graph, &eligible_subjects, depth)?
+            && !hits.is_empty()
         {
-            let preds: Vec<NamedNode> = match ds
-                .dataset
-                .indexes()
-                .text()
-                .status()
-                .map(|s| s.config.predicates)
-            {
-                Some(sparkles::text::PredicateSet::Only(p)) => p
-                    .iter()
-                    .map(|p| NamedNode::new_unchecked(p.as_str()))
-                    .collect(),
-                _ => Vec::new(),
-            };
-            let mut args: Vec<String> = preds.iter().map(ToString::to_string).collect();
-            args.push(Literal::new_simple_literal(&plain).to_string());
-            let call = format!(
-                "(?s ?score) <http://jena.apache.org/text#query> ({})",
-                args.join(" ")
-            );
-            match run_ranked(&call) {
-                Ok(h) if !h.is_empty() => lists.push(rank_terms(h.into_iter())),
-                Ok(_) => {}
-                Err(e) if unavailable(&e) => {}
-                Err(e) => return Err(e),
-            }
+            lists.push(rank_terms(hits.into_iter()));
         }
         // every index that may embed report text, each its own ranked list, restricted
         // to the eligible report and finding subjects via candidates:join
@@ -598,6 +574,157 @@ impl Tools<'_> {
             lists.into_iter().map(|l| (1.0, l)),
             super::RRF_K,
         ))
+    }
+
+    /// Eligible-only BM25 text ranking over the report and finding literals matched by
+    /// `eligible_subjects` in `graph`, gated on the dataset's full-text index being
+    /// enabled, ready, and covering `graph`. Computing BM25 strictly over eligible
+    /// literals ensures excluded reports neither exhaust `maxHits` nor shift term
+    /// weights for eligible reports, and keeps broad queries bounded to `depth`.
+    fn eligible_text_hits(
+        &self,
+        ds: &crate::state::Dataset,
+        r: &Reader,
+        q: &str,
+        graph: &str,
+        eligible_subjects: &str,
+        depth: usize,
+    ) -> Result<Option<Vec<(NamedNode, f64)>>, sparkles::error::Error> {
+        if !ds.dataset.indexes().text().enabled() {
+            return Ok(None);
+        }
+        let Some(status) = ds.dataset.indexes().text().status() else {
+            return Ok(None);
+        };
+        if !status.enabled
+            || status.state != "ready"
+            || !status.config.graphs.include.contains(graph)
+            || status.config.graphs.exclude.iter().any(|g| g == graph)
+        {
+            return Ok(None);
+        }
+        let q_terms = terms(q);
+        let use_terms = !q_terms.is_empty();
+        let mut q_tokens = if use_terms { q_terms } else { words(q) };
+        q_tokens.sort();
+        q_tokens.dedup();
+        if q_tokens.is_empty() {
+            return Ok(None);
+        }
+        let preds: Vec<NamedNode> = match &status.config.predicates {
+            sparkles::text::PredicateSet::Only(p) => p
+                .iter()
+                .filter_map(|p| NamedNode::new(p.as_str()).ok())
+                .collect(),
+            sparkles::text::PredicateSet::All => vec![
+                NamedNode::new_unchecked(crate::graphrag::store::RDFS_LABEL),
+                NamedNode::new_unchecked(crate::graphrag::guard::gr("summary")),
+                NamedNode::new_unchecked(crate::graphrag::guard::gr("text")),
+            ],
+        };
+        if preds.is_empty() {
+            return Ok(None);
+        }
+        let pred_values = super::values_iris("p", &preds);
+        let sparql = format!(
+            "SELECT ?r ?lit WHERE {{ GRAPH <{graph}> {{ {eligible_subjects} {pred_values} ?s ?p ?lit . FILTER(isLiteral(?lit) && (DATATYPE(?lit) = <http://www.w3.org/2001/XMLSchema#string> || DATATYPE(?lit) = <http://www.w3.org/1999/02/22-rdf-syntax-ns#langString>)) }} }}"
+        );
+        let q_index: HashMap<&str, usize> = q_tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.as_str(), i))
+            .collect();
+        const K1: f64 = 1.2;
+        const B: f64 = 0.75;
+        let mut rep_nodes: Vec<NamedNode> = Vec::new();
+        let mut rep_idx: HashMap<String, usize> = HashMap::new();
+        let mut total_docs: usize = 0;
+        let mut total_len: usize = 0;
+        let mut df: Vec<usize> = vec![0; q_tokens.len()];
+        let mut counts: Vec<usize> = vec![0; q_tokens.len()];
+        let mut touched: Vec<usize> = Vec::with_capacity(q_tokens.len());
+        struct MatchedDoc {
+            rep: usize,
+            len: usize,
+            tfs: Vec<(usize, usize)>,
+        }
+        let mut matched: Vec<MatchedDoc> = Vec::new();
+        for row in r.rows(&sparql, Vec::new())? {
+            let [Some(Term::NamedNode(rep)), Some(Term::Literal(lit))] = row.as_slice() else {
+                continue;
+            };
+            total_docs += 1;
+            let doc_tokens = if use_terms {
+                terms(lit.value())
+            } else {
+                words(lit.value())
+            };
+            let doc_len = doc_tokens.len();
+            total_len += doc_len;
+            touched.clear();
+            for tok in &doc_tokens {
+                if let Some(&qi) = q_index.get(tok.as_str()) {
+                    if counts[qi] == 0 {
+                        touched.push(qi);
+                    }
+                    counts[qi] += 1;
+                }
+            }
+            if !touched.is_empty() {
+                let idx = match rep_idx.get(rep.as_str()) {
+                    Some(&i) => i,
+                    None => {
+                        let i = rep_nodes.len();
+                        rep_nodes.push(rep.clone());
+                        rep_idx.insert(rep.as_str().to_string(), i);
+                        i
+                    }
+                };
+                let mut tfs = Vec::with_capacity(touched.len());
+                for &qi in &touched {
+                    df[qi] += 1;
+                    tfs.push((qi, counts[qi]));
+                    counts[qi] = 0;
+                }
+                matched.push(MatchedDoc {
+                    rep: idx,
+                    len: doc_len,
+                    tfs,
+                });
+            }
+        }
+        if matched.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let n = total_docs as f64;
+        let avgdl = (total_len as f64 / n).max(1.0);
+        let mut best: HashMap<usize, f64> = HashMap::new();
+        for doc in matched {
+            let norm = 1.0 - B + B * (doc.len as f64) / avgdl;
+            let mut score = 0.0f64;
+            for (qi, tf) in doc.tfs {
+                let f = tf as f64;
+                let df_i = df[qi] as f64;
+                let idf = (1.0 + (n - df_i + 0.5) / (df_i + 0.5)).ln();
+                score += idf * f * (K1 + 1.0) / (f + K1 * norm);
+            }
+            if score.is_finite() && score > 0.0 {
+                let e = best.entry(doc.rep).or_insert(score);
+                if score > *e {
+                    *e = score;
+                }
+            }
+        }
+        let mut out: Vec<(NamedNode, f64)> = best
+            .into_iter()
+            .map(|(i, s)| (rep_nodes[i].clone(), s))
+            .collect();
+        out.sort_by(|a, b| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| a.0.as_str().cmp(b.0.as_str()))
+        });
+        out.truncate(depth);
+        Ok(Some(out))
     }
 }
 

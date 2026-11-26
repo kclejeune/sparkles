@@ -1821,12 +1821,12 @@ async fn global_ask_and_community_reports_enforce_policy_and_footprint_authoriza
     //    withholds the global answer with 403 forbidden.
     let reload_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reload_flag = reload_done.clone();
-    let e_reload = e.clone();
+    let auth_reload = e.s.auth();
     let fenced_mock = MockModel::start(move |r, _| {
         let body = r.body.to_string();
         if body.contains("\"Points\"") || body.contains("pick out what bears") {
             if !reload_flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                e_reload.s.auth().reload().unwrap();
+                auth_reload.reload().unwrap();
             }
             return (
                 200,

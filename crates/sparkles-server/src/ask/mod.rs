@@ -1888,6 +1888,12 @@ impl Asking<'_, '_> {
                             self.withheld = true;
                             return json!({});
                         }
+                        // Unpolicied auto fallback (C22 §7.2): reports disappeared, became
+                        // too stale, or became unreadable during the scoped draft. Re-run
+                        // as an unscoped local draft within the existing call and token
+                        // budgets instead of falling through with an empty query.
+                        attempt = 0;
+                        continue;
                     }
                     Err(e) => return self.error(&e.code, e.message),
                 }

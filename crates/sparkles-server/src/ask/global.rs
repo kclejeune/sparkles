@@ -166,39 +166,70 @@ fn format_identity_line(id: &Value, max_members: usize) -> Option<String> {
     }
 }
 
-/// Format an identity line so it fits `limit` characters, reducing inline cluster
-/// members before truncating the core `<entity> resolvesTo <rep>` link.
-fn fit_identity_line(id: &Value, limit: usize) -> Option<String> {
-    for k in (0..=PROMPT_IDENTITY_MEMBERS).rev() {
-        let line = format_identity_line(id, k)?;
-        if line.chars().count() <= limit {
-            return Some(line);
-        }
-    }
+/// The bare `<entity> resolvesTo <rep>` identity line, never truncated mid-IRI.
+fn bare_identity_line(id: &Value) -> Option<String> {
     let clean = |s: &str| s.replace(['\r', '\n'], " ");
-    let bare = format!(
+    Some(format!(
         "Identity: <{}> resolvesTo <{}>",
         clean(id["entity"].as_str()?),
         clean(id["representative"].as_str()?),
-    );
-    if bare.chars().count() <= limit {
-        Some(bare)
-    } else {
-        Some(prompts::cut(&bare, limit.max(32)))
+    ))
+}
+
+fn omission_note(omitted: usize) -> String {
+    format!("Identity: (+{omitted} more identities)")
+}
+
+fn make_head(n: usize, title: &str, continued: bool, max_head_chars: usize) -> String {
+    let prefix = format!("R{n} ");
+    let suffix = if continued { " (continued)\n" } else { "\n" };
+    let overhead = prefix.chars().count() + suffix.chars().count();
+    if max_head_chars <= overhead {
+        return if continued {
+            format!("R{n} (continued)\n")
+        } else {
+            format!("R{n}\n")
+        };
+    }
+    let t = prompts::cut(title, max_head_chars - overhead);
+    format!("{prefix}{t}{suffix}")
+}
+
+struct PackedUnit {
+    finding_line: String,
+    id_lines: Vec<String>,
+    emitted_ents: Vec<String>,
+    /// Chars used by finding text + complete bare links + omission note (without optional
+    /// inline cluster member expansion).
+    core_chars: usize,
+    /// Chars used by minimum finding label/snippet + complete bare links + omission note.
+    must_chars: usize,
+    /// Whether the full finding text fit without truncation.
+    finding_complete: bool,
+}
+
+impl PackedUnit {
+    fn total_chars(&self) -> usize {
+        self.finding_line.chars().count()
+            + 1
+            + self
+                .id_lines
+                .iter()
+                .map(|l| l.chars().count() + 1)
+                .sum::<usize>()
     }
 }
 
 /// A report as the map step sees it, numbered from 1 in the selection: its title,
 /// summary and numbered findings, in parts that each fit `budget` tokens. A later part
 /// repeats the title, so every finding keeps its label `F{n}.{i}`, and a line longer than
-/// the budget is cut. Each identity link is paired with a finding that references it in
-/// the same block, with space reserved so the complete link stays alongside the finding
-/// label, and no empty-finding continuation block is emitted.
+/// the budget is cut. Space is reserved for the finding label, complete bare identity
+/// links and findings that fit in a fresh block before spending space on the title,
+/// summary or inline cluster member lists; an un-fittable link is omitted with an
+/// explicit marker rather than clipped mid-IRI, and no empty-finding block is emitted.
 pub fn report_blocks(n: usize, r: &Value, budget: u64) -> Vec<(String, Vec<usize>)> {
     let max_chars = (budget * CHARS_PER_TOKEN).max(64) as usize;
     let title = r["title"].as_str().unwrap_or("");
-    let head0 = format!("R{n} {title}\n");
-    let cont_head = format!("R{n} {title} (continued)\n");
     let findings = r["findings"].as_array().map(Vec::as_slice).unwrap_or(&[]);
 
     // Map each report identity to the findings that reference it (by `about` and cited
@@ -247,28 +278,14 @@ pub fn report_blocks(n: usize, r: &Value, budget: u64) -> Vec<(String, Vec<usize
     }
     let omitted_report = assigned.len().saturating_sub(allowed.len());
 
-    let mut out: Vec<(String, Vec<usize>)> = Vec::new();
-    let mut cur = head0;
-    let mut shown: Vec<usize> = Vec::new();
-    let mut cur_ids: BTreeSet<String> = BTreeSet::new();
-
-    let summary_cap = if findings.is_empty() {
-        max_chars.saturating_sub(cur.chars().count() + 1).max(32)
-    } else {
-        (max_chars / 2)
-            .min(max_chars.saturating_sub(cur.chars().count() + 1))
-            .max(32)
-    };
-    let summary_line = prompts::cut(
-        &format!("Summary: {}", r["summary"].as_str().unwrap_or("")),
-        summary_cap,
-    );
-    cur.push_str(&summary_line);
-    cur.push('\n');
-
+    let full_summary = format!("Summary: {}", r["summary"].as_str().unwrap_or(""));
     if findings.is_empty() {
-        out.push((cur, shown));
-        return out;
+        let head0 = make_head(n, title, false, (max_chars / 4).max(32));
+        let summary_cap = max_chars.saturating_sub(head0.chars().count() + 1).max(32);
+        let mut cur = head0;
+        cur.push_str(&prompts::cut(&full_summary, summary_cap));
+        cur.push('\n');
+        return vec![(cur, Vec::new())];
     }
 
     let build_unit = |i: usize,
@@ -277,95 +294,200 @@ pub fn report_blocks(n: usize, r: &Value, budget: u64) -> Vec<(String, Vec<usize
                       block_ids: &BTreeSet<String>,
                       avail: usize,
                       extra_omitted: usize|
-     -> (String, Vec<String>, Vec<String>) {
-        let mut eligible: Vec<&Value> = Vec::new();
+     -> PackedUnit {
+        let label = format!("F{n}.{} ", i + 1);
+        let label_len = label.chars().count();
+        let full_finding = format!("{label}{}", f["text"].as_str().unwrap_or(""));
+        let full_finding_chars = full_finding.chars().count() + 1;
+        let min_finding_chars = (label_len + 16).min(full_finding_chars);
+
+        let mut eligible: Vec<(&Value, String)> = Vec::new();
         let mut omitted = extra_omitted;
         for &id in f_ids {
             let Some(e) = id["entity"].as_str() else {
                 continue;
             };
-            if !allowed.contains(e) {
+            if !allowed.contains(e) || block_ids.contains(e) {
                 continue;
             }
-            if block_ids.contains(e) {
+            let Some(bare) = bare_identity_line(id) else {
                 continue;
-            }
+            };
             if eligible.len() < PROMPT_IDENTITIES_PER_FINDING {
-                eligible.push(id);
+                eligible.push((id, bare));
             } else {
                 omitted += 1;
             }
         }
-        let id_budget = (avail / 2).max(64).min(avail.saturating_sub(40));
-        let mut id_lines: Vec<String> = Vec::new();
-        let mut emitted_ents: Vec<String> = Vec::new();
-        let mut id_chars = 0usize;
-        for (idx, id) in eligible.iter().enumerate() {
-            let remaining = id_budget.saturating_sub(id_chars);
-            if idx > 0 && remaining < 48 {
-                omitted += eligible.len() - idx;
-                break;
+
+        // Pass 1: admit complete bare links without ever cutting an IRI. Reserve at
+        // least `min_finding_chars` for the finding label/snippet; allow subsequent
+        // links to use leftover space beyond the full finding or half the block.
+        let first_cap = avail.saturating_sub(min_finding_chars);
+        let multi_cap = (avail / 2)
+            .max(avail.saturating_sub(full_finding_chars))
+            .min(first_cap);
+        let mut admitted: Vec<(&Value, String)> = Vec::new();
+        let mut bare_chars = 0usize;
+        for (id, bare) in eligible {
+            let bare_len = bare.chars().count() + 1;
+            let cap = if admitted.is_empty() {
+                first_cap
+            } else {
+                multi_cap
+            };
+            let note_reserve = if omitted > 0 {
+                omission_note(omitted).chars().count() + 1
+            } else {
+                0
+            };
+            if bare_chars + bare_len + note_reserve <= cap {
+                bare_chars += bare_len;
+                admitted.push((id, bare));
+            } else {
+                omitted += 1;
             }
-            if let Some(line) = fit_identity_line(id, remaining.saturating_sub(1).max(32)) {
-                let len = line.chars().count() + 1;
-                if idx > 0 && id_chars + len > id_budget {
-                    omitted += eligible.len() - idx;
+        }
+
+        // Keep an explicit omission marker whenever any identity was omitted.
+        let mut note_line: Option<String> = None;
+        if omitted > 0 {
+            loop {
+                let note = omission_note(omitted);
+                let nlen = note.chars().count() + 1;
+                if bare_chars + nlen <= first_cap {
+                    bare_chars += nlen;
+                    note_line = Some(note);
                     break;
                 }
-                id_chars += len;
-                id_lines.push(line);
-                if let Some(e) = id["entity"].as_str() {
-                    emitted_ents.push(e.to_string());
+                let Some((_, popped)) = admitted.pop() else {
+                    break;
+                };
+                bare_chars = bare_chars.saturating_sub(popped.chars().count() + 1);
+                omitted += 1;
+            }
+        }
+
+        // Pass 2: give the finding all remaining space after bare links and any marker.
+        let finding_cap = avail.saturating_sub(bare_chars + 1).max(label_len);
+        let finding_line = prompts::cut(&full_finding, finding_cap);
+        let actual_finding_chars = finding_line.chars().count() + 1;
+        let finding_complete = finding_line == full_finding;
+        let core_chars = actual_finding_chars + bare_chars;
+        let must_chars = min_finding_chars + bare_chars;
+
+        // Pass 3: spend only remaining slack on inline cluster member lists so members
+        // never steal space from the finding or a complete bare link.
+        let mut slack = avail.saturating_sub(core_chars);
+        for (id, line) in &mut admitted {
+            let cur_len = line.chars().count();
+            for k in (0..=PROMPT_IDENTITY_MEMBERS).rev() {
+                if let Some(cand) = format_identity_line(id, k) {
+                    let cand_len = cand.chars().count();
+                    if cand_len <= cur_len + slack {
+                        slack = (cur_len + slack) - cand_len;
+                        *line = cand;
+                        break;
+                    }
                 }
             }
         }
-        if omitted > 0 {
-            let note = format!("Identity: (+{omitted} more identities)");
-            let note_len = note.chars().count() + 1;
-            if id_chars + note_len <= avail.saturating_sub(33) {
-                id_chars += note_len;
-                id_lines.push(note);
-            }
+
+        let emitted_ents: Vec<String> = admitted
+            .iter()
+            .filter_map(|(id, _)| id["entity"].as_str().map(str::to_string))
+            .collect();
+        let mut id_lines: Vec<String> = admitted.into_iter().map(|(_, l)| l).collect();
+        if let Some(note) = note_line {
+            id_lines.push(note);
         }
-        let finding_cap = avail.saturating_sub(id_chars + 1).max(32);
-        let finding_line = prompts::cut(
-            &format!("F{n}.{} {}", i + 1, f["text"].as_str().unwrap_or("")),
-            finding_cap,
-        );
-        (finding_line, id_lines, emitted_ents)
+
+        PackedUnit {
+            finding_line,
+            id_lines,
+            emitted_ents,
+            core_chars,
+            must_chars,
+            finding_complete,
+        }
     };
 
-    let fresh_avail = max_chars.saturating_sub(cont_head.chars().count()).max(64);
     let last_idx = findings.len() - 1;
+    let empty_ids: BTreeSet<String> = BTreeSet::new();
+    let min_head0_len = format!("R{n}\n").chars().count();
+    let min_cont_len = format!("R{n} (continued)\n").chars().count();
+    let extra0 = if last_idx == 0 { omitted_report } else { 0 };
+    let probe0 = build_unit(
+        0,
+        &findings[0],
+        &finding_ids[0],
+        &empty_ids,
+        max_chars.saturating_sub(min_head0_len),
+        extra0,
+    );
+    let desired_title_cap = (max_chars / 4).max(32);
+    let reserve_for_f0 = if probe0.finding_complete {
+        probe0.core_chars
+    } else {
+        probe0.must_chars
+    };
+    let head0_cap = desired_title_cap
+        .min(max_chars.saturating_sub(reserve_for_f0))
+        .max(min_head0_len);
+    let head0 = make_head(n, title, false, head0_cap);
+    let cont_head = make_head(n, title, true, head0_cap.max(min_cont_len));
+
+    let mut out: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut cur = head0;
+    let mut shown: Vec<usize> = Vec::new();
+    let mut cur_ids: BTreeSet<String> = BTreeSet::new();
+
+    // Reserve space for the first finding (and its bare identity links) before spending
+    // block 0 space on the summary.
+    let block0_body = max_chars.saturating_sub(cur.chars().count());
+    let probe_body = build_unit(
+        0,
+        &findings[0],
+        &finding_ids[0],
+        &empty_ids,
+        block0_body,
+        extra0,
+    );
+    let summary_avail = if probe_body.finding_complete {
+        block0_body.saturating_sub(probe_body.core_chars)
+    } else {
+        (block0_body / 4).min(block0_body.saturating_sub(probe_body.must_chars))
+    };
+    if summary_avail >= 16 {
+        let summary_line = prompts::cut(&full_summary, summary_avail - 1);
+        cur.push_str(&summary_line);
+        cur.push('\n');
+    }
+
+    let fresh_avail = max_chars.saturating_sub(cont_head.chars().count());
     for (i, f) in findings.iter().enumerate() {
         let extra = if i == last_idx { omitted_report } else { 0 };
         let avail_now = if shown.is_empty() {
-            max_chars.saturating_sub(cur.chars().count()).max(64)
+            max_chars.saturating_sub(cur.chars().count())
         } else {
             fresh_avail
         };
-        let (mut fline, mut ilines, mut ients) =
-            build_unit(i, f, &finding_ids[i], &cur_ids, avail_now, extra);
-        let unit_chars =
-            fline.chars().count() + 1 + ilines.iter().map(|l| l.chars().count() + 1).sum::<usize>();
-        if !shown.is_empty() && cur.chars().count() + unit_chars > max_chars {
+        let mut unit = build_unit(i, f, &finding_ids[i], &cur_ids, avail_now, extra);
+        if !shown.is_empty() && cur.chars().count() + unit.total_chars() > max_chars {
             out.push((
                 std::mem::replace(&mut cur, cont_head.clone()),
                 std::mem::take(&mut shown),
             ));
             cur_ids.clear();
-            let rebuilt = build_unit(i, f, &finding_ids[i], &cur_ids, fresh_avail, extra);
-            fline = rebuilt.0;
-            ilines = rebuilt.1;
-            ients = rebuilt.2;
+            unit = build_unit(i, f, &finding_ids[i], &cur_ids, fresh_avail, extra);
         }
-        cur.push_str(&fline);
+        cur.push_str(&unit.finding_line);
         cur.push('\n');
-        for il in ilines {
+        for il in unit.id_lines {
             cur.push_str(&il);
             cur.push('\n');
         }
-        cur_ids.extend(ients);
+        cur_ids.extend(unit.emitted_ents);
         shown.push(i);
     }
     out.push((cur, shown));
@@ -1415,5 +1537,108 @@ mod tests {
             "too many identity lines: {identity_lines}"
         );
         assert!(saw_omitted, "expected truncation note across {parts:?}");
+    }
+
+    #[test]
+    fn report_blocks_preserves_complete_long_bare_link_within_256_token_budget() {
+        let budget = 256;
+        let max_chars = (budget * CHARS_PER_TOKEN) as usize;
+        let ent = format!("http://example.org/entity/{}", "e".repeat(274));
+        let rep = format!("http://example.org/entity/{}", "r".repeat(274));
+        assert_eq!(ent.len(), 300);
+        assert_eq!(rep.len(), 300);
+        let bare = format!("Identity: <{ent}> resolvesTo <{rep}>");
+        let r = json!({
+            "title": "Payments",
+            "summary": "Short summary.",
+            "findings": [{
+                "text": "Alice leads payments.",
+                "about": [ent],
+            }],
+            "identities": [{
+                "entity": ent,
+                "representative": rep,
+                "members": [rep, ent],
+                "membersComplete": true,
+            }],
+        });
+        let parts = report_blocks(1, &r, budget);
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert_eq!(parts[0].1, vec![0], "{parts:?}");
+        let text = &parts[0].0;
+        assert!(
+            text.chars().count() <= max_chars,
+            "exceeded budget: {}",
+            text.chars().count()
+        );
+        assert!(text.contains("F1.1 Alice leads payments."), "{text}");
+        assert!(text.contains(&bare), "complete bare link was cut: {text}");
+    }
+
+    #[test]
+    fn report_blocks_preserves_first_finding_that_fits_before_summary() {
+        let budget = 256;
+        let max_chars = (budget * CHARS_PER_TOKEN) as usize;
+        let summary = "s".repeat(700);
+        let finding = format!("START_{}_END", "f".repeat(790));
+        assert_eq!(finding.len(), 800);
+        let r = json!({
+            "title": "Payments",
+            "summary": summary,
+            "findings": [{ "text": finding }],
+        });
+        let parts = report_blocks(1, &r, budget);
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert_eq!(parts[0].1, vec![0], "{parts:?}");
+        let text = &parts[0].0;
+        assert!(
+            text.chars().count() <= max_chars,
+            "exceeded budget: {}",
+            text.chars().count()
+        );
+        assert!(
+            text.contains(&format!("F1.1 {finding}")),
+            "finding was truncated despite fitting in budget: {text}"
+        );
+    }
+
+    #[test]
+    fn report_blocks_omits_unfittable_bare_link_with_marker_instead_of_clipping() {
+        let budget = 256;
+        let max_chars = (budget * CHARS_PER_TOKEN) as usize;
+        let ent = format!("http://example.org/entity/{}", "e".repeat(574));
+        let rep = format!("http://example.org/entity/{}", "r".repeat(574));
+        let r = json!({
+            "title": "Payments",
+            "summary": "Short summary.",
+            "findings": [{
+                "text": "Alice leads payments.",
+                "about": [ent],
+            }],
+            "identities": [{
+                "entity": ent,
+                "representative": rep,
+                "members": [rep, ent],
+                "membersComplete": true,
+            }],
+        });
+        let parts = report_blocks(1, &r, budget);
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert_eq!(parts[0].1, vec![0], "{parts:?}");
+        let text = &parts[0].0;
+        assert!(
+            text.chars().count() <= max_chars,
+            "exceeded budget: {}",
+            text.chars().count()
+        );
+        assert!(text.contains("F1.1 Alice leads payments."), "{text}");
+        assert!(
+            !text.contains("Identity: <"),
+            "unfittable bare link was emitted clipped: {text}"
+        );
+        assert!(
+            text.contains("Identity: (+1 more identities)"),
+            "expected explicit omission marker: {text}"
+        );
     }
 }

@@ -2483,7 +2483,8 @@ pub(super) struct ResolutionDoc {
     /// Deduplicated cluster member slices keyed by representative IRI so many entities
     /// in one large cluster share one allocation.
     clusters: HashMap<String, std::sync::Arc<[NamedNode]>>,
-    /// Retained IRI bytes across `entities` keys/representatives and unique `clusters`.
+    /// Retained IRI bytes across `entities` keys/representatives and unique `clusters`
+    /// (keys and members).
     retained_bytes: usize,
     /// whether the map's header has been read
     read: bool,
@@ -2550,36 +2551,100 @@ impl ResolutionDoc {
             self.revision = got.revision;
             self.number = got.number;
             for e in got.entities {
-                let named = e.members.len() > 1 || e.representative != e.entity;
-                let entry_bytes = e.entity.as_str().len() + e.representative.as_str().len();
-                self.charge_retained(entry_bytes)?;
-                let members = if named {
-                    if let Some(existing) = self.clusters.get(e.representative.as_str()) {
-                        std::sync::Arc::clone(existing)
-                    } else {
-                        let cluster_bytes: usize = e.members.iter().map(|m| m.as_str().len()).sum();
-                        self.charge_retained(cluster_bytes)?;
-                        let shared: std::sync::Arc<[NamedNode]> = std::sync::Arc::from(e.members);
-                        self.clusters.insert(
-                            e.representative.as_str().to_string(),
-                            std::sync::Arc::clone(&shared),
-                        );
-                        shared
-                    }
-                } else {
-                    std::sync::Arc::clone(&empty_members)
-                };
-                self.entities.insert(
-                    e.entity.as_str().to_string(),
-                    ResolvedDoc {
-                        representative: e.representative,
-                        members,
-                        complete: e.members_complete,
-                        named,
-                    },
-                );
+                self.record_resolved(e, &empty_members)?;
             }
         }
         Ok(())
+    }
+
+    fn record_resolved(
+        &mut self,
+        e: sparkles::evidence::ResolvedEntity,
+        empty_members: &std::sync::Arc<[NamedNode]>,
+    ) -> Result<(), Error> {
+        let named = e.members.len() > 1 || e.representative != e.entity;
+        let entry_bytes = e.entity.as_str().len() + e.representative.as_str().len();
+        self.charge_retained(entry_bytes)?;
+        let members = if named {
+            if let Some(existing) = self.clusters.get(e.representative.as_str()) {
+                std::sync::Arc::clone(existing)
+            } else {
+                let cluster_bytes = e.representative.as_str().len().saturating_add(
+                    e.members
+                        .iter()
+                        .fold(0usize, |acc, m| acc.saturating_add(m.as_str().len())),
+                );
+                self.charge_retained(cluster_bytes)?;
+                let shared: std::sync::Arc<[NamedNode]> = std::sync::Arc::from(e.members);
+                self.clusters.insert(
+                    e.representative.as_str().to_string(),
+                    std::sync::Arc::clone(&shared),
+                );
+                shared
+            }
+        } else {
+            std::sync::Arc::clone(empty_members)
+        };
+        self.entities.insert(
+            e.entity.as_str().to_string(),
+            ResolvedDoc {
+                representative: e.representative,
+                members,
+                complete: e.members_complete,
+                named,
+            },
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod resolution_doc_tests {
+    use super::*;
+
+    #[test]
+    fn cluster_interning_charges_cluster_map_key_once_per_representative() {
+        let rep = NamedNode::new_unchecked("http://example.org/rep/alpha");
+        let m1 = NamedNode::new_unchecked("http://example.org/ent/m1");
+        let m2 = NamedNode::new_unchecked("http://example.org/ent/m2");
+        let empty: std::sync::Arc<[NamedNode]> = std::sync::Arc::from([]);
+        let mut doc = ResolutionDoc::new("people", 1);
+
+        doc.record_resolved(
+            sparkles::evidence::ResolvedEntity {
+                entity: m1.clone(),
+                representative: rep.clone(),
+                members: vec![rep.clone(), m1.clone(), m2.clone()],
+                members_complete: true,
+                decisions: Vec::new(),
+            },
+            &empty,
+        )
+        .unwrap();
+        let expected_first = (m1.as_str().len() + rep.as_str().len())
+            + rep.as_str().len()
+            + rep.as_str().len()
+            + m1.as_str().len()
+            + m2.as_str().len();
+        assert_eq!(doc.retained_bytes, expected_first);
+
+        // Second entity in the same cluster reuses the interned slice and cluster key.
+        doc.record_resolved(
+            sparkles::evidence::ResolvedEntity {
+                entity: m2.clone(),
+                representative: rep.clone(),
+                members: vec![rep.clone(), m1.clone(), m2.clone()],
+                members_complete: true,
+                decisions: Vec::new(),
+            },
+            &empty,
+        )
+        .unwrap();
+        let expected_second = expected_first + m2.as_str().len() + rep.as_str().len();
+        assert_eq!(doc.retained_bytes, expected_second);
+        assert!(std::sync::Arc::ptr_eq(
+            &doc.entities[m1.as_str()].members,
+            &doc.entities[m2.as_str()].members
+        ));
     }
 }

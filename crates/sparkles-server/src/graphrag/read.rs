@@ -544,12 +544,6 @@ fn reports_of_members_in(
     Ok(out)
 }
 
-/// The report a finding belongs to, from the finding's IRI (`store::finding_iri`).
-pub fn report_of_finding(f: &str) -> Option<&str> {
-    let (r, n) = f.rsplit_once("#f")?;
-    n.parse::<u64>().ok().map(|_| r)
-}
-
 /// The distinct entity IRIs referenced by a finding's `gr:about` list and any
 /// N-Triples triple terms in its `gr:cites` list, in deterministic order.
 pub fn finding_entity_iris(about: &[String], cites: &[String]) -> Vec<oxrdf::NamedNode> {
@@ -589,15 +583,6 @@ mod tests {
         assert_eq!(choose_level(&c, 2), Some(0));
         assert_eq!(choose_level(&c, 1000), Some(2));
         assert_eq!(choose_level(&BTreeMap::new(), 100), None);
-    }
-
-    #[test]
-    fn findings_name_their_report() {
-        assert_eq!(
-            report_of_finding(&store::finding_iri("urn:r:1", 3)),
-            Some("urn:r:1")
-        );
-        assert_eq!(report_of_finding("urn:r:1#fx"), None);
     }
 
     #[test]
