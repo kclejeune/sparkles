@@ -706,8 +706,9 @@ pub(super) enum DefaultDatasetOverride<'a> {
     /// named graphs are empty (`selector_default_only = true`).
     Selector(&'a GraphSel),
     /// Protection pattern query (C12b §2.3): default graph is the union of the
-    /// default graph and every named graph resolved by graph ID through the
-    /// controlled distinct-graph iterator, while `GRAPH` reaches all named graphs.
+    /// default graph and every physical named graph (including blank-node-named
+    /// graphs) resolved by graph ID, using the controlled distinct-graph iterator
+    /// when a preparation is active, while `GRAPH` reaches all named graphs.
     AllGraphsWithNamed,
 }
 
@@ -817,7 +818,7 @@ fn make_ctx_input_policy(
                 ctx.selector_default_only = true;
             }
             DefaultDatasetOverride::AllGraphsWithNamed => {
-                ds.default = Some(resolve_selector_graphs(&mut ctx, &GraphSel::All)?);
+                ds.default = Some(resolve_all_graphs(&mut ctx)?);
             }
         }
     } else if !opts.default_graph_uris.is_empty() || !opts.named_graph_uris.is_empty() {
@@ -1051,6 +1052,17 @@ fn resolve_graphs<'a>(
         .as_mut()
         .expect("source setup owner")
         .merge(held);
+    Ok(ids)
+}
+
+fn resolve_all_graphs(ctx: &mut Ctx) -> Result<Vec<Id>> {
+    if ctx.source_preparation.is_some() {
+        return resolve_selector_graphs(ctx, &GraphSel::All);
+    }
+    let named = ctx.snap.graph_ids()?;
+    let mut ids = Vec::with_capacity(named.len().saturating_add(1));
+    ids.push(Id::DEFAULT_GRAPH);
+    ids.extend(named);
     Ok(ids)
 }
 
@@ -1383,6 +1395,37 @@ pub(crate) fn query_prepared_source(
     source.query_input().2.check()?;
     let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
     execute_retained_source(source, &parsed, opts, 0.0, None)
+}
+
+/// Run a protection pattern query (C12b §2.3) over an unmasked snapshot with every
+/// physical graph of the snapshot (default, IRI-named and blank-node-named) merged
+/// into the default dataset by graph ID, while `GRAPH` still reaches all named graphs.
+pub(crate) fn query_pattern(
+    snap: Arc<Snapshot>,
+    q: &str,
+    opts: &QueryOptions,
+) -> Result<QueryResult> {
+    let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
+    let stack = depth::check_query(&parsed)?;
+    depth::with_stack(stack, || {
+        let start = Instant::now();
+        let prepared = prepare_query_input_policy(
+            snap,
+            &parsed,
+            opts,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(DefaultDatasetOverride::AllGraphsWithNamed),
+            None,
+        )?;
+        let plan_ms = start.elapsed().as_secs_f64() * 1000.0;
+        depth::with_stack(prepared.plan_depth, || {
+            execute_prepared(&parsed, opts, 0.0, plan_ms, prepared).map_err(|failed| failed.error)
+        })
+    })
 }
 
 /// Run a protection pattern query (C12b §2.3) over an unmasked prepared source with

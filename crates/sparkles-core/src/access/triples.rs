@@ -477,20 +477,11 @@ pub(crate) fn passes(
     let Some((q, cols)) = pattern_query(p, pattern, caller) else {
         return Ok(Passes::None);
     };
-    let named: Vec<String> = snap
-        .graph_ids()?
-        .into_iter()
-        .filter_map(|g| match snap.term(g) {
-            Some(Term::NamedNode(n)) => Some(n.into_string()),
-            _ => None,
-        })
-        .collect();
     let opts = crate::sparql::QueryOptions {
-        default_graph_extra: named,
         max_rows: Some(usize::try_from(limits.max_pattern_rows).unwrap_or(usize::MAX)),
         ..Default::default()
     };
-    let r = crate::sparql::query(snap.clone(), &q, &opts).map_err(|e| match e {
+    let r = crate::sparql::query_pattern(snap.clone(), &q, &opts).map_err(|e| match e {
         Error::BudgetExceeded(_) => Error::BudgetExceeded(Budget {
             kind: BudgetKind::Rows,
             limit: limits.max_pattern_rows,
