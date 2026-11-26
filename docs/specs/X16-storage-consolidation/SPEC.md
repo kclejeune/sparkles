@@ -1,8 +1,8 @@
 # X16: Storage consolidation
 
-> **Status:** implemented in part (Phases 1, 2, 3 stages 1 and 3, 4, 5 apart from `imbl`, and item 846). The plan below is ordered and audited against the code.
+> **Status:** implemented in part (Phases 1, 2, 3, 4, 5 apart from `imbl`, and items 846 and 1062). The plan below is ordered and audited against the code.
 >
-> **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Items 830 and 833 hold the remaining ready phases, item 1152 takes the last `imbl` maps of Phase 5, and items 479, 484, 831, 832 and 846 are complete. The later candidate phases get their numbers when their prerequisites land.
+> **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Item 833 holds the remaining ready phase, item 1152 takes the last `imbl` maps of Phase 5, and items 479, 484, 830, 831, 832, 846 and 1062 are complete. The later candidate phases get their numbers when their prerequisites land.
 
 The design covers a first-release format cutoff, budgeted readers through one Control
 trait, a shared commit publish tail, one load plan, partitioned vocabularies with
@@ -741,10 +741,43 @@ serves Stage 2's vocabulary bridges (`dvocab.len_limited` and
 `dvocab.resident_bytes_limited`), `Control`'s default lock and refusal helpers,
 `HistoryCeiling` lock acquisition, `cache_limited_snapshot`,
 `authenticate_retained_generation`, and `ColdBudget` initialization in
-`history_generation_with` and `retained_bytes_with`. Stage 2's vocabulary scanners
-(`vocab.rs` and `vocab/`) stay for the next slice of item 830, and Stage 3's `bench:insn`,
-`sparkles-core` binary size, compile time and spill matrix measurements remain to be
-recorded on a quiet host before landing.
+`history_generation_with` and `retained_bytes_with`.
+
+The second stage of Phase 3 finishes item 830 across the vocabulary stack. `budgeted.rs`
+extends `BudgetControl` with `key_step`, `read_from`, `read_mutable_prefix` and `crc32`,
+removes its three vocabulary-specific bridge methods, implements `Control` for
+`task::Control` and adds `FnMutControl` for fallible closure callers. `vocab/cold.rs`
+folds `hash_with`, `compare_with`, `equal_with`, `copy_with`, `Index::find_with` and
+`Index::insert_with` onto `BudgetControl`, keeping chunked `FxHasher` fingerprints
+identical between `Unlimited` and controlled opens. `vocab/numeric.rs` folds `open` and
+`open_controlled` into `NumColumn::open_with`, and `vocab/fsst.rs` folds
+`first_byte_with` over `Control` and `measure_with` over a zero-cost `SuffixMeasure`
+trait. `vocab/delta.rs` folds `parse_delta_with`, `open_read_only_with`,
+`open_layered_with`, `extend_read_only_with`, `len_with`, `resident_bytes_with` and
+`with_control`, removing the `dvocab.len_limited` and `dvocab.resident_bytes_limited`
+`read_limit` bridges across `store.rs`, `store/cold.rs`, `store/branching/readonly.rs`
+and `store/configuration_history/validation.rs`. `vocab.rs` folds `Sparse::read_with`,
+`Sparse::decode_with`, `Vocab::open_with`, `boundary_with` and `AppendVocab::push_with`
+onto `BudgetControl` and `Control`, and introduces zero-cost `BlockScratch` and
+`HintAdmit` traits so `decode_block_with`, `get_sorted_with`, `find_with`,
+`prefetch_sorted_with`, `prefetch_value_pages_with` and `prefetch_terms_with` serve the
+unlimited, checked, owned-checked, exact and controlled-capacity paths from single
+implementations while preserving the unchecked dense loop and plain checked register loop.
+
+Item 1062 unifies the change-log and read-only change-log codecs in `store/changelog.rs`
+and `store/changelog/readonly.rs`. A single `decode_record_with` generic over `Control`
+and a zero-cost `RecordSink` trait serves `OwnedRecordSink` for owned `Record` values,
+`ViewRecordSink` for borrowed `RecordView` slices with in-place trailing entry
+validation, and `TimestampRecordSink` for timestamp-only validation. Shared `Control`
+and `BudgetControl` helpers (`read_settings_with`, `crc32_with`, `frame_with`,
+`read_exact_at_loop_with`, `read_exact_at_with`, `arc_bytes_with`, `valid_utf8_with`,
+`arc_text_with`, `decode_meta_with`, `footprint_with`, `read_file_frame_with`,
+`ChangeLog::read_with`, `SegIndex::decode_with`, `ChangeLog::index_with`,
+`ChangeLog::read_index_with` and the hole sorting and deduplication helpers shared by
+`HoleCollector::finish_with` and `ReadOnlyLog::scan`) replace the `_checked` twins and
+the duplicate decoders and hole normalizers in `changelog/readonly.rs`. Stage 2 and
+Stage 3 `bench:insn`, `sparkles-core` binary size, compile time and spill matrix
+measurements remain to be recorded on a quiet Intel host before the batch pushes.
 
 Phase 4 is built. `LoadPlan::choose` in `store/load_plan.rs` takes a `LoadInputs` and a
 `Sizes` that reads a source's estimate or probes its streams only when the plan depends
