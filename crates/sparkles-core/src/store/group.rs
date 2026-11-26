@@ -89,6 +89,9 @@ pub(super) struct Pending {
     pub control: Option<crate::control::ControlState>,
     /// true when admitted to group commit; false for solo fences under the writer lock
     pub grouped: bool,
+    /// true when this commit belongs to the Evidence managed-graph owner
+    #[cfg(any(test, feature = "failpoints"))]
+    pub evidence_commit: bool,
     /// the commit's full-text changes, applied to the live index at publication
     #[cfg(feature = "text")]
     pub text: Option<PendingText>,
@@ -126,6 +129,10 @@ impl State {
     fn busy(&self) -> bool {
         self.syncing.is_some() || self.publishing.is_some()
     }
+
+    fn idle(&self) -> bool {
+        !self.busy() && self.queue.is_empty() && !self.failed
+    }
 }
 
 #[derive(Default)]
@@ -158,8 +165,12 @@ impl Coordinator {
     /// No fence runs and nothing is queued, so a commit made now would be the only one
     /// in its group.
     pub fn idle(&self) -> bool {
-        let s = self.state.lock();
-        !s.busy() && s.queue.is_empty() && !s.failed
+        self.state.lock().idle()
+    }
+
+    /// Check for a healthy idle queue without waiting for a fence.
+    pub(super) fn try_idle(&self) -> bool {
+        self.state.try_lock().is_some_and(|state| state.idle())
     }
 
     /// Wait, without leading a fence, until no commit is in flight: no fence runs, and
@@ -435,6 +446,8 @@ impl Coordinator {
     ) -> Result<bool> {
         let grouped = batch[0].grouped;
         let has_control = batch.iter().any(|p| p.control.is_some());
+        #[cfg(any(test, feature = "failpoints"))]
+        let has_evidence = batch.iter().any(|p| p.evidence_commit);
         let mut leader = Leader {
             group: self,
             publishing: false,
@@ -482,6 +495,10 @@ impl Coordinator {
             Ok(_) => {
                 if has_control {
                     store.failpoint("control-commit-synced");
+                }
+                #[cfg(any(test, feature = "failpoints"))]
+                if has_evidence {
+                    store.failpoint("evidence-wal-synced");
                 }
                 {
                     let mut s = self.state.lock();
@@ -1041,6 +1058,11 @@ impl WriteTxn<'_> {
             merge: self.merge,
             control: control.map(|(_, state)| state),
             grouped,
+            #[cfg(any(test, feature = "failpoints"))]
+            evidence_commit: self
+                .managed
+                .as_ref()
+                .is_some_and(|cap| cap.owner() == crate::managed::OwnerKind::Evidence),
             #[cfg(feature = "text")]
             text,
             _family: family,

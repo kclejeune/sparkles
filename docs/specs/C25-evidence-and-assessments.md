@@ -720,10 +720,12 @@ that requires that graph.
 ### Durable source holds
 
 Durable source holds are the third Phase 2 step. `sparkles_core::holds` records in
-`holds.json` format 1 at the dataset root the commits that owners keep readable on
-`main` and every branch. A hold has an owner-chosen UUID, its owner, its creation time
-and a sorted set of commits, each named by the branch identity the caller gave and the
-branch store whose history serves it. A commit at or below a branch's starting point is
+`holds.json` at the dataset root the commits that owners keep readable on
+`main` and every branch. Format 1 records local holds. Format 2 adds a
+`forDatasetId` to each foreign hold to identify the proposing dataset.
+A hold has an owner-chosen UUID, its owner, its creation time and a sorted set of commits.
+Each commit names the branch identity the caller gave and the branch store whose
+history serves it. A commit at or below a branch's starting point is
 served by its upstream. A read of the starting commit on the branch falls back to the
 upstream once the branch no longer keeps its own copy, so the hold keeps it readable
 under both names. Together the holds of a dataset name at most 65,536 commits. The
@@ -781,10 +783,12 @@ every lock and releases those it does not keep, unless the hold was acquired aga
 meanwhile. Each acquisition of an existing hold starts its grace period again, and a
 reopened store counts it from the hold's creation. The
 typed evidence operations supply that check when they record references. A
-`holds.json` that cannot be read or names another dataset keeps every past state and
-refuses hold changes and branch deletions with `holds-unavailable`, while reads and
-writes continue. A newer format refuses the open. Backups and clones carry no holds,
-because they carry no past states, and deleting a dataset deletes its holds. The file
+`holds.json` that cannot be read or whose top-level `datasetId` differs from the
+dataset being opened keeps every past state and refuses hold changes and branch deletions
+with `holds-unavailable`, while reads and writes continue. A newer format refuses the
+open. Backups and clones carry no holds because they carry no past states. Deleting
+a dataset deletes the holds stored there. Foreign holds stored elsewhere stay subject
+to the reconciliation rules below. The file
 is rewritten whole for each change, which costs up to a few megabytes of writing at the
 bound. That keeps one atomic commit point per change.
 
@@ -957,37 +961,50 @@ A proposal runs in this order.
 4. The references to existing records and stored facts are resolved under the caller's
    read access with the L4 resolver, so a reference the caller cannot read answers as a
    missing one.
-5. The stored facts of this dataset are held under a hold whose id is the operation
-   UUID, and the hold is durable before step 6 starts.
+5. The server checks the caller's authority to change holds on every referenced
+   dataset outside the proposing dataset. The registered names and identities stay
+   pinned through this check and hold acquisition. Each dataset that serves a
+   referenced stored fact acquires a hold under the operation UUID before step 6 starts.
+   Persistent datasets make each hold durable before acquiring the next.
 6. Under the branch writer, `ifHead` is checked as `409 head-changed`, the key is checked
    again, every record identity is checked, the commit is stamped and the record and
    operation quads are built. An existing identity in the same graph whose authenticated
    record has an equal digest is reported as `existing` and not written again, and any
    other existing identity is `409 immutable-record-conflict`. A publish hook then runs
-   on the committing thread inside the commit. It takes the holds' publication lock
-   shared, refuses when the hold is gone or holds other commits, and enters the host's
-   authority fence. The thread keeps both guards until the commit has published or been
-   refused.
+   on the committing thread inside the commit. It pins the same registered names
+   and handles for a cross-dataset proposal and takes the referenced datasets' hold publication
+   locks in ascending dataset UUID order. It verifies each hold and refuses if its
+   last file replacement is uncertain. It then enters the host's authority fence.
+   The thread keeps the guards until the commit has published or been refused.
 
-The hold comes before the commit because a reference recorded without a durable hold
-could lose its commit to retention before any hold existed. With this order a crash at
-any point leaves either nothing, a hold without a published operation or a published
-operation with its hold. A hold without an operation is an orphan. A retry with the same
-key acquires the same hold again, because the hold id is the operation UUID and the
-held commits are equal. `reconcile_operation_holds` releases each evidence hold that is
-older than its grace period and whose operation no graph of `main` or a branch
-describes as an `ev:Operation`, whatever its nonce. A changed protection does not show
-that an operation never published, so such a hold stays. Every published proposal runs
-the reconciliation with an hour's grace, after its commit, and its failure never fails
-the proposal. Every release takes the publication lock exclusively, and a
-reconciliation asks again under it which holds to keep, reading only the current
-snapshots of the stores it found and taking no writer. A commit's hold check also
-renews the hold, so a reconciliation that chose its candidates before the check does
-not release it. A release therefore either
-comes before a commit's hold check, which then refuses the commit, or waits until the
-commit has published, and a reconciliation never releases the hold of an operation
-that published after it first looked. A published operation always names a hold that
-protects it.
+Each source hold precedes publication so retention cannot collect the referenced
+commit before it is protected. A crash before publication can leave holds in some or
+all of the sources. A successful publication has all its holds. A retry of the same
+payload can reacquire the same holds. A competing payload under the same key may
+already have acquired holds before it loses at the writer check.
+
+`reconcile_operation_holds_in` checks whether each candidate past the grace period is
+accounted for by a receipt in the originating dataset. A new receipt records the exact
+hold set per source as digests in `ev:sourceHoldSets`. A receipt from an earlier build
+keeps the hold when it describes the operation but lacks that field. The first pass
+opens the origin's stores and checks that retained origin history cannot supply a
+foreign receipt to a historical fork. The second pass rechecks current heads under
+the target's exclusive publication lock. It excludes catalog management and pins
+the verified open and closed registrations and listed branches through the durable
+release. An unresolved registration keeps a foreign hold when it could name the
+target or the origin. It also tries to pin each relevant
+persistent writer while it confirms that the published head includes every commit
+that could recover at reopen. An uncertain writer or busy or changed membership
+keeps the hold. Publication renews each hold, so a reconciliation that selected the
+hold earlier leaves it in place.
+
+Each published proposal checks its own dataset and the datasets it held with an
+hour's grace. The checks share the request's cancellation and remaining time, capped
+at one second across all datasets. This path uses available branch stores and skips
+cold opens and change-log flushes. Any hold whose check cannot finish stays for later
+reconciliation. The outcome of this housekeeping does not affect the commit.
+`reconcile_operation_holds` and the legacy `reconcile_holds` callback are local-only.
+Use `reconcile_operation_holds_in` with the catalog to check foreign holds.
 
 The server's authority fence binds the commit to the caller's credential.
 `AuthorityRegistry::begin_hold` takes a shared guard on the authority generation, and
@@ -1001,15 +1018,16 @@ fence also refuses a changed generation and an expired credential. The guard is 
 
 `POST /{ds}/claims` needs `write` on the dataset or branch through the update endpoint,
 an update grant on each written graph and read access to every referenced record and
-fact. Its principal is the caller's authenticated log name as a
-`urn:x-sparkles:principal:` IRI. A dry run checks everything except the hold and the
-fence and returns a preview of the inserted and deleted quads. The response gives the
+fact. It also needs `admin` on every branch and graph of each foreign dataset whose
+commits it will hold. Its principal is the caller's authenticated log name as a
+`urn:x-sparkles:principal:` IRI. A dry run checks the grants and returns a preview
+of the inserted and deleted quads without acquiring holds. The response gives the
 operation, whether it committed or replayed, the commit, branch, first availability,
 hold and each record's key, kind, IRI, graph, digest and `existing` flag. The new codes
 are `head-changed`, `idempotency-conflict` and `authority-changed`, and `GET /$/server`
 advertises `capabilities.claims` with profile 1 and both routes. The vocabulary adds
 `ev:Operation`, `ev:graphProtection`, `ev:payloadDigest`, `ev:idempotencyKey`,
-`ev:sourceHold`, `ev:recordDigest`, `ev:retainedBytes`, `ev:locator` and
+`ev:sourceHold`, `ev:sourceHoldSets`, `ev:recordDigest`, `ev:retainedBytes`, `ev:locator` and
 `ev:reportedRights`.
 
 Tests cover deterministic identities, graph choice, the server fields on every written
@@ -1035,15 +1053,13 @@ reconciliation and a retry.
    existing passage and a structured value outside a retained JSON revision of the
    same batch answer `incomplete-evidence`, because this step cannot yet verify them
    against retained content. Roadmap item 551 tracks their verification.
-2. **Holds in other datasets.** A stored fact of another dataset is verified but not held.
-   Roadmap item 550 tracks holding it under the operation.
-3. **Records of an earlier protection.** A detach and a new protection invalidate the
+2. **Records of an earlier protection.** A detach and a new protection invalidate the
    records written before them, which then answer `origin-not-reproduced`. Roadmap item
    552 tracks an administered re-authentication.
-4. **Blank nodes.** Record content refuses blank nodes, except in a stored fact's
+3. **Blank nodes.** Record content refuses blank nodes, except in a stored fact's
    expected triple, so that the record digest and the conflict check compare ground
    content.
-5. **Bindings and MCP.** The route is HTTP, OpenAPI and Rust only. MCP waits for Phase 3
+4. **Bindings and MCP.** The route is HTTP, OpenAPI and Rust only. MCP waits for Phase 3
    and the bindings for roadmap item 509.
 
 Review decisions, accepted projections and withdrawals are the sixth Phase 2 step.
@@ -2345,6 +2361,36 @@ graph, the state, the head commit, the model requests and the task list unchange
 also covers a withdrawal behind a cited claim and a state left behind the reports graph
 at the next server start, each of which starts one refresh. A hidden superseding decision
 under a triple protection has no test of the check.
+
+### Holds for stored facts of other datasets
+
+Item 550 extends proposal holds to every catalog dataset that serves a referenced
+stored fact. Each dataset must be uniquely registered by UUID in the same catalog.
+All must be persistent or all must be in memory. HTTP, MCP and ingestion callers need
+`admin` on every branch and graph of each foreign source in addition to their read
+grants. Acquisition pins the names under which the caller is authorized. The
+publication hook revalidates the verified names and identities and preserves every
+source hold through publication. Replay returns the hold in the original receipt,
+including a null hold for older proposals that referenced only foreign facts.
+
+A foreign hold records the proposing dataset's UUID as `forDatasetId` in
+`holds.json` format 2. Files with only local holds remain in format 1.
+`GET /$/evidence/{ds}/holds` and the Rust `sparkles::evidence::hold_details` helper
+include the originating dataset for foreign holds.
+
+A hold stays while either dataset is unavailable or ambiguously registered.
+A pending or refused registration with an unknown UUID prevents automatic release
+until the catalog can establish the hold's origin.
+Deleting the origin leaves the foreign hold for an administrator to release until
+item 1315 adds durable cleanup. Automatic reconciliation currently runs after
+proposals publish on the target or acquire holds there. Item 1316 tracks scheduled
+cleanup and an index for large historical scans. A foreign hold also stays if its
+origin can recover an unpublished receipt or its history cannot be checked within
+the scan bounds.
+
+Tests cover catalog ambiguity, copied store handles, mixed persistence, foreign
+authority, both hold file versions, retention, crash recovery, a race between
+competing payloads and a fork from a historical receipt.
 
 ### Scope changes
 

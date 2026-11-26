@@ -816,8 +816,8 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("managed.json", 3),
     ds("evidence.json", 1),
     ds("jobs.json", crate::jobs::FORMAT),
-    // durable source holds (see `crate::holds`)
-    ds("holds.json", 1),
+    // durable source holds (see `crate::holds`): format 2 adds cross-dataset `forDatasetId`
+    ds(crate::holds::FILE, crate::holds::FORMAT),
     // a view's definition, `views/NAME/view.json`: format 2 is a paused one
     ds("view.json", 2),
     named(ds("graphrag/state.json", 3), "version"),

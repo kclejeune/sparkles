@@ -4478,7 +4478,7 @@ export interface paths {
         put?: never;
         /**
          * Propose claims with their evidence
-         * @description Needs `write` on the dataset or branch through the update endpoint, update grants on every graph the batch writes, and read access to every record and stored fact it references, decided as `POST /{ds}/claims/resolve` decides it. Counts as an update. Publishes the batch's source revisions, renditions and passages in the evidence settings' source-record graph and its references, claims, links and assessments in the proposal graph, as one commit of the evidence owner. Claims describe their propositions and never assert them. The server sets each record's receipt, creation activity and record digest, a source revision's `firstAvailableAt` and the operation that the authenticated caller is the agent of. A repeated `idempotencyKey` with the same payload answers the first receipt with `replayed` and writes nothing. Refusals write nothing: `400` for a malformed or inconsistent batch, naming its field, `403` for a written graph the caller may not update, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict` for a record identity that holds other content or no authenticated record, `409 unsupported-profile`, the reference outcomes of `POST /{ds}/claims/resolve`, and `503 authority-changed` when the caller's credential was revoked or the access policy changed before publication. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.
+         * @description Needs `write` on the dataset or branch through the update endpoint, update grants on every graph the batch writes, and read access to every record and stored fact it references, decided as `POST /{ds}/claims/resolve` decides it. Counts as an update. Publishes the batch's source revisions, renditions and passages in the evidence settings' source-record graph and its references, claims, links and assessments in the proposal graph, as one commit of the evidence owner. Claims describe their propositions and never assert them. The server sets each record's receipt, creation activity and record digest, a source revision's `firstAvailableAt` and the operation that the authenticated caller is the agent of. A foreign stored fact requires `admin` on every branch and graph of the dataset that serves it. The proposal acquires one hold per referenced dataset before publication. A repeated `idempotencyKey` with the same payload answers the first receipt with `replayed`. A replay found before reference resolution writes nothing. Competing proposals may acquire holds before one finds the receipt at the writer check. A refusal before publication writes no proposal records. A publication storage failure may leave a receipt that recovers when the origin reopens. The proposal answers `400` for a malformed or inconsistent batch, naming its field, `403` for insufficient update grants or foreign-source admin, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 hold-conflict`, `409 holds-limit`, `409 unsupported-profile`, the reference outcomes of `POST /{ds}/claims/resolve`, `503 holds-unavailable` when a durable hold cannot be confirmed, and `503 authority-changed` when the caller's credential or access policy changed before publication. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.
          */
         post: operations["proposeClaims"];
         delete?: never;
@@ -7301,6 +7301,11 @@ export interface components {
             created: string;
             /**
              * Format: uuid
+             * @description The dataset whose operation acquired this hold, when it differs from this dataset.
+             */
+            forDatasetId?: string;
+            /**
+             * Format: uuid
              * @description The hold's identity.
              */
             id: string;
@@ -7665,7 +7670,7 @@ export interface components {
                         key?: string;
                     };
                 };
-                /** @description A stored fact in the form of `EvidenceResolveRequest`. A fact of this dataset is held for the operation. */
+                /** @description A stored fact in the form of `EvidenceResolveRequest`. Its commit is held for the operation. */
                 storedFact?: Record<string, never>;
                 structured?: {
                     method: {
@@ -7781,7 +7786,7 @@ export interface components {
             };
             /** @description The commit's time, the first availability of its source revisions. `null` for a dry run. */
             firstAvailableAt: string | null;
-            /** @description The source hold of the stored facts of this dataset that the batch references. */
+            /** @description The UUID shared by the source holds of this operation in the referenced datasets. */
             hold: string | null;
             /** @description The operation, which is every record's availability receipt. */
             operation: string;

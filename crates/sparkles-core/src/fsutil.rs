@@ -60,11 +60,21 @@ pub fn take_dir_syncs() -> Vec<(std::path::PathBuf, Vec<String>)> {
 /// directory: write and sync `tmp`, rename it over `path`, then sync the directory so
 /// that the rename itself survives a power loss. A failed write removes `tmp`.
 pub fn write_atomic_via(path: &Path, tmp: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_via_then(path, tmp, bytes, || {})
+}
+
+pub(crate) fn write_atomic_via_then(
+    path: &Path,
+    tmp: &Path,
+    bytes: &[u8],
+    before_sync: impl FnOnce(),
+) -> io::Result<()> {
     let written = write_synced(tmp, bytes).and_then(|()| std::fs::rename(tmp, path));
     if written.is_err() {
         let _ = std::fs::remove_file(tmp);
     }
     written?;
+    before_sync();
     sync_dir(path.parent().unwrap_or(Path::new(".")))
 }
 

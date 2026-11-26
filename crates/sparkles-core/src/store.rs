@@ -67,7 +67,7 @@ mod lock;
 mod lock_tests;
 mod managed;
 pub(crate) mod managed_history;
-pub use holds::{Acquired, HoldPublication};
+pub use holds::{Acquired, HoldPublication, PublishedWriter};
 pub use managed::ManagedSnapshot;
 #[cfg(test)]
 mod control_tests;
@@ -118,12 +118,15 @@ pub use backup::{
 pub(crate) use branching::BRANCH_FILE as BRANCH_FILE_NAME;
 pub(crate) use branching::write_initial_table;
 pub use branching::{
-    BRANCHES_DIR, BRANCHES_FILE, BranchCommit, BranchSet, BranchStore, read_branch_table,
+    BRANCHES_DIR, BRANCHES_FILE, BranchCommit, BranchSet, BranchStore, ListedBranches,
+    read_branch_table,
 };
 pub use changelog::{
     CHANGE_LOG_FILE, CHANGES_DIR, ChangeCommit, ChangeLog, ChangeLogSettings, ChangeLogStatus,
     Unrecorded, UnrecordedReason,
 };
+#[cfg(feature = "failpoints")]
+pub use changelog::{ChangeLogReadEvent, ChangeLogReadObserver, set_changelog_read_observer};
 pub use changes::{ChangePage, ChangesOptions, CommitChanges};
 pub use clone::{CloneMethod, CloneMode, CloneOptions, CloneReport};
 pub use commit_graph::{CommitGraph, CommitGraphOptions, GraphBranch, GraphCommit, GraphCursor};
@@ -3451,6 +3454,17 @@ impl Store {
             self.resolve(at)?
         };
         let live = self.snapshot();
+        self.snapshot_at_resolved(at, limit, r, live)
+    }
+
+    /// Materialize a resolved commit against a published snapshot's generation.
+    fn snapshot_at_resolved<C: HistoryRead>(
+        &self,
+        at: &crate::history::At,
+        limit: C,
+        r: crate::history::Resolved,
+        live: Arc<Snapshot>,
+    ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
         if r.commit.seq == live.commit {
             limit.check(history_limited::SHARED_SNAPSHOT_BYTES)?;
             return Ok((
@@ -4454,6 +4468,13 @@ impl Store {
     pub fn set_clock(&self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) {
         crate::sparql::extensions::assert_family(self.owner_dataset_id());
         *self.clock.lock() = Some(clock);
+    }
+
+    /// Inject a vocabulary sync error after writing the terms (tests).
+    #[cfg(any(test, feature = "failpoints"))]
+    #[doc(hidden)]
+    pub fn fail_next_vocab_sync(&self) {
+        self.snapshot().generation.dvocab.fail_next_sync();
     }
 
     // ------------------------------------------------------------ full-text ------

@@ -10,14 +10,18 @@
 //! dataset root:
 //!
 //! ```json
-//! {"format": 1, "datasetId": "…",
+//! {"format": 2, "datasetId": "…",
 //!  "holds": [{"id": "…", "owner": "evidence", "created": "2026-11-01T00:00:00.000Z",
+//!             "forDatasetId": "…",
 //!             "commits": [{"branchId": "…", "seq": 12, "storeId": "…"}]}]}
 //! ```
 //!
 //! `branchId` is the branch the caller named. `storeId`, present when it differs, is the
 //! branch that made the commit: a commit at or below a branch's starting point belongs
-//! to its upstream, whose history the hold keeps. Together the holds name at most
+//! to its upstream, whose history the hold keeps. `forDatasetId`, present when it differs
+//! from `datasetId`, names the dataset whose operation acquired this hold so
+//! cross-dataset reconciliation can verify it there. A file with a foreign hold uses
+//! format 2. A file with only local holds uses format 1. Together the holds name at most
 //! [`MAX_COMMITS`] commits. A dataset with `holds.json` needs dataset reader 7
 //! ([`READER`]), so a build that ignores the file refuses to open the dataset instead of
 //! trimming held history.
@@ -42,8 +46,9 @@ use std::sync::Arc;
 /// The holds file at the dataset root.
 pub const FILE: &str = "holds.json";
 
-/// The `holds.json` format this build reads and writes.
-pub const FORMAT: u32 = 1;
+/// The highest `holds.json` format this build reads and writes. Format 2 adds optional
+/// `forDatasetId` for cross-dataset holds; files without any foreign hold stay format 1.
+pub const FORMAT: u32 = 2;
 
 /// The dataset reader capability that honors holds (`minimumReader` of `dataset.json`).
 pub const READER: u32 = 7;
@@ -71,10 +76,20 @@ pub struct SourceHold {
     pub commits: Vec<CommitRef>,
 }
 
+/// A source hold with the identity of its originating dataset when it is foreign.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SourceHoldInfo {
+    #[serde(flatten)]
+    pub hold: SourceHold,
+    #[serde(rename = "forDatasetId", skip_serializing_if = "Option::is_none")]
+    pub for_dataset: Option<uuid::Uuid>,
+}
+
 /// A hold and, for each of its commits, the branch store whose history serves it.
 #[derive(Clone, Debug)]
 pub(crate) struct Record {
     pub hold: SourceHold,
+    pub for_dataset: Option<uuid::Uuid>,
     pub stores: Vec<uuid::Uuid>,
     /// Raised by every acquisition of the hold, the repeated ones too, so that a
     /// reconciliation releases only a hold nobody acquired since it looked. In memory
@@ -279,6 +294,8 @@ struct HoldFile {
     id: uuid::Uuid,
     owner: String,
     created: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    for_dataset_id: Option<uuid::Uuid>,
     commits: Vec<CommitFile>,
 }
 
@@ -293,8 +310,11 @@ struct CommitFile {
 
 /// The bytes of `holds.json` for `records` of dataset `dataset_id`.
 pub(crate) fn encode(dataset_id: uuid::Uuid, records: &BTreeMap<uuid::Uuid, Record>) -> Vec<u8> {
+    let has_foreign = records
+        .values()
+        .any(|r| r.for_dataset.is_some_and(|d| d != dataset_id));
     let f = File {
-        format: FORMAT,
+        format: if has_foreign { FORMAT } else { 1 },
         dataset_id,
         holds: records
             .values()
@@ -302,6 +322,7 @@ pub(crate) fn encode(dataset_id: uuid::Uuid, records: &BTreeMap<uuid::Uuid, Reco
                 id: r.hold.id,
                 owner: r.hold.owner.as_str().to_string(),
                 created: crate::commit::rfc3339_ms(r.hold.created_ms),
+                for_dataset_id: r.for_dataset.filter(|&d| d != dataset_id),
                 commits: r
                     .hold
                     .commits
@@ -327,8 +348,8 @@ pub(crate) fn decode(bytes: &[u8], dataset_id: uuid::Uuid) -> Result<BTreeMap<uu
     let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| corrupt(e.to_string()))?;
     crate::formats::check_settings(FILE, &v)?;
     let f: File = serde_json::from_value(v).map_err(|e| corrupt(e.to_string()))?;
-    if f.format != FORMAT {
-        return Err(corrupt(format!("format {} is not {FORMAT}", f.format)));
+    if f.format != 1 && f.format != FORMAT {
+        return Err(corrupt(format!("format {} is not 1 or {FORMAT}", f.format)));
     }
     if f.dataset_id != dataset_id {
         return Err(corrupt(format!(
@@ -343,6 +364,18 @@ pub(crate) fn decode(bytes: &[u8], dataset_id: uuid::Uuid) -> Result<BTreeMap<uu
             .ok_or_else(|| corrupt(format!("hold {} has an unknown owner {:?}", h.id, h.owner)))?;
         let created_ms = crate::commit::parse_rfc3339_ms(&h.created)
             .ok_or_else(|| corrupt(format!("hold {} has an invalid created time", h.id)))?;
+        if f.format == 1 && h.for_dataset_id.is_some() {
+            return Err(corrupt(format!(
+                "hold {} names forDatasetId in format 1",
+                h.id
+            )));
+        }
+        if h.for_dataset_id == Some(dataset_id) {
+            return Err(corrupt(format!(
+                "hold {} names this dataset as forDatasetId",
+                h.id
+            )));
+        }
         if h.commits.is_empty() {
             return Err(corrupt(format!("hold {} names no commit", h.id)));
         }
@@ -374,6 +407,7 @@ pub(crate) fn decode(bytes: &[u8], dataset_id: uuid::Uuid) -> Result<BTreeMap<uu
                 created_ms,
                 commits,
             },
+            for_dataset: h.for_dataset_id,
             stores,
             touch: 0,
             acquired_ms: created_ms,
@@ -431,6 +465,10 @@ mod tests {
     use super::*;
 
     fn record(id: u128, commits: &[(u128, u64, u128)]) -> Record {
+        record_for(id, commits, None)
+    }
+
+    fn record_for(id: u128, commits: &[(u128, u64, u128)], for_dataset: Option<u128>) -> Record {
         Record {
             hold: SourceHold {
                 id: uuid::Uuid::from_u128(id),
@@ -444,6 +482,7 @@ mod tests {
                     })
                     .collect(),
             },
+            for_dataset: for_dataset.map(uuid::Uuid::from_u128),
             stores: commits
                 .iter()
                 .map(|(_, _, s)| uuid::Uuid::from_u128(*s))
@@ -462,6 +501,7 @@ mod tests {
         let bytes = encode(ds, &m);
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["format"], 1);
+        assert!(v["holds"][0].get("forDatasetId").is_none());
         let c = &v["holds"][0]["commits"];
         assert_eq!(c[0]["storeId"], uuid::Uuid::from_u128(9).to_string());
         assert!(c[1].get("storeId").is_none(), "same as the branch");
@@ -478,6 +518,20 @@ mod tests {
         assert_eq!(&*index.on(uuid::Uuid::from_u128(9)), &[2, 3]);
         assert!(index.holds(uuid::Uuid::from_u128(9), 2));
         assert!(!index.holds(uuid::Uuid::from_u128(7), 2));
+        // a cross-dataset hold writes format 2 with forDatasetId
+        let other = uuid::Uuid::from_u128(42);
+        m.insert(
+            uuid::Uuid::from_u128(2),
+            record_for(2, &[(9, 4, 9)], Some(42)),
+        );
+        let bytes2 = encode(ds, &m);
+        let v2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
+        assert_eq!(v2["format"], 2);
+        assert!(v2["holds"][0].get("forDatasetId").is_none());
+        assert_eq!(v2["holds"][1]["forDatasetId"], other.to_string());
+        let back2 = decode(&bytes2, ds).unwrap();
+        assert_eq!(back2[&uuid::Uuid::from_u128(2)].for_dataset, Some(other));
+        assert_eq!(back2[&uuid::Uuid::from_u128(1)].for_dataset, None);
     }
 
     #[test]
@@ -486,10 +540,28 @@ mod tests {
         let other = uuid::Uuid::from_u128(8);
         let bytes = encode(ds, &BTreeMap::new());
         assert!(matches!(decode(&bytes, other), Err(Error::Corrupt(_))));
-        let newer = format!(r#"{{"format":2,"datasetId":"{ds}","holds":[]}}"#);
+        let newer = format!(r#"{{"format":3,"datasetId":"{ds}","holds":[]}}"#);
         assert!(matches!(
             decode(newer.as_bytes(), ds),
             Err(Error::Unsupported(_))
+        ));
+        let v2_empty = format!(r#"{{"format":2,"datasetId":"{ds}","holds":[]}}"#);
+        assert!(decode(v2_empty.as_bytes(), ds).is_ok());
+        let v1_foreign = format!(
+            r#"{{"format":1,"datasetId":"{ds}","holds":[{{"id":"{}","owner":"evidence","created":"2026-11-01T00:00:00.000Z","forDatasetId":"{other}","commits":[{{"branchId":"{ds}","seq":1}}]}}]}}"#,
+            uuid::Uuid::from_u128(1)
+        );
+        assert!(matches!(
+            decode(v1_foreign.as_bytes(), ds),
+            Err(Error::Corrupt(_))
+        ));
+        let v2_self = format!(
+            r#"{{"format":2,"datasetId":"{ds}","holds":[{{"id":"{}","owner":"evidence","created":"2026-11-01T00:00:00.000Z","forDatasetId":"{ds}","commits":[{{"branchId":"{ds}","seq":1}}]}}]}}"#,
+            uuid::Uuid::from_u128(1)
+        );
+        assert!(matches!(
+            decode(v2_self.as_bytes(), ds),
+            Err(Error::Corrupt(_))
         ));
         let unknown = format!(r#"{{"format":1,"datasetId":"{ds}","holds":[],"x":1}}"#);
         assert!(matches!(

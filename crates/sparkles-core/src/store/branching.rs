@@ -588,7 +588,10 @@ pub struct BranchSet {
     opts: StoreOptions,
     cache: Arc<BlockCache>,
     quota: Arc<quota::Quota>,
-    table: Mutex<TableFile>,
+    table: Arc<Mutex<TableFile>>,
+    // A fork may have captured a base that retention no longer lists. Reconciliation
+    // excludes in-flight captures while releasing holds based on retained history.
+    forks: Arc<parking_lot::RwLock<()>>,
     /// open branch stores (not `main`)
     pub(super) stores: Mutex<HashMap<uuid::Uuid, Arc<Store>>>,
     pub(super) openings: Mutex<HashMap<usize, Opening>>,
@@ -690,7 +693,8 @@ impl BranchSet {
             opts: opts.clone(),
             cache,
             quota,
-            table: Mutex::new(TableFile::new(dataset_id)),
+            table: Arc::new(Mutex::new(TableFile::new(dataset_id))),
+            forks: Arc::default(),
             stores: Default::default(),
             openings: Default::default(),
             opening: Mutex::new(()),
@@ -794,7 +798,8 @@ impl BranchSet {
             opts: opts.clone(),
             cache,
             quota,
-            table: Mutex::new(table),
+            table: Arc::new(Mutex::new(table)),
+            forks: Arc::default(),
             stores: Default::default(),
             openings: Default::default(),
             opening: Mutex::new(()),
@@ -1447,6 +1452,12 @@ impl BranchStore<'_> {
     }
 }
 
+/// Keeps the listed branch identities stable during operation-hold reconciliation.
+pub struct ListedBranches {
+    _table: Option<parking_lot::ArcMutexGuard<parking_lot::RawMutex, TableFile>>,
+    _forks: Option<parking_lot::ArcRwLockWriteGuard<parking_lot::RawRwLock, ()>>,
+}
+
 impl Store {
     /// The name of this store's branch (`main` for a dataset's own store).
     pub fn branch_name(&self) -> String {
@@ -1468,6 +1479,12 @@ impl Store {
             .ident
             .as_ref()
             .map_or(self.dataset_id, |i| i.dataset_id)
+    }
+
+    /// Whether both handles belong to the same open dataset family. A separately
+    /// opened copy can have the same persisted UUID without sharing the family.
+    pub fn shares_family_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.family, &other.family)
     }
 
     /// Whether this is a branch store (not a dataset's own store).
@@ -1640,6 +1657,12 @@ impl Store {
         Ok(BranchStore::Other(set.open_store(id)?))
     }
 
+    /// Open an upstream store whose history can still be selected through a listed
+    /// branch, including an upstream that was retired when its name was removed.
+    pub fn upstream_store(&self, id: uuid::Uuid) -> Result<BranchStore<'_>> {
+        self.branch_by_id(id)
+    }
+
     /// The id of branch `name`.
     pub fn branch_id_of(&self, name: &str) -> Result<uuid::Uuid> {
         if name == MAIN {
@@ -1648,11 +1671,6 @@ impl Store {
         Ok(self.owned_set()?.entry(name)?.id)
     }
 
-    /// The current name of the listed branch whose identity is `id`, `main` for the
-    /// dataset id, through the dataset's main store. `None` for a deleted, retired or
-    /// unknown identity. Reads only the branch table, so no branch store is opened, and
-    /// waits for the table under the cancellation, deadline and no-wait choice of
-    /// `options`.
     /// The ids of the listed branches, read from the branch table without taking any
     /// writer. Empty for a store without branches.
     pub fn listed_branch_ids(&self) -> Vec<uuid::Uuid> {
@@ -1662,6 +1680,83 @@ impl Store {
         set.table.lock().branches.iter().map(|b| b.id).collect()
     }
 
+    /// Enumerate the listed branch IDs under reconciliation's lock-wait policy.
+    #[doc(hidden)]
+    pub fn reconciliation_branch_ids(
+        &self,
+        options: &crate::guard::WriteOptions,
+    ) -> Result<Vec<uuid::Uuid>> {
+        let SetRef::Owner(set) = &self.branching.set else {
+            return Ok(Vec::new());
+        };
+        let table = controlled_lock(&set.table, options)?;
+        let mut ids = Vec::with_capacity(table.branches.len());
+        for branch in &table.branches {
+            options.check()?;
+            ids.push(branch.id);
+        }
+        Ok(ids)
+    }
+
+    /// Read a listed branch or a reachable retired upstream for reconciliation. A
+    /// no-wait scan uses only resident stores because reopening can do lengthy I/O.
+    #[doc(hidden)]
+    pub fn reconciliation_branch_store(
+        &self,
+        id: uuid::Uuid,
+        options: &crate::guard::WriteOptions,
+    ) -> Result<Option<Arc<Store>>> {
+        options.check()?;
+        if !options.no_wait {
+            return self.upstream_store(id).map(|store| store.shared());
+        }
+        let set = self.owned_set()?;
+        Ok(controlled_lock(&set.stores, options)?.get(&id).cloned())
+    }
+
+    /// Check that the listed branch identities still match a previous enumeration.
+    /// Returns false if the branch table is busy, so this can be used under a source
+    /// hold's publication lock without waiting for another dataset's branch table.
+    pub fn matches_listed_branch_ids(&self, ids: &[uuid::Uuid]) -> bool {
+        let SetRef::Owner(set) = &self.branching.set else {
+            return ids.is_empty();
+        };
+        set.table.try_lock().is_some_and(|table| {
+            table
+                .branches
+                .iter()
+                .map(|branch| branch.id)
+                .eq(ids.iter().copied())
+        })
+    }
+
+    /// Keep the previously enumerated branches listed during a durable hold release.
+    /// A busy branch table or a different list leaves the release unconfirmed.
+    pub fn pin_listed_branch_ids(&self, ids: &[uuid::Uuid]) -> Option<ListedBranches> {
+        let SetRef::Owner(set) = &self.branching.set else {
+            return ids.is_empty().then_some(ListedBranches {
+                _table: None,
+                _forks: None,
+            });
+        };
+        let forks = set.forks.try_write_arc()?;
+        let table = set.table.try_lock_arc()?;
+        table
+            .branches
+            .iter()
+            .map(|branch| branch.id)
+            .eq(ids.iter().copied())
+            .then_some(ListedBranches {
+                _table: Some(table),
+                _forks: Some(forks),
+            })
+    }
+
+    /// The current name of the listed branch whose identity is `id`, `main` for the
+    /// dataset id, through the dataset's main store. `None` for a deleted, retired or
+    /// unknown identity. Reads only the branch table, so no branch store is opened, and
+    /// waits for the table under the cancellation, deadline and no-wait choice of
+    /// `options`.
     pub fn listed_branch_name(
         &self,
         id: uuid::Uuid,
@@ -2108,6 +2203,7 @@ impl Store {
             return Err(branch::invalid_branch("the note is longer than 1024 bytes"));
         }
         let set = self.owned_set()?.clone();
+        let _fork = set.forks.read();
         if set.memory {
             return self.create_memory_branch(name, o, &set);
         }
@@ -3320,7 +3416,7 @@ mod source_tests {
 }
 
 /// Take `mutex` under the cancellation, deadline and no-wait choice of `options`.
-fn controlled_lock<'a, T>(
+pub(super) fn controlled_lock<'a, T>(
     mutex: &'a parking_lot::Mutex<T>,
     options: &crate::guard::WriteOptions,
 ) -> Result<parking_lot::MutexGuard<'a, T>> {

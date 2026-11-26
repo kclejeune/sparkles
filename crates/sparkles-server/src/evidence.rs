@@ -165,8 +165,9 @@ fn branch_names(
 fn hold_json(
     h: &sparkles::evidence::SourceHold,
     names: &std::collections::HashMap<uuid::Uuid, String>,
+    for_dataset: Option<uuid::Uuid>,
 ) -> J {
-    json!({
+    let mut out = json!({
         "id": h.id,
         "owner": h.owner.as_str(),
         "created": sparkles::commit::rfc3339_ms(h.created_ms),
@@ -175,7 +176,11 @@ fn hold_json(
             "branchId": c.branch_id,
             "commit": c.seq,
         })).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(ds) = for_dataset {
+        out["forDatasetId"] = json!(ds);
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -212,19 +217,19 @@ async fn list_holds(
             None => None,
             Some(b) => Some(branch_id(store, b)?),
         };
-        let all = sparkles::evidence::holds(&ds.dataset)?;
-        let held: usize = all.iter().map(|h| h.commits.len()).sum();
+        let all = sparkles::evidence::hold_details(&ds.dataset)?;
+        let held: usize = all.iter().map(|h| h.hold.commits.len()).sum();
         let mut page: Vec<J> = Vec::new();
         let mut next = None;
         for h in all.iter().filter(|h| {
-            q.after.is_none_or(|a| h.id > a)
-                && branch.is_none_or(|b| h.commits.iter().any(|c| c.branch_id == b))
+            q.after.is_none_or(|a| h.hold.id > a)
+                && branch.is_none_or(|b| h.hold.commits.iter().any(|c| c.branch_id == b))
         }) {
             if page.len() == limit {
                 next = page.last().map(|p: &J| p["id"].clone());
                 break;
             }
-            page.push(hold_json(h, &names));
+            page.push(hold_json(&h.hold, &names, h.for_dataset));
         }
         Ok(Json(json!({
             "holds": page,
@@ -322,7 +327,7 @@ async fn acquire_hold(
         } else {
             StatusCode::OK
         };
-        Ok((status, Json(hold_json(&acquired.hold, &names))).into_response())
+        Ok((status, Json(hold_json(&acquired.hold, &names, None))).into_response())
     })
     .await
 }

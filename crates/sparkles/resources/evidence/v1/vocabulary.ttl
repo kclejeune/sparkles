@@ -78,6 +78,7 @@ ev:graphProtection a rdf:Property ; rdfs:comment "The protection nonce of the gr
 ev:payloadDigest a rdf:Property ; rdfs:comment "The digest of an operation's request payload, compared when its idempotency key repeats." .
 ev:idempotencyKey a rdf:Property ; rdfs:comment "The caller's idempotency key of an operation." .
 ev:sourceHold a rdf:Property ; rdfs:comment "The durable source hold that keeps an operation's referenced commits readable." .
+ev:sourceHoldSets a rdf:Property ; rdfs:comment "Version 1 digests of the commit sets held in each source dataset by a proposal." .
 ev:recordDigest a rdf:Property ; rdfs:comment "The digest of a record's immutable content, recorded by its typed writer." .
 ev:retainedBytes a rdf:Property ; rdfs:comment "The retained bytes of a source revision or rendition, whose contentDigest they match." .
 ev:locator a rdf:Property ; rdfs:comment "A locator of a source revision; a locator is not its identity." .

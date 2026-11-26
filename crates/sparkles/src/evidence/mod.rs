@@ -96,6 +96,7 @@ pub mod review;
 pub use propose::{
     AuthorityFence, Options as ProposeOptions, OrdinaryChanges, Proposed, ProposedRecord,
     operation_id, operation_iri, operation_recorded, propose, reconcile_operation_holds,
+    reconcile_operation_holds_in,
 };
 pub use review::claims::{
     self, ClaimOccurrence, ClaimOrigin, ClaimState, MAX_CLAIM_SCAN, MAX_CLAIMS, MEM_INSTRUCTIONS,
@@ -396,7 +397,7 @@ pub fn detach(dataset: &Dataset, graph: &str) -> Result<SettingsStatus> {
 // --------------------------------------------------------------- holds ------------
 
 pub use sparkles_core::branch::CommitRef;
-pub use sparkles_core::holds::{DEFAULT_GRACE_MS, MAX_COMMITS, SourceHold};
+pub use sparkles_core::holds::{DEFAULT_GRACE_MS, MAX_COMMITS, SourceHold, SourceHoldInfo};
 pub use sparkles_core::store::Acquired;
 
 /// The durable source holds of the evidence profile in `dataset` and its branches, by
@@ -408,6 +409,13 @@ pub fn holds(dataset: &Dataset) -> Result<Vec<SourceHold>> {
         .into_iter()
         .filter(|h| h.owner == OwnerKind::Evidence)
         .collect())
+}
+
+/// The evidence holds with their originating dataset IDs when foreign.
+pub fn hold_details(dataset: &Dataset) -> Result<Vec<SourceHoldInfo>> {
+    let mut holds = dataset.store().source_hold_details()?;
+    holds.retain(|h| h.hold.owner == OwnerKind::Evidence);
+    Ok(holds)
 }
 
 /// Keep `commits` readable for the evidence profile under the hold `id`. Each commit
@@ -422,9 +430,21 @@ pub fn holds(dataset: &Dataset) -> Result<Vec<SourceHold>> {
 /// commits, so repeat the acquisition, release it or reconcile it. The first hold raises
 /// the dataset reader to 7.
 pub fn acquire_hold(dataset: &Dataset, id: uuid::Uuid, commits: &[CommitRef]) -> Result<Acquired> {
+    acquire_hold_for(dataset, id, commits, None)
+}
+
+/// [`acquire_hold`] for an operation in `for_dataset`, when it differs from `dataset`.
+/// A `for_dataset` equal to `dataset`'s id is normalized to `None`. Any hold naming
+/// another dataset writes `holds.json` as format 2.
+pub fn acquire_hold_for(
+    dataset: &Dataset,
+    id: uuid::Uuid,
+    commits: &[CommitRef],
+    for_dataset: Option<uuid::Uuid>,
+) -> Result<Acquired> {
     dataset
         .store()
-        .acquire_hold(OwnerKind::Evidence, id, commits)
+        .acquire_hold_for(OwnerKind::Evidence, id, commits, for_dataset)
 }
 
 /// Release the evidence hold `id`, returning whether it existed. Its commits can be
@@ -436,9 +456,10 @@ pub fn release_hold(dataset: &Dataset, id: uuid::Uuid) -> Result<bool> {
         .is_empty())
 }
 
-/// Release the evidence holds acquired at least `grace_ms` milliseconds ago that `keep`
-/// does not keep, such as holds whose referencing commit never published. Returns the
-/// released ids.
+/// Release local evidence holds acquired at least `grace_ms` milliseconds ago that
+/// `keep` does not keep. Foreign holds stay in place and are never passed to the
+/// callback. Use [`reconcile_operation_holds_in`] to verify and release foreign holds.
+/// Returns the released ids.
 pub fn reconcile_holds(
     dataset: &Dataset,
     grace_ms: i64,

@@ -63,6 +63,41 @@ mod readonly;
 
 pub(crate) use pager::HistoryPages;
 
+/// Test-only observation of changelog index and record read progress.
+#[cfg(feature = "failpoints")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeLogReadEvent {
+    IndexReadChunk,
+    IndexDecode,
+    CandidateCheck,
+    RecordReadChunk,
+    RecordDecode,
+}
+
+#[cfg(feature = "failpoints")]
+pub type ChangeLogReadObserver = Arc<dyn Fn(ChangeLogReadEvent) + Send + Sync>;
+
+#[cfg(feature = "failpoints")]
+thread_local! {
+    static CHANGELOG_READ_OBSERVER: std::cell::RefCell<Option<ChangeLogReadObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install a thread-local observer for changelog index and record reads.
+#[cfg(feature = "failpoints")]
+#[doc(hidden)]
+pub fn set_changelog_read_observer(observer: Option<ChangeLogReadObserver>) {
+    CHANGELOG_READ_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
+}
+
+#[cfg(feature = "failpoints")]
+fn observe_changelog_read(event: ChangeLogReadEvent) {
+    let observer = CHANGELOG_READ_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer(event);
+    }
+}
+
 use super::diff::{Keys, QuadKey};
 use super::*;
 use rustc_hash::FxHashMap;
@@ -70,6 +105,122 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Weak;
 use std::time::{Duration, Instant};
+
+pub(super) fn memory_budget(limit: u64, requested: u64) -> Error {
+    Error::BudgetExceeded(crate::Budget {
+        kind: crate::BudgetKind::Memory,
+        limit,
+        requested,
+    })
+}
+
+/// Tracks live bytes across overlapping allocations in a bounded history scan:
+/// accumulated results, access memo, unrecorded holes, cold index buffers,
+/// candidate cursor scratch, and the record currently being read or decoded.
+pub(crate) struct MemoryBudget {
+    limit: u64,
+    used: std::cell::Cell<u64>,
+}
+
+impl MemoryBudget {
+    pub(super) fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            used: std::cell::Cell::new(0),
+        }
+    }
+
+    pub(super) fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    pub(super) fn used(&self) -> u64 {
+        self.used.get()
+    }
+
+    pub(super) fn guard(&self) -> BudgetGuard<'_> {
+        BudgetGuard {
+            budget: self,
+            bytes: 0,
+        }
+    }
+
+    pub(super) fn charge(&self, bytes: u64) -> Result<()> {
+        let next = self.used.get().saturating_add(bytes);
+        if next > self.limit {
+            return Err(memory_budget(self.limit, next));
+        }
+        self.used.set(next);
+        Ok(())
+    }
+
+    pub(super) fn release(&self, bytes: u64) {
+        self.used.set(self.used.get().saturating_sub(bytes));
+    }
+
+    pub(super) fn reserve(&self, bytes: u64) -> Result<BudgetGuard<'_>> {
+        self.charge(bytes)?;
+        Ok(BudgetGuard {
+            budget: self,
+            bytes,
+        })
+    }
+}
+
+pub(super) struct BudgetGuard<'a> {
+    budget: &'a MemoryBudget,
+    bytes: u64,
+}
+
+impl BudgetGuard<'_> {
+    pub(super) fn resize(&mut self, new_bytes: u64) -> Result<()> {
+        if new_bytes > self.bytes {
+            self.budget.charge(new_bytes - self.bytes)?;
+            self.bytes = new_bytes;
+        } else if new_bytes < self.bytes {
+            self.budget.release(self.bytes - new_bytes);
+            self.bytes = new_bytes;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BudgetGuard<'_> {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
+/// The bytes a quad decoded from `k` can allocate, at most: each term's text is no
+/// longer than its key, a blank node's label is at most 64 bytes, and a triple term
+/// boxes its parts at each level of nesting.
+pub(super) fn quad_bytes(k: &QuadKey) -> u64 {
+    k.iter()
+        .map(|t| {
+            let nested = if t.first() == Some(&b'(') {
+                t.len() as u64 * 64
+            } else {
+                0
+            };
+            t.len() as u64 + 64 + nested
+        })
+        .sum()
+}
+
+/// The bytes the table of a hash map from graph keys to a flag allocates for
+/// `capacity` entries: its buckets of entries and their control bytes, as the standard
+/// map sizes them.
+pub(super) fn memo_table_bytes(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = match capacity {
+        0..4 => 4,
+        4..8 => 8,
+        n => (n.saturating_mul(8) / 7).next_power_of_two(),
+    } as u64;
+    buckets * (std::mem::size_of::<(Arc<[u8]>, bool)>() as u64 + 1) + 16
+}
 
 /// The directory of a persistent store's change log.
 pub const CHANGES_DIR: &str = "changes";
@@ -449,7 +600,7 @@ fn decode(body: &[u8]) -> Option<Record> {
 }
 
 /// The bytes an `Arc<[u8]>` or `Arc<str>` of `len` bytes allocates.
-fn arc_slice_bytes(len: usize) -> u64 {
+pub(super) fn arc_slice_bytes(len: usize) -> u64 {
     (16 + len as u64).next_multiple_of(8)
 }
 
@@ -789,6 +940,309 @@ impl RecEntry {
     }
 }
 
+/// A sorted, deduplicated slice of record ordinals within a segment's `[lo, hi)`.
+#[derive(Clone, Copy)]
+enum PostingRun<'a> {
+    Sealed(&'a [(u64, u32)]),
+    Live(&'a [u32]),
+}
+
+impl<'a> PostingRun<'a> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Sealed(s) => s.len(),
+            Self::Live(s) => s.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn pop(&mut self, descending: bool) -> Option<u32> {
+        match (self, descending) {
+            (Self::Sealed(s), false) => {
+                let (&(_, o), rest) = s.split_first()?;
+                *s = rest;
+                Some(o)
+            }
+            (Self::Sealed(s), true) => {
+                let (&(_, o), rest) = s.split_last()?;
+                *s = rest;
+                Some(o)
+            }
+            (Self::Live(s), false) => {
+                let (&o, rest) = s.split_first()?;
+                *s = rest;
+                Some(o)
+            }
+            (Self::Live(s), true) => {
+                let (&o, rest) = s.split_last()?;
+                *s = rest;
+                Some(o)
+            }
+        }
+    }
+
+    fn contains(&self, ord: u32) -> bool {
+        match self {
+            Self::Sealed(s) => s.binary_search_by_key(&ord, |&(_, o)| o).is_ok(),
+            Self::Live(s) => s.binary_search(&ord).is_ok(),
+        }
+    }
+}
+
+/// Streams distinct candidate record ordinals in ascending or descending order
+/// without copying posting lists.
+enum CandidateStream<'a> {
+    Range {
+        lo: u32,
+        hi: u32,
+        descending: bool,
+    },
+    Single {
+        run: PostingRun<'a>,
+        descending: bool,
+    },
+    Merge {
+        runs: Vec<PostingRun<'a>>,
+        heap: std::collections::BinaryHeap<(u32, usize)>,
+        descending: bool,
+        last: Option<u32>,
+    },
+}
+
+impl<'a> CandidateStream<'a> {
+    fn next_ord(
+        &mut self,
+        checked: bool,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<u32>> {
+        match self {
+            Self::Range { lo, hi, descending } => {
+                if *lo >= *hi {
+                    return Ok(None);
+                }
+                if *descending {
+                    *hi -= 1;
+                    Ok(Some(*hi))
+                } else {
+                    let o = *lo;
+                    *lo += 1;
+                    Ok(Some(o))
+                }
+            }
+            Self::Single { run, descending } => Ok(run.pop(*descending)),
+            Self::Merge {
+                runs,
+                heap,
+                descending,
+                last,
+            } => {
+                let mut dups = 0usize;
+                while let Some((key, idx)) = heap.pop() {
+                    if checked && dups != 0 && dups.is_multiple_of(CHECK_STRIDE) {
+                        check()?;
+                    }
+                    let ord = if *descending { key } else { u32::MAX - key };
+                    if let Some(next) = runs[idx].pop(*descending) {
+                        let next_key = if *descending { next } else { u32::MAX - next };
+                        heap.push((next_key, idx));
+                    }
+                    if *last != Some(ord) {
+                        *last = Some(ord);
+                        return Ok(Some(ord));
+                    }
+                    dups += 1;
+                }
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn hole_key(h: &Unrecorded) -> (u64, u8, u64) {
+    (h.from, h.reason as u8, h.to)
+}
+
+fn reverse_holes_checked(
+    holes: &mut [Unrecorded],
+    checked: bool,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    let len = holes.len();
+    for i in 0..(len / 2) {
+        if checked && i != 0 && i.is_multiple_of(CHECK_STRIDE) {
+            check()?;
+        }
+        holes.swap(i, len - 1 - i);
+    }
+    Ok(())
+}
+
+fn sort_holes_checked(
+    holes: &mut [Unrecorded],
+    checked: bool,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    let len = holes.len();
+    if len <= 1 {
+        return Ok(());
+    }
+    let mut steps = 0usize;
+    let mut sift_down = |slice: &mut [Unrecorded], mut root: usize, end: usize| -> Result<()> {
+        loop {
+            if checked && steps != 0 && steps.is_multiple_of(CHECK_STRIDE) {
+                check()?;
+            }
+            steps += 1;
+            let left = root * 2 + 1;
+            if left >= end {
+                break;
+            }
+            let mut swap = root;
+            if hole_key(&slice[swap]) < hole_key(&slice[left]) {
+                swap = left;
+            }
+            let right = left + 1;
+            if right < end && hole_key(&slice[swap]) < hole_key(&slice[right]) {
+                swap = right;
+            }
+            if swap == root {
+                break;
+            }
+            slice.swap(root, swap);
+            root = swap;
+        }
+        Ok(())
+    };
+    for start in (0..(len / 2)).rev() {
+        sift_down(holes, start, len)?;
+    }
+    for end in (1..len).rev() {
+        holes.swap(0, end);
+        sift_down(holes, 0, end)?;
+    }
+    Ok(())
+}
+
+fn dedup_holes_checked(
+    holes: &mut Vec<Unrecorded>,
+    checked: bool,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    if holes.len() <= 1 {
+        return Ok(());
+    }
+    let mut write = 0usize;
+    for read in 1..holes.len() {
+        if checked && read.is_multiple_of(CHECK_STRIDE) {
+            check()?;
+        }
+        let b = holes[read];
+        let a = &mut holes[write];
+        if a.reason == b.reason && b.from <= a.to.saturating_add(1) {
+            a.to = a.to.max(b.to);
+        } else {
+            write += 1;
+            holes[write] = b;
+        }
+    }
+    holes.truncate(write + 1);
+    Ok(())
+}
+
+/// Collects unrecorded ranges incrementally, merging adjacent/overlapping ranges of the
+/// same reason on arrival and normalizing cooperatively on [`HoleCollector::finish`].
+struct HoleCollector<'a> {
+    holes: Vec<Unrecorded>,
+    guard: Option<BudgetGuard<'a>>,
+    descending: bool,
+    ordered: bool,
+}
+
+impl<'a> HoleCollector<'a> {
+    fn new(budget: Option<&'a MemoryBudget>, descending: bool) -> Self {
+        Self {
+            holes: Vec::new(),
+            guard: budget.map(MemoryBudget::guard),
+            descending,
+            ordered: true,
+        }
+    }
+
+    fn push(&mut self, hole: Unrecorded) -> Result<()> {
+        if hole.from > hole.to {
+            self.ordered = false;
+        } else if self.ordered
+            && let Some(last) = self.holes.last_mut()
+        {
+            if self.descending {
+                if last.reason == hole.reason
+                    && hole.to <= last.to
+                    && hole.to.saturating_add(1) >= last.from
+                {
+                    last.from = last.from.min(hole.from);
+                    return Ok(());
+                }
+                if hole.to >= last.from {
+                    self.ordered = false;
+                }
+            } else {
+                if last.reason == hole.reason
+                    && hole.from >= last.from
+                    && hole.from <= last.to.saturating_add(1)
+                {
+                    last.to = last.to.max(hole.to);
+                    return Ok(());
+                }
+                if last.to >= hole.from {
+                    self.ordered = false;
+                }
+            }
+        }
+        if self.holes.len() == self.holes.capacity()
+            && let Some(guard) = self.guard.as_mut()
+        {
+            let size = std::mem::size_of::<Unrecorded>() as u64;
+            let old = (self.holes.capacity() as u64).saturating_mul(size);
+            let more = self.holes.capacity().max(16);
+            let new = (self.holes.capacity().saturating_add(more) as u64).saturating_mul(size);
+            guard.resize(old.saturating_add(new))?;
+            self.holes.try_reserve_exact(more).map_err(|_| {
+                Error::HistoryUnsupported("history unrecorded-range allocation was refused".into())
+            })?;
+            guard.resize((self.holes.capacity() as u64).saturating_mul(size))?;
+        }
+        self.holes.push(hole);
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        checked: bool,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Vec<Unrecorded>> {
+        if checked {
+            check()?;
+        }
+        if self.ordered {
+            if self.descending {
+                reverse_holes_checked(&mut self.holes, checked, check)?;
+            }
+        } else {
+            sort_holes_checked(&mut self.holes, checked, check)?;
+            dedup_holes_checked(&mut self.holes, checked, check)?;
+        }
+        if checked {
+            check()?;
+        }
+        Ok(self.holes)
+    }
+}
+
+type DecodedSegIndex<'a> = (u64, u64, SegIndex, Option<BudgetGuard<'a>>);
+
 /// The index of one segment.
 #[derive(Clone, Default)]
 struct SegIndex {
@@ -838,18 +1292,30 @@ impl SegIndex {
         self.postings = p;
     }
 
-    /// The record numbers that may hold `hash`, ascending.
-    fn lookup(&self, hash: u64, out: &mut Vec<u32>) {
-        let lo = self.postings.partition_point(|p| p.0 < hash);
-        out.extend(
-            self.postings[lo..]
-                .iter()
-                .take_while(|p| p.0 == hash)
-                .map(|p| p.1),
-        );
-        if let Some(v) = self.live.get(&hash) {
-            out.extend_from_slice(v);
-        }
+    /// Sorted, deduplicated posting runs for `hash` restricted to `lo..hi`.
+    fn runs_in_range(&self, hash: u64, lo: u32, hi: u32) -> [PostingRun<'_>; 2] {
+        let p_lo = self
+            .postings
+            .partition_point(|&(h, o)| h < hash || (h == hash && o < lo));
+        let p_hi = if self
+            .postings
+            .get(p_lo)
+            .is_some_and(|&(h, o)| h == hash && o < hi)
+        {
+            p_lo + self.postings[p_lo..].partition_point(|&(h, o)| h == hash && o < hi)
+        } else {
+            p_lo
+        };
+        let sealed = PostingRun::Sealed(&self.postings[p_lo..p_hi]);
+        let live = match self.live.get(&hash) {
+            Some(v) => {
+                let l_lo = v.partition_point(|&o| o < lo);
+                let l_hi = l_lo + v[l_lo..].partition_point(|&o| o < hi);
+                PostingRun::Live(&v[l_lo..l_hi])
+            }
+            None => PostingRun::Live(&[]),
+        };
+        [sealed, live]
     }
 
     fn encode(&self, dataset_id: uuid::Uuid, first: u64, last: u64) -> Vec<u8> {
@@ -891,14 +1357,18 @@ impl SegIndex {
 
     /// Decode an index file: (first, last, index).
     fn decode(b: &[u8], dataset_id: uuid::Uuid) -> Option<(u64, u64, SegIndex)> {
-        Self::decode_with(b, dataset_id, None).ok().flatten()
+        Self::decode_with(b, dataset_id, None, None)
+            .ok()
+            .flatten()
+            .map(|(first, last, ix, _)| (first, last, ix))
     }
 
-    fn decode_with(
+    fn decode_with<'a>(
         b: &[u8],
         dataset_id: uuid::Uuid,
         mut check: Option<&mut dyn FnMut() -> Result<()>>,
-    ) -> Result<Option<(u64, u64, SegIndex)>> {
+        budget: Option<&'a MemoryBudget>,
+    ) -> Result<Option<DecodedSegIndex<'a>>> {
         if b.len() < IDX_HEADER || &b[0..8] != IDX_MAGIC {
             return Ok(None);
         }
@@ -921,10 +1391,47 @@ impl SegIndex {
         if actual_crc != u32_at(56) {
             return Ok(None);
         }
+        let min_bytes = (nrecs as u64)
+            .saturating_mul(25)
+            .saturating_add((nposts as u64).saturating_mul(12));
+        if min_bytes > body.len() as u64 {
+            return Ok(None);
+        }
         let mut c = Cur { b: body, i: 0 };
         let mut ix = SegIndex::default();
+        let decoded_guard = if let Some(budget) = budget {
+            let decoded = arc_slice_bytes(std::mem::size_of::<SegIndex>())
+                .saturating_add(
+                    (nrecs as u64).saturating_mul(std::mem::size_of::<RecEntry>() as u64),
+                )
+                .saturating_add(
+                    (nposts as u64).saturating_mul(std::mem::size_of::<(u64, u32)>() as u64),
+                );
+            let mut guard = budget.reserve(decoded)?;
+            ix.recs.try_reserve_exact(nrecs).map_err(|_| {
+                Error::HistoryUnsupported("history-log index allocation was refused".into())
+            })?;
+            ix.postings.try_reserve_exact(nposts).map_err(|_| {
+                Error::HistoryUnsupported("history-log index allocation was refused".into())
+            })?;
+            let actual = arc_slice_bytes(std::mem::size_of::<SegIndex>())
+                .saturating_add(
+                    (ix.recs.capacity() as u64)
+                        .saturating_mul(std::mem::size_of::<RecEntry>() as u64),
+                )
+                .saturating_add(
+                    (ix.postings.capacity() as u64)
+                        .saturating_mul(std::mem::size_of::<(u64, u32)>() as u64),
+                );
+            guard.resize(actual)?;
+            Some(guard)
+        } else {
+            None
+        };
         #[cfg(test)]
         open_tests::observe(open_tests::Event::IndexRecords);
+        #[cfg(feature = "failpoints")]
+        observe_changelog_read(ChangeLogReadEvent::IndexDecode);
         for idx in 0..nrecs {
             if idx.is_multiple_of(CHECK_STRIDE)
                 && let Some(check) = check.as_deref_mut()
@@ -938,6 +1445,7 @@ impl SegIndex {
             };
             ix.recs.push(entry);
         }
+        let mut prev_posting: Option<(u64, u32)> = None;
         for idx in 0..nposts {
             if idx.is_multiple_of(CHECK_STRIDE)
                 && let Some(check) = check.as_deref_mut()
@@ -950,6 +1458,10 @@ impl SegIndex {
                 return Ok(None);
             };
             let o = u32::from_le_bytes(raw.try_into().unwrap());
+            if o as usize >= nrecs || prev_posting.is_some_and(|prev| prev >= (h, o)) {
+                return Ok(None);
+            }
+            prev_posting = Some((h, o));
             ix.postings.push((h, o));
         }
         if c.i != body.len() {
@@ -958,7 +1470,7 @@ impl SegIndex {
         if let Some(check) = check {
             check()?;
         }
-        Ok(Some((first, last, ix)))
+        Ok(Some((first, last, ix, decoded_guard)))
     }
 }
 
@@ -1551,66 +2063,113 @@ impl ChangeLog {
 
     /// The index of segment `i`.
     fn index(&self, inner: &mut Inner, i: usize) -> Result<Arc<SegIndex>> {
-        self.index_with(inner, i, None)
+        Ok(self.index_with(inner, i, None, None)?.0)
     }
 
-    fn index_with(
+    fn index_with<'a>(
         &self,
         inner: &mut Inner,
         i: usize,
         mut check: Option<&mut dyn FnMut() -> Result<()>>,
-    ) -> Result<Arc<SegIndex>> {
+        budget: Option<&'a MemoryBudget>,
+    ) -> Result<(Arc<SegIndex>, Option<BudgetGuard<'a>>)> {
         if let Some(ix) = &inner.segs[i].index {
-            return Ok(ix.clone());
+            return Ok((ix.clone(), None));
         }
         let first = inner.segs[i].first;
         if let Some(p) = inner.cache.iter().position(|c| c.0 == first) {
             let c = inner.cache.remove(p).expect("found");
             let ix = c.1.clone();
             inner.cache.push_front(c);
-            return Ok(ix);
+            return Ok((ix, None));
         }
         let path = inner.segs[i]
             .idx_path()
             .expect("a sealed persistent segment");
-        let b = match check.as_deref_mut() {
-            Some(check) => Self::read_index_checked(&path, check)?,
+        let (b, raw_guard) = match check.as_deref_mut() {
+            Some(check) => Self::read_index_checked(&path, check, budget)?,
             None => {
                 #[cfg(test)]
                 open_tests::observe(open_tests::Event::IndexReadAttempt);
                 let bytes = std::fs::read(&path)?;
                 #[cfg(test)]
                 open_tests::observe(open_tests::Event::IndexReadChunk);
-                bytes
+                #[cfg(feature = "failpoints")]
+                observe_changelog_read(ChangeLogReadEvent::IndexReadChunk);
+                let guard = match budget {
+                    Some(budget) => Some(budget.reserve(bytes.capacity() as u64)?),
+                    None => None,
+                };
+                (bytes, guard)
             }
         };
-        let (_, _, ix) = SegIndex::decode_with(&b, self.dataset_id, check)?
+        let (_, _, ix, decoded_guard) = SegIndex::decode_with(&b, self.dataset_id, check, budget)?
             .ok_or_else(|| Error::Corrupt(format!("{}: damaged index", path.display())))?;
+        drop(b);
+        drop(raw_guard);
         let ix = Arc::new(ix);
-        inner.cache.push_front((first, ix.clone()));
-        inner.cache.truncate(INDEX_CACHE);
-        Ok(ix)
+        if budget.is_none() {
+            inner.cache.push_front((first, ix.clone()));
+            inner.cache.truncate(INDEX_CACHE);
+        }
+        Ok((ix, decoded_guard))
     }
 
     /// Read the entire sidecar, polling before each read and every interrupted retry.
-    fn read_index_checked(path: &Path, check: &mut dyn FnMut() -> Result<()>) -> Result<Vec<u8>> {
+    fn read_index_checked<'a>(
+        path: &Path,
+        check: &mut dyn FnMut() -> Result<()>,
+        budget: Option<&'a MemoryBudget>,
+    ) -> Result<(Vec<u8>, Option<BudgetGuard<'a>>)> {
         check()?;
         let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
         let mut bytes = Vec::new();
+        let mut guard = match budget {
+            Some(budget) => {
+                let cap = usize::try_from(file_len).map_err(|_| {
+                    memory_budget(budget.limit(), budget.used().saturating_add(file_len))
+                })?;
+                let mut guard = budget.reserve(file_len)?;
+                if cap > 0 {
+                    bytes.try_reserve_exact(cap).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
+                    })?;
+                    guard.resize(bytes.capacity() as u64)?;
+                }
+                Some(guard)
+            }
+            None => None,
+        };
         let mut chunk = [0; 64 << 10];
         loop {
             check()?;
             #[cfg(test)]
             open_tests::observe(open_tests::Event::IndexReadAttempt);
             match file.read(&mut chunk) {
-                Ok(0) => return Ok(bytes),
+                Ok(0) => return Ok((bytes, guard)),
                 Ok(n) => {
-                    bytes.try_reserve(n).map_err(|error| {
-                        std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
-                    })?;
+                    if bytes.capacity() - bytes.len() < n {
+                        let next_len = (bytes.len() as u64).saturating_add(n as u64);
+                        if let Some(guard) = guard.as_mut() {
+                            let old_cap = bytes.capacity() as u64;
+                            // Growing reallocates while holding both old and new buffers.
+                            guard.resize(old_cap.saturating_add(next_len))?;
+                            bytes.try_reserve_exact(n).map_err(|error| {
+                                std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
+                            })?;
+                            guard.resize(bytes.capacity() as u64)?;
+                        } else {
+                            bytes.try_reserve(n).map_err(|error| {
+                                std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
+                            })?;
+                        }
+                    }
                     bytes.extend_from_slice(&chunk[..n]);
                     #[cfg(test)]
                     open_tests::observe(open_tests::Event::IndexReadChunk);
+                    #[cfg(feature = "failpoints")]
+                    observe_changelog_read(ChangeLogReadEvent::IndexReadChunk);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error.into()),
@@ -1629,6 +2188,10 @@ impl ChangeLog {
         };
         if seg.path.is_none() {
             let (body, _) = frame(&seg.mem, offset as usize).ok_or_else(damaged)?;
+            #[cfg(feature = "failpoints")]
+            observe_changelog_read(ChangeLogReadEvent::RecordReadChunk);
+            #[cfg(feature = "failpoints")]
+            observe_changelog_read(ChangeLogReadEvent::RecordDecode);
             return decode(body).ok_or_else(damaged);
         }
         let path = seg.path.as_ref().expect("checked");
@@ -1639,7 +2202,11 @@ impl ChangeLog {
         let mut buf = vec![0u8; 8 + len];
         buf[..8].copy_from_slice(&h);
         read_exact_at(&f, &mut buf[8..], offset + 8)?;
+        #[cfg(feature = "failpoints")]
+        observe_changelog_read(ChangeLogReadEvent::RecordReadChunk);
         let (body, _) = frame(&buf, 0).ok_or_else(damaged)?;
+        #[cfg(feature = "failpoints")]
+        observe_changelog_read(ChangeLogReadEvent::RecordDecode);
         decode(body).ok_or_else(damaged)
     }
 
@@ -1675,6 +2242,8 @@ impl ChangeLog {
                 check()?;
                 admit(frame + held)?;
                 check()?;
+                #[cfg(feature = "failpoints")]
+                observe_changelog_read(ChangeLogReadEvent::RecordDecode);
                 let r = decode_admitted_checked(body, check)?.ok_or_else(damaged)?;
                 Ok::<_, Error>((r, held))
             };
@@ -1698,6 +2267,10 @@ impl ChangeLog {
         body.try_reserve_exact(len).map_err(|_| {
             Error::HistoryUnsupported("history-log record allocation was refused".into())
         })?;
+        if body.capacity() > len {
+            admit(8 + body.capacity() as u64)?;
+            check()?;
+        }
         let mut crc = flate2::Crc::new();
         while body.len() < len {
             check()?;
@@ -1709,6 +2282,8 @@ impl ChangeLog {
                 .and_then(|n| n.checked_add(start as u64))
                 .ok_or_else(|| Error::Corrupt("history-log offset overflow".into()))?;
             readonly::read_exact_at_checked(&f, &mut body[start..end], read_offset, check)?;
+            #[cfg(feature = "failpoints")]
+            observe_changelog_read(ChangeLogReadEvent::RecordReadChunk);
             check()?;
             crc.update(&body[start..end]);
         }
@@ -1716,7 +2291,7 @@ impl ChangeLog {
         if crc.sum() != expected_crc {
             return Err(damaged());
         }
-        let (r, held) = decode_admitted(&body, 8 + body.len() as u64, admit, check)?;
+        let (r, held) = decode_admitted(&body, 8 + body.capacity() as u64, admit, check)?;
         drop(body);
         admit(held)?;
         check()?;
@@ -1882,6 +2457,7 @@ impl ChangeLog {
         &self,
         ms: i64,
         check: &mut dyn FnMut() -> Result<()>,
+        budget: Option<&MemoryBudget>,
     ) -> Result<Option<u64>> {
         if let Some(reader) = &self.readonly {
             return reader.commit_at_time(ms, check);
@@ -1893,7 +2469,12 @@ impl ChangeLog {
             check()?;
             #[cfg(test)]
             open_tests::observe(open_tests::Event::TimestampIndex);
-            let ix = self.index_with(&mut inner, i, Some(check))?;
+            // Keep the decoded index guard bound before `ix` so `ix` always drops before
+            // its budget charge is released on every exit path.
+            let (_ix_guard, ix) = {
+                let (ix, guard) = self.index_with(&mut inner, i, Some(check), budget)?;
+                (guard, ix)
+            };
             let n = ix.recs.partition_point(|r| r.ts <= ms);
             // a gap tells no time of its own
             for (idx, r) in ix.recs[..n].iter().rev().enumerate() {
@@ -1909,7 +2490,10 @@ impl ChangeLog {
             }
             #[cfg(test)]
             open_tests::observe(open_tests::Event::TimestampIndexed);
-            if n < ix.recs.len() {
+            let done = n < ix.recs.len();
+            drop(ix);
+            drop(_ix_guard);
+            if done {
                 break;
             }
         }
@@ -1933,6 +2517,8 @@ impl ChangeLog {
         filter: &LogFilter,
         descending: bool,
         holes_after_stop: bool,
+        no_wait: bool,
+        budget: Option<&MemoryBudget>,
         check: &mut dyn FnMut() -> Result<()>,
         mut paged: Option<&mut PageHooks<'_, '_>>,
         visit: &mut Visit<'_>,
@@ -1940,44 +2526,54 @@ impl ChangeLog {
         if let Some(reader) = &self.readonly {
             return reader.scan(from, to, filter, descending, check, visit);
         }
-        let mut inner = self.inner.lock();
-        let mut holes: Vec<Unrecorded> = Vec::new();
+        let checked = no_wait || paged.is_some() || budget.is_some();
+        if checked {
+            check()?;
+        }
+        let mut inner = if no_wait {
+            self.inner.try_lock().ok_or(Error::WriterBusy)?
+        } else {
+            self.inner.lock()
+        };
+        if checked {
+            check()?;
+        }
+        let mut holes = HoleCollector::new(budget, descending);
         if from > to {
-            return Ok(holes);
+            if checked {
+                check()?;
+            }
+            return Ok(Vec::new());
         }
         let Some(newest) = inner.last else {
             holes.push(Unrecorded {
                 from,
                 to,
                 reason: UnrecordedReason::BeforeLog,
-            });
-            return Ok(holes);
+            })?;
+            return holes.finish(checked, check);
         };
         let oldest = inner.segs.first().map_or(newest + 1, |s| s.first);
-        if from < oldest {
+        if !descending && from < oldest {
             holes.push(Unrecorded {
                 from,
                 to: to.min(oldest - 1),
                 reason: UnrecordedReason::BeforeLog,
-            });
+            })?;
         }
-        if to > newest {
+        if descending && to > newest {
             holes.push(Unrecorded {
                 from: from.max(newest + 1),
                 to,
                 reason: UnrecordedReason::Gap,
-            });
+            })?;
         }
         let hashes = filter.hashes();
         let n = inner.segs.len();
-        let order: Vec<usize> = if descending {
-            (0..n).rev().collect()
-        } else {
-            (0..n).collect()
-        };
         let mut stop = false;
-        'segs: for i in order {
-            if paged.is_some() {
+        'segs: for step in 0..n {
+            let i = if descending { n - 1 - step } else { step };
+            if checked {
                 check()?;
             }
             let (sf, sl) = (inner.segs[i].first, inner.segs[i].last);
@@ -1985,14 +2581,14 @@ impl ChangeLog {
                 continue;
             }
             // holes between segments (damage) are reported as gaps
-            if i > 0 && inner.segs[i - 1].last + 1 < sf {
+            if !descending && i > 0 && inner.segs[i - 1].last + 1 < sf {
                 let (a, b) = (inner.segs[i - 1].last + 1, sf - 1);
                 if a <= to && b >= from {
                     holes.push(Unrecorded {
                         from: a.max(from),
                         to: b.min(to),
                         reason: UnrecordedReason::Gap,
-                    });
+                    })?;
                 }
             }
             // a full page stops before it loads the next segment's index; a commit is
@@ -2006,7 +2602,14 @@ impl ChangeLog {
             if stop && !holes_after_stop {
                 break;
             }
-            let ix = self.index(&mut inner, i)?;
+            // Keep the decoded index guard bound before `ix` so `ix` always drops before
+            // its budget charge is released on every exit path.
+            let (_ix_guard, ix) = if checked {
+                let (ix, guard) = self.index_with(&mut inner, i, Some(check), budget)?;
+                (guard, ix)
+            } else {
+                (None, self.index(&mut inner, i)?)
+            };
             let lo = ix.recs.partition_point(|r| r.seq < from);
             let hi = ix.recs.partition_point(|r| r.seq <= to);
             // A gap can begin in the requested window but end after it. That
@@ -2018,48 +2621,213 @@ impl ChangeLog {
                         .get(hi)
                         .is_some_and(|record| record.hole.is_some_and(|(first, _)| first <= to)),
                 );
-            for r in &ix.recs[lo..hole_hi] {
-                if let Some((f, reason)) = r.hole {
-                    holes.push(Unrecorded {
-                        from: f.max(from),
-                        to: r.seq.min(to),
-                        reason,
-                    });
+            if descending {
+                for (idx, r) in ix.recs[lo..hole_hi].iter().rev().enumerate() {
+                    if checked && idx != 0 && idx.is_multiple_of(CHECK_STRIDE) {
+                        check()?;
+                    }
+                    if let Some((f, reason)) = r.hole {
+                        holes.push(Unrecorded {
+                            from: f.max(from),
+                            to: r.seq.min(to),
+                            reason,
+                        })?;
+                    }
+                }
+                if i > 0 && inner.segs[i - 1].last + 1 < sf {
+                    let (a, b) = (inner.segs[i - 1].last + 1, sf - 1);
+                    if a <= to && b >= from {
+                        holes.push(Unrecorded {
+                            from: a.max(from),
+                            to: b.min(to),
+                            reason: UnrecordedReason::Gap,
+                        })?;
+                    }
+                }
+            } else {
+                for (idx, r) in ix.recs[lo..hole_hi].iter().enumerate() {
+                    if checked && idx != 0 && idx.is_multiple_of(CHECK_STRIDE) {
+                        check()?;
+                    }
+                    if let Some((f, reason)) = r.hole {
+                        holes.push(Unrecorded {
+                            from: f.max(from),
+                            to: r.seq.min(to),
+                            reason,
+                        })?;
+                    }
                 }
             }
             if stop {
                 continue;
             }
-            // the records that may match
-            let cands: Vec<u32> = match &hashes {
-                None => (lo as u32..hi as u32).collect(),
+            // Stream candidate ordinals without copying posting lists: short-circuit
+            // immediately if any constrained role has zero postings in lo..hi, and
+            // drive traversal from the smallest constrained role.
+            let mut cand_guard = budget.map(MemoryBudget::guard);
+            let mut cand_fixed_bytes = 0u64;
+            let (mut cands, other_roles) = match &hashes {
+                None => (
+                    CandidateStream::Range {
+                        lo: lo as u32,
+                        hi: hi as u32,
+                        descending,
+                    },
+                    Vec::new(),
+                ),
                 Some(roles) => {
-                    let mut acc: Option<Vec<u32>> = None;
-                    for hs in roles {
-                        let mut v = Vec::new();
-                        for h in hs {
-                            ix.lookup(*h, &mut v);
-                        }
-                        v.retain(|&o| (lo as u32..hi as u32).contains(&o));
-                        v.sort_unstable();
-                        v.dedup();
-                        acc = Some(match acc {
-                            None => v,
-                            Some(a) => a
-                                .into_iter()
-                                .filter(|o| v.binary_search(o).is_ok())
-                                .collect(),
-                        });
+                    let mut role_runs: Vec<Vec<PostingRun<'_>>> = Vec::new();
+                    if let Some(guard) = cand_guard.as_mut() {
+                        let outer = (roles.len() as u64)
+                            .saturating_mul(std::mem::size_of::<Vec<PostingRun<'_>>>() as u64);
+                        guard.resize(outer)?;
                     }
-                    acc.unwrap_or_default()
+                    role_runs.try_reserve_exact(roles.len()).map_err(|_| {
+                        Error::HistoryUnsupported(
+                            "history candidate role allocation was refused".into(),
+                        )
+                    })?;
+                    if let Some(guard) = cand_guard.as_mut() {
+                        cand_fixed_bytes = (role_runs.capacity() as u64)
+                            .saturating_mul(std::mem::size_of::<Vec<PostingRun<'_>>>() as u64);
+                        guard.resize(cand_fixed_bytes)?;
+                    }
+                    let mut drive_idx = 0usize;
+                    let mut drive_count = usize::MAX;
+                    let mut empty_role = false;
+                    for (role_i, hs) in roles.iter().enumerate() {
+                        if checked {
+                            check()?;
+                        }
+                        let mut runs: Vec<PostingRun<'_>> = Vec::new();
+                        let mut count = 0usize;
+                        for (h_i, &h) in hs.iter().enumerate() {
+                            if checked && h_i != 0 && h_i.is_multiple_of(CHECK_STRIDE) {
+                                check()?;
+                            }
+                            for run in ix.runs_in_range(h, lo as u32, hi as u32) {
+                                if !run.is_empty() {
+                                    count = count.saturating_add(run.len());
+                                    if runs.len() == runs.capacity() {
+                                        let size = std::mem::size_of::<PostingRun<'_>>() as u64;
+                                        let old = (runs.capacity() as u64).saturating_mul(size);
+                                        let more = runs.capacity().max(4);
+                                        let new = (runs.capacity().saturating_add(more) as u64)
+                                            .saturating_mul(size);
+                                        if let Some(guard) = cand_guard.as_mut() {
+                                            guard.resize(
+                                                cand_fixed_bytes
+                                                    .saturating_add(old)
+                                                    .saturating_add(new),
+                                            )?;
+                                        }
+                                        runs.try_reserve_exact(more).map_err(|_| {
+                                            Error::HistoryUnsupported(
+                                                "history candidate cursor allocation was refused"
+                                                    .into(),
+                                            )
+                                        })?;
+                                        if let Some(guard) = cand_guard.as_mut() {
+                                            let actual =
+                                                (runs.capacity() as u64).saturating_mul(size);
+                                            guard
+                                                .resize(cand_fixed_bytes.saturating_add(actual))?;
+                                        }
+                                    }
+                                    runs.push(run);
+                                }
+                            }
+                        }
+                        if count == 0 {
+                            empty_role = true;
+                            break;
+                        }
+                        cand_fixed_bytes = cand_fixed_bytes.saturating_add(
+                            (runs.capacity() as u64)
+                                .saturating_mul(std::mem::size_of::<PostingRun<'_>>() as u64),
+                        );
+                        if count < drive_count {
+                            drive_count = count;
+                            drive_idx = role_i;
+                        }
+                        role_runs.push(runs);
+                    }
+                    if empty_role {
+                        continue 'segs;
+                    }
+                    let mut drive_runs = role_runs.swap_remove(drive_idx);
+                    let stream = if drive_runs.len() == 1 {
+                        CandidateStream::Single {
+                            run: drive_runs[0],
+                            descending,
+                        }
+                    } else {
+                        let mut entries: Vec<(u32, usize)> = Vec::new();
+                        let entry_size = std::mem::size_of::<(u32, usize)>() as u64;
+                        if let Some(guard) = cand_guard.as_mut() {
+                            let need = (drive_runs.len() as u64).saturating_mul(entry_size);
+                            guard.resize(cand_fixed_bytes.saturating_add(need))?;
+                        }
+                        entries.try_reserve_exact(drive_runs.len()).map_err(|_| {
+                            Error::HistoryUnsupported(
+                                "history candidate heap allocation was refused".into(),
+                            )
+                        })?;
+                        if let Some(guard) = cand_guard.as_mut() {
+                            let actual = (entries.capacity() as u64).saturating_mul(entry_size);
+                            guard.resize(cand_fixed_bytes.saturating_add(actual))?;
+                        }
+                        for (idx, run) in drive_runs.iter_mut().enumerate() {
+                            if checked && idx != 0 && idx.is_multiple_of(CHECK_STRIDE) {
+                                check()?;
+                            }
+                            if let Some(ord) = run.pop(descending) {
+                                let key = if descending { ord } else { u32::MAX - ord };
+                                entries.push((key, idx));
+                            }
+                        }
+                        CandidateStream::Merge {
+                            runs: drive_runs,
+                            heap: std::collections::BinaryHeap::from(entries),
+                            descending,
+                            last: None,
+                        }
+                    };
+                    (stream, role_runs)
                 }
             };
-            let iter: Box<dyn Iterator<Item = &u32>> = if descending {
-                Box::new(cands.iter().rev())
-            } else {
-                Box::new(cands.iter())
-            };
-            for &o in iter {
+            let mut cand_steps = 0usize;
+            while let Some(o) = cands.next_ord(checked, check)? {
+                if checked && cand_steps.is_multiple_of(CHECK_STRIDE) {
+                    #[cfg(test)]
+                    open_tests::observe(open_tests::Event::CandidateCheck);
+                    #[cfg(feature = "failpoints")]
+                    observe_changelog_read(ChangeLogReadEvent::CandidateCheck);
+                    check()?;
+                }
+                cand_steps += 1;
+                if !other_roles.is_empty() {
+                    let mut matched = true;
+                    for other in &other_roles {
+                        let mut hit = false;
+                        for (r_idx, run) in other.iter().enumerate() {
+                            if checked && r_idx != 0 && r_idx.is_multiple_of(CHECK_STRIDE) {
+                                check()?;
+                            }
+                            if run.contains(o) {
+                                hit = true;
+                                break;
+                            }
+                        }
+                        if !hit {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if !matched {
+                        continue;
+                    }
+                }
                 check()?;
                 let e = ix.recs[o as usize];
                 if e.hole.is_some() {
@@ -2071,14 +2839,26 @@ impl ChangeLog {
                     stop = true;
                     break;
                 }
+                let mut record_guard = budget.map(MemoryBudget::guard);
                 let record = match paged.as_deref_mut() {
                     Some(p) => self.read_admitted(&inner, i, e.offset, p.admit, check)?,
+                    None if checked => {
+                        let mut admit = |bytes: u64| {
+                            if let Some(guard) = record_guard.as_mut() {
+                                guard.resize(bytes)
+                            } else {
+                                Ok(())
+                            }
+                        };
+                        self.read_admitted(&inner, i, e.offset, &mut admit, check)?
+                    }
                     None => self.read(&inner, i, e.offset)?,
                 };
                 if let Record::Changes(c, changes) = &record {
+                    #[cfg(test)]
                     let is_paged = paged.is_some();
                     for (idx, (add, k)) in changes.iter().enumerate() {
-                        if is_paged && idx.is_multiple_of(CHECK_STRIDE) {
+                        if checked && idx.is_multiple_of(CHECK_STRIDE) {
                             check()?;
                         }
                         #[cfg(test)]
@@ -2092,6 +2872,7 @@ impl ChangeLog {
                     }
                 }
                 drop(record);
+                drop(record_guard);
                 if let Some(p) = paged.as_deref_mut() {
                     (p.admit)(0)?;
                     check()?;
@@ -2103,21 +2884,30 @@ impl ChangeLog {
                     break;
                 }
             }
+            drop(cands);
+            drop(other_roles);
+            drop(cand_guard);
+            drop(ix);
+            drop(_ix_guard);
             if stop && !holes_after_stop {
                 break;
             }
         }
-        holes.sort_by_key(|h| h.from);
-        // a hole reported twice (a gap past the end and a gap record) is merged
-        holes.dedup_by(|b, a| {
-            if a.reason == b.reason && b.from <= a.to + 1 {
-                a.to = a.to.max(b.to);
-                true
-            } else {
-                false
-            }
-        });
-        Ok(holes)
+        if !descending && to > newest {
+            holes.push(Unrecorded {
+                from: from.max(newest + 1),
+                to,
+                reason: UnrecordedReason::Gap,
+            })?;
+        }
+        if descending && from < oldest {
+            holes.push(Unrecorded {
+                from,
+                to: to.min(oldest - 1),
+                reason: UnrecordedReason::BeforeLog,
+            })?;
+        }
+        holes.finish(checked, check)
     }
 
     /// Read the records of commits `from` through `to` in commit order, calling `visit`
@@ -2973,6 +3763,8 @@ mod settings_format_tests {
             &reject_all,
             false,
             false,
+            false,
+            None,
             &mut || Ok(()),
             Some(&mut PageHooks {
                 admit: &mut admit,
@@ -2997,6 +3789,8 @@ mod settings_format_tests {
             &reject_all,
             false,
             false,
+            false,
+            None,
             &mut || {
                 if evaluated.get() == 1_024 {
                     Err(Error::Cancelled)
@@ -3214,6 +4008,1605 @@ mod settings_format_tests {
                 admits <= 1,
                 "fail_poll={fail_poll}: expected at most frame admission before decode, got {admits}"
             );
+        }
+    }
+
+    #[test]
+    fn published_history_changes_check_cold_indexes_and_bound_records() {
+        use crate::store::history_query::{HistoryBound, HistoryQuery};
+        use std::rc::Rc;
+
+        // 1. Cold sealed index (> 128 KiB): cancel, deadline, and budget refusal before full read.
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            change_log_segment_bytes: 4096,
+            ..Default::default()
+        };
+        let store = Store::open(dir.path(), opts.clone()).unwrap();
+        store.change_log().unwrap().set_background(false);
+        let mut triples = String::new();
+        use std::fmt::Write as _;
+        for i in 0..8_000 {
+            writeln!(&mut triples, "<urn:idx{i}> <urn:p> {i} .").unwrap();
+        }
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {triples} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let big_payload = "r".repeat(256 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:target> <urn:p> \"{big_payload}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let head = store.head_commit().seq;
+        let log = store.change_log().unwrap().clone();
+        let first_idx_len = {
+            let mut inner = log.inner.lock();
+            assert!(inner.segs.len() >= 2);
+            assert!(inner.segs[0].sealed);
+            inner.cache.clear();
+            inner.segs[0].idx_path().unwrap().metadata().unwrap().len()
+        };
+        assert!(first_idx_len > (128 << 10));
+
+        for no_wait in [true, false] {
+            // 1a. Mid-read cancellation during cold index load stops before chunk 2 and decode.
+            log.inner.lock().cache.clear();
+            let flag = Arc::new(AtomicBool::new(false));
+            let stop = flag.clone();
+            let progress = Rc::new(Cell::new((0usize, 0usize)));
+            let witness = progress.clone();
+            let observer = open_tests::Observe::new(move |event| {
+                let (mut chunks, mut after) = witness.get();
+                match event {
+                    open_tests::Event::IndexReadChunk => {
+                        if chunks == 0 {
+                            chunks = 1;
+                            stop.store(true, Ordering::Relaxed);
+                        } else {
+                            after += 1;
+                        }
+                    }
+                    open_tests::Event::IndexCrcChunk
+                    | open_tests::Event::IndexRecords
+                    | open_tests::Event::IndexRecord
+                    | open_tests::Event::IndexPosting
+                        if chunks > 0 =>
+                    {
+                        after += 1;
+                    }
+                    _ => {}
+                }
+                witness.set((chunks, after));
+            });
+            let q = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+                from: Some(HistoryBound::Commit(1)),
+                to: Some(HistoryBound::Commit(head)),
+                cancel: Some(flag.clone()),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q, 16 << 20)
+            } else {
+                store.published_history_changes(&q, 16 << 20)
+            };
+            drop(observer);
+            assert!(
+                matches!(res, Err(Error::Cancelled)),
+                "no_wait={no_wait}: {res:?}"
+            );
+            assert_eq!(progress.get(), (1, 0), "no_wait={no_wait}");
+            assert!(
+                log.inner.lock().cache.is_empty(),
+                "cancelled cold index must not be cached"
+            );
+
+            // 1b. Deadline expiration after the first cold index chunk stops with Timeout.
+            log.inner.lock().cache.clear();
+            let deadline = Instant::now() + Duration::from_millis(20);
+            let expired = Rc::new(Cell::new((0usize, 0usize)));
+            let witness = expired.clone();
+            let observer = open_tests::Observe::new(move |event| {
+                let (mut chunks, mut after) = witness.get();
+                match event {
+                    open_tests::Event::IndexReadChunk => {
+                        if chunks == 0 {
+                            chunks = 1;
+                            while Instant::now() <= deadline {
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                        } else {
+                            after += 1;
+                        }
+                    }
+                    open_tests::Event::IndexCrcChunk | open_tests::Event::IndexRecords
+                        if chunks > 0 =>
+                    {
+                        after += 1;
+                    }
+                    _ => {}
+                }
+                witness.set((chunks, after));
+            });
+            let q = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+                from: Some(HistoryBound::Commit(1)),
+                to: Some(HistoryBound::Commit(head)),
+                deadline: Some(deadline),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q, 16 << 20)
+            } else {
+                store.published_history_changes(&q, 16 << 20)
+            };
+            drop(observer);
+            assert!(
+                matches!(res, Err(Error::Timeout)),
+                "no_wait={no_wait}: {res:?}"
+            );
+            assert_eq!(expired.get(), (1, 0), "no_wait={no_wait}");
+
+            // 1c. Oversized cold index is refused before reading any chunk.
+            log.inner.lock().cache.clear();
+            let attempts = Rc::new(Cell::new(0usize));
+            let witness = attempts.clone();
+            let observer = open_tests::Observe::new(move |event| {
+                if event == open_tests::Event::IndexReadAttempt {
+                    witness.set(witness.get() + 1);
+                }
+            });
+            let q = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+                from: Some(HistoryBound::Commit(1)),
+                to: Some(HistoryBound::Commit(head)),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q, 64 << 10)
+            } else {
+                store.published_history_changes(&q, 64 << 10)
+            };
+            drop(observer);
+            assert!(
+                matches!(res, Err(Error::BudgetExceeded(_))),
+                "no_wait={no_wait}: {res:?}"
+            );
+            assert_eq!(attempts.get(), 0, "no_wait={no_wait}");
+
+            // 2. Oversized matching record (> 256 KiB) is refused before reading when budget is small,
+            //    and succeeds when the budget covers frame + decoded footprint.
+            let q = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:target"))],
+                from: Some(HistoryBound::Commit(head)),
+                to: Some(HistoryBound::Commit(head)),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q, 64 << 10)
+            } else {
+                store.published_history_changes(&q, 64 << 10)
+            };
+            assert!(
+                matches!(res, Err(Error::BudgetExceeded(_))),
+                "no_wait={no_wait}: {res:?}"
+            );
+
+            let res = if no_wait {
+                store.try_published_history_changes(&q, 16 << 20)
+            } else {
+                store.published_history_changes(&q, 16 << 20)
+            }
+            .unwrap();
+            assert_eq!(res.changes.len(), 1, "no_wait={no_wait}");
+            assert_eq!(res.changes[0].commit.seq, head, "no_wait={no_wait}");
+        }
+    }
+
+    #[test]
+    fn cold_sidecar_capacity_and_overlap_memory_budget() {
+        use crate::store::history_query::{HistoryBound, HistoryQuery};
+        use std::rc::Rc;
+
+        // 1. Direct spare-capacity check: b.len() + decoded fits limit, while
+        //    b.capacity() + decoded exceeds limit.
+        let dataset_id = uuid::Uuid::new_v4();
+        let mut synth = SegIndex::default();
+        synth.recs.push(RecEntry {
+            seq: 1,
+            offset: SEG_HEADER as u64,
+            ts: 1,
+            hole: None,
+        });
+        for i in 0..4_000u64 {
+            synth.postings.push((i + 1, 0));
+        }
+        let encoded = synth.encode(dataset_id, 1, 1);
+        let decoded_bytes = arc_slice_bytes(std::mem::size_of::<SegIndex>())
+            + std::mem::size_of::<RecEntry>() as u64
+            + 4_000u64 * std::mem::size_of::<(u64, u32)>() as u64;
+        let mut raw_with_spare = Vec::with_capacity(encoded.len() + (64 << 10));
+        raw_with_spare.extend_from_slice(&encoded);
+        assert!(raw_with_spare.capacity() >= raw_with_spare.len() + (64 << 10));
+        let spare_limit = raw_with_spare.len() as u64 + decoded_bytes + 4096;
+        assert!(
+            raw_with_spare.capacity() as u64 + decoded_bytes > spare_limit,
+            "spare capacity must push total past spare_limit"
+        );
+        let decoded_events = Rc::new(Cell::new(0usize));
+        let witness = decoded_events.clone();
+        let observer = open_tests::Observe::new(move |event| {
+            if event == open_tests::Event::IndexRecords {
+                witness.set(witness.get() + 1);
+            }
+        });
+        let budget = MemoryBudget::new(spare_limit);
+        let _raw_guard = budget.reserve(raw_with_spare.capacity() as u64).unwrap();
+        let res = SegIndex::decode_with(&raw_with_spare, dataset_id, None, Some(&budget));
+        drop(observer);
+        assert!(
+            matches!(res, Err(Error::BudgetExceeded(_))),
+            "expected spare-capacity rejection, got {:?}",
+            res.as_ref().err()
+        );
+        assert_eq!(
+            decoded_events.get(),
+            0,
+            "allocated index records despite capacity overrun"
+        );
+        drop(_raw_guard);
+        assert_eq!(budget.used(), 0);
+
+        let exact_budget = MemoryBudget::new(raw_with_spare.capacity() as u64 + decoded_bytes);
+        let _raw_guard = exact_budget
+            .reserve(raw_with_spare.capacity() as u64)
+            .unwrap();
+        let (_, _, _, decoded_guard) =
+            SegIndex::decode_with(&raw_with_spare, dataset_id, None, Some(&exact_budget))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            exact_budget.used(),
+            raw_with_spare.capacity() as u64 + decoded_bytes
+        );
+        drop(_raw_guard);
+        assert_eq!(exact_budget.used(), decoded_bytes);
+        drop(decoded_guard);
+        assert_eq!(exact_budget.used(), 0);
+
+        // 2. End-to-end persistent store:
+        //    - Segment 0 (commit 1): matching ~96 KiB literal for <urn:overlap>
+        //    - Segment 1 (commit 2): 6,000 triples -> cold .idx > 128 KiB
+        //    - Segment 2 (commit 3): second matching ~96 KiB literal for <urn:overlap>
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            change_log_segment_bytes: 4096,
+            ..Default::default()
+        };
+        let store = Store::open(dir.path(), opts).unwrap();
+        store.change_log().unwrap().set_background(false);
+
+        let payload_a = "a".repeat(96 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:overlap> <urn:p> \"{payload_a}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c1 = store.head_commit().seq;
+
+        let mut triples = String::new();
+        use std::fmt::Write as _;
+        for i in 0..6_000 {
+            writeln!(&mut triples, "<urn:cap{i}> <urn:p> {i} .").unwrap();
+        }
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {triples} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c2 = store.head_commit().seq;
+
+        let payload_b = "b".repeat(96 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:overlap> <urn:p> \"{payload_b}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c3 = store.head_commit().seq;
+
+        let log = store.change_log().unwrap().clone();
+        let (seg1_idx_path, seg1_idx_len) = {
+            let mut inner = log.inner.lock();
+            assert!(inner.segs.len() >= 3);
+            assert!(inner.segs[1].sealed);
+            inner.cache.clear();
+            let path = inner.segs[1].idx_path().unwrap();
+            let len = path.metadata().unwrap().len();
+            (path, len)
+        };
+        assert!(
+            seg1_idx_len > (128 << 10),
+            "expected cold .idx > 128 KiB (non-power-of-two growth test), got {seg1_idx_len}"
+        );
+
+        // 2a. read_index_checked reserves exact capacity without geometric 2x jump past idx_len.
+        let exact_raw_budget = MemoryBudget::new(seg1_idx_len);
+        let (raw_bytes, raw_guard) =
+            ChangeLog::read_index_checked(&seg1_idx_path, &mut || Ok(()), Some(&exact_raw_budget))
+                .unwrap();
+        assert_eq!(raw_bytes.len() as u64, seg1_idx_len);
+        assert!(raw_bytes.capacity() as u64 <= seg1_idx_len);
+        let seg1_decoded_bytes = {
+            let (_, _, ix) = SegIndex::decode(&raw_bytes, log.dataset_id).unwrap();
+            arc_slice_bytes(std::mem::size_of::<SegIndex>())
+                + (ix.recs.len() as u64) * (std::mem::size_of::<RecEntry>() as u64)
+                + (ix.postings.len() as u64) * (std::mem::size_of::<(u64, u32)>() as u64)
+        };
+        drop(raw_bytes);
+        drop(raw_guard);
+        assert_eq!(exact_raw_budget.used(), 0);
+
+        // 2b. Cold sidecar whose file length fits limit, while raw capacity + decoded exceeds limit.
+        let len_only_limit = seg1_idx_len + 16_384;
+        assert!(seg1_idx_len + seg1_decoded_bytes > len_only_limit);
+        for no_wait in [true, false] {
+            log.inner.lock().cache.clear();
+            let stats = Rc::new(Cell::new((0usize, 0usize)));
+            let witness = stats.clone();
+            let observer = open_tests::Observe::new(move |event| {
+                let (mut chunks, mut decodes) = witness.get();
+                match event {
+                    open_tests::Event::IndexReadChunk => chunks += 1,
+                    open_tests::Event::IndexRecords => decodes += 1,
+                    _ => {}
+                }
+                witness.set((chunks, decodes));
+            });
+            let q = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+                from: Some(HistoryBound::Commit(c2)),
+                to: Some(HistoryBound::Commit(c2)),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q, len_only_limit)
+            } else {
+                store.published_history_changes(&q, len_only_limit)
+            };
+            drop(observer);
+            assert!(
+                matches!(res, Err(Error::BudgetExceeded(_))),
+                "no_wait={no_wait}: {res:?}"
+            );
+            let (chunks, decodes) = stats.get();
+            assert!(
+                chunks > 0,
+                "no_wait={no_wait}: file length fit limit so raw read should proceed"
+            );
+            assert_eq!(
+                decodes, 0,
+                "no_wait={no_wait}: decoded index must be rejected before allocating entries"
+            );
+            assert!(log.inner.lock().cache.is_empty());
+        }
+
+        // 2c. Live overlap between accumulated results (commit 1) and cold index load (commit 2).
+        let overlap_idx_limit = seg1_idx_len + seg1_decoded_bytes + (32 << 10);
+        for no_wait in [true, false] {
+            // Segment 1 alone fits overlap_idx_limit.
+            log.inner.lock().cache.clear();
+            let q_only_c2 = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:overlap"))],
+                from: Some(HistoryBound::Commit(c2)),
+                to: Some(HistoryBound::Commit(c2)),
+                ..Default::default()
+            };
+            let solo = if no_wait {
+                store.try_published_history_changes(&q_only_c2, overlap_idx_limit)
+            } else {
+                store.published_history_changes(&q_only_c2, overlap_idx_limit)
+            }
+            .unwrap();
+            assert!(solo.changes.is_empty());
+
+            // Segment 0 (~96 KiB result) + cold Segment 1 index exceeds overlap_idx_limit.
+            log.inner.lock().cache.clear();
+            let q_c1_c2 = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:overlap"))],
+                from: Some(HistoryBound::Commit(c1)),
+                to: Some(HistoryBound::Commit(c2)),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q_c1_c2, overlap_idx_limit)
+            } else {
+                store.published_history_changes(&q_c1_c2, overlap_idx_limit)
+            };
+            assert!(
+                matches!(res, Err(Error::BudgetExceeded(_))),
+                "no_wait={no_wait}: expected accumulated-result + cold-index overlap refusal, got {res:?}"
+            );
+        }
+
+        // 2d. Live overlap between accumulated results (commit 1) and record read (commit 3)
+        //     with warm indexes so no cold index load intervenes.
+        //     Single commit peak is ~201 KiB (frame + decoded or decoded + result);
+        //     overlapping commit 1 result (~96 KiB) with commit 3 read (~193 KiB) peaks near 297 KiB.
+        let single_record_limit = 240 << 10;
+        for no_wait in [true, false] {
+            // Warm all segment indexes via an unbounded scan first.
+            let warm_q = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+                from: Some(HistoryBound::Commit(c1)),
+                to: Some(HistoryBound::Commit(c3)),
+                ..Default::default()
+            };
+            store.history_changes(&warm_q).unwrap();
+
+            // Commit 1 alone and commit 3 alone each fit single_record_limit.
+            for seq in [c1, c3] {
+                let q_one = HistoryQuery {
+                    subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:overlap"))],
+                    from: Some(HistoryBound::Commit(seq)),
+                    to: Some(HistoryBound::Commit(seq)),
+                    ..Default::default()
+                };
+                let ok = if no_wait {
+                    store.try_published_history_changes(&q_one, single_record_limit)
+                } else {
+                    store.published_history_changes(&q_one, single_record_limit)
+                }
+                .unwrap();
+                assert_eq!(ok.changes.len(), 1);
+            }
+
+            // Combined commit 1..=3 overflows when commit 1's live results overlap commit 3's read.
+            let q_both = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:overlap"))],
+                from: Some(HistoryBound::Commit(c1)),
+                to: Some(HistoryBound::Commit(c3)),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q_both, single_record_limit)
+            } else {
+                store.published_history_changes(&q_both, single_record_limit)
+            };
+            assert!(
+                matches!(res, Err(Error::BudgetExceeded(_))),
+                "no_wait={no_wait}: expected accumulated-result + record overlap refusal, got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn warm_segment_candidate_traversal_short_circuits_and_polls() {
+        use crate::store::history_query::{HistoryBound, HistoryQuery};
+
+        let store = Store::in_memory(StoreOptions {
+            change_log_segment_bytes: 64 << 20,
+            ..Default::default()
+        });
+        let log = store.change_log().unwrap().clone();
+        log.set_background(false);
+
+        // Populate one warm/live segment directly so we get > CHECK_STRIDE commits quickly:
+        // - 1,200 commits with rdf:type
+        // - 1,100 commits with <urn:sparse> and <urn:other> (none with rdf:type)
+        // - 1 commit with <urn:hit> and rdf:type
+        let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+        let hold_sets = NamedNode::new_unchecked("urn:x-sparkles:evidence:sourceHoldSets");
+        let other_pred = NamedNode::new_unchecked("urn:other");
+        let rdf_type_key: Arc<[u8]> = Arc::from(id::iri_key(rdf_type.as_str()));
+        let other_pred_key: Arc<[u8]> = Arc::from(id::iri_key(other_pred.as_str()));
+        let sparse_key: Arc<[u8]> = Arc::from(id::iri_key("urn:sparse"));
+        let hit_key: Arc<[u8]> = Arc::from(id::iri_key("urn:hit"));
+        let thing_key: Arc<[u8]> = Arc::from(id::iri_key("urn:Thing"));
+        let default_g: Arc<[u8]> = Arc::from(&[][..]);
+
+        let make_commit = |seq: u64| {
+            Arc::new(ChangeCommit {
+                seq,
+                timestamp_ms: seq as i64,
+                kind: CommitKind::Update,
+                bulk: false,
+                inserted: 1,
+                deleted: 0,
+                author: None,
+                message: None,
+            })
+        };
+
+        let mut seq = 0u64;
+        {
+            let mut inner = log.inner.lock();
+            for i in 0..1_200u64 {
+                seq += 1;
+                let s: Arc<[u8]> = Arc::from(id::iri_key(&format!("urn:noise:{i}")));
+                let q: QuadKey = [
+                    default_g.clone(),
+                    s,
+                    rdf_type_key.clone(),
+                    thing_key.clone(),
+                ];
+                log.append(
+                    &mut inner,
+                    Record::Changes(make_commit(seq), vec![(true, q)]),
+                )
+                .unwrap();
+            }
+            for i in 0..1_100u64 {
+                seq += 1;
+                let o: Arc<[u8]> = Arc::from(id::iri_key(&format!("urn:val:{i}")));
+                let q: QuadKey = [
+                    default_g.clone(),
+                    sparse_key.clone(),
+                    other_pred_key.clone(),
+                    o,
+                ];
+                log.append(
+                    &mut inner,
+                    Record::Changes(make_commit(seq), vec![(true, q)]),
+                )
+                .unwrap();
+            }
+            seq += 1;
+            let hit_q: QuadKey = [
+                default_g.clone(),
+                hit_key.clone(),
+                rdf_type_key.clone(),
+                thing_key.clone(),
+            ];
+            log.append(
+                &mut inner,
+                Record::Changes(make_commit(seq), vec![(true, hit_q)]),
+            )
+            .unwrap();
+            assert_eq!(inner.segs.len(), 1);
+            assert!(inner.segs[0].index.is_some());
+        }
+        let hit_seq = seq;
+
+        // 1. Missing subject with frequent rdf:type short-circuits with tiny max_bytes
+        //    (far below the ~4,800 bytes copying 1,200 rdf:type postings would require).
+        for descending in [false, true] {
+            let filter = LogFilter {
+                keys: [
+                    None,
+                    Some(vec![id::iri_key("urn:missing")]),
+                    Some(vec![
+                        id::iri_key(rdf_type.as_str()),
+                        id::iri_key(hold_sets.as_str()),
+                    ]),
+                    None,
+                ],
+            };
+            let budget = MemoryBudget::new(256);
+            let mut visited = 0usize;
+            let holes = log
+                .scan(
+                    1,
+                    hit_seq,
+                    &filter,
+                    descending,
+                    true,
+                    true,
+                    Some(&budget),
+                    &mut || Ok(()),
+                    None,
+                    &mut |_, _, _| {
+                        visited += 1;
+                        Ok(true)
+                    },
+                )
+                .unwrap();
+            assert!(holes.is_empty());
+            assert_eq!(visited, 0);
+            assert_eq!(budget.used(), 0);
+        }
+
+        // 2. Sparse matching subject with frequent rdf:type drives from the subject role
+        //    without copying rdf:type's 1,200 postings.
+        for descending in [false, true] {
+            let filter = LogFilter {
+                keys: [
+                    None,
+                    Some(vec![id::iri_key("urn:hit")]),
+                    Some(vec![
+                        id::iri_key(rdf_type.as_str()),
+                        id::iri_key(hold_sets.as_str()),
+                    ]),
+                    None,
+                ],
+            };
+            let budget = MemoryBudget::new(2048);
+            let mut found = Vec::new();
+            log.scan(
+                1,
+                hit_seq,
+                &filter,
+                descending,
+                true,
+                true,
+                Some(&budget),
+                &mut || Ok(()),
+                None,
+                &mut |c, _, _| {
+                    found.push(c.seq);
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            assert_eq!(found, [hit_seq]);
+            assert_eq!(budget.used(), 0);
+        }
+
+        // 3. Multi-run merge across two predicates matches unfiltered order both ways.
+        for descending in [false, true] {
+            let filter = LogFilter {
+                keys: [
+                    None,
+                    None,
+                    Some(vec![
+                        id::iri_key(rdf_type.as_str()),
+                        id::iri_key(other_pred.as_str()),
+                    ]),
+                    None,
+                ],
+            };
+            let mut merged = Vec::new();
+            log.scan(
+                1_195,
+                1_210,
+                &filter,
+                descending,
+                true,
+                true,
+                Some(&MemoryBudget::new(1 << 20)),
+                &mut || Ok(()),
+                None,
+                &mut |c, _, _| {
+                    merged.push(c.seq);
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            let mut expected: Vec<u64> = (1_195..=1_210).collect();
+            if descending {
+                expected.reverse();
+            }
+            assert_eq!(merged, expected, "descending={descending}");
+        }
+
+        // 4. Cooperative polling inside candidate traversal stops at CHECK_STRIDE
+        //    even when no record matches. Key cancellation to the 2nd CandidateCheck
+        //    event (cand_steps == CHECK_STRIDE) rather than a raw poll counter.
+        let filter = LogFilter {
+            keys: [
+                None,
+                Some(vec![id::iri_key("urn:sparse")]),
+                Some(vec![
+                    id::iri_key(rdf_type.as_str()),
+                    id::iri_key(hold_sets.as_str()),
+                ]),
+                None,
+            ],
+        };
+        let candidate_checks = std::rc::Rc::new(Cell::new(0usize));
+        let witness = candidate_checks.clone();
+        let observer = open_tests::Observe::new(move |event| {
+            if event == open_tests::Event::CandidateCheck {
+                witness.set(witness.get() + 1);
+            }
+        });
+        #[cfg(feature = "failpoints")]
+        let (fp_candidate_checks, _fp_reset) = {
+            use std::sync::atomic::AtomicUsize;
+            struct ResetObserver;
+            impl Drop for ResetObserver {
+                fn drop(&mut self) {
+                    set_changelog_read_observer(None);
+                }
+            }
+            let counts = Arc::new(AtomicUsize::new(0));
+            let c = counts.clone();
+            set_changelog_read_observer(Some(Arc::new(move |event| {
+                if event == ChangeLogReadEvent::CandidateCheck {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }
+            })));
+            (counts, ResetObserver)
+        };
+        let mut visited = 0usize;
+        let res = log.scan(
+            1,
+            hit_seq,
+            &filter,
+            false,
+            true,
+            true,
+            Some(&MemoryBudget::new(4096)),
+            &mut || {
+                if candidate_checks.get() >= 2 {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+            None,
+            &mut |_, _, _| {
+                visited += 1;
+                Ok(true)
+            },
+        );
+        drop(observer);
+        #[cfg(feature = "failpoints")]
+        drop(_fp_reset);
+        assert!(matches!(res, Err(Error::Cancelled)), "{res:?}");
+        assert_eq!(
+            candidate_checks.get(),
+            2,
+            "expected cancellation on the 2nd CandidateCheck (cand_steps == CHECK_STRIDE)"
+        );
+        #[cfg(feature = "failpoints")]
+        assert_eq!(
+            fp_candidate_checks.load(Ordering::SeqCst),
+            2,
+            "expected failpoints CandidateCheck observer to observe the 2nd traversal stride"
+        );
+        assert_eq!(visited, 0);
+
+        // Also exercise published_history_changes against the real HistoryQuery wrapper.
+        let q = HistoryQuery {
+            subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+            predicates: vec![rdf_type, hold_sets],
+            from: Some(HistoryBound::Commit(1)),
+            to: Some(HistoryBound::Commit(hit_seq)),
+            ..Default::default()
+        };
+        let res = log.query_with(&q, hit_seq, true, Some(256)).unwrap();
+        assert!(res.changes.is_empty());
+    }
+
+    #[test]
+    fn cold_index_and_record_overlap_memory_budget() {
+        use crate::store::history_query::{HistoryBound, HistoryQuery};
+        use std::fmt::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            change_log_segment_bytes: 768 << 10,
+            ..Default::default()
+        };
+        let store = Store::open(dir.path(), opts).unwrap();
+        store.change_log().unwrap().set_background(false);
+
+        let mut triples = String::new();
+        for i in 0..6_000 {
+            writeln!(&mut triples, "<urn:pad{i}> <urn:p> {i} .").unwrap();
+        }
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {triples} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c1 = store.head_commit().seq;
+
+        let payload = "x".repeat(160 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:coldhit> <urn:p> \"{payload}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c2 = store.head_commit().seq;
+
+        let seal_payload = "s".repeat(512 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:seal> <urn:p> \"{seal_payload}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+
+        let log = store.change_log().unwrap().clone();
+        let (seg0_idx_path, seg0_idx_len) = {
+            let mut inner = log.inner.lock();
+            assert!(inner.segs[0].sealed, "segment 0 must be sealed");
+            assert!(
+                inner.segs[0].first <= c1 && inner.segs[0].last >= c2,
+                "c1={c1} and c2={c2} must share sealed segment 0 ({}..={})",
+                inner.segs[0].first,
+                inner.segs[0].last
+            );
+            inner.cache.clear();
+            let path = inner.segs[0].idx_path().unwrap();
+            let len = path.metadata().unwrap().len();
+            (path, len)
+        };
+        let raw_bytes = std::fs::read(&seg0_idx_path).unwrap();
+        let seg0_decoded_bytes = {
+            let (_, _, ix) = SegIndex::decode(&raw_bytes, log.dataset_id).unwrap();
+            arc_slice_bytes(std::mem::size_of::<SegIndex>())
+                + (ix.recs.len() as u64) * (std::mem::size_of::<RecEntry>() as u64)
+                + (ix.postings.len() as u64) * (std::mem::size_of::<(u64, u32)>() as u64)
+        };
+        let limit = (seg0_idx_len + seg0_decoded_bytes).max(360 << 10) + (24 << 10);
+        assert!(
+            seg0_decoded_bytes + (320 << 10) > limit,
+            "decoded index ({seg0_decoded_bytes}) + record peak (~320 KiB) must exceed limit ({limit})"
+        );
+
+        for no_wait in [true, false] {
+            // 1. Cold index decode alone fits limit, and bounded scans leave the shared cache empty.
+            log.inner.lock().cache.clear();
+            let q_missing = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+                from: Some(HistoryBound::Commit(c1)),
+                to: Some(HistoryBound::Commit(c2)),
+                ..Default::default()
+            };
+            let ok = if no_wait {
+                store.try_published_history_changes(&q_missing, limit)
+            } else {
+                store.published_history_changes(&q_missing, limit)
+            }
+            .unwrap();
+            assert!(ok.changes.is_empty(), "no_wait={no_wait}");
+            assert!(
+                log.inner.lock().cache.is_empty(),
+                "no_wait={no_wait}: bounded cold scan must not insert decoded index into shared cache"
+            );
+
+            // 2. Matching record alone (with warm index loaded by an unbounded scan) fits limit.
+            store.history_changes(&q_missing).unwrap();
+            assert!(!log.inner.lock().cache.is_empty());
+            let q_hit = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:coldhit"))],
+                from: Some(HistoryBound::Commit(c2)),
+                to: Some(HistoryBound::Commit(c2)),
+                ..Default::default()
+            };
+            let ok = if no_wait {
+                store.try_published_history_changes(&q_hit, limit)
+            } else {
+                store.published_history_changes(&q_hit, limit)
+            }
+            .unwrap();
+            assert_eq!(ok.changes.len(), 1, "no_wait={no_wait}");
+
+            // 3. Cold index + matching record live overlap exceeds limit and is refused.
+            log.inner.lock().cache.clear();
+            let res = if no_wait {
+                store.try_published_history_changes(&q_hit, limit)
+            } else {
+                store.published_history_changes(&q_hit, limit)
+            };
+            assert!(
+                matches!(res, Err(Error::BudgetExceeded(_))),
+                "no_wait={no_wait}: expected cold index + record live overlap refusal, got {res:?}"
+            );
+            assert!(
+                log.inner.lock().cache.is_empty(),
+                "no_wait={no_wait}: failed bounded cold scan must leave shared cache empty"
+            );
+        }
+    }
+
+    #[test]
+    fn time_bound_cold_sidecar_memory_budget() {
+        use crate::store::history_query::{HistoryBound, HistoryQuery};
+        use std::fmt::Write as _;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            change_log_segment_bytes: 768 << 10,
+            ..Default::default()
+        };
+        let store = Store::open(dir.path(), opts).unwrap();
+        store.change_log().unwrap().set_background(false);
+
+        let mut triples = String::new();
+        for i in 0..6_000 {
+            writeln!(&mut triples, "<urn:pad{i}> <urn:p> {i} .").unwrap();
+        }
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {triples} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c1 = store.head_commit().seq;
+
+        let payload = "x".repeat(160 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:coldhit> <urn:p> \"{payload}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c2_commit = store.head_commit();
+        let c2 = c2_commit.seq;
+        let c2_ts = c2_commit.timestamp_ms;
+
+        let seal_payload = "s".repeat(512 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:seal> <urn:p> \"{seal_payload}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+
+        let log = store.change_log().unwrap().clone();
+        let (seg0_idx_path, seg0_idx_len) = {
+            let mut inner = log.inner.lock();
+            assert!(inner.segs[0].sealed, "segment 0 must be sealed");
+            assert!(
+                inner.segs[0].first <= c1 && inner.segs[0].last >= c2,
+                "c1={c1} and c2={c2} must share sealed segment 0 ({}..={})",
+                inner.segs[0].first,
+                inner.segs[0].last
+            );
+            inner.cache.clear();
+            let path = inner.segs[0].idx_path().unwrap();
+            let len = path.metadata().unwrap().len();
+            (path, len)
+        };
+        let raw_bytes = std::fs::read(&seg0_idx_path).unwrap();
+        let seg0_decoded_bytes = {
+            let (_, _, ix) = SegIndex::decode(&raw_bytes, log.dataset_id).unwrap();
+            arc_slice_bytes(std::mem::size_of::<SegIndex>())
+                + (ix.recs.len() as u64) * (std::mem::size_of::<RecEntry>() as u64)
+                + (ix.postings.len() as u64) * (std::mem::size_of::<(u64, u32)>() as u64)
+        };
+
+        let q_missing = HistoryQuery {
+            subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+            from: Some(HistoryBound::Time(c2_ts)),
+            to: Some(HistoryBound::Time(c2_ts)),
+            ..Default::default()
+        };
+        let q_hit = HistoryQuery {
+            subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:coldhit"))],
+            from: Some(HistoryBound::Time(c2_ts)),
+            to: Some(HistoryBound::Time(c2_ts)),
+            ..Default::default()
+        };
+
+        // 1. Cap smaller than the cold sidecar refuses before reading raw chunks and leaves cache empty.
+        let tiny_limit = seg0_idx_len / 2;
+        log.inner.lock().cache.clear();
+        let stats = Rc::new(Cell::new((0usize, 0usize)));
+        let witness = stats.clone();
+        let observer = open_tests::Observe::new(move |event| {
+            let (mut chunks, mut decodes) = witness.get();
+            match event {
+                open_tests::Event::IndexReadChunk => chunks += 1,
+                open_tests::Event::IndexRecords => decodes += 1,
+                _ => {}
+            }
+            witness.set((chunks, decodes));
+        });
+        let res = store.published_history_changes(&q_missing, tiny_limit);
+        drop(observer);
+        assert!(
+            matches!(res, Err(Error::BudgetExceeded(_))),
+            "expected cold sidecar refusal under tiny time-bound cap, got {res:?}"
+        );
+        assert_eq!(
+            stats.get(),
+            (0, 0),
+            "sidecar larger than cap must fail before reading chunks or decoding"
+        );
+        assert!(
+            log.inner.lock().cache.is_empty(),
+            "refused time-bound lookup must leave shared cache empty"
+        );
+
+        // 2. Cap fitting raw sidecar length but not raw + decoded refuses before decoding and leaves cache empty.
+        let len_only_limit = seg0_idx_len + 16_384;
+        assert!(seg0_idx_len + seg0_decoded_bytes > len_only_limit);
+        log.inner.lock().cache.clear();
+        let stats = Rc::new(Cell::new((0usize, 0usize)));
+        let witness = stats.clone();
+        let observer = open_tests::Observe::new(move |event| {
+            let (mut chunks, mut decodes) = witness.get();
+            match event {
+                open_tests::Event::IndexReadChunk => chunks += 1,
+                open_tests::Event::IndexRecords => decodes += 1,
+                _ => {}
+            }
+            witness.set((chunks, decodes));
+        });
+        let res = store.published_history_changes(&q_missing, len_only_limit);
+        drop(observer);
+        assert!(
+            matches!(res, Err(Error::BudgetExceeded(_))),
+            "expected raw + decoded refusal under time-bound cap, got {res:?}"
+        );
+        let (chunks, decodes) = stats.get();
+        assert!(chunks > 0, "file length fit cap so raw read should proceed");
+        assert_eq!(
+            decodes, 0,
+            "decoded index must be refused before allocating entries"
+        );
+        assert!(
+            log.inner.lock().cache.is_empty(),
+            "refused time-bound decode must leave shared cache empty"
+        );
+
+        // 3. Cap fitting cold index succeeds for missing subject while leaving shared cache empty.
+        let limit = (seg0_idx_len + seg0_decoded_bytes).max(360 << 10) + (24 << 10);
+        assert!(
+            seg0_decoded_bytes + (320 << 10) > limit,
+            "decoded index ({seg0_decoded_bytes}) + record peak (~320 KiB) must exceed limit ({limit})"
+        );
+        log.inner.lock().cache.clear();
+        let ok = store.published_history_changes(&q_missing, limit).unwrap();
+        assert!(ok.changes.is_empty());
+        assert!(
+            log.inner.lock().cache.is_empty(),
+            "budgeted time-bound lookup and scan must leave shared cache empty"
+        );
+
+        // 4. Cold index + matching record overlap is still refused under time bounds because
+        //    timestamp resolution did not populate the shared cache.
+        log.inner.lock().cache.clear();
+        let res = store.published_history_changes(&q_hit, limit);
+        assert!(
+            matches!(res, Err(Error::BudgetExceeded(_))),
+            "expected cold index + record overlap refusal under time bounds, got {res:?}"
+        );
+        assert!(
+            log.inner.lock().cache.is_empty(),
+            "failed time-bound overlap scan must leave shared cache empty"
+        );
+
+        // 5. Once warmed by an unbounded scan, the same time-bound query fits `limit`.
+        store.history_changes(&q_missing).unwrap();
+        assert!(!log.inner.lock().cache.is_empty());
+        let ok = store.published_history_changes(&q_hit, limit).unwrap();
+        assert_eq!(ok.changes.len(), 1);
+    }
+
+    #[test]
+    fn hole_normalization_polls_and_checks_before_return() {
+        let store = Store::in_memory(StoreOptions {
+            change_log_segment_bytes: 64 << 20,
+            ..Default::default()
+        });
+        let log = store.change_log().unwrap().clone();
+        log.set_background(false);
+
+        let default_g: Arc<[u8]> = Arc::from(&[][..]);
+        let pred_key: Arc<[u8]> = Arc::from(id::iri_key("urn:p"));
+        let val_key: Arc<[u8]> = Arc::from(id::iri_key("urn:v"));
+
+        // 5,000 alternating Changes/Summary commits -> 2,500 non-adjacent Bulk holes
+        // (1,250 swaps in descending reverse, exceeding CHECK_STRIDE = 1,024),
+        // followed by two adjacent Bulk commits and a trailing Gap commit.
+        let mut seq = 0u64;
+        {
+            let mut inner = log.inner.lock();
+            for i in 0..2_500u64 {
+                seq += 1;
+                let s: Arc<[u8]> = Arc::from(id::iri_key(&format!("urn:s:{i}")));
+                let q: QuadKey = [default_g.clone(), s, pred_key.clone(), val_key.clone()];
+                let c = Arc::new(ChangeCommit {
+                    seq,
+                    timestamp_ms: seq as i64,
+                    kind: CommitKind::Update,
+                    bulk: false,
+                    inserted: 1,
+                    deleted: 0,
+                    author: None,
+                    message: None,
+                });
+                log.append(&mut inner, Record::Changes(c, vec![(true, q)]))
+                    .unwrap();
+                seq += 1;
+                let summary = Arc::new(ChangeCommit {
+                    seq,
+                    timestamp_ms: seq as i64,
+                    kind: CommitKind::Update,
+                    bulk: true,
+                    inserted: 1,
+                    deleted: 0,
+                    author: None,
+                    message: None,
+                });
+                log.append(&mut inner, Record::Summary(summary)).unwrap();
+            }
+            // Adjacent bulk summary merges with seq 5,000.
+            seq += 1;
+            let adjacent_bulk = Arc::new(ChangeCommit {
+                seq,
+                timestamp_ms: seq as i64,
+                kind: CommitKind::Update,
+                bulk: true,
+                inserted: 1,
+                deleted: 0,
+                author: None,
+                message: None,
+            });
+            log.append(&mut inner, Record::Summary(adjacent_bulk))
+                .unwrap();
+            // Trailing gap record merges with to > newest gap.
+            let gap_from = seq + 1;
+            seq += 3;
+            log.append(
+                &mut inner,
+                Record::Gap {
+                    from: gap_from,
+                    through: seq,
+                },
+            )
+            .unwrap();
+        }
+        let head = seq;
+        let filter = LogFilter {
+            keys: [None, Some(vec![id::iri_key("urn:missing")]), None, None],
+        };
+
+        // 1. Ascending and descending produce identical normalized holes including merges.
+        let asc = log
+            .scan(
+                1,
+                head + 5,
+                &filter,
+                false,
+                true,
+                true,
+                Some(&MemoryBudget::new(1 << 20)),
+                &mut || Ok(()),
+                None,
+                &mut |_, _, _| Ok(true),
+            )
+            .unwrap();
+        let desc = log
+            .scan(
+                1,
+                head + 5,
+                &filter,
+                true,
+                true,
+                true,
+                Some(&MemoryBudget::new(1 << 20)),
+                &mut || Ok(()),
+                None,
+                &mut |_, _, _| Ok(true),
+            )
+            .unwrap();
+        assert_eq!(asc, desc);
+        assert_eq!(asc.len(), 2_501);
+        assert_eq!(
+            asc[2_499],
+            Unrecorded {
+                from: 5_000,
+                to: 5_001,
+                reason: UnrecordedReason::Bulk,
+            }
+        );
+        assert_eq!(
+            asc[2_500],
+            Unrecorded {
+                from: 5_002,
+                to: head + 5,
+                reason: UnrecordedReason::Gap,
+            }
+        );
+
+        // 2. Cancellation and deadline expiration right after hole collection completes
+        //    must stop before returning from scan (both ascending and descending).
+        for descending in [false, true] {
+            for use_deadline in [false, true] {
+                let mut polls = 0usize;
+                let mut armed = false;
+                let mut deadline: Option<Instant> = None;
+                let res = log.scan(
+                    1,
+                    head,
+                    &filter,
+                    descending,
+                    true,
+                    true,
+                    Some(&MemoryBudget::new(1 << 20)),
+                    &mut || {
+                        polls += 1;
+                        if let Some(limit) = deadline {
+                            if Instant::now() >= limit {
+                                return Err(Error::Timeout);
+                            }
+                        } else if armed {
+                            return Err(Error::Cancelled);
+                        }
+                        // Polls: 1=entry, 2=post-lock, 3=seg, 4..7=hole@1024..4096, 8=role0.
+                        // Trigger stop right after hole collection finishes on role0.
+                        if polls == 8 {
+                            if use_deadline {
+                                let d = Instant::now() + Duration::from_millis(2);
+                                while Instant::now() < d {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                deadline = Some(d);
+                            } else {
+                                armed = true;
+                            }
+                        }
+                        Ok(())
+                    },
+                    None,
+                    &mut |_, _, _| Ok(true),
+                );
+                if use_deadline {
+                    assert!(
+                        matches!(res, Err(Error::Timeout)),
+                        "descending={descending}: expected Timeout before return, got {res:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(res, Err(Error::Cancelled)),
+                        "descending={descending}: expected Cancelled before return, got {res:?}"
+                    );
+                }
+            }
+        }
+
+        // 3. End-to-end scan poll accounting distinguishes reverse stride and final pre-return checks.
+        //    Ascending polls: 1..8 up to role0, 9=finish entry, 10=finish final.
+        //    Descending polls: 1..8 up to role0, 9=finish entry, 10=reverse@CHECK_STRIDE, 11=finish final.
+        let mut asc_total_polls = 0usize;
+        log.scan(
+            1,
+            head,
+            &filter,
+            false,
+            true,
+            true,
+            Some(&MemoryBudget::new(1 << 20)),
+            &mut || {
+                asc_total_polls += 1;
+                Ok(())
+            },
+            None,
+            &mut |_, _, _| Ok(true),
+        )
+        .unwrap();
+        let mut desc_total_polls = 0usize;
+        log.scan(
+            1,
+            head,
+            &filter,
+            true,
+            true,
+            true,
+            Some(&MemoryBudget::new(1 << 20)),
+            &mut || {
+                desc_total_polls += 1;
+                Ok(())
+            },
+            None,
+            &mut |_, _, _| Ok(true),
+        )
+        .unwrap();
+        assert_eq!(asc_total_polls, 10);
+        assert_eq!(desc_total_polls, 11);
+
+        // Letting entry and reverse stride checks pass still cancels on the final pre-return check.
+        for (descending, stop_at) in [
+            (false, asc_total_polls),
+            (true, desc_total_polls - 1),
+            (true, desc_total_polls),
+        ] {
+            let mut polls = 0usize;
+            let res = log.scan(
+                1,
+                head,
+                &filter,
+                descending,
+                true,
+                true,
+                Some(&MemoryBudget::new(1 << 20)),
+                &mut || {
+                    polls += 1;
+                    if polls >= stop_at {
+                        Err(Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                },
+                None,
+                &mut |_, _, _| Ok(true),
+            );
+            assert!(
+                matches!(res, Err(Error::Cancelled)),
+                "descending={descending} stop_at={stop_at}: {res:?}"
+            );
+            assert_eq!(polls, stop_at);
+        }
+
+        // 4. Directly exercise `reverse_holes_checked` with >1 stride of work (2 stride polls)
+        //    and ordered `HoleCollector::finish` entry, mid-reverse, and final pre-return checks.
+        let rev_len = 2 * (2 * CHECK_STRIDE + 50);
+        let desc_holes: Vec<Unrecorded> = (0..rev_len as u64)
+            .rev()
+            .map(|idx| Unrecorded {
+                from: idx * 2 + 1,
+                to: idx * 2 + 1,
+                reason: UnrecordedReason::Bulk,
+            })
+            .collect();
+        let asc_holes: Vec<Unrecorded> = desc_holes.iter().copied().rev().collect();
+
+        let mut rev_ok = desc_holes.clone();
+        let mut rev_polls = 0usize;
+        reverse_holes_checked(&mut rev_ok, true, &mut || {
+            rev_polls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rev_ok, asc_holes);
+        assert_eq!(
+            rev_polls, 2,
+            "expected two reverse stride polls for {rev_len} holes"
+        );
+
+        for (stop_poll, checked_idx) in [(1usize, CHECK_STRIDE), (2usize, 2 * CHECK_STRIDE)] {
+            let mut partial = desc_holes.clone();
+            let mut polls = 0usize;
+            let err = reverse_holes_checked(&mut partial, true, &mut || {
+                polls += 1;
+                if polls >= stop_poll {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(matches!(err, Err(Error::Cancelled)), "{err:?}");
+            assert_eq!(polls, stop_poll);
+            assert_eq!(
+                partial[checked_idx - 1],
+                asc_holes[checked_idx - 1],
+                "swaps before poll {stop_poll} must have run"
+            );
+            assert_eq!(
+                partial[checked_idx], desc_holes[checked_idx],
+                "cancellation at poll {stop_poll} must stop before swap {checked_idx}"
+            );
+        }
+
+        let mut desc_collector = HoleCollector::new(None, true);
+        for &h in &desc_holes {
+            desc_collector.push(h).unwrap();
+        }
+        assert!(desc_collector.ordered);
+        let mut desc_finish_polls = 0usize;
+        let desc_got = desc_collector
+            .finish(true, &mut || {
+                desc_finish_polls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(desc_got, asc_holes);
+        assert_eq!(
+            desc_finish_polls,
+            1 + rev_polls + 1,
+            "ordered descending finish must poll entry + reverse strides + final"
+        );
+
+        for stop_at in [1usize, 2, 3, desc_finish_polls] {
+            let mut c = HoleCollector::new(None, true);
+            for &h in &desc_holes {
+                c.push(h).unwrap();
+            }
+            let mut polls = 0usize;
+            let err = c.finish(true, &mut || {
+                polls += 1;
+                if polls >= stop_at {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(
+                matches!(err, Err(Error::Cancelled)),
+                "descending finish stop_at={stop_at}: {err:?}"
+            );
+            assert_eq!(polls, stop_at);
+        }
+
+        let mut asc_collector = HoleCollector::new(None, false);
+        for &h in &asc_holes {
+            asc_collector.push(h).unwrap();
+        }
+        assert!(asc_collector.ordered);
+        let mut asc_finish_polls = 0usize;
+        let asc_got = asc_collector
+            .finish(true, &mut || {
+                asc_finish_polls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(asc_got, asc_holes);
+        assert_eq!(
+            asc_finish_polls, 2,
+            "ordered ascending finish must poll entry and final pre-return checks"
+        );
+        for stop_at in [1usize, 2] {
+            let mut c = HoleCollector::new(None, false);
+            for &h in &asc_holes {
+                c.push(h).unwrap();
+            }
+            let mut polls = 0usize;
+            let err = c.finish(true, &mut || {
+                polls += 1;
+                if polls >= stop_at {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(
+                matches!(err, Err(Error::Cancelled)),
+                "ascending finish stop_at={stop_at}: {err:?}"
+            );
+            assert_eq!(polls, stop_at);
+        }
+
+        // 5. Directly exercise `sort_holes_checked` and `dedup_holes_checked` with >1 stride of work,
+        //    and verify unordered `HoleCollector::finish` polls entry + sort + dedup + final.
+        let mut raw = Vec::new();
+        for i in (0..2_500u64).rev() {
+            raw.push(Unrecorded {
+                from: i * 3 + 1,
+                to: i * 3 + 1,
+                reason: UnrecordedReason::Bulk,
+            });
+            if i % 5 == 0 {
+                raw.push(Unrecorded {
+                    from: i * 3 + 2,
+                    to: i * 3 + 2,
+                    reason: UnrecordedReason::Bulk,
+                });
+            }
+        }
+        assert_eq!(raw.len(), 3_000);
+        let mut expected_sorted = raw.clone();
+        expected_sorted.sort_unstable_by_key(|h| (h.from, h.reason as u8, h.to));
+        let mut expected = expected_sorted.clone();
+        expected.dedup_by(|b, a| {
+            if a.reason == b.reason && b.from <= a.to + 1 {
+                a.to = a.to.max(b.to);
+                true
+            } else {
+                false
+            }
+        });
+
+        let mut sorted = raw.clone();
+        let mut sort_polls = 0usize;
+        sort_holes_checked(&mut sorted, true, &mut || {
+            sort_polls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(sorted, expected_sorted);
+        assert!(
+            sort_polls > 1,
+            "expected >1 heapsort stride poll, got {sort_polls}"
+        );
+        let mut sort_cancel_buf = raw.clone();
+        let mut sort_cancel_polls = 0usize;
+        let sort_err = sort_holes_checked(&mut sort_cancel_buf, true, &mut || {
+            sort_cancel_polls += 1;
+            if sort_cancel_polls >= 2 {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(sort_err, Err(Error::Cancelled)), "{sort_err:?}");
+        assert_eq!(sort_cancel_polls, 2);
+
+        let mut deduped = expected_sorted.clone();
+        let mut dedup_polls = 0usize;
+        dedup_holes_checked(&mut deduped, true, &mut || {
+            dedup_polls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(deduped, expected);
+        assert_eq!(
+            dedup_polls,
+            2,
+            "expected two dedup stride polls for {} sorted holes",
+            expected_sorted.len()
+        );
+        for stop_poll in [1usize, 2] {
+            let mut partial = expected_sorted.clone();
+            let mut polls = 0usize;
+            let err = dedup_holes_checked(&mut partial, true, &mut || {
+                polls += 1;
+                if polls >= stop_poll {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(matches!(err, Err(Error::Cancelled)), "{err:?}");
+            assert_eq!(polls, stop_poll);
+            assert_eq!(
+                partial.len(),
+                expected_sorted.len(),
+                "mid-dedup cancellation at poll {stop_poll} must stop before truncate"
+            );
+        }
+
+        let mut collector = HoleCollector::new(None, false);
+        for &h in &raw {
+            collector.push(h).unwrap();
+        }
+        assert!(!collector.ordered);
+        let mut norm_polls = 0usize;
+        let got = collector
+            .finish(true, &mut || {
+                norm_polls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(got, expected);
+        assert_eq!(
+            norm_polls,
+            1 + sort_polls + dedup_polls + 1,
+            "unordered finish must poll entry + sort strides + dedup strides + final"
+        );
+
+        for stop_at in [
+            1usize,
+            1 + 2,
+            1 + sort_polls + 1,
+            1 + sort_polls + dedup_polls,
+            norm_polls,
+        ] {
+            let mut cancel_collector = HoleCollector::new(None, false);
+            for &h in &raw {
+                cancel_collector.push(h).unwrap();
+            }
+            let mut cancel_polls = 0usize;
+            let cancelled = cancel_collector.finish(true, &mut || {
+                cancel_polls += 1;
+                if cancel_polls >= stop_at {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(
+                matches!(cancelled, Err(Error::Cancelled)),
+                "unordered finish stop_at={stop_at}: {cancelled:?}"
+            );
+            assert_eq!(cancel_polls, stop_at);
         }
     }
 }

@@ -385,3 +385,95 @@ fn single_identities_charge_their_first_allocations() {
     drop(held);
     assert!(preparation.reserve(LIMIT - 2048).is_ok());
 }
+
+#[test]
+fn plan_held_collects_local_and_cross_dataset_stored_facts_sorted_by_dataset() {
+    use crate::evidence::{EvidenceRefInput, EvidenceRefTarget, GraphIdentity, StoredFactRef};
+    let ds_a = Uuid::from_u128(10);
+    let ds_b = Uuid::from_u128(20);
+    let branch_b = Uuid::from_u128(21);
+    let mut batch = input("o1", "urn:o");
+    batch.references = vec![
+        EvidenceRefInput {
+            version: RecordVersion::V1,
+            key: RecordKey::new("f_b2").unwrap(),
+            occurrence_key: RecordKey::new("f_b2").unwrap(),
+            target: EvidenceRefTarget::StoredFact(StoredFactRef {
+                dataset: ds_b,
+                branch: branch_b,
+                commit: 9,
+                graph: GraphIdentity::Default,
+                expected: Triple::new(iri("urn:s"), iri("urn:p"), iri("urn:o1")),
+                anchor: None,
+            }),
+        },
+        EvidenceRefInput {
+            version: RecordVersion::V1,
+            key: RecordKey::new("f_local").unwrap(),
+            occurrence_key: RecordKey::new("f_local").unwrap(),
+            target: EvidenceRefTarget::StoredFact(StoredFactRef {
+                dataset: DATASET,
+                branch: DATASET,
+                commit: 3,
+                graph: GraphIdentity::Default,
+                expected: Triple::new(iri("urn:s"), iri("urn:p"), iri("urn:o2")),
+                anchor: None,
+            }),
+        },
+        EvidenceRefInput {
+            version: RecordVersion::V1,
+            key: RecordKey::new("f_a").unwrap(),
+            occurrence_key: RecordKey::new("f_a").unwrap(),
+            target: EvidenceRefTarget::StoredFact(StoredFactRef {
+                dataset: ds_a,
+                branch: ds_a,
+                commit: 5,
+                graph: GraphIdentity::Default,
+                expected: Triple::new(iri("urn:s"), iri("urn:p"), iri("urn:o3")),
+                anchor: None,
+            }),
+        },
+        // duplicate of f_a's commit
+        EvidenceRefInput {
+            version: RecordVersion::V1,
+            key: RecordKey::new("f_a_dup").unwrap(),
+            occurrence_key: RecordKey::new("f_a_dup").unwrap(),
+            target: EvidenceRefTarget::StoredFact(StoredFactRef {
+                dataset: ds_a,
+                branch: ds_a,
+                commit: 5,
+                graph: GraphIdentity::Default,
+                expected: Triple::new(iri("urn:s"), iri("urn:p"), iri("urn:o4")),
+                anchor: None,
+            }),
+        },
+    ];
+    let p = plan_of(&batch, &settings(&["urn:s"], &["urn:c"]), None).unwrap();
+    let local = HeldCommit {
+        branch: DATASET,
+        commit: 3,
+    };
+    let mut expected = [
+        DatasetHeldCommit {
+            dataset: ds_a,
+            commit: HeldCommit {
+                branch: ds_a,
+                commit: 5,
+            },
+        },
+        DatasetHeldCommit {
+            dataset: ds_b,
+            commit: HeldCommit {
+                branch: branch_b,
+                commit: 9,
+            },
+        },
+        DatasetHeldCommit {
+            dataset: DATASET,
+            commit: local,
+        },
+    ];
+    expected.sort();
+    assert_eq!(p.held_in(), expected);
+    assert_eq!(p.held, [local]);
+}

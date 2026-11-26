@@ -161,6 +161,11 @@ mod tests {
             CRASH_AFTER.set(stage);
             assert!(cat.rename("before", "after").is_err());
             CRASH_AFTER.set(0);
+            if stage < 3 {
+                assert_eq!(cat.closed(), ["before"]);
+            } else {
+                assert!(cat.closed().is_empty());
+            }
             drop(cat);
             let cat = Catalog::open(dir.path(), Default::default()).unwrap();
             let (kept, absent) = if stage == 3 {
