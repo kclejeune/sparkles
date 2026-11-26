@@ -246,6 +246,19 @@ pub const PATTERNS: FileKind = FileKind {
     reads: &[1],
 };
 
+/// A generation's reifier proposition-term index (roadmap item 766). Derived from the
+/// generation's POS permutation and vocabulary: a version this build does not read is
+/// left unused, claim lookups fall back to scanning, and the next full compaction
+/// writes the current version.
+pub const REIFIERS: FileKind = FileKind {
+    id: "reifiers",
+    files: "gen-*/reifiers.bin",
+    marker: "the u32 after the `SPKREIF\\0` magic; another version is not used and is rebuilt at the next full compaction",
+    class: Class::Derived,
+    writes: crate::reifiers::VERSION,
+    reads: &[1],
+};
+
 /// The planner's correlation statistics of a generation: the remainders of its subject
 /// sets and its node sets (see [`crate::builder::correlations`]). They are the member
 /// `correlations` of `stats.json`, whose version is read before the rest of it. A version
@@ -681,6 +694,7 @@ pub const KINDS: &[&FileKind] = &[
     &VOCAB_FSST,
     &NUMERIC_COLUMN,
     &PATTERNS,
+    &REIFIERS,
     &PLANNER_STATISTICS,
     &DELTA_VOCAB,
     &WAL,
@@ -1344,6 +1358,7 @@ mod tests {
         assert!(INDEX.reads(crate::builder::FORMAT_VERSION));
         assert_eq!(DELTA_VOCAB.writes, crate::vocab::delta::VERSION);
         assert_eq!(PATTERNS.writes, crate::patterns::VERSION);
+        assert_eq!(REIFIERS.writes, crate::reifiers::VERSION);
         assert_eq!(
             PLANNER_STATISTICS.writes,
             crate::builder::correlations::VERSION

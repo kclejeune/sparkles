@@ -480,6 +480,74 @@ fn a_newer_pattern_file_is_not_used() {
     same_predicate_listing(&s.snapshot());
 }
 
+/// A reifier index of a newer version is not used: the database opens, claim lookups fall
+/// back to scanning, `check` warns, and the next full compaction writes the current version.
+#[test]
+fn a_newer_reifier_file_is_not_used() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("db");
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let reifies = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
+    sparkles_core::sparql::update::update(
+        &s,
+        &format!("INSERT DATA {{ GRAPH <urn:g> {{ <urn:c1> <{reifies}> <<( <urn:e> <urn:p> <urn:o> )>> }} }}"),
+        &sparkles_core::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    s.compact().unwrap();
+    assert!(s.snapshot().generation.reifiers.file.is_some());
+    let gen_dir = s.snapshot().generation.dir.clone().unwrap();
+    drop(s);
+
+    // Full check passes on a valid reifier index
+    let r = check(&root, &CheckOptions { quick: false }).unwrap();
+    let c = r.get("reifiers").unwrap();
+    assert_eq!(c.status, Status::Ok, "{}", r.to_text());
+
+    // Rewrite version to 99: check warns, open leaves it unused and falls back cleanly
+    let path = gen_dir.join(sparkles_core::reifiers::FILE);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[8..12].copy_from_slice(&99u32.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    let r = check(&root, &CheckOptions { quick: false }).unwrap();
+    let c = r.get("reifiers").unwrap();
+    assert_eq!(c.status, Status::Warning, "{}", r.to_text());
+    assert!(r.to_text().contains("version 99"), "{}", r.to_text());
+
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let snap = s.snapshot();
+    assert!(snap.generation.reifiers.file.is_none());
+    assert!(!snap.generation.reifiers.is_indexed());
+    assert!(
+        snap.generation
+            .reifiers
+            .missing
+            .as_deref()
+            .unwrap()
+            .contains("version 99")
+    );
+    let prep =
+        sparkles_core::access::Preparation::new(sparkles_core::task::Control::none(), 16 << 20)
+            .unwrap();
+    let mut reads = sparkles_core::evidence::write::Reads::new(&prep, &snap);
+    let mut held = prep.reserve(0).unwrap();
+    let wanted: std::collections::BTreeSet<String> = ["urn:e".to_string()].into();
+    let (rows, more) = reads
+        .reifiers_about(reifies, "urn:g", &wanted, 100, &mut held)
+        .unwrap();
+    assert!(!more);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].as_str(), "urn:c1");
+    drop(reads);
+    drop(held);
+    drop(snap);
+
+    // Next full compaction rebuilds version 1
+    s.compact().unwrap();
+    assert!(s.snapshot().generation.reifiers.file.is_some());
+    assert!(s.snapshot().generation.reifiers.is_indexed());
+}
+
 // ---------------------------------------------------------- refused datasets ------
 
 /// A closed database whose `dataset.json` another release of this format wrote, without

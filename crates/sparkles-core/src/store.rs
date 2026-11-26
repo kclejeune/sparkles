@@ -172,6 +172,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+/// Sentinel stored in [`Generation::rdf_reifies`] for cold-opened generations so
+/// `open_base_controlled` avoids touching the base vocabulary until WAL replay
+/// encounters a triple-term quad.
+pub(crate) const RDF_REIFIES_UNRESOLVED: u64 = u64::MAX;
+
 /// Immutable base index generation.
 pub struct Generation {
     /// unique within the process: two openings of one directory differ
@@ -197,6 +202,10 @@ pub struct Generation {
     pub charsets: std::sync::OnceLock<crate::sparql::charsets::CharIndex>,
     /// the predicate patterns of the base index (see [`crate::patterns`])
     pub patterns: crate::patterns::Loaded,
+    /// the reifier proposition-term index of the base index (see [`crate::reifiers`])
+    pub reifiers: crate::reifiers::Loaded,
+    /// cached id of `rdf:reifies` in this generation's vocab or delta vocab (`Id::UNDEF` when absent)
+    pub(crate) rdf_reifies: AtomicU64,
     /// The ids of the base vocabulary's literals that `sparkles-reasoner`'s diagnostics
     /// found ill-typed for their own datatype, in id order, and whether the list is
     /// complete. The diagnostics fill it on first use and bound its length, and it lives
@@ -229,6 +238,8 @@ impl Generation {
             counts: Default::default(),
             charsets: Default::default(),
             patterns: Default::default(),
+            reifiers: crate::reifiers::Loaded::empty(),
+            rdf_reifies: AtomicU64::new(Id::UNDEF.0),
             ill_typed_literals: Mutex::new(None),
             wal_index: Mutex::new(None),
             link: None,
@@ -238,6 +249,17 @@ impl Generation {
 
     fn memory_branch(base: &Arc<Generation>, vocab_len: u64) -> Generation {
         let dvocab = base.dvocab.fork_memory(vocab_len);
+        let raw = base.rdf_reifies.load(Ordering::Acquire);
+        let rdf_reifies = if raw == RDF_REIFIES_UNRESOLVED {
+            RDF_REIFIES_UNRESOLVED
+        } else {
+            let base_reifies = Id(raw);
+            match base_reifies.tag() {
+                Tag::Vocab => base_reifies.0,
+                Tag::Delta if base_reifies.payload() < vocab_len => base_reifies.0,
+                _ => Id::UNDEF.0,
+            }
+        };
         Generation {
             uid: crate::index::next_uid(),
             name: "mem".into(),
@@ -254,6 +276,8 @@ impl Generation {
             counts: Default::default(),
             charsets: Default::default(),
             patterns: base.patterns.clone(),
+            reifiers: base.reifiers.clone(),
+            rdf_reifies: AtomicU64::new(rdf_reifies),
             ill_typed_literals: Mutex::new(None),
             wal_index: Mutex::new(None),
             link: None,
@@ -298,14 +322,22 @@ impl Generation {
             tracing::warn!(target: "sparkles::store", "generation {name}: {why}");
         }
         let patterns = crate::patterns::Loaded::open(dir, meta.patterns.as_ref());
+        let reifiers = crate::reifiers::Loaded::open(dir, meta.reifiers.as_ref(), meta.quads);
+        let vocab = Arc::new(Vocab::open_codec(
+            dir,
+            meta.has_feature(crate::builder::FEATURE_FSST_VOCAB),
+        )?);
+        let rdf_reifies = vocab
+            .find(crate::reifiers::RDF_REIFIES_KEY)
+            .ok()
+            .map(Id::vocab)
+            .or_else(|| dvocab.find(crate::reifiers::RDF_REIFIES_KEY).map(Id::delta))
+            .unwrap_or(Id::UNDEF);
         Ok(Generation {
             uid: crate::index::next_uid(),
             name: name.to_string(),
             dir: Some(dir.to_path_buf()),
-            vocab: Arc::new(Vocab::open_codec(
-                dir,
-                meta.has_feature(crate::builder::FEATURE_FSST_VOCAB),
-            )?),
+            vocab,
             perms: Perm::ALL
                 .iter()
                 .map(|&p| PermIndex::open(dir, p))
@@ -320,11 +352,86 @@ impl Generation {
             counts: Default::default(),
             charsets: Default::default(),
             patterns,
+            reifiers,
+            rdf_reifies: AtomicU64::new(rdf_reifies.0),
             ill_typed_literals: Mutex::new(None),
             wal_index: Mutex::new(None),
             link: None,
             cold_bytes: 0,
         })
+    }
+
+    /// When `pred` is `rdf:reifies` and `obj` is a stored triple term, return the distinct
+    /// 64-bit hashes of its IRI subject and IRI object.
+    #[inline]
+    pub(crate) fn is_rdf_reifies_triple(
+        &self,
+        pred: Id,
+        obj: Id,
+    ) -> Option<(Option<u64>, Option<u64>)> {
+        let cached = self.rdf_reifies.load(Ordering::Acquire);
+        if cached != RDF_REIFIES_UNRESOLVED {
+            if cached == Id::UNDEF.0 || pred.0 != cached {
+                return None;
+            }
+            return self.triple_term_hashes(obj);
+        }
+        // Cold-opened generation: avoid touching vocab during cold open; resolve only
+        // when a WAL-replayed quad actually carries a triple-term object.
+        let hashes = self.triple_term_hashes(obj)?;
+        let matches = match pred.tag() {
+            Tag::Vocab => self
+                .vocab
+                .get_with_checked(
+                    pred.payload(),
+                    |_| Ok::<(), ()>(()),
+                    |key| key == crate::reifiers::RDF_REIFIES_KEY,
+                )
+                .ok()
+                .flatten()
+                .unwrap_or(false),
+            Tag::Delta => self
+                .dvocab
+                .with(|d| d.get(pred.payload()) == Some(crate::reifiers::RDF_REIFIES_KEY)),
+            _ => false,
+        };
+        if matches {
+            self.rdf_reifies.store(pred.0, Ordering::Release);
+            Some(hashes)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub(crate) fn intern_delta_key(&self, key: &[u8]) -> Result<Id> {
+        let id = Id::delta(self.dvocab.insert(key)?);
+        if key == crate::reifiers::RDF_REIFIES_KEY {
+            self.rdf_reifies.store(id.0, Ordering::Release);
+        }
+        Ok(id)
+    }
+
+    /// Extract the distinct 64-bit hashes of the IRI subject and IRI object of a stored
+    /// triple-term id, returning `None` when `id` is not a triple term.
+    pub(crate) fn triple_term_hashes(&self, id: Id) -> Option<(Option<u64>, Option<u64>)> {
+        match id.tag() {
+            Tag::Vocab if self.vocab.is_triple(id.payload()) => self
+                .vocab
+                .get_with_checked(
+                    id.payload(),
+                    |_| Ok::<(), ()>(()),
+                    crate::reifiers::triple_key_term_hashes,
+                )
+                .ok()
+                .flatten()
+                .flatten(),
+            Tag::Delta => self.dvocab.with(|d| {
+                d.get(id.payload())
+                    .and_then(crate::reifiers::triple_key_term_hashes)
+            }),
+            _ => None,
+        }
     }
 
     #[inline]
@@ -333,7 +440,9 @@ impl Generation {
     }
 
     pub fn disk_bytes(&self) -> u64 {
-        self.vocab.disk_bytes() + self.perms.iter().map(|p| p.disk_bytes()).sum::<u64>()
+        self.vocab.disk_bytes()
+            + self.perms.iter().map(|p| p.disk_bytes()).sum::<u64>()
+            + self.reifiers.disk_bytes()
     }
 }
 
@@ -342,6 +451,8 @@ impl Generation {
 pub struct Delta {
     pub ins: [KeySet; 7],
     pub del: [KeySet; 7],
+    /// Inserted `rdf:reifies` triple-term quads indexed as `[graph, term_hash, reifier, triple_term]`.
+    pub reifiers_ins: KeySet,
     /// the planner's statistics of the inserted quads, by predicate, kept up to date by
     /// each write ([`Delta::insert_quad`], [`Delta::remove_inserted`])
     predicates: imbl::OrdMap<u64, DeltaPredicate>,
@@ -375,8 +486,8 @@ impl Delta {
         self.ins[perm.index()].intersects([a, b, 0, 0]..=[a, b, u64::MAX, u64::MAX])
     }
 
-    /// Add `q`, which is not in the base, to the inserted quads.
-    fn insert_quad(&mut self, q: &[Id; 4]) {
+    /// Add `q`, which is not in the base, to the inserted quads. Returns whether `q` was new.
+    fn insert_quad(&mut self, q: &[Id; 4]) -> bool {
         // whether the (predicate, subject) and (predicate, object) pairs are new, read
         // off the keys next to the quad's in PSO and POS
         let (mut new_s, mut new_o, mut added) = (false, false, false);
@@ -403,6 +514,7 @@ impl Delta {
             e.distinct_subjects += new_s as u64;
             e.distinct_objects += new_o as u64;
         }
+        added
     }
 
     /// The bytes of key-set nodes this delta alone owns, and their number: what writes
@@ -413,7 +525,12 @@ impl Delta {
         mut check: impl FnMut() -> Result<()>,
     ) -> Result<(u64, u64)> {
         let (mut bytes, mut nodes) = (0u64, 0u64);
-        for set in self.ins.iter().chain(&self.del) {
+        for set in self
+            .ins
+            .iter()
+            .chain(&self.del)
+            .chain(std::iter::once(&self.reifiers_ins))
+        {
             let (b, n) = set.unshared_bytes(&mut check)?;
             bytes = bytes.saturating_add(b);
             nodes = nodes.saturating_add(n);
@@ -446,8 +563,8 @@ impl Delta {
         self.forget_with(p, n, subjects, objects, check)
     }
 
-    /// Take `q`, which is not in the base, out of the inserted quads.
-    pub(crate) fn remove_inserted(&mut self, q: &[Id; 4]) {
+    /// Take `q`, which is not in the base, out of the inserted quads. Returns whether `q` was present.
+    pub(crate) fn remove_inserted(&mut self, q: &[Id; 4]) -> bool {
         let mut removed = false;
         for perm in Perm::ALL {
             removed |= self.ins[perm.index()].remove(&perm.to_key(q));
@@ -456,6 +573,7 @@ impl Delta {
             let (s, p, o) = (q[0].0, q[1].0, q[2].0);
             self.forget(p, 1, &[s], &[o]);
         }
+        removed
     }
 
     /// Lower the statistics of predicate `p` by `n` removed quads, and by those of the
@@ -1521,13 +1639,13 @@ impl Snapshot {
                 continue;
             }
             if delta.del[spo].contains(&k) {
-                apply(&mut delta, q, true, true);
+                apply(&self.generation, &mut delta, q, true, true);
                 continue;
             }
             if !absent && self.perm(Perm::Spo).contains(&self.cache, &k)? {
                 continue;
             }
-            apply(&mut delta, q, true, false);
+            apply(&self.generation, &mut delta, q, true, false);
         }
         Ok(Snapshot {
             delta,
@@ -7039,13 +7157,31 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
 }
 
 /// Apply an insert/delete to a delta, preserving the invariants
-/// `ins ∩ base = ∅` and `del ⊆ base`.
-fn apply(delta: &mut Delta, q: &[Id; 4], insert: bool, in_base: bool) {
+/// `ins ∩ base = ∅` and `del ⊆ base`, and maintaining `delta.reifiers_ins` for
+/// inserted `rdf:reifies` triple-term quads.
+fn apply(generation: &Generation, delta: &mut Delta, q: &[Id; 4], insert: bool, in_base: bool) {
     // The invariants above determine the only set this operation can change, so the
     // opposite set is left alone. The inserted quads' writes keep their statistics.
     match (insert, in_base) {
-        (true, false) => delta.insert_quad(q),
-        (false, false) => delta.remove_inserted(q),
+        (true, false) => {
+            if delta.insert_quad(q)
+                && let Some((hs, ho)) = generation.is_rdf_reifies_triple(q[1], q[2])
+            {
+                for h in [hs, ho].into_iter().flatten() {
+                    delta.reifiers_ins.insert([q[3].0, h, q[0].0, q[2].0]);
+                }
+            }
+        }
+        (false, false) => {
+            if delta.remove_inserted(q)
+                && !delta.reifiers_ins.is_empty()
+                && let Some((hs, ho)) = generation.is_rdf_reifies_triple(q[1], q[2])
+            {
+                for h in [hs, ho].into_iter().flatten() {
+                    delta.reifiers_ins.remove(&[q[3].0, h, q[0].0, q[2].0]);
+                }
+            }
+        }
         (true, true) => {
             for p in Perm::ALL {
                 delta.del[p.index()].remove(&p.to_key(q));
@@ -7511,7 +7647,7 @@ impl WriteTxn<'_> {
         if let Ok(i) = self.base.generation.vocab.find(key) {
             return Ok(Id::vocab(i));
         }
-        Ok(Id::delta(self.base.generation.dvocab.insert(key)?))
+        self.base.generation.intern_delta_key(key)
     }
 
     /// Resolve a term against this writer's vocabulary without retaining a data view.
@@ -7655,7 +7791,7 @@ impl WriteTxn<'_> {
         } else {
             self.net_ins += 1;
         }
-        apply(&mut self.delta, &q, true, ib);
+        apply(&self.base.generation, &mut self.delta, &q, true, ib);
         self.log.push((WAL_INSERT, q));
         Ok(true)
     }
@@ -7675,7 +7811,7 @@ impl WriteTxn<'_> {
         } else {
             self.net_ins -= 1;
         }
-        apply(&mut self.delta, &q, false, ib);
+        apply(&self.base.generation, &mut self.delta, &q, false, ib);
         self.log.push((WAL_DELETE, q));
         Ok(true)
     }
@@ -8965,7 +9101,13 @@ pub(crate) fn replay_wal(
                         (false, true) => del += 1,
                         (false, false) => ins -= 1,
                     }
-                    apply(&mut out.delta, &q, op == WAL_INSERT, in_base);
+                    apply(
+                        &probe.generation,
+                        &mut out.delta,
+                        &q,
+                        op == WAL_INSERT,
+                        in_base,
+                    );
                 }
                 start.clear();
                 let (ins, del) = (ins.max(0) as u64, del.max(0) as u64);

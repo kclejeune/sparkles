@@ -485,6 +485,14 @@ impl super::Generation {
                 .as_ref()
                 .map_or(0, |s| s.len() as u64 + 64)
         })?;
+        budget.charge(if self.reifiers.file.is_some() {
+            std::mem::size_of::<crate::reifiers::ReifierFile>() as u64 + 64
+        } else {
+            self.reifiers
+                .missing
+                .as_ref()
+                .map_or(0, |s| s.len() as u64 + 64)
+        })?;
         if let Some(link) = &self.link {
             budget.charge(
                 std::mem::size_of::<super::link::Linked>() as u64
@@ -609,6 +617,19 @@ impl super::Generation {
             patterns.missing.as_ref().map_or(0, |s| s.len() as u64 + 64)
         };
         budget.release(allowance - retained);
+        let reifier_allowance = std::mem::size_of::<crate::reifiers::ReifierFile>() as u64
+            + 2048
+            + dir.as_os_str().len() as u64 * 3;
+        budget.charge(reifier_allowance)?;
+        budget.check()?;
+        let reifiers = crate::reifiers::Loaded::open(dir, meta.reifiers.as_ref(), meta.quads);
+        budget.check()?;
+        let reifier_retained = if reifiers.file.is_some() {
+            std::mem::size_of::<crate::reifiers::ReifierFile>() as u64 + 64
+        } else {
+            reifiers.missing.as_ref().map_or(0, |s| s.len() as u64 + 64)
+        };
+        budget.release(reifier_allowance - reifier_retained);
         let charge = budget.used() - start;
         let value = Self {
             uid: crate::index::next_uid(),
@@ -626,6 +647,8 @@ impl super::Generation {
             counts: Default::default(),
             charsets: Default::default(),
             patterns,
+            reifiers,
+            rdf_reifies: std::sync::atomic::AtomicU64::new(crate::store::RDF_REIFIES_UNRESOLVED),
             ill_typed_literals: parking_lot::Mutex::new(None),
             wal_index: parking_lot::Mutex::new(None),
             link: None,

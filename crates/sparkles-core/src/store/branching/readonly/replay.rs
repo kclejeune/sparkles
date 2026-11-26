@@ -68,7 +68,7 @@ pub(super) fn selected_metadata(
                 || (in_base && !delta.del[Perm::Spo.index()].contains(&key));
             touched.push((key, index, present, in_base));
             default_graph |= quad[3] == Id::DEFAULT_GRAPH;
-            apply(delta, &quad, record[0] == WAL_INSERT, in_base);
+            apply(generation, delta, &quad, record[0] == WAL_INSERT, in_base);
         }
         budget.sort_by(&mut touched, |left, right| {
             left.0.cmp(&right.0).then(left.1.cmp(&right.1))

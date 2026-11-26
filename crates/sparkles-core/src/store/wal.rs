@@ -1214,7 +1214,7 @@ pub(crate) fn apply_forward<C: Control>(
             } else {
                 spo.contains(cache, &Perm::Spo.to_key(&q))?
             };
-            apply(delta, &q, rec[0] == WAL_INSERT, in_base);
+            apply(generation, delta, &q, rec[0] == WAL_INSERT, in_base);
             records += 1;
             if Stride::<0x1_0000>::due::<C>(records) {
                 limit.check_delta(delta)?;
@@ -1354,7 +1354,7 @@ pub(crate) fn apply_backward<C: Control>(
             } else {
                 spo.contains(cache, &Perm::Spo.to_key(&q))?
             };
-            apply(delta, &q, r[0] != WAL_INSERT, in_base);
+            apply(generation, delta, &q, r[0] != WAL_INSERT, in_base);
             records += 1;
             if Stride::<0x1_0000>::due::<C>(records) {
                 limit.check_delta(delta)?;

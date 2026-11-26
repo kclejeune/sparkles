@@ -301,9 +301,9 @@ fn reifiers_about_charges_the_identities_it_returns() {
         Ok(out)
     };
     assert_eq!(scan(16 << 20).unwrap().len(), 400);
-    // one scan keeps about 75 KiB of identities beside 64 KiB of rows, so it fits in
-    // 176 KiB, and two scans that keep the first one's identities do not
-    let one = Preparation::new(crate::task::Control::none(), 176 << 10).unwrap();
+    // one indexed lookup keeps about 75 KiB of identities beside ~14 KiB of matched ids,
+    // so it fits in 128 KiB, and two lookups that keep the first one's identities do not
+    let one = Preparation::new(crate::task::Control::none(), 128 << 10).unwrap();
     let mut reads = Reads::new(&one, &snap);
     let mut held = one.reserve(0).unwrap();
     assert!(
@@ -318,7 +318,7 @@ fn reifiers_about_charges_the_identities_it_returns() {
             .is_ok()
     );
     drop(held);
-    assert!(matches!(scan(176 << 10), Err(Error::BudgetExceeded(_))));
+    assert!(matches!(scan(128 << 10), Err(Error::BudgetExceeded(_))));
 }
 
 /// Each identity a `Reads` caches, found or not, is charged to its preparation.
@@ -384,4 +384,92 @@ fn single_identities_charge_their_first_allocations() {
     assert!(preparation.reserve(LIMIT - 2048).is_err());
     drop(held);
     assert!(preparation.reserve(LIMIT - 2048).is_ok());
+}
+
+/// The reifier index returns identical subjects across delta, full compaction, partial
+/// compaction, base deletions, re-insertions and triple-masked views, and does not hit
+/// the legacy scan cap on graphs past 1,000,000 quads.
+#[test]
+fn reifiers_about_indexed_matches_across_compaction_deletes_and_large_graphs() {
+    use crate::store::{Store, StoreOptions};
+    let tmp = tempfile::tempdir().unwrap();
+    let s = Store::open(tmp.path(), StoreOptions::default()).unwrap();
+    let reifies = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
+    let lookup = |snap: &Snapshot, entities: &[&str]| -> (Vec<String>, bool) {
+        let prep = Preparation::new(Control::none(), 16 << 20).unwrap();
+        let mut reads = Reads::new(&prep, snap);
+        let mut held = prep.reserve(0).unwrap();
+        let wanted: BTreeSet<String> = entities.iter().map(|e| e.to_string()).collect();
+        let (rows, more) = reads
+            .reifiers_about(reifies, "urn:g", &wanted, 5, &mut held)
+            .unwrap();
+        let mut names: Vec<String> = rows.into_iter().map(|n| n.into_string()).collect();
+        names.sort();
+        (names, more)
+    };
+
+    // Uncompacted delta: 20 unrelated quads + 2 matching claims (well past scan=5)
+    let mut data = String::from("INSERT DATA { GRAPH <urn:g> {");
+    for i in 0..20 {
+        data.push_str(&format!(
+            " <urn:other:{i}> <{reifies}> <<( <urn:u{i}> <urn:p> <urn:v{i}> )>> ."
+        ));
+    }
+    data.push_str(&format!(
+        " <urn:c1> <{reifies}> <<( <urn:target> <urn:p> <urn:o1> )>> .\
+          <urn:c2> <{reifies}> <<( <urn:s2> <urn:p> <urn:target> )>> .\
+          <urn:c3> <{reifies}> <<( <urn:s3> <urn:target> <urn:o3> )>> . }} }}"
+    ));
+    crate::sparql::update::update(&s, &data, &crate::sparql::QueryOptions::default()).unwrap();
+    assert_eq!(
+        lookup(&s.snapshot(), &["urn:target"]),
+        (vec!["urn:c1".into(), "urn:c2".into()], false)
+    );
+
+    // Full compaction writes reifiers.bin and preserves exact results
+    s.compact().unwrap();
+    assert!(s.snapshot().generation.reifiers.file.is_some());
+    assert_eq!(
+        lookup(&s.snapshot(), &["urn:target"]),
+        (vec!["urn:c1".into(), "urn:c2".into()], false)
+    );
+
+    // Delete a base reifier and insert a delta reifier in the same graph
+    crate::sparql::update::update(
+        &s,
+        &format!(
+            "DELETE DATA {{ GRAPH <urn:g> {{ <urn:c1> <{reifies}> <<( <urn:target> <urn:p> <urn:o1> )>> }} }};\
+             INSERT DATA {{ GRAPH <urn:g> {{ <urn:c4> <{reifies}> <<( <urn:target> <urn:p> <urn:target> )>> }} }}"
+        ),
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        lookup(&s.snapshot(), &["urn:target"]),
+        (vec!["urn:c2".into(), "urn:c4".into()], false)
+    );
+
+    // Re-insert the deleted base reifier (clears delta.del) and delete the delta reifier
+    crate::sparql::update::update(
+        &s,
+        &format!(
+            "INSERT DATA {{ GRAPH <urn:g> {{ <urn:c1> <{reifies}> <<( <urn:target> <urn:p> <urn:o1> )>> }} }};\
+             DELETE DATA {{ GRAPH <urn:g> {{ <urn:c4> <{reifies}> <<( <urn:target> <urn:p> <urn:target> )>> }} }}"
+        ),
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        lookup(&s.snapshot(), &["urn:target"]),
+        (vec!["urn:c1".into(), "urn:c2".into()], false)
+    );
+
+    // Reopen persistent store and check
+    drop(s);
+    let s = Store::open(tmp.path(), StoreOptions::default()).unwrap();
+    assert!(s.snapshot().generation.reifiers.file.is_some());
+    assert_eq!(
+        lookup(&s.snapshot(), &["urn:target"]),
+        (vec!["urn:c1".into(), "urn:c2".into()], false)
+    );
 }

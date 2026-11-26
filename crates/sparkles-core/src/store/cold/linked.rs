@@ -300,7 +300,7 @@ fn apply_overlay_controlled(
             &limit,
             mutation,
         )?;
-        apply(delta, &quad, record[0] == WAL_INSERT, in_base);
+        apply(generation, delta, &quad, record[0] == WAL_INSERT, in_base);
         *delta_charge = history_limited::preparation_delta_bytes(delta);
         budget.charge(*delta_charge)?;
     }

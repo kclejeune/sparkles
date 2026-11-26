@@ -254,7 +254,7 @@ fn apply_overlay(
         let in_base = generation
             .perm(Perm::Spo)
             .contains(cache, &Perm::Spo.to_key(&q))?;
-        apply(delta, &q, rec[0] == WAL_INSERT, in_base);
+        apply(generation, delta, &q, rec[0] == WAL_INSERT, in_base);
     }
     generation.meta.next_bnode = generation.meta.next_bnode.max(overlay.next_bnode);
     Ok(())

@@ -1504,12 +1504,19 @@ impl<'a> Reads<'a> {
     }
 
     /// The IRI subjects in `g` that reify, through `p`, a triple term whose subject or
-    /// object is one of `entities`, in subject order. At most `scan` quads of `g` are
-    /// read. The rows read are charged to the preparation while the scan runs, and each
-    /// identity returned is charged to `held` before it is copied, with room for the
-    /// returned vector and one set the caller keeps it in, so the caller keeps it
-    /// charged for as long as it keeps `held`. Returns whether `g` holds more than
-    /// `scan` quads, in which case the list is incomplete.
+    /// object is one of `entities`, in subject order.
+    ///
+    /// When `p` is `rdf:reifies` and the base generation has a reifier proposition-term
+    /// index (including every empty/in-memory generation and every generation written by
+    /// this release), the lookup queries the index by `(g, term_hash(entity))` and reads
+    /// only the matching claims without scanning `g`. Only a legacy pre-index generation
+    /// (or a predicate other than `rdf:reifies`) falls back to scanning at most `scan`
+    /// quads of `g`.
+    ///
+    /// Each identity returned is charged to `held` before it is copied, with room for the
+    /// returned vector and one set the caller keeps it in, so the caller keeps it charged
+    /// for as long as it keeps `held`. Returns whether a fallback scan stopped at `scan`
+    /// quads, in which case the list is incomplete.
     pub fn reifiers_about(
         &mut self,
         p: &str,
@@ -1518,9 +1525,121 @@ impl<'a> Reads<'a> {
         scan: usize,
         held: &mut Reservation,
     ) -> Result<(Vec<NamedNode>, bool)> {
-        let (Some(p), Some(g)) = (self.id(p)?, self.id(g)?) else {
+        if entities.is_empty() {
+            return Ok((Vec::new(), false));
+        }
+        let (Some(p_id), Some(g_id)) = (self.id(p)?, self.id(g)?) else {
             return Ok((Vec::new(), false));
         };
+        if p == RDF_REIFIES && self.snap.generation.reifiers.is_indexed() {
+            return self.reifiers_about_indexed(p_id, g_id, entities, held);
+        }
+        self.reifiers_about_scan(p_id, g_id, entities, scan, held)
+    }
+
+    fn reifiers_about_indexed(
+        &mut self,
+        p: Id,
+        g: Id,
+        entities: &BTreeSet<String>,
+        held: &mut Reservation,
+    ) -> Result<(Vec<NamedNode>, bool)> {
+        const SEEN_START: u64 = 512;
+        const SEEN_ENTRY: u64 = 64;
+        let spo = Perm::Spo.index();
+        let mut ids_held = self.preparation.reserve(0)?;
+        let mut seen: BTreeSet<Id> = BTreeSet::new();
+
+        for entity in entities {
+            self.preparation.check()?;
+            let hash = crate::reifiers::term_hash(entity.as_bytes());
+            if let Some(file) = &self.snap.generation.reifiers.file {
+                for (i, (s, tt)) in file.lookup(g, hash).enumerate() {
+                    if i.is_multiple_of(256) {
+                        self.preparation.check()?;
+                    }
+                    if seen.contains(&s) {
+                        continue;
+                    }
+                    if self.snap.delta.del[spo].contains(&[s.0, p.0, tt.0, g.0]) {
+                        continue;
+                    }
+                    if self.triple_mentions_entity(tt, entity)? {
+                        let start = if seen.is_empty() { SEEN_START } else { 0 };
+                        ids_held.grow_by(start + SEEN_ENTRY)?;
+                        seen.insert(s);
+                    }
+                }
+            }
+            for (i, key) in self
+                .snap
+                .delta
+                .reifiers_ins
+                .range([g.0, hash, 0, 0]..=[g.0, hash, u64::MAX, u64::MAX])
+                .enumerate()
+            {
+                if i.is_multiple_of(256) {
+                    self.preparation.check()?;
+                }
+                let (s, tt) = (Id(key[2]), Id(key[3]));
+                if seen.contains(&s) {
+                    continue;
+                }
+                if !self.snap.delta.ins[spo].contains(&[s.0, p.0, tt.0, g.0]) {
+                    continue;
+                }
+                if self.triple_mentions_entity(tt, entity)? {
+                    let start = if seen.is_empty() { SEEN_START } else { 0 };
+                    ids_held.grow_by(start + SEEN_ENTRY)?;
+                    seen.insert(s);
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        for s in seen {
+            self.preparation.check()?;
+            if let Some(n) = self.preparation.with_term(self.snap, s, |t| {
+                Ok(match t {
+                    Some(Term::NamedNode(n)) => {
+                        let start = if out.is_empty() { IDENTITY_START } else { 0 };
+                        held.grow_by(start + n.as_str().len() as u64 + IDENTITY_ENTRY)?;
+                        Some(n.as_str().to_string())
+                    }
+                    _ => None,
+                })
+            })? {
+                out.push(NamedNode::new_unchecked(n));
+            }
+        }
+        Ok((out, false))
+    }
+
+    fn triple_mentions_entity(&self, tt: Id, entity: &str) -> Result<bool> {
+        self.preparation.with_term(self.snap, tt, |t| {
+            let Some(Term::Triple(t)) = t else {
+                return Ok(false);
+            };
+            let subject = matches!(
+                &t.subject,
+                NamedOrBlankNode::NamedNode(n) if n.as_str() == entity
+            );
+            let object = matches!(
+                &t.object,
+                Term::NamedNode(n) if n.as_str() == entity
+            );
+            Ok(subject || object)
+        })
+    }
+
+    fn reifiers_about_scan(
+        &mut self,
+        p: Id,
+        g: Id,
+        entities: &BTreeSet<String>,
+        scan: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<NamedNode>, bool)> {
         const ROW: u64 = std::mem::size_of::<(Id, Id)>() as u64;
         const CHUNK: usize = 4096;
         let mut rows_held = self.preparation.reserve(0)?;

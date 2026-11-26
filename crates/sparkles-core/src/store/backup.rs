@@ -2836,6 +2836,7 @@ mod tests {
             "prefixes",
             "created",
             "patterns",
+            "reifiers",
             "features",
         ] {
             let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
@@ -2856,6 +2857,14 @@ mod tests {
                     changed[field] = serde_json::to_value(crate::patterns::PatternInfo::skipped(
                         "fingerprint-test-replacement",
                     ))
+                    .unwrap()
+                }
+                "reifiers" => {
+                    changed[field] = serde_json::to_value(crate::reifiers::ReifierInfo {
+                        format: crate::reifiers::VERSION,
+                        entries: 1,
+                        bytes: 88,
+                    })
                     .unwrap()
                 }
                 "features" => {
