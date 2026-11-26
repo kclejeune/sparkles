@@ -371,6 +371,10 @@ pub(crate) fn write_git_tree_tracked(
     let (prior_owned, pending_prior) = if dir_exists {
         preflight_optional_child_dir_no_symlink(&clean_dir, METADATA_DIR)?;
         preflight_optional_child_dir_no_symlink(&clean_dir, GRAPHS_DIR)?;
+        let meta_candidate = clean_dir.join(METADATA_DIR);
+        if meta_candidate.is_dir() {
+            preflight_optional_child_dir_no_symlink(&meta_candidate, STAGING_SUBDIR)?;
+        }
         let manifest_path = resolve_safe_path(&clean_dir, MANIFEST_REL_PATH)?;
         let prior = read_prior_owned_graph_paths(&manifest_path, options.max_manifest_bytes)?;
         let pending_path = resolve_safe_path(&clean_dir, PENDING_WRITE_REL_PATH)?;
@@ -395,7 +399,12 @@ pub(crate) fn write_git_tree_tracked(
             .push(sha.clone());
     }
     if let Some(ref p) = pending_prior {
-        for (rel, sha) in p.prior_graphs.iter().chain(p.target_graphs.iter()) {
+        for (rel, sha) in p
+            .prior_graphs
+            .iter()
+            .chain(p.target_graphs.iter())
+            .chain(p.in_flight_graphs.iter())
+        {
             let list = owned_candidates.entry(rel.clone()).or_default();
             if !list.contains(sha) {
                 list.push(sha.clone());
@@ -441,6 +450,7 @@ pub(crate) fn write_git_tree_tracked(
     }
 
     let mut stale_to_prune: Vec<String> = Vec::new();
+    let mut verified_on_disk: BTreeMap<String, String> = BTreeMap::new();
     if dir_exists {
         for (_, rel_path, _) in &planned {
             let full_path = resolve_safe_path(&clean_dir, rel_path)?;
@@ -448,42 +458,68 @@ pub(crate) fn write_git_tree_tracked(
                 .get(rel_path)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            preflight_owned_graph_file(
+            if let Some(actual_sha) = preflight_owned_graph_file(
                 &full_path,
                 rel_path,
                 expected,
                 options.max_graph_file_bytes,
                 "overwrite",
-            )?;
+            )? {
+                verified_on_disk.insert(rel_path.clone(), actual_sha);
+            }
         }
         if options.prune_stale_graphs {
             for (rel, expected_shas) in &owned_candidates {
                 if used_paths.contains(rel) {
                     continue;
                 }
+                validate_any_graph_path(rel)?;
                 let full_path = resolve_safe_path(&clean_dir, rel)?;
-                if preflight_owned_graph_file(
+                if let Some(actual_sha) = preflight_owned_graph_file(
                     &full_path,
                     rel,
                     expected_shas,
                     options.max_graph_file_bytes,
                     "prune",
                 )? {
+                    verified_on_disk.insert(rel.clone(), actual_sha);
                     stale_to_prune.push(rel.clone());
+                }
+            }
+        } else if pending_prior.is_some() {
+            for (rel, expected_shas) in &owned_candidates {
+                if used_paths.contains(rel) {
+                    continue;
+                }
+                validate_any_graph_path(rel)?;
+                let full_path = resolve_safe_path(&clean_dir, rel)?;
+                if let Ok(Some(actual_sha)) = preflight_owned_graph_file(
+                    &full_path,
+                    rel,
+                    expected_shas,
+                    options.max_graph_file_bytes,
+                    "retain",
+                ) {
+                    verified_on_disk.insert(rel.clone(), actual_sha);
                 }
             }
         }
     }
 
-    // 6. Now create target and managed directories safely.
+    // 6. Now create target and managed directories safely. Staging temporaries live under
+    //    `.sparkles-git/staging/` (outside `graphs/`) so an abrupt process crash never leaves
+    //    unlisted temp files inside `graphs/`.
     let clean_dir = ensure_dir_no_symlink(&clean_dir)?;
     let meta_dir = ensure_child_dir_no_symlink(&clean_dir, METADATA_DIR)?;
+    let staging_dir = ensure_child_dir_no_symlink(&meta_dir, STAGING_SUBDIR)?;
+    cleanup_stale_staging_files(&staging_dir)?;
     let graphs_dir = ensure_child_dir_no_symlink(&clean_dir, GRAPHS_DIR)?;
     let manifest_path = resolve_safe_path(&clean_dir, MANIFEST_REL_PATH)?;
 
     // 7. Stream each graph into an exclusively created temp file (`TempPath`, closing the
-    //    descriptor immediately) while enforcing per-file and aggregate byte limits so an
-    //    over-limit write fails atomically without leaving partial files behind.
+    //    descriptor immediately) inside `.sparkles-git/staging/` while enforcing per-file
+    //    and aggregate byte limits so an over-limit write fails atomically without leaving
+    //    partial files in `graphs/`.
     let mut total_bytes_written = 0u64;
     let mut staged_graphs: Vec<(tempfile::TempPath, PathBuf)> = Vec::with_capacity(planned.len());
     let mut entries = Vec::with_capacity(planned.len());
@@ -495,7 +531,7 @@ pub(crate) fn write_git_tree_tracked(
         let file_cap = options.max_graph_file_bytes.min(remaining);
 
         let (temp_path, written, digest) =
-            stage_atomic_stream_hashed(&full_path, &rel_path, file_cap, |w| {
+            stage_atomic_stream_hashed_in(&staging_dir, &full_path, &rel_path, file_cap, |w| {
                 match options.syntax {
                     CanonicalSyntax::Turtle => {
                         write_canonical_turtle(&graph_quads, &merged_prefixes, w)
@@ -547,7 +583,8 @@ pub(crate) fn write_git_tree_tracked(
             options.max_total_bytes
         )));
     }
-    let (staged_manifest, _, _) = stage_atomic_stream_hashed(
+    let (staged_manifest, _, _) = stage_atomic_stream_hashed_in(
+        &staging_dir,
         &manifest_path,
         MANIFEST_REL_PATH,
         options.max_manifest_bytes,
@@ -558,8 +595,9 @@ pub(crate) fn write_git_tree_tracked(
     )?;
 
     // 8.5. Persist a versioned pending-write journal before mutating any graph files or
-    //      pruning stale files so an interruption mid-write remains cleanly recoverable on
-    //      retry without relaxing strict collision ownership checks.
+    //      pruning stale files so an interruption mid-write (including chained interruptions
+    //      targeting different datasets) remains cleanly recoverable on retry without
+    //      relaxing strict collision ownership checks.
     let pending_path = resolve_safe_path(&clean_dir, PENDING_WRITE_REL_PATH)?;
     let target_graphs: BTreeMap<String, String> = manifest
         .graphs
@@ -570,10 +608,19 @@ pub(crate) fn write_git_tree_tracked(
         Some(p) if prior_owned == p.prior_graphs => p.prior_graphs.clone(),
         _ => prior_owned,
     };
+    let mut in_flight_graphs: BTreeMap<String, String> = BTreeMap::new();
+    for (rel, sha) in verified_on_disk {
+        let in_prior = pending_prior_graphs.get(&rel).is_some_and(|s| s == &sha);
+        let in_target = target_graphs.get(&rel).is_some_and(|s| s == &sha);
+        if !in_prior && !in_target {
+            in_flight_graphs.insert(rel, sha);
+        }
+    }
     let pending_write = PendingTreeWrite {
-        format_version: MANIFEST_FORMAT_VERSION,
+        format_version: PENDING_WRITE_FORMAT_VERSION,
         prior_graphs: pending_prior_graphs,
         target_graphs,
+        in_flight_graphs,
     };
     let pending_bytes = serde_json::to_vec(&pending_write).map_err(|e| {
         GitError::InvalidManifest(format!("failed to serialize pending write: {e}"))
@@ -586,9 +633,11 @@ pub(crate) fn write_git_tree_tracked(
         )));
     }
     write_atomic_safe(&pending_path, &pending_bytes)?;
+    #[cfg(test)]
+    profile_test_hooks::after_pending_write()?;
 
     // 9. Commit staged graph files, prune verified stale files, publish manifest, and clear
-    //    the pending-write journal.
+    //    the pending-write journal and staging directory.
     let wrote_graphs = !staged_graphs.is_empty();
     for (idx, (temp_path, full_path)) in staged_graphs.into_iter().enumerate() {
         check_dest_file_not_symlink(&full_path)?;
@@ -607,6 +656,7 @@ pub(crate) fn write_git_tree_tracked(
     if !stale_to_prune.is_empty() {
         verify_existing_dir_no_symlink(&graphs_dir, GRAPHS_DIR)?;
         for rel in stale_to_prune {
+            validate_any_graph_path(&rel)?;
             let full = resolve_safe_path(&clean_dir, &rel)?;
             match fs::symlink_metadata(&full) {
                 Ok(meta) => {
@@ -647,12 +697,15 @@ pub(crate) fn write_git_tree_tracked(
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(GitError::io(&pending_path, e)),
     }
+    let _ = fs::remove_dir(&staging_dir);
     fsutil::sync_dir(&meta_dir).map_err(|e| GitError::io(&meta_dir, e))?;
 
     Ok((manifest, pruned_paths))
 }
 
 const PENDING_WRITE_REL_PATH: &str = ".sparkles-git/pending-write.json";
+const PENDING_WRITE_FORMAT_VERSION: u32 = 1;
+const STAGING_SUBDIR: &str = "staging";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -660,12 +713,42 @@ struct PendingTreeWrite {
     format_version: u32,
     prior_graphs: BTreeMap<String, String>,
     target_graphs: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    in_flight_graphs: BTreeMap<String, String>,
 }
 
 fn max_pending_write_bytes(max_manifest_bytes: u64) -> u64 {
     max_manifest_bytes
-        .saturating_mul(2)
+        .saturating_mul(3)
         .saturating_add(64 * 1024)
+}
+
+fn cleanup_stale_staging_files(staging_dir: &Path) -> GitResult<()> {
+    verify_existing_dir_no_symlink(staging_dir, STAGING_SUBDIR)?;
+    let mut removed_any = false;
+    for entry in fs::read_dir(staging_dir).map_err(|e| GitError::io(staging_dir, e))? {
+        let entry = entry.map_err(|e| GitError::io(staging_dir, e))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let meta = fs::symlink_metadata(&path).map_err(|e| GitError::io(&path, e))?;
+        if meta.file_type().is_symlink() {
+            return Err(GitError::UnsafePath {
+                path: path.display().to_string(),
+                reason: "symlink inside .sparkles-git/staging/ is not allowed".into(),
+            });
+        }
+        if meta.file_type().is_file() && name.to_string_lossy().starts_with(".sparkles-tmp-") {
+            match fs::remove_file(&path) {
+                Ok(()) => removed_any = true,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(GitError::io(&path, e)),
+            }
+        }
+    }
+    if removed_any {
+        fsutil::sync_dir(staging_dir).map_err(|e| GitError::io(staging_dir, e))?;
+    }
+    Ok(())
 }
 
 fn read_pending_tree_write(
@@ -709,11 +792,11 @@ fn read_pending_tree_write(
             )
         })?;
     let found = u32::try_from(version_val).unwrap_or(u32::MAX);
-    if found != MANIFEST_FORMAT_VERSION {
+    if found != PENDING_WRITE_FORMAT_VERSION {
         return Err(GitError::UnsupportedFormatVersion {
             file: PENDING_WRITE_REL_PATH.to_string(),
             found,
-            supported: MANIFEST_FORMAT_VERSION,
+            supported: PENDING_WRITE_FORMAT_VERSION,
         });
     }
     let pending: PendingTreeWrite = serde_json::from_value(raw)
@@ -722,8 +805,9 @@ fn read_pending_tree_write(
         .prior_graphs
         .iter()
         .chain(pending.target_graphs.iter())
+        .chain(pending.in_flight_graphs.iter())
     {
-        validate_relative_path(rel)?;
+        validate_any_graph_path(rel)?;
         if !is_sha256_hex(sha) {
             return Err(GitError::InvalidManifest(format!(
                 "invalid sha256 digest in pending write record for {rel:?}"
@@ -769,19 +853,19 @@ fn read_prior_owned_graph_paths(
 
 /// Preflight a graph path on disk before overwriting or pruning it.
 ///
-/// Returns `Ok(true)` if the file exists and is verified to match one of `expected_shas`,
-/// `Ok(false)` if it does not exist, or an `UnsafePath` error if the path is a symlink,
-/// non-regular file, unmanaged (`expected_shas.is_empty()`), or modified relative to the
-/// verified manifest / pending write checksums.
+/// Returns `Ok(Some(actual_sha256))` if the file exists and is verified to match one of
+/// `expected_shas`, `Ok(None)` if it does not exist, or an `UnsafePath` error if the path
+/// is a symlink, non-regular file, unmanaged (`expected_shas.is_empty()`), or modified
+/// relative to the verified manifest / pending write checksums.
 fn preflight_owned_graph_file(
     full_path: &Path,
     rel_path: &str,
     expected_shas: &[String],
     max_graph_file_bytes: u64,
     verb: &str,
-) -> GitResult<bool> {
+) -> GitResult<Option<String>> {
     match fs::symlink_metadata(full_path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(GitError::io(full_path, e)),
         Ok(meta) => {
             if meta.file_type().is_symlink() {
@@ -826,7 +910,7 @@ fn preflight_owned_graph_file(
             ),
         });
     }
-    Ok(true)
+    Ok(Some(actual_sha))
 }
 
 /// Read and strictly validate a canonical git serialization tree using default [`ReadOptions`].
@@ -1431,6 +1515,36 @@ pub(crate) fn validate_graph_path(rel: &str, syntax: CanonicalSyntax) -> GitResu
     Ok(())
 }
 
+/// Strictly validate a relative graph path from a pending-write journal, requiring a single
+/// filename directly under `graphs/` with a canonical RDF extension (`.ttl` or `.nq`).
+fn validate_any_graph_path(rel: &str) -> GitResult<()> {
+    validate_relative_path(rel)?;
+    let expected_prefix = format!("{GRAPHS_DIR}/");
+    let Some(file_name) = rel.strip_prefix(&expected_prefix) else {
+        return Err(GitError::UnsafePath {
+            path: rel.to_string(),
+            reason: format!("graph path must live directly under {GRAPHS_DIR}/"),
+        });
+    };
+    if file_name.is_empty() || file_name.contains('/') {
+        return Err(GitError::UnsafePath {
+            path: rel.to_string(),
+            reason: format!("graph path must be a single filename directly under {GRAPHS_DIR}/"),
+        });
+    }
+    let valid_ext = (file_name.ends_with(".ttl") && file_name != ".ttl")
+        || (file_name.ends_with(".nq") && file_name != ".nq");
+    if !valid_ext {
+        return Err(GitError::UnsafePath {
+            path: rel.to_string(),
+            reason: format!(
+                "graph path {rel:?} must end with a canonical graph extension (.ttl or .nq)"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Validate that `rel` is a safe forward-slash relative path without traversal, backslashes,
 /// NUL/control characters, drive prefixes, `.`, or `..`.
 pub(crate) fn validate_relative_path(rel: &str) -> GitResult<()> {
@@ -1877,16 +1991,36 @@ pub(crate) fn ensure_child_dir_no_symlink(parent: &Path, child: &str) -> GitResu
 
 /// Resolve `rel` inside `root`, verifying that no component beneath `root` is a symlink.
 pub(crate) fn resolve_safe_path(root: &Path, rel: &str) -> GitResult<PathBuf> {
+    resolve_safe_path_inner(root, rel, false)
+}
+
+/// Resolve `rel` inside `root`, verifying that no ancestor component beneath `root` is a
+/// symlink while allowing the final leaf component itself to be a symlink (used for
+/// Git-tracked `120000` symlink entries).
+pub(crate) fn resolve_safe_path_allow_leaf_symlink(root: &Path, rel: &str) -> GitResult<PathBuf> {
+    resolve_safe_path_inner(root, rel, true)
+}
+
+fn resolve_safe_path_inner(root: &Path, rel: &str, allow_leaf_symlink: bool) -> GitResult<PathBuf> {
     validate_relative_path(rel)?;
     let mut cur = normalize_dir_for_lstat(root)?;
-    for segment in rel.split('/') {
+    let segments: Vec<&str> = rel.split('/').collect();
+    let last_idx = segments.len().saturating_sub(1);
+    for (idx, segment) in segments.into_iter().enumerate() {
         cur.push(segment);
+        let is_leaf = idx == last_idx;
         match fs::symlink_metadata(&cur) {
             Ok(meta) => {
-                if meta.file_type().is_symlink() {
+                if meta.file_type().is_symlink() && !(allow_leaf_symlink && is_leaf) {
                     return Err(GitError::UnsafePath {
                         path: rel.to_string(),
                         reason: format!("symlink component {segment:?} is not allowed"),
+                    });
+                }
+                if !is_leaf && !meta.file_type().is_dir() {
+                    return Err(GitError::UnsafePath {
+                        path: rel.to_string(),
+                        reason: format!("ancestor component {segment:?} is not a directory"),
                     });
                 }
             }
@@ -2002,13 +2136,28 @@ fn stage_atomic_stream_hashed(
     write_fn: impl FnOnce(&mut HashingWriter<BufWriter<&mut File>>) -> GitResult<()>,
 ) -> GitResult<(tempfile::TempPath, u64, String)> {
     let parent = effective_parent(path)?;
+    stage_atomic_stream_hashed_in(&parent, path, label, max_bytes, write_fn)
+}
+
+/// Stream serialized bytes to an exclusively created temporary file inside `staging_dir`
+/// (which must lie on the same filesystem as `path`) while verifying `path` and its parent
+/// are not symlinks and computing the lowercase hex SHA-256 digest.
+fn stage_atomic_stream_hashed_in(
+    staging_dir: &Path,
+    path: &Path,
+    label: &str,
+    max_bytes: u64,
+    write_fn: impl FnOnce(&mut HashingWriter<BufWriter<&mut File>>) -> GitResult<()>,
+) -> GitResult<(tempfile::TempPath, u64, String)> {
+    let parent = effective_parent(path)?;
     verify_existing_dir_no_symlink(&parent, &parent.display().to_string())?;
+    verify_existing_dir_no_symlink(staging_dir, &staging_dir.display().to_string())?;
     check_dest_file_not_symlink(path)?;
 
     let mut tmp = tempfile::Builder::new()
         .prefix(".sparkles-tmp-")
-        .tempfile_in(&parent)
-        .map_err(|e| GitError::io(&parent, e))?;
+        .tempfile_in(staging_dir)
+        .map_err(|e| GitError::io(staging_dir, e))?;
 
     let (written, digest) = {
         let bw = BufWriter::new(tmp.as_file_mut());
@@ -3465,7 +3614,9 @@ mod profile_test_hooks {
 
     #[derive(Default)]
     pub(super) struct FaultState {
+        pub fail_after_pending_write: bool,
         pub fail_after_first_graph_persist: bool,
+        pub exit_after_first_graph_persist: Option<i32>,
         pub fail_after_first_graph_prune: bool,
         pub fail_after_manifest_persist: bool,
     }
@@ -3487,9 +3638,26 @@ mod profile_test_hooks {
         FaultGuard
     }
 
+    pub(super) fn after_pending_write() -> GitResult<()> {
+        FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            if s.fail_after_pending_write {
+                s.fail_after_pending_write = false;
+                return Err(GitError::Io {
+                    path: None,
+                    source: io::Error::other("injected failure after pending write"),
+                });
+            }
+            Ok(())
+        })
+    }
+
     pub(super) fn after_first_graph_persist() -> GitResult<()> {
         FAULTS.with(|f| {
             let mut s = f.borrow_mut();
+            if let Some(code) = s.exit_after_first_graph_persist.take() {
+                std::process::exit(code);
+            }
             if s.fail_after_first_graph_persist {
                 s.fail_after_first_graph_persist = false;
                 return Err(GitError::Io {
@@ -3794,5 +3962,263 @@ mod tests {
             ),
             "{err_ver:?}"
         );
+    }
+
+    #[test]
+    fn pending_write_journal_rejects_paths_outside_graphs_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let q1 = Quad::new(
+            NamedNode::new_unchecked("http://example.org/s1"),
+            NamedNode::new_unchecked("http://example.org/p"),
+            Literal::from(1i64),
+            GraphName::DefaultGraph,
+        );
+        let manifest = write_git_tree(
+            vec![q1.clone()],
+            &BTreeMap::new(),
+            dir.path(),
+            &WriteOptions::default(),
+        )
+        .unwrap();
+
+        let outside = dir.path().join("outside.txt");
+        let outside_bytes = b"do not delete me\n";
+        fs::write(&outside, outside_bytes).unwrap();
+        let outside_sha = sha256_hex(outside_bytes);
+
+        let nested = dir.path().join("graphs/sub/nested.ttl");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, b"nested\n").unwrap();
+        let nested_sha = sha256_hex(b"nested\n");
+
+        let prior_map: BTreeMap<String, String> = manifest
+            .graphs
+            .iter()
+            .map(|g| (g.path.clone(), g.sha256.clone()))
+            .collect();
+
+        for (bad_rel, bad_sha) in [
+            ("outside.txt", outside_sha.as_str()),
+            ("graphs/sub/nested.ttl", nested_sha.as_str()),
+            ("graphs/not-rdf.txt", outside_sha.as_str()),
+        ] {
+            let mut target_map = prior_map.clone();
+            target_map.insert(bad_rel.to_string(), bad_sha.to_string());
+            let bad_pending = PendingTreeWrite {
+                format_version: PENDING_WRITE_FORMAT_VERSION,
+                prior_graphs: prior_map.clone(),
+                target_graphs: target_map,
+                in_flight_graphs: BTreeMap::new(),
+            };
+            fs::write(
+                dir.path().join(PENDING_WRITE_REL_PATH),
+                serde_json::to_vec(&bad_pending).unwrap(),
+            )
+            .unwrap();
+
+            let err = write_git_tree(
+                vec![q1.clone()],
+                &BTreeMap::new(),
+                dir.path(),
+                &WriteOptions::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GitError::UnsafePath { .. }),
+                "journal entry {bad_rel:?} must be refused with UnsafePath, got {err:?}"
+            );
+            assert_eq!(
+                fs::read(&outside).unwrap(),
+                outside_bytes,
+                "out-of-scope file must remain untouched"
+            );
+            assert!(nested.is_file(), "nested file must remain untouched");
+        }
+    }
+
+    #[test]
+    fn direct_write_recovers_across_chained_interruptions_with_different_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk_quad = |s: &str, g: Option<&str>| {
+            Quad::new(
+                NamedNode::new_unchecked(s),
+                NamedNode::new_unchecked("http://example.org/p"),
+                Literal::from(s),
+                match g {
+                    Some(iri) => GraphName::NamedNode(NamedNode::new_unchecked(iri)),
+                    None => GraphName::DefaultGraph,
+                },
+            )
+        };
+
+        // Initial committed state A.
+        let q_a = vec![mk_quad("http://example.org/a", None)];
+        write_git_tree(q_a, &BTreeMap::new(), dir.path(), &WriteOptions::default()).unwrap();
+
+        // Write 1 targets B (updates default.ttl AND adds graph-b), interrupted right after
+        // persisting both graph files (before manifest advances). Use fail_after_manifest
+        // no — interrupt after persisting first graph (default.ttl), or use a two-graph B
+        // where default.ttl AND graph-b are persisted before interruption:
+        // Persist order is BTreeMap order: Default comes first, Named comes second.
+        // Interrupt on prune or let us include a stale graph in A so B persists BOTH default.ttl
+        // and graph-b before failing on prune!
+        let q_a2 = vec![
+            mk_quad("http://example.org/a", None),
+            mk_quad(
+                "http://example.org/stale",
+                Some("http://example.org/stale-g"),
+            ),
+        ];
+        write_git_tree(q_a2, &BTreeMap::new(), dir.path(), &WriteOptions::default()).unwrap();
+
+        let q_b = vec![
+            mk_quad("http://example.org/b", None),
+            mk_quad("http://example.org/gb", Some("http://example.org/graph-b")),
+        ];
+        {
+            let _g = profile_test_hooks::install(profile_test_hooks::FaultState {
+                fail_after_first_graph_prune: true,
+                ..Default::default()
+            });
+            assert!(
+                write_git_tree(q_b, &BTreeMap::new(), dir.path(), &WriteOptions::default())
+                    .is_err()
+            );
+        }
+        // Now manifest is still A2, while on disk default.ttl has B's bytes AND graph-b exists!
+        let b_graph_files: Vec<PathBuf> = fs::read_dir(dir.path().join(GRAPHS_DIR))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert!(
+            b_graph_files.iter().any(|p| p
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("graph-b")),
+            "graph-b from interrupted write 1 should be on disk: {b_graph_files:?}"
+        );
+
+        // Write 2 targets a DIFFERENT dataset C (updates default.ttl, adds graph-c, drops graph-b)
+        // and is interrupted RIGHT AFTER overwriting pending-write.json (before writing C or
+        // pruning graph-b).
+        let q_c = vec![
+            mk_quad("http://example.org/c", None),
+            mk_quad("http://example.org/gc", Some("http://example.org/graph-c")),
+        ];
+        {
+            let _g = profile_test_hooks::install(profile_test_hooks::FaultState {
+                fail_after_pending_write: true,
+                ..Default::default()
+            });
+            let err = write_git_tree(
+                q_c.clone(),
+                &BTreeMap::new(),
+                dir.path(),
+                &WriteOptions::default(),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("after pending write"), "{err}");
+        }
+
+        // Write 3 retries C: must still recognize B's surviving default.ttl AND prune graph-b!
+        write_git_tree(q_c, &BTreeMap::new(), dir.path(), &WriteOptions::default()).unwrap();
+        assert!(!dir.path().join(PENDING_WRITE_REL_PATH).exists());
+        let verified = verify_git_tree(dir.path()).unwrap();
+        assert_eq!(verified.quad_count, 2);
+        assert_eq!(verified.graph_count, 2);
+        let final_files: Vec<String> = fs::read_dir(dir.path().join(GRAPHS_DIR))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !final_files.iter().any(|f| f.contains("graph-b")),
+            "stale graph-b from write 1 must be pruned: {final_files:?}"
+        );
+    }
+
+    #[test]
+    fn abrupt_child_process_exit_during_direct_write_recovers_strictly_without_stray_graph_temps() {
+        const CHILD_ENV: &str = "SPARKLES_TEST_PROFILE_CRASH_DIR";
+        let q_def = Quad::new(
+            NamedNode::new_unchecked("http://example.org/s1"),
+            NamedNode::new_unchecked("http://example.org/p"),
+            Literal::from(1i64),
+            GraphName::DefaultGraph,
+        );
+        let q_named = Quad::new(
+            NamedNode::new_unchecked("http://example.org/s2"),
+            NamedNode::new_unchecked("http://example.org/p"),
+            Literal::from(2i64),
+            GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/g2")),
+        );
+
+        if let Ok(target) = std::env::var(CHILD_ENV) {
+            let _g = profile_test_hooks::install(profile_test_hooks::FaultState {
+                exit_after_first_graph_persist: Some(99),
+                ..Default::default()
+            });
+            let _ = write_git_tree(
+                vec![q_def, q_named],
+                &BTreeMap::new(),
+                Path::new(&target),
+                &WriteOptions::default(),
+            );
+            std::process::exit(1);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let unmanaged = dir.path().join("README.txt");
+        fs::write(&unmanaged, b"keep unmanaged file\n").unwrap();
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "git::profile::tests::abrupt_child_process_exit_during_direct_write_recovers_strictly_without_stray_graph_temps",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, dir.path())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(99), "child must exit abruptly with 99");
+
+        // No temporary staging file may exist inside `graphs/` after the abrupt crash.
+        let graph_entries: Vec<String> = fs::read_dir(dir.path().join(GRAPHS_DIR))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !graph_entries
+                .iter()
+                .any(|n| n.starts_with(".sparkles-tmp-")),
+            "abrupt crash must not leave staging temps in graphs/: {graph_entries:?}"
+        );
+        // Orphaned staging temp should be inside `.sparkles-git/staging/`.
+        let staging_dir = dir.path().join(METADATA_DIR).join(STAGING_SUBDIR);
+        assert!(staging_dir.is_dir());
+        assert!(
+            fs::read_dir(&staging_dir).unwrap().any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".sparkles-tmp-")),
+            "abrupt crash should have left unpersisted temp inside .sparkles-git/staging/"
+        );
+
+        // Retry completes cleanly, cleans up `.sparkles-git/staging/`, preserves unmanaged file,
+        // and passes strict verification.
+        write_git_tree(
+            vec![q_def, q_named],
+            &BTreeMap::new(),
+            dir.path(),
+            &WriteOptions::default(),
+        )
+        .unwrap();
+        assert!(!dir.path().join(PENDING_WRITE_REL_PATH).exists());
+        assert!(!staging_dir.exists());
+        assert_eq!(fs::read(&unmanaged).unwrap(), b"keep unmanaged file\n");
+        let report = verify_git_tree(dir.path()).unwrap();
+        assert_eq!(report.graph_count, 2);
+        assert_eq!(report.quad_count, 2);
     }
 }

@@ -15,16 +15,18 @@ use crate::git::profile::{
     MANIFEST_REL_PATH, METADATA_DIR, WriteOptions, check_dest_file_not_symlink, effective_parent,
     ensure_child_dir_no_symlink, ensure_dir_no_symlink, normalize_dir_for_lstat,
     open_regular_file_no_symlink, read_bounded_regular_file, reject_duplicate_json_keys,
-    resolve_safe_path, sanitize_slug, sha256_hex, validate_relative_path,
-    verify_existing_dir_no_symlink, write_atomic_safe, write_snapshot_git_tree_tracked,
+    resolve_safe_path, resolve_safe_path_allow_leaf_symlink, sanitize_slug, sha256_hex,
+    validate_relative_path, verify_existing_dir_no_symlink, verify_no_symlink_components,
+    write_atomic_safe, write_snapshot_git_tree_tracked,
 };
 use crate::git::{GitError, GitResult};
 use crate::history::{At, HistoryOptions};
 use crate::store::{BranchCommit, Snapshot, Store};
 use serde::{Deserialize, Serialize};
+use sparkles_core::jobs::Sha256Stream;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -32,6 +34,11 @@ use uuid::Uuid;
 
 /// Supported format version of the bidirectional commit mapping record.
 pub const MAPPING_FORMAT_VERSION: u32 = 1;
+/// Supported format version of crash-recoverable pending publication journals
+/// (versioned independently of [`MAPPING_FORMAT_VERSION`]).
+const PENDING_PUBLICATION_FORMAT_VERSION: u32 = 2;
+/// Prefix written inside `.git/index.lock` to prove Sparkles ownership during crash recovery.
+const INDEX_LOCK_PREFIX: &str = "sparkles-git-index-lock-v1:";
 /// Stable profile identifier recorded in the mapping file.
 pub const MAPPING_PROFILE_NAME: &str = "sparkles-git-mapping-v1";
 /// Default maximum size of a bidirectional commit mapping file in bytes (16 MiB).
@@ -271,6 +278,10 @@ impl CommitMapping {
 #[serde(deny_unknown_fields)]
 struct PendingPublication {
     format_version: u32,
+    /// Unique ownership token recorded inside `.git/index.lock` while this publication
+    /// holds the Git index lock, allowing crash recovery to reclaim its own stale lock
+    /// while refusing active or foreign locks.
+    index_lock_token: String,
     mapping_path: PathBuf,
     ref_name: String,
     old_ref_sha: Option<String>,
@@ -528,8 +539,9 @@ pub fn export_branch_to_git(
     let ref_name = format!("refs/heads/{git_branch}");
     let pending_path = pending_publication_path(&git_dir, &git_branch)?;
 
+    let custom_mapping = options.mapping_path.is_some();
     let mapping_path = match &options.mapping_path {
-        Some(p) => prepare_mapping_path_safe(p)?,
+        Some(p) => resolve_mapping_path_readonly(p)?,
         None => {
             let sparkles_dir = ensure_child_dir_no_symlink(&git_dir, DEFAULT_SPARKLES_GIT_SUBDIR)?;
             let mappings_dir = ensure_child_dir_no_symlink(&sparkles_dir, DEFAULT_MAPPINGS_SUBDIR)?;
@@ -538,7 +550,19 @@ pub fn export_branch_to_git(
             mappings_dir.join(format!("{slug}-{}.json", &hash[..16]))
         }
     };
-    validate_mapping_destination_no_overlap(&mapping_path, &canon_repo, &git_dir, &pending_path)?;
+    validate_mapping_destination_no_overlap(
+        &mapping_path,
+        &canon_repo,
+        &git_dir,
+        &pending_path,
+        custom_mapping,
+    )?;
+
+    // Refuse if `mapping_path` aliases any file currently tracked on `HEAD` BEFORE creating
+    // directories, running recovery, or publishing commits.
+    let initial_head = git_rev_parse_opt(&clean_repo, "HEAD")?;
+    let initial_tracked = list_tracked_paths_in_commit(&clean_repo, initial_head.as_deref())?;
+    ensure_mapping_not_tracked(&mapping_path, &canon_repo, &initial_tracked)?;
 
     // Refuse if another branch has an unreconciled interrupted publication pending.
     ensure_no_other_pending_publications(&git_dir, &pending_path)?;
@@ -548,6 +572,7 @@ pub fn export_branch_to_git(
     // recovers cleanly without manual resets or duplicate commits.
     reconcile_pending_publication(
         &clean_repo,
+        &canon_repo,
         &git_dir,
         &pending_path,
         &mapping_path,
@@ -764,9 +789,17 @@ pub fn export_branch_to_git(
                 .as_deref()
                 .is_some_and(|h| h.eq_ignore_ascii_case(&head_git_sha));
         if !already_on_target {
+            // Verify `mapping_path` aliases neither the currently checked-out branch's
+            // tracked files (which the switch would unlink) nor the target commit's files.
+            let old_tracked = list_tracked_paths_in_commit(&clean_repo, prev_head.as_deref())?;
+            let target_tracked = list_tracked_paths_in_commit(&clean_repo, Some(&head_git_sha))?;
+            ensure_mapping_not_tracked(&mapping_path, &canon_repo, &old_tracked)?;
+            ensure_mapping_not_tracked(&mapping_path, &canon_repo, &target_tracked)?;
             ensure_clean_git_state(&clean_repo, &git_dir)?;
+            let lock_token = Uuid::new_v4().to_string();
             let pending = PendingPublication {
-                format_version: MAPPING_FORMAT_VERSION,
+                format_version: PENDING_PUBLICATION_FORMAT_VERSION,
+                index_lock_token: lock_token.clone(),
                 mapping_path: mapping_path.clone(),
                 ref_name: ref_name.clone(),
                 old_ref_sha: Some(head_git_sha.clone()),
@@ -786,6 +819,7 @@ pub fn export_branch_to_git(
                 prev_head.as_deref(),
                 prev_head_ref.as_deref(),
                 &head_git_sha,
+                &lock_token,
                 SyncMode::Normal,
             )?;
             #[cfg(test)]
@@ -970,9 +1004,15 @@ fn build_and_publish_commit(
     ensure_clean_git_state(clean_repo, git_dir)?;
     let next_mapping_bytes = next_mapping.serialize_bounded(max_mapping_bytes)?;
 
-    // 6. Persist the crash-recoverable pending publication record BEFORE moving the ref.
+    // 6. Ensure the validated mapping parent directory exists (now that all overlap,
+    //    tracked-path, and clean checks have succeeded) and persist the crash-recoverable
+    //    pending publication record BEFORE moving the ref.
+    let mapping_parent = effective_parent(mapping_path)?;
+    ensure_dir_no_symlink(&mapping_parent)?;
+    let lock_token = Uuid::new_v4().to_string();
     let pending = PendingPublication {
-        format_version: MAPPING_FORMAT_VERSION,
+        format_version: PENDING_PUBLICATION_FORMAT_VERSION,
+        index_lock_token: lock_token.clone(),
         mapping_path: mapping_path.to_path_buf(),
         ref_name: ref_name.to_string(),
         old_ref_sha: old_ref_sha.map(str::to_string),
@@ -1018,6 +1058,7 @@ fn build_and_publish_commit(
         prev_head_sha.as_deref(),
         prev_head_ref.as_deref(),
         &new_commit_sha,
+        &lock_token,
         SyncMode::Normal,
     )?;
     #[cfg(test)]
@@ -1030,6 +1071,7 @@ fn build_and_publish_commit(
 #[allow(clippy::too_many_arguments)]
 fn reconcile_pending_publication(
     clean_repo: &Path,
+    canon_repo: &Path,
     git_dir: &Path,
     pending_path: &Path,
     mapping_path: &Path,
@@ -1074,16 +1116,27 @@ fn reconcile_pending_publication(
             GitError::InvalidMapping("pending publication record missing format_version".into())
         })?;
     let found = u32::try_from(found_u64).unwrap_or(u32::MAX);
-    if found != MAPPING_FORMAT_VERSION {
+    if found != PENDING_PUBLICATION_FORMAT_VERSION {
         return Err(GitError::UnsupportedFormatVersion {
             file: label,
             found,
-            supported: MAPPING_FORMAT_VERSION,
+            supported: PENDING_PUBLICATION_FORMAT_VERSION,
         });
     }
     let pending: PendingPublication = serde_json::from_value(raw_val).map_err(|e| {
         GitError::InvalidMapping(format!("invalid pending publication record: {e}"))
     })?;
+    if pending.index_lock_token.is_empty()
+        || pending.index_lock_token.len() > 128
+        || pending
+            .index_lock_token
+            .bytes()
+            .any(|b| b == b'\n' || b == b'\r' || b == 0)
+    {
+        return Err(GitError::InvalidMapping(
+            "pending publication record has invalid index_lock_token".into(),
+        ));
+    }
     if pending.ref_name != ref_name || pending.mapping_path != mapping_path {
         return Err(GitError::InvalidMapping(format!(
             "unreconciled pending publication at {} does not match current export target",
@@ -1124,6 +1177,13 @@ fn reconcile_pending_publication(
             branch_head, pending.old_ref_sha, pending.new_commit_sha
         )));
     }
+
+    // Verify `mapping_path` never aliases any tracked file in the prior or target commits.
+    let old_tracked =
+        list_tracked_paths_in_commit(clean_repo, pending.prev_checkout_sha.as_deref())?;
+    let target_tracked = list_tracked_paths_in_commit(clean_repo, Some(&pending.new_commit_sha))?;
+    ensure_mapping_not_tracked(mapping_path, canon_repo, &old_tracked)?;
+    ensure_mapping_not_tracked(mapping_path, canon_repo, &target_tracked)?;
 
     // Complete mapping persistence if this pending record carries a new mapping entry,
     // verifying existing mapping consistency first.
@@ -1173,8 +1233,8 @@ fn reconcile_pending_publication(
     }
 
     // Replay or finish the checkout under `.git/index.lock` using the recorded prior
-    // checkout identity, accepting files matching either the prior or target blob while
-    // refusing any local edits, unmanaged collisions, or concurrent staging.
+    // checkout identity and lock ownership token, accepting files matching either the prior
+    // or target blob while refusing any local edits, unmanaged collisions, or foreign locks.
     sync_worktree_to_commit_no_filters(
         clean_repo,
         git_dir,
@@ -1182,6 +1242,7 @@ fn reconcile_pending_publication(
         pending.prev_checkout_sha.as_deref(),
         pending.prev_head_ref.as_deref(),
         &pending.new_commit_sha,
+        &pending.index_lock_token,
         SyncMode::Recovery,
     )?;
 
@@ -1958,36 +2019,91 @@ fn validate_git_branch_name(name: &str) -> GitResult<()> {
     Ok(())
 }
 
-/// Validate and prepare the custom mapping path and its parent directory BEFORE publishing
-/// any Git commits, including bare relative paths such as `mapping.json`, returning one
-/// canonical absolute destination path used consistently for all reads, journals, and writes.
-fn prepare_mapping_path_safe(path: &Path) -> GitResult<PathBuf> {
+/// Resolve a custom mapping path read-only (WITHOUT creating any missing parent
+/// directories), rejecting symlinks on existing ancestors or the destination file, and
+/// returning one canonical absolute destination path for overlap checks, journals, and
+/// persistence.
+fn resolve_mapping_path_readonly(path: &Path) -> GitResult<PathBuf> {
     let parent = effective_parent(path)?;
-    ensure_dir_no_symlink(&parent)?;
+    let label = path.display().to_string();
+    verify_no_symlink_components(&parent, &label)?;
     let file_name = path.file_name().ok_or_else(|| GitError::UnsafePath {
-        path: path.display().to_string(),
+        path: label.clone(),
         reason: "mapping path must name a file".into(),
     })?;
-    let clean_path = parent.join(file_name);
-    check_dest_file_not_symlink(&clean_path)?;
-    let canon_parent = fs::canonicalize(&parent).map_err(|e| GitError::io(&parent, e))?;
-    Ok(canon_parent.join(file_name))
+
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = parent;
+    let existing_base = loop {
+        match fs::symlink_metadata(&probe) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(GitError::UnsafePath {
+                        path: label,
+                        reason: format!(
+                            "mapping ancestor {} must not be a symlink",
+                            probe.display()
+                        ),
+                    });
+                }
+                if !meta.file_type().is_dir() {
+                    return Err(GitError::UnsafePath {
+                        path: label,
+                        reason: format!("mapping ancestor {} is not a directory", probe.display()),
+                    });
+                }
+                break probe;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let Some(name) = probe.file_name() else {
+                    return Err(GitError::io(&probe, e));
+                };
+                missing.push(name.to_os_string());
+                match probe.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => probe = p.to_path_buf(),
+                    _ => {
+                        let dot = PathBuf::from(".");
+                        verify_existing_dir_no_symlink(&dot, ".")?;
+                        break dot;
+                    }
+                }
+            }
+            Err(e) => return Err(GitError::io(&probe, e)),
+        }
+    };
+
+    let mut canon_parent =
+        fs::canonicalize(&existing_base).map_err(|e| GitError::io(&existing_base, e))?;
+    let parent_existed = missing.is_empty();
+    for seg in missing.into_iter().rev() {
+        canon_parent.push(seg);
+    }
+    let resolved = canon_parent.join(file_name);
+    if parent_existed {
+        check_dest_file_not_symlink(&resolved)?;
+    }
+    Ok(resolved)
 }
 
-/// Refuse any custom mapping destination that aliases internal Git/pending metadata or
-/// published canonical tree directories (`.sparkles-git/`, `graphs/`).
+/// Refuse any mapping destination that aliases internal Git/pending metadata or published
+/// canonical tree directories (`.sparkles-git/`, `graphs/`). Custom `--mapping` paths are
+/// never permitted anywhere inside `.git/`.
 fn validate_mapping_destination_no_overlap(
     mapping_path: &Path,
     canon_repo: &Path,
     git_dir: &Path,
     pending_path: &Path,
+    is_custom_mapping: bool,
 ) -> GitResult<()> {
     let sparkles_dir = git_dir.join(DEFAULT_SPARKLES_GIT_SUBDIR);
     let pending_dir = sparkles_dir.join(DEFAULT_PENDING_SUBDIR);
     let staging_dir = sparkles_dir.join(DEFAULT_STAGING_SUBDIR);
     let lock_path = sparkles_dir.join("export.lock");
-    let forbidden_reason = if mapping_path == pending_path || mapping_path.starts_with(&pending_dir)
+    let forbidden_reason = if is_custom_mapping
+        && (mapping_path == git_dir || mapping_path.starts_with(git_dir))
     {
+        Some("custom mapping path must not lie inside internal Git metadata directory (.git/)")
+    } else if mapping_path == pending_path || mapping_path.starts_with(&pending_dir) {
         Some("mapping path must not alias Sparkles pending publication directory")
     } else if mapping_path.starts_with(&staging_dir) {
         Some("mapping path must not alias Sparkles staging directory")
@@ -1996,6 +2112,7 @@ fn validate_mapping_destination_no_overlap(
     } else if mapping_path == git_dir.join("index")
         || mapping_path == git_dir.join("index.lock")
         || mapping_path == git_dir.join("HEAD")
+        || mapping_path == git_dir.join("HEAD.lock")
         || mapping_path.starts_with(git_dir.join("refs"))
         || mapping_path.starts_with(git_dir.join("objects"))
     {
@@ -2014,6 +2131,23 @@ fn validate_mapping_destination_no_overlap(
             path: mapping_path.display().to_string(),
             reason: reason.into(),
         });
+    }
+    Ok(())
+}
+
+/// Verify that `mapping_path` does not alias any tracked path in `tracked_paths`.
+fn ensure_mapping_not_tracked(
+    mapping_path: &Path,
+    canon_repo: &Path,
+    tracked_paths: &HashSet<String>,
+) -> GitResult<()> {
+    for rel in tracked_paths {
+        if mapping_path == canon_repo.join(rel) {
+            return Err(GitError::UnsafePath {
+                path: mapping_path.display().to_string(),
+                reason: format!("mapping path must not alias repository tracked path {rel:?}"),
+            });
+        }
     }
     Ok(())
 }
@@ -2253,64 +2387,228 @@ enum SyncMode {
     Recovery,
 }
 
+fn index_lock_payload(token: &str) -> Vec<u8> {
+    format!("{INDEX_LOCK_PREFIX}{token}\n").into_bytes()
+}
+
 /// Exclusive lock on `<git-dir>/index.lock` following Git's lockfile protocol so external
 /// `git add`/`git rm`/`git checkout` cannot race with index inspection, worktree sync, or
 /// the atomic swap of `.git/index`.
+///
+/// The lock file contains a unique per-publication ownership token (`sparkles-git-index-lock-v1:<token>\n`)
+/// and is also held with an OS advisory lock (`File::try_lock`), installed atomically via
+/// `hard_link` from `<git-dir>/sparkles/staging/`. If a process crashes abruptly while
+/// holding `.git/index.lock`, recovery under [`SyncMode::Recovery`] verifies both exact
+/// token ownership and that no live process holds the OS lock before reclaiming it, while
+/// refusing any active or foreign `.git/index.lock`.
 struct GitIndexLock {
     lock_path: PathBuf,
-    file: Option<File>,
+    _file: Option<File>,
     committed: bool,
 }
 
 impl GitIndexLock {
-    fn acquire(git_dir: &Path) -> GitResult<Self> {
+    fn acquire(git_dir: &Path, lock_token: &str, allow_reclaim: bool) -> GitResult<Self> {
         let lock_path = git_dir.join("index.lock");
+        let payload = index_lock_payload(lock_token);
+        let sparkles_dir = ensure_child_dir_no_symlink(git_dir, DEFAULT_SPARKLES_GIT_SUBDIR)?;
+        let staging_dir = ensure_child_dir_no_symlink(&sparkles_dir, DEFAULT_STAGING_SUBDIR)?;
+
+        // Stage the ownership payload into a temp file, sync it, and lock its inode BEFORE
+        // linking it into `.git/index.lock` so `.git/index.lock` is never visible empty.
+        let mut tmp = tempfile::Builder::new()
+            .prefix("index-lock-")
+            .tempfile_in(&staging_dir)
+            .map_err(|e| GitError::io(&staging_dir, e))?;
+        tmp.as_file_mut()
+            .write_all(&payload)
+            .map_err(|e| GitError::io(tmp.path(), e))?;
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| GitError::io(tmp.path(), e))?;
+        tmp.as_file()
+            .try_lock()
+            .map_err(|e| GitError::io(tmp.path(), io::Error::other(e.to_string())))?;
+
+        match fs::hard_link(tmp.path(), &lock_path) {
+            Ok(()) => {
+                let (file, tmp_path) = tmp.into_parts();
+                let _ = fs::remove_file(&tmp_path);
+                crate::fsutil::sync_dir(git_dir).map_err(|e| GitError::io(git_dir, e))?;
+                Ok(Self {
+                    lock_path,
+                    _file: Some(file),
+                    committed: false,
+                })
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                drop(tmp);
+                if allow_reclaim {
+                    Self::try_reclaim(&lock_path, &payload)
+                } else {
+                    Err(Self::busy_error(&lock_path))
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::Unsupported
+                        | io::ErrorKind::CrossesDevices
+                        | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                drop(tmp);
+                Self::acquire_create_new(git_dir, &lock_path, &payload, allow_reclaim)
+            }
+            Err(e) => Err(GitError::io(&lock_path, e)),
+        }
+    }
+
+    fn acquire_create_new(
+        git_dir: &Path,
+        lock_path: &Path,
+        payload: &[u8],
+        allow_reclaim: bool,
+    ) -> GitResult<Self> {
         let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
+        opts.read(true).write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.custom_flags(libc::O_NOFOLLOW);
         }
-        let file = opts.open(&lock_path).map_err(|e| {
-            if e.kind() == io::ErrorKind::AlreadyExists {
-                GitError::InvalidMapping(format!(
-                    "refusing to modify Git index while {} exists (another Git operation is in \
-                     progress)",
-                    lock_path.display()
-                ))
-            } else {
-                GitError::io(&lock_path, e)
+        let mut file = match opts.open(lock_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                if allow_reclaim {
+                    return Self::try_reclaim(lock_path, payload);
+                }
+                return Err(Self::busy_error(lock_path));
             }
-        })?;
+            Err(e) => return Err(GitError::io(lock_path, e)),
+        };
+        file.try_lock()
+            .map_err(|e| GitError::io(lock_path, io::Error::other(e.to_string())))?;
+        file.write_all(payload)
+            .map_err(|e| GitError::io(lock_path, e))?;
+        file.sync_all().map_err(|e| GitError::io(lock_path, e))?;
+        crate::fsutil::sync_dir(git_dir).map_err(|e| GitError::io(git_dir, e))?;
         Ok(Self {
-            lock_path,
-            file: Some(file),
+            lock_path: lock_path.to_path_buf(),
+            _file: Some(file),
             committed: false,
         })
     }
 
-    fn commit_index_bytes(mut self, git_dir: &Path, bytes: &[u8]) -> GitResult<()> {
-        let mut f = self.file.take().expect("index lock file held");
-        f.write_all(bytes)
-            .map_err(|e| GitError::io(&self.lock_path, e))?;
-        f.sync_all().map_err(|e| GitError::io(&self.lock_path, e))?;
+    fn try_reclaim(lock_path: &Path, expected_payload: &[u8]) -> GitResult<Self> {
+        let lmeta = match fs::symlink_metadata(lock_path) {
+            Ok(m) => m,
+            Err(e) => return Err(GitError::io(lock_path, e)),
+        };
+        if lmeta.file_type().is_symlink() || !lmeta.file_type().is_file() {
+            return Err(Self::busy_error(lock_path));
+        }
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let mut file = match opts.open(lock_path) {
+            Ok(f) => f,
+            Err(_) => return Err(Self::busy_error(lock_path)),
+        };
+        let fmeta = file.metadata().map_err(|e| GitError::io(lock_path, e))?;
+        if !fmeta.file_type().is_file() {
+            return Err(Self::busy_error(lock_path));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if (fmeta.dev(), fmeta.ino()) != (lmeta.dev(), lmeta.ino()) {
+                return Err(Self::busy_error(lock_path));
+            }
+        }
+        // Refuse if any live process still holds the OS lock on this inode.
+        if file.try_lock().is_err() {
+            return Err(Self::busy_error(lock_path));
+        }
+        let mut buf = Vec::with_capacity(expected_payload.len() + 1);
+        Read::by_ref(&mut file)
+            .take((expected_payload.len() as u64).saturating_add(1))
+            .read_to_end(&mut buf)
+            .map_err(|e| GitError::io(lock_path, e))?;
+        if buf != expected_payload {
+            return Err(Self::busy_error(lock_path));
+        }
+        // Confirm the directory entry still refers to the exact inode we locked and verified.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let lmeta2 = fs::symlink_metadata(lock_path).map_err(|e| GitError::io(lock_path, e))?;
+            if lmeta2.file_type().is_symlink()
+                || (fmeta.dev(), fmeta.ino()) != (lmeta2.dev(), lmeta2.ino())
+            {
+                return Err(Self::busy_error(lock_path));
+            }
+        }
+        Ok(Self {
+            lock_path: lock_path.to_path_buf(),
+            _file: Some(file),
+            committed: false,
+        })
+    }
+
+    fn busy_error(lock_path: &Path) -> GitError {
+        GitError::InvalidMapping(format!(
+            "refusing to modify Git index while {} exists (another Git operation is in progress)",
+            lock_path.display()
+        ))
+    }
+
+    /// Atomically install the already-built `staged_index_path` into `<git-dir>/index`
+    /// while `.git/index.lock` continues to hold our ownership token, then release the lock.
+    fn commit_index_from_path(mut self, git_dir: &Path, staged_index_path: &Path) -> GitResult<()> {
+        let f = File::open(staged_index_path).map_err(|e| GitError::io(staged_index_path, e))?;
+        f.sync_all()
+            .map_err(|e| GitError::io(staged_index_path, e))?;
         drop(f);
+
         let index_path = git_dir.join("index");
         check_dest_file_not_symlink(&index_path)?;
-        fs::rename(&self.lock_path, &index_path).map_err(|e| GitError::io(&index_path, e))?;
-        self.committed = true;
+        match fs::rename(staged_index_path, &index_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+                let bytes = fs::read(staged_index_path)
+                    .map_err(|err| GitError::io(staged_index_path, err))?;
+                write_atomic_safe(&index_path, &bytes)?;
+                let _ = fs::remove_file(staged_index_path);
+            }
+            Err(e) => return Err(GitError::io(&index_path, e)),
+        }
         crate::fsutil::sync_dir(git_dir).map_err(|e| GitError::io(git_dir, e))?;
+        match fs::remove_file(&self.lock_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(GitError::io(&self.lock_path, e)),
+        }
+        crate::fsutil::sync_dir(git_dir).map_err(|e| GitError::io(git_dir, e))?;
+        self.committed = true;
+        self._file.take();
         Ok(())
     }
 }
 
 impl Drop for GitIndexLock {
     fn drop(&mut self) {
-        self.file.take();
         if !self.committed {
             let _ = fs::remove_file(&self.lock_path);
+            if let Some(parent) = self.lock_path.parent() {
+                let _ = crate::fsutil::sync_dir(parent);
+            }
         }
+        self._file.take();
     }
 }
 
@@ -2419,87 +2717,387 @@ fn read_index_entries(clean_repo: &Path) -> GitResult<BTreeMap<String, TreeBlobE
     Ok(entries)
 }
 
-fn git_cat_file_batch(clean_repo: &Path, oids: &[&str]) -> GitResult<HashMap<String, Vec<u8>>> {
-    let mut unique: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    for oid in oids {
-        let lower = oid.to_ascii_lowercase();
-        if seen.insert(lower.clone()) {
-            unique.push(lower);
-        }
+/// Stream blobs from `git cat-file --batch` in request order without deadlocking on pipe
+/// buffers and without materializing the batch stdout in memory.
+///
+/// Feeds OIDs into `stdin` on a scoped writer thread and drains bounded `stderr` on a
+/// second scoped thread while the calling thread streams each `<oid> blob <size>\n<body>\n`
+/// entry directly into `on_blob`.
+fn stream_git_blobs<F>(clean_repo: &Path, oids: &[&str], mut on_blob: F) -> GitResult<()>
+where
+    F: FnMut(usize, &str, u64, &mut dyn Read) -> GitResult<()>,
+{
+    if oids.is_empty() {
+        return Ok(());
     }
-    if unique.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let mut stdin = String::new();
-    for oid in &unique {
-        stdin.push_str(oid);
-        stdin.push('\n');
-    }
-    let raw =
-        run_git_bytes_with_stdin(clean_repo, &["cat-file", "--batch"], &[], stdin.as_bytes())?;
-    let mut out = HashMap::with_capacity(unique.len());
-    let mut cursor = 0usize;
-    for req_oid in unique {
-        let Some(nl_rel) = raw[cursor..].iter().position(|&b| b == b'\n') else {
-            return Err(GitError::InvalidMapping(format!(
-                "truncated git cat-file --batch header for {req_oid}"
-            )));
-        };
-        let header = std::str::from_utf8(&raw[cursor..cursor + nl_rel])
-            .map_err(|_| GitError::InvalidMapping("non-UTF-8 git cat-file header".into()))?;
-        cursor += nl_rel + 1;
-        let parts: Vec<&str> = header.split_whitespace().collect();
-        if parts.len() != 3 || parts[1] != "blob" {
-            return Err(GitError::InvalidMapping(format!(
-                "unexpected git cat-file --batch entry for {req_oid}: {header:?}"
-            )));
+    let clean = normalize_dir_for_lstat(clean_repo)?;
+    let mut cmd = git_command(&clean);
+    cmd.args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| GitError::GitCommand {
+        args: vec!["cat-file".into(), "--batch".into()],
+        status: None,
+        stderr: e.to_string(),
+    })?;
+    let stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+
+    let mut reader_err: Option<GitError> = None;
+    let (write_res, stderr_bytes) = std::thread::scope(|scope| {
+        let writer_handle = scope.spawn(move || -> io::Result<()> {
+            let mut bw = BufWriter::new(stdin);
+            for oid in oids {
+                if let Err(e) = bw
+                    .write_all(oid.as_bytes())
+                    .and_then(|()| bw.write_all(b"\n"))
+                {
+                    if e.kind() == io::ErrorKind::BrokenPipe {
+                        return Ok(());
+                    }
+                    return Err(e);
+                }
+            }
+            if let Err(e) = bw.flush()
+                && e.kind() != io::ErrorKind::BrokenPipe
+            {
+                return Err(e);
+            }
+            Ok(())
+        });
+        let stderr_handle = scope.spawn(move || -> Vec<u8> {
+            let mut buf = Vec::new();
+            let mut limited = stderr.take(64 * 1024);
+            let _ = limited.read_to_end(&mut buf);
+            let mut rest = limited.into_inner();
+            let _ = io::copy(&mut rest, &mut io::sink());
+            buf
+        });
+
+        let mut reader = BufReader::with_capacity(64 * 1024, stdout);
+        let mut header_buf = Vec::with_capacity(128);
+        for (idx, &req_oid) in oids.iter().enumerate() {
+            header_buf.clear();
+            let read_hdr = read_line_bounded(&mut reader, &mut header_buf, 1024);
+            let n = match read_hdr {
+                Ok(n) => n,
+                Err(e) => {
+                    reader_err = Some(e);
+                    break;
+                }
+            };
+            if n == 0 {
+                reader_err = Some(GitError::InvalidMapping(format!(
+                    "truncated git cat-file --batch header for {req_oid}"
+                )));
+                break;
+            }
+            let header = match std::str::from_utf8(&header_buf) {
+                Ok(s) => s.trim_end_matches(['\r', '\n']),
+                Err(_) => {
+                    reader_err = Some(GitError::InvalidMapping(
+                        "non-UTF-8 git cat-file header".into(),
+                    ));
+                    break;
+                }
+            };
+            let parts: Vec<&str> = header.split_whitespace().collect();
+            if parts.len() != 3 || parts[1] != "blob" {
+                reader_err = Some(GitError::InvalidMapping(format!(
+                    "unexpected git cat-file --batch entry for {req_oid}: {header:?}"
+                )));
+                break;
+            }
+            let size: u64 = match parts[2].parse() {
+                Ok(sz) => sz,
+                Err(_) => {
+                    reader_err = Some(GitError::InvalidMapping(format!(
+                        "invalid git cat-file --batch size for {req_oid}: {:?}",
+                        parts[2]
+                    )));
+                    break;
+                }
+            };
+            let mut limited = reader.by_ref().take(size);
+            if let Err(e) = on_blob(idx, req_oid, size, &mut limited) {
+                reader_err = Some(e);
+                break;
+            }
+            if limited.limit() > 0 {
+                match io::copy(&mut limited, &mut io::sink()) {
+                    Ok(_) if limited.limit() == 0 => {}
+                    Ok(_) => {
+                        reader_err = Some(GitError::InvalidMapping(format!(
+                            "truncated git cat-file --batch body for {req_oid}"
+                        )));
+                        break;
+                    }
+                    Err(e) => {
+                        reader_err = Some(GitError::GitCommand {
+                            args: vec!["cat-file".into(), "--batch".into()],
+                            status: None,
+                            stderr: e.to_string(),
+                        });
+                        break;
+                    }
+                }
+            }
+            let mut nl = [0u8; 1];
+            match reader.read_exact(&mut nl) {
+                Ok(()) if nl[0] == b'\n' => {}
+                Ok(()) => {
+                    reader_err = Some(GitError::InvalidMapping(
+                        "missing trailing newline in git cat-file --batch output".into(),
+                    ));
+                    break;
+                }
+                Err(_) => {
+                    reader_err = Some(GitError::InvalidMapping(format!(
+                        "truncated trailing newline in git cat-file --batch output for {req_oid}"
+                    )));
+                    break;
+                }
+            }
         }
-        let size: usize = parts[2].parse().map_err(|_| {
-            GitError::InvalidMapping(format!(
-                "invalid git cat-file --batch size for {req_oid}: {:?}",
-                parts[2]
-            ))
-        })?;
-        let end = cursor.checked_add(size).ok_or_else(|| {
-            GitError::InvalidMapping(format!("git cat-file --batch size overflow for {req_oid}"))
-        })?;
-        if end > raw.len() {
-            return Err(GitError::InvalidMapping(format!(
-                "truncated git cat-file --batch body for {req_oid}"
-            )));
+        drop(reader);
+        if reader_err.is_some() {
+            let _ = child.kill();
         }
-        out.insert(req_oid, raw[cursor..end].to_vec());
-        cursor = end;
-        if raw.get(cursor) != Some(&b'\n') {
-            return Err(GitError::InvalidMapping(
-                "missing trailing newline in git cat-file --batch output".into(),
-            ));
-        }
-        cursor += 1;
+        let write_res = writer_handle
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("cat-file stdin writer thread panicked")));
+        let stderr_bytes = stderr_handle.join().unwrap_or_default();
+        (write_res, stderr_bytes)
+    });
+
+    let status = child.wait().map_err(|e| GitError::GitCommand {
+        args: vec!["cat-file".into(), "--batch".into()],
+        status: None,
+        stderr: e.to_string(),
+    })?;
+    if let Some(err) = reader_err {
+        return Err(err);
     }
-    Ok(out)
+    write_res.map_err(|e| GitError::GitCommand {
+        args: vec!["cat-file".into(), "--batch".into()],
+        status: status.code(),
+        stderr: e.to_string(),
+    })?;
+    if !status.success() {
+        return Err(GitError::GitCommand {
+            args: vec!["cat-file".into(), "--batch".into()],
+            status: status.code(),
+            stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+        });
+    }
+    Ok(())
 }
 
-fn check_worktree_entry_raw(
+fn read_line_bounded<R: BufRead>(
+    reader: &mut R,
+    out: &mut Vec<u8>,
+    max_len: usize,
+) -> GitResult<usize> {
+    let mut total = 0usize;
+    loop {
+        let avail = reader.fill_buf().map_err(|e| GitError::GitCommand {
+            args: vec!["cat-file".into(), "--batch".into()],
+            status: None,
+            stderr: e.to_string(),
+        })?;
+        if avail.is_empty() {
+            return Ok(total);
+        }
+        let (take, done) = match avail.iter().position(|&b| b == b'\n') {
+            Some(pos) => (pos + 1, true),
+            None => (avail.len(), false),
+        };
+        if total + take > max_len {
+            return Err(GitError::InvalidMapping(
+                "git cat-file --batch header exceeds maximum length".into(),
+            ));
+        }
+        out.extend_from_slice(&avail[..take]);
+        reader.consume(take);
+        total += take;
+        if done {
+            return Ok(total);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ExpectedFileContent {
+    mode: String,
+    len: u64,
+    sha256: String,
+}
+
+fn drain_and_hash_reader(reader: &mut dyn Read, hasher: &mut Sha256Stream) -> io::Result<u64> {
+    let mut buf = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok(total)
+}
+
+/// Stream-compare a working-tree path against a raw Git blob reader in bounded chunks while
+/// computing the blob's SHA-256 digest.
+///
+/// Uses [`resolve_safe_path_allow_leaf_symlink`] for tracked `120000` symlinks and
+/// [`resolve_safe_path`] for regular files, and checks Git's owner execute bit (`0o100`).
+fn stream_compare_and_hash_worktree_entry(
     clean_repo: &Path,
     rel: &str,
     expected: &TreeBlobEntry,
-    expected_bytes: &[u8],
+    blob_size: u64,
+    blob_reader: &mut dyn Read,
     check_filemode: bool,
-) -> GitResult<bool> {
+) -> GitResult<(bool, String)> {
+    let mut hasher = Sha256Stream::new();
+    if expected.mode == "120000" {
+        const MAX_SYMLINK_TARGET_BYTES: u64 = 64 * 1024;
+        if blob_size > MAX_SYMLINK_TARGET_BYTES {
+            let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+            return Ok((false, hasher.finalize_hex()));
+        }
+        let mut target_blob = Vec::with_capacity(blob_size as usize);
+        blob_reader
+            .read_to_end(&mut target_blob)
+            .map_err(|e| GitError::GitCommand {
+                args: vec!["cat-file".into(), "--batch".into()],
+                status: None,
+                stderr: e.to_string(),
+            })?;
+        hasher.update(&target_blob);
+        let digest = hasher.finalize_hex();
+        let full = resolve_safe_path_allow_leaf_symlink(clean_repo, rel)?;
+        let meta = match fs::symlink_metadata(&full) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((false, digest)),
+            Err(e) => return Err(GitError::io(&full, e)),
+        };
+        if !meta.file_type().is_symlink() {
+            return Ok((false, digest));
+        }
+        let target = fs::read_link(&full).map_err(|e| GitError::io(&full, e))?;
+        return Ok((
+            target.as_os_str().as_encoded_bytes() == target_blob.as_slice(),
+            digest,
+        ));
+    }
+
+    if expected.mode != "100644" && expected.mode != "100755" {
+        let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+        return Ok((false, hasher.finalize_hex()));
+    }
+
     let full = resolve_safe_path(clean_repo, rel)?;
     let meta = match fs::symlink_metadata(&full) {
         Ok(m) => m,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+            return Ok((false, hasher.finalize_hex()));
+        }
         Err(e) => return Err(GitError::io(&full, e)),
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+        return Ok((false, hasher.finalize_hex()));
+    }
+    #[cfg(unix)]
+    if check_filemode {
+        use std::os::unix::fs::PermissionsExt;
+        // Git maps regular files to 100755 vs 100644 strictly using the owner execute bit.
+        let is_exec = (meta.permissions().mode() & 0o100) != 0;
+        let expect_exec = expected.mode == "100755";
+        if is_exec != expect_exec {
+            let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+            return Ok((false, hasher.finalize_hex()));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = check_filemode;
+
+    if meta.len() != blob_size {
+        let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+        return Ok((false, hasher.finalize_hex()));
+    }
+    let (mut file, actual_len) = open_regular_file_no_symlink(&full, rel)?;
+    if actual_len != blob_size {
+        let _ = drain_and_hash_reader(blob_reader, &mut hasher);
+        return Ok((false, hasher.finalize_hex()));
+    }
+
+    let mut blob_buf = [0u8; 64 * 1024];
+    let mut file_buf = [0u8; 64 * 1024];
+    let mut matched = true;
+    loop {
+        let n = blob_reader
+            .read(&mut blob_buf)
+            .map_err(|e| GitError::GitCommand {
+                args: vec!["cat-file".into(), "--batch".into()],
+                status: None,
+                stderr: e.to_string(),
+            })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&blob_buf[..n]);
+        if matched {
+            let mut got = 0usize;
+            while got < n {
+                let r = file
+                    .read(&mut file_buf[got..n])
+                    .map_err(|e| GitError::io(&full, e))?;
+                if r == 0 {
+                    matched = false;
+                    break;
+                }
+                got += r;
+            }
+            if matched && file_buf[..n] != blob_buf[..n] {
+                matched = false;
+            }
+        }
+    }
+    if matched {
+        let mut extra = [0u8; 1];
+        if file.read(&mut extra).map_err(|e| GitError::io(&full, e))? != 0 {
+            matched = false;
+        }
+    }
+    Ok((matched, hasher.finalize_hex()))
+}
+
+/// Stream-verify an on-disk path against an [`ExpectedFileContent`] without buffering the
+/// full file in memory.
+fn verify_path_matches_expected(
+    full: &Path,
+    rel: &str,
+    expected: &ExpectedFileContent,
+    check_filemode: bool,
+) -> GitResult<bool> {
+    let meta = match fs::symlink_metadata(full) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(GitError::io(full, e)),
     };
     if expected.mode == "120000" {
         if !meta.file_type().is_symlink() {
             return Ok(false);
         }
-        let target = fs::read_link(&full).map_err(|e| GitError::io(&full, e))?;
-        return Ok(target.as_os_str().as_encoded_bytes() == expected_bytes);
+        let target = fs::read_link(full).map_err(|e| GitError::io(full, e))?;
+        let raw = target.as_os_str().as_encoded_bytes();
+        return Ok(raw.len() as u64 == expected.len && sha256_hex(raw) == expected.sha256);
     }
     if expected.mode != "100644" && expected.mode != "100755" {
         return Ok(false);
@@ -2510,7 +3108,7 @@ fn check_worktree_entry_raw(
     #[cfg(unix)]
     if check_filemode {
         use std::os::unix::fs::PermissionsExt;
-        let is_exec = (meta.permissions().mode() & 0o111) != 0;
+        let is_exec = (meta.permissions().mode() & 0o100) != 0;
         let expect_exec = expected.mode == "100755";
         if is_exec != expect_exec {
             return Ok(false);
@@ -2519,17 +3117,76 @@ fn check_worktree_entry_raw(
     #[cfg(not(unix))]
     let _ = check_filemode;
 
-    if meta.len() != expected_bytes.len() as u64 {
+    if meta.len() != expected.len {
         return Ok(false);
     }
-    let (mut file, actual_len) = open_regular_file_no_symlink(&full, rel)?;
-    if actual_len != expected_bytes.len() as u64 {
+    let (mut file, actual_len) = open_regular_file_no_symlink(full, rel)?;
+    if actual_len != expected.len {
         return Ok(false);
     }
-    let mut actual = Vec::with_capacity(expected_bytes.len());
-    file.read_to_end(&mut actual)
-        .map_err(|e| GitError::io(&full, e))?;
-    Ok(actual == expected_bytes)
+    let mut hasher = Sha256Stream::new();
+    let total = drain_and_hash_reader(&mut file, &mut hasher).map_err(|e| GitError::io(full, e))?;
+    Ok(total == expected.len && hasher.finalize_hex() == expected.sha256)
+}
+
+fn verify_open_file_matches_expected(
+    file: &mut File,
+    path_for_err: &Path,
+    expected: &ExpectedFileContent,
+    check_filemode: bool,
+) -> GitResult<bool> {
+    let meta = file.metadata().map_err(|e| GitError::io(path_for_err, e))?;
+    if !meta.file_type().is_file() {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    if check_filemode {
+        use std::os::unix::fs::PermissionsExt;
+        let is_exec = (meta.permissions().mode() & 0o100) != 0;
+        let expect_exec = expected.mode == "100755";
+        if is_exec != expect_exec {
+            return Ok(false);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = check_filemode;
+
+    if meta.len() != expected.len {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| GitError::io(path_for_err, e))?;
+    let mut hasher = Sha256Stream::new();
+    let total =
+        drain_and_hash_reader(file, &mut hasher).map_err(|e| GitError::io(path_for_err, e))?;
+    Ok(total == expected.len && hasher.finalize_hex() == expected.sha256)
+}
+
+#[cfg(target_os = "linux")]
+fn renameat2_exchange(a: &Path, b: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let ca = CString::new(a.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let cb = CString::new(b.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: `ca` and `cb` are valid NUL-terminated C strings passed to the Linux
+    // `renameat2` syscall with `AT_FDCWD` and `RENAME_EXCHANGE`.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            ca.as_ptr(),
+            libc::AT_FDCWD,
+            cb.as_ptr(),
+            libc::RENAME_EXCHANGE as libc::c_uint,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Verify that the repository has no in-progress Git operation, that `.git/index` matches
@@ -2557,30 +3214,39 @@ fn ensure_clean_git_state(repo_dir: &Path, git_dir: &Path) -> GitResult<()> {
     if expected_tree.is_empty() {
         return Ok(());
     }
-    let oids: Vec<&str> = expected_tree
-        .values()
-        .filter(|e| matches!(e.mode.as_str(), "100644" | "100755" | "120000"))
-        .map(|e| e.oid.as_str())
-        .collect();
-    let blobs = git_cat_file_batch(repo_dir, &oids)?;
-    let check_filemode = git_core_filemode(repo_dir);
+    let mut items: Vec<(&str, &TreeBlobEntry)> = Vec::with_capacity(expected_tree.len());
+    let mut oids: Vec<&str> = Vec::with_capacity(expected_tree.len());
     for (rel, entry) in &expected_tree {
-        let Some(expected_bytes) = blobs.get(&entry.oid) else {
+        if !matches!(entry.mode.as_str(), "100644" | "100755" | "120000") {
             return Err(GitError::InvalidMapping(format!(
                 "refusing to export into a Git repository with unsupported tracked entry {rel:?} \
                  (mode {})",
                 entry.mode
             )));
-        };
-        if !check_worktree_entry_raw(repo_dir, rel, entry, expected_bytes, check_filemode)? {
+        }
+        items.push((rel.as_str(), entry));
+        oids.push(entry.oid.as_str());
+    }
+    let check_filemode = git_core_filemode(repo_dir);
+    stream_git_blobs(repo_dir, &oids, |idx, _, blob_size, blob_reader| {
+        let (rel, entry) = items[idx];
+        let (matched, _) = stream_compare_and_hash_worktree_entry(
+            repo_dir,
+            rel,
+            entry,
+            blob_size,
+            blob_reader,
+            check_filemode,
+        )?;
+        if !matched {
             return Err(GitError::InvalidMapping(
                 "refusing to export into a Git repository with uncommitted modifications to \
                  tracked files"
                     .into(),
             ));
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn list_tracked_paths_in_commit(
@@ -2628,15 +3294,308 @@ fn preflight_worktree_collisions(
     Ok(())
 }
 
+enum WriteExpectation {
+    Absent,
+    Existing {
+        old: ExpectedFileContent,
+        recovery_target: Option<ExpectedFileContent>,
+    },
+}
+
+struct PlannedWrite {
+    rel: String,
+    target_mode: String,
+    target_oid: String,
+    expectation: WriteExpectation,
+}
+
+struct PlannedRemoval {
+    rel: String,
+    expected: ExpectedFileContent,
+}
+
+fn stage_blob_into_temp(
+    staging_dir: &Path,
+    target_mode: &str,
+    blob_reader: &mut dyn Read,
+) -> GitResult<tempfile::TempPath> {
+    let mut tmp = tempfile::Builder::new()
+        .prefix("worktree-")
+        .tempfile_in(staging_dir)
+        .map_err(|e| GitError::io(staging_dir, e))?;
+    {
+        let mut bw = BufWriter::with_capacity(64 * 1024, tmp.as_file_mut());
+        io::copy(blob_reader, &mut bw).map_err(|e| GitError::io(staging_dir, e))?;
+        bw.flush().map_err(|e| GitError::io(staging_dir, e))?;
+    }
+    #[cfg(unix)]
+    if target_mode == "100755" {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o755);
+        tmp.as_file()
+            .set_permissions(perms)
+            .map_err(|e| GitError::io(tmp.path(), e))?;
+    }
+    #[cfg(not(unix))]
+    let _ = target_mode;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| GitError::io(tmp.path(), e))?;
+    Ok(tmp.into_temp_path())
+}
+
+fn restage_temp_in_dir(
+    temp_path: tempfile::TempPath,
+    dest_dir: &Path,
+    target_mode: &str,
+) -> GitResult<tempfile::TempPath> {
+    let mut src = File::open(&temp_path).map_err(|e| GitError::io(&temp_path, e))?;
+    let next = stage_blob_into_temp(dest_dir, target_mode, &mut src)?;
+    drop(temp_path);
+    Ok(next)
+}
+
+fn install_absent_noclobber(
+    temp_path: tempfile::TempPath,
+    full: &Path,
+    parent: &Path,
+    rel: &str,
+    target_mode: &str,
+) -> GitResult<()> {
+    match temp_path.persist_noclobber(full) {
+        Ok(_) => {
+            crate::fsutil::sync_dir(parent).map_err(|e| GitError::io(parent, e))?;
+            Ok(())
+        }
+        Err(err) if err.error.kind() == io::ErrorKind::AlreadyExists => Err(GitError::UnsafePath {
+            path: rel.to_string(),
+            reason: format!(
+                "refusing to overwrite file created concurrently at {rel:?} in repository working \
+                 tree"
+            ),
+        }),
+        Err(err) if err.error.kind() == io::ErrorKind::CrossesDevices => {
+            let local_tmp = restage_temp_in_dir(err.path, parent, target_mode)?;
+            match local_tmp.persist_noclobber(full) {
+                Ok(_) => {
+                    crate::fsutil::sync_dir(parent).map_err(|e| GitError::io(parent, e))?;
+                    Ok(())
+                }
+                Err(e2) if e2.error.kind() == io::ErrorKind::AlreadyExists => {
+                    Err(GitError::UnsafePath {
+                        path: rel.to_string(),
+                        reason: format!(
+                            "refusing to overwrite file created concurrently at {rel:?} in \
+                             repository working tree"
+                        ),
+                    })
+                }
+                Err(e2) => Err(GitError::io(full, e2.error)),
+            }
+        }
+        Err(err) => Err(GitError::io(full, err.error)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replace_existing_preserving_concurrent_edits(
+    mut temp_path: tempfile::TempPath,
+    full: &Path,
+    parent: &Path,
+    rel: &str,
+    target_mode: &str,
+    old: &ExpectedFileContent,
+    recovery_target: Option<&ExpectedFileContent>,
+    check_filemode: bool,
+) -> GitResult<()> {
+    // 1. Mutation-boundary ownership re-check BEFORE touching `full`.
+    if let Some(rt) = recovery_target
+        && verify_path_matches_expected(full, rel, rt, check_filemode)?
+    {
+        return Ok(());
+    }
+    if !verify_path_matches_expected(full, rel, old, check_filemode)? {
+        return Err(GitError::InvalidMapping(format!(
+            "refusing to overwrite locally modified tracked file {rel:?}"
+        )));
+    }
+
+    // 2. On Linux, perform an atomic `RENAME_EXCHANGE` swap so any concurrent edit or
+    //    atomic replacement that raced with the mutation lands in `temp_path`, where we
+    //    verify it and swap back immediately if it changed.
+    #[cfg(target_os = "linux")]
+    {
+        let mut exchanged = renameat2_exchange(temp_path.as_ref(), full);
+        if let Err(ref e) = exchanged
+            && e.kind() == io::ErrorKind::CrossesDevices
+        {
+            temp_path = restage_temp_in_dir(temp_path, parent, target_mode)?;
+            exchanged = renameat2_exchange(temp_path.as_ref(), full);
+        }
+        match exchanged {
+            Ok(()) => {
+                let swapped_ok =
+                    verify_path_matches_expected(temp_path.as_ref(), rel, old, check_filemode)?
+                        || recovery_target.is_some_and(|rt| {
+                            verify_path_matches_expected(
+                                temp_path.as_ref(),
+                                rel,
+                                rt,
+                                check_filemode,
+                            )
+                            .unwrap_or(false)
+                        });
+                if !swapped_ok {
+                    // Intervening edit or replacement detected right at the mutation boundary:
+                    // atomically restore the user's file back to `full` and refuse.
+                    let _ = renameat2_exchange(temp_path.as_ref(), full);
+                    let _ = crate::fsutil::sync_dir(parent);
+                    return Err(GitError::InvalidMapping(format!(
+                        "refusing to overwrite concurrently modified tracked file {rel:?}"
+                    )));
+                }
+                drop(temp_path);
+                crate::fsutil::sync_dir(parent).map_err(|e| GitError::io(parent, e))?;
+                return Ok(());
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(GitError::InvalidMapping(format!(
+                    "refusing worktree sync: tracked file {rel:?} disappeared concurrently"
+                )));
+            }
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
+                ) =>
+            {
+                // Filesystem does not support RENAME_EXCHANGE; fall through to open-fd fallback.
+            }
+            Err(e) => return Err(GitError::io(full, e)),
+        }
+    }
+
+    // 3. Portable fallback: hold an open fd on the original inode across rename, and re-check
+    //    its contents immediately after rename to detect and restore any in-place write.
+    let (mut orig_fd, _) = open_regular_file_no_symlink(full, rel)?;
+    if !verify_open_file_matches_expected(&mut orig_fd, full, old, check_filemode)? {
+        return Err(GitError::InvalidMapping(format!(
+            "refusing to overwrite locally modified tracked file {rel:?}"
+        )));
+    }
+    match temp_path.persist(full) {
+        Ok(_) => {}
+        Err(err) if err.error.kind() == io::ErrorKind::CrossesDevices => {
+            let local_tmp = restage_temp_in_dir(err.path, parent, target_mode)?;
+            local_tmp
+                .persist(full)
+                .map_err(|e| GitError::io(full, e.error))?;
+        }
+        Err(err) => return Err(GitError::io(full, err.error)),
+    }
+    if !verify_open_file_matches_expected(&mut orig_fd, full, old, check_filemode)? {
+        orig_fd
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| GitError::io(full, e))?;
+        let restored = stage_blob_into_temp(parent, &old.mode, &mut orig_fd)?;
+        let _ = restored.persist(full);
+        let _ = crate::fsutil::sync_dir(parent);
+        return Err(GitError::InvalidMapping(format!(
+            "refusing to overwrite concurrently modified tracked file {rel:?}"
+        )));
+    }
+    crate::fsutil::sync_dir(parent).map_err(|e| GitError::io(parent, e))?;
+    Ok(())
+}
+
+fn remove_verified_preserving_concurrent_edits(
+    full: &Path,
+    staging_dir: &Path,
+    rel: &str,
+    expected: &ExpectedFileContent,
+    mode: SyncMode,
+    check_filemode: bool,
+) -> GitResult<bool> {
+    match fs::symlink_metadata(full) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if mode == SyncMode::Recovery {
+                return Ok(false);
+            }
+            return Err(GitError::InvalidMapping(format!(
+                "refusing to remove missing tracked file {rel:?}"
+            )));
+        }
+        Err(e) => return Err(GitError::io(full, e)),
+        Ok(_) => {}
+    }
+
+    // 1. Mutation-boundary ownership re-check BEFORE moving or unlinking `full`.
+    if !verify_path_matches_expected(full, rel, expected, check_filemode)? {
+        return Err(GitError::InvalidMapping(format!(
+            "refusing to remove locally modified tracked file {rel:?}"
+        )));
+    }
+
+    // 2. Atomically move `full` out of the worktree into `.git/sparkles/staging/`, re-verify
+    //    the moved entry still matches `expected`, and restore it immediately if an
+    //    intervening edit raced with the move.
+    let trash_path = staging_dir.join(format!("remove-{}", Uuid::new_v4()));
+    match fs::rename(full, &trash_path) {
+        Ok(()) => {
+            let still_matches =
+                verify_path_matches_expected(&trash_path, rel, expected, check_filemode)?;
+            if !still_matches {
+                // Restore the concurrently edited file back to `full` without clobbering any
+                // newly created file at `full`.
+                let restored = fs::hard_link(&trash_path, full)
+                    .map(|()| {
+                        let _ = fs::remove_file(&trash_path);
+                    })
+                    .or_else(|_| fs::rename(&trash_path, full));
+                let _ = restored;
+                if let Some(p) = full.parent() {
+                    let _ = crate::fsutil::sync_dir(p);
+                }
+                return Err(GitError::InvalidMapping(format!(
+                    "refusing to remove concurrently modified tracked file {rel:?}"
+                )));
+            }
+            match fs::remove_file(&trash_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(GitError::io(&trash_path, e)),
+            }
+            if let Some(p) = full.parent() {
+                let _ = crate::fsutil::sync_dir(p);
+            }
+            Ok(true)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound && mode == SyncMode::Recovery => Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+            // Different mount: verify once more and unlink.
+            if !verify_path_matches_expected(full, rel, expected, check_filemode)? {
+                return Err(GitError::InvalidMapping(format!(
+                    "refusing to remove locally modified tracked file {rel:?}"
+                )));
+            }
+            fs::remove_file(full).map_err(|err| GitError::io(full, err))?;
+            if let Some(p) = full.parent() {
+                let _ = crate::fsutil::sync_dir(p);
+            }
+            Ok(true)
+        }
+        Err(e) => Err(GitError::io(full, e)),
+    }
+}
+
 /// Synchronize `HEAD`, `.git/index`, and `clean_repo`'s working tree to `commit_sha` on
 /// `git_branch` while holding `.git/index.lock`.
 ///
 /// Verifies `.git/index` and every affected working-tree path against raw Git blobs (never
-/// running `.gitattributes` clean or smudge filters) before any write or removal, writes
-/// exact raw blob bytes, updates `HEAD`, and atomically swaps `.git/index` via `index.lock`.
-/// In [`SyncMode::Recovery`], individual old-to-new path transitions and post-sync states
-/// are replayable while any unexpected edit, unmanaged file, or staged index entry is
-/// refused.
+/// running `.gitattributes` clean or smudge filters) via streaming `cat-file --batch`,
+/// enforces mutation-boundary ownership (no-clobber install for absent targets, atomic
+/// exchange/restore for existing targets and removals), updates `HEAD`, and atomically swaps
+/// `.git/index` while holding `.git/index.lock`.
 #[allow(clippy::too_many_arguments)]
 fn sync_worktree_to_commit_no_filters(
     clean_repo: &Path,
@@ -2645,10 +3604,11 @@ fn sync_worktree_to_commit_no_filters(
     previous_commit_sha: Option<&str>,
     prev_head_ref: Option<&str>,
     commit_sha: &str,
+    lock_token: &str,
     mode: SyncMode,
 ) -> GitResult<()> {
     ensure_no_in_progress_git_op(git_dir)?;
-    let index_lock = GitIndexLock::acquire(git_dir)?;
+    let index_lock = GitIndexLock::acquire(git_dir, lock_token, mode == SyncMode::Recovery)?;
 
     let old_tree = read_commit_tree_entries(clean_repo, previous_commit_sha)?;
     let target_tree = read_commit_tree_entries(clean_repo, Some(commit_sha))?;
@@ -2698,44 +3658,55 @@ fn sync_worktree_to_commit_no_filters(
         }
     }
 
-    let mut all_oids: Vec<&str> = Vec::with_capacity(old_tree.len() + target_tree.len());
-    for entry in old_tree.values().chain(target_tree.values()) {
-        if matches!(entry.mode.as_str(), "100644" | "100755" | "120000") {
-            all_oids.push(entry.oid.as_str());
-        }
-    }
-    let blobs = git_cat_file_batch(clean_repo, &all_oids)?;
     let check_filemode = git_core_filemode(clean_repo);
 
-    // Post-sync recovery: HEAD and index already point to `commit_sha`; verify every target
-    // file matches its raw blob bytes so local post-sync edits are never ignored, then
-    // finish without misclassifying new files as unmanaged collisions.
+    // Post-sync recovery: HEAD and index already point to `commit_sha`; stream-verify every
+    // target file against its raw blob bytes so local post-sync edits are never ignored, then
+    // finish cleanly (releasing any reclaimed stale `.git/index.lock` on drop).
     if mode == SyncMode::Recovery
         && index_matches_new
         && head_sym.as_deref() == Some(ref_name.as_str())
     {
-        for (rel, target_entry) in &target_tree {
-            let new_bytes = blobs.get(&target_entry.oid).ok_or_else(|| {
-                GitError::InvalidMapping(format!("missing blob {} for {rel:?}", target_entry.oid))
-            })?;
-            if !check_worktree_entry_raw(clean_repo, rel, target_entry, new_bytes, check_filemode)?
-            {
-                return Err(GitError::InvalidMapping(
-                    "refusing pending recovery with uncommitted modifications to tracked files"
-                        .into(),
-                ));
-            }
-        }
+        let target_items: Vec<(&str, &TreeBlobEntry)> =
+            target_tree.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        let target_oids: Vec<&str> = target_items.iter().map(|(_, e)| e.oid.as_str()).collect();
+        stream_git_blobs(
+            clean_repo,
+            &target_oids,
+            |idx, _, blob_size, blob_reader| {
+                let (rel, target_entry) = target_items[idx];
+                let (matched, _) = stream_compare_and_hash_worktree_entry(
+                    clean_repo,
+                    rel,
+                    target_entry,
+                    blob_size,
+                    blob_reader,
+                    check_filemode,
+                )?;
+                if !matched {
+                    return Err(GitError::InvalidMapping(
+                        "refusing pending recovery with uncommitted modifications to tracked files"
+                            .into(),
+                    ));
+                }
+                Ok(())
+            },
+        )?;
         return Ok(());
     }
 
-    // Read-only eligibility preflight for EVERY target path and EVERY stale old path under
-    // `.git/index.lock` BEFORE mutating any working-tree file.
-    let mut to_write: Vec<(&str, &[u8])> = Vec::new();
+    // Pass 1: Read-only streaming preflight of every target path (checking existence, type,
+    // and whether on-disk bytes already match `target_entry`).
+    struct TargetPreflight {
+        rel: String,
+        target_entry: TreeBlobEntry,
+        exists: bool,
+        matches_new: bool,
+        target_expected: ExpectedFileContent,
+    }
+    let mut target_states: Vec<TargetPreflight> = Vec::with_capacity(target_tree.len());
+    let mut need_target_check: Vec<(&str, &TreeBlobEntry)> = Vec::new();
     for (rel, target_entry) in &target_tree {
-        let new_bytes = blobs.get(&target_entry.oid).ok_or_else(|| {
-            GitError::InvalidMapping(format!("missing blob {} for {rel:?}", target_entry.oid))
-        })?;
         let full = resolve_safe_path(clean_repo, rel)?;
         match fs::symlink_metadata(&full) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -2745,7 +3716,17 @@ fn sync_worktree_to_commit_no_filters(
                          deleted"
                     )));
                 }
-                to_write.push((rel.as_str(), new_bytes.as_slice()));
+                target_states.push(TargetPreflight {
+                    rel: rel.clone(),
+                    target_entry: target_entry.clone(),
+                    exists: false,
+                    matches_new: false,
+                    target_expected: ExpectedFileContent {
+                        mode: target_entry.mode.clone(),
+                        len: 0,
+                        sha256: String::new(),
+                    },
+                });
             }
             Err(e) => return Err(GitError::io(&full, e)),
             Ok(meta) => {
@@ -2761,83 +3742,135 @@ fn sync_worktree_to_commit_no_filters(
                         reason: "destination path in repository is not a regular file".into(),
                     });
                 }
-                let matches_new = check_worktree_entry_raw(
+                if mode == SyncMode::Normal && !old_tree.contains_key(rel) {
+                    return Err(GitError::UnsafePath {
+                        path: rel.clone(),
+                        reason: format!(
+                            "refusing to overwrite unmanaged file {rel:?} in repository working \
+                             tree"
+                        ),
+                    });
+                }
+                need_target_check.push((rel.as_str(), target_entry));
+            }
+        }
+    }
+    if !need_target_check.is_empty() {
+        let target_oids: Vec<&str> = need_target_check
+            .iter()
+            .map(|(_, e)| e.oid.as_str())
+            .collect();
+        stream_git_blobs(
+            clean_repo,
+            &target_oids,
+            |idx, _, blob_size, blob_reader| {
+                let (rel, target_entry) = need_target_check[idx];
+                let (matches_new, sha256) = stream_compare_and_hash_worktree_entry(
                     clean_repo,
                     rel,
                     target_entry,
-                    new_bytes,
+                    blob_size,
+                    blob_reader,
                     check_filemode,
                 )?;
-                let matches_old = match old_tree.get(rel) {
-                    Some(old_entry) => {
-                        let old_bytes = blobs.get(&old_entry.oid).ok_or_else(|| {
-                            GitError::InvalidMapping(format!(
-                                "missing old blob {} for {rel:?}",
-                                old_entry.oid
-                            ))
-                        })?;
-                        check_worktree_entry_raw(
-                            clean_repo,
-                            rel,
-                            old_entry,
-                            old_bytes,
-                            check_filemode,
-                        )?
-                    }
-                    None => false,
+                target_states.push(TargetPreflight {
+                    rel: rel.to_string(),
+                    target_entry: target_entry.clone(),
+                    exists: true,
+                    matches_new,
+                    target_expected: ExpectedFileContent {
+                        mode: target_entry.mode.clone(),
+                        len: blob_size,
+                        sha256,
+                    },
+                });
+                Ok(())
+            },
+        )?;
+    }
+
+    // Pass 2: Read-only streaming preflight against `old_tree` for every existing target file
+    // that needs old-blob verification AND every stale tracked path in `old_tree \ target_tree`.
+    let mut old_checks: Vec<(
+        String,
+        TreeBlobEntry,
+        bool,
+        Option<ExpectedFileContent>,
+        bool,
+    )> = Vec::new();
+    // Tuple: (rel, old_entry, is_target_overwrite, recovery_target, target_matches_new)
+    let mut to_write: Vec<PlannedWrite> = Vec::new();
+
+    for ts in target_states {
+        if !ts.exists {
+            to_write.push(PlannedWrite {
+                rel: ts.rel,
+                target_mode: ts.target_entry.mode,
+                target_oid: ts.target_entry.oid,
+                expectation: WriteExpectation::Absent,
+            });
+            continue;
+        }
+        match mode {
+            SyncMode::Normal => {
+                let Some(old_entry) = old_tree.get(&ts.rel) else {
+                    return Err(GitError::UnsafePath {
+                        path: ts.rel.clone(),
+                        reason: format!(
+                            "refusing to overwrite unmanaged file {:?} in repository working tree",
+                            ts.rel
+                        ),
+                    });
                 };
-                match mode {
-                    SyncMode::Normal => {
-                        if !old_tree.contains_key(rel) {
-                            return Err(GitError::UnsafePath {
-                                path: rel.clone(),
-                                reason: format!(
-                                    "refusing to overwrite unmanaged file {rel:?} in repository \
-                                     working tree"
-                                ),
-                            });
-                        }
-                        if !matches_old {
-                            return Err(GitError::InvalidMapping(format!(
-                                "refusing to overwrite locally modified tracked file {rel:?}"
-                            )));
-                        }
-                        if !matches_new {
-                            to_write.push((rel.as_str(), new_bytes.as_slice()));
-                        }
+                if !matches!(old_entry.mode.as_str(), "100644" | "100755" | "120000") {
+                    return Err(GitError::InvalidMapping(format!(
+                        "refusing to overwrite unsupported tracked entry {:?} (mode {})",
+                        ts.rel, old_entry.mode
+                    )));
+                }
+                old_checks.push((ts.rel, old_entry.clone(), true, None, ts.matches_new));
+            }
+            SyncMode::Recovery => {
+                if ts.matches_new {
+                    // Already written by the interrupted sync (or unchanged).
+                } else if let Some(old_entry) = old_tree.get(&ts.rel) {
+                    if !matches!(old_entry.mode.as_str(), "100644" | "100755" | "120000") {
+                        return Err(GitError::InvalidMapping(format!(
+                            "refusing pending recovery on unsupported tracked entry {:?} (mode {})",
+                            ts.rel, old_entry.mode
+                        )));
                     }
-                    SyncMode::Recovery => {
-                        if matches_new {
-                            // Already written by the interrupted sync (or unchanged).
-                        } else if matches_old {
-                            to_write.push((rel.as_str(), new_bytes.as_slice()));
-                        } else if !old_tree.contains_key(rel) {
-                            return Err(GitError::UnsafePath {
-                                path: rel.clone(),
-                                reason: format!(
-                                    "refusing to overwrite unmanaged file {rel:?} in repository \
-                                     working tree"
-                                ),
-                            });
-                        } else {
-                            return Err(GitError::InvalidMapping(format!(
-                                "refusing pending recovery: tracked file {rel:?} matches neither \
-                                 pre-sync nor post-sync state"
-                            )));
-                        }
-                    }
+                    old_checks.push((
+                        ts.rel,
+                        old_entry.clone(),
+                        true,
+                        Some(ts.target_expected),
+                        false,
+                    ));
+                } else {
+                    return Err(GitError::UnsafePath {
+                        path: ts.rel.clone(),
+                        reason: format!(
+                            "refusing to overwrite unmanaged file {:?} in repository working tree",
+                            ts.rel
+                        ),
+                    });
                 }
             }
         }
     }
 
-    let mut to_remove: Vec<(&str, bool)> = Vec::new();
     for (old_rel, old_entry) in &old_tree {
         if target_tree.contains_key(old_rel) {
             continue;
         }
         validate_relative_path(old_rel)?;
-        let full = resolve_safe_path(clean_repo, old_rel)?;
+        let is_tracked_symlink = old_entry.mode == "120000";
+        let full = if is_tracked_symlink {
+            resolve_safe_path_allow_leaf_symlink(clean_repo, old_rel)?
+        } else {
+            resolve_safe_path(clean_repo, old_rel)?
+        };
         match fs::symlink_metadata(&full) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 if mode == SyncMode::Normal {
@@ -2850,90 +3883,169 @@ fn sync_worktree_to_commit_no_filters(
             }
             Err(e) => return Err(GitError::io(&full, e)),
             Ok(meta) => {
-                let is_tracked_symlink = old_entry.mode == "120000";
                 if meta.file_type().is_symlink() && !is_tracked_symlink {
                     return Err(GitError::UnsafePath {
                         path: old_rel.clone(),
                         reason: "tracked path in repository must not be a symlink".into(),
                     });
                 }
-                let Some(old_bytes) = blobs.get(&old_entry.oid) else {
+                if !matches!(old_entry.mode.as_str(), "100644" | "100755" | "120000") {
                     return Err(GitError::InvalidMapping(format!(
                         "refusing to remove unsupported tracked entry {old_rel:?} (mode {})",
                         old_entry.mode
                     )));
-                };
-                if !check_worktree_entry_raw(
-                    clean_repo,
-                    old_rel,
-                    old_entry,
-                    old_bytes,
-                    check_filemode,
-                )? {
-                    return Err(GitError::InvalidMapping(format!(
-                        "refusing to remove locally modified tracked file {old_rel:?}"
-                    )));
                 }
-                to_remove.push((old_rel.as_str(), is_tracked_symlink));
+                old_checks.push((old_rel.clone(), old_entry.clone(), false, None, false));
             }
         }
     }
 
-    // Write every changed tracked blob byte-exact without running Git checkout/smudge filters.
-    for (idx, (rel, blob_bytes)) in to_write.into_iter().enumerate() {
-        let full = resolve_safe_path(clean_repo, rel)?;
-        let parent = effective_parent(&full)?;
-        ensure_dir_no_symlink(&parent)?;
-        write_atomic_safe(&full, blob_bytes)?;
-        #[cfg(test)]
-        if idx == 0 {
-            test_hooks::after_first_worktree_blob_write()?;
-        }
-        #[cfg(not(test))]
-        let _ = idx;
-    }
-
-    // Remove verified previously tracked files absent from the target commit (leaving
-    // unmanaged untracked files completely untouched).
-    for (idx, (old_rel, is_tracked_symlink)) in to_remove.into_iter().enumerate() {
-        let full = resolve_safe_path(clean_repo, old_rel)?;
-        match fs::symlink_metadata(&full) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() && !is_tracked_symlink {
-                    return Err(GitError::UnsafePath {
-                        path: old_rel.to_string(),
-                        reason: "tracked path in repository must not be a symlink".into(),
+    let mut to_remove: Vec<PlannedRemoval> = Vec::new();
+    if !old_checks.is_empty() {
+        let old_oids: Vec<&str> = old_checks
+            .iter()
+            .map(|(_, e, _, _, _)| e.oid.as_str())
+            .collect();
+        stream_git_blobs(clean_repo, &old_oids, |idx, _, blob_size, blob_reader| {
+            let (ref rel, ref old_entry, is_target_overwrite, ref recovery_target, matches_new) =
+                old_checks[idx];
+            let (matches_old, sha256) = stream_compare_and_hash_worktree_entry(
+                clean_repo,
+                rel,
+                old_entry,
+                blob_size,
+                blob_reader,
+                check_filemode,
+            )?;
+            let old_expected = ExpectedFileContent {
+                mode: old_entry.mode.clone(),
+                len: blob_size,
+                sha256,
+            };
+            if is_target_overwrite {
+                if !matches_old {
+                    return Err(GitError::InvalidMapping(match mode {
+                        SyncMode::Normal => {
+                            format!("refusing to overwrite locally modified tracked file {rel:?}")
+                        }
+                        SyncMode::Recovery => format!(
+                            "refusing pending recovery: tracked file {rel:?} matches neither \
+                             pre-sync nor post-sync state"
+                        ),
+                    }));
+                }
+                if !matches_new {
+                    let target_entry = &target_tree[rel];
+                    to_write.push(PlannedWrite {
+                        rel: rel.clone(),
+                        target_mode: target_entry.mode.clone(),
+                        target_oid: target_entry.oid.clone(),
+                        expectation: WriteExpectation::Existing {
+                            old: old_expected,
+                            recovery_target: recovery_target.clone(),
+                        },
                     });
                 }
-                if meta.file_type().is_file()
-                    || (is_tracked_symlink && meta.file_type().is_symlink())
-                {
-                    fs::remove_file(&full).map_err(|e| GitError::io(&full, e))?;
-                    if let Some(p) = full.parent() {
-                        let _ = crate::fsutil::sync_dir(p);
-                    }
-                    #[cfg(test)]
-                    if idx == 0 {
-                        test_hooks::after_first_worktree_removal()?;
-                    }
+            } else {
+                if !matches_old {
+                    return Err(GitError::InvalidMapping(format!(
+                        "refusing to remove locally modified tracked file {rel:?}"
+                    )));
+                }
+                to_remove.push(PlannedRemoval {
+                    rel: rel.clone(),
+                    expected: old_expected,
+                });
+            }
+            Ok(())
+        })?;
+    }
+
+    #[cfg(test)]
+    test_hooks::before_worktree_mutations(clean_repo);
+
+    let sparkles_dir = ensure_child_dir_no_symlink(git_dir, DEFAULT_SPARKLES_GIT_SUBDIR)?;
+    let staging_parent = ensure_child_dir_no_symlink(&sparkles_dir, DEFAULT_STAGING_SUBDIR)?;
+
+    // Stream and install every changed tracked blob byte-exact without Git checkout/smudge
+    // filters, checking ownership at each mutation boundary.
+    if !to_write.is_empty() {
+        let write_oids: Vec<&str> = to_write.iter().map(|w| w.target_oid.as_str()).collect();
+        stream_git_blobs(clean_repo, &write_oids, |idx, _, _, blob_reader| {
+            let planned = &to_write[idx];
+            let full = resolve_safe_path(clean_repo, &planned.rel)?;
+            let parent = effective_parent(&full)?;
+            ensure_dir_no_symlink(&parent)?;
+            let temp_path =
+                stage_blob_into_temp(&staging_parent, &planned.target_mode, blob_reader)?;
+            match &planned.expectation {
+                WriteExpectation::Absent => {
+                    install_absent_noclobber(
+                        temp_path,
+                        &full,
+                        &parent,
+                        &planned.rel,
+                        &planned.target_mode,
+                    )?;
+                }
+                WriteExpectation::Existing {
+                    old,
+                    recovery_target,
+                } => {
+                    replace_existing_preserving_concurrent_edits(
+                        temp_path,
+                        &full,
+                        &parent,
+                        &planned.rel,
+                        &planned.target_mode,
+                        old,
+                        recovery_target.as_ref(),
+                        check_filemode,
+                    )?;
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(GitError::io(&full, e)),
-        }
-        #[cfg(not(test))]
-        let _ = idx;
+            #[cfg(test)]
+            if idx == 0 {
+                test_hooks::after_first_worktree_blob_write()?;
+            }
+            Ok(())
+        })?;
     }
+
+    // Remove verified previously tracked files absent from the target commit, checking
+    // ownership at each mutation boundary and preserving any concurrent edit.
+    let mut removed_count = 0usize;
+    for planned in to_remove {
+        let is_tracked_symlink = planned.expected.mode == "120000";
+        let full = if is_tracked_symlink {
+            resolve_safe_path_allow_leaf_symlink(clean_repo, &planned.rel)?
+        } else {
+            resolve_safe_path(clean_repo, &planned.rel)?
+        };
+        if remove_verified_preserving_concurrent_edits(
+            &full,
+            &staging_parent,
+            &planned.rel,
+            &planned.expected,
+            mode,
+            check_filemode,
+        )? {
+            removed_count += 1;
+            #[cfg(test)]
+            if removed_count == 1 {
+                test_hooks::after_first_worktree_removal()?;
+            }
+        }
+    }
+    let _ = removed_count;
 
     run_git(clean_repo, &["symbolic-ref", "HEAD", &ref_name], &[])?;
     #[cfg(test)]
     test_hooks::after_symbolic_ref_before_index()?;
 
     // Build the exact target index in an isolated temporary file from the object database
-    // (never running filters) and atomically swap it into `.git/index` through our held
-    // `.git/index.lock`.
-    let sparkles_dir = ensure_child_dir_no_symlink(git_dir, DEFAULT_SPARKLES_GIT_SUBDIR)?;
-    let staging_parent = ensure_child_dir_no_symlink(&sparkles_dir, DEFAULT_STAGING_SUBDIR)?;
+    // (never running filters) and atomically swap it into `.git/index` while holding our
+    // ownership-proven `.git/index.lock`.
     let tmp_index = tempfile::Builder::new()
         .prefix("sync-index-")
         .tempfile_in(&staging_parent)
@@ -2943,10 +4055,7 @@ fn sync_worktree_to_commit_no_filters(
     let tmp_index_str = tmp_index_path.to_string_lossy().into_owned();
     let idx_env = [("GIT_INDEX_FILE", tmp_index_str.as_str())];
     run_git(clean_repo, &["read-tree", commit_sha], &idx_env)?;
-    let new_index_bytes =
-        fs::read(&tmp_index_path).map_err(|e| GitError::io(&tmp_index_path, e))?;
-    drop(tmp_index_path);
-    index_lock.commit_index_bytes(git_dir, &new_index_bytes)?;
+    index_lock.commit_index_from_path(git_dir, &tmp_index_path)?;
     Ok(())
 }
 
@@ -3025,28 +4134,62 @@ fn run_git_bytes_with_stdin(
         status: None,
         stderr: e.to_string(),
     })?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(stdin_bytes)
-            .map_err(|e| GitError::GitCommand {
-                args: args.iter().map(|s| (*s).to_string()).collect(),
-                status: None,
-                stderr: e.to_string(),
-            })?;
-    }
-    let output = child.wait_with_output().map_err(|e| GitError::GitCommand {
+    let stdin = child.stdin.take();
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+
+    let (write_res, stdout_res, stderr_res) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || -> io::Result<()> {
+            if let Some(mut s) = stdin
+                && let Err(e) = s.write_all(stdin_bytes)
+                && e.kind() != io::ErrorKind::BrokenPipe
+            {
+                return Err(e);
+            }
+            Ok(())
+        });
+        let err_reader = scope.spawn(move || -> io::Result<Vec<u8>> {
+            let mut buf = Vec::new();
+            stderr.read_to_end(&mut buf)?;
+            Ok(buf)
+        });
+        let mut out_buf = Vec::new();
+        let stdout_res = stdout.read_to_end(&mut out_buf).map(|_| out_buf);
+        let write_res = writer
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("git stdin writer panicked")));
+        let stderr_res = err_reader
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("git stderr reader panicked")));
+        (write_res, stdout_res, stderr_res)
+    });
+
+    let status = child.wait().map_err(|e| GitError::GitCommand {
         args: args.iter().map(|s| (*s).to_string()).collect(),
         status: None,
         stderr: e.to_string(),
     })?;
-    if !output.status.success() {
+    let stderr_bytes = stderr_res.unwrap_or_default();
+    if let Err(e) = write_res {
         return Err(GitError::GitCommand {
             args: args.iter().map(|s| (*s).to_string()).collect(),
-            status: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            status: status.code(),
+            stderr: e.to_string(),
         });
     }
-    Ok(output.stdout)
+    let stdout_bytes = stdout_res.map_err(|e| GitError::GitCommand {
+        args: args.iter().map(|s| (*s).to_string()).collect(),
+        status: status.code(),
+        stderr: e.to_string(),
+    })?;
+    if !status.success() {
+        return Err(GitError::GitCommand {
+            args: args.iter().map(|s| (*s).to_string()).collect(),
+            status: status.code(),
+            stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+        });
+    }
+    Ok(stdout_bytes)
 }
 
 /// Convenience helper for building a [`CommitRef`] from a mapping entry.
@@ -3070,6 +4213,7 @@ mod test_hooks {
         pub fail_mapping_write: bool,
         pub fail_worktree_sync: bool,
         pub fail_after_first_blob_write: bool,
+        pub exit_after_first_blob_write: Option<i32>,
         pub fail_after_first_removal: bool,
         pub fail_after_symbolic_ref: bool,
         pub fail_before_remove_pending: bool,
@@ -3077,6 +4221,7 @@ mod test_hooks {
         pub inject_stage_before_sync: Option<(String, Vec<u8>)>,
         pub inject_tracked_edit_after_clean: Option<(String, Vec<u8>)>,
         pub inject_tracked_edit_before_sync: Option<(String, Vec<u8>)>,
+        pub inject_edit_after_preflight: Option<(String, Vec<u8>)>,
     }
 
     thread_local! {
@@ -3155,9 +4300,23 @@ mod test_hooks {
         Ok(())
     }
 
+    pub(super) fn before_worktree_mutations(repo_dir: &Path) {
+        let edit = FAULTS.with(|f| f.borrow_mut().inject_edit_after_preflight.take());
+        if let Some((rel, bytes)) = edit {
+            let p = repo_dir.join(&rel);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&p, bytes).unwrap();
+        }
+    }
+
     pub(super) fn after_first_worktree_blob_write() -> GitResult<()> {
         FAULTS.with(|f| {
             let mut s = f.borrow_mut();
+            if let Some(code) = s.exit_after_first_blob_write.take() {
+                std::process::exit(code);
+            }
             if s.fail_after_first_blob_write {
                 s.fail_after_first_blob_write = false;
                 return Err(GitError::Io {
@@ -3733,7 +4892,8 @@ mod tests {
         assert!(mapping.serialize_bounded(exact_limit).is_ok());
 
         let pending = PendingPublication {
-            format_version: MAPPING_FORMAT_VERSION,
+            format_version: PENDING_PUBLICATION_FORMAT_VERSION,
+            index_lock_token: Uuid::new_v4().to_string(),
             mapping_path: PathBuf::from("/tmp/mapping.json"),
             ref_name: "refs/heads/main".to_string(),
             old_ref_sha: Some(format!("{:040x}", 4499u64)),
@@ -3756,5 +4916,460 @@ mod tests {
         );
         let parsed: PendingPublication = serde_json::from_slice(&compact).unwrap();
         assert_eq!(parsed.mapping.unwrap().entries.len(), 4500);
+    }
+
+    #[test]
+    fn abrupt_child_exit_holding_index_lock_recovers_while_foreign_lock_is_refused() {
+        const CHILD_DB_ENV: &str = "SPARKLES_TEST_EXPORT_CRASH_DB";
+        const CHILD_REPO_ENV: &str = "SPARKLES_TEST_EXPORT_CRASH_REPO";
+
+        if let (Ok(db_p), Ok(repo_p)) = (std::env::var(CHILD_DB_ENV), std::env::var(CHILD_REPO_ENV))
+        {
+            let ds = Dataset::open(&db_p).unwrap();
+            let _g = test_hooks::install(test_hooks::FaultState {
+                exit_after_first_blob_write: Some(99),
+                ..Default::default()
+            });
+            let _ = export_branch_to_git(&ds, Path::new(&repo_p), &GitExportOptions::default());
+            std::process::exit(1);
+        }
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("db");
+        {
+            let ds = Dataset::open(&db_path).unwrap();
+            ds.transaction(|tx| {
+                tx.insert(
+                    Quad::new(
+                        NamedNode::new_unchecked("http://example.org/s1"),
+                        NamedNode::new_unchecked("http://example.org/p"),
+                        Literal::from(1i64),
+                        GraphName::DefaultGraph,
+                    )
+                    .as_ref(),
+                )?;
+                tx.insert(
+                    Quad::new(
+                        NamedNode::new_unchecked("http://example.org/s2"),
+                        NamedNode::new_unchecked("http://example.org/p"),
+                        Literal::from(2i64),
+                        GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/g2")),
+                    )
+                    .as_ref(),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        let repo = tempfile::tempdir().unwrap();
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "git::export::tests::abrupt_child_exit_holding_index_lock_recovers_while_foreign_lock_is_refused",
+                "--nocapture",
+            ])
+            .env(CHILD_DB_ENV, &db_path)
+            .env(CHILD_REPO_ENV, repo.path())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(99), "child must exit abruptly with 99");
+
+        let index_lock_path = repo.path().join(".git/index.lock");
+        assert!(
+            index_lock_path.is_file(),
+            "abrupt exit must leave .git/index.lock on disk"
+        );
+        let own_lock_bytes = fs::read(&index_lock_path).unwrap();
+        assert!(
+            own_lock_bytes.starts_with(INDEX_LOCK_PREFIX.as_bytes()),
+            "index.lock must carry Sparkles ownership prefix"
+        );
+
+        let ds = Dataset::open(&db_path).unwrap();
+
+        // 1. Foreign `.git/index.lock` (wrong bytes) must be refused and preserved.
+        fs::write(&index_lock_path, b"DIRC-foreign-git-lock").unwrap();
+        let err_foreign =
+            export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap_err();
+        assert!(
+            err_foreign.to_string().contains("index.lock"),
+            "expected foreign lock refusal, got {err_foreign}"
+        );
+        assert_eq!(
+            fs::read(&index_lock_path).unwrap(),
+            b"DIRC-foreign-git-lock"
+        );
+
+        // 2. Empty `.git/index.lock` (e.g. brand-new foreign git process) must be refused.
+        fs::write(&index_lock_path, b"").unwrap();
+        assert!(export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).is_err());
+        assert!(index_lock_path.is_file());
+
+        // 3. Restore our exact ownership token; while an active OS lock is held on it,
+        //    recovery must still refuse.
+        fs::write(&index_lock_path, &own_lock_bytes).unwrap();
+        {
+            let active = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&index_lock_path)
+                .unwrap();
+            active.lock().unwrap();
+            let err_active =
+                export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap_err();
+            assert!(
+                err_active.to_string().contains("index.lock"),
+                "expected active lock refusal, got {err_active}"
+            );
+        }
+
+        // 4. Once no process holds the OS lock, recovery reclaims our stale lock and succeeds.
+        let report = export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
+        assert_eq!(report.mapping.entries.len(), 1);
+        assert!(
+            !index_lock_path.exists(),
+            "stale index.lock must be removed"
+        );
+        verify_git_tree(repo.path()).unwrap();
+    }
+
+    #[test]
+    fn edits_and_new_files_after_checkout_preflight_are_preserved() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+        let insert_quad = |s: &str, g: Option<&str>| {
+            ds.transaction(|tx| {
+                tx.insert(
+                    Quad::new(
+                        NamedNode::new_unchecked(s),
+                        NamedNode::new_unchecked("http://example.org/p"),
+                        Literal::from(s),
+                        match g {
+                            Some(iri) => GraphName::NamedNode(NamedNode::new_unchecked(iri)),
+                            None => GraphName::DefaultGraph,
+                        },
+                    )
+                    .as_ref(),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        };
+
+        insert_quad("http://example.org/s1", None);
+        insert_quad(
+            "http://example.org/drop1",
+            Some("http://example.org/drop-me"),
+        );
+        let repo = tempfile::tempdir().unwrap();
+        export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
+
+        // Find the dropped graph path on disk.
+        let drop_rel = fs::read_dir(repo.path().join(GRAPHS_DIR))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .find(|n| n.contains("drop-me"))
+            .map(|n| format!("{GRAPHS_DIR}/{n}"))
+            .unwrap();
+
+        // Commit 2 modifies `graphs/default.ttl`.
+        insert_quad("http://example.org/s2", None);
+
+        // A. Edit an existing tracked file (`graphs/default.ttl`) AFTER eligibility preflight
+        //    and BEFORE mutation -> must refuse and preserve the user's edit.
+        let orig_default = fs::read(repo.path().join("graphs/default.ttl")).unwrap();
+        let user_edit = b"# edited after preflight\n";
+        {
+            let _g = test_hooks::install(test_hooks::FaultState {
+                inject_edit_after_preflight: Some((
+                    "graphs/default.ttl".into(),
+                    user_edit.to_vec(),
+                )),
+                ..Default::default()
+            });
+            assert!(export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).is_err());
+        }
+        assert_eq!(
+            fs::read(repo.path().join("graphs/default.ttl")).unwrap(),
+            user_edit,
+            "intervening edit to existing tracked file must be preserved"
+        );
+        fs::write(repo.path().join("graphs/default.ttl"), &orig_default).unwrap();
+        export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
+
+        // Commit 3 adds a brand-new named graph (`brand-new`) that is absent from the worktree.
+        insert_quad(
+            "http://example.org/ng",
+            Some("http://example.org/brand-new"),
+        );
+        // Stop right before worktree sync so `refs/heads/main` names the exact new graph path
+        // while the worktree has NOT yet written it.
+        {
+            let _g = test_hooks::install(test_hooks::FaultState {
+                fail_worktree_sync: true,
+                ..Default::default()
+            });
+            assert!(export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).is_err());
+        }
+        let tip_files = run_git(
+            repo.path(),
+            &["ls-tree", "-r", "--name-only", "refs/heads/main"],
+            &[],
+        )
+        .unwrap();
+        let new_graph_rel = tip_files
+            .lines()
+            .find(|l| l.contains("brand-new"))
+            .unwrap()
+            .to_string();
+        assert!(!repo.path().join(&new_graph_rel).exists());
+
+        // B. Create a brand-new regular file at previously absent `new_graph_rel` AFTER
+        //    eligibility preflight -> no-clobber install must refuse and preserve its bytes!
+        let concurrent_new = b"# user created file concurrently\n";
+        {
+            let _g = test_hooks::install(test_hooks::FaultState {
+                inject_edit_after_preflight: Some((new_graph_rel.clone(), concurrent_new.to_vec())),
+                ..Default::default()
+            });
+            let err =
+                export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap_err();
+            assert!(
+                matches!(err, GitError::UnsafePath { .. }),
+                "expected UnsafePath on no-clobber collision, got {err:?}"
+            );
+        }
+        assert_eq!(
+            fs::read(repo.path().join(&new_graph_rel)).unwrap(),
+            concurrent_new,
+            "concurrently created file at absent target must not be clobbered"
+        );
+        fs::remove_file(repo.path().join(&new_graph_rel)).unwrap();
+        export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
+
+        // Commit 4 drops `drop-me`.
+        let orig_drop = fs::read(repo.path().join(&drop_rel)).unwrap();
+        ds.update("DROP GRAPH <http://example.org/drop-me>")
+            .unwrap();
+
+        // C. Edit stale tracked file in `to_remove` AFTER eligibility preflight and BEFORE
+        //    removal -> must refuse and preserve the edited file on disk!
+        let edit_drop = b"# user saved notes in file being removed\n";
+        {
+            let _g = test_hooks::install(test_hooks::FaultState {
+                inject_edit_after_preflight: Some((drop_rel.clone(), edit_drop.to_vec())),
+                ..Default::default()
+            });
+            assert!(export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).is_err());
+        }
+        assert_eq!(
+            fs::read(repo.path().join(&drop_rel)).unwrap(),
+            edit_drop,
+            "intervening edit to file being removed must be preserved"
+        );
+        fs::write(repo.path().join(&drop_rel), orig_drop).unwrap();
+        export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
+        assert!(!repo.path().join(&drop_rel).exists());
+        verify_git_tree(repo.path()).unwrap();
+    }
+
+    #[test]
+    fn large_git_blob_batch_exceeding_pipe_buffers_does_not_deadlock() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-q", "-b", "seed"], &[]).unwrap();
+        run_git(repo.path(), &["config", "user.name", "Test"], &[]).unwrap();
+        run_git(repo.path(), &["config", "user.email", "t@example.org"], &[]).unwrap();
+
+        // Write 2,200 files (> 90 KiB of OID lines on stdin, exceeding 64 KiB Linux pipe
+        // buffer), with the first file > 256 KiB (exceeding 64 KiB stdout pipe buffer).
+        let big_body = vec![b'A'; 256 * 1024];
+        let dir_files = repo.path().join("bulk");
+        fs::create_dir_all(&dir_files).unwrap();
+        fs::write(dir_files.join("0000.txt"), &big_body).unwrap();
+        for i in 1..2200usize {
+            fs::write(
+                dir_files.join(format!("{i:04}.txt")),
+                format!("entry-{i}\n"),
+            )
+            .unwrap();
+        }
+        run_git(repo.path(), &["add", "."], &[]).unwrap();
+        run_git(repo.path(), &["commit", "-q", "-m", "seed 2200 files"], &[]).unwrap();
+
+        let git_dir = resolve_exact_git_dir(repo.path()).unwrap();
+        ensure_clean_git_state(repo.path(), &git_dir).unwrap();
+
+        // Also export a Sparkles dataset onto a separate branch, exercising both clean check
+        // and streaming checkout removal across all 2,200 old tracked blobs.
+        let db_dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+        ds.transaction(|tx| {
+            tx.insert(
+                Quad::new(
+                    NamedNode::new_unchecked("http://example.org/s"),
+                    NamedNode::new_unchecked("http://example.org/p"),
+                    Literal::from(1i64),
+                    GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        export_branch_to_git(
+            &ds,
+            repo.path(),
+            &GitExportOptions {
+                git_branch: Some("sparkles".into()),
+                ..GitExportOptions::default()
+            },
+        )
+        .unwrap();
+        verify_git_tree(repo.path()).unwrap();
+    }
+
+    #[test]
+    fn pending_publication_rejects_legacy_v1_and_unknown_versions_before_replay() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+        ds.transaction(|tx| {
+            tx.insert(
+                Quad::new(
+                    NamedNode::new_unchecked("http://example.org/s1"),
+                    NamedNode::new_unchecked("http://example.org/p"),
+                    Literal::from(1i64),
+                    GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let repo = tempfile::tempdir().unwrap();
+        let r1 = export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
+        let git_dir = resolve_exact_git_dir(repo.path()).unwrap();
+        let pending_path = pending_publication_path(&git_dir, "main").unwrap();
+
+        // Legacy v1 journal lacking `prev_checkout_sha` / `index_lock_token`.
+        let legacy_v1 = serde_json::json!({
+            "format_version": 1,
+            "mapping_path": r1.mapping_path,
+            "ref_name": "refs/heads/main",
+            "old_ref_sha": r1.head_git_sha,
+            "new_commit_sha": r1.head_git_sha,
+            "mapping": r1.mapping,
+        });
+        fs::write(&pending_path, serde_json::to_vec(&legacy_v1).unwrap()).unwrap();
+        let err_v1 =
+            export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap_err();
+        assert!(
+            matches!(
+                err_v1,
+                GitError::UnsupportedFormatVersion {
+                    found: 1,
+                    supported: PENDING_PUBLICATION_FORMAT_VERSION,
+                    ..
+                }
+            ),
+            "expected UnsupportedFormatVersion for legacy v1 journal, got {err_v1:?}"
+        );
+
+        // Future v99 journal.
+        fs::write(&pending_path, br#"{"format_version":99}"#).unwrap();
+        let err_v99 =
+            export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap_err();
+        assert!(
+            matches!(
+                err_v99,
+                GitError::UnsupportedFormatVersion {
+                    found: 99,
+                    supported: PENDING_PUBLICATION_FORMAT_VERSION,
+                    ..
+                }
+            ),
+            "expected UnsupportedFormatVersion for future v99 journal, got {err_v99:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_symlink_and_owner_execute_bit_checks_match_git_semantics() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-q", "-b", "seed"], &[]).unwrap();
+        run_git(repo.path(), &["config", "user.name", "Test"], &[]).unwrap();
+        run_git(repo.path(), &["config", "user.email", "t@example.org"], &[]).unwrap();
+        run_git(repo.path(), &["config", "core.fileMode", "true"], &[]).unwrap();
+
+        let readme = repo.path().join("README.md");
+        fs::write(&readme, b"hello\n").unwrap();
+        fs::set_permissions(&readme, fs::Permissions::from_mode(0o644)).unwrap();
+        let link = repo.path().join("link.txt");
+        symlink("README.md", &link).unwrap();
+        run_git(repo.path(), &["add", "README.md", "link.txt"], &[]).unwrap();
+        run_git(repo.path(), &["commit", "-q", "-m", "track symlink"], &[]).unwrap();
+
+        let git_dir = resolve_exact_git_dir(repo.path()).unwrap();
+
+        // 1. Clean tracked 120000 symlink passes clean check.
+        ensure_clean_git_state(repo.path(), &git_dir).unwrap();
+
+        // 2. Group/other execute bit (`0o641`) on a `100644` file is clean under Git's `0o100`
+        //    rule, whereas setting owner execute (`0o744`) is detected as modified.
+        fs::set_permissions(&readme, fs::Permissions::from_mode(0o641)).unwrap();
+        ensure_clean_git_state(repo.path(), &git_dir).unwrap();
+        fs::set_permissions(&readme, fs::Permissions::from_mode(0o744)).unwrap();
+        assert!(ensure_clean_git_state(repo.path(), &git_dir).is_err());
+        fs::set_permissions(&readme, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+        ds.transaction(|tx| {
+            tx.insert(
+                Quad::new(
+                    NamedNode::new_unchecked("http://example.org/s"),
+                    NamedNode::new_unchecked("http://example.org/p"),
+                    Literal::from(1i64),
+                    GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // 3. Modified tracked symlink target is detected and refused as a local modification.
+        fs::remove_file(&link).unwrap();
+        symlink("OTHER.md", &link).unwrap();
+        assert!(
+            export_branch_to_git(
+                &ds,
+                repo.path(),
+                &GitExportOptions {
+                    git_branch: Some("sparkles".into()),
+                    ..GitExportOptions::default()
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("OTHER.md"));
+
+        // 4. Restoring the tracked symlink allows clean export and unlinks the stale symlink.
+        fs::remove_file(&link).unwrap();
+        symlink("README.md", &link).unwrap();
+        export_branch_to_git(
+            &ds,
+            repo.path(),
+            &GitExportOptions {
+                git_branch: Some("sparkles".into()),
+                ..GitExportOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(fs::symlink_metadata(&link).is_err());
+        verify_git_tree(repo.path()).unwrap();
     }
 }

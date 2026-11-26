@@ -2930,7 +2930,14 @@ fn custom_mapping_rejects_published_paths_pending_journal_and_missing_dotdot() {
         repo.path().join(".sparkles-git/manifest.json"),
         repo.path().join("graphs/default.ttl"),
         repo.path().join(".git/sparkles/pending/custom.json"),
+        repo.path().join(".git/sparkles/mappings/other.json"),
         repo.path().join(".git/index"),
+        repo.path().join(".git/HEAD.lock"),
+        repo.path().join(".git/MERGE_HEAD"),
+        repo.path().join(".git/packed-refs"),
+        repo.path().join(".git/config"),
+        repo.path().join(".git/info/attributes"),
+        repo.path().join(".git/bad-subdir/map.json"),
         repo.path().join("missing-dir/../mapping.json"),
     ];
     for dest in bad_destinations {
@@ -2963,6 +2970,77 @@ fn custom_mapping_rejects_published_paths_pending_journal_and_missing_dotdot() {
             "rejected mapping {dest:?} must not publish any Git commit"
         );
     }
+    // Rejected overlapping destinations must NOT create forbidden directories on disk.
+    assert!(!repo.path().join(".sparkles-git").exists());
+    assert!(!repo.path().join("graphs").exists());
+    assert!(!repo.path().join(".git/bad-subdir").exists());
+    assert!(!repo.path().join(".git/MERGE_HEAD").exists());
+    assert!(!repo.path().join(".git/HEAD.lock").exists());
+}
+
+#[test]
+fn noop_branch_switch_refuses_custom_mapping_aliasing_old_tracked_file() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+    ds.load_str(
+        "PREFIX ex: <http://example.org/> ex:s ex:p 1 .",
+        sparkles::io::RdfFormat::Turtle,
+    )
+    .unwrap();
+
+    let repo = tempfile::tempdir().unwrap();
+    let custom_map = repo.path().join("shared-map.json");
+    sparkles::git::export_branch_to_git(
+        &ds,
+        repo.path(),
+        &GitExportOptions {
+            mapping_path: Some(custom_map.clone()),
+            ..GitExportOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(custom_map.is_file());
+    let saved_map_bytes = fs::read(&custom_map).unwrap();
+
+    // Create a second Git branch `other` that tracks `shared-map.json`, then check it out.
+    for args in [
+        &["config", "user.name", "Test"][..],
+        &["config", "user.email", "t@example.org"][..],
+        &["checkout", "-q", "-b", "other"][..],
+        &["add", "shared-map.json"][..],
+        &["commit", "-q", "-m", "track custom mapping on other"][..],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(["-C", repo.path().to_str().unwrap()])
+                .args(args)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?} failed"
+        );
+    }
+
+    // Re-exporting `main` (0 new commits, switching from `other` back to `main`) with
+    // `mapping_path = shared-map.json` must refuse before unlinking the mapping file.
+    let err = sparkles::git::export_branch_to_git(
+        &ds,
+        repo.path(),
+        &GitExportOptions {
+            mapping_path: Some(custom_map.clone()),
+            ..GitExportOptions::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, GitError::UnsafePath { .. }),
+        "expected UnsafePath when no-op switch mapping aliases old tracked file, got {err:?}"
+    );
+    assert_eq!(
+        fs::read(&custom_map).unwrap(),
+        saved_map_bytes,
+        "custom mapping file must remain untouched when no-op switch refuses overlap"
+    );
 }
 
 #[cfg(unix)]
