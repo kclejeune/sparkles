@@ -550,22 +550,16 @@ impl State<'_> {
     ) -> Result<(Vec<NamedNode>, BTreeSet<NamedNode>)> {
         let policy = Term::NamedNode(p.policy_iri.clone());
         let class = Term::NamedNode(NamedNode::new_unchecked(ev("Projection")));
-        let mut all_held = self.reads.preparation().reserve(0)?;
-        let all =
-            self.subjects_held(RDF_TYPE, &class, &p.supports, "projections", &mut all_held)?;
-        let mut records = Vec::new();
-        for r in all {
-            if self.reads.contains(
-                r.as_str(),
-                &ev("reviewPolicy"),
-                &policy,
-                p.supports.0.as_str(),
-            )? {
-                held.grow_by((r.as_str().len() as u64).saturating_add(64))?;
-                records.push(r);
-            }
+        let review_policy = ev("reviewPolicy");
+        let (records, more) = self.reads.subjects_matching_up_to_held(
+            &[(RDF_TYPE, &class), (review_policy.as_str(), &policy)],
+            p.supports.0.as_str(),
+            MAX_EVIDENCE,
+            held,
+        )?;
+        if more {
+            return Err(incomplete("projections"));
         }
-        drop(all_held);
         let mut superseded = BTreeSet::new();
         for r in &records {
             if !self
@@ -713,14 +707,22 @@ impl State<'_> {
         Ok(())
     }
 
-    /// Refuse when `p.output` holds continuously authenticated evidence record history
-    /// under its unchanged protection nonce (as when a former record-role graph was
-    /// reassigned as a dedicated projection output without detaching it first).
-    fn check_output_record_history(&self, p: &PolicyGraphs) -> Result<()> {
-        if self
-            .reads
-            .has_authenticated_operation(p.output.0.as_str(), p.output.1)?
-        {
+    /// Refuse when `p.output` holds continuously authenticated evidence-owner operation
+    /// history under its unchanged protection nonce (as when a former record-role graph
+    /// was reassigned as a dedicated projection output without detaching it first),
+    /// while ignoring ordinary and support-projected RDF assertions in the output.
+    fn check_output_record_history(
+        &self,
+        p: &PolicyGraphs,
+        dataset_id: Uuid,
+        protected_record_graphs: &[(&str, Uuid)],
+    ) -> Result<()> {
+        if self.reads.has_published_operation_in_output(
+            p.output.0.as_str(),
+            p.output.1,
+            dataset_id,
+            protected_record_graphs,
+        )? {
             return Err(managed(
                 ManagedErrorKind::ImmutableRecordConflict,
                 format!(
@@ -1865,8 +1867,12 @@ pub fn review(
             .iter()
             .map(|(g, n)| (g.as_str(), *n))
             .collect();
+        let protected_records: Vec<(&str, Uuid)> = records
+            .iter()
+            .filter_map(|(g, n)| n.map(|n| (g.as_str(), n)))
+            .collect();
         state.check_same_version_drift(&p, policy_version, &settings, &protected_refs)?;
-        state.check_output_record_history(&p)?;
+        state.check_output_record_history(&p, main.dataset_id(), &protected_records)?;
         let existing = state.check_projection(&p, Some((policy_version, &record)))?;
         batch.records.push(record);
         skip.push(existing);
@@ -1980,20 +1986,38 @@ fn protected_managed_graphs(settings: &Settings, capability: &ManagedWrite) -> V
         .collect()
 }
 
-/// Every managed graph of `settings` (including dedicated projections) with its
-/// current protection nonce under `capability`, so keyed reconciliation replays and
-/// identity collision checks retain visibility into former record graphs that changed
-/// roles to dedicated outputs while keeping their protection nonces.
-fn managed_graph_nonces(settings: &Settings, capability: &ManagedWrite) -> Vec<G> {
+/// The dedicated projection graphs of `settings` with their current protection nonces
+/// under `capability`. Dedicated outputs can hold ordinary and support-projected RDF
+/// assertions, so callers inspect them only for genuinely published evidence-owner
+/// records (as when a former record graph moved into `projections` without detaching).
+fn projection_graph_nonces(settings: &Settings, capability: &ManagedWrite) -> Vec<G> {
     settings
-        .managed_graphs()
-        .into_iter()
+        .projections
+        .iter()
         .filter_map(|g| NamedNode::new(g.as_str()).ok())
         .map(|g| {
             let n = capability.protection(g.as_str());
             (g, n)
         })
         .collect()
+}
+
+fn merge_recorded_operation(
+    prev: Option<sparkles_core::evidence::write::RecordedOperation>,
+    this: Option<sparkles_core::evidence::write::RecordedOperation>,
+) -> Option<sparkles_core::evidence::write::RecordedOperation> {
+    match (prev, this) {
+        (None, other) | (other, None) => other,
+        (Some(prev), Some(this)) => Some(sparkles_core::evidence::write::RecordedOperation {
+            authenticated: prev.authenticated && this.authenticated,
+            payload_digest: prev
+                .payload_digest
+                .filter(|d| Some(*d) == this.payload_digest),
+            branch: prev.branch.filter(|b| Some(*b) == this.branch),
+            commit: prev.commit.filter(|c| Some(*c) == this.commit),
+            ended_at: prev.ended_at,
+        }),
+    }
 }
 
 /// Refuse when a record identity the operation mints already has content in a record
@@ -2589,7 +2613,12 @@ pub fn reconcile_projection_prepared(
             superseded: BTreeSet::new(),
             withdrawn: BTreeSet::new(),
         };
-        let managed_records = managed_graph_nonces(&settings, &capability);
+        let record_graphs = record_graph_nonces(&settings, &capability);
+        let projection_graphs = projection_graph_nonces(&settings, &capability);
+        let protected_records: Vec<(&str, Uuid)> = record_graphs
+            .iter()
+            .filter_map(|(g, n)| n.map(|n| (g.as_str(), n)))
+            .collect();
         let op_iri = operation_iri(operation);
         if options.idempotency_key.is_some() {
             let probe = Batch {
@@ -2602,20 +2631,44 @@ pub fn reconcile_projection_prepared(
                 graphs: Vec::new(),
                 records: Vec::new(),
             };
-            let found = state
+            let mut found = state
                 .reads
-                .operation(&probe.operation_iri, &managed_records)?;
+                .operation(&probe.operation_iri, &record_graphs)?;
+            let mut published_op_outputs: Vec<G> = Vec::new();
+            for (g, nonce) in &projection_graphs {
+                if state.reads.is_published_operation_in_output(
+                    &op_iri,
+                    g.as_str(),
+                    *nonce,
+                    main.dataset_id(),
+                    &protected_records,
+                )? {
+                    let copy = state
+                        .reads
+                        .operation(&probe.operation_iri, &[(g.clone(), *nonce)])?;
+                    found = merge_recorded_operation(found, copy);
+                    published_op_outputs.push((g.clone(), *nonce));
+                }
+            }
             if let Some((commit, recorded_branch)) = replayed(found, &probe)? {
                 // Preserve keyed refusal semantics above, then enforce caller read
-                // authorization on every graph that recorded the replayed operation
+                // authorization on every graph that published the replayed operation
                 // before exposing any metadata from it.
-                for (g, _) in &managed_records {
+                for (g, _) in &record_graphs {
                     if state.reads.has_operation(op_iri.as_str(), g.as_str())? {
                         readable_optional(access.as_ref(), g)?;
                     }
                 }
+                for (g, _) in &published_op_outputs {
+                    readable_optional(access.as_ref(), g)?;
+                }
                 let mut search_graphs: Vec<G> = vec![p.supports.clone()];
-                for (g, nonce) in &managed_records {
+                for (g, nonce) in &record_graphs {
+                    if *g != p.supports.0 {
+                        search_graphs.push((g.clone(), *nonce));
+                    }
+                }
+                for (g, nonce) in &published_op_outputs {
                     if *g != p.supports.0 {
                         search_graphs.push((g.clone(), *nonce));
                     }
@@ -2742,7 +2795,7 @@ pub fn reconcile_projection_prepared(
             .map(|(g, n)| (g.as_str(), *n))
             .collect();
         state.check_same_version_drift(&p, policy.version, &settings, &protected_refs)?;
-        state.check_output_record_history(&p)?;
+        state.check_output_record_history(&p, main.dataset_id(), &protected_records)?;
         // Existing projection records of this policy, and which remain unsuperseded.
         let mut proj_held = preparation.reserve(0)?;
         let (existing_projections, superseded_projections) =
@@ -3005,7 +3058,24 @@ pub fn reconcile_projection_prepared(
             let iri = record.iri.clone();
             batch.records.push(record);
             let skip = [false];
-            check_identities(&mut state, &batch, &managed_records, &skip)?;
+            check_identities(&mut state, &batch, &record_graphs, &skip)?;
+            for (g, nonce) in &projection_graphs {
+                if state.reads.has_published_record_in_output(
+                    &iri,
+                    g.as_str(),
+                    *nonce,
+                    main.dataset_id(),
+                    &protected_records,
+                )? {
+                    return Err(managed(
+                        ManagedErrorKind::ImmutableRecordConflict,
+                        format!(
+                            "projection: <{}> is already recorded with other content",
+                            iri.as_str()
+                        ),
+                    ));
+                }
+            }
             iri
         };
         drop(active_projections);

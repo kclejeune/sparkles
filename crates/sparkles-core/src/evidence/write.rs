@@ -1479,16 +1479,41 @@ impl<'a> Reads<'a> {
         limit: usize,
         held: &mut Reservation,
     ) -> Result<(Vec<NamedNode>, bool)> {
-        let (Some(p), Some(g)) = (self.id(p)?, self.id(g)?) else {
+        self.subjects_matching_up_to_held(&[(p, o)], g, limit, held)
+    }
+
+    /// The IRI subjects in `g` that satisfy every `(predicate, object)` clause in
+    /// `clauses`, at most `limit` of them, and whether more exist. Every object must be
+    /// ground. Uses range-seeking leapfrog intersection with `Gspo[g]` so unrelated
+    /// graphs' rows are skipped. The scan buffer, output buffer and every retained IRI
+    /// are charged to `held` before allocation or cloning.
+    pub fn subjects_matching_up_to_held(
+        &mut self,
+        clauses: &[(&str, &Term)],
+        g: &str,
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<NamedNode>, bool)> {
+        if clauses.is_empty() {
+            return Ok((Vec::new(), false));
+        }
+        let Some(g) = self.id(g)? else {
             return Ok((Vec::new(), false));
         };
-        let o = match o {
-            Term::NamedNode(n) => self.id(n.as_str())?,
-            t => self.preparation.lookup_term(self.snap, t)?,
-        };
-        let Some(o) = o else {
-            return Ok((Vec::new(), false));
-        };
+        let mut resolved = Vec::with_capacity(clauses.len());
+        for (p, o) in clauses {
+            let Some(p) = self.id(p)? else {
+                return Ok((Vec::new(), false));
+            };
+            let o = match o {
+                Term::NamedNode(n) => self.id(n.as_str())?,
+                t => self.preparation.lookup_term(self.snap, t)?,
+            };
+            let Some(o) = o else {
+                return Ok((Vec::new(), false));
+            };
+            resolved.push((p, o));
+        }
         const ROW: u64 = std::mem::size_of::<Id>() as u64;
         const CHUNK: usize = 1024;
         const OUT_ROW: u64 = std::mem::size_of::<NamedNode>() as u64;
@@ -1496,23 +1521,19 @@ impl<'a> Reads<'a> {
         let mut rows_held = self.preparation.reserve(0)?;
         let mut ids: Vec<Id> = Vec::new();
         let mut more = false;
-        self.preparation
-            .scan(self.snap, Perm::Pos, &[p.0, o.0], |q| {
-                if q[3] != g {
-                    return Ok(true);
-                }
-                if ids.len() == limit {
-                    more = true;
-                    return Ok(false);
-                }
-                if ids.len() == ids.capacity() {
-                    let add = limit.saturating_sub(ids.len()).clamp(1, CHUNK);
-                    rows_held.grow_by((add as u64).saturating_mul(ROW))?;
-                    ids.reserve_exact(add);
-                }
-                ids.push(q[0]);
-                Ok(true)
-            })?;
+        self.for_each_pos_intersection_in_graph(g, &resolved, |s| {
+            if ids.len() == limit {
+                more = true;
+                return Ok(false);
+            }
+            if ids.len() == ids.capacity() {
+                let add = limit.saturating_sub(ids.len()).clamp(1, CHUNK);
+                rows_held.grow_by((add as u64).saturating_mul(ROW))?;
+                ids.reserve_exact(add);
+            }
+            ids.push(s);
+            Ok(true)
+        })?;
         let mut out: Vec<NamedNode> = Vec::new();
         let total = ids.len();
         for (i, id) in ids.into_iter().enumerate() {
@@ -1759,57 +1780,416 @@ impl<'a> Reads<'a> {
         Ok(if duplicate { None } else { found })
     }
 
-    /// Whether `graph` holds any continuously authenticated `ev:Operation` (or
-    /// authenticated record receipted by one) under its current protection `nonce`.
+    /// Stream every subject `s` in `g_id` that satisfies every `(predicate, object)`
+    /// clause in `clauses`, using range-seeking leapfrog intersection across `Perm::Pos`
+    /// and `Perm::Gspo[g_id]`. Skips unrelated graphs and non-matching subjects in
+    /// logarithmic seeks without visiting unrelated rows.
+    fn for_each_pos_intersection_in_graph(
+        &self,
+        g_id: Id,
+        clauses: &[(Id, Id)],
+        mut each: impl FnMut(Id) -> Result<bool>,
+    ) -> Result<()> {
+        if clauses.is_empty() {
+            return Ok(());
+        }
+        let total = clauses.len() + 1; // last stream is Gspo[g_id]
+        let mut target_s = 0u64;
+        let mut matched = 0usize;
+        let mut idx = 0usize;
+        let mut steps = 0u64;
+        loop {
+            self.preparation.check()?;
+            steps += 1;
+            if steps.is_multiple_of(1024) {
+                self.preparation.stage("scanning permission rows")?;
+            }
+            if idx < clauses.len() {
+                let (p, o) = clauses[idx];
+                let lo = [p.0, o.0, target_s, g_id.0];
+                let hi = [p.0, o.0, u64::MAX, u64::MAX];
+                let Some(q) = self
+                    .preparation
+                    .first_in_range(self.snap, Perm::Pos, lo, hi)?
+                else {
+                    return Ok(());
+                };
+                let (found_s, found_g) = (q[0].0, q[3].0);
+                if found_s == target_s {
+                    if found_g == g_id.0 {
+                        matched += 1;
+                    } else {
+                        let Some(next) = target_s.checked_add(1) else {
+                            return Ok(());
+                        };
+                        target_s = next;
+                        matched = 0;
+                    }
+                } else if found_g == g_id.0
+                    || (found_g < g_id.0 && self.snap.contains(&[Id(found_s), p, o, g_id])?)
+                {
+                    target_s = found_s;
+                    matched = 1;
+                } else {
+                    let Some(next) = found_s.checked_add(1) else {
+                        return Ok(());
+                    };
+                    target_s = next;
+                    matched = 0;
+                }
+            } else {
+                let lo = [g_id.0, target_s, 0, 0];
+                let hi = [g_id.0, u64::MAX, u64::MAX, u64::MAX];
+                let Some(q) = self
+                    .preparation
+                    .first_in_range(self.snap, Perm::Gspo, lo, hi)?
+                else {
+                    return Ok(());
+                };
+                let found_s = q[0].0;
+                if found_s == target_s {
+                    matched += 1;
+                } else {
+                    target_s = found_s;
+                    matched = 1;
+                }
+            }
+            if matched == total {
+                if !each(Id(target_s))? {
+                    return Ok(());
+                }
+                let Some(next) = target_s.checked_add(1) else {
+                    return Ok(());
+                };
+                target_s = next;
+                matched = 0;
+                idx = 0;
+            } else {
+                idx = (idx + 1) % total;
+            }
+        }
+    }
+
+    /// Whether `s` is authenticated in protected graph `g` under `g_nonce_id` via its
+    /// single `ev:availabilityReceipt` and `ev:graphProtection` markers.
+    #[allow(clippy::too_many_arguments)]
+    fn authenticated_record_id(
+        &self,
+        s: Id,
+        g: Id,
+        g_nonce_id: Id,
+        rdf_type: Id,
+        op_class: Id,
+        graph_prot_pred: Id,
+        avail_receipt: Id,
+    ) -> Result<bool> {
+        let Some(op_id) = self.single_object_id(g, s, avail_receipt)? else {
+            return Ok(false);
+        };
+        let op_is_iri = self.preparation.with_term(self.snap, op_id, |t| {
+            Ok(matches!(t, Some(Term::NamedNode(_))))
+        })?;
+        if !op_is_iri {
+            return Ok(false);
+        }
+        if !self.snap.contains(&[op_id, rdf_type, op_class, g])? {
+            return Ok(false);
+        }
+        if self.single_object_id(g, op_id, graph_prot_pred)? != Some(g_nonce_id) {
+            return Ok(false);
+        }
+        Ok(self.single_object_id(g, s, graph_prot_pred)? == Some(g_nonce_id))
+    }
+
+    /// Whether `(subject, ev:graphProtection, "<nonce>")` in dedicated output graph
+    /// `output_g_id` was projected there by an authenticated `ev:AcceptanceSupport` in
+    /// any continuously protected record-role graph `sg != output_g_id`.
+    fn graph_protection_projected_by_support(
+        &self,
+        subject: &NamedNode,
+        nonce: Uuid,
+        output_g_id: Id,
+        protected_record_graphs: &[(&str, Uuid)],
+    ) -> Result<bool> {
+        if protected_record_graphs.is_empty() {
+            return Ok(false);
+        }
+        let triple = Triple::new(
+            subject.clone(),
+            ev("graphProtection"),
+            string(&nonce.to_string()),
+        );
+        let Some(t_id) = self
+            .preparation
+            .lookup_term(self.snap, &Term::Triple(Box::new(triple)))?
+        else {
+            return Ok(false);
+        };
+        let (
+            Some(supported_triple_pred),
+            Some(output_pred),
+            Some(rdf_type),
+            Some(support_class),
+            Some(op_class),
+            Some(graph_prot_pred),
+            Some(avail_receipt),
+        ) = (
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}supportedTriple"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}output"))?,
+            self.preparation.lookup_iri(self.snap, RDF_TYPE)?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}AcceptanceSupport"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}Operation"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}graphProtection"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}availabilityReceipt"))?,
+        )
+        else {
+            return Ok(false);
+        };
+        for (sg_iri, sg_nonce) in protected_record_graphs {
+            self.preparation.check()?;
+            let Some(sg_id) = self.preparation.lookup_iri(self.snap, sg_iri)? else {
+                continue;
+            };
+            if sg_id == output_g_id {
+                continue;
+            }
+            let sg_nonce_term = Term::Literal(Literal::new_simple_literal(sg_nonce.to_string()));
+            let Some(sg_nonce_id) = self.preparation.lookup_term(self.snap, &sg_nonce_term)? else {
+                continue;
+            };
+            let mut projected = false;
+            self.for_each_pos_intersection_in_graph(
+                sg_id,
+                &[
+                    (supported_triple_pred, t_id),
+                    (output_pred, output_g_id),
+                    (rdf_type, support_class),
+                    (graph_prot_pred, sg_nonce_id),
+                ],
+                |sup_id| {
+                    if self.single_object_id(sg_id, sup_id, output_pred)? == Some(output_g_id)
+                        && self.single_object_id(sg_id, sup_id, supported_triple_pred)?
+                            == Some(t_id)
+                        && self.authenticated_record_id(
+                            sup_id,
+                            sg_id,
+                            sg_nonce_id,
+                            rdf_type,
+                            op_class,
+                            graph_prot_pred,
+                            avail_receipt,
+                        )?
+                    {
+                        projected = true;
+                        return Ok(false);
+                    }
+                    Ok(true)
+                },
+            )?;
+            if projected {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether `op_id` in dedicated output graph `g_id` is a genuinely published
+    /// evidence-owner `ev:Operation` under `nonce` for `dataset_id`, rather than
+    /// ordinary or support-projected RDF assertions.
+    #[allow(clippy::too_many_arguments)]
+    fn is_published_operation_id(
+        &self,
+        op_id: Id,
+        g_id: Id,
+        nonce: Uuid,
+        nonce_id: Id,
+        expected_dataset_id: Id,
+        rdf_type: Id,
+        op_class: Id,
+        prov_activity: Id,
+        was_assoc: Id,
+        ended_at: Id,
+        dataset_id_pred: Id,
+        branch_id_pred: Id,
+        commit_pred: Id,
+        payload_digest_pred: Id,
+        graph_prot_pred: Id,
+        protected_record_graphs: &[(&str, Uuid)],
+    ) -> Result<bool> {
+        let Some(op_iri) = self.preparation.with_term(self.snap, op_id, |t| match t {
+            Some(Term::NamedNode(n)) => Ok(Some(n.clone())),
+            _ => Ok(None),
+        })?
+        else {
+            return Ok(false);
+        };
+        if !self.snap.contains(&[op_id, rdf_type, op_class, g_id])?
+            || !self
+                .snap
+                .contains(&[op_id, rdf_type, prov_activity, g_id])?
+            || self.single_object_id(g_id, op_id, graph_prot_pred)? != Some(nonce_id)
+            || self.single_object_id(g_id, op_id, dataset_id_pred)? != Some(expected_dataset_id)
+        {
+            return Ok(false);
+        }
+        let Some(assoc_id) = self.single_object_id(g_id, op_id, was_assoc)? else {
+            return Ok(false);
+        };
+        if !self.preparation.with_term(self.snap, assoc_id, |t| {
+            Ok(matches!(t, Some(Term::NamedNode(_))))
+        })? {
+            return Ok(false);
+        }
+        let Some(ended_id) = self.single_object_id(g_id, op_id, ended_at)? else {
+            return Ok(false);
+        };
+        let xsd_dt = format!("{XSD}dateTime");
+        if !self.preparation.with_term(self.snap, ended_id, |t| {
+            Ok(matches!(t, Some(Term::Literal(l)) if l.datatype().as_str() == xsd_dt))
+        })? {
+            return Ok(false);
+        }
+        let xsd_str = format!("{XSD}string");
+        let Some(branch_id) = self.single_object_id(g_id, op_id, branch_id_pred)? else {
+            return Ok(false);
+        };
+        if !self.preparation.with_term(self.snap, branch_id, |t| {
+            Ok(matches!(
+                t,
+                Some(Term::Literal(l))
+                    if l.datatype().as_str() == xsd_str && Uuid::parse_str(l.value()).is_ok()
+            ))
+        })? {
+            return Ok(false);
+        }
+        let xsd_int = format!("{XSD}integer");
+        let Some(commit_id) = self.single_object_id(g_id, op_id, commit_pred)? else {
+            return Ok(false);
+        };
+        if !self.preparation.with_term(self.snap, commit_id, |t| {
+            Ok(matches!(
+                t,
+                Some(Term::Literal(l))
+                    if l.datatype().as_str() == xsd_int && l.value().parse::<u64>().is_ok()
+            ))
+        })? {
+            return Ok(false);
+        }
+        let Some(digest_id) = self.single_object_id(g_id, op_id, payload_digest_pred)? else {
+            return Ok(false);
+        };
+        if !self.preparation.with_term(self.snap, digest_id, |t| {
+            Ok(matches!(
+                t,
+                Some(Term::Literal(l))
+                    if l.datatype().as_str() == xsd_str
+                        && l.value().parse::<Sha256Digest>().is_ok()
+            ))
+        })? {
+            return Ok(false);
+        }
+        Ok(!self.graph_protection_projected_by_support(
+            &op_iri,
+            nonce,
+            g_id,
+            protected_record_graphs,
+        )?)
+    }
+
+    /// Whether dedicated output `graph` holds any genuinely published `ev:Operation`
+    /// under its current protection `nonce` for `dataset_id`, ignoring ordinary and
+    /// support-projected RDF assertions.
     ///
-    /// Operates directly on physical [`Id`]s keyed by `(ev:graphProtection, nonce)`
-    /// without mutating this reader's IRI cache, so a dedicated output graph that
-    /// never held authenticated evidence records matches zero rows.
-    pub fn has_authenticated_operation(&self, graph: &str, nonce: Option<Uuid>) -> Result<bool> {
+    /// Operates directly on physical [`Id`]s with leapfrog intersection over
+    /// `(ev:graphProtection, nonce)`, `(rdf:type, ev:Operation)`,
+    /// `(rdf:type, prov:Activity)` and `Gspo[graph]` without mutating `Reads::ids`.
+    pub fn has_published_operation_in_output(
+        &self,
+        graph: &str,
+        nonce: Option<Uuid>,
+        dataset_id: Uuid,
+        protected_record_graphs: &[(&str, Uuid)],
+    ) -> Result<bool> {
         let Some(nonce) = nonce else {
             return Ok(false);
         };
         let nonce_term = Term::Literal(Literal::new_simple_literal(nonce.to_string()));
-        let (Some(g_id), Some(rdf_type), Some(op_class), Some(graph_prot_pred), Some(nonce_id)) = (
+        let ds_term = Term::Literal(Literal::new_simple_literal(dataset_id.to_string()));
+        let (
+            Some(g_id),
+            Some(rdf_type),
+            Some(op_class),
+            Some(prov_activity),
+            Some(was_assoc),
+            Some(ended_at),
+            Some(dataset_id_pred),
+            Some(expected_dataset_id),
+            Some(branch_id_pred),
+            Some(commit_pred),
+            Some(payload_digest_pred),
+            Some(graph_prot_pred),
+            Some(nonce_id),
+        ) = (
             self.preparation.lookup_iri(self.snap, graph)?,
             self.preparation.lookup_iri(self.snap, RDF_TYPE)?,
             self.preparation
                 .lookup_iri(self.snap, &format!("{EV}Operation"))?,
             self.preparation
+                .lookup_iri(self.snap, &format!("{PROV}Activity"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{PROV}wasAssociatedWith"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{PROV}endedAtTime"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}datasetId"))?,
+            self.preparation.lookup_term(self.snap, &ds_term)?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}branchId"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}commit"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}payloadDigest"))?,
+            self.preparation
                 .lookup_iri(self.snap, &format!("{EV}graphProtection"))?,
             self.preparation.lookup_term(self.snap, &nonce_term)?,
-        ) else {
+        )
+        else {
             return Ok(false);
         };
-        let avail_receipt = self
-            .preparation
-            .lookup_iri(self.snap, &format!("{EV}availabilityReceipt"))?;
-        let is_auth_op = |op_id: Id| -> Result<bool> {
-            let op_is_iri = self.preparation.with_term(self.snap, op_id, |t| {
-                Ok(matches!(t, Some(Term::NamedNode(_))))
-            })?;
-            Ok(op_is_iri
-                && self.snap.contains(&[op_id, rdf_type, op_class, g_id])?
-                && self.single_object_id(g_id, op_id, graph_prot_pred)? == Some(nonce_id))
-        };
         let mut found = false;
-        self.preparation.scan(
-            self.snap,
-            Perm::Pos,
-            &[graph_prot_pred.0, nonce_id.0],
-            |q| {
-                if q[3] != g_id {
-                    return Ok(true);
-                }
-                let s = q[0];
-                if is_auth_op(s)? {
-                    found = true;
-                    return Ok(false);
-                }
-                if let Some(avail) = avail_receipt
-                    && let Some(op_id) = self.single_object_id(g_id, s, avail)?
-                    && is_auth_op(op_id)?
-                {
+        self.for_each_pos_intersection_in_graph(
+            g_id,
+            &[
+                (graph_prot_pred, nonce_id),
+                (rdf_type, op_class),
+                (rdf_type, prov_activity),
+                (dataset_id_pred, expected_dataset_id),
+            ],
+            |op_id| {
+                if self.is_published_operation_id(
+                    op_id,
+                    g_id,
+                    nonce,
+                    nonce_id,
+                    expected_dataset_id,
+                    rdf_type,
+                    op_class,
+                    prov_activity,
+                    was_assoc,
+                    ended_at,
+                    dataset_id_pred,
+                    branch_id_pred,
+                    commit_pred,
+                    payload_digest_pred,
+                    graph_prot_pred,
+                    protected_record_graphs,
+                )? {
                     found = true;
                     return Ok(false);
                 }
@@ -1819,13 +2199,147 @@ impl<'a> Reads<'a> {
         Ok(found)
     }
 
+    /// Whether dedicated output `graph` holds a genuinely published `ev:Operation`
+    /// with IRI `op` under `nonce` for `dataset_id` (not ordinary or support-projected
+    /// RDF).
+    pub fn is_published_operation_in_output(
+        &self,
+        op: &NamedNode,
+        graph: &str,
+        nonce: Option<Uuid>,
+        dataset_id: Uuid,
+        protected_record_graphs: &[(&str, Uuid)],
+    ) -> Result<bool> {
+        let Some(nonce) = nonce else {
+            return Ok(false);
+        };
+        let nonce_term = Term::Literal(Literal::new_simple_literal(nonce.to_string()));
+        let ds_term = Term::Literal(Literal::new_simple_literal(dataset_id.to_string()));
+        let (
+            Some(op_id),
+            Some(g_id),
+            Some(rdf_type),
+            Some(op_class),
+            Some(prov_activity),
+            Some(was_assoc),
+            Some(ended_at),
+            Some(dataset_id_pred),
+            Some(expected_dataset_id),
+            Some(branch_id_pred),
+            Some(commit_pred),
+            Some(payload_digest_pred),
+            Some(graph_prot_pred),
+            Some(nonce_id),
+        ) = (
+            self.preparation.lookup_iri(self.snap, op.as_str())?,
+            self.preparation.lookup_iri(self.snap, graph)?,
+            self.preparation.lookup_iri(self.snap, RDF_TYPE)?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}Operation"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{PROV}Activity"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{PROV}wasAssociatedWith"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{PROV}endedAtTime"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}datasetId"))?,
+            self.preparation.lookup_term(self.snap, &ds_term)?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}branchId"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}commit"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}payloadDigest"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}graphProtection"))?,
+            self.preparation.lookup_term(self.snap, &nonce_term)?,
+        )
+        else {
+            return Ok(false);
+        };
+        self.is_published_operation_id(
+            op_id,
+            g_id,
+            nonce,
+            nonce_id,
+            expected_dataset_id,
+            rdf_type,
+            op_class,
+            prov_activity,
+            was_assoc,
+            ended_at,
+            dataset_id_pred,
+            branch_id_pred,
+            commit_pred,
+            payload_digest_pred,
+            graph_prot_pred,
+            protected_record_graphs,
+        )
+    }
+
+    /// Whether dedicated output `graph` holds a genuinely published record with IRI
+    /// `record_iri` under `nonce` for `dataset_id` (authenticated by a genuinely
+    /// published `ev:Operation` in `graph` and not projected by a support).
+    pub fn has_published_record_in_output(
+        &self,
+        record_iri: &NamedNode,
+        graph: &str,
+        nonce: Option<Uuid>,
+        dataset_id: Uuid,
+        protected_record_graphs: &[(&str, Uuid)],
+    ) -> Result<bool> {
+        let Some(nonce) = nonce else {
+            return Ok(false);
+        };
+        let nonce_term = Term::Literal(Literal::new_simple_literal(nonce.to_string()));
+        let (Some(r_id), Some(g_id), Some(graph_prot_pred), Some(avail_receipt), Some(nonce_id)) = (
+            self.preparation
+                .lookup_iri(self.snap, record_iri.as_str())?,
+            self.preparation.lookup_iri(self.snap, graph)?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}graphProtection"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}availabilityReceipt"))?,
+            self.preparation.lookup_term(self.snap, &nonce_term)?,
+        ) else {
+            return Ok(false);
+        };
+        if self.single_object_id(g_id, r_id, graph_prot_pred)? != Some(nonce_id) {
+            return Ok(false);
+        }
+        let Some(op_id) = self.single_object_id(g_id, r_id, avail_receipt)? else {
+            return Ok(false);
+        };
+        let Some(op_iri) = self.preparation.with_term(self.snap, op_id, |t| match t {
+            Some(Term::NamedNode(n)) => Ok(Some(n.clone())),
+            _ => Ok(None),
+        })?
+        else {
+            return Ok(false);
+        };
+        Ok(self.is_published_operation_in_output(
+            &op_iri,
+            graph,
+            Some(nonce),
+            dataset_id,
+            protected_record_graphs,
+        )? && !self.graph_protection_projected_by_support(
+            record_iri,
+            nonce,
+            g_id,
+            protected_record_graphs,
+        )?)
+    }
+
     /// Whether any continuously protected managed graph holds an active, authenticated
     /// `ev:Projection` record showing same-version drift for `(policy_iri, policy_version)`
     /// or its output `(output_graph, output_nonce)`.
     ///
-    /// Operates directly on physical [`Id`]s keyed by current protection nonces
-    /// (`ev:supportsProtection` and `ev:outputProtection`), without mutating this
-    /// reader's IRI cache or scanning unrelated graphs' rows.
+    /// Operates directly on physical [`Id`]s using range-seeking leapfrog intersection
+    /// over protection nonces, policy/version/output clauses, `prov:wasRevisionOf`, and
+    /// `Gspo[g]`, without mutating this reader's IRI cache, scanning unrelated policies'
+    /// history, scanning unrelated noise graphs, or rescanning all projections per prior.
     #[allow(clippy::too_many_arguments)]
     pub fn has_same_version_projection_drift(
         &self,
@@ -1887,48 +2401,36 @@ impl<'a> Reads<'a> {
         }
 
         let authenticated_id = |s: Id, g: Id, g_nonce_id: Id| -> Result<bool> {
-            let Some(op_id) = self.single_object_id(g, s, avail_receipt)? else {
-                return Ok(false);
-            };
-            let op_is_iri = self.preparation.with_term(self.snap, op_id, |t| {
-                Ok(matches!(t, Some(Term::NamedNode(_))))
-            })?;
-            if !op_is_iri {
-                return Ok(false);
-            }
-            if !self.snap.contains(&[op_id, rdf_type, op_class, g])? {
-                return Ok(false);
-            }
-            if self.single_object_id(g, op_id, graph_prot_pred)? != Some(g_nonce_id) {
-                return Ok(false);
-            }
-            Ok(self.single_object_id(g, s, graph_prot_pred)? == Some(g_nonce_id))
+            self.authenticated_record_id(
+                s,
+                g,
+                g_nonce_id,
+                rdf_type,
+                op_class,
+                graph_prot_pred,
+                avail_receipt,
+            )
         };
 
-        // Every authenticated `ev:Projection` in `g` written under `g_nonce_id` carries
-        // `(ev:supportsProtection, g_nonce_id)`, so keying the supersession check by
-        // `g_nonce_id` avoids scanning unrelated graphs' `prov:wasRevisionOf` rows.
+        // Intersect `(prov:wasRevisionOf, r)` with `(ev:supportsProtection, g_nonce_id)`,
+        // `(rdf:type, ev:Projection)`, `(ev:reviewPolicy, target_policy_id)` and `Gspo[g]`
+        // so each eligible prior resolves in O(1) seeks instead of rescanning all
+        // projections in `g`, while skipping unrelated `prov:wasRevisionOf` noise.
         let is_superseded = |r: Id, g: Id, g_nonce_id: Id, target_policy_id: Id| -> Result<bool> {
             let Some(rev_pred) = was_revision_of else {
                 return Ok(false);
             };
             let mut superseded = false;
-            self.preparation.scan(
-                self.snap,
-                Perm::Pos,
-                &[supports_prot_pred.0, g_nonce_id.0],
-                |q| {
-                    if q[3] != g {
-                        return Ok(true);
-                    }
-                    let later = q[0];
-                    if self.snap.contains(&[later, rev_pred, r, g])?
-                        && self.snap.contains(&[later, rdf_type, proj_class, g])?
-                        && self
-                            .snap
-                            .contains(&[later, review_policy, target_policy_id, g])?
-                        && authenticated_id(later, g, g_nonce_id)?
-                    {
+            self.for_each_pos_intersection_in_graph(
+                g,
+                &[
+                    (rev_pred, r),
+                    (supports_prot_pred, g_nonce_id),
+                    (rdf_type, proj_class),
+                    (review_policy, target_policy_id),
+                ],
+                |later| {
+                    if authenticated_id(later, g, g_nonce_id)? {
                         superseded = true;
                         return Ok(false);
                     }
@@ -1940,8 +2442,9 @@ impl<'a> Reads<'a> {
 
         // 1. Policy moved supports out of a continuously protected graph without raising
         // its version (including when the former supports graph changed managed roles).
-        // Key each scan by `(ev:supportsProtection, g_nonce)` so unrelated graphs'
-        // ordinary `(ev:reviewPolicy, policy_iri)` statements are never visited.
+        // Intersect `(ev:supportsProtection, g_nonce)` with `(ev:reviewPolicy, policy_id)`,
+        // `(rdf:type, ev:Projection)`, `(ev:policyVersion, version_id)` and `Gspo[g_id]`
+        // so unrelated policies' authentic history and unrelated noise rows are skipped.
         let cur_supports_id = self.preparation.lookup_iri(self.snap, supports_graph)?;
         let version_term = Term::Literal(Literal::new_simple_literal(policy_version.to_string()));
         if let (Some(policy_id), Some(version_id)) = (
@@ -1953,27 +2456,19 @@ impl<'a> Reads<'a> {
                     continue;
                 }
                 let mut drifted = false;
-                self.preparation.scan(
-                    self.snap,
-                    Perm::Pos,
-                    &[supports_prot_pred.0, g_nonce_id.0],
-                    |q| {
-                        if q[3] != g_id {
-                            return Ok(true);
-                        }
-                        let r = q[0];
-                        if !self.snap.contains(&[r, review_policy, policy_id, g_id])?
-                            || !self.snap.contains(&[r, rdf_type, proj_class, g_id])?
-                            || !self
-                                .snap
-                                .contains(&[r, policy_version_pred, version_id, g_id])?
-                            || !self
-                                .snap
-                                .contains(&[r, graph_prot_pred, g_nonce_id, g_id])?
-                        {
-                            return Ok(true);
-                        }
-                        if self.single_object_id(g_id, r, review_policy)? != Some(policy_id)
+                self.for_each_pos_intersection_in_graph(
+                    g_id,
+                    &[
+                        (supports_prot_pred, g_nonce_id),
+                        (review_policy, policy_id),
+                        (rdf_type, proj_class),
+                        (policy_version_pred, version_id),
+                    ],
+                    |r| {
+                        if !self
+                            .snap
+                            .contains(&[r, graph_prot_pred, g_nonce_id, g_id])?
+                            || self.single_object_id(g_id, r, review_policy)? != Some(policy_id)
                             || self.single_object_id(g_id, r, supports_prot_pred)?
                                 != Some(g_nonce_id)
                             || self.single_object_id(g_id, r, policy_version_pred)?
@@ -2026,51 +2521,60 @@ impl<'a> Reads<'a> {
                     };
                     rivals.insert(other_id, other_ver_id);
                 }
-                if !rivals.is_empty() {
-                    let mut drifted = false;
-                    self.preparation.scan(
-                        self.snap,
-                        Perm::Pos,
-                        &[output_prot_pred.0, out_nonce_id.0],
-                        |q| {
-                            let (r, g) = (q[0], q[3]);
-                            let Some(&g_nonce_id) = protected.get(&g) else {
-                                return Ok(true);
-                            };
-                            if !self.snap.contains(&[r, rdf_type, proj_class, g])?
-                                || !self.snap.contains(&[r, output_pred, output_id, g])?
-                                || !self
+                if !rivals.is_empty()
+                    && self
+                        .preparation
+                        .first_in_range(
+                            self.snap,
+                            Perm::Pos,
+                            [output_prot_pred.0, out_nonce_id.0, 0, 0],
+                            [output_prot_pred.0, out_nonce_id.0, u64::MAX, u64::MAX],
+                        )?
+                        .is_some()
+                {
+                    for (&g_id, &g_nonce_id) in &protected {
+                        let mut drifted = false;
+                        self.for_each_pos_intersection_in_graph(
+                            g_id,
+                            &[
+                                (output_prot_pred, out_nonce_id),
+                                (output_pred, output_id),
+                                (rdf_type, proj_class),
+                                (supports_prot_pred, g_nonce_id),
+                            ],
+                            |r| {
+                                if !self
                                     .snap
-                                    .contains(&[r, supports_prot_pred, g_nonce_id, g])?
-                                || !self.snap.contains(&[r, graph_prot_pred, g_nonce_id, g])?
-                            {
-                                return Ok(true);
-                            }
-                            if self.single_object_id(g, r, output_prot_pred)? != Some(out_nonce_id)
-                                || self.single_object_id(g, r, supports_prot_pred)?
-                                    != Some(g_nonce_id)
-                            {
-                                return Ok(true);
-                            }
-                            let Some(other_id) = self.single_object_id(g, r, review_policy)? else {
-                                return Ok(true);
-                            };
-                            let Some(&other_ver_id) = rivals.get(&other_id) else {
-                                return Ok(true);
-                            };
-                            if self.single_object_id(g, r, policy_version_pred)?
-                                != Some(other_ver_id)
-                                || !authenticated_id(r, g, g_nonce_id)?
-                                || is_superseded(r, g, g_nonce_id, other_id)?
-                            {
-                                return Ok(true);
-                            }
-                            drifted = true;
-                            Ok(false)
-                        },
-                    )?;
-                    if drifted {
-                        return Ok(true);
+                                    .contains(&[r, graph_prot_pred, g_nonce_id, g_id])?
+                                    || self.single_object_id(g_id, r, output_prot_pred)?
+                                        != Some(out_nonce_id)
+                                    || self.single_object_id(g_id, r, supports_prot_pred)?
+                                        != Some(g_nonce_id)
+                                {
+                                    return Ok(true);
+                                }
+                                let Some(other_id) =
+                                    self.single_object_id(g_id, r, review_policy)?
+                                else {
+                                    return Ok(true);
+                                };
+                                let Some(&other_ver_id) = rivals.get(&other_id) else {
+                                    return Ok(true);
+                                };
+                                if self.single_object_id(g_id, r, policy_version_pred)?
+                                    != Some(other_ver_id)
+                                    || !authenticated_id(r, g_id, g_nonce_id)?
+                                    || is_superseded(r, g_id, g_nonce_id, other_id)?
+                                {
+                                    return Ok(true);
+                                }
+                                drifted = true;
+                                Ok(false)
+                            },
+                        )?;
+                        if drifted {
+                            return Ok(true);
+                        }
                     }
                 }
             }

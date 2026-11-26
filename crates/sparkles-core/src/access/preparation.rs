@@ -977,6 +977,23 @@ impl Preparation {
         snap.scan_prepared(perm, prefix, self, each)
     }
 
+    /// Return the first live physical quad in `[lo, hi]` under `perm`, seeking
+    /// directly via block, segment, row and delta bounds.
+    pub(crate) fn first_in_range(
+        &self,
+        snap: &Snapshot,
+        perm: Perm,
+        lo: crate::index::Key,
+        hi: crate::index::Key,
+    ) -> Result<Option<[Id; 4]>> {
+        let mut found = None;
+        snap.scan_prepared_range::<Error>(perm, lo, hi, self, |q| {
+            found = Some(q);
+            Ok(false)
+        })?;
+        Ok(found)
+    }
+
     /// Resolve an IRI with controlled reconstruction and delta-vocabulary waiting.
     pub fn lookup_iri(&self, snap: &Snapshot, iri: &str) -> Result<Option<Id>> {
         self.check()?;
