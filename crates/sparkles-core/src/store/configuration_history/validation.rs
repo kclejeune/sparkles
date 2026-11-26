@@ -126,7 +126,8 @@ fn verify_registry(
         .map_err(|_| managed_history::unavailable("invalid copied configuration registry"))?;
     let document =
         managed_history::resolve(root, family, history, history.identity(family), preparation)?;
-    if registry.format != 3
+    let expected_format = crate::managed::expected_format(&registry.owners, true);
+    if registry.format != expected_format
         || registry.configuration_history != *history
         || registry.revision != document.value.registry_revision
         || registry.owners != document.value.owners

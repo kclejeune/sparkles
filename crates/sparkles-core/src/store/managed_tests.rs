@@ -1052,3 +1052,128 @@ fn protection_nonces_persist_while_protected_and_renew_after_a_detach() {
     let reopened = s.managed_graphs().unwrap().unwrap();
     assert_eq!(nonce(&reopened, M), Some(r));
 }
+
+#[test]
+fn projection_only_registry_writes_format_4_upgrades_from_v1_and_works_with_history() {
+    let (dir, s) = setup();
+    let root = dir.path().join("ds");
+    let mut settings = crate::evidence::Settings {
+        enabled: true,
+        source_records: vec!["urn:src".into()],
+        proposals: vec!["urn:prop".into()],
+        decisions: vec!["urn:dec".into()],
+        supports: vec!["urn:sup".into()],
+        projections: vec!["urn:proj".into()],
+        ..Default::default()
+    };
+    settings.policies.insert(
+        "main".into(),
+        crate::evidence::Policy {
+            version: 1,
+            admitted_kinds: vec![crate::evidence::ClaimKind::Reported],
+            required_scope: Vec::new(),
+            conflicts: crate::evidence::ConflictMode::Refuse,
+            boundary: vec!["urn:src".into(), "urn:prop".into()],
+            decisions: "urn:dec".into(),
+            supports: "urn:sup".into(),
+            output: "urn:proj".into(),
+        },
+    );
+    let canonical = settings.canonical(&crate::task::Control::none()).unwrap();
+    let ev_settings = canonical.bytes();
+    let graphs = settings.managed_graphs();
+    // Start with a format-1 registry (no protections) on disk and verify clean upgrade.
+    let v1_entry = OwnerEntry::for_settings(1, graphs, ev_settings);
+    s.enable_managed(OwnerKind::Evidence, v1_entry.clone(), ev_settings)
+        .unwrap();
+    drop(s);
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("managed.json")).unwrap()).unwrap();
+    assert_eq!(raw["format"], 4);
+    raw["format"] = 1.into();
+    raw["owners"]["evidence"]
+        .as_object_mut()
+        .unwrap()
+        .remove("protections");
+    std::fs::write(
+        root.join("managed.json"),
+        serde_json::to_vec_pretty(&raw).unwrap(),
+    )
+    .unwrap();
+
+    // Format 1 opens cleanly with empty protections and upgrades to format 4 on re-enable.
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let loaded = s.managed_graphs().unwrap().unwrap();
+    assert!(loaded.owners[&OwnerKind::Evidence].protections.is_empty());
+    let upgraded = s
+        .enable_managed(OwnerKind::Evidence, v1_entry, ev_settings)
+        .unwrap();
+    let proj_nonce = upgraded.owners[&OwnerKind::Evidence].protections["urn:proj"];
+    let sup_nonce = upgraded.owners[&OwnerKind::Evidence].protections["urn:sup"];
+    assert!(crate::managed::is_projection_only_protection(proj_nonce));
+    assert!(!crate::managed::is_projection_only_protection(sup_nonce));
+    drop(s);
+
+    let on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("managed.json")).unwrap()).unwrap();
+    assert_eq!(on_disk["format"], 4);
+    assert!(on_disk.get("configurationHistory").is_none());
+
+    // Format 4 reopens cleanly on an unactivated store (reader 6).
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(
+        s.managed_graphs().unwrap().unwrap().owners[&OwnerKind::Evidence].protections["urn:proj"],
+        proj_nonce
+    );
+    drop(s);
+
+    // An unknown future format (format 5) on a plain store keeps reads and refuses writes
+    // cleanly with managed-unavailable.
+    let saved_v4 = std::fs::read(root.join("managed.json")).unwrap();
+    let mut future_plain = on_disk;
+    future_plain["format"] = 5.into();
+    std::fs::write(
+        root.join("managed.json"),
+        serde_json::to_vec_pretty(&future_plain).unwrap(),
+    )
+    .unwrap();
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(
+        managed_code(upd(
+            &s,
+            "INSERT DATA { GRAPH <urn:free> { <urn:x> <urn:p> 1 } }"
+        )),
+        "managed-unavailable"
+    );
+    drop(s);
+    std::fs::write(root.join("managed.json"), saved_v4).unwrap();
+
+    // Activating configuration history keeps format 4 with configurationHistory anchored
+    // and passes both reopen and full copied configuration-history validation.
+    let prep = crate::access::Preparation::new(crate::task::Control::none(), 64 << 20).unwrap();
+    crate::migrate::activate_configuration_history(&root, false, &prep).unwrap();
+    let activated_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("managed.json")).unwrap()).unwrap();
+    assert_eq!(activated_json["format"], 4);
+    assert!(activated_json.get("configurationHistory").is_some());
+    crate::check::configuration_history(&root, true, &crate::task::Control::none()).unwrap();
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(
+        s.managed_graphs().unwrap().unwrap().owners[&OwnerKind::Evidence].protections["urn:proj"],
+        proj_nonce
+    );
+    drop(s);
+
+    // On an activated store, an unknown future format (format 5) refuses open cleanly.
+    let mut future = activated_json;
+    future["format"] = 5.into();
+    std::fs::write(
+        root.join("managed.json"),
+        serde_json::to_vec_pretty(&future).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        managed_code(Store::open(&root, StoreOptions::default()).map(|_| ())),
+        "evidence-unavailable"
+    );
+}

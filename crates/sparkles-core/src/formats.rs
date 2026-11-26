@@ -811,7 +811,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     // the import map of the ontology editor (spec U12, import resolution)
     ds("ontology-imports.json", 1),
     // the managed-graph registry and its owners' settings (see `crate::managed`)
-    ds("managed.json", 3),
+    ds("managed.json", crate::managed::FORMAT),
     ds("evidence.json", 1),
     ds("jobs.json", crate::jobs::FORMAT),
     // durable source holds (see `crate::holds`)
@@ -1075,8 +1075,9 @@ fn settings_stamp_format(s: &SettingsFile, v: &serde_json::Value) -> u32 {
 /// this build would misread.
 /// Refuse `version` of `what` in a dataset that records `recorded_reader` unless
 /// that is the reader of configuration history. Only activation writes the
-/// versions that need it (logs 2, generation `commit.json` 2, `managed.json` 3,
-/// `history.json` 2 and `branch.json` 2), and it raises the dataset reader first.
+/// versions that need it (logs 2, generation `commit.json` 2, `managed.json` 3
+/// and `managed.json` 4 with `configurationHistory`, `history.json` 2 and
+/// `branch.json` 2), and it raises the dataset reader first.
 /// A dataset that records an older reader holds none of them, so one there is a
 /// newer file that this dataset does not admit, refused as a newer release's is.
 /// Callers pass the reader they already read, and bounded readers do not call it.

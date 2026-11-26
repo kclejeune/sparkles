@@ -56,11 +56,14 @@ pub const FILE: &str = "managed.json";
 /// `dataset.json`).
 pub const READER: u32 = 6;
 
-/// The `managed.json` format this build writes. Format 2 adds each owner's
-/// `protections`. Format 1, which has none, is read as a registry whose graphs have no
-/// protection nonces, so they take no typed writes until their owner protects them
-/// again.
-pub const FORMAT: u32 = 3;
+/// The `managed.json` format this build writes when projection-only nonces are present.
+/// Format 1 has no `protections` (read as graphs without nonces until re-enabled).
+/// Format 2 adds `protections` (record-role v4 nonces only). Format 3 adds
+/// `configurationHistory` for activated datasets without projection-only nonces.
+/// Format 4 records registries carrying at least one version-8 projection-only
+/// protection nonce (with or without `configurationHistory`), fencing older writers
+/// that do not enforce the projection-only nonce contract.
+pub const FORMAT: u32 = 4;
 
 /// Whether this build reads the `managed.json` format `f`.
 fn reads_format(f: u64) -> bool {
@@ -80,7 +83,9 @@ pub const MAX_SETTINGS_BYTES: usize = 16 << 20;
 /// version 8 with RFC 4122 variant and 122 cryptographically random bits). Record-role
 /// and legacy protection nonces use UUID version 4, so [`is_projection_only_protection`]
 /// durably distinguishes dedicated projection outputs from former record-role graphs
-/// across `supports` rotations without changing `managed.json`'s on-disk format.
+/// across `supports` rotations. Registries carrying a version-8 nonce write
+/// `managed.json` format 4 so pre-581 writers refuse them rather than publishing
+/// records under a projection-only nonce.
 pub fn new_projection_protection() -> uuid::Uuid {
     let mut bytes = *uuid::Uuid::new_v4().as_bytes();
     bytes[6] = (bytes[6] & 0x0f) | 0x80;
@@ -92,6 +97,29 @@ pub fn new_projection_protection() -> uuid::Uuid {
 /// rather than a record-role graph.
 pub fn is_projection_only_protection(nonce: uuid::Uuid) -> bool {
     nonce.get_version_num() == 8 && nonce.get_variant() == uuid::Variant::RFC4122
+}
+
+/// Whether any owner in `owners` holds a version-8 projection-only protection nonce.
+pub(crate) fn owners_have_projection_only_protections(
+    owners: &BTreeMap<OwnerKind, OwnerEntry>,
+) -> bool {
+    owners.values().any(|entry| {
+        entry
+            .protections
+            .values()
+            .any(|&nonce| is_projection_only_protection(nonce))
+    })
+}
+
+/// The canonical `managed.json` format version for `owners` and `has_history`.
+pub(crate) fn expected_format(owners: &BTreeMap<OwnerKind, OwnerEntry>, has_history: bool) -> u32 {
+    if owners_have_projection_only_protections(owners) {
+        FORMAT
+    } else if has_history {
+        3
+    } else {
+        2
+    }
 }
 
 /// Who owns a set of managed graphs. Each owner has its own typed writer and settings
@@ -687,9 +715,10 @@ fn managed_file<'a>(
     history: Option<&'a crate::store::managed_history::Root>,
 ) -> ManagedFile<'a> {
     ManagedFile {
-        // A legacy configuration change does not activate history or fabricate a
-        // coverage boundary. Only an anchored root writes the new primary form.
-        format: if history.is_some() { FORMAT } else { 2 },
+        // Legacy registries without projection-only nonces keep format 2 (plain) or
+        // format 3 (activated configuration history). Registries carrying any v8
+        // projection-only nonce write format 4 so pre-581 writers refuse them.
+        format: expected_format(&graphs.owners, history.is_some()),
         revision: graphs.revision,
         owners: graphs.owners.iter().map(|(o, e)| (o.as_str(), e)).collect(),
         configuration_history: history,
@@ -918,7 +947,7 @@ fn decode_inner(
         Some(Some(f)) => {
             return Err((
                 format!(
-                    "{FILE} has format {f}; Sparkles {} reads formats 1, 2 and {FORMAT}. It was written by a newer release",
+                    "{FILE} has format {f}; Sparkles {} reads formats 1 to {FORMAT}. It was written by a newer release",
                     crate::formats::SPARKLES_VERSION
                 ),
                 false,
@@ -928,9 +957,15 @@ fn decode_inner(
     }
     let raw: RawFile = serde_json::from_value(v).map_err(|e| (format!("{FILE}: {e}"), false))?;
     debug_assert!(reads_format(raw.format));
-    if (raw.format == 3) != raw.configuration_history.is_some() {
+    if raw.format < 3 && raw.configuration_history.is_some() {
         return Err((
-            format!("{FILE}: configuration history requires format 3 and its complete root"),
+            format!("{FILE}: configuration history requires format 3 or {FORMAT}"),
+            false,
+        ));
+    }
+    if raw.format == 3 && raw.configuration_history.is_none() {
+        return Err((
+            format!("{FILE}: format 3 requires configuration history and its complete root"),
             false,
         ));
     }
@@ -967,6 +1002,20 @@ fn decode_inner(
                 false,
             ));
         }
+        if raw.format < 4
+            && entry
+                .protections
+                .values()
+                .any(|&nonce| is_projection_only_protection(nonce))
+        {
+            return Err((
+                format!(
+                    "{FILE}: owner {name}: format {} does not support projection-only protection nonces",
+                    raw.format
+                ),
+                false,
+            ));
+        }
         check_graphs(&entry.graphs).map_err(|e| (format!("{FILE}: owner {name}: {e}"), false))?;
         let file = owner.settings_file();
         let found = read_settings(owner).map_err(|e| (format!("{file}: {e}"), false))?;
@@ -988,6 +1037,12 @@ fn decode_inner(
         settings.insert(owner, Arc::from(found));
         owners.insert(owner, entry);
     }
+    if raw.format == 4 && !owners_have_projection_only_protections(&owners) {
+        return Err((
+            format!("{FILE}: format 4 requires at least one projection-only protection nonce"),
+            false,
+        ));
+    }
     let mut installed = Installed::new(
         ManagedGraphs {
             revision: raw.revision,
@@ -997,7 +1052,7 @@ fn decode_inner(
     )
     .map_err(|e| (e.to_string(), false))?;
     installed.configuration_history = raw.configuration_history;
-    if raw.format == 3 && installed.file_bytes() != bytes {
+    if installed.configuration_history.is_some() && installed.file_bytes() != bytes {
         return Err((
             format!("{FILE}: history registry is not its unique canonical encoding"),
             false,
@@ -1020,7 +1075,10 @@ pub(crate) fn recorded_history(
     }
     let envelope: Envelope = serde_json::from_slice(bytes)
         .map_err(|_| Error::Corrupt("invalid managed history envelope".into()))?;
-    if !reads_format(envelope.format) || (envelope.format == 3) != envelope.history.is_some() {
+    if !reads_format(envelope.format)
+        || (envelope.format < 3 && envelope.history.is_some())
+        || (envelope.format == 3 && envelope.history.is_none())
+    {
         return Err(Error::Unsupported(
             "managed history envelope has an unsupported version or missing root".into(),
         ));
@@ -1184,6 +1242,12 @@ mod tests {
         v["format"] = 3.into();
         let newer = serde_json::to_vec(&v).unwrap();
         let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        v["format"] = 4.into();
+        let empty_v4 = serde_json::to_vec(&v).unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        v["format"] = 5.into();
+        let unknown_future = serde_json::to_vec(&v).unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
         v["owners"]["widgets"] = v["owners"]["evidence"].clone();
         let unknown_owner = serde_json::to_vec(&v).unwrap();
         let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
@@ -1200,6 +1264,8 @@ mod tests {
         let unknown_merge = serde_json::to_vec(&v).unwrap();
         for (bytes, repairable, settings) in [
             (&newer[..], false, Some(b"{}".to_vec())),
+            (&empty_v4, false, Some(b"{}".to_vec())),
+            (&unknown_future, false, Some(b"{}".to_vec())),
             (&unknown_owner, false, Some(b"{}".to_vec())),
             (&unknown_profile, false, Some(b"{}".to_vec())),
             (&hidden, false, Some(b"{}".to_vec())),
@@ -1213,6 +1279,65 @@ mod tests {
                 ManagedState::Unavailable { repairable: r, .. } => assert_eq!(r, repairable),
                 s => panic!("{s:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn projection_only_nonces_write_format_4_and_fence_older_readers() {
+        let mut e = entry(&["http://e/rec", "http://e/proj"], b"{}");
+        let rec_nonce = uuid::Uuid::new_v4();
+        let proj_nonce = new_projection_protection();
+        e.protections = [
+            ("http://e/rec".to_string(), rec_nonce),
+            ("http://e/proj".to_string(), proj_nonce),
+        ]
+        .into();
+        let graphs = ManagedGraphs {
+            revision: 3,
+            owners: [(OwnerKind::Evidence, e)].into(),
+        };
+        let bytes = file_bytes(&graphs);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // A registry carrying a v8 projection-only nonce writes format 4, which a
+        // pre-581 reader (accepting formats 1..=3 only) must refuse.
+        let written_format = v["format"].as_u64().unwrap();
+        assert_eq!(written_format, 4);
+        assert!(
+            !(1..=3).contains(&written_format),
+            "older readers accepting 1..=3 must refuse a v8-protected registry"
+        );
+        // Current reader decodes format 4 cleanly.
+        match decode(&bytes, |_| Ok(Some(b"{}".to_vec()))) {
+            ManagedState::Installed(i) => assert_eq!(i.graphs, graphs),
+            s => panic!("expected Installed for format 4, got {s:?}"),
+        }
+        // Downgrading the format marker to 2 or 3 while keeping a v8 nonce is refused.
+        for downgraded in [2u64, 3u64] {
+            let mut bad = v.clone();
+            bad["format"] = downgraded.into();
+            assert!(matches!(
+                decode(&serde_json::to_vec(&bad).unwrap(), |_| Ok(Some(
+                    b"{}".to_vec()
+                ))),
+                ManagedState::Unavailable {
+                    repairable: false,
+                    ..
+                }
+            ));
+        }
+        // Unknown higher versions are refused cleanly.
+        for higher in [5u64, 99u64] {
+            let mut future = v.clone();
+            future["format"] = higher.into();
+            assert!(matches!(
+                decode(&serde_json::to_vec(&future).unwrap(), |_| Ok(Some(
+                    b"{}".to_vec()
+                ))),
+                ManagedState::Unavailable {
+                    repairable: false,
+                    ..
+                }
+            ));
         }
     }
 

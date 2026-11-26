@@ -4747,3 +4747,342 @@ fn same_version_drift_supersession_is_linear_across_retained_revisions() {
         "projection-unavailable"
     );
 }
+
+/// A dataset upgraded from a pre-581 writer keeps legacy v4 protection nonces on its
+/// dedicated projection outputs until they rotate. Follow-on projecting reviews,
+/// reconciliation, narrow-grant keyed replay, and supports resets (both retained and
+/// cleared) must handle projected 9-triple `ev:Operation` lookalikes cleanly, upgrading
+/// legacy v4 outputs without genuine record history to v8 (format 4) on supports detach
+/// while keeping genuine former-record v4 graphs protected.
+#[test]
+fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
+    use oxrdf::Literal;
+    use sparkles::managed::OwnerKind;
+
+    const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+    const PROV: &str = "http://www.w3.org/ns/prov#";
+    const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+
+    let decisions2 = "urn:ev:decisions2";
+    let supports2 = "urn:ev:supports2";
+    let output2 = "urn:ev:accepted2";
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ds");
+    let mut s = settings(ConflictMode::Refuse);
+    s.decisions.push(decisions2.into());
+    s.supports.push(supports2.into());
+    s.projections.push(output2.into());
+    s.policies.insert(
+        "other".into(),
+        Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported, ClaimKind::Observation],
+            required_scope: Vec::new(),
+            conflicts: ConflictMode::Refuse,
+            boundary: vec![SOURCES.into(), CLAIMS.into(), OTHER.into()],
+            decisions: decisions2.into(),
+            supports: supports2.into(),
+            output: output2.into(),
+        },
+    );
+
+    // Seed a persistent dataset with a pre-581 format-2 `managed.json` whose dedicated
+    // outputs (`OUTPUT`, `output2`) carry legacy version-4 protection nonces.
+    let legacy_out_nonce = uuid::Uuid::new_v4();
+    let legacy_out2_nonce = uuid::Uuid::new_v4();
+    {
+        let ds = Dataset::open(&root).unwrap();
+        evidence::configure(&ds, &s, &Control::none()).unwrap();
+    }
+    {
+        let managed_path = root.join("managed.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&managed_path).unwrap()).unwrap();
+        assert_eq!(raw["format"], 4);
+        raw["format"] = 2.into();
+        raw["owners"]["evidence"]["protections"][OUTPUT] = legacy_out_nonce.to_string().into();
+        raw["owners"]["evidence"]["protections"][output2] = legacy_out2_nonce.to_string().into();
+        std::fs::write(&managed_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+    }
+
+    let ds = Dataset::open(&root).unwrap();
+    let protections = |ds: &Dataset| {
+        ds.store()
+            .managed_graphs()
+            .unwrap()
+            .unwrap()
+            .owners
+            .get(&OwnerKind::Evidence)
+            .unwrap()
+            .protections
+            .clone()
+    };
+    let p0 = protections(&ds);
+    assert_eq!(p0[OUTPUT], legacy_out_nonce);
+    assert_eq!(p0[output2], legacy_out2_nonce);
+    assert!(!sparkles_core::managed::is_projection_only_protection(
+        p0[OUTPUT]
+    ));
+    assert!(!sparkles_core::managed::is_projection_only_protection(
+        p0[output2]
+    ));
+
+    let project_lookalike =
+        |ds: &Dataset, policy_name: &str, tag: &str, op_iri: NamedNode, nonce: uuid::Uuid| {
+            let ds_id = ds.dataset_id().to_string();
+            let branch_id = ds.store().branch_id().to_string();
+            let payload_sha = sha(&format!("legacy-lookalike-{tag}")).to_string();
+            let dt = Literal::new_typed_literal(
+                "2026-11-26T00:00:00.000Z",
+                iri(&format!("{XSD}dateTime")),
+            );
+            let commit_int = Literal::new_typed_literal("99", iri(&format!("{XSD}integer")));
+            let triples = vec![
+                (
+                    "type",
+                    Triple::new(
+                        op_iri.clone(),
+                        iri(RDF_TYPE),
+                        iri(&format!("{EV}Operation")),
+                    ),
+                ),
+                (
+                    "act",
+                    Triple::new(
+                        op_iri.clone(),
+                        iri(RDF_TYPE),
+                        iri(&format!("{PROV}Activity")),
+                    ),
+                ),
+                (
+                    "assoc",
+                    Triple::new(
+                        op_iri.clone(),
+                        iri(&format!("{PROV}wasAssociatedWith")),
+                        iri("urn:principal:reviewer"),
+                    ),
+                ),
+                (
+                    "ended",
+                    Triple::new(op_iri.clone(), iri(&format!("{PROV}endedAtTime")), dt),
+                ),
+                (
+                    "ds",
+                    Triple::new(
+                        op_iri.clone(),
+                        iri(&format!("{EV}datasetId")),
+                        Literal::new_simple_literal(ds_id),
+                    ),
+                ),
+                (
+                    "br",
+                    Triple::new(
+                        op_iri.clone(),
+                        iri(&format!("{EV}branchId")),
+                        Literal::new_simple_literal(branch_id),
+                    ),
+                ),
+                (
+                    "commit",
+                    Triple::new(op_iri.clone(), iri(&format!("{EV}commit")), commit_int),
+                ),
+                (
+                    "digest",
+                    Triple::new(
+                        op_iri.clone(),
+                        iri(&format!("{EV}payloadDigest")),
+                        Literal::new_simple_literal(payload_sha),
+                    ),
+                ),
+                (
+                    "prot",
+                    Triple::new(
+                        op_iri,
+                        iri(&format!("{EV}graphProtection")),
+                        Literal::new_simple_literal(nonce.to_string()),
+                    ),
+                ),
+            ];
+            let mut decs = Vec::new();
+            for (k, t) in triples {
+                let key = format!("{tag}-{k}");
+                let input = EvidenceInput {
+                    revisions: vec![revision(&key)],
+                    claims: vec![claim("c", Polarity::Positive, t)],
+                    ..Default::default()
+                };
+                let c = claim_of(&propose(ds, &input));
+                decs.push(decision(&key, &c, Disposition::Accepted, None));
+            }
+            let mut opts = reviewer();
+            opts.if_head = Some(ds.store().head_commit().seq);
+            let res = evidence::review(
+                None,
+                ds,
+                ds,
+                policy_name,
+                1,
+                &decs,
+                &opts,
+                &mut |_, _| all(),
+                &Control::none(),
+            )
+            .unwrap();
+            assert!(res.committed);
+        };
+
+    // 1. Project a 9-triple lookalike into legacy v4 OUTPUT and verify a follow-on
+    // projecting review and keyed reconciliation both succeed (not immutable-record-conflict).
+    project_lookalike(
+        &ds,
+        "main",
+        "v4-init",
+        iri("urn:proj:v4-op"),
+        legacy_out_nonce,
+    );
+    let follow = claim_of(&propose(
+        &ds,
+        &occurrence_with("v4-follow", "urn:cve:v4-follow", Polarity::Positive),
+    ));
+    let follow_res = review(
+        &ds,
+        &[decision("v4-follow", &follow, Disposition::Accepted, None)],
+    )
+    .unwrap();
+    assert!(follow_res.committed);
+
+    let mut keyed_opts = reviewer();
+    keyed_opts.idempotency_key = Some("legacy-v4-reconcile-key".into());
+    let first = reconcile(&ds, "main", Some(1), &keyed_opts).unwrap();
+    assert!(first.committed && !first.replayed);
+
+    // 2. Project a 9-triple copy of `first.operation` (different payloadDigest) into
+    // legacy v4 `output2` via `other`. Narrow-grant keyed replay on `main` (without read
+    // grants on `supports2` / `output2`) must succeed without conflict or NotPermitted.
+    project_lookalike(
+        &ds,
+        "other",
+        "v4-shadow",
+        first.operation.clone(),
+        legacy_out2_nonce,
+    );
+    let main_only = Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(
+            [SOURCES, CLAIMS, OTHER, DECISIONS, SUPPORTS, OUTPUT],
+            &[],
+        )),
+        Graphs::Only(GraphRule::new([SUPPORTS, OUTPUT], &[])),
+    ));
+    let mut narrow_replay = keyed_opts.clone();
+    narrow_replay.write = Some(main_only.clone());
+    let head_before_replay = ds.store().head_commit().seq;
+    let replayed1 = evidence::reconcile_projection(
+        &ds,
+        &ds,
+        "main",
+        Some(1),
+        &narrow_replay,
+        Some(main_only.clone()),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(!replayed1.committed && replayed1.replayed);
+    assert_eq!(replayed1.commit, first.commit);
+    assert_eq!(replayed1.projection, first.projection);
+    assert_eq!(ds.store().head_commit().seq, head_before_replay);
+
+    // 3. Supports reset (retained, then cleared) on `supports2` upgrades legacy v4
+    // `output2` to v8 (format 4) while `SUPPORTS` stays intact and narrow-grant keyed
+    // replay on `main` keeps returning `first` without advancing the head.
+    evidence::detach(&ds, supports2).unwrap();
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+    let upgraded_out2_nonce = protections(&ds)[output2];
+    assert_ne!(upgraded_out2_nonce, legacy_out2_nonce);
+    assert!(sparkles_core::managed::is_projection_only_protection(
+        upgraded_out2_nonce
+    ));
+    let managed_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("managed.json")).unwrap()).unwrap();
+    assert_eq!(managed_json["format"], 4);
+
+    let head_after_s2_retain = ds.store().head_commit().seq;
+    let replayed2 = evidence::reconcile_projection(
+        &ds,
+        &ds,
+        "main",
+        Some(1),
+        &narrow_replay,
+        Some(main_only.clone()),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(!replayed2.committed && replayed2.replayed);
+    assert_eq!(replayed2.commit, first.commit);
+    assert_eq!(replayed2.projection, first.projection);
+    assert_eq!(ds.store().head_commit().seq, head_after_s2_retain);
+
+    evidence::detach(&ds, supports2).unwrap();
+    ds.update(&format!(
+        "DELETE WHERE {{ GRAPH <{supports2}> {{ ?s ?p ?o }} }}"
+    ))
+    .unwrap();
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+    let head_after_s2_clear = ds.store().head_commit().seq;
+    let replayed3 = evidence::reconcile_projection(
+        &ds,
+        &ds,
+        "main",
+        Some(1),
+        &narrow_replay,
+        Some(main_only),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(!replayed3.committed && replayed3.replayed);
+    assert_eq!(replayed3.commit, first.commit);
+    assert_eq!(replayed3.projection, first.projection);
+    assert_eq!(ds.store().head_commit().seq, head_after_s2_clear);
+
+    // 4. Supports reset (retained) on SUPPORTS upgrades legacy v4 OUTPUT to v8 (format 4)
+    // and lets `reconcile_projection` empty OUTPUT cleanly.
+    assert_eq!(protections(&ds)[OUTPUT], legacy_out_nonce);
+    evidence::detach(&ds, SUPPORTS).unwrap();
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+    let upgraded_out_nonce = protections(&ds)[OUTPUT];
+    assert_ne!(upgraded_out_nonce, legacy_out_nonce);
+    assert!(sparkles_core::managed::is_projection_only_protection(
+        upgraded_out_nonce
+    ));
+
+    let rec_retain = reconcile(&ds, "main", Some(1), &reviewer()).unwrap();
+    assert!(rec_retain.committed);
+    assert!(
+        !ds.ask(&format!("ASK {{ GRAPH <{OUTPUT}> {{ ?s ?p ?o }} }}"))
+            .unwrap(),
+        "reconcile_projection after SUPPORTS reset (retained) must empty legacy OUTPUT"
+    );
+
+    // 5. Supports reset (cleared) on SUPPORTS after projecting another lookalike also
+    // empties OUTPUT cleanly.
+    project_lookalike(
+        &ds,
+        "main",
+        "v8-clear",
+        iri("urn:proj:v8-clear-op"),
+        upgraded_out_nonce,
+    );
+    evidence::detach(&ds, SUPPORTS).unwrap();
+    ds.update(&format!(
+        "DELETE WHERE {{ GRAPH <{SUPPORTS}> {{ ?s ?p ?o }} }}"
+    ))
+    .unwrap();
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+    let rec_clear = reconcile(&ds, "main", Some(1), &reviewer()).unwrap();
+    assert!(rec_clear.committed);
+    assert!(
+        !ds.ask(&format!("ASK {{ GRAPH <{OUTPUT}> {{ ?s ?p ?o }} }}"))
+            .unwrap(),
+        "reconcile_projection after SUPPORTS reset (cleared) must empty OUTPUT"
+    );
+}

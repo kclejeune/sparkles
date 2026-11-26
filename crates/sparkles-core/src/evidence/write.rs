@@ -1924,13 +1924,113 @@ impl<'a> Reads<'a> {
         Ok(self.single_object_id(g, s, graph_prot_pred)? == Some(g_nonce_id))
     }
 
+    /// Whether `(subject, ev:graphProtection, "<nonce>")` in dedicated output graph
+    /// `output_g_id` was projected there by an authenticated `ev:AcceptanceSupport` in
+    /// any continuously protected record-role graph `sg != output_g_id`.
+    fn graph_protection_projected_by_support(
+        &self,
+        subject: &NamedNode,
+        nonce: Uuid,
+        output_g_id: Id,
+        protected_record_graphs: &[(&str, Uuid)],
+    ) -> Result<bool> {
+        if protected_record_graphs.is_empty() {
+            return Ok(false);
+        }
+        let triple = Triple::new(
+            subject.clone(),
+            ev("graphProtection"),
+            string(&nonce.to_string()),
+        );
+        let Some(t_id) = self
+            .preparation
+            .lookup_term(self.snap, &Term::Triple(Box::new(triple)))?
+        else {
+            return Ok(false);
+        };
+        let (
+            Some(supported_triple_pred),
+            Some(output_pred),
+            Some(rdf_type),
+            Some(support_class),
+            Some(op_class),
+            Some(graph_prot_pred),
+            Some(avail_receipt),
+        ) = (
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}supportedTriple"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}output"))?,
+            self.preparation.lookup_iri(self.snap, RDF_TYPE)?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}AcceptanceSupport"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}Operation"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}graphProtection"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}availabilityReceipt"))?,
+        )
+        else {
+            return Ok(false);
+        };
+        for (sg_iri, sg_nonce) in protected_record_graphs {
+            self.preparation.check()?;
+            let Some(sg_id) = self.preparation.lookup_iri(self.snap, sg_iri)? else {
+                continue;
+            };
+            if sg_id == output_g_id {
+                continue;
+            }
+            let sg_nonce_term = Term::Literal(Literal::new_simple_literal(sg_nonce.to_string()));
+            let Some(sg_nonce_id) = self.preparation.lookup_term(self.snap, &sg_nonce_term)? else {
+                continue;
+            };
+            let mut projected = false;
+            self.for_each_pos_intersection_in_graph(
+                sg_id,
+                &[
+                    (supported_triple_pred, t_id),
+                    (output_pred, output_g_id),
+                    (rdf_type, support_class),
+                    (graph_prot_pred, sg_nonce_id),
+                ],
+                |sup_id| {
+                    if self.single_object_id(sg_id, sup_id, output_pred)? == Some(output_g_id)
+                        && self.single_object_id(sg_id, sup_id, supported_triple_pred)?
+                            == Some(t_id)
+                        && self.authenticated_record_id(
+                            sup_id,
+                            sg_id,
+                            sg_nonce_id,
+                            rdf_type,
+                            op_class,
+                            graph_prot_pred,
+                            avail_receipt,
+                        )?
+                    {
+                        projected = true;
+                        return Ok(false);
+                    }
+                    Ok(true)
+                },
+            )?;
+            if projected {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Whether `op_id` in graph `g_id` carries the full mandatory `publish_quads`
-    /// `ev:Operation` signature under record-origin `nonce_id` for `expected_dataset_id`.
+    /// `ev:Operation` signature under record-origin `nonce` for `expected_dataset_id`
+    /// and was not projected there by an authenticated `ev:AcceptanceSupport`.
     #[allow(clippy::too_many_arguments)]
     fn is_published_operation_id(
         &self,
         op_id: Id,
         g_id: Id,
+        nonce: Uuid,
         nonce_id: Id,
         expected_dataset_id: Id,
         rdf_type: Id,
@@ -1943,13 +2043,15 @@ impl<'a> Reads<'a> {
         commit_pred: Id,
         payload_digest_pred: Id,
         graph_prot_pred: Id,
+        protected_record_graphs: &[(&str, Uuid)],
     ) -> Result<bool> {
-        let op_is_iri = self.preparation.with_term(self.snap, op_id, |t| {
-            Ok(matches!(t, Some(Term::NamedNode(_))))
-        })?;
-        if !op_is_iri {
+        let Some(op_iri) = self.preparation.with_term(self.snap, op_id, |t| match t {
+            Some(Term::NamedNode(n)) => Ok(Some(n.clone())),
+            _ => Ok(None),
+        })?
+        else {
             return Ok(false);
-        }
+        };
         if !self.contains_id(op_id, rdf_type, op_class, g_id)?
             || !self.contains_id(op_id, rdf_type, prov_activity, g_id)?
             || self.single_object_id(g_id, op_id, graph_prot_pred)? != Some(nonce_id)
@@ -2003,14 +2105,22 @@ impl<'a> Reads<'a> {
         let Some(digest_id) = self.single_object_id(g_id, op_id, payload_digest_pred)? else {
             return Ok(false);
         };
-        self.preparation.with_term(self.snap, digest_id, |t| {
+        if !self.preparation.with_term(self.snap, digest_id, |t| {
             Ok(matches!(
                 t,
                 Some(Term::Literal(l))
                     if l.datatype().as_str() == xsd_str
                         && l.value().parse::<Sha256Digest>().is_ok()
             ))
-        })
+        })? {
+            return Ok(false);
+        }
+        Ok(!self.graph_protection_projected_by_support(
+            &op_iri,
+            nonce,
+            g_id,
+            protected_record_graphs,
+        )?)
     }
 
     /// Whether dedicated output `graph` holds any genuinely published `ev:Operation`
@@ -2019,14 +2129,16 @@ impl<'a> Reads<'a> {
     ///
     /// A projection-only (version-8) protection nonce was never held by a record-role
     /// graph and never accepted `publish_quads`, so it immediately returns `false` even
-    /// after `supports` graphs rotate or are cleared. Record-origin (version-4) nonces
-    /// (as when a former record graph moved into `projections` without detaching) are
-    /// checked for the full `publish_quads` signature.
+    /// after `supports` graphs rotate or are cleared. Record-origin and legacy
+    /// (version-4) nonces are checked for the full `publish_quads` signature while
+    /// excluding assertions projected by authenticated supports in
+    /// `protected_record_graphs`.
     pub fn has_published_operation_in_output(
         &self,
         graph: &str,
         nonce: Option<Uuid>,
         dataset_id: Uuid,
+        protected_record_graphs: &[(&str, Uuid)],
     ) -> Result<bool> {
         let Some(nonce) = nonce else {
             return Ok(false);
@@ -2090,6 +2202,7 @@ impl<'a> Reads<'a> {
                 if self.is_published_operation_id(
                     op_id,
                     g_id,
+                    nonce,
                     nonce_id,
                     expected_dataset_id,
                     rdf_type,
@@ -2102,6 +2215,7 @@ impl<'a> Reads<'a> {
                     commit_pred,
                     payload_digest_pred,
                     graph_prot_pred,
+                    protected_record_graphs,
                 )? {
                     found = true;
                     return Ok(false);
@@ -2121,6 +2235,7 @@ impl<'a> Reads<'a> {
         graph: &str,
         nonce: Option<Uuid>,
         dataset_id: Uuid,
+        protected_record_graphs: &[(&str, Uuid)],
     ) -> Result<bool> {
         let Some(nonce) = nonce else {
             return Ok(false);
@@ -2176,6 +2291,7 @@ impl<'a> Reads<'a> {
         self.is_published_operation_id(
             op_id,
             g_id,
+            nonce,
             nonce_id,
             expected_dataset_id,
             rdf_type,
@@ -2188,18 +2304,20 @@ impl<'a> Reads<'a> {
             commit_pred,
             payload_digest_pred,
             graph_prot_pred,
+            protected_record_graphs,
         )
     }
 
     /// Whether dedicated output `graph` holds a genuinely published record with IRI
     /// `record_iri` under `nonce` for `dataset_id` (authenticated by a genuinely
-    /// published `ev:Operation` in `graph`).
+    /// published `ev:Operation` in `graph` and not projected by a support).
     pub fn has_published_record_in_output(
         &self,
         record_iri: &NamedNode,
         graph: &str,
         nonce: Option<Uuid>,
         dataset_id: Uuid,
+        protected_record_graphs: &[(&str, Uuid)],
     ) -> Result<bool> {
         let Some(nonce) = nonce else {
             return Ok(false);
@@ -2233,7 +2351,13 @@ impl<'a> Reads<'a> {
         else {
             return Ok(false);
         };
-        self.is_published_operation_in_output(&op_iri, graph, Some(nonce), dataset_id)
+        self.is_published_operation_in_output(
+            &op_iri,
+            graph,
+            Some(nonce),
+            dataset_id,
+            protected_record_graphs,
+        )
     }
 
     /// Whether any continuously protected managed graph holds an active, authenticated
