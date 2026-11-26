@@ -106,8 +106,9 @@ pub use review::dependents::{
     self, Dependence, Dependent, Dependents, MAX_CHANGED, dependents as find_dependents,
 };
 pub use review::identity::{
-    self, EntityResolution, MAX_MEMBERS, MAX_RESOLVE, RESOLVES_TO, ResolvedEntity,
-    resolve as resolve_entities, resolve_at as resolve_entities_at,
+    self, EntityResolution, MAX_MEMBERS, MAX_RESOLVE, RESOLVES_TO, RebuiltMap, ResolvedEntity,
+    rebuild as rebuild_resolution_map, resolve as resolve_entities,
+    resolve_at as resolve_entities_at,
 };
 pub use review::{
     Changed, Decided, MapChange, Options as ReviewOptions, ProjectionChange, Reviewed, Withdrawn,

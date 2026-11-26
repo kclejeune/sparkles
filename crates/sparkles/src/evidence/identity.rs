@@ -39,16 +39,20 @@ use crate::evidence::resolve::{Resolution, unavailable};
 use crate::managed::ManagedErrorKind;
 use crate::task::Control;
 use crate::{Catalog, Dataset, Error, Result};
-use oxrdf::{GraphName, NamedNode, Quad, Term, Triple};
+use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Triple};
 use sparkles_core::evidence::review::{
     self as rv, BOUNDARY_PROTECTION, Batch, DecisionInput, Disposition, MAP_NONCE_PREDICATES,
     MAX_DECISIONS, MAX_EVIDENCE, MapNonces, MapRevision,
 };
 use sparkles_core::evidence::write::{ExistingRecord, Reads, operation_iri};
 use sparkles_core::evidence::{IdentityRelation, MatchingPolicy, RecordKind, Settings};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
 use uuid::Uuid;
+
+const PROV: &str = "http://www.w3.org/ns/prov#";
+/// The most existing triples of a policy's output graph that [`rebuild`] reads.
+const MAX_OUTPUT_TRIPLES: usize = 1_000_000;
 
 fn ev(local: &str) -> String {
     super::ev(local)
@@ -174,43 +178,36 @@ pub(super) struct Latest {
     pub(super) number: u64,
 }
 
-/// The latest revision of `m`'s map, found by galloping and binary search over the
-/// minted revision identities, which a typed writer publishes in order. Refuses as
-/// `projection-unavailable` when a revision present in the maps graph does not
-/// authenticate or was written under other protections than the current ones, and
-/// when the output holds triples while no revision exists.
-fn latest(
+/// The latest revision present in `m.maps`, found by galloping and binary search over the
+/// minted revision identities, together with its number and whether it authenticates under
+/// the current `maps` protection nonce.
+fn latest_present(
     state: &mut State<'_>,
     dataset: Uuid,
     m: &MapGraphs,
     control: &Control,
-) -> Result<Option<Latest>> {
-    let probe = |n: u64, state: &mut State<'_>| -> Result<Option<NamedNode>> {
+) -> Result<Option<(NamedNode, u64, bool)>> {
+    let probe = |n: u64, state: &mut State<'_>| -> Result<Option<(NamedNode, bool)>> {
         let iri = rv::map_iri(dataset, &m.name, n, control)?;
         match state.reads.record(&iri, std::slice::from_ref(&m.maps))? {
             ExistingRecord::Absent => Ok(None),
-            ExistingRecord::Present {
-                authenticated: true,
-                ..
-            } => Ok(Some(iri)),
-            _ => Err(projection_unavailable(&m.name)),
+            ExistingRecord::Present { authenticated, .. } => Ok(Some((iri, authenticated))),
+            ExistingRecord::Many => Err(projection_unavailable(&m.name)),
         }
     };
-    let Some(first) = probe(1, state)? else {
-        if state.reads.graph_nonempty(m.output.0.as_str())? {
-            return Err(projection_unavailable(&m.name));
-        }
+    let Some((first, first_auth)) = probe(1, state)? else {
         return Ok(None);
     };
     // the largest present revision lies in [lo, hi)
-    let (mut lo, mut lo_iri) = (1u64, first);
+    let (mut lo, mut lo_iri, mut lo_auth) = (1u64, first, first_auth);
     let mut hi = 2u64;
     loop {
         control.check()?;
         match probe(hi, state)? {
-            Some(iri) => {
+            Some((iri, auth)) => {
                 lo = hi;
                 lo_iri = iri;
+                lo_auth = auth;
                 hi = hi
                     .checked_mul(2)
                     .ok_or_else(|| projection_unavailable(&m.name))?;
@@ -222,12 +219,36 @@ fn latest(
         control.check()?;
         let mid = lo + (hi - lo) / 2;
         match probe(mid, state)? {
-            Some(iri) => {
+            Some((iri, auth)) => {
                 lo = mid;
                 lo_iri = iri;
+                lo_auth = auth;
             }
             None => hi = mid,
         }
+    }
+    Ok(Some((lo_iri, lo, lo_auth)))
+}
+
+/// The latest revision of `m`'s map, found by galloping and binary search over the
+/// minted revision identities, which a typed writer publishes in order. Refuses as
+/// `projection-unavailable` when the latest revision in the maps graph does not
+/// authenticate or was written under other protections than the current ones, and
+/// when the output holds triples while no revision exists.
+fn latest(
+    state: &mut State<'_>,
+    dataset: Uuid,
+    m: &MapGraphs,
+    control: &Control,
+) -> Result<Option<Latest>> {
+    let Some((lo_iri, lo, lo_auth)) = latest_present(state, dataset, m, control)? else {
+        if state.reads.graph_nonempty(m.output.0.as_str())? {
+            return Err(projection_unavailable(&m.name));
+        }
+        return Ok(None);
+    };
+    if !lo_auth || !state.typed(&lo_iri, &m.maps, RecordKind::ResolutionMap)? {
+        return Err(projection_unavailable(&m.name));
     }
     // the latest revision's protections must be the current ones
     let now = m.nonces().map(|n| [n.decisions, n.maps, n.output]);
@@ -1072,6 +1093,629 @@ fn quad(t: &Triple, output: &NamedNode) -> Quad {
         t.object.clone(),
         GraphName::NamedNode(output.clone()),
     )
+}
+
+// ------------------------------------------------------------------ rebuild -------
+
+/// The outcome of [`rebuild`].
+#[derive(Debug)]
+pub struct RebuiltMap {
+    pub operation: NamedNode,
+    pub committed: bool,
+    pub replayed: bool,
+    pub commit: u64,
+    pub branch: Uuid,
+    pub policy: NamedNode,
+    pub policy_version: u32,
+    /// The resolution map revision the rebuild published, also for a replay.
+    pub revision: NamedNode,
+    /// Its number, from 1.
+    pub number: u64,
+    /// The previous authenticated revision it follows, `None` when none existed or when
+    /// earlier revisions in the maps graph no longer authenticate.
+    pub previous: Option<NamedNode>,
+    /// The protected identity graphs of the boundary recorded on the revision, sorted.
+    pub boundary: Vec<NamedNode>,
+    /// What changed. A replay reports nothing here.
+    pub changed: Changed,
+    pub preview: Option<Box<crate::preview::Preview>>,
+}
+
+/// Fold the authenticated revision chain ending at `head_rev` to obtain the set of
+/// accepted decisions effective at `head_rev`.
+fn fold_previous_effective(
+    state: &mut State<'_>,
+    m: &MapGraphs,
+    head_rev: &NamedNode,
+    retained: &mut usize,
+    control: &Control,
+) -> Result<BTreeSet<NamedNode>> {
+    let mut chain = Vec::new();
+    let mut visited = BTreeSet::new();
+    let mut cursor = Some(head_rev.clone());
+    while let Some(rev) = cursor {
+        control.check()?;
+        if !visited.insert(rev.clone()) {
+            return Err(managed(
+                ManagedErrorKind::ImmutableRecordConflict,
+                format!(
+                    "policy {}: resolution map revision chain contains a cycle at <{}>",
+                    m.name,
+                    rev.as_str()
+                ),
+            ));
+        }
+        if !state.typed(&rev, &m.maps, RecordKind::ResolutionMap)? {
+            break;
+        }
+        if chain.len() == MAX_EVIDENCE {
+            return Err(incomplete("resolution map revisions"));
+        }
+        let next = state.iri(&rev, &format!("{PROV}wasRevisionOf"), &m.maps)?;
+        chain.push(rev);
+        cursor = next;
+    }
+    chain.reverse();
+    let mut effective = BTreeSet::new();
+    let mut counted = 0usize;
+    for rev in &chain {
+        control.check()?;
+        let (adds, more_a) = state.reads.objects_up_to(
+            rev.as_str(),
+            &ev("adds"),
+            m.maps.0.as_str(),
+            MAX_EVIDENCE,
+        )?;
+        if more_a {
+            return Err(incomplete("resolution map decisions"));
+        }
+        let (ends, more_e) = state.reads.objects_up_to(
+            rev.as_str(),
+            &ev("ends"),
+            m.maps.0.as_str(),
+            MAX_EVIDENCE,
+        )?;
+        if more_e {
+            return Err(incomplete("resolution map decisions"));
+        }
+        for t in adds {
+            if let Term::NamedNode(d) = t {
+                counted += 1;
+                if counted > MAX_EVIDENCE {
+                    return Err(incomplete("resolution map decisions"));
+                }
+                effective.insert(d);
+            }
+        }
+        for t in ends {
+            if let Term::NamedNode(d) = t {
+                counted += 1;
+                if counted > MAX_EVIDENCE {
+                    return Err(incomplete("resolution map decisions"));
+                }
+                effective.remove(&d);
+            }
+        }
+    }
+    for d in &effective {
+        retain(retained, RETAINED_BYTES, d.as_str().len())?;
+    }
+    Ok(effective)
+}
+
+/// Administered rebuild of a matching policy's resolution map on `logical` (`main` or one
+/// of its branches) after a boundary or protection change.
+///
+/// Recomputes the clusters of the policy's current authenticated accepted decisions whose
+/// targets are authenticated identity proposals in the current protected identity graphs
+/// of the policy's boundary, validates all current effective separations, rewrites the
+/// policy's output graph atomically to match those clusters, and appends a fresh
+/// `ev:ResolutionMap` revision recording the current graph protections and boundary
+/// protections.
+///
+/// Refusals, which write nothing: invalid input or unknown matching policy,
+/// `unsupported-profile` when the evidence profile is disabled or a policy graph is
+/// detached, `policy-changed` when `policy_version` does not match, `head-changed`,
+/// `identity-conflict` when an effective separation joins one cluster,
+/// `immutable-record-conflict`, `idempotency-conflict`, `incomplete-evidence` beyond the
+/// operation's record or memory bounds, `NotPermitted` when `options.write` lacks access
+/// or masks triples, and `authority-changed`.
+pub fn rebuild(
+    main: &Dataset,
+    logical: &Dataset,
+    policy_name: &str,
+    policy_version: Option<u32>,
+    options: &Options,
+    control: &Control,
+) -> Result<RebuiltMap> {
+    control.check()?;
+    check_store(main, logical)?;
+    let (settings, settings_bytes) = settings_of(main)?;
+    if !settings.enabled {
+        return Err(managed(
+            ManagedErrorKind::UnsupportedProfile,
+            "the evidence profile is not enabled in this dataset",
+        ));
+    }
+    let Some(policy) = settings.matching_policies.get(policy_name) else {
+        return Err(Error::invalid(format!(
+            "policy: the evidence settings name no matching policy {policy_name}"
+        )));
+    };
+    if let Some(expected) = policy_version
+        && policy.version != expected
+    {
+        return Err(managed(
+            ManagedErrorKind::PolicyChanged,
+            format!(
+                "policyVersion: policy {policy_name} is at version {}, not {expected}",
+                policy.version
+            ),
+        ));
+    }
+    let operation = operation(main, options)?;
+    let payload = rv::rebuild_map_payload_digest(policy_name, policy_version, control)?;
+    if let Some(access) = options.write.as_ref() {
+        if access.hides_triples() {
+            return Err(Error::NotPermitted(
+                "rebuilding a resolution map requires an unmasked view of the policy's graphs"
+                    .into(),
+            ));
+        }
+        for g in [&policy.maps, &policy.output] {
+            let g = NamedNode::new(g.as_str()).map_err(|e| Error::invalid(e.to_string()))?;
+            writable(Some(access), &g)?;
+        }
+        for g in required_graphs(&settings, policy) {
+            let g = NamedNode::new(g.as_str()).map_err(|e| Error::invalid(e.to_string()))?;
+            readable(Some(access), &g)?;
+        }
+    }
+    let capability = capability(logical, operation, &settings_bytes)?;
+    let m = MapGraphs::new(policy_name, policy, &settings, &|g| {
+        capability.protection(g)
+    })?;
+    let nonces = m.protected()?;
+    let store = logical.store();
+    let branch = store.branch_id();
+    let head = store.snapshot();
+    let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
+    let mut state = State {
+        reads: Reads::new(&preparation, &head),
+        seen: None,
+        claim_graphs: Vec::new(),
+        superseded: BTreeSet::new(),
+        withdrawn: BTreeSet::new(),
+    };
+    let records = record_graph_nonces(&settings, &capability);
+    // A repeated idempotency key answers the first receipt before anything else is read.
+    if options.idempotency_key.is_some() {
+        let probe = Batch {
+            operation,
+            operation_iri: operation_iri(operation),
+            payload_digest: payload,
+            principal: options.principal.clone(),
+            idempotency_key: options.idempotency_key.clone(),
+            graphs: Vec::new(),
+            records: Vec::new(),
+        };
+        let found = state.reads.operation(&probe.operation_iri, &records)?;
+        if let Some((commit, recorded_branch)) = replayed(found, &probe)? {
+            let (published, _) = state.reads.subjects_up_to(
+                &ev("availabilityReceipt"),
+                &Term::NamedNode(probe.operation_iri.clone()),
+                m.maps.0.as_str(),
+                MAX_DECISIONS + 2,
+            )?;
+            let mut found_rev = None;
+            for s in published {
+                if state.typed(&s, &m.maps, RecordKind::ResolutionMap)?
+                    && state.reads.contains(
+                        s.as_str(),
+                        &ev("reviewPolicy"),
+                        &Term::NamedNode(m.policy_iri.clone()),
+                        m.maps.0.as_str(),
+                    )?
+                {
+                    found_rev = Some(s);
+                    break;
+                }
+            }
+            let Some(revision) = found_rev else {
+                return Err(managed(
+                    ManagedErrorKind::ImmutableRecordConflict,
+                    format!(
+                        "operation <{}> has no authenticated resolution map revision in <{}>",
+                        probe.operation_iri.as_str(),
+                        m.maps.0.as_str()
+                    ),
+                ));
+            };
+            let number = state
+                .text(&revision, &ev("mapRevision"), &m.maps)?
+                .and_then(|v| v.parse::<u64>().ok())
+                .ok_or_else(|| projection_unavailable(&m.name))?;
+            let previous = state.iri(&revision, &format!("{PROV}wasRevisionOf"), &m.maps)?;
+            let recorded_version = state
+                .text(&revision, &ev("policyVersion"), &m.maps)?
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(m.version);
+            let (built, _) = state.reads.objects_up_to(
+                revision.as_str(),
+                BOUNDARY_PROTECTION,
+                m.maps.0.as_str(),
+                MAX_BOUNDARY,
+            )?;
+            let mut boundary: Vec<NamedNode> = built
+                .into_iter()
+                .filter_map(|t| match t {
+                    Term::Literal(l) => l
+                        .value()
+                        .split_once(' ')
+                        .and_then(|(_, iri)| NamedNode::new(iri).ok()),
+                    _ => None,
+                })
+                .collect();
+            boundary.sort();
+            boundary.dedup();
+            return Ok(RebuiltMap {
+                operation: probe.operation_iri,
+                committed: false,
+                replayed: true,
+                commit,
+                branch: recorded_branch.unwrap_or(branch),
+                policy: m.policy_iri,
+                policy_version: recorded_version,
+                revision,
+                number,
+                previous,
+                boundary,
+                changed: Changed::default(),
+                preview: None,
+            });
+        }
+    }
+    if let Some(expected) = options.if_head
+        && head.commit != expected
+    {
+        return Err(managed(
+            ManagedErrorKind::HeadChanged,
+            format!(
+                "ifHead: the head of the branch is commit {}, not {expected}",
+                head.commit
+            ),
+        ));
+    }
+    let prev_present = latest_present(&mut state, main.dataset_id(), &m, control)?;
+    let prev_number = prev_present.as_ref().map_or(0, |(_, n, _)| *n);
+    // When `maps` has no revisions or its latest revision does not authenticate (as after
+    // a detach), verify no revision exists past a numbering gap before minting the next.
+    if prev_present.as_ref().is_none_or(|(_, _, auth)| !*auth) {
+        let (revs, more) = state.reads.subjects_up_to(
+            &ev("reviewPolicy"),
+            &Term::NamedNode(m.policy_iri.clone()),
+            m.maps.0.as_str(),
+            MAX_EVIDENCE,
+        )?;
+        if more {
+            return Err(incomplete("resolution map revisions"));
+        }
+        let class = Term::NamedNode(NamedNode::new_unchecked(ev("ResolutionMap")));
+        for r in revs {
+            control.check()?;
+            if !state
+                .reads
+                .contains(r.as_str(), super::RDF_TYPE, &class, m.maps.0.as_str())?
+            {
+                continue;
+            }
+            if let Some(n) = state
+                .text(&r, &ev("mapRevision"), &m.maps)?
+                .and_then(|v| v.parse::<u64>().ok())
+                && n > prev_number
+            {
+                return Err(managed(
+                    ManagedErrorKind::ImmutableRecordConflict,
+                    format!(
+                        "policy {}: maps graph holds revision {n} past a gap after revision {prev_number}",
+                        m.name
+                    ),
+                ));
+            }
+        }
+    }
+    let next_number = prev_number
+        .checked_add(1)
+        .ok_or_else(|| projection_unavailable(&m.name))?;
+    let previous = prev_present
+        .as_ref()
+        .and_then(|(iri, _, auth)| auth.then(|| iri.clone()));
+    let mut retained = 0usize;
+    let prev_effective = match &previous {
+        Some(prev_iri) => {
+            fold_previous_effective(&mut state, &m, prev_iri, &mut retained, control)?
+        }
+        None => BTreeSet::new(),
+    };
+    // Collect all current authenticated accepted decisions under this matching policy
+    // whose targets are authenticated identity proposals in the current protected
+    // identity graphs of the boundary.
+    let (decision_candidates, more) = state.reads.subjects_up_to(
+        &ev("reviewPolicy"),
+        &Term::NamedNode(m.policy_iri.clone()),
+        m.decisions.0.as_str(),
+        MAX_EVIDENCE,
+    )?;
+    if more {
+        return Err(incomplete("decisions of the matching policy"));
+    }
+    let mut seen_current_target: BTreeSet<NamedNode> = BTreeSet::new();
+    let mut effective_decisions: BTreeSet<NamedNode> = BTreeSet::new();
+    let mut matches: Vec<(NamedNode, Facts)> = Vec::new();
+    let mut distincts: Vec<(NamedNode, Facts)> = Vec::new();
+    for d in decision_candidates {
+        control.check()?;
+        if !state.typed(&d, &m.decisions, RecordKind::ReviewDecision)? {
+            continue;
+        }
+        if state.is_superseded(&d, &m.decisions)? {
+            continue;
+        }
+        let Some(target) = state.iri(&d, &ev("target"), &m.decisions)? else {
+            continue;
+        };
+        let Some(disp) = state.disposition(&d, &m.decisions)? else {
+            continue;
+        };
+        if !seen_current_target.insert(target.clone()) {
+            return Err(managed(
+                ManagedErrorKind::ImmutableRecordConflict,
+                format!(
+                    "<{}> has more than one current decision under policy {}",
+                    target.as_str(),
+                    m.name
+                ),
+            ));
+        }
+        if disp != Disposition::Accepted {
+            continue;
+        }
+        let mut found_graph: Option<G> = None;
+        for g in &m.proposals {
+            if g.1.is_none() {
+                continue;
+            }
+            if state.typed(&target, g, RecordKind::IdentityProposal)? {
+                if found_graph.is_some() {
+                    return Err(managed(
+                        ManagedErrorKind::ImmutableRecordConflict,
+                        format!(
+                            "<{}> is recorded in more than one identity graph of policy {}",
+                            target.as_str(),
+                            m.name
+                        ),
+                    ));
+                }
+                found_graph = Some(g.clone());
+            }
+        }
+        let Some(tg) = found_graph else {
+            // Target left the boundary or its identity graph was detached/re-protected.
+            continue;
+        };
+        let f = facts(&mut state, &target, &tg)?;
+        let Some(relation) = f.relation else {
+            continue;
+        };
+        retain(
+            &mut retained,
+            RETAINED_BYTES,
+            d.as_str().len() + target.as_str().len() + fact_bytes(&f),
+        )?;
+        effective_decisions.insert(d);
+        match relation {
+            IdentityRelation::PossibleMatch => matches.push((target, f)),
+            IdentityRelation::DistinctEntities => distincts.push((target, f)),
+        }
+    }
+    // Recompute connected components from all effective PossibleMatch proposals.
+    let mut entity_to_matches: BTreeMap<NamedNode, Vec<usize>> = BTreeMap::new();
+    for (idx, (_, f)) in matches.iter().enumerate() {
+        control.check()?;
+        for e in &f.entities {
+            entity_to_matches.entry(e.clone()).or_default().push(idx);
+        }
+    }
+    let mut visited: BTreeSet<NamedNode> = BTreeSet::new();
+    let mut desired: BTreeMap<NamedNode, NamedNode> = BTreeMap::new();
+    for seed in entity_to_matches.keys() {
+        if visited.contains(seed) {
+            continue;
+        }
+        let mut cluster = Cluster::default();
+        cluster.entities.insert(seed.clone());
+        visited.insert(seed.clone());
+        let mut queue = VecDeque::from([seed.clone()]);
+        while let Some(e) = queue.pop_front() {
+            control.check()?;
+            if let Some(indices) = entity_to_matches.get(&e) {
+                for &idx in indices {
+                    let (_, f) = &matches[idx];
+                    if let Some(pref) = &f.preferred {
+                        cluster.preferred.insert(pref.clone());
+                    }
+                    for x in &f.entities {
+                        if cluster.entities.insert(x.clone()) {
+                            visited.insert(x.clone());
+                            queue.push_back(x.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(rep) = cluster.representative().cloned() {
+            for x in cluster.entities {
+                retain(
+                    &mut retained,
+                    RETAINED_BYTES,
+                    x.as_str().len() + rep.as_str().len(),
+                )?;
+                desired.insert(x, rep.clone());
+            }
+        }
+    }
+    // Validate all effective DistinctEntities constraints against the recomputed clusters.
+    for (_, f) in &distincts {
+        control.check()?;
+        let mut seen_reps: BTreeSet<&NamedNode> = BTreeSet::new();
+        for e in &f.entities {
+            if let Some(rep) = desired.get(e)
+                && !seen_reps.insert(rep)
+            {
+                return Err(managed(
+                    ManagedErrorKind::IdentityConflict,
+                    format!(
+                        "policy {}: an accepted separation keeps two entities of one cluster apart; reverse the match or the separation",
+                        m.name
+                    ),
+                ));
+            }
+        }
+    }
+    // Diff the desired resolvesTo triples against ALL existing quads in the output graph
+    // so stale or detached-epoch triples are removed atomically.
+    let mut output_held = state.reads.preparation().reserve(0)?;
+    let (existing, more) = state.reads.graph_triples_up_to(
+        m.output.0.as_str(),
+        MAX_OUTPUT_TRIPLES,
+        &mut output_held,
+    )?;
+    if more {
+        return Err(incomplete("triples of the output graph"));
+    }
+    let mut present_rep: BTreeMap<NamedNode, Vec<NamedNode>> = BTreeMap::new();
+    for t in &existing {
+        if t.predicate.as_str() == RESOLVES_TO
+            && let (NamedOrBlankNode::NamedNode(s), Term::NamedNode(o)) = (&t.subject, &t.object)
+        {
+            present_rep.entry(s.clone()).or_default().push(o.clone());
+        }
+    }
+    let desired_set: HashSet<Triple> = desired.iter().map(|(e, rep)| resolves(e, rep)).collect();
+    let existing_set: HashSet<Triple> = existing.iter().cloned().collect();
+    let mut changes: Vec<(Quad, bool)> = Vec::new();
+    let mut changed = Changed::default();
+    let mut to_remove: Vec<Triple> = existing
+        .into_iter()
+        .filter(|t| !desired_set.contains(t))
+        .collect();
+    to_remove.sort_by_cached_key(|t| t.to_string());
+    for t in to_remove {
+        changes.push((quad(&t, &m.output.0), false));
+        changed.removed.push(ProjectionChange {
+            output: m.output.0.clone(),
+            triple: t,
+        });
+    }
+    for (e, rep) in &desired {
+        let t = resolves(e, rep);
+        if !existing_set.contains(&t) {
+            changes.push((quad(&t, &m.output.0), true));
+            changed.inserted.push(ProjectionChange {
+                output: m.output.0.clone(),
+                triple: t,
+            });
+        }
+    }
+    let all_entities: BTreeSet<&NamedNode> = present_rep.keys().chain(desired.keys()).collect();
+    let mut moved = Vec::new();
+    for e in all_entities {
+        let want = desired.get(e);
+        let have = present_rep.get(e);
+        let same = match (have, want) {
+            (None, None) => true,
+            (Some(v), Some(r)) => v.len() == 1 && &v[0] == r,
+            _ => false,
+        };
+        if !same {
+            moved.push(e.clone());
+        }
+    }
+    let adds: Vec<NamedNode> = effective_decisions
+        .difference(&prev_effective)
+        .cloned()
+        .collect();
+    let ends: Vec<NamedNode> = prev_effective
+        .difference(&effective_decisions)
+        .cloned()
+        .collect();
+    let boundary_protections = m.boundary_protections();
+    let record = rv::map_record(
+        main.dataset_id(),
+        &MapRevision {
+            policy: policy_name,
+            version: m.version,
+            number: next_number,
+            previous: previous.as_ref(),
+            output: &m.output.0,
+            adds: &adds,
+            ends: &ends,
+            nonces,
+            boundary: &boundary_protections,
+        },
+        &m.maps.0,
+        control,
+    )?;
+    let revision = record.iri.clone();
+    changed.map = Some(MapChange {
+        policy: m.policy_iri.clone(),
+        revision: revision.clone(),
+        number: next_number,
+        previous: previous.clone(),
+        decisions_added: adds,
+        decisions_ended: ends,
+        entities: moved,
+    });
+    let batch = Batch {
+        operation,
+        operation_iri: operation_iri(operation),
+        payload_digest: payload,
+        principal: options.principal.clone(),
+        idempotency_key: options.idempotency_key.clone(),
+        graphs: vec![m.maps.0.clone()],
+        records: vec![record],
+    };
+    let skip = vec![false];
+    check_identities(&mut state, &batch, &records, &skip)?;
+    drop(output_held);
+    drop(state);
+    let committed = publish(
+        main,
+        logical,
+        capability,
+        head.commit,
+        &batch,
+        &skip,
+        &changes,
+        options,
+        control,
+    )?;
+    let boundary = boundary_protections.into_iter().map(|(g, _)| g).collect();
+    Ok(RebuiltMap {
+        operation: batch.operation_iri,
+        committed: committed.committed,
+        replayed: false,
+        commit: committed.commit,
+        branch,
+        policy: m.policy_iri,
+        policy_version: m.version,
+        revision,
+        number: next_number,
+        previous,
+        boundary,
+        changed,
+        preview: committed.preview,
+    })
 }
 
 // -------------------------------------------------------------------- reads -------

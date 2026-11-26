@@ -1351,3 +1351,596 @@ fn a_resolution_leaves_out_masked_proposals_and_decisions() {
     let r = read(&["b"], targets);
     assert!(r[0].decisions.is_empty(), "{r:?}");
 }
+
+/// Removing an identity graph from the boundary makes the map unavailable; an
+/// administered rebuild recomputes the clusters in the new boundary, rewrites the output
+/// graph atomically, records the new boundary in a fresh map revision, conforms to the
+/// v1 shapes, supports dry-run and idempotent replay, exposes changed identities for
+/// dependents and restores reviews and reads.
+#[test]
+fn rebuilding_after_boundary_removal_recomputes_clusters_and_restores_operations() {
+    let ds = configured();
+    let ab = propose_in(
+        &ds,
+        HIDDEN,
+        proposal(
+            "ab",
+            IdentityRelation::PossibleMatch,
+            &["a", "b"],
+            Some("b"),
+        ),
+    );
+    let bc = matched(&ds, "bc", &["b", "c"], Some("c"));
+    let de = matched(&ds, "de", &["d", "e"], None);
+    let ef = propose_in(
+        &ds,
+        HIDDEN,
+        proposal("ef", IdentityRelation::PossibleMatch, &["e", "f"], None),
+    );
+    let dab = accept(&ds, "ab", &ab);
+    let dbc = accept(&ds, "bc", &bc);
+    let dde = accept(&ds, "de", &de);
+    let r4 = review(&ds, &[decision("ef", &ef, Disposition::Accepted, None)]).unwrap();
+    let def = r4.decisions[0].iri.clone();
+    let rev4 = r4.map_revision.clone().unwrap();
+    assert_eq!(map(&ds), pairs(&["a b", "b b", "c b", "d d", "e d", "f d"]));
+
+    // An assessment that consumes rev4 so we can verify dependents discovery after rebuild.
+    let mut po = ProposeOptions::new(iri("urn:principal:analyst"));
+    po.proposal_graph = Some(iri(CLAIMS));
+    let assessed = evidence::propose(
+        None,
+        &ds,
+        &ds,
+        &EvidenceInput {
+            assessments: vec![evidence::AssessmentInput {
+                version: RecordVersion::V1,
+                key: key("a1"),
+                occurrence_key: key("a1"),
+                target: evidence::RecordRef::Existing(ab.0.clone()),
+                conclusion: oxrdf::Term::NamedNode(iri("urn:conclusion:ok")),
+                method: evidence::MethodRef {
+                    method: iri("urn:method:check"),
+                    version: key("1"),
+                },
+                configuration_digest: format!("sha256:{}", "1".repeat(64)).parse().unwrap(),
+                evaluated_at: oxrdf::Literal::new_typed_literal(
+                    "2026-01-02T00:00:00Z",
+                    oxrdf::vocab::xsd::DATE_TIME,
+                ),
+                attributed_evaluator: iri("urn:analyst"),
+                scope: Default::default(),
+                inputs: vec![evidence::RecordRef::Existing(rev4.clone())],
+                confidence: None,
+            }],
+            ..Default::default()
+        },
+        &po,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    let assessment = assessed.records[0].iri.clone();
+
+    // Remove HIDDEN from the boundary -> projection-unavailable.
+    evidence::configure(
+        &ds,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    let cg = matched(&ds, "cg", &["c", "g"], None);
+    assert_eq!(
+        code(review(
+            &ds,
+            &[decision("cg", &cg, Disposition::Accepted, None)]
+        )),
+        "projection-unavailable"
+    );
+    assert_eq!(
+        code(evidence::resolve_entities(
+            &ds,
+            &ds,
+            "people",
+            &[e("b")],
+            all(),
+            &Control::none()
+        )),
+        "projection-unavailable"
+    );
+
+    // Dry run previews the rebuild without committing or changing the map.
+    let head = ds.store().head_commit().seq;
+    let mut dry = ReviewOptions::new(iri("urn:principal:admin"));
+    dry.dry_run = true;
+    dry.if_head = Some(head);
+    let preview =
+        evidence::rebuild_resolution_map(&ds, &ds, "people", Some(1), &dry, &Control::none())
+            .unwrap();
+    assert!(!preview.committed);
+    assert!(!preview.replayed);
+    assert!(preview.preview.is_some());
+    assert_eq!(preview.number, 5);
+    assert_eq!(preview.previous.as_ref(), Some(&rev4));
+    assert_eq!(preview.boundary, vec![iri(IDENTITY)]);
+    assert_eq!(ds.store().head_commit().seq, head);
+    assert_eq!(
+        code(evidence::resolve_entities(
+            &ds,
+            &ds,
+            "people",
+            &[e("b")],
+            all(),
+            &Control::none()
+        )),
+        "projection-unavailable"
+    );
+
+    // Actual rebuild with idempotency key.
+    let mut admin = ReviewOptions::new(iri("urn:principal:admin"));
+    admin.idempotency_key = Some("rebuild-after-boundary-removal".into());
+    admin.if_head = Some(head);
+    let rebuilt =
+        evidence::rebuild_resolution_map(&ds, &ds, "people", Some(1), &admin, &Control::none())
+            .unwrap();
+    assert!(rebuilt.committed);
+    assert!(!rebuilt.replayed);
+    assert_eq!(rebuilt.number, 5);
+    assert_eq!(rebuilt.previous.as_ref(), Some(&rev4));
+    assert_eq!(rebuilt.boundary, vec![iri(IDENTITY)]);
+    let mc = rebuilt.changed.map.as_ref().unwrap();
+    assert_eq!(mc.revision, rebuilt.revision);
+    assert_eq!(mc.previous.as_ref(), Some(&rev4));
+    assert!(mc.decisions_added.is_empty());
+    let mut expected_ended = vec![dab, def];
+    expected_ended.sort();
+    assert_eq!(mc.decisions_ended, expected_ended);
+    assert_eq!(map(&ds), pairs(&["b c", "c c", "d d", "e d"]));
+
+    // Replay returns the first receipt with empty changed.
+    let replayed =
+        evidence::rebuild_resolution_map(&ds, &ds, "people", Some(1), &admin, &Control::none())
+            .unwrap();
+    assert!(!replayed.committed);
+    assert!(replayed.replayed);
+    assert_eq!(replayed.operation, rebuilt.operation);
+    assert_eq!(replayed.commit, rebuilt.commit);
+    assert_eq!(replayed.revision, rebuilt.revision);
+    assert_eq!(replayed.number, 5);
+    assert_eq!(replayed.previous.as_ref(), Some(&rev4));
+    assert_eq!(replayed.boundary, vec![iri(IDENTITY)]);
+    assert_eq!(replayed.changed, evidence::Changed::default());
+
+    // Different payload under same idempotency key -> idempotency-conflict.
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &ds,
+            &ds,
+            "people",
+            None,
+            &admin,
+            &Control::none()
+        )),
+        "idempotency-conflict"
+    );
+
+    // Dependents of the rebuilt operation's changed identities find the assessment on rev4.
+    let deps = evidence::find_dependents(
+        &ds,
+        &ds,
+        &rebuilt.changed.identities(),
+        false,
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(deps.dependents.len(), 1);
+    assert_eq!(deps.dependents[0].assessment, assessment);
+    assert_eq!(deps.dependents[0].on, rev4);
+
+    // Resolution reads succeed in the new boundary.
+    let resolved = evidence::resolve_entities(
+        &ds,
+        &ds,
+        "people",
+        &[e("a"), e("b"), e("d"), e("f")],
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(resolved.revision.as_ref(), Some(&rebuilt.revision));
+    assert_eq!(resolved.number, 5);
+    assert_eq!(resolved.entities[0].representative, e("a"));
+    assert_eq!(resolved.entities[0].members, vec![e("a")]);
+    assert!(resolved.entities[0].decisions.is_empty());
+    assert_eq!(resolved.entities[1].representative, e("c"));
+    assert_eq!(resolved.entities[1].members, vec![e("b"), e("c")]);
+    assert_eq!(resolved.entities[1].decisions, vec![dbc]);
+    assert_eq!(resolved.entities[2].representative, e("d"));
+    assert_eq!(resolved.entities[2].members, vec![e("d"), e("e")]);
+    assert_eq!(resolved.entities[2].decisions, vec![dde]);
+    assert_eq!(resolved.entities[3].representative, e("f"));
+
+    // Subsequent reviews succeed and chain from the rebuilt revision.
+    let r6 = review(&ds, &[decision("cg", &cg, Disposition::Accepted, None)]).unwrap();
+    assert_eq!(r6.changed.map.as_ref().unwrap().number, 6);
+    assert_eq!(
+        r6.changed.map.as_ref().unwrap().previous.as_ref(),
+        Some(&rebuilt.revision)
+    );
+    assert_eq!(map(&ds), pairs(&["b c", "c c", "d d", "e d", "g c"]));
+
+    // Written ResolutionMap records conform to the profile v1 SHACL shapes.
+    #[cfg(feature = "shacl")]
+    {
+        let copy = Dataset::memory();
+        let mut nt = String::new();
+        for g in [IDENTITY, DECISIONS, MAPS] {
+            for t in ds
+                .construct(&format!(
+                    "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{g}> {{ ?s ?p ?o }} }}"
+                ))
+                .unwrap()
+                .iter()
+            {
+                nt.push_str(&format!("{t} .\n"));
+            }
+        }
+        copy.load_str(&nt, oxrdfio::RdfFormat::NTriples).unwrap();
+        let shapes = sparkles_shacl::Shapes::parse(
+            evidence::profile(1).unwrap().shapes,
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )
+        .unwrap();
+        let report = copy
+            .validation()
+            .shacl(&shapes, &Default::default())
+            .unwrap();
+        assert!(report.conforms, "SHACL violations: {report:?}");
+    }
+}
+
+/// Detaching and re-protecting an identity graph in the boundary invalidates its earlier
+/// proposals, so rebuild drops them, records the new protection nonce in the fresh map
+/// revision, and allows new proposals in that graph to be reviewed normally.
+#[test]
+fn rebuilding_after_detached_and_reprotected_identity_graph_restores_map() {
+    let ds = configured();
+    let ab = propose_in(
+        &ds,
+        HIDDEN,
+        proposal(
+            "ab",
+            IdentityRelation::PossibleMatch,
+            &["a", "b"],
+            Some("b"),
+        ),
+    );
+    let cd = matched(&ds, "cd", &["c", "d"], None);
+    let dab = accept(&ds, "ab", &ab);
+    let dcd = accept(&ds, "cd", &cd);
+    assert_eq!(map(&ds), pairs(&["a b", "b b", "c c", "d c"]));
+
+    evidence::detach(&ds, HIDDEN).unwrap();
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+    assert_eq!(
+        code(evidence::resolve_entities(
+            &ds,
+            &ds,
+            "people",
+            &[e("c")],
+            all(),
+            &Control::none()
+        )),
+        "projection-unavailable"
+    );
+
+    let rebuilt = evidence::rebuild_resolution_map(
+        &ds,
+        &ds,
+        "people",
+        None,
+        &ReviewOptions::new(iri("urn:principal:admin")),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(rebuilt.committed);
+    assert_eq!(rebuilt.number, 3);
+    assert_eq!(rebuilt.boundary, vec![iri(IDENTITY), iri(HIDDEN)]);
+    assert_eq!(
+        rebuilt.changed.map.as_ref().unwrap().decisions_ended,
+        vec![dab]
+    );
+    assert_eq!(map(&ds), pairs(&["c c", "d c"]));
+
+    // New proposal in the re-protected graph authenticates and reviews cleanly.
+    let xy = propose_in(
+        &ds,
+        HIDDEN,
+        proposal("xy", IdentityRelation::PossibleMatch, &["x", "y"], None),
+    );
+    let dxy = accept(&ds, "xy", &xy);
+    assert_eq!(map(&ds), pairs(&["c c", "d c", "x x", "y x"]));
+    let resolved = evidence::resolve_entities(
+        &ds,
+        &ds,
+        "people",
+        &[e("c"), e("y")],
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(resolved.entities[0].decisions, vec![dcd]);
+    assert_eq!(resolved.entities[1].decisions, vec![dxy]);
+}
+
+/// Rebuilding recovers from a detached and re-protected output graph (stripping arbitrary
+/// quads written while detached), maps graph (whether cleared or kept), and decisions graph.
+#[test]
+fn rebuilding_recovers_after_output_maps_or_decisions_protection_change() {
+    // 1. Detached output graph edited with stray quads, then re-protected.
+    let ds = configured();
+    let ab = matched(&ds, "ab", &["a", "b"], None);
+    accept(&ds, "ab", &ab);
+    evidence::detach(&ds, MAP).unwrap();
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{MAP}> {{ <urn:person:z> <urn:bogus> \"junk\" . <urn:person:a> <{EV}resolvesTo> <urn:person:z> }} }}"
+    ))
+    .unwrap();
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+    assert_eq!(
+        code(evidence::resolve_entities(
+            &ds,
+            &ds,
+            "people",
+            &[e("a")],
+            all(),
+            &Control::none()
+        )),
+        "projection-unavailable"
+    );
+    let r = evidence::rebuild_resolution_map(
+        &ds,
+        &ds,
+        "people",
+        None,
+        &ReviewOptions::new(iri("urn:principal:admin")),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(r.committed);
+    assert_eq!(r.number, 2);
+    assert!(r.previous.is_some());
+    assert_eq!(map(&ds), pairs(&["a a", "b a"]));
+
+    // 2. Detached maps graph (not cleared) then re-protected -> starts a new authenticated
+    //    chain at the next revision number.
+    let ds = configured();
+    let ab = matched(&ds, "ab", &["a", "b"], None);
+    let dab = accept(&ds, "ab", &ab);
+    evidence::detach(&ds, MAPS).unwrap();
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+    assert_eq!(
+        code(evidence::resolve_entities(
+            &ds,
+            &ds,
+            "people",
+            &[e("a")],
+            all(),
+            &Control::none()
+        )),
+        "projection-unavailable"
+    );
+    let r = evidence::rebuild_resolution_map(
+        &ds,
+        &ds,
+        "people",
+        None,
+        &ReviewOptions::new(iri("urn:principal:admin")),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(r.number, 2);
+    assert!(r.previous.is_none());
+    assert_eq!(r.changed.map.as_ref().unwrap().decisions_added, vec![dab]);
+    assert_eq!(map(&ds), pairs(&["a a", "b a"]));
+    let cd = matched(&ds, "cd", &["c", "d"], None);
+    accept(&ds, "cd", &cd);
+    assert_eq!(map(&ds), pairs(&["a a", "b a", "c c", "d c"]));
+
+    // 3. Detached maps graph cleared, then re-protected -> rebuild mints revision 1.
+    let ds = configured();
+    let ab = matched(&ds, "ab", &["a", "b"], None);
+    let dab = accept(&ds, "ab", &ab);
+    evidence::detach(&ds, MAPS).unwrap();
+    ds.update(&format!("CLEAR GRAPH <{MAPS}>")).unwrap();
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+    let r = evidence::rebuild_resolution_map(
+        &ds,
+        &ds,
+        "people",
+        None,
+        &ReviewOptions::new(iri("urn:principal:admin")),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(r.number, 1);
+    assert!(r.previous.is_none());
+    assert_eq!(r.changed.map.as_ref().unwrap().decisions_added, vec![dab]);
+    assert_eq!(map(&ds), pairs(&["a a", "b a"]));
+
+    // 4. Detached decisions graph re-protected -> old decisions no longer authenticate,
+    //    rebuild clears the output graph and records a fresh revision.
+    let ds = configured();
+    let ab = matched(&ds, "ab", &["a", "b"], None);
+    let dab = accept(&ds, "ab", &ab);
+    evidence::detach(&ds, DECISIONS).unwrap();
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+    let r = evidence::rebuild_resolution_map(
+        &ds,
+        &ds,
+        "people",
+        None,
+        &ReviewOptions::new(iri("urn:principal:admin")),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(r.number, 2);
+    assert_eq!(r.changed.map.as_ref().unwrap().decisions_ended, vec![dab]);
+    assert!(map(&ds).is_empty());
+    let resolved =
+        evidence::resolve_entities(&ds, &ds, "people", &[e("a")], all(), &Control::none()).unwrap();
+    assert_eq!(resolved.entities[0].representative, e("a"));
+}
+
+/// Preconditions, access refusals, separation conflicts on re-added boundary graphs,
+/// branch independence and persistent restart/reopen durability.
+#[test]
+fn rebuilding_checks_preconditions_conflicts_branch_and_restart_durability() {
+    let ds = configured();
+    let ab_hidden = propose_in(
+        &ds,
+        HIDDEN,
+        proposal("ab", IdentityRelation::PossibleMatch, &["a", "b"], None),
+    );
+    accept(&ds, "ab", &ab_hidden);
+
+    // Preconditions: unknown policy, stale policy version, stale head, masked/missing grants.
+    let admin = ReviewOptions::new(iri("urn:principal:admin"));
+    assert!(
+        evidence::rebuild_resolution_map(&ds, &ds, "nobody", None, &admin, &Control::none())
+            .is_err()
+    );
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &ds,
+            &ds,
+            "people",
+            Some(99),
+            &admin,
+            &Control::none()
+        )),
+        "policy-changed"
+    );
+    let mut stale = admin.clone();
+    stale.if_head = Some(0);
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &ds,
+            &ds,
+            "people",
+            None,
+            &stale,
+            &Control::none()
+        )),
+        "head-changed"
+    );
+    let mut masked_opts = admin.clone();
+    masked_opts.write = masking(&format!("{EV}entity"), HIDDEN);
+    assert!(matches!(
+        evidence::rebuild_resolution_map(&ds, &ds, "people", None, &masked_opts, &Control::none()),
+        Err(sparkles::Error::NotPermitted(_))
+    ));
+    let mut narrow_opts = admin.clone();
+    narrow_opts.write = Some(Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new([IDENTITY, DECISIONS, MAPS, MAP], &[])),
+        Graphs::All,
+    )));
+    assert!(matches!(
+        evidence::rebuild_resolution_map(&ds, &ds, "people", None, &narrow_opts, &Control::none()),
+        Err(sparkles::Error::NotPermitted(_))
+    ));
+
+    // Re-adding a previously removed boundary graph whose accepted match conflicts with a
+    // separation accepted in the meantime causes rebuild to refuse with identity-conflict.
+    evidence::configure(
+        &ds,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    evidence::rebuild_resolution_map(&ds, &ds, "people", None, &admin, &Control::none()).unwrap();
+    assert!(map(&ds).is_empty());
+    let ab_apart = distinct(&ds, "ab-apart", &["a", "b"]);
+    accept(&ds, "apart", &ab_apart);
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+    let head = ds.store().head_commit().seq;
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &ds,
+            &ds,
+            "people",
+            None,
+            &admin,
+            &Control::none()
+        )),
+        "identity-conflict"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Persistent dataset: branch rebuild and restart/reopen durability.
+    let dir = tempfile::tempdir().unwrap();
+    let rev_main;
+    {
+        let pds = Dataset::open(dir.path()).unwrap();
+        evidence::configure(&pds, &settings(1), &Control::none()).unwrap();
+        let ab = propose_in(
+            &pds,
+            HIDDEN,
+            proposal("ab", IdentityRelation::PossibleMatch, &["a", "b"], None),
+        );
+        let cd = matched(&pds, "cd", &["c", "d"], None);
+        accept(&pds, "ab", &ab);
+        accept(&pds, "cd", &cd);
+        pds.create_branch("dev", &Default::default()).unwrap();
+        let dev = pds.branch("dev").unwrap();
+        evidence::configure(
+            &pds,
+            &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+            &Control::none(),
+        )
+        .unwrap();
+        // Rebuild on dev independently of main.
+        let r_dev =
+            evidence::rebuild_resolution_map(&pds, &dev, "people", None, &admin, &Control::none())
+                .unwrap();
+        assert!(r_dev.committed);
+        assert_eq!(r_dev.number, 3);
+        // Main is still unavailable until rebuilt too.
+        assert_eq!(
+            code(evidence::resolve_entities(
+                &pds,
+                &pds,
+                "people",
+                &[e("c")],
+                all(),
+                &Control::none()
+            )),
+            "projection-unavailable"
+        );
+        let r_main =
+            evidence::rebuild_resolution_map(&pds, &pds, "people", None, &admin, &Control::none())
+                .unwrap();
+        rev_main = r_main.revision;
+    }
+    // Reopen from disk and verify map, reads and reviews survive restart.
+    let reopened = Dataset::open(dir.path()).unwrap();
+    let res = evidence::resolve_entities(
+        &reopened,
+        &reopened,
+        "people",
+        &[e("a"), e("c")],
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(res.revision.as_ref(), Some(&rev_main));
+    assert_eq!(res.number, 3);
+    assert_eq!(res.entities[0].representative, e("a"));
+    assert_eq!(res.entities[1].representative, e("c"));
+    assert_eq!(res.entities[1].members, vec![e("c"), e("d")]);
+    let de = matched(&reopened, "de", &["d", "e"], None);
+    accept(&reopened, "de", &de);
+    assert_eq!(map(&reopened), pairs(&["c c", "d c", "e c"]));
+}

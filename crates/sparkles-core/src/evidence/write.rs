@@ -1383,6 +1383,93 @@ impl<'a> Reads<'a> {
         Ok(found)
     }
 
+    /// All triples in `g`, up to `limit`, and whether more exist. Raw rows are charged to
+    /// the preparation during the scan, and each decoded triple is charged to `held`
+    /// before it is retained so the caller keeps it charged for as long as it keeps `held`.
+    pub fn graph_triples_up_to(
+        &mut self,
+        g: &str,
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<Triple>, bool)> {
+        let Some(g) = self.id(g)? else {
+            return Ok((Vec::new(), false));
+        };
+        const ROW: u64 = std::mem::size_of::<[Id; 3]>() as u64;
+        const CHUNK: usize = 4096;
+        let mut rows_held = self.preparation.reserve(0)?;
+        let mut rows: Vec<[Id; 3]> = Vec::new();
+        let mut more = false;
+        self.preparation.scan(self.snap, Perm::Gspo, &[g.0], |q| {
+            if rows.len() == limit {
+                more = true;
+                return Ok(false);
+            }
+            if rows.len() == rows.capacity() {
+                rows_held.grow_by(CHUNK as u64 * ROW)?;
+                rows.reserve_exact(CHUNK);
+            }
+            rows.push([q[0], q[1], q[2]]);
+            Ok(true)
+        })?;
+        fn term_bytes(t: &Term) -> u64 {
+            match t {
+                Term::NamedNode(n) => n.as_str().len() as u64,
+                Term::BlankNode(b) => b.as_str().len() as u64,
+                Term::Literal(l) => {
+                    l.value().len() as u64
+                        + l.datatype().as_str().len() as u64
+                        + l.language().map_or(0, |lang| lang.len() as u64)
+                }
+                Term::Triple(t) => {
+                    let s = match &t.subject {
+                        NamedOrBlankNode::NamedNode(n) => n.as_str().len() as u64,
+                        NamedOrBlankNode::BlankNode(b) => b.as_str().len() as u64,
+                    };
+                    std::mem::size_of::<Triple>() as u64
+                        + s
+                        + t.predicate.as_str().len() as u64
+                        + term_bytes(&t.object)
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(rows.len());
+        for [s, p, o] in rows {
+            let subject = match self
+                .preparation
+                .with_term(self.snap, s, |t| Ok(t.cloned()))?
+            {
+                Some(Term::NamedNode(n)) => NamedOrBlankNode::NamedNode(n),
+                Some(Term::BlankNode(b)) => NamedOrBlankNode::BlankNode(b),
+                _ => continue,
+            };
+            let Some(Term::NamedNode(predicate)) =
+                self.preparation
+                    .with_term(self.snap, p, |t| Ok(t.cloned()))?
+            else {
+                continue;
+            };
+            let Some(object) = self
+                .preparation
+                .with_term(self.snap, o, |t| Ok(t.cloned()))?
+            else {
+                continue;
+            };
+            let subj_bytes = match &subject {
+                NamedOrBlankNode::NamedNode(n) => n.as_str().len() as u64,
+                NamedOrBlankNode::BlankNode(b) => b.as_str().len() as u64,
+            };
+            let triple_bytes = std::mem::size_of::<Triple>() as u64
+                + subj_bytes
+                + predicate.as_str().len() as u64
+                + term_bytes(&object)
+                + IDENTITY_ENTRY;
+            held.grow_by(triple_bytes)?;
+            out.push(Triple::new(subject, predicate, object));
+        }
+        Ok((out, more))
+    }
+
     /// Whether the quad `s p o g` is in the snapshot. `o` is a ground term.
     pub fn contains(&mut self, s: &str, p: &str, o: &Term, g: &str) -> Result<bool> {
         let (Some(s), Some(p), Some(g)) = (self.id(s)?, self.id(p)?, self.id(g)?) else {
