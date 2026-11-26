@@ -1558,14 +1558,27 @@ impl Vocab {
                 self.entry::<false>(data, position, first)
             }
         };
-        let mut entry = read_entry(&mut position, true);
+        let mut entries = [Entry::default(); FC_BLOCK];
         ioacct::vocab_blocks_scanned(1);
         self.touch_block(b);
+        for (at, slot) in entries.iter_mut().enumerate().take(last + 1) {
+            *slot = read_entry(&mut position, at == 0);
+        }
+        // Propagate required prefix lengths backward so a single-key read never
+        // reconstructs a longer unrelated prefix shared only by earlier entries.
+        let mut needs = [0usize; FC_BLOCK];
+        for at in (0..=last).rev() {
+            needs[at] = if wanted >> at & 1 == 1 {
+                usize::MAX
+            } else {
+                entries[at + 1].shared.min(needs[at + 1])
+            };
+        }
         for at in 0..=last {
             checkpoint("reconstructing vocabulary entry")?;
             let id = (b * FC_BLOCK + at) as u64;
-            let next = (at < last).then(|| read_entry(&mut position, false));
-            let need = lookahead(wanted, at, next);
+            let entry = entries[at];
+            let need = needs[at];
             key.truncate(entry.shared.min(need));
             if need > entry.shared {
                 let prefix = key.len();
@@ -1624,9 +1637,6 @@ impl Vocab {
             }
             if wanted >> at & 1 == 1 && !each(at, &mut key)? {
                 break;
-            }
-            if let Some(next) = next {
-                entry = next;
             }
         }
         checkpoint("completed vocabulary reconstruction")
@@ -5293,5 +5303,41 @@ mod tests {
         let mut all = Vec::new();
         v.for_each(|_, k| all.push(k.to_vec()));
         assert_eq!(all, keys);
+    }
+
+    #[test]
+    fn single_key_controlled_read_ignores_long_preceding_shared_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let long_prefix = format!("<urn:a/{}/", "x".repeat(256 * 1024));
+        let k0 = format!("{long_prefix}1").into_bytes();
+        let k1 = format!("{long_prefix}2").into_bytes();
+        let k2 = b"<urn:b/short".to_vec();
+        assert!(k0 < k1 && k1 < k2);
+        let mut w = VocabWriter::create(dir.path()).unwrap();
+        w.push(&k0).unwrap();
+        w.push(&k1).unwrap();
+        w.push(&k2).unwrap();
+        w.finish().unwrap();
+
+        let v = Vocab::open(dir.path()).unwrap();
+        let mut max_reserved = 0usize;
+        let got = v
+            .get_with_controlled(
+                2,
+                |bytes| {
+                    max_reserved = max_reserved.max(bytes);
+                    Ok(())
+                },
+                |_| Ok(()),
+                |k| k.to_vec(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, k2);
+        assert!(
+            max_reserved <= k2.len(),
+            "single-key read reserved {max_reserved} bytes for a {}-byte key",
+            k2.len()
+        );
     }
 }

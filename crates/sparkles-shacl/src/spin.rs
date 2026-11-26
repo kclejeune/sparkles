@@ -182,7 +182,19 @@ pub(crate) struct CandidateCheck<'a> {
 }
 
 impl CandidateCheck<'_> {
-    pub(crate) fn validate(&self, sparql: &str) -> Result<Query> {
+    pub(crate) fn validate(&self, sparql: &str, budget: &mut rdf::WorkBudget) -> Result<Query> {
+        template::admit_resolved_prefixed_iris(
+            sparql,
+            Some(&self.prefixes),
+            budget.remaining_bytes(),
+        )?;
+        let full_len = self.prefix_head.len().saturating_add(sparql.len());
+        if full_len > rdf::MAX_RETAINED_BYTES {
+            return Err(rdf::limit_err(format!(
+                "SPIN candidate query exceeds maximum parse size ({} bytes)",
+                rdf::MAX_RETAINED_BYTES
+            )));
+        }
         let full = if self.prefix_head.is_empty() {
             std::borrow::Cow::Borrowed(sparql)
         } else {
@@ -295,7 +307,7 @@ fn query_to_sparql(
         let rdf_res = rdf::serialize_query_with_bindings(g, node, &empty, known_prefixes, budget)
             .and_then(|q| {
                 if let Some(c) = check {
-                    c.validate(&q)?;
+                    c.validate(&q, budget)?;
                 }
                 Ok(q)
             });
@@ -344,18 +356,6 @@ pub(crate) fn translate_with_extra_types(
     prefixes: &[(String, String)],
 ) -> Result<Graph> {
     let g = G { g: graph };
-    let mut head = String::new();
-    let mut prefix_map: FxHashMap<&str, &str> = FxHashMap::default();
-    for (p, ns) in prefixes
-        .iter()
-        .map(|(p, n)| (p.as_str(), n.as_str()))
-        .chain(STANDARD_PREFIXES.iter().copied())
-    {
-        if let std::collections::hash_map::Entry::Vacant(e) = prefix_map.entry(p) {
-            e.insert(ns);
-            head.push_str(&format!("PREFIX {p}: <{ns}>\n"));
-        }
-    }
     let mut discovery_budget = rdf::WorkBudget::new(rdf::MAX_NODES);
     let mut pairs: Vec<(Term, Term)> = Vec::new();
     for p in rule_properties(graph, &mut discovery_budget)? {
@@ -366,8 +366,34 @@ pub(crate) fn translate_with_extra_types(
             pairs.push((Term::from(s), o));
         }
     }
+    if pairs.is_empty() {
+        return Ok(Graph::new());
+    }
     pairs.sort_by_cached_key(|(c, r)| (c.to_string(), r.to_string()));
     pairs.dedup();
+    let mut head = String::new();
+    let mut prefix_map: FxHashMap<&str, &str> = FxHashMap::default();
+    for (p, ns) in prefixes
+        .iter()
+        .map(|(p, n)| (p.as_str(), n.as_str()))
+        .chain(STANDARD_PREFIXES.iter().copied())
+    {
+        if let std::collections::hash_map::Entry::Vacant(e) = prefix_map.entry(p) {
+            let next_len = head
+                .len()
+                .saturating_add(p.len())
+                .saturating_add(ns.len())
+                .saturating_add(12);
+            if next_len > rdf::MAX_RETAINED_BYTES {
+                return Err(rdf::limit_err(format!(
+                    "SPIN prefix declarations exceed maximum size ({} bytes)",
+                    rdf::MAX_RETAINED_BYTES
+                )));
+            }
+            e.insert(ns);
+            head.push_str(&format!("PREFIX {p}: <{ns}>\n"));
+        }
+    }
     let mut cache = template::HierarchyCache::default();
     let mut out = Graph::new();
     let mut n = 0usize;
@@ -391,6 +417,20 @@ pub(crate) fn translate_with_extra_types(
         let r = fresh();
         // a variable named this in the parsed query, not a word in a comment or a
         // longer variable name
+        template::admit_resolved_prefixed_iris(
+            &text,
+            Some(&check.prefixes),
+            rule_budget.remaining_bytes(),
+        )
+        .with_context(|| format!("the SPARQL query of the SPIN rule {rule}"))?;
+        let full_len = head.len().saturating_add(text.len());
+        if full_len > rdf::MAX_RETAINED_BYTES {
+            return Err(rdf::limit_err(format!(
+                "SPIN rule query exceeds maximum parse size ({} bytes)",
+                rdf::MAX_RETAINED_BYTES
+            )))
+            .with_context(|| format!("the SPARQL query of the SPIN rule {rule}"));
+        }
         let full = format!("{head}{text}");
         let parsed = sparkles_core::sparql::parse_query(&full, None, &[])
             .map_err(|e| anyhow::anyhow!("{e}"))
@@ -2741,5 +2781,455 @@ mod tests {
                 "{clause}: {q}"
             );
         }
+    }
+
+    #[test]
+    fn round4_base_vocab_short_class_and_tight_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = sparkles_core::store::Store::open(dir.path(), Default::default()).unwrap();
+        let huge_prefix = format!("urn:a/{}/", "x".repeat(super::rdf::MAX_OUTPUT_BYTES + 2048));
+        let huge_1 = format!("{huge_prefix}1");
+        let huge_2 = format!("{huge_prefix}2");
+        let short_cls = "urn:b/ShortClass";
+        let med_prefix = format!("urn:e/{}/", "m".repeat(200_000));
+        let med_1 = format!("{med_prefix}1");
+        let med_2 = format!("{med_prefix}2");
+        let short_cls2 = "urn:f/ShortClass2";
+        let nt_data = format!(
+            "<urn:c/inst> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{short_cls}> .\n\
+             <urn:d/bigInst> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{huge_1}> .\n\
+             <urn:d/other> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{huge_2}> .\n\
+             <urn:g/inst2> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{short_cls2}> .\n\
+             <urn:h/m1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{med_1}> .\n\
+             <urn:h/m2> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{med_2}> .\n"
+        );
+        store
+            .load(&[sparkles_core::io::Source::from_bytes(
+                nt_data.into_bytes(),
+                sparkles_core::io::RdfFormat::NTriples,
+                Some(NamedNode::new_unchecked("urn:x:data")),
+            )])
+            .unwrap();
+        store.compact().unwrap();
+
+        let snap = store.snapshot();
+        assert_eq!(
+            snap.lookup_iri(short_cls).unwrap().tag(),
+            sparkles_core::id::Tag::Vocab,
+            "fixture must exercise compacted base vocabulary keys"
+        );
+        assert_eq!(
+            snap.lookup_iri(short_cls2).unwrap().tag(),
+            sparkles_core::id::Tag::Vocab,
+            "fixture must exercise compacted base vocabulary keys"
+        );
+        let extra = super::ExtraTypes::new(&snap, &["urn:x:data".to_string()]);
+
+        // 1. Short class IRI after two >1 MiB shared-prefix IRIs in the same vocab block succeeds
+        let mut budget = super::rdf::WorkBudget::new(super::rdf::MAX_NODES);
+        let types = extra
+            .rdf_types(
+                &Term::NamedNode(NamedNode::new_unchecked("urn:c/inst")),
+                &mut budget,
+            )
+            .unwrap();
+        assert_eq!(
+            types,
+            vec![Term::NamedNode(NamedNode::new_unchecked(short_cls))]
+        );
+
+        // 2. Short class IRI after a 200 KiB shared-prefix pair succeeds under a tight budget
+        let mut tight = super::rdf::WorkBudget::new(super::rdf::MAX_NODES);
+        tight
+            .charge_bytes(super::rdf::MAX_RETAINED_BYTES - 1_000)
+            .unwrap();
+        let types2 = extra
+            .rdf_types(
+                &Term::NamedNode(NamedNode::new_unchecked("urn:g/inst2")),
+                &mut tight,
+            )
+            .unwrap();
+        assert_eq!(
+            types2,
+            vec![Term::NamedNode(NamedNode::new_unchecked(short_cls2))]
+        );
+
+        // 3. Oversized selected class IRI in base vocabulary is still refused before decode
+        let mut budget_big = super::rdf::WorkBudget::new(super::rdf::MAX_NODES);
+        let err = extra
+            .rdf_types(
+                &Term::NamedNode(NamedNode::new_unchecked("urn:d/bigInst")),
+                &mut budget_big,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("maximum output size"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn round4_standalone_prefixed_aggregates_without_distinct() {
+        // 1. Standalone prefixed custom aggregate without DISTINCT mixed with COUNT
+        let g_mix = parse_ttl(
+            r#"
+            ex:q a sp:Construct ;
+              sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:var ; sp:object [ sp:varName "variance" ] ] ) ;
+              sp:where (
+                [ a sp:SubQuery ;
+                  sp:query [ sp:text "SELECT (afn:variance(?v) AS ?variance) (COUNT(?v) AS ?count) WHERE { ?s <urn:p> ?v }" ] ]
+              ) .
+            "#,
+        );
+        let q_mix = serialize_query(&g_mix, &ex("q")).unwrap();
+        assert!(q_mix.contains("afn:variance(?v)"), "{q_mix}");
+        assert!(q_mix.contains("COUNT(?v)"), "{q_mix}");
+
+        // 2. Standalone prefixed custom aggregate without DISTINCT under explicit GROUP BY
+        let g_grp = parse_ttl(
+            r#"
+            ex:q a sp:Construct ;
+              sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:var ; sp:object [ sp:varName "g" ] ] ) ;
+              sp:where (
+                [ a sp:SubQuery ;
+                  sp:query [ sp:text "SELECT ?s (afn:variance(?v) AS ?g) WHERE { ?s <urn:p> ?v } GROUP BY ?s" ] ]
+              ) .
+            "#,
+        );
+        let q_grp = serialize_query(&g_grp, &ex("q")).unwrap();
+        assert!(q_grp.contains("afn:variance(?v)"), "{q_grp}");
+        assert!(q_grp.contains("GROUP BY ?s"), "{q_grp}");
+
+        // 3. Mixed DISTINCT + non-DISTINCT and scalar/aggregate wrappers in standalone mode
+        let g_both = parse_ttl(
+            r#"
+            ex:q a sp:Construct ;
+              sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:var ; sp:object [ sp:varName "v1" ] ] ) ;
+              sp:where (
+                [ a sp:SubQuery ;
+                  sp:query [ sp:text "SELECT (afn:variance(DISTINCT ?v) AS ?v1) (STR(afn:stdev(?v)) AS ?v2) (afn:var_pop(xsd:double(?v)) AS ?v3) WHERE { ?s <urn:p> ?v }" ] ]
+              ) .
+            "#,
+        );
+        let q_both = serialize_query(&g_both, &ex("q")).unwrap();
+        assert!(q_both.contains("afn:variance(DISTINCT ?v)"), "{q_both}");
+        assert!(q_both.contains("afn:stdev(?v)"), "{q_both}");
+
+        // 4. Standalone still rejects truly invalid grouped projections:
+        //    unbound var outside any 1-arg prefixed call, 2-arg call, and full-IRI non-aggregate
+        for bad_subquery in [
+            "SELECT (afn:variance(?v) + ?w AS ?g) (COUNT(?v) AS ?c) WHERE { ?s <urn:p> ?v ; <urn:q> ?w }",
+            "SELECT (ex:twoArg(?v, ?w) AS ?g) (COUNT(?v) AS ?c) WHERE { ?s <urn:p> ?v ; <urn:q> ?w }",
+            "SELECT (<http://example.org/notAnAgg>(?v) AS ?g) (COUNT(?v) AS ?c) WHERE { ?s <urn:p> ?v }",
+        ] {
+            let mut g_bad = parse_ttl(
+                r#"
+                ex:q a sp:Construct ;
+                  sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:var ; sp:object [ sp:varName "g" ] ] ) ;
+                  sp:where ( [ a sp:SubQuery ; sp:query ex:inner ] ) .
+                "#,
+            );
+            g_bad.insert(&Triple::new(
+                NamedNode::new_unchecked("http://example.org/inner"),
+                super::vocab::sp::TEXT,
+                Literal::new_simple_literal(bad_subquery),
+            ));
+            assert!(
+                serialize_query(&g_bad, &ex("q")).is_err(),
+                "must reject invalid standalone subquery: {bad_subquery}"
+            );
+        }
+
+        // 5. Real prefix mapping keeps strict aggregate and scope checks
+        let afn_prefixes = vec![(
+            "afn".to_string(),
+            "http://jena.apache.org/ARQ/function#".to_string(),
+        )];
+        let g_real_ok = parse_ttl(
+            r#"
+            ex:Person spin:rule [
+              a sp:Construct ;
+              sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:var ; sp:object [ sp:varName "variance" ] ] ) ;
+              sp:where (
+                [ a sp:SubQuery ;
+                  sp:query [ sp:text "SELECT (afn:variance(?v) AS ?variance) (COUNT(?v) AS ?count) WHERE { ?s <urn:p> ?v }" ] ]
+              )
+            ] .
+            "#,
+        );
+        assert!(translate(&g_real_ok, &afn_prefixes).is_ok());
+
+        let ex_prefixes = vec![("ex".to_string(), "http://example.org/".to_string())];
+        let g_real_bad = parse_ttl(
+            r#"
+            ex:Person spin:rule [
+              a sp:Construct ;
+              sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:var ; sp:object [ sp:varName "g" ] ] ) ;
+              sp:where (
+                [ a sp:SubQuery ;
+                  sp:query [ sp:text "SELECT (ex:notAnAgg(?v) AS ?g) (COUNT(?v) AS ?c) WHERE { ?s <urn:p> ?v }" ] ]
+              )
+            ] .
+            "#,
+        );
+        assert!(translate(&g_real_bad, &ex_prefixes).is_err());
+    }
+
+    #[test]
+    fn round4_prefixed_iri_expansion_bounded_in_preflight_and_candidates() {
+        let long_ns = format!("http://example.org/{}/", "a".repeat(200_000));
+        let long_prefixes = vec![("p".to_string(), long_ns.clone())];
+        let repeated_triples = (0..30)
+            .map(|i| format!("?s p:k{i} ?v{i} ."))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sq_text = format!("SELECT ?s WHERE {{ {repeated_triples} }}");
+
+        // 1. Discarded structural candidate with long caller namespace repeated in a textual
+        //    subquery followed by an unsupported RDF element falls back to valid outer sp:text
+        //    without expanding the 200 KiB namespace during subquery preflight.
+        let mut g_discard = parse_ttl(
+            r#"
+            ex:Person spin:rule [
+              a sp:Construct ;
+              sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:out ; sp:object 1 ] ) ;
+              sp:where (
+                [ a sp:SubQuery ; sp:query ex:sq ]
+                [ a sp:UnsupportedOp ; sp:arg1 1 ]
+              ) ;
+              sp:text "CONSTRUCT { ?this <http://example.org/ok> 1 } WHERE { ?this <http://example.org/in> ?x }"
+            ] .
+            "#,
+        );
+        g_discard.insert(&Triple::new(
+            NamedNode::new_unchecked("http://example.org/sq"),
+            super::vocab::sp::TEXT,
+            Literal::new_simple_literal(sq_text.clone()),
+        ));
+        let tr = translate(&g_discard, &long_prefixes).unwrap();
+        assert!(!tr.is_empty());
+
+        // 2. Surviving structural candidate with 30x 200 KiB expansion (= 6 MiB > 2 MiB budget)
+        //    is refused at CandidateCheck before parse allocation (not hidden by outer sp:text).
+        let mut g_survive = parse_ttl(
+            r#"
+            ex:Person spin:rule [
+              a sp:Construct ;
+              sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:out ; sp:object [ sp:varName "s" ] ] ) ;
+              sp:where (
+                [ a sp:SubQuery ; sp:query ex:sq ]
+              ) ;
+              sp:text "CONSTRUCT { ?this <http://example.org/ok> 1 } WHERE { ?this <http://example.org/in> ?x }"
+            ] .
+            "#,
+        );
+        g_survive.insert(&Triple::new(
+            NamedNode::new_unchecked("http://example.org/sq"),
+            super::vocab::sp::TEXT,
+            Literal::new_simple_literal(sq_text),
+        ));
+        let err = translate(&g_survive, &long_prefixes).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("maximum resolved IRI size"),
+            "{err:#}"
+        );
+
+        // 3. Direct sp:text using inline PREFIX amplification is also refused before parse
+        let inline_amp = format!(
+            "PREFIX q: <{long_ns}>\nCONSTRUCT {{ ?this <urn:ok> 1 }} WHERE {{ {} }}",
+            (0..30)
+                .map(|i| format!("?this q:k{i} ?v{i} ."))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let mut g_direct = parse_ttl(r#"ex:Person spin:rule ex:r ."#);
+        g_direct.insert(&Triple::new(
+            NamedNode::new_unchecked("http://example.org/r"),
+            super::vocab::sp::TEXT,
+            Literal::new_simple_literal(inline_amp),
+        ));
+        let err = translate(&g_direct, &[]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("maximum resolved IRI size"),
+            "{err:#}"
+        );
+
+        // 4. Inline PREFIX override narrowing a long caller namespace is still accepted
+        let inline_override = format!(
+            "PREFIX p: <http://example.org/short/>\nCONSTRUCT {{ ?this <urn:ok> 1 }} WHERE {{ {} }}",
+            (0..30)
+                .map(|i| format!("?this p:k{i} ?v{i} ."))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let mut g_override = parse_ttl(r#"ex:Person spin:rule ex:r ."#);
+        g_override.insert(&Triple::new(
+            NamedNode::new_unchecked("http://example.org/r"),
+            super::vocab::sp::TEXT,
+            Literal::new_simple_literal(inline_override),
+        ));
+        assert!(translate(&g_override, &long_prefixes).is_ok());
+    }
+
+    #[test]
+    fn round4_select_where_segment_assembly_bounds_live_output() {
+        // 600 KiB WHERE clause inside a bound SELECT template with anonymous variable
+        // collision rewriting, a failing nested sp:SubQuery fallback, and solution modifiers.
+        let mut g = parse_ttl(
+            r#"
+            ex:sel a sp:Select ;
+              sp:resultVariables ( [ sp:varName "arg" ] [ sp:varName "_spin_v1" ] ) ;
+              sp:orderBy ( [ sp:varName "arg" ] ) ;
+              sp:limit 5 .
+            "#,
+        );
+        let sel = NamedNode::new_unchecked("http://example.org/sel");
+        let anon_var = BlankNode::new_unchecked("anonV");
+        g.insert(&Triple::new(
+            anon_var.clone(),
+            crate::vocab::rdf::TYPE,
+            super::vocab::sp::VARIABLE_CLS,
+        ));
+        let payload = "p".repeat(600 * 1024);
+        let big_tp = BlankNode::new_unchecked("bigTp");
+        g.insert(&Triple::new(
+            big_tp.clone(),
+            super::vocab::sp::SUBJECT,
+            anon_var.clone(),
+        ));
+        g.insert(&Triple::new(
+            big_tp.clone(),
+            super::vocab::sp::PREDICATE,
+            NamedNode::new_unchecked("http://example.org/p"),
+        ));
+        g.insert(&Triple::new(
+            big_tp.clone(),
+            super::vocab::sp::OBJECT,
+            Literal::new_simple_literal(payload),
+        ));
+
+        // Failing dual-form nested SubQuery (sp:Select with unsupported element after an inner
+        // sp:Select) that must cleanly roll back segments and fall back to sp:text exporting ?arg.
+        let inner_sq = BlankNode::new_unchecked("innerSq");
+        let inner_sel = BlankNode::new_unchecked("innerSel");
+        let nested_sq = BlankNode::new_unchecked("nestedSq");
+        let nested_sel = BlankNode::new_unchecked("nestedSel");
+        let bad_elem = BlankNode::new_unchecked("badElem");
+        g.insert(&Triple::new(
+            inner_sq.clone(),
+            crate::vocab::rdf::TYPE,
+            super::vocab::sp::SUB_QUERY,
+        ));
+        g.insert(&Triple::new(
+            inner_sq.clone(),
+            super::vocab::sp::QUERY_PROP,
+            inner_sel.clone(),
+        ));
+        g.insert(&Triple::new(
+            inner_sel.clone(),
+            crate::vocab::rdf::TYPE,
+            super::vocab::sp::SELECT,
+        ));
+        g.insert(&Triple::new(
+            inner_sel.clone(),
+            super::vocab::sp::TEXT,
+            Literal::new_simple_literal("SELECT ?arg WHERE { ?s <http://example.org/q> ?arg }"),
+        ));
+        // inner_sel's sp:where has [nested_sq, bad_elem] so nested_sel flushes segments first,
+        // then bad_elem fails and triggers segment rollback to sp:text.
+        g.insert(&Triple::new(
+            nested_sq.clone(),
+            crate::vocab::rdf::TYPE,
+            super::vocab::sp::SUB_QUERY,
+        ));
+        g.insert(&Triple::new(
+            nested_sq.clone(),
+            super::vocab::sp::QUERY_PROP,
+            nested_sel.clone(),
+        ));
+        g.insert(&Triple::new(
+            nested_sel.clone(),
+            crate::vocab::rdf::TYPE,
+            super::vocab::sp::SELECT,
+        ));
+        g.insert(&Triple::new(
+            nested_sel,
+            super::vocab::sp::WHERE,
+            crate::vocab::rdf::NIL,
+        ));
+        g.insert(&Triple::new(
+            bad_elem.clone(),
+            crate::vocab::rdf::TYPE,
+            NamedNode::new_unchecked("http://spinrdf.org/sp#UnsupportedOp"),
+        ));
+        let ic2 = BlankNode::new_unchecked("ic2");
+        let ic1 = BlankNode::new_unchecked("ic1");
+        g.insert(&Triple::new(
+            ic2.clone(),
+            crate::vocab::rdf::FIRST,
+            bad_elem,
+        ));
+        g.insert(&Triple::new(
+            ic2.clone(),
+            crate::vocab::rdf::REST,
+            crate::vocab::rdf::NIL,
+        ));
+        g.insert(&Triple::new(
+            ic1.clone(),
+            crate::vocab::rdf::FIRST,
+            nested_sq,
+        ));
+        g.insert(&Triple::new(ic1.clone(), crate::vocab::rdf::REST, ic2));
+        g.insert(&Triple::new(inner_sel, super::vocab::sp::WHERE, ic1));
+
+        // Outer WHERE list: [big_tp, inner_sq]
+        let oc2 = BlankNode::new_unchecked("oc2");
+        let oc1 = BlankNode::new_unchecked("oc1");
+        g.insert(&Triple::new(
+            oc2.clone(),
+            crate::vocab::rdf::FIRST,
+            inner_sq,
+        ));
+        g.insert(&Triple::new(
+            oc2.clone(),
+            crate::vocab::rdf::REST,
+            crate::vocab::rdf::NIL,
+        ));
+        g.insert(&Triple::new(oc1.clone(), crate::vocab::rdf::FIRST, big_tp));
+        g.insert(&Triple::new(oc1.clone(), crate::vocab::rdf::REST, oc2));
+        g.insert(&Triple::new(sel.clone(), super::vocab::sp::WHERE, oc1));
+
+        let mut bindings = rustc_hash::FxHashMap::default();
+        bindings.insert("arg".to_string(), Some(ex("Val")));
+        let mut budget = super::rdf::WorkBudget::new(super::rdf::MAX_NODES);
+        let gr = crate::shapes::G { g: &g };
+        let (q, peak_live) = super::rdf::serialize_query_with_bindings_measured(
+            &gr,
+            &Term::NamedNode(sel),
+            &bindings,
+            None,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(
+            peak_live <= super::rdf::MAX_OUTPUT_BYTES,
+            "live output bytes ({peak_live}) must stay within MAX_OUTPUT_BYTES ({})",
+            super::rdf::MAX_OUTPUT_BYTES
+        );
+        assert!(
+            peak_live < 700 * 1024,
+            "joining 600 KiB WHERE must not duplicate buffer bytes (peak={peak_live})"
+        );
+        assert!(parse_query(&q, None, &[]).is_ok(), "invalid SPARQL output");
+        assert!(q.contains("SELECT ?arg ?_spin_v1 WHERE {"), "{}", &q[..120]);
+        assert!(
+            q.contains("?_spin_v2 <http://example.org/p>"),
+            "anon var collision must rewrite"
+        );
+        assert!(
+            q.ends_with("ORDER BY (<http://example.org/Val>) LIMIT 5"),
+            "{}",
+            &q[q.len() - 60..]
+        );
     }
 }

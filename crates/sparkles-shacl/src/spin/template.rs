@@ -760,7 +760,7 @@ fn expand_inner(
                 serialize_query_with_bindings(g, &body, &bindings, known_prefixes, budget)
                     .and_then(|q| {
                         if let Some(c) = check {
-                            c.validate(&q)?;
+                            c.validate(&q, budget)?;
                         }
                         Ok(q)
                     });
@@ -1312,12 +1312,161 @@ pub(crate) fn collect_sparql_text_vars(
     Ok(())
 }
 
-fn placeholder_prefix_ns(prefix: &str) -> String {
-    if prefix.is_empty() {
-        "urn:sparkles:spin-subquery-check:default/".to_string()
-    } else {
-        format!("urn:sparkles:spin-subquery-check:ns/{prefix}/")
+const PLACEHOLDER_PREFIX_BASE: &str = "urn:sparkles:spin-subquery-check:";
+
+fn indexed_placeholder_ns(idx: usize) -> String {
+    format!("{PLACEHOLDER_PREFIX_BASE}p{idx}/")
+}
+
+/// Whether `ns` is a prefix of any custom aggregate IRI registered by
+/// [`sparkles_core::sparql::aggext::register`]. Every such namespace is short (<= 63 bytes),
+/// so emitting the real `PREFIX` declaration for it in subquery preflight cannot cause
+/// long-namespace IRI amplification.
+fn could_resolve_to_registered_aggregate(ns: &str) -> bool {
+    !ns.is_empty()
+        && (spargebra::algebra::BUILT_IN_AGGREGATE_IRIS
+            .iter()
+            .any(|iri| iri.starts_with(ns))
+            || spargebra::algebra::ARQ_AGGREGATE_KEYWORDS
+                .iter()
+                .any(|(_, local)| {
+                    let base = spargebra::algebra::ARQ_AGGREGATE_NAMESPACE;
+                    let full_len = base.len() + local.len();
+                    ns.len() <= full_len
+                        && if ns.len() <= base.len() {
+                            base.starts_with(ns)
+                        } else {
+                            ns.starts_with(base) && local.starts_with(&ns[base.len()..])
+                        }
+                }))
+}
+
+fn has_iri_scheme(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
     }
+    for b in bytes {
+        if b == b':' {
+            return true;
+        }
+        if !(b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')) {
+            return false;
+        }
+    }
+    false
+}
+
+fn resolved_iri_len(raw: &str, base_len: usize) -> usize {
+    if base_len > 0 && !has_iri_scheme(raw) {
+        base_len.saturating_add(raw.len())
+    } else {
+        raw.len()
+    }
+}
+
+/// Admit the resolved IRI bytes that `spargebra` will materialize when parsing `sparql`
+/// under `base_prefixes` (plus any inline `BASE` / `PREFIX` declarations in `sparql`).
+/// Refuses with [`super::rdf::SpinLimitError`] before parse allocations if any single
+/// resolved IRI exceeds [`MAX_OUTPUT_BYTES`] or total resolved IRI bytes exceed
+/// `max_resolved_bytes`.
+pub(crate) fn admit_resolved_prefixed_iris(
+    sparql: &str,
+    base_prefixes: Option<&FxHashMap<&str, &str>>,
+    max_resolved_bytes: usize,
+) -> Result<()> {
+    let mut scan_budget = WorkBudget::new(MAX_OUTPUT_BYTES);
+    let tokens = tokenize_sparql(sparql, &mut scan_budget)?;
+    let mut base_len = 0usize;
+    let mut local_prefixes: FxHashMap<&str, usize> = FxHashMap::default();
+    let mut total_resolved = 0usize;
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i];
+        if tok.is_word(sparql, "PREFIX")
+            && i + 2 < tokens.len()
+            && tokens[i + 1].kind == TokKind::PrefixedName
+            && tokens[i + 2].kind == TokKind::IriRef
+        {
+            let p_str = tokens[i + 1].as_str(sparql);
+            if let Some(prefix) = p_str.strip_suffix(':') {
+                let iri_tok = tokens[i + 2].as_str(sparql);
+                let inner = &iri_tok[1..iri_tok.len().saturating_sub(1)];
+                let ns_len = resolved_iri_len(inner, base_len);
+                if ns_len > MAX_OUTPUT_BYTES {
+                    return Err(limit_err(format!(
+                        "SPIN resolved IRI exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
+                    )));
+                }
+                local_prefixes.insert(prefix, ns_len);
+                i += 3;
+                continue;
+            }
+        }
+        if tok.is_word(sparql, "BASE")
+            && i + 1 < tokens.len()
+            && tokens[i + 1].kind == TokKind::IriRef
+        {
+            let iri_tok = tokens[i + 1].as_str(sparql);
+            let inner = &iri_tok[1..iri_tok.len().saturating_sub(1)];
+            base_len = resolved_iri_len(inner, base_len);
+            if base_len > MAX_OUTPUT_BYTES {
+                return Err(limit_err(format!(
+                    "SPIN resolved IRI exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
+                )));
+            }
+            i += 2;
+            continue;
+        }
+        match tok.kind {
+            TokKind::PrefixedName => {
+                if let Some((prefix, local)) = tok.as_str(sparql).split_once(':') {
+                    let ns_len = local_prefixes
+                        .get(prefix)
+                        .copied()
+                        .or_else(|| base_prefixes.and_then(|m| m.get(prefix).map(|ns| ns.len())));
+                    if let Some(ns_len) = ns_len {
+                        let resolved_len = ns_len.saturating_add(local.len());
+                        if resolved_len > MAX_OUTPUT_BYTES {
+                            return Err(limit_err(format!(
+                                "SPIN resolved IRI exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
+                            )));
+                        }
+                        total_resolved = total_resolved.saturating_add(resolved_len);
+                        if total_resolved > max_resolved_bytes {
+                            return Err(limit_err(format!(
+                                "SPIN query exceeds maximum resolved IRI size ({max_resolved_bytes} bytes)"
+                            )));
+                        }
+                    }
+                }
+            }
+            TokKind::IriRef if base_len > 0 => {
+                let iri_tok = tok.as_str(sparql);
+                let inner = &iri_tok[1..iri_tok.len().saturating_sub(1)];
+                if !has_iri_scheme(inner) {
+                    let resolved_len = base_len.saturating_add(inner.len());
+                    if resolved_len > MAX_OUTPUT_BYTES {
+                        return Err(limit_err(format!(
+                            "SPIN resolved IRI exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
+                        )));
+                    }
+                    total_resolved = total_resolved.saturating_add(resolved_len);
+                    if total_resolved > max_resolved_bytes {
+                        return Err(limit_err(format!(
+                            "SPIN query exceeds maximum resolved IRI size ({max_resolved_bytes} bytes)"
+                        )));
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(())
 }
 
 fn unescape_pn_local(raw: &str) -> String {
@@ -1339,12 +1488,14 @@ fn unescape_pn_local(raw: &str) -> String {
 /// balanced `{}` braces that cannot escape the subquery block, and no dataset clauses or
 /// prologue), charging `budget`.
 ///
-/// When `known_prefixes` is `Some`, prefixes are resolved against the real translation
-/// prefix environment so registered custom aggregates (such as `afn:variance(DISTINCT ?v)`)
-/// retain their true IRIs. When `None` (standalone serialization without a prefix table),
-/// placeholder namespaces are generated per prefix and placeholder-prefixed calls using
-/// `DISTINCT` are admitted as custom aggregates so placeholder resolution does not decide
-/// aggregate identity.
+/// When `known_prefixes` is `Some`, only declared prefixes are emitted; namespaces that can
+/// resolve to a registered custom aggregate keep their real (short) IRI while other declared
+/// prefixes use fixed-length indexed placeholder namespaces so discarded structural candidates
+/// never amplify long caller namespaces during preflight. When `None` (standalone
+/// serialization without a prefix table), indexed placeholder namespaces are emitted for all
+/// prefixes and both `DISTINCT` and non-`DISTINCT` single-argument placeholder calls are
+/// admitted as potential custom aggregates so missing prefix declarations do not reject
+/// valid standalone fragments.
 pub(crate) fn validate_subquery_text(
     text: &str,
     known_prefixes: Option<&FxHashMap<&str, &str>>,
@@ -1363,8 +1514,11 @@ pub(crate) fn validate_subquery_text(
         bail!("sp:SubQuery sp:text must be a SELECT query");
     }
     let mut brace_depth: isize = 0;
-    let mut prefixes: FxHashSet<&str> = FxHashSet::default();
-    let mut standalone_distinct_aggs: Vec<NamedNode> = Vec::new();
+    let mut prefix_indices: FxHashMap<&str, usize> = FxHashMap::default();
+    let mut used_prefixes: Vec<(&str, String)> = Vec::new();
+    let mut distinct_agg_tokens: Vec<(usize, &str)> = Vec::new();
+    let mut resolved_iri_bytes = 0usize;
+    let max_resolved_bytes = budget.remaining_bytes();
     for (idx, tok) in tokens.iter().enumerate() {
         match tok.kind {
             TokKind::LBrace => brace_depth += 1,
@@ -1376,22 +1530,50 @@ pub(crate) fn validate_subquery_text(
             }
             TokKind::PrefixedName => {
                 if let Some((prefix, local)) = tok.as_str(text).split_once(':') {
-                    prefixes.insert(prefix);
-                    if known_prefixes.is_none()
-                        && tokens
-                            .get(idx + 1)
-                            .is_some_and(|t| t.kind == TokKind::LParen)
-                        && tokens
-                            .get(idx + 2)
-                            .is_some_and(|t| t.is_word(text, "DISTINCT"))
-                    {
-                        let iri_str = format!(
-                            "{}{}",
-                            placeholder_prefix_ns(prefix),
-                            unescape_pn_local(local)
-                        );
-                        if let Ok(iri) = NamedNode::new(iri_str) {
-                            standalone_distinct_aggs.push(iri);
+                    let slot = if let Some(&existing) = prefix_indices.get(prefix) {
+                        Some(existing)
+                    } else {
+                        let effective_ns = match known_prefixes {
+                            Some(prefix_map) => prefix_map.get(prefix).map(|&ns| {
+                                if could_resolve_to_registered_aggregate(ns) {
+                                    ns.to_string()
+                                } else {
+                                    indexed_placeholder_ns(used_prefixes.len())
+                                }
+                            }),
+                            None => Some(indexed_placeholder_ns(used_prefixes.len())),
+                        };
+                        if let Some(ns) = effective_ns {
+                            let new_slot = used_prefixes.len();
+                            prefix_indices.insert(prefix, new_slot);
+                            used_prefixes.push((prefix, ns));
+                            Some(new_slot)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(slot) = slot {
+                        let resolved_len = used_prefixes[slot].1.len().saturating_add(local.len());
+                        if resolved_len > MAX_OUTPUT_BYTES {
+                            return Err(limit_err(format!(
+                                "SPIN resolved IRI exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
+                            )));
+                        }
+                        resolved_iri_bytes = resolved_iri_bytes.saturating_add(resolved_len);
+                        if resolved_iri_bytes > max_resolved_bytes {
+                            return Err(limit_err(format!(
+                                "SPIN query exceeds maximum resolved IRI size ({max_resolved_bytes} bytes)"
+                            )));
+                        }
+                        if known_prefixes.is_none()
+                            && tokens
+                                .get(idx + 1)
+                                .is_some_and(|t| t.kind == TokKind::LParen)
+                            && tokens
+                                .get(idx + 2)
+                                .is_some_and(|t| t.is_word(text, "DISTINCT"))
+                        {
+                            distinct_agg_tokens.push((slot, local));
                         }
                     }
                 }
@@ -1402,36 +1584,49 @@ pub(crate) fn validate_subquery_text(
     if brace_depth != 0 {
         bail!("sp:SubQuery sp:text has unbalanced braces");
     }
-    let mut wrapped = String::with_capacity(text.len().saturating_add(64));
-    match known_prefixes {
-        Some(prefix_map) => {
-            for p in prefixes {
-                if let Some(&ns) = prefix_map.get(p) {
-                    wrapped.push_str("PREFIX ");
-                    wrapped.push_str(p);
-                    wrapped.push_str(": <");
-                    wrapped.push_str(ns);
-                    wrapped.push_str(">\n");
-                }
-            }
-        }
-        None => {
-            for p in prefixes {
-                wrapped.push_str("PREFIX ");
-                wrapped.push_str(p);
-                wrapped.push_str(": <");
-                wrapped.push_str(&placeholder_prefix_ns(p));
-                wrapped.push_str(">\n");
-            }
-        }
+
+    let mut header_bytes = 0usize;
+    for (p, ns) in &used_prefixes {
+        // "PREFIX " (7) + p + ": <" (3) + ns + ">\n" (2)
+        header_bytes = header_bytes
+            .saturating_add(12)
+            .saturating_add(p.len())
+            .saturating_add(ns.len());
+    }
+    let wrapped_len = header_bytes
+        .saturating_add(text.len())
+        .saturating_add("SELECT * WHERE { {\n\n} }".len());
+    if header_bytes > MAX_OUTPUT_BYTES || wrapped_len > super::rdf::MAX_RETAINED_BYTES {
+        return Err(limit_err(format!(
+            "SPIN subquery validation wrapper exceeds maximum size ({} bytes)",
+            super::rdf::MAX_RETAINED_BYTES
+        )));
+    }
+
+    let mut wrapped = String::with_capacity(wrapped_len);
+    for (p, ns) in &used_prefixes {
+        wrapped.push_str("PREFIX ");
+        wrapped.push_str(p);
+        wrapped.push_str(": <");
+        wrapped.push_str(ns);
+        wrapped.push_str(">\n");
     }
     wrapped.push_str("SELECT * WHERE { {\n");
     wrapped.push_str(text);
     wrapped.push_str("\n} }");
 
     let mut parser = sparkles_core::sparql::aggext::register(spargebra::SparqlParser::new());
-    for iri in standalone_distinct_aggs {
-        parser = parser.with_custom_aggregate_function(iri);
+    if known_prefixes.is_none() {
+        parser = parser.with_placeholder_aggregate_namespace(PLACEHOLDER_PREFIX_BASE);
+        let mut seen_aggs: FxHashSet<NamedNode> = FxHashSet::default();
+        for (slot, local) in distinct_agg_tokens {
+            let iri_str = format!("{}{}", used_prefixes[slot].1, unescape_pn_local(local));
+            if let Ok(iri) = NamedNode::new(iri_str)
+                && seen_aggs.insert(iri.clone())
+            {
+                parser = parser.with_custom_aggregate_function(iri);
+            }
+        }
     }
     let parsed = parser.parse_query(&wrapped).map_err(|e| {
         if e.is_too_deep() {

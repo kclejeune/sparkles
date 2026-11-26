@@ -321,8 +321,12 @@ pub(crate) fn serialize_query_with_bindings(
         bindings,
         known_prefixes,
         budget,
+        segments: Vec::new(),
+        segments_bytes: 0,
         out: String::new(),
         reserved_out_bytes: 0,
+        #[cfg(test)]
+        peak_live_output_bytes: 0,
         ancestors: FxHashSet::default(),
         anon_vars: FxHashMap::default(),
         anon_var_spans: Vec::new(),
@@ -331,6 +335,36 @@ pub(crate) fn serialize_query_with_bindings(
     };
     ser.write_query(query, 0, false)?;
     ser.resolve_anon_var_collisions()
+}
+
+#[cfg(test)]
+pub(crate) fn serialize_query_with_bindings_measured(
+    g: &G<'_>,
+    query: &Term,
+    bindings: &FxHashMap<String, Option<Term>>,
+    known_prefixes: Option<&FxHashMap<&str, &str>>,
+    budget: &mut WorkBudget,
+) -> Result<(String, usize)> {
+    let mut ser = Serializer {
+        g: *g,
+        bindings,
+        known_prefixes,
+        budget,
+        segments: Vec::new(),
+        segments_bytes: 0,
+        out: String::new(),
+        reserved_out_bytes: 0,
+        peak_live_output_bytes: 0,
+        ancestors: FxHashSet::default(),
+        anon_vars: FxHashMap::default(),
+        anon_var_spans: Vec::new(),
+        template_bnodes: FxHashMap::default(),
+        used_var_names: FxHashSet::default(),
+    };
+    ser.write_query(query, 0, false)?;
+    let peak = ser.peak_live_output_bytes;
+    let sparql = ser.resolve_anon_var_collisions()?;
+    Ok((sparql, peak))
 }
 
 /// Append `s` to `out`, refusing output larger than `limit`.
@@ -554,18 +588,32 @@ enum NodePos {
     Object,
 }
 
+struct OutputCheckpoint {
+    segments_len: usize,
+    segments_bytes: usize,
+    out_len: usize,
+    anon_spans_len: usize,
+}
+
 struct Serializer<'g, 'b, 'p, 'w> {
     g: G<'g>,
     bindings: &'b FxHashMap<String, Option<Term>>,
     known_prefixes: Option<&'p FxHashMap<&'p str, &'p str>>,
     budget: &'w mut WorkBudget,
+    /// Completed owned output segments preceding `out`, moved without copying when
+    /// joining buffered `SELECT` `WHERE` clauses.
+    segments: Vec<String>,
+    segments_bytes: usize,
     out: String,
     reserved_out_bytes: usize,
+    #[cfg(test)]
+    peak_live_output_bytes: usize,
     ancestors: FxHashSet<Term>,
     /// Anonymous blank-node variable -> sequential id `0..anon_vars.len()`.
     anon_vars: FxHashMap<BlankNode, usize>,
-    /// Byte spans `(name_start, name_end, anon_id)` of provisionally emitted `_spin_v{id+1}`
-    /// names in `out`, rewritten once at the end only if any name collides with query vars.
+    /// Logical byte spans `(name_start, name_end, anon_id)` of provisionally emitted
+    /// `_spin_v{id+1}` names across `segments` + `out`, rewritten once at the end only
+    /// if any name collides with query vars.
     anon_var_spans: Vec<(usize, usize, usize)>,
     template_bnodes: FxHashMap<BlankNode, String>,
     /// Variable names seen anywhere in this query (named SPIN vars, `sp:Values`, `sp:SubQuery` `sp:text`).
@@ -573,28 +621,81 @@ struct Serializer<'g, 'b, 'p, 'w> {
 }
 
 impl Serializer<'_, '_, '_, '_> {
+    fn logical_out_len(&self) -> usize {
+        self.segments_bytes.saturating_add(self.out.len())
+    }
+
     fn output_limit(&self) -> usize {
-        MAX_OUTPUT_BYTES.saturating_sub(self.reserved_out_bytes)
+        MAX_OUTPUT_BYTES
+            .saturating_sub(self.segments_bytes)
+            .saturating_sub(self.reserved_out_bytes)
+    }
+
+    fn record_live_output(&mut self) {
+        #[cfg(test)]
+        {
+            let live = self
+                .segments_bytes
+                .saturating_add(self.out.len())
+                .saturating_add(self.reserved_out_bytes);
+            if live > self.peak_live_output_bytes {
+                self.peak_live_output_bytes = live;
+            }
+        }
+    }
+
+    fn checkpoint_output(&self) -> OutputCheckpoint {
+        OutputCheckpoint {
+            segments_len: self.segments.len(),
+            segments_bytes: self.segments_bytes,
+            out_len: self.out.len(),
+            anon_spans_len: self.anon_var_spans.len(),
+        }
+    }
+
+    fn rollback_output(&mut self, cp: OutputCheckpoint) {
+        if cp.out_len == 0 {
+            self.segments.truncate(cp.segments_len);
+            self.segments_bytes = cp.segments_bytes;
+            self.out.clear();
+        } else if self.segments.len() > cp.segments_len {
+            // A nested SELECT flushed the original `out` buffer into `segments[cp.segments_len]`.
+            self.segments.truncate(cp.segments_len + 1);
+            self.out = self.segments.pop().unwrap_or_default();
+            self.out.truncate(cp.out_len);
+            self.segments_bytes = cp.segments_bytes;
+        } else {
+            self.out.truncate(cp.out_len);
+        }
+        self.anon_var_spans.truncate(cp.anon_spans_len);
     }
 
     fn push(&mut self, s: &str) -> Result<()> {
         let limit = self.output_limit();
-        push_str_bounded_max(&mut self.out, s, limit)
+        push_str_bounded_max(&mut self.out, s, limit)?;
+        self.record_live_output();
+        Ok(())
     }
 
     fn push_iri(&mut self, iri: &str) -> Result<()> {
         let limit = self.output_limit();
-        write_iri_max(&mut self.out, iri, limit)
+        write_iri_max(&mut self.out, iri, limit)?;
+        self.record_live_output();
+        Ok(())
     }
 
     fn push_literal_ref(&mut self, lit: LiteralRef<'_>) -> Result<()> {
         let limit = self.output_limit();
-        write_literal_ref_max(&mut self.out, lit, limit)
+        write_literal_ref_max(&mut self.out, lit, limit)?;
+        self.record_live_output();
+        Ok(())
     }
 
     fn push_term_value(&mut self, term: &Term, depth: usize) -> Result<()> {
         let limit = self.output_limit();
-        write_term_ref_value_max(&mut self.out, term.as_ref(), depth, limit)
+        write_term_ref_value_max(&mut self.out, term.as_ref(), depth, limit)?;
+        self.record_live_output();
+        Ok(())
     }
 
     fn count_node(&mut self) -> Result<()> {
@@ -746,17 +847,33 @@ impl Serializer<'_, '_, '_, '_> {
             id
         };
         self.push("?")?;
-        let start = self.out.len();
+        let start = self.logical_out_len();
         let provisional = format!("_spin_v{}", id + 1);
         self.push(&provisional)?;
-        let end = self.out.len();
+        let end = self.logical_out_len();
         self.anon_var_spans.push((start, end, id));
         Ok(())
     }
 
+    fn flatten_segments(self) -> String {
+        if self.segments.is_empty() {
+            return self.out;
+        }
+        let total = self.segments_bytes.saturating_add(self.out.len());
+        let mut iter = self.segments.into_iter().chain(std::iter::once(self.out));
+        let mut out = iter.next().unwrap_or_default();
+        if total > out.len() {
+            out.reserve_exact(total - out.len());
+        }
+        for seg in iter {
+            out.push_str(&seg);
+        }
+        out
+    }
+
     fn resolve_anon_var_collisions(mut self) -> Result<String> {
         if self.anon_vars.is_empty() {
-            return Ok(self.out);
+            return Ok(self.flatten_segments());
         }
         let count = self.anon_vars.len();
         let has_collision = (0..count).any(|id| {
@@ -764,7 +881,7 @@ impl Serializer<'_, '_, '_, '_> {
             self.used_var_names.contains(&name) || self.bindings.contains_key(&name)
         });
         if !has_collision {
-            return Ok(self.out);
+            return Ok(self.flatten_segments());
         }
         let mut final_names = Vec::with_capacity(count);
         let mut next_n = 1usize;
@@ -779,14 +896,24 @@ impl Serializer<'_, '_, '_, '_> {
                 }
             }
         }
-        let mut rebuilt = String::with_capacity(self.out.len().min(MAX_OUTPUT_BYTES));
-        let mut cursor = 0usize;
-        for (start, end, id) in self.anon_var_spans {
-            push_str_bounded(&mut rebuilt, &self.out[cursor..start])?;
-            push_str_bounded(&mut rebuilt, &final_names[id])?;
-            cursor = end;
+        let mut rebuilt = String::with_capacity(self.logical_out_len().min(MAX_OUTPUT_BYTES));
+        let mut spans = self.anon_var_spans.into_iter().peekable();
+        let mut seg_base = 0usize;
+        for seg in self.segments.into_iter().chain(std::iter::once(self.out)) {
+            let seg_end = seg_base + seg.len();
+            let mut cursor = seg_base;
+            while let Some(&(start, end, id)) = spans.peek() {
+                if start >= seg_end {
+                    break;
+                }
+                spans.next();
+                push_str_bounded(&mut rebuilt, &seg[cursor - seg_base..start - seg_base])?;
+                push_str_bounded(&mut rebuilt, &final_names[id])?;
+                cursor = end;
+            }
+            push_str_bounded(&mut rebuilt, &seg[cursor - seg_base..])?;
+            seg_base = seg_end;
         }
-        push_str_bounded(&mut rebuilt, &self.out[cursor..])?;
         Ok(rebuilt)
     }
 
@@ -983,15 +1110,21 @@ impl Serializer<'_, '_, '_, '_> {
                         this.write_solution_modifiers(query, depth + 1, &empty)?;
                         Ok(FxHashSet::default())
                     } else {
-                        // Serialize WHERE into a bounded sub-buffer first so `body_exported`
+                        // Serialize WHERE into owned segments first so `body_exported`
                         // reflects the exact subquery candidates emitted (including any
-                        // dual-form `sp:text` fallbacks).
+                        // dual-form `sp:text` fallbacks), then move the owned segments
+                        // into place without duplicating `where_buf` across live buffers.
+                        let saved_segments = std::mem::take(&mut this.segments);
+                        let saved_segments_bytes = std::mem::take(&mut this.segments_bytes);
                         let saved_out = std::mem::take(&mut this.out);
                         let saved_spans = std::mem::take(&mut this.anon_var_spans);
-                        let saved_len = saved_out.len();
+                        let saved_len = saved_segments_bytes.saturating_add(saved_out.len());
                         this.reserved_out_bytes = this.reserved_out_bytes.saturating_add(saved_len);
                         let where_res = this.write_element_list(&where_head, depth + 1);
-                        let where_buf = std::mem::replace(&mut this.out, saved_out);
+                        let where_segments = std::mem::replace(&mut this.segments, saved_segments);
+                        let where_segments_bytes =
+                            std::mem::replace(&mut this.segments_bytes, saved_segments_bytes);
+                        let where_out = std::mem::replace(&mut this.out, saved_out);
                         let where_spans = std::mem::replace(&mut this.anon_var_spans, saved_spans);
                         this.reserved_out_bytes = this.reserved_out_bytes.saturating_sub(saved_len);
                         let body_exported = where_res?;
@@ -1003,7 +1136,7 @@ impl Serializer<'_, '_, '_, '_> {
                             depth + 1,
                         )?;
 
-                        let where_len = where_buf.len();
+                        let where_len = where_segments_bytes.saturating_add(where_out.len());
                         this.reserved_out_bytes = this.reserved_out_bytes.saturating_add(where_len);
                         let header_res = (|| -> Result<FxHashSet<String>> {
                             this.push("SELECT ")?;
@@ -1037,8 +1170,19 @@ impl Serializer<'_, '_, '_, '_> {
                         this.reserved_out_bytes = this.reserved_out_bytes.saturating_sub(where_len);
                         let select_exported = header_res?;
 
-                        let base = this.out.len();
-                        this.push(&where_buf)?;
+                        let base = this.logical_out_len();
+                        if !this.out.is_empty() {
+                            this.segments_bytes =
+                                this.segments_bytes.saturating_add(this.out.len());
+                            this.segments.push(std::mem::take(&mut this.out));
+                        }
+                        if !where_segments.is_empty() {
+                            this.segments_bytes =
+                                this.segments_bytes.saturating_add(where_segments_bytes);
+                            this.segments.extend(where_segments);
+                        }
+                        this.out = where_out;
+                        this.record_live_output();
                         for (s, e, id) in where_spans {
                             this.anon_var_spans.push((base + s, base + e, id));
                         }
@@ -1420,8 +1564,7 @@ impl Serializer<'_, '_, '_, '_> {
                 let inner = this.required_object(node, sp::QUERY_PROP, "sp:SubQuery")?;
                 this.push("{ ")?;
                 let exported = if has_rdf_query_structure(&this.g, &inner) {
-                    let saved_len = this.out.len();
-                    let saved_spans = this.anon_var_spans.len();
+                    let cp = this.checkpoint_output();
                     match this.write_query(&inner, depth + 1, true) {
                         Ok(sub_exported) => sub_exported,
                         Err(rdf_err) => {
@@ -1429,8 +1572,7 @@ impl Serializer<'_, '_, '_, '_> {
                                 && let Some(text_term) =
                                     single_object_ref(&this.g, &inner, sp::TEXT, this.budget)?
                             {
-                                this.out.truncate(saved_len);
-                                this.anon_var_spans.truncate(saved_spans);
+                                this.rollback_output(cp);
                                 this.write_subquery_text(&inner, text_term)?
                             } else {
                                 return Err(rdf_err);

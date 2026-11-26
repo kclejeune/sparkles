@@ -42,6 +42,9 @@ pub struct SparqlParser {
     prefixes: HashMap<String, String>,
     /// shared, so that a parser with many custom aggregates is cheap to clone
     custom_aggregate_functions: Arc<HashSet<NamedNode>>,
+    /// Optional placeholder namespace prefix whose single-argument custom function calls
+    /// may resolve to custom aggregates once real prefix declarations are supplied.
+    placeholder_aggregate_namespace: Option<&'static str>,
     /// Reject Jena ARQ's syntax extensions (see [`SparqlParser::with_arq_syntax`]).
     sparql_only: bool,
 }
@@ -125,6 +128,16 @@ impl SparqlParser {
         self
     }
 
+    /// Treats single-argument custom function calls whose resolved IRI starts with
+    /// `ns_prefix` as potentially aggregate-scoped during grouped `SELECT` projection
+    /// validation. Used for standalone fragment validation when real prefix bindings are
+    /// not yet known.
+    #[inline]
+    pub fn with_placeholder_aggregate_namespace(mut self, ns_prefix: &'static str) -> Self {
+        self.placeholder_aggregate_namespace = Some(ns_prefix);
+        self
+    }
+
     /// Whether Jena ARQ's extensions of the SPARQL syntax are accepted (the default) or
     /// are syntax errors: `LATERAL`, `LET`, `UNFOLD`, `SEMIJOIN`, `ANTIJOIN`, path ranges (`p{2}`,
     /// `p{1,3}`, `p{2,}`, `p{,3}`, `p{*}`, `p{+}`) and `distinct(…)`, `multi(…)` and
@@ -165,6 +178,7 @@ impl SparqlParser {
             self.prefixes,
             self.custom_aggregate_functions,
         );
+        state.placeholder_aggregate_namespace = self.placeholder_aggregate_namespace;
         state.arq = !self.sparql_only;
         #[cfg(feature = "standard-unicode-escaping")]
         let query = unescape_unicode_codepoints(query);
@@ -787,7 +801,13 @@ fn build_select(
                                 "The SELECT overrides an existing variable using an expression",
                             );
                         }
-                        if with_aggregate && !are_variables_bound(&expression, &visible) {
+                        if with_aggregate
+                            && !are_variables_bound(
+                                &expression,
+                                &visible,
+                                state.placeholder_aggregate_namespace,
+                            )
+                        {
                             // We validate projection variables if there is an aggregate
                             return Err(
                                 "The SELECT contains an expression with a variable that is unbound",
@@ -858,7 +878,11 @@ fn build_select(
     Ok(m)
 }
 
-fn are_variables_bound(expression: &Expression, variables: &HashSet<Variable>) -> bool {
+fn are_variables_bound(
+    expression: &Expression,
+    variables: &HashSet<Variable>,
+    placeholder_aggregate_namespace: Option<&str>,
+) -> bool {
     match expression {
         Expression::NamedNode(_)
         | Expression::Literal(_)
@@ -867,7 +891,7 @@ fn are_variables_bound(expression: &Expression, variables: &HashSet<Variable>) -
         | Expression::Exists(_) => true,
         Expression::Variable(var) => variables.contains(var),
         Expression::UnaryPlus(e) | Expression::UnaryMinus(e) | Expression::Not(e) => {
-            are_variables_bound(e, variables)
+            are_variables_bound(e, variables, placeholder_aggregate_namespace)
         }
         Expression::Or(a, b)
         | Expression::And(a, b)
@@ -881,18 +905,30 @@ fn are_variables_bound(expression: &Expression, variables: &HashSet<Variable>) -
         | Expression::Subtract(a, b)
         | Expression::Multiply(a, b)
         | Expression::Divide(a, b) => {
-            are_variables_bound(a, variables) && are_variables_bound(b, variables)
+            are_variables_bound(a, variables, placeholder_aggregate_namespace)
+                && are_variables_bound(b, variables, placeholder_aggregate_namespace)
         }
         Expression::In(a, b) => {
-            are_variables_bound(a, variables) && b.iter().all(|b| are_variables_bound(b, variables))
+            are_variables_bound(a, variables, placeholder_aggregate_namespace)
+                && b.iter()
+                    .all(|b| are_variables_bound(b, variables, placeholder_aggregate_namespace))
         }
-        Expression::FunctionCall(_, parameters) => {
-            parameters.iter().all(|p| are_variables_bound(p, variables))
+        Expression::FunctionCall(function, parameters) => {
+            if let Some(ns_prefix) = placeholder_aggregate_namespace
+                && parameters.len() == 1
+                && let Function::Custom(iri) = function
+                && iri.as_str().starts_with(ns_prefix)
+            {
+                return true;
+            }
+            parameters
+                .iter()
+                .all(|p| are_variables_bound(p, variables, placeholder_aggregate_namespace))
         }
         Expression::If(a, b, c) => {
-            are_variables_bound(a, variables)
-                && are_variables_bound(b, variables)
-                && are_variables_bound(c, variables)
+            are_variables_bound(a, variables, placeholder_aggregate_namespace)
+                && are_variables_bound(b, variables, placeholder_aggregate_namespace)
+                && are_variables_bound(c, variables, placeholder_aggregate_namespace)
         }
     }
 }
@@ -1100,6 +1136,7 @@ pub struct ParserState {
     base_iri: Option<Iri<String>>,
     prefixes: HashMap<String, String>,
     custom_aggregate_functions: Arc<HashSet<NamedNode>>,
+    placeholder_aggregate_namespace: Option<&'static str>,
     used_bnodes: HashSet<BlankNode>,
     currently_used_bnodes: HashSet<BlankNode>,
     aggregates: Vec<Vec<(Variable, AggregateExpression)>>,
@@ -1117,6 +1154,7 @@ impl ParserState {
             base_iri,
             prefixes,
             custom_aggregate_functions,
+            placeholder_aggregate_namespace: None,
             used_bnodes: HashSet::new(),
             currently_used_bnodes: HashSet::new(),
             aggregates: Vec::new(),
