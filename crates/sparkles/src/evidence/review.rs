@@ -717,6 +717,9 @@ impl State<'_> {
         dataset_id: Uuid,
         protected_record_graphs: &[(&str, Uuid)],
     ) -> Result<()> {
+        if p.output_projection_only {
+            return Ok(());
+        }
         if self.reads.has_published_operation_in_output(
             p.output.0.as_str(),
             p.output.1,
@@ -819,6 +822,7 @@ struct PolicyGraphs {
     decisions: G,
     supports: G,
     output: G,
+    output_projection_only: bool,
     boundary: Vec<G>,
 }
 
@@ -836,6 +840,7 @@ impl PolicyGraphs {
             decisions: g(&policy.decisions)?,
             supports: g(&policy.supports)?,
             output: g(&policy.output)?,
+            output_projection_only: cap.is_projection_only(&policy.output),
             boundary: policy
                 .boundary
                 .iter()
@@ -862,6 +867,7 @@ impl PolicyGraphs {
             decisions: g(&policy.decisions)?,
             supports: g(&policy.supports)?,
             output: g(&policy.output)?,
+            output_projection_only: false,
             boundary: policy
                 .boundary
                 .iter()
@@ -1206,7 +1212,7 @@ fn publish(
                 commit: seq,
                 time_ms,
             },
-            |g| capability.protection(g.as_str()),
+            |g| capability.record_protection(g.as_str()),
             skip,
         )?
     };
@@ -1989,18 +1995,20 @@ fn protected_managed_graphs(settings: &Settings, capability: &ManagedWrite) -> V
     settings
         .managed_graphs()
         .into_iter()
+        .filter(|g| !capability.is_projection_only(g))
         .filter_map(|g| capability.protection(&g).map(|n| (g, n)))
         .collect()
 }
 
-/// The dedicated projection graphs of `settings` with their current protection nonces
-/// under `capability`. Dedicated outputs can hold ordinary and support-projected RDF
-/// assertions, so callers inspect them only for genuinely published evidence-owner
-/// records (as when a former record graph moved into `projections` without detaching).
+/// The non-`projection_only` projection graphs of `settings` with their current
+/// protection nonces under `capability` (former record graphs moved into `projections`
+/// without detaching, or legacy pre-format-4 outputs not yet upgraded). Dedicated
+/// `projection_only` outputs never accepted `publish_quads` and are skipped.
 fn projection_graph_nonces(settings: &Settings, capability: &ManagedWrite) -> Vec<G> {
     settings
         .projections
         .iter()
+        .filter(|g| !capability.is_projection_only(g))
         .filter_map(|g| NamedNode::new(g.as_str()).ok())
         .map(|g| {
             let n = capability.protection(g.as_str());

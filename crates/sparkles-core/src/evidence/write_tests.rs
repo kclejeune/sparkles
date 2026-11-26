@@ -500,17 +500,69 @@ fn subjects_up_to_held_and_objects_up_to_held_charge_before_cloning() {
     ));
 }
 
-/// Projection-only protection nonces are version-8 RFC 4122 UUIDs distinguishable from
-/// version-4 record-role nonces across serialization.
+/// `ManagedWrite::record_protection` returns `None` for projection-only graphs so
+/// `publish_quads` refuses to publish `ev:Operation` records into them.
 #[test]
-fn projection_protection_nonces_distinguish_roles_and_survive_serialization() {
-    let proj = crate::managed::new_projection_protection();
-    let rec = Uuid::new_v4();
-    assert!(crate::managed::is_projection_only_protection(proj));
-    assert!(!crate::managed::is_projection_only_protection(rec));
-    let parsed = Uuid::parse_str(&proj.to_string()).unwrap();
-    assert_eq!(parsed, proj);
-    assert!(crate::managed::is_projection_only_protection(parsed));
+fn publish_quads_refuses_projection_only_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = crate::store::Store::open(
+        &dir.path().join("ds"),
+        crate::store::StoreOptions::default(),
+    )
+    .unwrap();
+    let mut s = settings(&["urn:ev:sources"], &["urn:ev:claims"]);
+    s.decisions.push("urn:ev:decisions".into());
+    s.supports.push("urn:ev:supports".into());
+    s.projections.push("urn:ev:output".into());
+    s.policies.insert(
+        "main".into(),
+        crate::evidence::Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported],
+            required_scope: Vec::new(),
+            conflicts: crate::evidence::ConflictMode::Refuse,
+            boundary: vec!["urn:ev:sources".into(), "urn:ev:claims".into()],
+            decisions: "urn:ev:decisions".into(),
+            supports: "urn:ev:supports".into(),
+            output: "urn:ev:output".into(),
+        },
+    );
+    let canonical = s.canonical(&Control::none()).unwrap();
+    store
+        .enable_managed(
+            crate::managed::OwnerKind::Evidence,
+            crate::managed::OwnerEntry::for_settings(1, s.managed_graphs(), canonical.bytes()),
+            canonical.bytes(),
+        )
+        .unwrap();
+    let cap = store
+        .managed_writer(crate::managed::OwnerKind::Evidence, Uuid::new_v4())
+        .unwrap();
+    assert!(cap.is_projection_only("urn:ev:output"));
+    assert!(cap.protection("urn:ev:output").is_some());
+    assert_eq!(cap.record_protection("urn:ev:output"), None);
+    let err = publish_quads(
+        &Operation {
+            iri: &iri("urn:op:1"),
+            principal: &iri("urn:p"),
+            payload_digest: Sha256Digest::of_bytes(b"p", &Control::none()).unwrap(),
+            idempotency_key: None,
+            hold: None,
+            used: None,
+        },
+        &[iri("urn:ev:output")],
+        &[],
+        &Stamp {
+            dataset: Uuid::new_v4(),
+            branch: Uuid::new_v4(),
+            commit: 1,
+            time_ms: 0,
+        },
+        &|g| cap.record_protection(g.as_str()),
+        &[],
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "unsupported-profile");
 }
 
 /// On a compacted disk-backed snapshot where preceding graphs are ordered before the

@@ -1049,9 +1049,6 @@ pub(super) fn publish_quads(
         let Some(nonce) = protection(g) else {
             return Err(unprotected(g));
         };
-        if crate::managed::is_projection_only_protection(nonce) {
-            return Err(unprotected(g));
-        }
         quad(iri, rdf_type(), ev("Operation").into(), g);
         quad(iri, rdf_type(), prov("Activity").into(), g);
         quad(
@@ -2127,10 +2124,9 @@ impl<'a> Reads<'a> {
     /// under its current protection `nonce` for `dataset_id`, ignoring ordinary and
     /// support-projected RDF assertions.
     ///
-    /// A projection-only (version-8) protection nonce was never held by a record-role
-    /// graph and never accepted `publish_quads`, so it immediately returns `false` even
-    /// after `supports` graphs rotate or are cleared. Record-origin and legacy
-    /// (version-4) nonces are checked for the full `publish_quads` signature while
+    /// Callers skip graphs already marked `projection_only` in the managed registry.
+    /// Non-`projection_only` graphs (former record-role graphs and legacy pre-format-4
+    /// dedicated outputs) are checked for the full `publish_quads` signature while
     /// excluding assertions projected by authenticated supports in
     /// `protected_record_graphs`.
     pub fn has_published_operation_in_output(
@@ -2143,9 +2139,6 @@ impl<'a> Reads<'a> {
         let Some(nonce) = nonce else {
             return Ok(false);
         };
-        if crate::managed::is_projection_only_protection(nonce) {
-            return Ok(false);
-        }
         let nonce_term = Term::Literal(Literal::new_simple_literal(nonce.to_string()));
         let ds_term = Term::Literal(Literal::new_simple_literal(dataset_id.to_string()));
         let (
@@ -2240,9 +2233,6 @@ impl<'a> Reads<'a> {
         let Some(nonce) = nonce else {
             return Ok(false);
         };
-        if crate::managed::is_projection_only_protection(nonce) {
-            return Ok(false);
-        }
         let nonce_term = Term::Literal(Literal::new_simple_literal(nonce.to_string()));
         let ds_term = Term::Literal(Literal::new_simple_literal(dataset_id.to_string()));
         let (
@@ -2322,9 +2312,6 @@ impl<'a> Reads<'a> {
         let Some(nonce) = nonce else {
             return Ok(false);
         };
-        if crate::managed::is_projection_only_protection(nonce) {
-            return Ok(false);
-        }
         let nonce_term = Term::Literal(Literal::new_simple_literal(nonce.to_string()));
         let (Some(r_id), Some(g_id), Some(graph_prot_pred), Some(avail_receipt), Some(nonce_id)) = (
             self.preparation
@@ -2421,9 +2408,6 @@ impl<'a> Reads<'a> {
         let mut protected: BTreeMap<Id, (Uuid, Id)> = BTreeMap::new();
         for &(g_iri, g_nonce) in managed_graphs {
             self.preparation.check()?;
-            if crate::managed::is_projection_only_protection(g_nonce) {
-                continue;
-            }
             let Some(g_id) = self.preparation.lookup_iri(self.snap, g_iri)? else {
                 continue;
             };

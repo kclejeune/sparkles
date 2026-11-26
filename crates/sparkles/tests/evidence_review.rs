@@ -3823,7 +3823,7 @@ fn projected_operation_lookalike_empties_after_supports_rotation() {
     let s = settings(ConflictMode::Refuse);
     evidence::configure(&ds, &s, &Control::none()).unwrap();
 
-    let out_nonce = ds
+    let ev_entry = ds
         .store()
         .managed_graphs()
         .unwrap()
@@ -3831,13 +3831,13 @@ fn projected_operation_lookalike_empties_after_supports_rotation() {
         .owners
         .get(&OwnerKind::Evidence)
         .unwrap()
+        .clone();
+    let out_nonce = ev_entry
         .protections
         .get(OUTPUT)
         .copied()
         .expect("OUTPUT protected");
-    assert!(sparkles_core::managed::is_projection_only_protection(
-        out_nonce
-    ));
+    assert!(ev_entry.projection_only.contains(OUTPUT));
 
     let project_lookalike = |ds: &Dataset, tag: &str, op_iri: NamedNode, nonce: uuid::Uuid| {
         let ds_id = ds.dataset_id().to_string();
@@ -3985,16 +3985,16 @@ fn projected_operation_lookalike_empties_after_supports_rotation() {
         "reconcile_projection after SUPPORTS rotation (cleared) must empty OUTPUT"
     );
 
-    // 3. Promoting a dedicated projection output (v8) into a record role without detaching
-    // must rotate its nonce to a fresh record-role (v4) nonce so any projected lookalike
-    // cannot escalate into an authenticated operation record.
+    // 3. Promoting a dedicated projection output into a record role without detaching
+    // must drop it from `projection_only` and rotate its nonce so any projected
+    // lookalike cannot escalate into an authenticated operation record.
     project_lookalike(&ds, "promote", iri("urn:proj:op-promote"), out_nonce);
     let mut promoted = s.clone();
     promoted.supports.push(OUTPUT.into());
     promoted.projections = vec!["urn:ev:accepted-new".into()];
     promoted.policies.get_mut("main").unwrap().output = "urn:ev:accepted-new".into();
     evidence::configure(&ds, &promoted, &Control::none()).unwrap();
-    let promoted_nonce = ds
+    let promoted_entry = ds
         .store()
         .managed_graphs()
         .unwrap()
@@ -4002,14 +4002,19 @@ fn projected_operation_lookalike_empties_after_supports_rotation() {
         .owners
         .get(&OwnerKind::Evidence)
         .unwrap()
+        .clone();
+    let promoted_nonce = promoted_entry
         .protections
         .get(OUTPUT)
         .copied()
         .expect("OUTPUT now protected as record role");
     assert_ne!(promoted_nonce, out_nonce);
-    assert!(!sparkles_core::managed::is_projection_only_protection(
-        promoted_nonce
-    ));
+    assert!(!promoted_entry.projection_only.contains(OUTPUT));
+    assert!(
+        promoted_entry
+            .projection_only
+            .contains("urn:ev:accepted-new")
+    );
 }
 
 /// Ordinary review's drift and output-history guards must skip both authentic
@@ -4748,12 +4753,13 @@ fn same_version_drift_supersession_is_linear_across_retained_revisions() {
     );
 }
 
-/// A dataset upgraded from a pre-581 writer keeps legacy v4 protection nonces on its
-/// dedicated projection outputs until they rotate. Follow-on projecting reviews,
+/// A dataset upgraded from a pre-581 format-2 registry keeps its legacy protection nonces
+/// on dedicated projection outputs without `projectionOnly`. Follow-on projecting reviews,
 /// reconciliation, narrow-grant keyed replay, and supports resets (both retained and
-/// cleared) must handle projected 9-triple `ev:Operation` lookalikes cleanly, upgrading
-/// legacy v4 outputs without genuine record history to v8 (format 4) on supports detach
-/// while keeping genuine former-record v4 graphs protected.
+/// cleared) must handle projected 9-triple `ev:Operation` lookalikes cleanly, marking
+/// legacy outputs without genuine record history in `projectionOnly` (format 4) while
+/// preserving their existing protection nonces unchanged and keeping genuine former-record
+/// graphs protected.
 #[test]
 fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
     use oxrdf::Literal;
@@ -4788,7 +4794,8 @@ fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
     );
 
     // Seed a persistent dataset with a pre-581 format-2 `managed.json` whose dedicated
-    // outputs (`OUTPUT`, `output2`) carry legacy version-4 protection nonces.
+    // outputs (`OUTPUT`, `output2`) carry legacy version-4 protection nonces and no
+    // `projectionOnly` metadata.
     let legacy_out_nonce = uuid::Uuid::new_v4();
     let legacy_out2_nonce = uuid::Uuid::new_v4();
     {
@@ -4801,13 +4808,17 @@ fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
             serde_json::from_slice(&std::fs::read(&managed_path).unwrap()).unwrap();
         assert_eq!(raw["format"], 4);
         raw["format"] = 2.into();
+        raw["owners"]["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("projectionOnly");
         raw["owners"]["evidence"]["protections"][OUTPUT] = legacy_out_nonce.to_string().into();
         raw["owners"]["evidence"]["protections"][output2] = legacy_out2_nonce.to_string().into();
         std::fs::write(&managed_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
     }
 
     let ds = Dataset::open(&root).unwrap();
-    let protections = |ds: &Dataset| {
+    let ev_entry = |ds: &Dataset| {
         ds.store()
             .managed_graphs()
             .unwrap()
@@ -4815,18 +4826,13 @@ fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
             .owners
             .get(&OwnerKind::Evidence)
             .unwrap()
-            .protections
             .clone()
     };
-    let p0 = protections(&ds);
-    assert_eq!(p0[OUTPUT], legacy_out_nonce);
-    assert_eq!(p0[output2], legacy_out2_nonce);
-    assert!(!sparkles_core::managed::is_projection_only_protection(
-        p0[OUTPUT]
-    ));
-    assert!(!sparkles_core::managed::is_projection_only_protection(
-        p0[output2]
-    ));
+    let e0 = ev_entry(&ds);
+    assert_eq!(e0.protections[OUTPUT], legacy_out_nonce);
+    assert_eq!(e0.protections[output2], legacy_out2_nonce);
+    assert!(!e0.projection_only.contains(OUTPUT));
+    assert!(!e0.projection_only.contains(output2));
 
     let project_lookalike =
         |ds: &Dataset, policy_name: &str, tag: &str, op_iri: NamedNode, nonce: uuid::Uuid| {
@@ -4932,7 +4938,7 @@ fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
             assert!(res.committed);
         };
 
-    // 1. Project a 9-triple lookalike into legacy v4 OUTPUT and verify a follow-on
+    // 1. Project a 9-triple lookalike into legacy OUTPUT and verify a follow-on
     // projecting review and keyed reconciliation both succeed (not immutable-record-conflict).
     project_lookalike(
         &ds,
@@ -4958,7 +4964,7 @@ fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
     assert!(first.committed && !first.replayed);
 
     // 2. Project a 9-triple copy of `first.operation` (different payloadDigest) into
-    // legacy v4 `output2` via `other`. Narrow-grant keyed replay on `main` (without read
+    // legacy `output2` via `other`. Narrow-grant keyed replay on `main` (without read
     // grants on `supports2` / `output2`) must succeed without conflict or NotPermitted.
     project_lookalike(
         &ds,
@@ -4992,16 +4998,16 @@ fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
     assert_eq!(replayed1.projection, first.projection);
     assert_eq!(ds.store().head_commit().seq, head_before_replay);
 
-    // 3. Supports reset (retained, then cleared) on `supports2` upgrades legacy v4
-    // `output2` to v8 (format 4) while `SUPPORTS` stays intact and narrow-grant keyed
-    // replay on `main` keeps returning `first` without advancing the head.
+    // 3. Supports reset (retained, then cleared) on `supports2` marks legacy `output2`
+    // as `projectionOnly` (format 4) while preserving its existing protection nonce,
+    // keeping `SUPPORTS` intact and narrow-grant keyed replay on `main` returning `first`.
     evidence::detach(&ds, supports2).unwrap();
     evidence::configure(&ds, &s, &Control::none()).unwrap();
-    let upgraded_out2_nonce = protections(&ds)[output2];
-    assert_ne!(upgraded_out2_nonce, legacy_out2_nonce);
-    assert!(sparkles_core::managed::is_projection_only_protection(
-        upgraded_out2_nonce
-    ));
+    let e1 = ev_entry(&ds);
+    assert_eq!(e1.protections[output2], legacy_out2_nonce);
+    assert!(e1.projection_only.contains(output2));
+    assert_eq!(e1.protections[OUTPUT], legacy_out_nonce);
+    assert!(e1.projection_only.contains(OUTPUT));
     let managed_json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("managed.json")).unwrap()).unwrap();
     assert_eq!(managed_json["format"], 4);
@@ -5044,16 +5050,13 @@ fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
     assert_eq!(replayed3.projection, first.projection);
     assert_eq!(ds.store().head_commit().seq, head_after_s2_clear);
 
-    // 4. Supports reset (retained) on SUPPORTS upgrades legacy v4 OUTPUT to v8 (format 4)
-    // and lets `reconcile_projection` empty OUTPUT cleanly.
-    assert_eq!(protections(&ds)[OUTPUT], legacy_out_nonce);
+    // 4. Supports reset (retained) on SUPPORTS preserves OUTPUT's nonce, keeps OUTPUT
+    // in `projectionOnly`, and lets `reconcile_projection` empty OUTPUT cleanly.
     evidence::detach(&ds, SUPPORTS).unwrap();
     evidence::configure(&ds, &s, &Control::none()).unwrap();
-    let upgraded_out_nonce = protections(&ds)[OUTPUT];
-    assert_ne!(upgraded_out_nonce, legacy_out_nonce);
-    assert!(sparkles_core::managed::is_projection_only_protection(
-        upgraded_out_nonce
-    ));
+    let e2 = ev_entry(&ds);
+    assert_eq!(e2.protections[OUTPUT], legacy_out_nonce);
+    assert!(e2.projection_only.contains(OUTPUT));
 
     let rec_retain = reconcile(&ds, "main", Some(1), &reviewer()).unwrap();
     assert!(rec_retain.committed);
@@ -5068,9 +5071,9 @@ fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
     project_lookalike(
         &ds,
         "main",
-        "v8-clear",
-        iri("urn:proj:v8-clear-op"),
-        upgraded_out_nonce,
+        "v4-clear",
+        iri("urn:proj:v4-clear-op"),
+        legacy_out_nonce,
     );
     evidence::detach(&ds, SUPPORTS).unwrap();
     ds.update(&format!(
@@ -5085,4 +5088,492 @@ fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
             .unwrap(),
         "reconcile_projection after SUPPORTS reset (cleared) must empty OUTPUT"
     );
+}
+
+/// Regression for Neon r9 P2-1: on an upgraded pre-581 format-2 dataset with an active
+/// matching policy (`matchingPolicies.*.output`), identical or unrelated `evidence::configure`
+/// calls must mark the matching-policy output `projectionOnly` (format 4) WITHOUT rotating
+/// its protection nonce, keeping `identity::resolve` and `identity::review` healthy.
+#[test]
+fn legacy_format2_matching_policy_output_preserves_nonce_across_configure() {
+    use sparkles::evidence::{IdentityInput, IdentityRelation, MatchingPolicy};
+    use sparkles::managed::OwnerKind;
+
+    let identity = "urn:ev:identity";
+    let maps = "urn:ev:maps";
+    let map_out = "urn:ev:map";
+    let decisions2 = "urn:ev:decisions2";
+    let supports2 = "urn:ev:supports2";
+    let output2 = "urn:ev:accepted2";
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ds");
+    let mut s = settings(ConflictMode::Refuse);
+    s.identity = vec![identity.into(), maps.into()];
+    s.projections.push(map_out.into());
+    s.matching_policies.insert(
+        "people".into(),
+        MatchingPolicy {
+            version: 1,
+            boundary: vec![identity.into(), SOURCES.into(), CLAIMS.into()],
+            decisions: DECISIONS.into(),
+            maps: maps.into(),
+            output: map_out.into(),
+        },
+    );
+
+    // Seed a persistent format-2 legacy dataset (no `projectionOnly`) and publish an
+    // active resolution map revision under `people`.
+    let legacy_map_nonce = uuid::Uuid::new_v4();
+    {
+        let ds = Dataset::open(&root).unwrap();
+        evidence::configure(&ds, &s, &Control::none()).unwrap();
+    }
+    {
+        let managed_path = root.join("managed.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&managed_path).unwrap()).unwrap();
+        assert_eq!(raw["format"], 4);
+        raw["format"] = 2.into();
+        raw["owners"]["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("projectionOnly");
+        raw["owners"]["evidence"]["protections"][map_out] = legacy_map_nonce.to_string().into();
+        std::fs::write(&managed_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+    }
+
+    let ds = Dataset::open(&root).unwrap();
+    let propose_match = |occurrence: &str, a: &str, b: &str| {
+        let mut po = ProposeOptions::new(iri("urn:principal:matcher"));
+        po.identity_graph = Some(iri(identity));
+        let p = evidence::propose(
+            None,
+            &ds,
+            &ds,
+            &EvidenceInput {
+                identities: vec![IdentityInput {
+                    version: RecordVersion::V1,
+                    key: key("p"),
+                    occurrence_key: key(occurrence),
+                    entities: vec![iri(a), iri(b)],
+                    relation: IdentityRelation::PossibleMatch,
+                    preferred: Some(iri(a)),
+                    attributed_author: iri("urn:matcher"),
+                    method: None,
+                }],
+                ..Default::default()
+            },
+            &po,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+        let r = p.records.iter().find(|r| r.key == "p").unwrap();
+        (r.iri.clone(), r.digest)
+    };
+    let p1 = propose_match("m1", "urn:person:alice", "urn:person:alice-alias");
+    let p2 = propose_match("m2", "urn:person:bob", "urn:person:bob-alias");
+
+    let mut ro = reviewer();
+    ro.if_head = Some(ds.store().head_commit().seq);
+    let r1 = evidence::review(
+        None,
+        &ds,
+        &ds,
+        "people",
+        1,
+        &[decision("d1", &p1, Disposition::Accepted, None)],
+        &ro,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(r1.committed);
+    assert!(r1.map_revision.is_some());
+
+    let resolved_before = evidence::resolve_entities(
+        &ds,
+        &ds,
+        "people",
+        &[iri("urn:person:alice-alias")],
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(
+        resolved_before.entities[0].representative,
+        iri("urn:person:alice")
+    );
+
+    // 1. Re-applying identical settings must keep `map_out`'s protection nonce unchanged
+    // while upgrading it into `projectionOnly` (format 4).
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+    let entry_after_noop = ds
+        .store()
+        .managed_graphs()
+        .unwrap()
+        .unwrap()
+        .owners
+        .get(&OwnerKind::Evidence)
+        .unwrap()
+        .clone();
+    assert_eq!(entry_after_noop.protections[map_out], legacy_map_nonce);
+    assert!(entry_after_noop.projection_only.contains(map_out));
+    let managed_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("managed.json")).unwrap()).unwrap();
+    assert_eq!(managed_json["format"], 4);
+
+    let resolved_after_noop = evidence::resolve_entities(
+        &ds,
+        &ds,
+        "people",
+        &[iri("urn:person:alice-alias")],
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(
+        resolved_after_noop.entities[0].representative,
+        iri("urn:person:alice")
+    );
+
+    // 2. An unrelated settings edit (adding another review policy) must also keep
+    // `map_out`'s protection nonce unchanged and keep both resolve and follow-on matching
+    // review healthy (never `projection-unavailable`).
+    let mut edited = s.clone();
+    edited.decisions.push(decisions2.into());
+    edited.supports.push(supports2.into());
+    edited.projections.push(output2.into());
+    edited.policies.insert(
+        "secondary".into(),
+        Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported],
+            required_scope: Vec::new(),
+            conflicts: ConflictMode::Refuse,
+            boundary: vec![SOURCES.into(), CLAIMS.into()],
+            decisions: decisions2.into(),
+            supports: supports2.into(),
+            output: output2.into(),
+        },
+    );
+    evidence::configure(&ds, &edited, &Control::none()).unwrap();
+    let entry_after_edit = ds
+        .store()
+        .managed_graphs()
+        .unwrap()
+        .unwrap()
+        .owners
+        .get(&OwnerKind::Evidence)
+        .unwrap()
+        .clone();
+    assert_eq!(entry_after_edit.protections[map_out], legacy_map_nonce);
+    assert!(entry_after_edit.projection_only.contains(map_out));
+
+    let resolved_after_edit = evidence::resolve_entities(
+        &ds,
+        &ds,
+        "people",
+        &[iri("urn:person:alice-alias")],
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(
+        resolved_after_edit.entities[0].representative,
+        iri("urn:person:alice")
+    );
+
+    let mut ro2 = reviewer();
+    ro2.if_head = Some(ds.store().head_commit().seq);
+    let r2 = evidence::review(
+        None,
+        &ds,
+        &ds,
+        "people",
+        1,
+        &[decision("d2", &p2, Disposition::Accepted, None)],
+        &ro2,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(r2.committed);
+    let resolved_bob = evidence::resolve_entities(
+        &ds,
+        &ds,
+        "people",
+        &[iri("urn:person:bob-alias")],
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(
+        resolved_bob.entities[0].representative,
+        iri("urn:person:bob")
+    );
+}
+
+/// Regression for Neon r9 P2-2: on an upgraded pre-581 format-2 dataset, a same-version
+/// rival output takeover (`main` v1 taking `second`'s undetached `output2`) AND a
+/// subsequent detach/re-protect of challenger `main`'s `SUPPORTS` must preserve
+/// `output2`'s protection nonce so `has_same_version_projection_drift` still refuses
+/// `main` with `projection-unavailable` and preserves `second`'s accepted output.
+#[test]
+fn legacy_format2_review_output_preserves_rival_drift_on_takeover_and_detach() {
+    use sparkles::managed::OwnerKind;
+
+    let supports2 = "urn:ev:supports2";
+    let output2 = "urn:ev:accepted2";
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ds");
+    let mut s = settings(ConflictMode::Refuse);
+    s.supports.push(supports2.into());
+    s.projections.push(output2.into());
+    s.policies.insert(
+        "second".into(),
+        Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported],
+            required_scope: Vec::new(),
+            conflicts: ConflictMode::Refuse,
+            boundary: vec![SOURCES.into(), CLAIMS.into()],
+            decisions: DECISIONS.into(),
+            supports: supports2.into(),
+            output: output2.into(),
+        },
+    );
+
+    let legacy_out2_nonce = uuid::Uuid::new_v4();
+    {
+        let ds = Dataset::open(&root).unwrap();
+        evidence::configure(&ds, &s, &Control::none()).unwrap();
+    }
+    {
+        let managed_path = root.join("managed.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&managed_path).unwrap()).unwrap();
+        assert_eq!(raw["format"], 4);
+        raw["format"] = 2.into();
+        raw["owners"]["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("projectionOnly");
+        raw["owners"]["evidence"]["protections"][output2] = legacy_out2_nonce.to_string().into();
+        std::fs::write(&managed_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+    }
+
+    let ds = Dataset::open(&root).unwrap();
+    let c_second = claim_of(&propose(
+        &ds,
+        &occurrence_with("s-second", "urn:cve:second", Polarity::Positive),
+    ));
+    let c_main = claim_of(&propose(
+        &ds,
+        &occurrence_with("s-main", "urn:cve:main", Polarity::Positive),
+    ));
+    let mut o_second = reviewer();
+    o_second.if_head = Some(ds.store().head_commit().seq);
+    evidence::review(
+        None,
+        &ds,
+        &ds,
+        "second",
+        1,
+        &[decision("c-second", &c_second, Disposition::Accepted, None)],
+        &o_second,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(
+        ds.ask(&format!(
+            "ASK {{ GRAPH <{output2}> {{ <urn:release> <urn:affectedBy> <urn:cve:second> }} }}"
+        ))
+        .unwrap()
+    );
+
+    // 1. Same-version rival takeover: `main` (v1, no prior projection) takes `output2`
+    // while `second` (v1) moves to `OUTPUT` and `supports2` stays continuously protected.
+    let mut takeover = s.clone();
+    takeover.policies.get_mut("main").unwrap().output = output2.into();
+    takeover.policies.get_mut("second").unwrap().output = OUTPUT.into();
+    evidence::configure(&ds, &takeover, &Control::none()).unwrap();
+
+    let ev_entry = |ds: &Dataset| {
+        ds.store()
+            .managed_graphs()
+            .unwrap()
+            .unwrap()
+            .owners
+            .get(&OwnerKind::Evidence)
+            .unwrap()
+            .clone()
+    };
+    let e_after_takeover = ev_entry(&ds);
+    assert_eq!(e_after_takeover.protections[output2], legacy_out2_nonce);
+    assert!(e_after_takeover.projection_only.contains(output2));
+
+    let head1 = ds.store().head_commit().seq;
+    assert_eq!(
+        code(reconcile(&ds, "main", Some(1), &reviewer())),
+        "projection-unavailable"
+    );
+    assert_eq!(
+        code(review(
+            &ds,
+            &[decision("c-main", &c_main, Disposition::Accepted, None)]
+        )),
+        "projection-unavailable"
+    );
+    assert_eq!(ds.store().head_commit().seq, head1);
+    assert!(
+        ds.ask(&format!(
+            "ASK {{ GRAPH <{output2}> {{ <urn:release> <urn:affectedBy> <urn:cve:second> }} }}"
+        ))
+        .unwrap(),
+        "second's undetached output must survive rival takeover"
+    );
+
+    // 2. Detaching and re-protecting challenger `main`'s `SUPPORTS` must NOT rotate
+    // `output2`'s nonce or bypass `second`'s rival drift guard.
+    evidence::detach(&ds, SUPPORTS).unwrap();
+    evidence::configure(&ds, &takeover, &Control::none()).unwrap();
+    assert_eq!(ev_entry(&ds).protections[output2], legacy_out2_nonce);
+
+    let head2 = ds.store().head_commit().seq;
+    assert_eq!(
+        code(reconcile(&ds, "main", Some(1), &reviewer())),
+        "projection-unavailable"
+    );
+    assert_eq!(
+        code(review(
+            &ds,
+            &[decision("c-main2", &c_main, Disposition::Accepted, None)]
+        )),
+        "projection-unavailable"
+    );
+    assert_eq!(ds.store().head_commit().seq, head2);
+    assert!(
+        ds.ask(&format!(
+            "ASK {{ GRAPH <{output2}> {{ <urn:release> <urn:affectedBy> <urn:cve:second> }} }}"
+        ))
+        .unwrap(),
+        "second's undetached output must survive challenger SUPPORTS detach"
+    );
+
+    // 3. Also test the direct detach path on a still-format-2 takeover registry (as if
+    // the takeover happened before upgrade and `detach(SUPPORTS)` is the very first
+    // mutation after upgrade): `detach_managed_checked` must mark `output2` in
+    // `projectionOnly` without rotating `legacy_out2_nonce`.
+    drop(ds);
+    {
+        let managed_path = root.join("managed.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&managed_path).unwrap()).unwrap();
+        raw["format"] = 2.into();
+        raw["owners"]["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("projectionOnly");
+        std::fs::write(&managed_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+    }
+    let ds = Dataset::open(&root).unwrap();
+    assert!(!ev_entry(&ds).projection_only.contains(output2));
+    evidence::detach(&ds, SUPPORTS).unwrap();
+    let e_after_direct_detach = ev_entry(&ds);
+    assert_eq!(
+        e_after_direct_detach.protections[output2],
+        legacy_out2_nonce
+    );
+    assert!(e_after_direct_detach.projection_only.contains(output2));
+    evidence::configure(&ds, &takeover, &Control::none()).unwrap();
+    assert_eq!(ev_entry(&ds).protections[output2], legacy_out2_nonce);
+
+    let head3 = ds.store().head_commit().seq;
+    assert_eq!(
+        code(reconcile(&ds, "main", Some(1), &reviewer())),
+        "projection-unavailable"
+    );
+    assert_eq!(ds.store().head_commit().seq, head3);
+    assert!(
+        ds.ask(&format!(
+            "ASK {{ GRAPH <{output2}> {{ <urn:release> <urn:affectedBy> <urn:cve:second> }} }}"
+        ))
+        .unwrap()
+    );
+}
+
+/// A pre-581 format-2 dataset whose `supports` graph was already reset (detached, cleared,
+/// and re-protected) before upgrade must still reconcile and empty its legacy output
+/// cleanly after upgrade, preserving its nonce when promoted to `projectionOnly`.
+#[test]
+fn legacy_format2_pre_upgrade_supports_reset_reconciles_cleanly() {
+    use sparkles::managed::OwnerKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ds");
+    let s = settings(ConflictMode::Refuse);
+    let legacy_out_nonce;
+    {
+        let ds = Dataset::open(&root).unwrap();
+        evidence::configure(&ds, &s, &Control::none()).unwrap();
+        let c = claim_of(&propose(
+            &ds,
+            &occurrence_with("pre-reset", "urn:cve:pre-reset", Polarity::Positive),
+        ));
+        review(&ds, &[decision("d", &c, Disposition::Accepted, None)]).unwrap();
+        assert_eq!(
+            accepted(&ds),
+            vec!["<urn:release> <urn:affectedBy> <urn:cve:pre-reset>".to_string()]
+        );
+        // Simulate a supports reset that happened on a pre-581 release (before upgrade).
+        evidence::detach(&ds, SUPPORTS).unwrap();
+        ds.update(&format!(
+            "DELETE WHERE {{ GRAPH <{SUPPORTS}> {{ ?s ?p ?o }} }}"
+        ))
+        .unwrap();
+        evidence::configure(&ds, &s, &Control::none()).unwrap();
+        legacy_out_nonce = ds
+            .store()
+            .managed_graphs()
+            .unwrap()
+            .unwrap()
+            .owners
+            .get(&OwnerKind::Evidence)
+            .unwrap()
+            .protections[OUTPUT];
+    }
+    // Downgrade `managed.json` back to pre-581 format 2 (no `projectionOnly`).
+    {
+        let managed_path = root.join("managed.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&managed_path).unwrap()).unwrap();
+        raw["format"] = 2.into();
+        raw["owners"]["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("projectionOnly");
+        std::fs::write(&managed_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+    }
+
+    let ds = Dataset::open(&root).unwrap();
+    let rec = reconcile(&ds, "main", Some(1), &reviewer()).unwrap();
+    assert!(rec.committed);
+    assert!(accepted(&ds).is_empty());
+
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+    let entry = ds
+        .store()
+        .managed_graphs()
+        .unwrap()
+        .unwrap()
+        .owners
+        .get(&OwnerKind::Evidence)
+        .unwrap()
+        .clone();
+    assert_eq!(entry.protections[OUTPUT], legacy_out_nonce);
+    assert!(entry.projection_only.contains(OUTPUT));
 }

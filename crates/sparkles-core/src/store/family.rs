@@ -19,6 +19,10 @@ pub(crate) struct Family {
     /// [`crate::managed`]). One registry serves main and every branch, including those
     /// created before it was enabled, so they cannot diverge.
     pub(crate) managed: arc_swap::ArcSwapOption<crate::managed::ManagedState>,
+    /// Serializes managed-registry changes end-to-end (including their post-install
+    /// `managed_barrier`) so a subsequent registry change never inspects branches while
+    /// a writer admitted under a superseded registry is still in flight.
+    pub(crate) managed_change: Mutex<()>,
     /// The durable source holds of main and every branch (see [`crate::holds`]).
     pub(crate) holds: crate::holds::FamilyHolds,
     /// Selection made under this opening's actual root process exclusion. This
@@ -37,6 +41,7 @@ impl Family {
         Arc::new(Self {
             gate: Arc::new(FamilyGate::default()),
             managed: arc_swap::ArcSwapOption::empty(),
+            managed_change: Mutex::new(()),
             holds: Default::default(),
             origin,
             _owner_lock: owner_lock,

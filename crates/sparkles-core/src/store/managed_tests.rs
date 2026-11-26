@@ -1095,6 +1095,10 @@ fn projection_only_registry_writes_format_4_upgrades_from_v1_and_works_with_hist
         .as_object_mut()
         .unwrap()
         .remove("protections");
+    raw["owners"]["evidence"]
+        .as_object_mut()
+        .unwrap()
+        .remove("projectionOnly");
     std::fs::write(
         root.join("managed.json"),
         serde_json::to_vec_pretty(&raw).unwrap(),
@@ -1105,14 +1109,29 @@ fn projection_only_registry_writes_format_4_upgrades_from_v1_and_works_with_hist
     let s = Store::open(&root, StoreOptions::default()).unwrap();
     let loaded = s.managed_graphs().unwrap().unwrap();
     assert!(loaded.owners[&OwnerKind::Evidence].protections.is_empty());
+    assert!(
+        loaded.owners[&OwnerKind::Evidence]
+            .projection_only
+            .is_empty()
+    );
     let upgraded = s
         .enable_managed(OwnerKind::Evidence, v1_entry, ev_settings)
         .unwrap();
-    let proj_nonce = upgraded.owners[&OwnerKind::Evidence].protections["urn:proj"];
-    let sup_nonce = upgraded.owners[&OwnerKind::Evidence].protections["urn:sup"];
-    assert!(crate::managed::is_projection_only_protection(proj_nonce));
-    assert!(!crate::managed::is_projection_only_protection(sup_nonce));
-    drop(s);
+    let ev_entry = &upgraded.owners[&OwnerKind::Evidence];
+    let proj_nonce = ev_entry.protections["urn:proj"];
+    let sup_nonce = ev_entry.protections["urn:sup"];
+    assert!(ev_entry.projection_only.contains("urn:proj"));
+    assert!(!ev_entry.projection_only.contains("urn:sup"));
+    let cap = s
+        .managed_writer(OwnerKind::Evidence, uuid::Uuid::new_v4())
+        .unwrap();
+    assert!(cap.is_projection_only("urn:proj"));
+    assert_eq!(cap.protection("urn:proj"), Some(proj_nonce));
+    assert_eq!(cap.record_protection("urn:proj"), None);
+    assert!(!cap.is_projection_only("urn:sup"));
+    assert_eq!(cap.protection("urn:sup"), Some(sup_nonce));
+    assert_eq!(cap.record_protection("urn:sup"), Some(sup_nonce));
+    drop((cap, s));
 
     let on_disk: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("managed.json")).unwrap()).unwrap();

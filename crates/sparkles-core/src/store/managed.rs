@@ -334,91 +334,99 @@ impl Store {
                 .ok_or_else(|| Error::invalid("managed registry revision overflow"))?;
             // A graph that stays protected keeps its nonce; one that becomes protected
             // gets a new random one, which nobody could have known before. Dedicated
-            // evidence projection outputs mint a version-8 projection-only nonce when
-            // newly protected and rotate to a fresh version-4 nonce if promoted into a
-            // record role without detaching, while a record-role graph moved into
-            // `projections` without detaching keeps its version-4 nonce so its record
-            // history remains protected and discoverable for replay. A legacy v4
-            // dedicated output whose policy supports/decisions changed or were detached
-            // and that holds no genuinely published operations anywhere in the family
-            // upgrades cleanly to a fresh version-8 projection-only nonce.
+            // evidence projection outputs are recorded in `entry.projection_only`
+            // (writing `managed.json` format 4) rather than encoding role bits in the
+            // UUID, so upgrading a legacy pre-format-4 dedicated output that holds no
+            // genuinely published `ev:Operation` history anywhere in the family
+            // preserves its existing protection nonce for active resolution maps and
+            // same-version rival drift guards. Promoting a projection-only output into
+            // a record role without detaching drops it from `projection_only` and
+            // rotates its nonce so previously projected lookalikes cannot authenticate
+            // as published records, while a record-role graph moved into `projections`
+            // without detaching stays out of `projection_only` and keeps its nonce so
+            // its record history remains protected and discoverable for replay.
             let new_roles = if owner == OwnerKind::Evidence {
                 evidence_graph_roles(settings)
             } else {
                 EvidenceGraphRoles::default()
             };
+            let previous = graphs.owners.get(&owner);
             let prev_roles = if owner == OwnerKind::Evidence {
                 current
                     .and_then(|i| i.settings.get(&OwnerKind::Evidence))
+                    .filter(|b| {
+                        previous
+                            .is_some_and(|p| crate::managed::settings_digest(b) == p.settings_digest)
+                    })
                     .map(|b| evidence_graph_roles(b))
                     .unwrap_or_default()
             } else {
                 EvidenceGraphRoles::default()
             };
-            let previous = graphs.owners.get(&owner);
             let prev_protected_records: Vec<(&str, uuid::Uuid)> = previous
                 .map(|p| {
                     p.protections
                         .iter()
-                        .filter(|(g, _)| prev_roles.record_roles.contains(g.as_str()))
+                        .filter(|(g, _)| {
+                            prev_roles.record_roles.contains(g.as_str())
+                                && !p.projection_only.contains(g.as_str())
+                        })
                         .map(|(g, n)| (g.as_str(), *n))
                         .collect()
                 })
                 .unwrap_or_default();
             let mut entry = entry;
-            entry.protections = entry
-                .graphs
-                .iter()
-                .map(|g| {
-                    let is_projection = new_roles.projection_only.contains(g);
-                    let kept = previous
-                        .filter(|p| p.graphs.contains(g))
-                        .and_then(|p| p.protections.get(g).copied());
-                    let nonce = match kept {
-                        Some(prev)
-                            if !is_projection
-                                && crate::managed::is_projection_only_protection(prev) =>
-                        {
-                            uuid::Uuid::new_v4()
-                        }
-                        Some(prev)
-                            if owner == OwnerKind::Evidence
-                                && is_projection
-                                && !crate::managed::is_projection_only_protection(prev)
-                                && prev_roles.projection_only.contains(g) =>
-                        {
-                            let prev_pol = prev_roles.policy_for_output(g);
-                            let new_pol = new_roles.policy_for_output(g);
-                            let supports_and_decisions_intact =
-                                match (prev_pol, new_pol, previous) {
-                                    (Some(pp), Some(np), Some(prev_entry)) => {
-                                        pp == np
-                                            && prev_entry.graphs.contains(&pp.supports)
-                                            && prev_entry.protections.contains_key(&pp.supports)
-                                            && prev_entry.graphs.contains(&pp.decisions)
-                                            && prev_entry.protections.contains_key(&pp.decisions)
-                                    }
-                                    _ => false,
-                                };
-                            if !supports_and_decisions_intact
-                                && !self.output_has_published_operation_in_family(
-                                    g,
-                                    prev,
-                                    &prev_protected_records,
-                                )
-                            {
-                                crate::managed::new_projection_protection()
-                            } else {
-                                prev
-                            }
-                        }
-                        Some(prev) => prev,
-                        None if is_projection => crate::managed::new_projection_protection(),
-                        None => uuid::Uuid::new_v4(),
-                    };
-                    (g.clone(), nonce)
-                })
-                .collect();
+            let mut protections = BTreeMap::new();
+            let mut projection_only = std::collections::BTreeSet::new();
+            for g in &entry.graphs {
+                let is_projection =
+                    owner == OwnerKind::Evidence && new_roles.projection_only.contains(g);
+                let kept = previous
+                    .filter(|p| p.graphs.contains(g))
+                    .and_then(|p| p.protections.get(g).copied());
+                let was_projection_only = previous
+                    .is_some_and(|p| p.graphs.contains(g) && p.projection_only.contains(g));
+                let (nonce, mark_projection_only) = match kept {
+                    Some(_) if !is_projection && was_projection_only => {
+                        (uuid::Uuid::new_v4(), false)
+                    }
+                    Some(prev) if is_projection && was_projection_only => (prev, true),
+                    Some(prev)
+                        if owner == OwnerKind::Evidence
+                            && is_projection
+                            && !was_projection_only
+                            && prev_roles.projection_only.contains(g) =>
+                    {
+                        let mark = !self.output_has_published_operation_in_family(
+                            g,
+                            prev,
+                            &prev_protected_records,
+                        );
+                        (prev, mark)
+                    }
+                    Some(prev)
+                        if owner == OwnerKind::Evidence
+                            && !is_projection
+                            && !was_projection_only
+                            && prev_roles.projection_only.contains(g)
+                            && !self.output_has_published_operation_in_family(
+                                g,
+                                prev,
+                                &prev_protected_records,
+                            ) =>
+                    {
+                        (uuid::Uuid::new_v4(), false)
+                    }
+                    Some(prev) => (prev, false),
+                    None => (uuid::Uuid::new_v4(), is_projection),
+                };
+                protections.insert(g.clone(), nonce);
+                if mark_projection_only {
+                    projection_only.insert(g.clone());
+                }
+            }
+            entry.protections = protections;
+            entry.projection_only = projection_only;
             graphs.owners.insert(owner, entry);
             files.insert(owner, Arc::from(settings));
             Ok((Installed::new(graphs, files)?, Some(owner)))
@@ -532,50 +540,52 @@ impl Store {
                     "graph <{graph}> is not managed by {owner}"
                 )));
             };
-            // Before removing `graph`'s nonce, upgrade any legacy v4 dedicated
-            // projection output whose policy's supports or decisions graph is being
-            // detached (so its projection records lose authentication anyway) when the
-            // output holds no genuinely published operations anywhere in the family.
-            // Checking before removal keeps `graph`'s authenticated supports visible to
-            // `graph_protection_projected_by_support`, while genuine former-record v4
-            // graphs retain their v4 nonce and history.
+            // Before removing `graph`'s nonce, upgrade any legacy pre-format-4
+            // dedicated projection output that holds no genuinely published
+            // `ev:Operation` history anywhere in the family into `projection_only`
+            // while preserving its existing protection nonce unchanged. Checking
+            // before removal keeps `graph`'s authenticated supports visible to
+            // `graph_protection_projected_by_support`, preserving active resolution
+            // maps and same-version rival drift guards while keeping genuine
+            // former-record graphs protected.
             if owner == OwnerKind::Evidence
                 && let Some(settings_bytes) = current.settings.get(&OwnerKind::Evidence)
+                && crate::managed::settings_digest(settings_bytes) == entry.settings_digest
             {
                 let roles = evidence_graph_roles(settings_bytes);
-                let prev_protected_records: Vec<(String, uuid::Uuid)> = entry
-                    .protections
-                    .iter()
-                    .filter(|(g, _)| roles.record_roles.contains(g.as_str()))
-                    .map(|(g, n)| (g.clone(), *n))
-                    .collect();
-                let prev_record_refs: Vec<(&str, uuid::Uuid)> = prev_protected_records
-                    .iter()
-                    .map(|(g, n)| (g.as_str(), *n))
-                    .collect();
-                let candidates: Vec<(String, uuid::Uuid)> = roles
-                    .policies
-                    .iter()
-                    .filter(|p| p.supports == graph || p.decisions == graph)
-                    .filter_map(|p| {
-                        let out = &p.output;
-                        if out == graph || !roles.projection_only.contains(out) {
-                            return None;
+                if roles.record_roles.contains(graph) {
+                    let prev_protected_records: Vec<(String, uuid::Uuid)> = entry
+                        .protections
+                        .iter()
+                        .filter(|(g, _)| {
+                            roles.record_roles.contains(g.as_str())
+                                && !entry.projection_only.contains(g.as_str())
+                        })
+                        .map(|(g, n)| (g.clone(), *n))
+                        .collect();
+                    let prev_record_refs: Vec<(&str, uuid::Uuid)> = prev_protected_records
+                        .iter()
+                        .map(|(g, n)| (g.as_str(), *n))
+                        .collect();
+                    let candidates: Vec<(String, uuid::Uuid)> = roles
+                        .projection_only
+                        .iter()
+                        .filter(|out| {
+                            out.as_str() != graph && !entry.projection_only.contains(out.as_str())
+                        })
+                        .filter_map(|out| {
+                            let &nonce = entry.protections.get(out)?;
+                            Some((out.clone(), nonce))
+                        })
+                        .collect();
+                    for (out, out_nonce) in candidates {
+                        if !self.output_has_published_operation_in_family(
+                            &out,
+                            out_nonce,
+                            &prev_record_refs,
+                        ) {
+                            entry.projection_only.insert(out);
                         }
-                        let &nonce = entry.protections.get(out)?;
-                        (!crate::managed::is_projection_only_protection(nonce))
-                            .then(|| (out.clone(), nonce))
-                    })
-                    .collect();
-                for (out, out_nonce) in candidates {
-                    if !self.output_has_published_operation_in_family(
-                        &out,
-                        out_nonce,
-                        &prev_record_refs,
-                    ) {
-                        entry
-                            .protections
-                            .insert(out, crate::managed::new_projection_protection());
                     }
                 }
             }
@@ -583,6 +593,7 @@ impl Store {
             // Protecting the graph again chooses a new nonce, so a record written while
             // it is detached never carries the nonce of a protection.
             entry.protections.remove(graph);
+            entry.projection_only.remove(graph);
             graphs.revision = graphs
                 .revision
                 .checked_add(1)
@@ -603,6 +614,7 @@ impl Store {
                 "managed graphs are changed through the dataset's main store",
             ));
         }
+        let _managed_change = self.family.managed_change.lock();
         let o = crate::guard::WriteOptions::default();
         let w = self.lock_writer(&o)?;
         if w.poisoned {
@@ -1192,24 +1204,10 @@ fn rootless_repair(reason: &str) -> Error {
     )
 }
 
-#[derive(Default, PartialEq, Eq)]
-struct EvidencePolicyRoles {
-    output: String,
-    supports: String,
-    decisions: String,
-}
-
 #[derive(Default)]
 struct EvidenceGraphRoles {
     projection_only: std::collections::BTreeSet<String>,
     record_roles: std::collections::BTreeSet<String>,
-    policies: Vec<EvidencePolicyRoles>,
-}
-
-impl EvidenceGraphRoles {
-    fn policy_for_output(&self, output: &str) -> Option<&EvidencePolicyRoles> {
-        self.policies.iter().find(|p| p.output == output)
-    }
 }
 
 fn evidence_graph_roles(settings: &[u8]) -> EvidenceGraphRoles {
@@ -1224,6 +1222,15 @@ fn evidence_graph_roles(settings: &[u8]) -> EvidenceGraphRoles {
         .filter_map(serde_json::Value::as_str)
         .map(str::to_owned)
         .collect();
+    for section in ["policies", "matchingPolicies"] {
+        if let Some(map) = v.get(section).and_then(serde_json::Value::as_object) {
+            for pol in map.values() {
+                if let Some(output) = pol.get("output").and_then(serde_json::Value::as_str) {
+                    projection_only.insert(output.to_owned());
+                }
+            }
+        }
+    }
     let mut record_roles = std::collections::BTreeSet::new();
     for role in [
         "sourceRecords",
@@ -1239,27 +1246,9 @@ fn evidence_graph_roles(settings: &[u8]) -> EvidenceGraphRoles {
             }
         }
     }
-    let mut policies = Vec::new();
-    if let Some(map) = v.get("policies").and_then(serde_json::Value::as_object) {
-        for pol in map.values() {
-            let (Some(output), Some(supports), Some(decisions)) = (
-                pol.get("output").and_then(serde_json::Value::as_str),
-                pol.get("supports").and_then(serde_json::Value::as_str),
-                pol.get("decisions").and_then(serde_json::Value::as_str),
-            ) else {
-                continue;
-            };
-            policies.push(EvidencePolicyRoles {
-                output: output.to_owned(),
-                supports: supports.to_owned(),
-                decisions: decisions.to_owned(),
-            });
-        }
-    }
     EvidenceGraphRoles {
         projection_only,
         record_roles,
-        policies,
     }
 }
 

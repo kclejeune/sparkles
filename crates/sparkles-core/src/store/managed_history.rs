@@ -366,6 +366,19 @@ impl Generation {
                     ));
                 }
             }
+            if *owner != OwnerKind::Evidence && !entry.projection_only.is_empty() {
+                return Err(unavailable(
+                    "only the evidence owner can record projection-only graphs",
+                ));
+            }
+            for graph in &entry.projection_only {
+                preparation.check()?;
+                if !entry.graphs.contains(graph) || !entry.protections.contains_key(graph) {
+                    return Err(unavailable(
+                        "configuration projection-only graph is not a protected graph",
+                    ));
+                }
+            }
         }
         let observed = match self.owner_settings.get(&OwnerKind::Evidence) {
             None => EvidenceState::Absent,
@@ -436,6 +449,11 @@ pub(crate) fn prepare(
         for graph in &entry.graphs {
             estimate = estimate
                 .checked_add((graph.len() as u64).saturating_mul(4).saturating_add(512))
+                .ok_or_else(|| preparation.exhausted())?;
+        }
+        for graph in &entry.projection_only {
+            estimate = estimate
+                .checked_add((graph.len() as u64).saturating_mul(2).saturating_add(64))
                 .ok_or_else(|| preparation.exhausted())?;
         }
     }
