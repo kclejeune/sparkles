@@ -2746,6 +2746,9 @@ fn run() -> Result<()> {
             | Cmd::Patch(_)
             | Cmd::Revert(_)
             | Cmd::CherryPick(_)
+            | Cmd::Git {
+                cmd: git_cmd::GitCmd::Export { .. } | git_cmd::GitCmd::WriteTree { .. },
+            }
     );
     #[cfg(feature = "backup")]
     let branch_capable = branch_capable

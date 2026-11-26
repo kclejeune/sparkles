@@ -6,7 +6,7 @@ use serde_json::json;
 use sparkles::Dataset;
 use sparkles::git::{
     CanonicalSyntax, GitExportMode, GitExportOptions, ReadOptions, WriteOptions,
-    read_git_tree_with, write_snapshot_git_tree,
+    verify_git_tree_with, write_snapshot_git_tree,
 };
 use sparkles::history::{At, HistoryOptions};
 use sparkles::store::{Store, StoreOptions};
@@ -235,10 +235,11 @@ pub fn run(cmd: GitCmd, opts: StoreOptions) -> Result<()> {
             no_checksums,
             format,
         } => {
-            let tree = read_git_tree_with(
+            let report = verify_git_tree_with(
                 &dir,
                 &ReadOptions {
                     verify_checksums: !no_checksums,
+                    ..ReadOptions::default()
                 },
             )?;
             match format {
@@ -246,22 +247,22 @@ pub fn run(cmd: GitCmd, opts: StoreOptions) -> Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "valid": true,
-                        "formatVersion": tree.manifest.format_version,
-                        "profile": tree.manifest.profile,
-                        "syntax": tree.manifest.syntax,
-                        "graphs": tree.manifest.graphs.len(),
-                        "quads": tree.quads.len(),
-                        "prefixes": tree.prefixes.len(),
+                        "format_version": report.manifest.format_version,
+                        "profile": report.manifest.profile,
+                        "syntax": report.manifest.syntax,
+                        "graphs": report.graph_count,
+                        "quads": report.quad_count,
+                        "prefixes": report.prefix_count,
                     }))?
                 ),
                 OutputFormat::Text => {
                     println!(
                         "valid canonical git tree (format_version {}, {}, {} graphs, {} quads, {} prefixes)",
-                        tree.manifest.format_version,
-                        tree.manifest.syntax.as_str(),
-                        tree.manifest.graphs.len(),
-                        tree.quads.len(),
-                        tree.prefixes.len()
+                        report.manifest.format_version,
+                        report.manifest.syntax.as_str(),
+                        report.graph_count,
+                        report.quad_count,
+                        report.prefix_count
                     );
                 }
             }

@@ -738,6 +738,9 @@ sparkles dump    --loc db --out dump.trig.gz  # syntax from the extension too, o
 sparkles dump    --loc db --format ttl --merge   # every graph as one Turtle graph
 sparkles dump    --loc db --format nt --graph http://ex.org/g   # one graph's triples
 sparkles dump    --server URL --dataset ds --out ds.rt   # a server's dataset, in RDF Thrift
+sparkles git write-tree --loc db --out tree/  # canonical per-graph Turtle/N-Quads tree (--branch, --at, --syntax)
+sparkles git verify     --dir tree/           # stream-verify manifest, layout, checksums and RDF (--no-checksums)
+sparkles git export     --loc db --out repo/  # export branch history to Git (--branch, --git-branch, --mode commits|squash)
 sparkles backup  --loc db --out backups/      # zstd; --compress gzip --level 9, --threads 8
 sparkles clone   --loc db --to sandbox        # independent copy (same blank nodes, new dataset id)
 sparkles clone   --loc db --to part --graph default --graph 'http://ex.org/g/*'   # some graphs only
