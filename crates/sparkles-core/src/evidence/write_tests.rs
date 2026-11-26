@@ -499,3 +499,101 @@ fn subjects_up_to_held_and_objects_up_to_held_charge_before_cloning() {
         Err(Error::BudgetExceeded(_))
     ));
 }
+
+/// Projection-only protection nonces are version-8 RFC 4122 UUIDs distinguishable from
+/// version-4 record-role nonces across serialization.
+#[test]
+fn projection_protection_nonces_distinguish_roles_and_survive_serialization() {
+    let proj = crate::managed::new_projection_protection();
+    let rec = Uuid::new_v4();
+    assert!(crate::managed::is_projection_only_protection(proj));
+    assert!(!crate::managed::is_projection_only_protection(rec));
+    let parsed = Uuid::parse_str(&proj.to_string()).unwrap();
+    assert_eq!(parsed, proj);
+    assert!(crate::managed::is_projection_only_protection(parsed));
+}
+
+/// On a compacted disk-backed snapshot where another graph is ordered before the
+/// requested graph (`id(g_before) < id(g_target)`), `subjects_up_to_held` and
+/// `subjects_matching_up_to_held` must exercise the exact-key fallback strictly inside
+/// `Preparation` rather than calling unbudgeted `Snapshot::contains`.
+#[test]
+fn subjects_up_to_held_on_compacted_snapshot_with_preceding_graph_stays_bounded() {
+    use crate::store::{Store, StoreOptions};
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        // Populate `<urn:a-before>` (lexicographically before `<urn:z-target>`) and
+        // `<urn:z-target>` with shared subjects so compacted `Perm::Pos` visits
+        // `found_g = id(a-before) < id(z-target)` on `found_s > target_s` and triggers
+        // the exact-key fallback against a multi-hundred-row disk segment.
+        let mut data = String::from("INSERT DATA {");
+        data.push_str(" GRAPH <urn:a-before> {");
+        for i in 0..800 {
+            data.push_str(&format!(" <urn:s:{i:04}> <urn:p> <urn:o> ."));
+            data.push_str(&format!(" <urn:s:{i:04}> <urn:p2> <urn:o2> ."));
+        }
+        data.push_str(" } GRAPH <urn:z-target> {");
+        for i in (0..800).step_by(20) {
+            data.push_str(&format!(" <urn:s:{i:04}> <urn:p> <urn:o> ."));
+            data.push_str(&format!(" <urn:s:{i:04}> <urn:p2> <urn:o2> ."));
+        }
+        data.push_str(" } }");
+        crate::sparql::update::update(&s, &data, &crate::sparql::QueryOptions::default()).unwrap();
+        s.compact().unwrap();
+    }
+
+    // Reopen from disk so the block cache starts cold.
+    let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    let snap = s.snapshot();
+    let roomy = Preparation::new(crate::task::Control::none(), 2 << 20).unwrap();
+    let g_before = roomy.lookup_iri(&snap, "urn:a-before").unwrap().unwrap();
+    let g_target = roomy.lookup_iri(&snap, "urn:z-target").unwrap().unwrap();
+    assert!(
+        g_before.0 < g_target.0,
+        "compacted vocab must order urn:a-before ({}) before urn:z-target ({})",
+        g_before.0,
+        g_target.0
+    );
+
+    let mut reads = Reads::new(&roomy, &snap);
+    let mut held = roomy.reserve(0).unwrap();
+    let o = Term::NamedNode(NamedNode::new_unchecked("urn:o"));
+    let o2 = Term::NamedNode(NamedNode::new_unchecked("urn:o2"));
+    let (subs, more) = reads
+        .subjects_up_to_held("urn:p", &o, "urn:z-target", 1000, &mut held)
+        .unwrap();
+    assert_eq!(subs.len(), 40);
+    assert!(!more);
+    assert_eq!(subs[0].as_str(), "urn:s:0000");
+    assert_eq!(subs[39].as_str(), "urn:s:0780");
+
+    let (matched, more_m) = reads
+        .subjects_matching_up_to_held(
+            &[("urn:p", &o), ("urn:p2", &o2)],
+            "urn:z-target",
+            1000,
+            &mut held,
+        )
+        .unwrap();
+    assert_eq!(matched, subs);
+    assert!(!more_m);
+    drop(held);
+
+    // Reopen with a cold cache and a tiny preparation budget smaller than the compacted
+    // segment's decode workspace: the scan must refuse cleanly with BudgetExceeded.
+    drop(reads);
+    drop(roomy);
+    drop(snap);
+    drop(s);
+    let s_cold = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    let snap_cold = s_cold.snapshot();
+    let tight = Preparation::new(crate::task::Control::none(), 8 << 10).unwrap();
+    let mut reads_tight = Reads::new(&tight, &snap_cold);
+    let mut held_tight = tight.reserve(0).unwrap();
+    assert!(matches!(
+        reads_tight.subjects_up_to_held("urn:p", &o, "urn:z-target", 1000, &mut held_tight),
+        Err(Error::BudgetExceeded(_))
+    ));
+}

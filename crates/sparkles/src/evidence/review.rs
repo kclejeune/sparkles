@@ -678,29 +678,29 @@ impl State<'_> {
     /// protections).
     fn check_same_version_drift(
         &self,
+        dataset_id: Uuid,
         p: &PolicyGraphs,
         policy_version: u32,
         settings: &Settings,
         managed_graphs: &[(&str, Uuid)],
+        control: &Control,
     ) -> Result<()> {
-        let rival_owned: Vec<(NamedNode, u32)> = settings
+        let rivals: Vec<(&str, u32)> = settings
             .policies
             .iter()
             .filter(|(name, _)| name.as_str() != p.name.as_str())
-            .map(|(name, other)| (rv::policy_iri(name), other.version))
-            .collect();
-        let rivals: Vec<(&str, u32)> = rival_owned
-            .iter()
-            .map(|(iri, ver)| (iri.as_str(), *ver))
+            .map(|(name, other)| (name.as_str(), other.version))
             .collect();
         if self.reads.has_same_version_projection_drift(
-            p.policy_iri.as_str(),
+            dataset_id,
+            p.name.as_str(),
             policy_version,
             p.supports.0.as_str(),
             p.output.0.as_str(),
             p.output.1,
             managed_graphs,
             &rivals,
+            control,
         )? {
             return Err(same_version_policy_changed(&p.name));
         }
@@ -711,17 +711,11 @@ impl State<'_> {
     /// history under its unchanged protection nonce (as when a former record-role graph
     /// was reassigned as a dedicated projection output without detaching it first),
     /// while ignoring ordinary and support-projected RDF assertions in the output.
-    fn check_output_record_history(
-        &self,
-        p: &PolicyGraphs,
-        dataset_id: Uuid,
-        protected_record_graphs: &[(&str, Uuid)],
-    ) -> Result<()> {
+    fn check_output_record_history(&self, p: &PolicyGraphs, dataset_id: Uuid) -> Result<()> {
         if self.reads.has_published_operation_in_output(
             p.output.0.as_str(),
             p.output.1,
             dataset_id,
-            protected_record_graphs,
         )? {
             return Err(managed(
                 ManagedErrorKind::ImmutableRecordConflict,
@@ -1867,12 +1861,15 @@ pub fn review(
             .iter()
             .map(|(g, n)| (g.as_str(), *n))
             .collect();
-        let protected_records: Vec<(&str, Uuid)> = records
-            .iter()
-            .filter_map(|(g, n)| n.map(|n| (g.as_str(), n)))
-            .collect();
-        state.check_same_version_drift(&p, policy_version, &settings, &protected_refs)?;
-        state.check_output_record_history(&p, main.dataset_id(), &protected_records)?;
+        state.check_same_version_drift(
+            main.dataset_id(),
+            &p,
+            policy_version,
+            &settings,
+            &protected_refs,
+            control,
+        )?;
+        state.check_output_record_history(&p, main.dataset_id())?;
         let existing = state.check_projection(&p, Some((policy_version, &record)))?;
         batch.records.push(record);
         skip.push(existing);
@@ -2615,10 +2612,6 @@ pub fn reconcile_projection_prepared(
         };
         let record_graphs = record_graph_nonces(&settings, &capability);
         let projection_graphs = projection_graph_nonces(&settings, &capability);
-        let protected_records: Vec<(&str, Uuid)> = record_graphs
-            .iter()
-            .filter_map(|(g, n)| n.map(|n| (g.as_str(), n)))
-            .collect();
         let op_iri = operation_iri(operation);
         if options.idempotency_key.is_some() {
             let probe = Batch {
@@ -2641,7 +2634,6 @@ pub fn reconcile_projection_prepared(
                     g.as_str(),
                     *nonce,
                     main.dataset_id(),
-                    &protected_records,
                 )? {
                     let copy = state
                         .reads
@@ -2794,8 +2786,15 @@ pub fn reconcile_projection_prepared(
             .iter()
             .map(|(g, n)| (g.as_str(), *n))
             .collect();
-        state.check_same_version_drift(&p, policy.version, &settings, &protected_refs)?;
-        state.check_output_record_history(&p, main.dataset_id(), &protected_records)?;
+        state.check_same_version_drift(
+            main.dataset_id(),
+            &p,
+            policy.version,
+            &settings,
+            &protected_refs,
+            control,
+        )?;
+        state.check_output_record_history(&p, main.dataset_id())?;
         // Existing projection records of this policy, and which remain unsuperseded.
         let mut proj_held = preparation.reserve(0)?;
         let (existing_projections, superseded_projections) =
@@ -3037,10 +3036,10 @@ pub fn reconcile_projection_prepared(
             for pred in &active_projections {
                 let pred_bytes = (pred.as_str().len() as u64)
                     .saturating_mul(2)
-                    .saturating_add(supports_len)
+                    .saturating_add(supports_len.saturating_mul(2))
                     .saturating_add((std::mem::size_of::<Triple>() as u64).saturating_mul(2))
-                    .saturating_add((std::mem::size_of::<Quad>() as u64).saturating_mul(2))
-                    .saturating_add(512);
+                    .saturating_add((std::mem::size_of::<Quad>() as u64).saturating_mul(3))
+                    .saturating_add(768);
                 batch_held.grow_by(pred_bytes)?;
             }
             let record = rv::reconciled_projection_record(
@@ -3065,7 +3064,6 @@ pub fn reconcile_projection_prepared(
                     g.as_str(),
                     *nonce,
                     main.dataset_id(),
-                    &protected_records,
                 )? {
                     return Err(managed(
                         ManagedErrorKind::ImmutableRecordConflict,

@@ -332,17 +332,39 @@ impl Store {
             graphs.revision = graphs.revision.checked_add(1)
                 .ok_or_else(|| Error::invalid("managed registry revision overflow"))?;
             // A graph that stays protected keeps its nonce; one that becomes protected
-            // gets a new random one, which nobody could have known before.
+            // gets a new random one, which nobody could have known before. Dedicated
+            // evidence projection outputs mint a version-8 projection-only nonce when
+            // newly protected and rotate to a fresh version-4 nonce if promoted into a
+            // record role without detaching, while a record-role graph moved into
+            // `projections` without detaching keeps its version-4 nonce so its record
+            // history remains protected and discoverable for replay.
+            let projection_only = if owner == OwnerKind::Evidence {
+                evidence_projection_graphs(settings)
+            } else {
+                std::collections::BTreeSet::new()
+            };
             let previous = graphs.owners.get(&owner);
             let mut entry = entry;
             entry.protections = entry
                 .graphs
                 .iter()
                 .map(|g| {
+                    let is_projection = projection_only.contains(g);
                     let kept = previous
                         .filter(|p| p.graphs.contains(g))
                         .and_then(|p| p.protections.get(g).copied());
-                    (g.clone(), kept.unwrap_or_else(uuid::Uuid::new_v4))
+                    let nonce = match kept {
+                        Some(prev)
+                            if !is_projection
+                                && crate::managed::is_projection_only_protection(prev) =>
+                        {
+                            uuid::Uuid::new_v4()
+                        }
+                        Some(prev) => prev,
+                        None if is_projection => crate::managed::new_projection_protection(),
+                        None => uuid::Uuid::new_v4(),
+                    };
+                    (g.clone(), nonce)
                 })
                 .collect();
             graphs.owners.insert(owner, entry);
@@ -1023,6 +1045,34 @@ fn rootless_repair(reason: &str) -> Error {
         ManagedErrorKind::Unavailable,
         format!("{reason}; a store without a directory has no recorded registry to repair it from"),
     )
+}
+
+fn evidence_projection_graphs(settings: &[u8]) -> std::collections::BTreeSet<String> {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(settings) else {
+        return std::collections::BTreeSet::new();
+    };
+    let mut projections: std::collections::BTreeSet<String> = v
+        .get("projections")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    for role in [
+        "sourceRecords",
+        "proposals",
+        "decisions",
+        "supports",
+        "identity",
+    ] {
+        if let Some(arr) = v.get(role).and_then(serde_json::Value::as_array) {
+            for g in arr.iter().filter_map(serde_json::Value::as_str) {
+                projections.remove(g);
+            }
+        }
+    }
+    projections
 }
 
 fn not_enabled(owner: OwnerKind) -> Error {

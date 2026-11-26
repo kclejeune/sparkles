@@ -76,6 +76,24 @@ pub const MAX_IRI_BYTES: usize = 4096;
 /// The largest owner settings file, in bytes.
 pub const MAX_SETTINGS_BYTES: usize = 16 << 20;
 
+/// Mint a random protection nonce for a dedicated projection-output graph (RFC 9562
+/// version 8 with RFC 4122 variant and 122 cryptographically random bits). Record-role
+/// and legacy protection nonces use UUID version 4, so [`is_projection_only_protection`]
+/// durably distinguishes dedicated projection outputs from former record-role graphs
+/// across `supports` rotations without changing `managed.json`'s on-disk format.
+pub fn new_projection_protection() -> uuid::Uuid {
+    let mut bytes = *uuid::Uuid::new_v4().as_bytes();
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes)
+}
+
+/// Whether `nonce` was minted exclusively for a dedicated projection-output graph
+/// rather than a record-role graph.
+pub fn is_projection_only_protection(nonce: uuid::Uuid) -> bool {
+    nonce.get_version_num() == 8 && nonce.get_variant() == uuid::Variant::RFC4122
+}
+
 /// Who owns a set of managed graphs. Each owner has its own typed writer and settings
 /// file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

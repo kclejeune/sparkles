@@ -3738,7 +3738,7 @@ fn projected_operation_assertions_do_not_block_output_or_keyed_replay() {
         "main",
         Some(1),
         &narrow_replay,
-        Some(main_only),
+        Some(main_only.clone()),
         &Control::none(),
     )
     .unwrap();
@@ -3746,6 +3746,270 @@ fn projected_operation_assertions_do_not_block_output_or_keyed_replay() {
     assert_eq!(replayed2.commit, first.commit);
     assert_eq!(replayed2.projection, first.projection);
     assert_eq!(ds.store().head_commit().seq, head_before2);
+
+    // Detach and re-protect `supports2` (first retaining old `supports2`, then clearing
+    // `supports2` completely) while `output2` keeps its unchanged protection nonce:
+    // `main`'s keyed replay under narrow grants must still succeed without returning
+    // `409 idempotency-conflict` or `403 NotPermitted`.
+    evidence::detach(&ds, supports2).unwrap();
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+    let out2_nonce_after_retain = ds
+        .store()
+        .managed_graphs()
+        .unwrap()
+        .unwrap()
+        .owners
+        .get(&OwnerKind::Evidence)
+        .unwrap()
+        .protections
+        .get(output2)
+        .copied()
+        .expect("output2 still protected");
+    assert_eq!(out2_nonce_after_retain, out2_nonce);
+    let head_after_s2_retain = ds.store().head_commit().seq;
+    let replayed3 = evidence::reconcile_projection(
+        &ds,
+        &ds,
+        "main",
+        Some(1),
+        &narrow_replay,
+        Some(main_only.clone()),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(!replayed3.committed && replayed3.replayed);
+    assert_eq!(replayed3.commit, first.commit);
+    assert_eq!(replayed3.projection, first.projection);
+    assert_eq!(ds.store().head_commit().seq, head_after_s2_retain);
+
+    evidence::detach(&ds, supports2).unwrap();
+    ds.update(&format!(
+        "DELETE WHERE {{ GRAPH <{supports2}> {{ ?s ?p ?o }} }}"
+    ))
+    .unwrap();
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+    let head_after_s2_clear = ds.store().head_commit().seq;
+    let replayed4 = evidence::reconcile_projection(
+        &ds,
+        &ds,
+        "main",
+        Some(1),
+        &narrow_replay,
+        Some(main_only),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(!replayed4.committed && replayed4.replayed);
+    assert_eq!(replayed4.commit, first.commit);
+    assert_eq!(replayed4.projection, first.projection);
+    assert_eq!(ds.store().head_commit().seq, head_after_s2_clear);
+}
+
+/// Rotating `SUPPORTS` (both retaining and clearing old `SUPPORTS`) while `OUTPUT`
+/// remains continuously protected must still let `reconcile_projection` empty a
+/// 9-triple projected `ev:Operation` lookalike from `OUTPUT` instead of refusing with
+/// `409 immutable-record-conflict`, and promoting a dedicated output to a record role
+/// without detaching must rotate its nonce so projected lookalikes never authenticate.
+#[test]
+fn projected_operation_lookalike_empties_after_supports_rotation() {
+    use oxrdf::Literal;
+    use sparkles::managed::OwnerKind;
+
+    const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+    const PROV: &str = "http://www.w3.org/ns/prov#";
+    const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+
+    let ds = Dataset::memory();
+    let s = settings(ConflictMode::Refuse);
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+
+    let out_nonce = ds
+        .store()
+        .managed_graphs()
+        .unwrap()
+        .unwrap()
+        .owners
+        .get(&OwnerKind::Evidence)
+        .unwrap()
+        .protections
+        .get(OUTPUT)
+        .copied()
+        .expect("OUTPUT protected");
+    assert!(sparkles_core::managed::is_projection_only_protection(
+        out_nonce
+    ));
+
+    let project_lookalike = |ds: &Dataset, tag: &str, op_iri: NamedNode, nonce: uuid::Uuid| {
+        let ds_id = ds.dataset_id().to_string();
+        let branch_id = ds.store().branch_id().to_string();
+        let payload_sha = sha(&format!("lookalike-{tag}")).to_string();
+        let dt =
+            Literal::new_typed_literal("2026-11-26T00:00:00.000Z", iri(&format!("{XSD}dateTime")));
+        let commit_int = Literal::new_typed_literal("99", iri(&format!("{XSD}integer")));
+        let triples = vec![
+            (
+                "type",
+                Triple::new(
+                    op_iri.clone(),
+                    iri(RDF_TYPE),
+                    iri(&format!("{EV}Operation")),
+                ),
+            ),
+            (
+                "act",
+                Triple::new(
+                    op_iri.clone(),
+                    iri(RDF_TYPE),
+                    iri(&format!("{PROV}Activity")),
+                ),
+            ),
+            (
+                "assoc",
+                Triple::new(
+                    op_iri.clone(),
+                    iri(&format!("{PROV}wasAssociatedWith")),
+                    iri("urn:principal:reviewer"),
+                ),
+            ),
+            (
+                "ended",
+                Triple::new(op_iri.clone(), iri(&format!("{PROV}endedAtTime")), dt),
+            ),
+            (
+                "ds",
+                Triple::new(
+                    op_iri.clone(),
+                    iri(&format!("{EV}datasetId")),
+                    Literal::new_simple_literal(ds_id),
+                ),
+            ),
+            (
+                "br",
+                Triple::new(
+                    op_iri.clone(),
+                    iri(&format!("{EV}branchId")),
+                    Literal::new_simple_literal(branch_id),
+                ),
+            ),
+            (
+                "commit",
+                Triple::new(op_iri.clone(), iri(&format!("{EV}commit")), commit_int),
+            ),
+            (
+                "digest",
+                Triple::new(
+                    op_iri.clone(),
+                    iri(&format!("{EV}payloadDigest")),
+                    Literal::new_simple_literal(payload_sha),
+                ),
+            ),
+            (
+                "prot",
+                Triple::new(
+                    op_iri,
+                    iri(&format!("{EV}graphProtection")),
+                    Literal::new_simple_literal(nonce.to_string()),
+                ),
+            ),
+        ];
+        let mut decs = Vec::new();
+        for (k, t) in triples {
+            let key = format!("{tag}-{k}");
+            let input = EvidenceInput {
+                revisions: vec![revision(&key)],
+                claims: vec![claim("c", Polarity::Positive, t)],
+                ..Default::default()
+            };
+            let c = claim_of(&propose(ds, &input));
+            decs.push(decision(&key, &c, Disposition::Accepted, None));
+        }
+        let res = review(ds, &decs).unwrap();
+        assert!(res.committed);
+    };
+
+    // 1. Project a 9-triple lookalike into OUTPUT, then detach & re-protect SUPPORTS
+    // while RETAINING old SUPPORTS quads and keeping OUTPUT continuously protected.
+    project_lookalike(&ds, "retain", iri("urn:proj:op-retain"), out_nonce);
+    evidence::detach(&ds, SUPPORTS).unwrap();
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+    let out_nonce_1 = ds
+        .store()
+        .managed_graphs()
+        .unwrap()
+        .unwrap()
+        .owners
+        .get(&OwnerKind::Evidence)
+        .unwrap()
+        .protections
+        .get(OUTPUT)
+        .copied()
+        .expect("OUTPUT still protected");
+    assert_eq!(out_nonce_1, out_nonce);
+
+    let rec_retain = reconcile(&ds, "main", Some(1), &reviewer()).unwrap();
+    assert!(rec_retain.committed);
+    assert!(
+        !ds.ask(&format!("ASK {{ GRAPH <{OUTPUT}> {{ ?s ?p ?o }} }}"))
+            .unwrap(),
+        "reconcile_projection after SUPPORTS rotation (retained) must empty OUTPUT"
+    );
+
+    // 2. Project a 9-triple lookalike again, then detach, CLEAR, and re-protect SUPPORTS
+    // while keeping OUTPUT continuously protected.
+    project_lookalike(&ds, "clear", iri("urn:proj:op-clear"), out_nonce);
+    evidence::detach(&ds, SUPPORTS).unwrap();
+    ds.update(&format!(
+        "DELETE WHERE {{ GRAPH <{SUPPORTS}> {{ ?s ?p ?o }} }}"
+    ))
+    .unwrap();
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+    let out_nonce_2 = ds
+        .store()
+        .managed_graphs()
+        .unwrap()
+        .unwrap()
+        .owners
+        .get(&OwnerKind::Evidence)
+        .unwrap()
+        .protections
+        .get(OUTPUT)
+        .copied()
+        .expect("OUTPUT still protected");
+    assert_eq!(out_nonce_2, out_nonce);
+
+    let rec_clear = reconcile(&ds, "main", Some(1), &reviewer()).unwrap();
+    assert!(rec_clear.committed);
+    assert!(
+        !ds.ask(&format!("ASK {{ GRAPH <{OUTPUT}> {{ ?s ?p ?o }} }}"))
+            .unwrap(),
+        "reconcile_projection after SUPPORTS rotation (cleared) must empty OUTPUT"
+    );
+
+    // 3. Promoting a dedicated projection output (v8) into a record role without detaching
+    // must rotate its nonce to a fresh record-role (v4) nonce so any projected lookalike
+    // cannot escalate into an authenticated operation record.
+    project_lookalike(&ds, "promote", iri("urn:proj:op-promote"), out_nonce);
+    let mut promoted = s.clone();
+    promoted.supports.push(OUTPUT.into());
+    promoted.projections = vec!["urn:ev:accepted-new".into()];
+    promoted.policies.get_mut("main").unwrap().output = "urn:ev:accepted-new".into();
+    evidence::configure(&ds, &promoted, &Control::none()).unwrap();
+    let promoted_nonce = ds
+        .store()
+        .managed_graphs()
+        .unwrap()
+        .unwrap()
+        .owners
+        .get(&OwnerKind::Evidence)
+        .unwrap()
+        .protections
+        .get(OUTPUT)
+        .copied()
+        .expect("OUTPUT now protected as record role");
+    assert_ne!(promoted_nonce, out_nonce);
+    assert!(!sparkles_core::managed::is_projection_only_protection(
+        promoted_nonce
+    ));
 }
 
 /// Ordinary review's drift and output-history guards must skip both authentic
@@ -3848,10 +4112,12 @@ fn ordinary_review_skips_unrelated_authentic_projections_and_nonce_noise() {
         let (seq, _) = t.managed_stamp().unwrap();
         let g = GraphName::NamedNode(iri(supports2));
         let mut labels = std::collections::HashMap::new();
-        let mut push = |sub: NamedNode, pred: NamedNode, obj: Term| {
-            let q = Quad::new(sub, pred, obj, g.clone());
+        let mut push_quad = |q: Quad| {
             let ids = t.encode_quad(&q, &mut labels).unwrap();
             t.insert(ids).unwrap();
+        };
+        let mut push = |sub: NamedNode, pred: NamedNode, obj: Term| {
+            push_quad(Quad::new(sub, pred, obj, g.clone()));
         };
         let s2_lit: Term = Literal::new_simple_literal(s2_nonce.to_string()).into();
         let d2_lit: Term = Literal::new_simple_literal(d2_nonce.to_string()).into();
@@ -3904,53 +4170,86 @@ fn ordinary_review_skips_unrelated_authentic_projections_and_nonce_noise() {
         );
 
         let other_policy = evidence::review::policy_iri("other");
+        let main_policy = evidence::review::policy_iri("main");
         let proj_class: Term = iri(&format!("{EV}Projection")).into();
         let refuse_iri: Term = iri(&format!("{EV}Refuse")).into();
         let out2_iri: Term = iri(output2).into();
+        let supports2_node = iri(supports2);
+        let noise_g = GraphName::NamedNode(iri(hidden_unmanaged));
+        // Interleave physical subject IDs `A0 < B0 < A1 < B1 ...` between `supports2`'s
+        // authentic version-1 projections of `other` and ordinary `(ev:reviewPolicy, main)`
+        // assertions in `hidden_unmanaged` (the exact Sol r7 P2-2 interleaved layout).
         for i in 0..2_000u32 {
-            let p_iri = iri(&format!("urn:other:proj:{i}"));
-            push(p_iri.clone(), iri(RDF_TYPE), proj_class.clone());
-            push(
+            let p_iri = iri(&format!("urn:interleave:{i:04}:a"));
+            let mut add = |sub: NamedNode, pred: NamedNode, obj: Term| {
+                let q = Quad::new(sub, pred, obj, g.clone());
+                let ids = t.encode_quad(&q, &mut labels).unwrap();
+                t.insert(ids).unwrap();
+            };
+            add(p_iri.clone(), iri(RDF_TYPE), proj_class.clone());
+            add(
                 p_iri.clone(),
                 iri(&format!("{EV}reviewPolicy")),
                 other_policy.clone().into(),
             );
-            push(
+            add(
                 p_iri.clone(),
                 iri(&format!("{EV}policyVersion")),
-                Literal::new_simple_literal((i + 1).to_string()).into(),
+                Literal::new_simple_literal("1").into(),
             );
-            push(p_iri.clone(), iri(&format!("{EV}output")), out2_iri.clone());
-            push(
+            add(p_iri.clone(), iri(&format!("{EV}output")), out2_iri.clone());
+            add(
                 p_iri.clone(),
                 iri(&format!("{EV}conflictMode")),
                 refuse_iri.clone(),
             );
-            push(
+            add(
                 p_iri.clone(),
                 iri(&format!("{EV}decisionsProtection")),
                 d2_lit.clone(),
             );
-            push(
+            add(
                 p_iri.clone(),
                 iri(&format!("{EV}supportsProtection")),
                 s2_lit.clone(),
             );
-            push(
+            add(
                 p_iri.clone(),
                 iri(&format!("{EV}outputProtection")),
                 o2_lit.clone(),
             );
-            push(
+            add(
                 p_iri.clone(),
                 iri(&format!("{EV}availabilityReceipt")),
                 op_iri.clone().into(),
             );
-            push(
+            add(
                 p_iri.clone(),
                 iri(&format!("{EV}graphProtection")),
                 s2_lit.clone(),
             );
+            for idx_q in sparkles_core::evidence::review::projection_index_quads(
+                &p_iri,
+                &supports2_node,
+                s2_nonce,
+                o2_nonce,
+                other_policy.as_str(),
+                1,
+                output2,
+                &[],
+            ) {
+                let ids = t.encode_quad(&idx_q, &mut labels).unwrap();
+                t.insert(ids).unwrap();
+            }
+            let b_iri = iri(&format!("urn:interleave:{i:04}:b"));
+            let noise_q = Quad::new(
+                b_iri,
+                iri(&format!("{EV}reviewPolicy")),
+                main_policy.clone(),
+                noise_g.clone(),
+            );
+            let ids = t.encode_quad(&noise_q, &mut labels).unwrap();
+            t.insert(ids).unwrap();
         }
         t.commit().unwrap();
     }
@@ -4111,73 +4410,137 @@ fn same_version_drift_supersession_is_linear_across_retained_revisions() {
         let proj_class: Term = iri(&format!("{EV}Projection")).into();
         let refuse_iri: Term = iri(&format!("{EV}Refuse")).into();
         let out_iri: Term = iri(OUTPUT).into();
-        let mut prev: Option<NamedNode> = None;
-        for i in 0..=REVISIONS {
-            let p_iri = iri(&format!("urn:main:proj:{i:04}"));
-            let ver = if i == REVISIONS { "2" } else { "1" };
-            push(p_iri.clone(), iri(RDF_TYPE), proj_class.clone());
-            push(
+        let supports_node = iri(SUPPORTS);
+        let noise_g = GraphName::NamedNode(iri(noise_graph));
+        let first_prior = iri("urn:main:proj:0000");
+
+        let push_proj = |t: &mut sparkles_core::store::WriteTxn<'_>,
+                         labels: &mut std::collections::HashMap<String, sparkles_core::id::Id>,
+                         p_iri: &NamedNode,
+                         ver: u32,
+                         prior: Option<&NamedNode>| {
+            let mut add = |sub: NamedNode, pred: NamedNode, obj: Term| {
+                let q = Quad::new(sub, pred, obj, g.clone());
+                let ids = t.encode_quad(&q, labels).unwrap();
+                t.insert(ids).unwrap();
+            };
+            add(p_iri.clone(), iri(RDF_TYPE), proj_class.clone());
+            add(
                 p_iri.clone(),
                 iri(&format!("{EV}reviewPolicy")),
                 main_policy.clone().into(),
             );
-            push(
+            add(
                 p_iri.clone(),
                 iri(&format!("{EV}policyVersion")),
-                Literal::new_simple_literal(ver).into(),
+                Literal::new_simple_literal(ver.to_string()).into(),
             );
-            push(p_iri.clone(), iri(&format!("{EV}output")), out_iri.clone());
-            push(
+            add(p_iri.clone(), iri(&format!("{EV}output")), out_iri.clone());
+            add(
                 p_iri.clone(),
                 iri(&format!("{EV}conflictMode")),
                 refuse_iri.clone(),
             );
-            push(
+            add(
                 p_iri.clone(),
                 iri(&format!("{EV}decisionsProtection")),
                 d_lit.clone(),
             );
-            push(
+            add(
                 p_iri.clone(),
                 iri(&format!("{EV}supportsProtection")),
                 s_lit.clone(),
             );
-            push(
+            add(
                 p_iri.clone(),
                 iri(&format!("{EV}outputProtection")),
                 o_lit.clone(),
             );
-            push(
+            add(
                 p_iri.clone(),
                 iri(&format!("{EV}availabilityReceipt")),
                 op_iri.clone().into(),
             );
-            push(
+            add(
                 p_iri.clone(),
                 iri(&format!("{EV}graphProtection")),
                 s_lit.clone(),
             );
-            if let Some(prior) = prev {
-                push(
+            let mut priors_slice: Vec<&str> = Vec::new();
+            if let Some(prev_iri) = prior {
+                add(
                     p_iri.clone(),
                     iri(&format!("{PROV}wasRevisionOf")),
-                    prior.into(),
+                    prev_iri.clone().into(),
                 );
+                priors_slice.push(prev_iri.as_str());
             }
+            for idx_q in sparkles_core::evidence::review::projection_index_quads(
+                p_iri,
+                &supports_node,
+                s_nonce,
+                o_nonce,
+                main_policy.as_str(),
+                ver,
+                OUTPUT,
+                &priors_slice,
+            ) {
+                let ids = t.encode_quad(&idx_q, labels).unwrap();
+                t.insert(ids).unwrap();
+            }
+        };
+
+        // Write `urn:main:proj:0000`, then interleave 3,000 foreign-graph
+        // `prov:wasRevisionOf` noise edges targeting `urn:main:proj:0000` with
+        // same-policy projection subjects BEFORE inserting `urn:main:proj:0000`'s
+        // genuine successor (`urn:main:proj:final`) so noise IDs sit strictly before
+        // the genuine successor (the exact Sol r7 P2-2 interleaved supersession layout).
+        push_proj(&mut t, &mut labels, &first_prior, 1, None);
+        let mut prev: Option<NamedNode> = None;
+        for i in 1..REVISIONS {
+            for j in 0..2 {
+                let noise_i = (i - 1) * 2 + j;
+                let noise_q = Quad::new(
+                    iri(&format!("urn:rev-noise:{noise_i:05}")),
+                    iri(&format!("{PROV}wasRevisionOf")),
+                    first_prior.clone(),
+                    noise_g.clone(),
+                );
+                let ids = t.encode_quad(&noise_q, &mut labels).unwrap();
+                t.insert(ids).unwrap();
+            }
+            let p_iri = iri(&format!("urn:main:proj:{i:04}"));
+            push_proj(&mut t, &mut labels, &p_iri, 1, prev.as_ref());
             prev = Some(p_iri);
+        }
+        // Genuine v2 successor of BOTH `first_prior` (after all 3,000 interleaved noise
+        // edges) and the tail of the v1 chain.
+        let tail = prev.expect("chain tail");
+        let final_proj = iri("urn:main:proj:final");
+        push_proj(&mut t, &mut labels, &final_proj, 2, Some(&tail));
+        {
+            let q = Quad::new(
+                final_proj.clone(),
+                iri(&format!("{PROV}wasRevisionOf")),
+                first_prior.clone(),
+                g.clone(),
+            );
+            let ids = t.encode_quad(&q, &mut labels).unwrap();
+            t.insert(ids).unwrap();
+            let idx_q = Quad::new(
+                sparkles_core::evidence::review::projection_revision_index_iri(
+                    s_nonce,
+                    first_prior.as_str(),
+                ),
+                iri(sparkles_core::evidence::review::INDEXED_PROJECTION),
+                final_proj,
+                g.clone(),
+            );
+            let ids = t.encode_quad(&idx_q, &mut labels).unwrap();
+            t.insert(ids).unwrap();
         }
         t.commit().unwrap();
     }
-
-    // Add 3,000 unrelated `prov:wasRevisionOf` noise rows targeting `urn:main:proj:0000`
-    // in an unmanaged graph to verify supersession skips noise as well.
-    let mut nq = String::with_capacity(3_000 * 110);
-    for i in 0..3_000 {
-        nq.push_str(&format!(
-            "<urn:rev-noise:{i}> <{PROV}wasRevisionOf> <urn:main:proj:0000> <{noise_graph}> .\n"
-        ));
-    }
-    ds.load_str(&nq, oxrdfio::RdfFormat::NQuads).unwrap();
 
     // Move `main` to fresh `supports2` / `output2` at version 1 while keeping `SUPPORTS`
     // continuously protected. Because all 1,500 v1 records in `SUPPORTS` are superseded
@@ -4224,6 +4587,163 @@ fn same_version_drift_supersession_is_linear_across_retained_revisions() {
     let cp_count = checkpoints.load(Ordering::Relaxed);
     assert!(
         cp_count <= 16,
-        "dismissing {REVISIONS} superseded revisions must scale linearly (got {cp_count} checkpoints)"
+        "dismissing {REVISIONS} superseded revisions with interleaved foreign revision noise must scale linearly (got {cp_count} checkpoints)"
+    );
+
+    // Also verify the guard is non-vacuous: adding one active (unsuperseded) v1
+    // projection of `main` in `SUPPORTS` must still be caught as same-version drift.
+    {
+        let op_uuid = uuid::Uuid::new_v4();
+        let op_iri = evidence::operation_iri(op_uuid);
+        let cap = ds
+            .store()
+            .managed_writer(OwnerKind::Evidence, op_uuid)
+            .unwrap();
+        let mut t = ds.store().write();
+        t.set_managed(cap).unwrap();
+        let (seq, _) = t.managed_stamp().unwrap();
+        let supports_node = iri(SUPPORTS);
+        let g = GraphName::NamedNode(supports_node.clone());
+        let mut labels = std::collections::HashMap::new();
+        let mut add = |sub: NamedNode, pred: NamedNode, obj: Term| {
+            let q = Quad::new(sub, pred, obj, g.clone());
+            let ids = t.encode_quad(&q, &mut labels).unwrap();
+            t.insert(ids).unwrap();
+        };
+        let s_lit: Term = Literal::new_simple_literal(s_nonce.to_string()).into();
+        let d_lit: Term = Literal::new_simple_literal(d_nonce.to_string()).into();
+        let o_lit: Term = Literal::new_simple_literal(o_nonce.to_string()).into();
+        add(
+            op_iri.clone(),
+            iri(RDF_TYPE),
+            iri(&format!("{EV}Operation")).into(),
+        );
+        add(
+            op_iri.clone(),
+            iri(RDF_TYPE),
+            iri(&format!("{PROV}Activity")).into(),
+        );
+        add(
+            op_iri.clone(),
+            iri(&format!("{PROV}wasAssociatedWith")),
+            iri("urn:principal:reviewer").into(),
+        );
+        add(
+            op_iri.clone(),
+            iri(&format!("{PROV}endedAtTime")),
+            Literal::new_typed_literal("2026-11-26T00:00:00.000Z", iri(&format!("{XSD}dateTime")))
+                .into(),
+        );
+        add(
+            op_iri.clone(),
+            iri(&format!("{EV}datasetId")),
+            Literal::new_simple_literal(ds.dataset_id().to_string()).into(),
+        );
+        add(
+            op_iri.clone(),
+            iri(&format!("{EV}branchId")),
+            Literal::new_simple_literal(ds.store().branch_id().to_string()).into(),
+        );
+        add(
+            op_iri.clone(),
+            iri(&format!("{EV}commit")),
+            Literal::new_typed_literal(seq.to_string(), iri(&format!("{XSD}integer"))).into(),
+        );
+        add(
+            op_iri.clone(),
+            iri(&format!("{EV}payloadDigest")),
+            Literal::new_simple_literal(sha("main-active-v1").to_string()).into(),
+        );
+        add(
+            op_iri.clone(),
+            iri(&format!("{EV}graphProtection")),
+            s_lit.clone(),
+        );
+
+        let active_v1 = iri("urn:main:proj:active-v1");
+        let main_policy = evidence::review::policy_iri("main");
+        add(
+            active_v1.clone(),
+            iri(RDF_TYPE),
+            iri(&format!("{EV}Projection")).into(),
+        );
+        add(
+            active_v1.clone(),
+            iri(&format!("{EV}reviewPolicy")),
+            main_policy.clone().into(),
+        );
+        add(
+            active_v1.clone(),
+            iri(&format!("{EV}policyVersion")),
+            Literal::new_simple_literal("1").into(),
+        );
+        add(
+            active_v1.clone(),
+            iri(&format!("{EV}output")),
+            iri(OUTPUT).into(),
+        );
+        add(
+            active_v1.clone(),
+            iri(&format!("{EV}conflictMode")),
+            iri(&format!("{EV}Refuse")).into(),
+        );
+        add(
+            active_v1.clone(),
+            iri(&format!("{EV}decisionsProtection")),
+            d_lit,
+        );
+        add(
+            active_v1.clone(),
+            iri(&format!("{EV}supportsProtection")),
+            s_lit.clone(),
+        );
+        add(
+            active_v1.clone(),
+            iri(&format!("{EV}outputProtection")),
+            o_lit,
+        );
+        add(
+            active_v1.clone(),
+            iri(&format!("{EV}availabilityReceipt")),
+            op_iri.into(),
+        );
+        add(
+            active_v1.clone(),
+            iri(&format!("{EV}graphProtection")),
+            s_lit,
+        );
+        for idx_q in sparkles_core::evidence::review::projection_index_quads(
+            &active_v1,
+            &supports_node,
+            s_nonce,
+            o_nonce,
+            main_policy.as_str(),
+            1,
+            OUTPUT,
+            &[],
+        ) {
+            let ids = t.encode_quad(&idx_q, &mut labels).unwrap();
+            t.insert(ids).unwrap();
+        }
+        t.commit().unwrap();
+    }
+    let claim_b = claim_of(&propose(
+        &ds,
+        &occurrence_with("lin2", "urn:cve:lin2", Polarity::Positive),
+    ));
+    opts.if_head = Some(ds.store().head_commit().seq);
+    assert_eq!(
+        code(evidence::review(
+            None,
+            &ds,
+            &ds,
+            "main",
+            1,
+            &[decision("lin2", &claim_b, Disposition::Accepted, None)],
+            &opts,
+            &mut |_, _| all(),
+            &Control::none(),
+        )),
+        "projection-unavailable"
     );
 }
