@@ -2258,6 +2258,32 @@ async fn ask_charges_usage_on_refusal_invalid_and_runtime_max_tokens() {
     );
 }
 
+struct GateGuard(Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>);
+
+impl GateGuard {
+    fn open(&self) {
+        let mut open = self.0.0.lock();
+        *open = true;
+        self.0.1.notify_all();
+    }
+}
+
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        self.open();
+    }
+}
+
+fn wait_gate(gate: &(parking_lot::Mutex<bool>, parking_lot::Condvar), timeout: Duration) {
+    let mut open = gate.0.lock();
+    let deadline = Instant::now() + timeout;
+    while !*open {
+        if gate.1.wait_until(&mut open, deadline).timed_out() {
+            break;
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ask_cancellation_and_slot_rpm_deadlines() {
     // 1. Mid-flight cancellation synchronized on mock arrival returns promptly while
@@ -2265,16 +2291,14 @@ async fn ask_cancellation_and_slot_rpm_deadlines() {
     //    and records late reported usage for both provider and Ask budgets.
     let (arrived_tx, arrived_rx) = std::sync::mpsc::channel::<()>();
     let gate = Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
+    let gate_guard = GateGuard(gate.clone());
     let slow = {
         let gate = gate.clone();
         let arrived_tx = parking_lot::Mutex::new(Some(arrived_tx));
         MockModel::start(move |_, _| {
             if let Some(tx) = arrived_tx.lock().take() {
                 let _ = tx.send(());
-                let mut open = gate.0.lock();
-                while !*open {
-                    gate.1.wait(&mut open);
-                }
+                wait_gate(&gate, Duration::from_secs(10));
             }
             (
                 200,
@@ -2372,13 +2396,10 @@ async fn ask_cancellation_and_slot_rpm_deadlines() {
     );
 
     // Release the in-flight HTTP response and verify late usage settlement + slot release.
-    {
-        let mut open = gate.0.lock();
-        *open = true;
-        gate.1.notify_all();
-    }
+    gate_guard.open();
     let settle_wait = Instant::now();
-    while st_cancel.asks.tokens_today("org", Some(&alice.id())) < 60
+    while (st_cancel.asks.tokens_today("org", Some(&alice.id())) < 60
+        || st_cancel.models().unwrap().describe()["providers"][0]["budget"]["usedToday"] != 60)
         && settle_wait.elapsed() < Duration::from_secs(3)
     {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2412,6 +2433,250 @@ async fn ask_cancellation_and_slot_rpm_deadlines() {
     };
     assert_eq!(after_release["outcome"], "answered", "{after_release}");
     assert_eq!(slow.requests().len(), 2);
+
+    // 1b. Queued Ask waiting on concurrency: 1 must be refused after late settlement
+    //     exhausts the provider's tokensPerDay cap.
+    let (cap_tx, cap_rx) = std::sync::mpsc::channel::<()>();
+    let cap_gate = Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
+    let cap_guard = GateGuard(cap_gate.clone());
+    let cap_mock = {
+        let gate = cap_gate.clone();
+        let cap_tx = parking_lot::Mutex::new(Some(cap_tx));
+        MockModel::start(move |_, _| {
+            if let Some(tx) = cap_tx.lock().take() {
+                let _ = tx.send(());
+                wait_gate(&gate, Duration::from_secs(10));
+            }
+            (
+                200,
+                json!({
+                    "choices": [{
+                        "message": { "content": draft_json(TEAMS_QUERY) },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 45, "completion_tokens": 15 }
+                }),
+            )
+        })
+    };
+    let cap_cfg = json!({
+        "providers": {
+            "cheap": {
+                "kind": "openai",
+                "endpoint": cap_mock.url(),
+                "concurrency": 1,
+                "requestTimeoutSecs": 5,
+                "budget": { "tokensPerDay": 50 },
+                "allowedModels": ["m"]
+            }
+        },
+        "roles": { "draft": [{ "provider": "cheap", "model": "m" }] }
+    });
+    let st_cap = make_state(Some(Models::new(
+        ModelsConfig::parse(&cap_cfg.to_string()).unwrap(),
+        Default::default(),
+        sparkles::outbound::OutboundPolicy {
+            allow_private: true,
+            ..Default::default()
+        },
+    )));
+    put_assistant(&st_cap, "org", json!({ "enabled": true, "send": "schema" })).await;
+    let srv_cap = McpServer::new(st_cap.clone(), McpConfig::default());
+    let cap_call = call_for(alice.clone());
+    let cap_flag = cap_call.cancel.clone();
+    let cap_first = {
+        let srv = srv_cap.clone();
+        tokio::spawn(async move {
+            srv.call(
+                "ask",
+                args_map(
+                    json!({ "dataset": "org", "question": "List teams", "timeoutSeconds": 5 }),
+                ),
+                cap_call,
+            )
+            .await
+            .unwrap()
+        })
+    };
+    cap_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("first ask should reach cap mock");
+    cap_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    let cap_err1 = cap_first.await.unwrap().err().unwrap();
+    assert_eq!(cap_err1.code.as_ref(), "cancelled", "{cap_err1:?}");
+
+    let cap_second = {
+        let srv = srv_cap.clone();
+        tokio::spawn(async move {
+            srv.call(
+                "ask",
+                args_map(
+                    json!({ "dataset": "org", "question": "List teams", "timeoutSeconds": 5 }),
+                ),
+                call_for(Principal::local()),
+            )
+            .await
+            .unwrap()
+        })
+    };
+    let cap_models = st_cap.models().unwrap();
+    let wait_park = Instant::now();
+    while cap_models.slot_waiters("cheap") == 0 && wait_park.elapsed() < Duration::from_secs(3) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        cap_models.slot_waiters("cheap") >= 1,
+        "second ask must park on concurrency slot before late settlement"
+    );
+    cap_guard.open();
+    let cap_err2 = cap_second
+        .await
+        .unwrap()
+        .err()
+        .expect("queued ask must be refused after late settlement exhausts provider cap");
+    assert_eq!(cap_err2.code.as_ref(), "budget-exceeded", "{cap_err2:?}");
+    assert_eq!(
+        cap_mock.requests().len(),
+        1,
+        "queued ask must not send a second POST after daily cap exhaustion"
+    );
+
+    // 1c. Late abandoned retry with cache-read tokens rounds once per step in both
+    //     provider daily counters and Ask daily/metric counters while keeping raw tokens/cost.
+    let (cache_tx, cache_rx) = std::sync::mpsc::channel::<()>();
+    let cache_gate = Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
+    let cache_guard = GateGuard(cache_gate.clone());
+    let cache_mock = {
+        let gate = cache_gate.clone();
+        let cache_tx = parking_lot::Mutex::new(Some(cache_tx));
+        MockModel::start(move |_, n| {
+            if n == 0 {
+                return (
+                    500,
+                    json!({
+                        "error": { "message": "temporary failure" },
+                        "usage": {
+                            "prompt_tokens": 5,
+                            "completion_tokens": 0,
+                            "prompt_tokens_details": { "cached_tokens": 5 }
+                        }
+                    }),
+                );
+            }
+            if let Some(tx) = cache_tx.lock().take() {
+                let _ = tx.send(());
+                wait_gate(&gate, Duration::from_secs(10));
+            }
+            (
+                200,
+                json!({
+                    "choices": [{
+                        "message": { "content": draft_json(TEAMS_QUERY) },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 5,
+                        "completion_tokens": 0,
+                        "prompt_tokens_details": { "cached_tokens": 5 }
+                    }
+                }),
+            )
+        })
+    };
+    let cache_cfg = json!({
+        "providers": {
+            "cheap": {
+                "kind": "openai",
+                "endpoint": cache_mock.url(),
+                "requestTimeoutSecs": 5,
+                "budget": { "tokensPerDay": 500 },
+                "pricing": { "inputPerMTok": 10.0, "outputPerMTok": 20.0, "cacheReadPerMTok": 1.0 },
+                "allowedModels": ["m"]
+            }
+        },
+        "roles": { "draft": [{ "provider": "cheap", "model": "m" }] }
+    });
+    let st_cache = make_state(Some(Models::new(
+        ModelsConfig::parse(&cache_cfg.to_string()).unwrap(),
+        Default::default(),
+        sparkles::outbound::OutboundPolicy {
+            allow_private: true,
+            ..Default::default()
+        },
+    )));
+    put_assistant(
+        &st_cache,
+        "org",
+        json!({ "enabled": true, "send": "schema" }),
+    )
+    .await;
+    let srv_cache = McpServer::new(st_cache.clone(), McpConfig::default());
+    let cache_call = call_for(alice.clone());
+    let cache_flag = cache_call.cancel.clone();
+    let cache_handle = {
+        let srv = srv_cache.clone();
+        tokio::spawn(async move {
+            srv.call(
+                "ask",
+                args_map(
+                    json!({ "dataset": "org", "question": "List teams", "timeoutSeconds": 5 }),
+                ),
+                cache_call,
+            )
+            .await
+            .unwrap()
+        })
+    };
+    cache_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("retry attempt should arrive at cache mock");
+    cache_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    let cache_err = cache_handle.await.unwrap().err().unwrap();
+    assert_eq!(cache_err.code.as_ref(), "cancelled", "{cache_err:?}");
+
+    cache_guard.open();
+    let cache_wait = Instant::now();
+    let mut cache_read_seen = 0u64;
+    while cache_wait.elapsed() < Duration::from_secs(3) {
+        let u = st_cache.asks.usage_json(1);
+        cache_read_seen = u["datasets"][0]["tokens"][0]["cacheReadInputTokens"]
+            .as_u64()
+            .unwrap_or(0);
+        if cache_read_seen >= 10 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let u = st_cache.asks.usage_json(1);
+    assert_eq!(
+        cache_read_seen, 10,
+        "raw cache-read tokens must sum to 10: {u}"
+    );
+    assert_eq!(
+        u["datasets"][0]["tokens"][0]["budgetTokens"], 1,
+        "Ask metrics budgetTokens must round once per step to 1: {u}"
+    );
+    assert!(
+        u["datasets"][0]["tokens"][0]["estimatedCost"]
+            .as_f64()
+            .is_some_and(|c| c > 0.0),
+        "Ask metrics estimatedCost must retain abandoned usage cost: {u}"
+    );
+    assert_eq!(
+        st_cache.asks.tokens_today("org", Some(&alice.id())),
+        1,
+        "principal daily tokens must round once per step to 1"
+    );
+    assert_eq!(
+        st_cache.asks.tokens_today("org", None),
+        1,
+        "dataset daily tokens must round once per step to 1"
+    );
+    assert_eq!(
+        st_cache.models().unwrap().describe()["providers"][0]["budget"]["usedToday"],
+        1,
+        "provider daily tokens must round once per step to 1"
+    );
 
     // 2. Deadline expiry while waiting for a provider concurrency slot sends 0 requests for caller 2.
     let slot_mock = MockModel::start(|_, _| {

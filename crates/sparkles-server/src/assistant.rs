@@ -473,7 +473,10 @@ impl Runtime {
     }
 
     /// Record late token usage reported by an in-flight provider HTTP request that
-    /// finished after its ask was cancelled or timed out.
+    /// finished after its ask was cancelled or timed out. `budget_tokens` is the
+    /// incremental rounded budget charge for the step (not an independent re-rounding of
+    /// `usage`), while raw token counts and estimated cost are added in full.
+    #[allow(clippy::too_many_arguments)]
     pub fn charge_abandoned(
         &self,
         dataset: &str,
@@ -481,13 +484,15 @@ impl Runtime {
         provider: &str,
         model: &str,
         usage: crate::models::admission::Usage,
+        budget_tokens: u64,
         estimated_cost: Option<f64>,
     ) {
-        let tokens = usage.budget();
-        if tokens == 0 && usage == crate::models::admission::Usage::default() {
+        if budget_tokens == 0 && usage == crate::models::admission::Usage::default() {
             return;
         }
-        self.add_tokens(dataset, principal, tokens);
+        if budget_tokens > 0 {
+            self.add_tokens(dataset, principal, budget_tokens);
+        }
         let add = |c: &mut Counts| {
             let t = c
                 .tokens
@@ -495,7 +500,7 @@ impl Runtime {
                 .or_default();
             t.0 = t.0.plus(usage);
             t.1 += estimated_cost.unwrap_or(0.0);
-            t.2 += tokens;
+            t.2 += budget_tokens;
         };
         {
             let mut u = self.usage.lock();

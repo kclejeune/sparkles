@@ -333,6 +333,8 @@ impl StepError {
 pub(super) struct Slots {
     max: usize,
     used: Mutex<usize>,
+    #[cfg(test)]
+    waiters: std::sync::atomic::AtomicUsize,
     cv: Condvar,
 }
 
@@ -354,7 +356,24 @@ impl Slots {
         cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<SlotGuard, bool> {
         let mut used = self.used.lock();
+        #[cfg(test)]
+        struct WaiterGuard<'a>(&'a std::sync::atomic::AtomicUsize, bool);
+        #[cfg(test)]
+        impl Drop for WaiterGuard<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+        }
+        #[cfg(test)]
+        let mut waiter = WaiterGuard(&self.waiters, false);
         while *used >= self.max {
+            #[cfg(test)]
+            if !waiter.1 {
+                waiter.0.fetch_add(1, Ordering::SeqCst);
+                waiter.1 = true;
+            }
             if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                 return Err(true);
             }
@@ -442,6 +461,8 @@ impl Models {
                         slots: Arc::new(Slots {
                             max: p.concurrency.unwrap_or(config::DEFAULT_CONCURRENCY),
                             used: Mutex::new(0),
+                            #[cfg(test)]
+                            waiters: std::sync::atomic::AtomicUsize::new(0),
                             cv: Condvar::new(),
                         }),
                         next: Mutex::new(Instant::now()),
@@ -770,9 +791,18 @@ impl Models {
         )
     }
 
+    /// Number of callers currently parked waiting for a concurrency slot on `provider`.
+    #[cfg(test)]
+    pub(crate) fn slot_waiters(&self, provider: &str) -> usize {
+        self.runtime
+            .get(provider)
+            .map_or(0, |rt| rt.slots.waiters.load(Ordering::SeqCst))
+    }
+
     /// [`Models::call_prompt_with_cancel`] with an optional callback that receives late
-    /// provider-reported usage and estimated cost if an in-flight HTTP request completes
-    /// after cancellation or deadline expiry.
+    /// provider-reported usage, incremental rounded budget tokens for this step, and
+    /// estimated cost if an in-flight HTTP request completes after cancellation or
+    /// deadline expiry.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn call_prompt_with_cancel_and_abandoned(
         &self,
@@ -783,7 +813,7 @@ impl Models {
         deadline: Instant,
         admission: Option<&dyn admission::Admission>,
         cancel: Option<&Arc<AtomicBool>>,
-        on_abandoned: Option<Arc<dyn Fn(admission::Usage, Option<f64>) + Send + Sync>>,
+        on_abandoned: Option<Arc<dyn Fn(admission::Usage, u64, Option<f64>) + Send + Sync>>,
     ) -> Result<Answer, Failure> {
         let mut rec = StepRecord {
             role,
@@ -845,6 +875,19 @@ impl Models {
         };
         let m = p.model(&pair.model);
         let pricing = m.pricing;
+        let check_budget = || -> Option<StepError> {
+            let cap = p.budget.and_then(|b| b.tokens_per_day)?;
+            let mut t = rt.tokens.lock();
+            if t.0 != today() {
+                *t = (today(), 0);
+            }
+            (t.1 >= cap).then(|| {
+                StepError::Budget(format!(
+                    "provider {}'s daily budget of {cap} tokens is used up",
+                    pair.provider
+                ))
+            })
+        };
         let charge_usage = |rec: &mut StepRecord, usage: admission::Usage| {
             if usage == admission::Usage::default() {
                 return;
@@ -891,21 +934,9 @@ impl Models {
                     rec.latency = started.elapsed();
                     return fail(StepError::Cancelled, rec);
                 }
-                if let Some(cap) = p.budget.and_then(|b| b.tokens_per_day) {
-                    let mut t = rt.tokens.lock();
-                    if t.0 != today() {
-                        *t = (today(), 0);
-                    }
-                    if t.1 >= cap {
-                        rec.latency = started.elapsed();
-                        return fail(
-                            StepError::Budget(format!(
-                                "provider {}'s daily budget of {cap} tokens is used up",
-                                pair.provider
-                            )),
-                            rec,
-                        );
-                    }
+                if let Some(err) = check_budget() {
+                    rec.latency = started.elapsed();
+                    return fail(err, rec);
                 }
                 let timeout = pair
                     .request_timeout_secs
@@ -925,6 +956,12 @@ impl Models {
                         return fail(StepError::Deadline, rec);
                     }
                 };
+                // Re-check the daily cap after acquiring the slot so a queued waiter
+                // observes usage settled by the call that just released the slot.
+                if let Some(err) = check_budget() {
+                    rec.latency = started.elapsed();
+                    return fail(err, rec);
+                }
                 if let Some(rpm) = p.requests_per_minute.filter(|r| *r > 0) {
                     let target = {
                         let mut next = rt.next.lock();
@@ -948,21 +985,28 @@ impl Models {
                             return fail(StepError::Deadline, rec);
                         }
                     }
+                    // Re-check once more after any RPM wait, close to dispatch.
+                    if let Some(err) = check_budget() {
+                        rec.latency = started.elapsed();
+                        return fail(err, rec);
+                    }
                 }
                 if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                     rec.latency = started.elapsed();
                     return fail(StepError::Cancelled, rec);
                 }
                 // Recompute the per-step deadline against the caller's absolute deadline
-                // after waiting on slots and rate limits so the request never overshoots it.
+                // after waiting on slots and rate limits, clamping the duration BEFORE
+                // adding it to `now` so huge configured timeouts never overflow `Instant`.
                 let now = Instant::now();
-                if now >= deadline {
+                let remaining = deadline.saturating_duration_since(now);
+                if remaining.is_zero() {
                     rec.latency = started.elapsed();
                     return fail(StepError::Deadline, rec);
                 }
-                let step_timeout = Duration::from_secs_f64(timeout);
-                let call_deadline = (now + step_timeout).min(deadline);
-                let left = call_deadline.saturating_duration_since(now);
+                let step_timeout = Duration::try_from_secs_f64(timeout).unwrap_or(Duration::MAX);
+                let left = step_timeout.min(remaining);
+                let call_deadline = now + left;
                 let req = ChatRequest {
                     model: pair.model.clone(),
                     system: prompt.system.clone(),
@@ -973,7 +1017,7 @@ impl Models {
                     temperature: m.temperature,
                     reasoning_effort: m.reasoning_effort,
                     num_ctx: m.num_ctx,
-                    timeout: step_timeout.min(left),
+                    timeout: left,
                 };
                 rec.requests += 1;
                 rec.level = Some(level);
@@ -984,12 +1028,11 @@ impl Models {
                 let abandoned_cb: client::AbandonedUsageFn = {
                     let rt_tokens = rt.tokens.clone();
                     let extra = on_abandoned.clone();
-                    Arc::new(move |usage: admission::Usage| {
+                    Arc::new(move |usage: admission::Usage, budget: u64| {
                         if usage == admission::Usage::default() {
                             return;
                         }
-                        let budget = usage.budget();
-                        {
+                        if budget > 0 {
                             let mut t = rt_tokens.lock();
                             if t.0 != today() {
                                 *t = (today(), 0);
@@ -997,7 +1040,7 @@ impl Models {
                             t.1 = t.1.saturating_add(budget);
                         }
                         if let Some(cb) = &extra {
-                            cb(usage, pricing.map(|pr| usage.cost(&pr)));
+                            cb(usage, budget, pricing.map(|pr| usage.cost(&pr)));
                         }
                     })
                 };
@@ -1010,6 +1053,7 @@ impl Models {
                     admission,
                     cancel,
                     Some(slot),
+                    rec.usage(),
                     Some(abandoned_cb),
                 );
                 let resp = match resp {

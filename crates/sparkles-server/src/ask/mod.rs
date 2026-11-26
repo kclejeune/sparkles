@@ -697,15 +697,22 @@ impl Asking<'_, '_> {
     fn abandoned_usage_cb(
         &self,
         pair: &Pair,
-    ) -> Arc<dyn Fn(crate::models::admission::Usage, Option<f64>) + Send + Sync> {
+    ) -> Arc<dyn Fn(crate::models::admission::Usage, u64, Option<f64>) + Send + Sync> {
         let st = self.server.state.clone();
         let dataset = self.o.dataset.clone();
         let principal = self.principal.id();
         let provider = pair.provider.clone();
         let model = pair.model.clone();
-        Arc::new(move |usage, cost| {
-            st.asks
-                .charge_abandoned(&dataset, &principal, &provider, &model, usage, cost);
+        Arc::new(move |usage, budget_tokens, cost| {
+            st.asks.charge_abandoned(
+                &dataset,
+                &principal,
+                &provider,
+                &model,
+                usage,
+                budget_tokens,
+                cost,
+            );
         })
     }
 

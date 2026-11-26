@@ -966,6 +966,34 @@ fn delayed_send_past_absolute_deadline_does_not_post() {
     );
 }
 
+/// RAII guard that opens a condvar gate on drop so an assertion failure cannot leak a
+/// blocked mock handler thread.
+struct GateGuard(Arc<(Mutex<bool>, Condvar)>);
+
+impl GateGuard {
+    fn open(&self) {
+        let mut open = self.0.0.lock();
+        *open = true;
+        self.0.1.notify_all();
+    }
+}
+
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        self.open();
+    }
+}
+
+fn wait_gate(gate: &(Mutex<bool>, Condvar), timeout: Duration) {
+    let mut open = gate.0.lock();
+    let deadline = Instant::now() + timeout;
+    while !*open {
+        if gate.1.wait_until(&mut open, deadline).timed_out() {
+            break;
+        }
+    }
+}
+
 #[test]
 fn cancelled_http_holds_slot_and_settles_admission_ticket() {
     use super::admission::{Admission, Attempt, Settle, Ticket, Usage};
@@ -988,16 +1016,14 @@ fn cancelled_http_holds_slot_and_settles_admission_ticket() {
 
     let (arrived_tx, arrived_rx) = std::sync::mpsc::channel::<()>();
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let gate_guard = GateGuard(gate.clone());
     let mock = {
         let gate = gate.clone();
         let arrived_tx = Mutex::new(Some(arrived_tx));
         MockModel::start(move |_, _| {
             if let Some(tx) = arrived_tx.lock().take() {
                 let _ = tx.send(());
-                let mut open = gate.0.lock();
-                while !*open {
-                    gate.1.wait(&mut open);
-                }
+                wait_gate(&gate, Duration::from_secs(10));
             }
             (
                 200,
@@ -1059,14 +1085,12 @@ fn cancelled_http_holds_slot_and_settles_admission_ticket() {
     assert_eq!(err2.error.code(), "deadline", "{:?}", err2.error);
     assert_eq!(mock.requests().len(), 1);
 
-    // Release the mock response and verify late ticket settlement and provider budget accounting.
-    {
-        let mut open = gate.0.lock();
-        *open = true;
-        gate.1.notify_all();
-    }
+    // Release the mock response and verify both late ticket settlement and provider accounting.
+    gate_guard.open();
     let start = Instant::now();
-    while settled.lock().is_empty() && start.elapsed() < Duration::from_secs(3) {
+    while (settled.lock().is_empty() || m.describe()["providers"][0]["budget"]["usedToday"] != 60)
+        && start.elapsed() < Duration::from_secs(3)
+    {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(
@@ -1081,5 +1105,430 @@ fn cancelled_http_holds_slot_and_settles_admission_ticket() {
     assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 60);
     // Slot is now free for a subsequent call.
     call(&m, "p").unwrap();
+    assert_eq!(mock.requests().len(), 2);
+}
+
+#[test]
+fn queued_call_refused_after_late_settlement_exhausts_provider_cap() {
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel::<()>();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let gate_guard = GateGuard(gate.clone());
+    let mock = {
+        let gate = gate.clone();
+        let arrived_tx = Mutex::new(Some(arrived_tx));
+        MockModel::start(move |_, _| {
+            if let Some(tx) = arrived_tx.lock().take() {
+                let _ = tx.send(());
+                wait_gate(&gate, Duration::from_secs(10));
+            }
+            (
+                200,
+                json!({
+                    "choices": [{
+                        "message": { "content": r#"{"query":"ASK {}"}"# },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 45, "completion_tokens": 15 }
+                }),
+            )
+        })
+    };
+    let m = Arc::new(models(
+        json!({ "p": { "kind": "openai", "endpoint": mock.url(), "concurrency": 1, "requestTimeoutSecs": 5, "budget": { "tokensPerDay": 50 } } }),
+        &[],
+    ));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let h1 = {
+        let m = m.clone();
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            m.call_prompt_with_cancel(
+                Some(Role::Draft),
+                &Pair::new("p", "m1"),
+                &Prompt::plain("system text", "user text"),
+                &draft_schema(),
+                Instant::now() + Duration::from_secs(5),
+                None,
+                Some(&cancel),
+            )
+        })
+    };
+    arrived_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("first request should reach mock");
+    cancel.store(true, Ordering::Relaxed);
+    let err1 = h1.join().unwrap().unwrap_err();
+    assert_eq!(err1.error.code(), "cancelled", "{:?}", err1.error);
+
+    // Queue a second call while the first response is still held so it passes the initial
+    // daily-cap read at 0 and parks waiting for the single concurrency slot.
+    let h2 = {
+        let m = m.clone();
+        std::thread::spawn(move || {
+            m.call_prompt(
+                Some(Role::Draft),
+                &Pair::new("p", "m1"),
+                &Prompt::plain("system text", "user text"),
+                &draft_schema(),
+                Instant::now() + Duration::from_secs(5),
+                None,
+            )
+        })
+    };
+    let wait_start = Instant::now();
+    while m.slot_waiters("p") == 0 && wait_start.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        m.slot_waiters("p") >= 1,
+        "second call must be queued on concurrency slot before late settlement"
+    );
+
+    // Release the first response (60 tokens > 50 cap). When the slot frees, the queued
+    // call must re-check the daily cap and refuse without posting.
+    gate_guard.open();
+    let err2 = h2.join().unwrap().unwrap_err();
+    assert_eq!(err2.error.code(), "budget-exceeded", "{:?}", err2.error);
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "queued call must not send a POST after late settlement exhausted the daily cap"
+    );
+    assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 60);
+}
+
+#[test]
+fn paused_worker_during_http_setup_aborts_without_posting() {
+    use super::admission::{Admission, Attempt, Settle, Ticket, Usage};
+
+    struct RecordSettle(Arc<Mutex<Vec<Option<Usage>>>>);
+    impl Settle for RecordSettle {
+        fn reported(self: Box<Self>, usage: Usage) {
+            self.0.lock().push(Some(usage));
+        }
+        fn unknown(self: Box<Self>) {
+            self.0.lock().push(None);
+        }
+    }
+    struct TrackAdmit(Arc<Mutex<Vec<Option<Usage>>>>);
+    impl Admission for TrackAdmit {
+        fn admit(&self, _: &Attempt<'_>) -> Result<Ticket, CallError> {
+            Ok(Ticket::new(Box::new(RecordSettle(self.0.clone()))))
+        }
+    }
+
+    // 1. Cancellation during HTTP setup (after admission, request construction, and header hook).
+    let mock_cancel = MockModel::start(|_, _| (200, mock::openai(r#"{"query":"ASK {}"}"#)));
+    let url_cancel = format!("{}/chat/completions", mock_cancel.url());
+    let (hook_tx, hook_rx) = std::sync::mpsc::channel::<()>();
+    let gate_cancel = Arc::new((Mutex::new(false), Condvar::new()));
+    let gate_cancel_guard = GateGuard(gate_cancel.clone());
+    let _before_send_cancel = {
+        let gate = gate_cancel.clone();
+        let hook_tx = Mutex::new(Some(hook_tx));
+        sparkles::outbound::probe::BeforeSendHook::install(url_cancel, move || {
+            if let Some(tx) = hook_tx.lock().take() {
+                let _ = tx.send(());
+                wait_gate(&gate, Duration::from_secs(10));
+            }
+        })
+    };
+    let m_cancel = Arc::new(models(
+        json!({ "p": { "kind": "openai", "endpoint": mock_cancel.url(), "requestTimeoutSecs": 5 } }),
+        &[],
+    ));
+    let settled_cancel = Arc::new(Mutex::new(Vec::new()));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let h_cancel = {
+        let m = m_cancel.clone();
+        let settled = settled_cancel.clone();
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            let admit = TrackAdmit(settled);
+            m.call_prompt_with_cancel(
+                Some(Role::Draft),
+                &Pair::new("p", "m1"),
+                &Prompt::plain("system text", "user text"),
+                &draft_schema(),
+                Instant::now() + Duration::from_secs(5),
+                Some(&admit),
+                Some(&cancel),
+            )
+        })
+    };
+    hook_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("worker should reach pre-send hook after admission and setup");
+    cancel.store(true, Ordering::Relaxed);
+    let err = h_cancel.join().unwrap().unwrap_err();
+    assert_eq!(err.error.code(), "cancelled", "{:?}", err.error);
+    gate_cancel_guard.open();
+    let start = Instant::now();
+    while settled_cancel.lock().is_empty() && start.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        mock_cancel.requests().len(),
+        0,
+        "cancellation during HTTP setup must prevent POST"
+    );
+    assert_eq!(
+        *settled_cancel.lock(),
+        vec![Some(Usage::default())],
+        "ticket aborted before send must settle as not_sent"
+    );
+
+    // 2. Deadline expiry during HTTP setup (after admission, request construction, and header hook).
+    let mock_dl = MockModel::start(|_, _| (200, mock::openai(r#"{"query":"ASK {}"}"#)));
+    let url_dl = format!("{}/chat/completions", mock_dl.url());
+    let (dl_tx, dl_rx) = std::sync::mpsc::channel::<()>();
+    let gate_dl = Arc::new((Mutex::new(false), Condvar::new()));
+    let gate_dl_guard = GateGuard(gate_dl.clone());
+    let _before_send_dl = {
+        let gate = gate_dl.clone();
+        let dl_tx = Mutex::new(Some(dl_tx));
+        sparkles::outbound::probe::BeforeSendHook::install(url_dl, move || {
+            if let Some(tx) = dl_tx.lock().take() {
+                let _ = tx.send(());
+                wait_gate(&gate, Duration::from_secs(10));
+            }
+        })
+    };
+    let m_dl = Arc::new(models(
+        json!({ "p": { "kind": "openai", "endpoint": mock_dl.url(), "requestTimeoutSecs": 5 } }),
+        &[],
+    ));
+    let settled_dl = Arc::new(Mutex::new(Vec::new()));
+    let cancel_dl = Arc::new(AtomicBool::new(false));
+    let h_dl = {
+        let m = m_dl.clone();
+        let settled = settled_dl.clone();
+        let cancel = cancel_dl.clone();
+        std::thread::spawn(move || {
+            let admit = TrackAdmit(settled);
+            m.call_prompt_with_cancel(
+                Some(Role::Draft),
+                &Pair::new("p", "m1"),
+                &Prompt::plain("system text", "user text"),
+                &draft_schema(),
+                Instant::now() + Duration::from_millis(80),
+                Some(&admit),
+                Some(&cancel),
+            )
+        })
+    };
+    dl_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("worker should reach pre-send hook before deadline expires");
+    let err_dl = h_dl.join().unwrap().unwrap_err();
+    assert_eq!(err_dl.error.code(), "deadline", "{:?}", err_dl.error);
+    gate_dl_guard.open();
+    let start = Instant::now();
+    while settled_dl.lock().is_empty() && start.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        mock_dl.requests().len(),
+        0,
+        "deadline expiry during HTTP setup must prevent POST"
+    );
+    assert_eq!(
+        *settled_dl.lock(),
+        vec![Some(Usage::default())],
+        "ticket expired before send must settle as not_sent"
+    );
+}
+
+#[test]
+fn completed_response_observed_after_deadline_fails_and_settles_usage() {
+    use super::admission::{Admission, Attempt, Settle, Ticket, Usage};
+
+    struct RecordSettle(Arc<Mutex<Vec<Option<Usage>>>>);
+    impl Settle for RecordSettle {
+        fn reported(self: Box<Self>, usage: Usage) {
+            self.0.lock().push(Some(usage));
+        }
+        fn unknown(self: Box<Self>) {
+            self.0.lock().push(None);
+        }
+    }
+    struct TrackAdmit(Arc<Mutex<Vec<Option<Usage>>>>);
+    impl Admission for TrackAdmit {
+        fn admit(&self, _: &Attempt<'_>) -> Result<Ticket, CallError> {
+            Ok(Ticket::new(Box::new(RecordSettle(self.0.clone()))))
+        }
+    }
+
+    let mock = MockModel::start(|_, _| {
+        (
+            200,
+            json!({
+                "choices": [{
+                    "message": { "content": r#"{"query":"ASK {}"}"# },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 45, "completion_tokens": 15 }
+            }),
+        )
+    });
+    let url = format!("{}/chat/completions", mock.url());
+    let _consume_delay = super::client::test_hooks::BeforeConsumeHook::install(url, || {
+        std::thread::sleep(Duration::from_millis(120));
+    });
+    let m = models(
+        json!({ "p": { "kind": "openai", "endpoint": mock.url(), "requestTimeoutSecs": 5, "budget": { "tokensPerDay": 500 } } }),
+        &[],
+    );
+    let settled = Arc::new(Mutex::new(Vec::new()));
+    let admit = TrackAdmit(settled.clone());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let err = m
+        .call_prompt_with_cancel(
+            Some(Role::Draft),
+            &Pair::new("p", "m1"),
+            &Prompt::plain("system text", "user text"),
+            &draft_schema(),
+            Instant::now() + Duration::from_millis(60),
+            Some(&admit),
+            Some(&cancel),
+        )
+        .unwrap_err();
+    assert_eq!(err.error.code(), "deadline", "{:?}", err.error);
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(
+        *settled.lock(),
+        vec![Some(Usage {
+            input: 45,
+            output: 15,
+            ..Default::default()
+        })],
+        "completed response rejected after deadline must still settle admission ticket"
+    );
+    assert_eq!(
+        m.describe()["providers"][0]["budget"]["usedToday"],
+        60,
+        "completed response rejected after deadline must still charge provider daily budget"
+    );
+}
+
+#[test]
+fn late_abandoned_usage_rounds_cache_reads_once_per_step() {
+    use super::admission::Usage;
+
+    let (retry_tx, retry_rx) = std::sync::mpsc::channel::<()>();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let gate_guard = GateGuard(gate.clone());
+    let mock = {
+        let gate = gate.clone();
+        let retry_tx = Mutex::new(Some(retry_tx));
+        MockModel::start(move |_, n| {
+            if n == 0 {
+                return (
+                    500,
+                    json!({
+                        "error": { "message": "temporary failure" },
+                        "usage": {
+                            "prompt_tokens": 5,
+                            "completion_tokens": 0,
+                            "prompt_tokens_details": { "cached_tokens": 5 }
+                        }
+                    }),
+                );
+            }
+            if let Some(tx) = retry_tx.lock().take() {
+                let _ = tx.send(());
+                wait_gate(&gate, Duration::from_secs(10));
+            }
+            (
+                200,
+                json!({
+                    "choices": [{
+                        "message": { "content": r#"{"query":"ASK {}"}"# },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 5,
+                        "completion_tokens": 0,
+                        "prompt_tokens_details": { "cached_tokens": 5 }
+                    }
+                }),
+            )
+        })
+    };
+    let m = Arc::new(models(
+        json!({
+            "p": {
+                "kind": "openai",
+                "endpoint": mock.url(),
+                "requestTimeoutSecs": 5,
+                "budget": { "tokensPerDay": 500 },
+                "pricing": { "inputPerMTok": 10.0, "outputPerMTok": 20.0, "cacheReadPerMTok": 1.0 }
+            }
+        }),
+        &[],
+    ));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (abandoned_tx, abandoned_rx) = std::sync::mpsc::channel::<(Usage, u64, Option<f64>)>();
+    let h = {
+        let m = m.clone();
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            let cb = Arc::new(move |u: Usage, budget: u64, cost: Option<f64>| {
+                let _ = abandoned_tx.send((u, budget, cost));
+            });
+            m.call_prompt_with_cancel_and_abandoned(
+                Some(Role::Draft),
+                &Pair::new("p", "m1"),
+                &Prompt::plain("system text", "user text"),
+                &draft_schema(),
+                Instant::now() + Duration::from_secs(5),
+                None,
+                Some(&cancel),
+                Some(cb),
+            )
+        })
+    };
+    retry_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("retry attempt should reach mock");
+    cancel.store(true, Ordering::Relaxed);
+    let err = h.join().unwrap().unwrap_err();
+    assert_eq!(err.error.code(), "cancelled", "{:?}", err.error);
+    assert_eq!(err.record.cache_read_tokens, 5);
+    assert_eq!(err.record.budget_tokens(), 1);
+    assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 1);
+
+    gate_guard.open();
+    let (late_usage, delta_budget, late_cost) = abandoned_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("abandoned retry should report late usage");
+    assert_eq!(late_usage.cache_read, 5);
+    assert_eq!(
+        delta_budget, 0,
+        "10 cumulative cache-read tokens in one step must round once to 1 budget token"
+    );
+    assert!(
+        late_cost.is_some_and(|c| c > 0.0),
+        "raw cost for abandoned tokens must be preserved: {late_cost:?}"
+    );
+    assert_eq!(
+        m.describe()["providers"][0]["budget"]["usedToday"],
+        1,
+        "provider daily budget must count 1 token, not 2"
+    );
+}
+
+#[test]
+fn large_request_timeout_clamped_to_caller_deadline_without_overflow() {
+    let mock = MockModel::start(|_, _| (200, mock::openai(r#"{"query":"ASK {}"}"#)));
+    let m = models(
+        json!({
+            "p1": { "kind": "openai", "endpoint": mock.url(), "requestTimeoutSecs": 1e19 },
+            "p2": { "kind": "openai", "endpoint": mock.url(), "requestTimeoutSecs": 1e300 }
+        }),
+        &[],
+    );
+    call(&m, "p1").expect("1e19 requestTimeoutSecs must clamp to caller deadline without overflow");
+    call(&m, "p2").expect("1e300 requestTimeoutSecs must clamp to caller deadline without panic");
     assert_eq!(mock.requests().len(), 2);
 }
