@@ -3424,9 +3424,9 @@ mod partial_tests {
     fn proof_decode_admits_nested_triple_allocations() {
         let store = sparkles_core::store::Store::in_memory(Default::default());
         let mut term: Term = oxrdf::NamedNode::new_unchecked("urn:o").into();
-        let subject = oxrdf::NamedNode::new_unchecked("urn:s");
-        let predicate = oxrdf::NamedNode::new_unchecked("urn:p");
-        for _ in 0..16 {
+        let subject = oxrdf::NamedNode::new_unchecked("urn:subject-0123");
+        let predicate = oxrdf::NamedNode::new_unchecked("urn:predica-0123");
+        for _ in 0..sparkles_core::nesting::MAX_TRIPLE_TERMS {
             term = Term::Triple(Box::new(oxrdf::Triple::new(
                 subject.clone(),
                 predicate.clone(),
@@ -3435,19 +3435,26 @@ mod partial_tests {
         }
         let key = sparkles_core::id::term_key(&term);
         let limit = key.len() * 2;
+        let decoded_bytes = term_bytes(&term);
+        // Keep the cap well above `anyhow::Error` backtrace capture under `RUST_BACKTRACE=1`
+        // while still far below the decoded nested `Term` size.
+        assert!(
+            limit >= 16_384 && limit < decoded_bytes,
+            "nested triple limit ({limit}) must exceed error backtrace overhead and stay below decoded size ({decoded_bytes})"
+        );
         let terms = Terms::new(store.snapshot());
         let id = terms.id_for(&term).unwrap();
         let budget = Budget::new(Some(limit));
         let (result, peak) = crate::alloc_probe::peak_of(|| terms.term_admitted(id, &budget));
         assert!(
             peak <= limit,
-            "decoded a nested triple over budget (peak={peak})"
+            "decoded a nested triple over budget (peak={peak}, limit={limit})"
         );
         assert!(BudgetFailure::from_anyhow(&result.unwrap_err()).is_some());
         assert_eq!(budget.used(), 0);
         let (decoded, held) = terms.term_admitted(id, &Budget::unlimited()).unwrap();
         assert_eq!(decoded.as_ref(), Some(&term));
-        assert_eq!(held.bytes(), term_bytes(&term));
+        assert_eq!(held.bytes(), decoded_bytes);
     }
 
     #[test]
