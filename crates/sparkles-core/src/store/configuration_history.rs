@@ -13,11 +13,15 @@ pub(super) mod primary;
 mod validation;
 
 pub(super) use imported::Identities as OriginalIdentities;
-pub(super) use imported::context::Pending as ImportedOpening;
+pub(super) use imported::context::{Pending as ImportedOpening, Retained as ImportedRetained};
 pub(crate) use imported::reidentify::reidentify_activated_dir;
+#[cfg(test)]
+pub(super) use imported::reidentify::write_clone_destination_with_sync;
 pub(super) use imported::reidentify::{
-    PriorImportFiles, capture_import_files, read_prior_imports_for_clone,
-    resolve_imported_wal_binding, verify_imported_identity, write_clone_destination,
+    DiskClosure, PriorImportFiles, build_branch_standalone_provenance, capture_import_files,
+    capture_materialized_imported_origin, clone_creation_digest, read_anchored_local_file,
+    read_prior_imports_for_clone, verify_imported_identity, verify_imported_identity_for_family,
+    write_clone_destination, write_memory_clone_origin,
 };
 pub(super) use imported::{
     MAX_MEMBERS as SOURCE_MEMBER_LIMIT, SourceFile as SourceFilePin, SourceManifest,
@@ -25,6 +29,14 @@ pub(super) use imported::{
     opening_origin_info, original_branch_table_document, original_history_document,
     source_member as source_metadata_member, verify_staged_native_source,
 };
+
+pub(super) fn load_disk_closure_for_family(
+    root: &Path,
+    family: &crate::store::family::Family,
+    preparation: &Preparation,
+) -> Result<Option<DiskClosure>> {
+    DiskClosure::load_for_family(root, family, preparation)
+}
 
 /// Authenticate copied primary configuration references without opening a writer,
 /// recovering a WAL or publishing the directory. Backup restores call this even
@@ -314,6 +326,7 @@ impl Store {
                         ));
                     }
                     if found == seq {
+                        let wal_start = cursor.last_start_offset();
                         let wal_offset = cursor.position().offset;
                         let wal_config = cursor.configuration();
                         let gen_name = entry.name.clone();
@@ -322,10 +335,11 @@ impl Store {
                         drop(history);
                         drop(_held);
                         if !self.is_branch()
-                            && let Some(family_root) = self.managed_root()
-                            && let Some(imported) = resolve_imported_wal_binding(
-                                &family_root,
+                            && let Some(retained) = &self.imported_opening
+                            && let Some(imported) = retained.resolve_wal_binding(
+                                &self.family,
                                 &gen_name,
+                                wal_start,
                                 wal_offset,
                                 seq,
                                 wal_config,
@@ -415,6 +429,9 @@ impl Store {
                     "covered commit is missing its configuration binding",
                 ));
             }
+            if let Some(retained) = &self.imported_opening {
+                retained.check_live_origin(&self.family, preparation)?;
+            }
             if let Some(identity) = binding.configuration() {
                 managed_history::resolve(
                     &root,
@@ -424,7 +441,11 @@ impl Store {
                     preparation,
                 )?;
             } else if let ConfigurationBinding::ImportedUnbound { source } = binding {
-                verify_imported_identity(&root, source, preparation)?;
+                if let Some(retained) = &self.imported_opening {
+                    retained.verify_identity(&self.family, source, preparation)?;
+                } else {
+                    verify_imported_identity_for_family(&root, &self.family, source, preparation)?;
+                }
             }
         } else {
             let memory = installed

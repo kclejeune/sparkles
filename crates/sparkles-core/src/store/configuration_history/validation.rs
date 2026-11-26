@@ -340,6 +340,7 @@ fn inspect_generation(
                         && let (Some(closure), ConfigurationBinding::ImportedUnbound { source }) =
                             (imported, binding)
                     {
+                        primary.check_imported_unbound_base(base, binding)?;
                         closure.verify_identity(source, &temporary)?;
                     } else {
                         primary.generation(family_root, &temporary, base, binding)?;

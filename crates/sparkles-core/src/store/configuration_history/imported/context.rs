@@ -117,12 +117,12 @@ pub(in crate::store) struct Pending {
 /// It is not Clone and has no constructor outside the completed physical proof.
 pub(in crate::store) struct Completed {
     pub(in crate::store) replay: crate::store::Replay,
-    pub(super) imports: Retained,
+    pub(in crate::store) imports: Retained,
 }
 
 /// A future Generation-owned map has no Arc back to Generation or Family. Every
 /// operation must still receive its actual physical owner and current authority.
-pub(super) struct Retained {
+pub(in crate::store) struct Retained {
     sources: Sources,
     ranges: Vec<Range>,
     lock: Arc<crate::store::ProcessLock>,
@@ -141,6 +141,108 @@ struct Headers {
 }
 
 impl Retained {
+    /// Resolve a WAL commit binding on this opening's proven generation using the
+    /// already-authenticated `Sources` and `ranges` without re-hashing the closure.
+    /// Verifies that `origin.json` on disk has not been replaced since opening.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::store) fn resolve_wal_binding(
+        &self,
+        family: &crate::store::family::Family,
+        gen_name: &str,
+        start_offset: u64,
+        end_offset: u64,
+        seq: u64,
+        digest: Option<Sha256Digest>,
+        preparation: &Preparation,
+    ) -> Result<Option<ConfigurationBinding>> {
+        preparation.check()?;
+        family.verify_origin_lock(&self.root, &self.lock)?;
+        family.check_origin_selection(opening_origin_selection(&self.root, preparation)?)?;
+        if gen_name != self.generation_name {
+            return Ok(None);
+        }
+        for range in &self.ranges {
+            let in_span = (range.span.start <= start_offset
+                || (range.span.start == 0 && start_offset == WAL_REC as u64))
+                && end_offset <= range.span.end
+                && seq >= range.span.first_seq
+                && seq <= range.span.last_seq;
+            if !in_span {
+                // Reject any partial/straddling overlap with a proven imported span.
+                if start_offset < range.span.end && end_offset > range.span.start {
+                    return Err(managed_history::unavailable(
+                        "WAL commit boundary straddles an imported interval",
+                    ));
+                }
+                continue;
+            }
+            let node = &self.sources.nodes[range.source];
+            return match digest {
+                Some(generation) => {
+                    let registry = documents::read_member(
+                        &node.directory,
+                        &node.descriptor.value,
+                        crate::managed::FILE,
+                        preparation,
+                    )?;
+                    let history = primary::recorded_root_bytes(&registry.value, preparation)?
+                        .ok_or_else(|| {
+                            managed_history::unavailable("imported source root is missing")
+                        })?;
+                    drop(registry);
+                    let identity = ConfigurationIdentity {
+                        dataset_id: node.descriptor.value.family_id,
+                        lineage_id: history.lineage_id,
+                        generation,
+                    };
+                    drop(documents::source_publication(
+                        &node.directory,
+                        &node.descriptor.value,
+                        identity,
+                        preparation,
+                    )?);
+                    Ok(Some(ConfigurationBinding::ImportedUnbound {
+                        source: identity,
+                    }))
+                }
+                None => {
+                    if !range.header.is_pre_cutoff(seq) {
+                        return Err(managed_history::unavailable(
+                            "covered imported commit is missing its configuration reference",
+                        ));
+                    }
+                    Ok(Some(ConfigurationBinding::LegacyUnbound))
+                }
+            };
+        }
+        Ok(None)
+    }
+
+    /// Authenticate an `ImportedUnbound` identity against this opening's retained
+    /// `Sources` after checking that `origin.json` on disk matches the opening.
+    pub(in crate::store) fn verify_identity(
+        &self,
+        family: &crate::store::family::Family,
+        identity: ConfigurationIdentity,
+        preparation: &Preparation,
+    ) -> Result<()> {
+        preparation.check()?;
+        family.verify_origin_lock(&self.root, &self.lock)?;
+        family.check_origin_selection(opening_origin_selection(&self.root, preparation)?)?;
+        resolve_any_source(&self.sources, identity, preparation)
+    }
+
+    /// Verify live origin selection against the opening's pinned digest.
+    pub(in crate::store) fn check_live_origin(
+        &self,
+        family: &crate::store::family::Family,
+        preparation: &Preparation,
+    ) -> Result<()> {
+        preparation.check()?;
+        family.verify_origin_lock(&self.root, &self.lock)?;
+        family.check_origin_selection(opening_origin_selection(&self.root, preparation)?)
+    }
+
     fn check_owner(
         &self,
         family: &crate::store::family::Family,
@@ -312,13 +414,20 @@ impl Pending {
                 ));
             }
             resolve_any_source(&sources, source, preparation)?;
-        } else {
-            native.generation(root, preparation, actual.commit.seq, actual.configuration)?;
-            if matches!(actual.configuration, ConfigurationBinding::LegacyUnbound) {
+        } else if matches!(actual.configuration, ConfigurationBinding::LegacyUnbound) {
+            // A compaction of an imported destination whose source head was itself
+            // pre-activation (LegacyUnbound) writes a fresh generation below cutoff.
+            // Verify that it is not a clone creation root and that every declared
+            // source covering this sequence genuinely left it LegacyUnbound.
+            if creation.is_some() || !native.is_pre_cutoff(actual.commit.seq) {
+                native.generation(root, preparation, actual.commit.seq, actual.configuration)?;
                 return Err(managed_history::unavailable(
                     "imported legacy base is missing its original physical assignment",
                 ));
             }
+            verify_legacy_unbound_base(&sources, actual.commit.seq, preparation)?;
+        } else {
+            native.generation(root, preparation, actual.commit.seq, actual.configuration)?;
         }
         let mut ranges = Vec::new();
         ranges
@@ -414,14 +523,25 @@ impl Pending {
     }
 
     /// Verify that an opening without a WAL file declares no imported WAL
-    /// intervals for the opened generation.
-    pub(in crate::store) fn verify_no_wal(self) -> Result<()> {
+    /// intervals for the opened generation, returning its retained import map.
+    pub(in crate::store) fn verify_no_wal(self) -> Result<Retained> {
         if !self.ranges.is_empty() {
             return Err(managed_history::unavailable(
                 "imported WAL is missing its declared source intervals",
             ));
         }
-        Ok(())
+        Ok(Retained {
+            generation_uid: self.generation.uid,
+            generation_name: self.generation.name.clone(),
+            sources: self.sources,
+            ranges: self.ranges,
+            lock: self.lock,
+            root: self.root,
+            base: self.base,
+            base_configuration: self.base_configuration,
+            base_origin: self.base_origin,
+            _held: self._held,
+        })
     }
 
     /// The caller lends the one immutable buffer already read by the genuine
@@ -698,6 +818,41 @@ pub(super) fn resolve_any_source(
     Err(managed_history::unavailable(
         "imported configuration identity is not in any declared original source",
     ))
+}
+
+/// Verify that a pre-cutoff compacted `LegacyUnbound` base at `seq` was genuinely
+/// pre-activation in its original source lineage rather than a downgraded bound
+/// commit or clone creation root.
+fn verify_legacy_unbound_base(
+    sources: &Sources,
+    seq: u64,
+    preparation: &Preparation,
+) -> Result<()> {
+    let mut covered_by_source = false;
+    for node in &sources.nodes {
+        preparation.check()?;
+        let Some(main_root) = node.descriptor.value.roots.get("main") else {
+            continue;
+        };
+        if main_root.head < seq {
+            continue;
+        }
+        covered_by_source = true;
+        let mut header =
+            documents::source_header(&node.directory, &node.descriptor.value, "main", preparation)?;
+        header.generation_using(
+            preparation,
+            seq,
+            ConfigurationBinding::LegacyUnbound,
+            &mut |_| Ok(()),
+        )?;
+    }
+    if !covered_by_source {
+        return Err(managed_history::unavailable(
+            "imported legacy base has no declared source covering its sequence",
+        ));
+    }
+    preparation.check()
 }
 
 #[cfg(test)]

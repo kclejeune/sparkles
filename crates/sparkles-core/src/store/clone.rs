@@ -152,12 +152,13 @@ struct Capture {
 }
 
 struct ActivatedCapture {
+    prep: crate::access::Preparation,
     managed_state: Arc<crate::managed::ManagedState>,
     src_family: uuid::Uuid,
     src_logical: uuid::Uuid,
     src_head: u64,
     src_generation: String,
-    source_files: Vec<(String, Vec<u8>)>,
+    source_files: Vec<(String, super::managed_history::Bytes)>,
     prior_imports: Vec<super::configuration_history::PriorImportFiles>,
     prior_direct_sources: Vec<crate::evidence::Sha256Digest>,
 }
@@ -200,6 +201,25 @@ impl Store {
     /// this store is never written.
     /// On any error `dir` is left as it was found (removed, or emptied).
     pub fn clone_to(&self, dir: &Path, opts: &CloneOptions) -> Result<CloneReport> {
+        self.clone_to_inner(dir, opts, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clone_to_with_preparation(
+        &self,
+        dir: &Path,
+        opts: &CloneOptions,
+        prep: &crate::access::Preparation,
+    ) -> Result<CloneReport> {
+        self.clone_to_inner(dir, opts, Some(prep))
+    }
+
+    fn clone_to_inner(
+        &self,
+        dir: &Path,
+        opts: &CloneOptions,
+        preparation: Option<&crate::access::Preparation>,
+    ) -> Result<CloneReport> {
         let t0 = std::time::Instant::now();
         let existed = dir.exists();
         if existed && std::fs::read_dir(dir)?.next().is_some() {
@@ -208,7 +228,7 @@ impl Store {
                 dir.display()
             )));
         }
-        let cap = self.clone_capture(opts)?;
+        let mut cap = self.clone_capture(opts, preparation)?;
         // a definition the clone could not open is refused before anything is written
         super::definitions::check_all(&cap.definitions)?;
         std::fs::create_dir_all(dir)?;
@@ -230,7 +250,8 @@ impl Store {
             id: self.dataset_id,
             seq: snap.commit,
         };
-        let dataset_bytes = if cap.activated.is_some() {
+        let has_activated = cap.activated.is_some();
+        let dataset_bytes = if has_activated {
             commit::with_reader(
                 &commit::clone_dataset_file_bytes(id, now, forked_from),
                 commit::IMPORTED_DESTINATION_READER,
@@ -239,8 +260,7 @@ impl Store {
             commit::clone_dataset_file_bytes(id, now, forked_from)
         };
         write_atomic(&dir.join("dataset.json"), &dataset_bytes)?;
-        let commit_bytes = if let Some(activated) = &cap.activated {
-            let prep = clone_preparation(opts)?;
+        let commit_bytes = if let Some(activated) = cap.activated.take() {
             let installed = match activated.managed_state.as_ref() {
                 crate::managed::ManagedState::Installed(i) => i,
                 crate::managed::ManagedState::Unavailable { reason, .. } => {
@@ -259,10 +279,10 @@ impl Store {
                 activated.src_logical,
                 activated.src_head,
                 &activated.src_generation,
-                activated.source_files.clone(),
+                activated.source_files,
                 &activated.prior_imports,
-                activated.prior_direct_sources.clone(),
-                &prep,
+                activated.prior_direct_sources,
+                &activated.prep,
             )?;
             commit::gen_commit_bytes_with_binding(
                 id,
@@ -278,7 +298,7 @@ impl Store {
         write_synced(&gdir.join("commit.json"), &commit_bytes)?;
         super::wal::create(
             &gdir.join("wal.log"),
-            if cap.activated.is_some() {
+            if has_activated {
                 super::wal::version_with(true, self.control_enabled())
             } else {
                 super::wal::PLAIN_VERSION
@@ -392,7 +412,7 @@ impl Store {
         store_opts: StoreOptions,
     ) -> Result<(Store, CloneReport)> {
         let t0 = std::time::Instant::now();
-        let cap = self.clone_capture(opts)?;
+        let mut cap = self.clone_capture(opts, None)?;
         let tmp = tempfile::Builder::new().prefix("sparkles-mem-").tempdir()?;
         let built =
             self.clone_generation(tmp.path(), &cap, opts, store_opts.min_free_disk_bytes)?;
@@ -429,8 +449,8 @@ impl Store {
         if self.control_enabled() {
             store.enable_control()?;
         }
-        if let Some(activated) = &cap.activated {
-            let prep = clone_preparation(opts)?;
+        if let Some(activated) = cap.activated.take() {
+            let prep = activated.prep;
             let installed = match activated.managed_state.as_ref() {
                 crate::managed::ManagedState::Installed(i) => i,
                 crate::managed::ManagedState::Unavailable { reason, .. } => {
@@ -465,8 +485,45 @@ impl Store {
                     },
                 )]),
             };
-            let (memory, hist_root) =
-                super::managed_history::MemoryHistory::initial(genesis, coverage, &prep)?;
+            // Pin the canonical `generation: 1` creation commit so materialized
+            // backups of this in-memory clone at `seq == 0` carry a valid format 2
+            // `origin.json` with `creationCommit` and restore cleanly.
+            let materialized_root = CommitInfo {
+                generation: 1,
+                ..root
+            };
+            let creation_commit = super::configuration_history::clone_creation_digest(
+                id,
+                &materialized_root,
+                genesis.identity,
+                &prep,
+            )?;
+            let mut origin_retained = 0u64;
+            for (_, b) in &activated.source_files {
+                origin_retained = origin_retained.saturating_add(b.held_bytes());
+            }
+            for (_, files) in &activated.prior_imports {
+                for (_, b) in files {
+                    origin_retained = origin_retained.saturating_add(b.held_bytes());
+                }
+            }
+            let mem_origin = Arc::new(super::managed_history::MemoryOrigin {
+                creation_commit,
+                src_family: activated.src_family,
+                src_logical: activated.src_logical,
+                src_head: activated.src_head,
+                src_generation: activated.src_generation,
+                source_files: activated.source_files,
+                prior_imports: activated.prior_imports,
+                prior_direct_sources: activated.prior_direct_sources,
+                retained_bytes: origin_retained,
+            });
+            let (memory, hist_root) = super::managed_history::MemoryHistory::initial_with_origin(
+                genesis,
+                coverage,
+                Some(mem_origin),
+                &prep,
+            )?;
             let s = store.snapshot();
             store.check_memory(
                 s.generation
@@ -528,9 +585,13 @@ impl Store {
         self.now_ms().max(copied)
     }
 
-    fn clone_capture(&self, opts: &CloneOptions) -> Result<Capture> {
+    fn clone_capture(
+        &self,
+        opts: &CloneOptions,
+        preparation: Option<&crate::access::Preparation>,
+    ) -> Result<Capture> {
         for _ in 0..2 {
-            if let Some(cap) = self.clone_capture_once(opts)? {
+            if let Some(cap) = self.clone_capture_once(opts, preparation)? {
                 return Ok(cap);
             }
         }
@@ -539,7 +600,11 @@ impl Store {
         ))
     }
 
-    fn clone_capture_once(&self, opts: &CloneOptions) -> Result<Option<Capture>> {
+    fn clone_capture_once(
+        &self,
+        opts: &CloneOptions,
+        preparation: Option<&crate::access::Preparation>,
+    ) -> Result<Option<Capture>> {
         self.failpoint("clone-admitting");
         let share = opts.mode != CloneMode::Rebuild && opts.at.is_none();
         let write_opts = crate::guard::WriteOptions {
@@ -548,16 +613,19 @@ impl Store {
             no_wait: opts.no_wait,
             ..Default::default()
         };
-        let prep = clone_preparation(opts)?;
+        let prep = match preparation {
+            Some(p) => p.clone(),
+            None => clone_preparation(opts)?,
+        };
         struct LockedActivated {
             managed_state: Arc<crate::managed::ManagedState>,
             identities: super::configuration_history::OriginalIdentities,
             src_head: u64,
             src_generation: String,
-            local_dataset: Option<Vec<u8>>,
-            local_current: Option<Vec<u8>>,
-            local_commit: Option<Vec<u8>>,
-            local_meta: Option<Vec<u8>>,
+            local_dataset: Option<super::managed_history::Bytes>,
+            local_current: Option<super::managed_history::Bytes>,
+            local_commit: Option<super::managed_history::Bytes>,
+            local_meta: Option<super::managed_history::Bytes>,
         }
         let (snap, next_bnode, lease, definitions, managed, locked_activated) = {
             let w = self.lock_writer(&write_opts)?;
@@ -595,18 +663,34 @@ impl Store {
                 };
                 let (local_dataset, local_current, local_commit, local_meta) =
                     if let Some(root) = &self.root {
-                        let ds = std::fs::read(root.join("dataset.json"))?;
-                        let cur = std::fs::read(root.join("CURRENT"))?;
-                        let gdir = root.join(&src_generation);
+                        let ds = super::configuration_history::read_anchored_local_file(
+                            root,
+                            "dataset.json",
+                            false,
+                            &prep,
+                        )?;
+                        let cur = super::configuration_history::read_anchored_local_file(
+                            root, "CURRENT", false, &prep,
+                        )?;
                         let (cj, mj) = if snap.generation.link.is_none() {
                             (
-                                std::fs::read(gdir.join("commit.json")).ok(),
-                                std::fs::read(gdir.join("meta.json")).ok(),
+                                super::configuration_history::read_anchored_local_file(
+                                    root,
+                                    &format!("{src_generation}/commit.json"),
+                                    true,
+                                    &prep,
+                                )?,
+                                super::configuration_history::read_anchored_local_file(
+                                    root,
+                                    &format!("{src_generation}/meta.json"),
+                                    true,
+                                    &prep,
+                                )?,
                             )
                         } else {
                             (None, None)
                         };
-                        (Some(ds), Some(cur), cj, mj)
+                        (ds, cur, cj, mj)
                     } else {
                         (None, None, None, None)
                     };
@@ -670,43 +754,81 @@ impl Store {
                 crate::managed::ManagedState::Installed(i) => i,
                 _ => unreachable!("checked installed"),
             };
-            let mut source_files: Vec<(String, Vec<u8>)> = Vec::new();
-            source_files.push((
+            let mut source_files: Vec<(String, super::managed_history::Bytes)> = Vec::new();
+            let push_src = |list: &mut Vec<(String, super::managed_history::Bytes)>,
+                            rel: String,
+                            bytes: super::managed_history::Bytes|
+             -> Result<()> {
+                if list.len() >= super::configuration_history::SOURCE_MEMBER_LIMIT {
+                    return Err(super::managed_history::unavailable(
+                        "clone source provenance exceeds member limit",
+                    ));
+                }
+                list.push((rel, bytes));
+                Ok(())
+            };
+            push_src(
+                &mut source_files,
                 "family-dataset.json".into(),
-                locked.identities.family_document().to_vec(),
-            ));
+                super::managed_history::Bytes::from_vec(
+                    locked.identities.family_document().to_vec(),
+                    &prep,
+                )?,
+            )?;
             let ds_bytes = match locked.local_dataset {
                 Some(b) => b,
                 None if locked.identities.family() == locked.identities.logical() => {
-                    locked.identities.family_document().to_vec()
+                    super::managed_history::Bytes::from_vec(
+                        locked.identities.family_document().to_vec(),
+                        &prep,
+                    )?
                 }
-                None => commit::with_reader(
-                    &commit::dataset_file_bytes(
-                        locked.identities.logical(),
-                        "memory-capture",
-                        self.now_ms(),
-                    ),
-                    super::managed_history::READER,
+                None => super::managed_history::Bytes::from_vec(
+                    commit::with_reader(
+                        &commit::dataset_file_bytes(
+                            locked.identities.logical(),
+                            "memory-capture",
+                            self.now_ms(),
+                        ),
+                        super::managed_history::READER,
+                    )?,
+                    &prep,
                 )?,
             };
-            source_files.push(("dataset.json".into(), ds_bytes));
-            let cur_bytes = locked
-                .local_current
-                .unwrap_or_else(|| format!("{}\n", locked.src_generation).into_bytes());
-            source_files.push(("CURRENT".into(), cur_bytes));
+            push_src(&mut source_files, "dataset.json".into(), ds_bytes)?;
+            let cur_bytes = match locked.local_current {
+                Some(b) => b,
+                None => super::managed_history::Bytes::from_vec(
+                    format!("{}\n", locked.src_generation).into_bytes(),
+                    &prep,
+                )?,
+            };
+            push_src(&mut source_files, "CURRENT".into(), cur_bytes)?;
             if let Some(branch_bytes) = locked.identities.branch_document() {
-                source_files.push(("branch.json".into(), branch_bytes.to_vec()));
+                push_src(
+                    &mut source_files,
+                    "branch.json".into(),
+                    super::managed_history::Bytes::from_vec(branch_bytes.to_vec(), &prep)?,
+                )?;
             }
             if let Some(cj) = locked.local_commit {
-                source_files.push((format!("{}/commit.json", locked.src_generation), cj));
+                push_src(
+                    &mut source_files,
+                    format!("{}/commit.json", locked.src_generation),
+                    cj,
+                )?;
             }
             if let Some(mj) = locked.local_meta {
-                source_files.push((format!("{}/meta.json", locked.src_generation), mj));
+                push_src(
+                    &mut source_files,
+                    format!("{}/meta.json", locked.src_generation),
+                    mj,
+                )?;
             }
             let (prior_imports, prior_direct_sources) = if let Some(family_root) =
                 self.managed_root()
             {
-                let captured = super::managed_history::capture::files(
+                let captured = super::managed_history::capture::files_native_only(
                     &family_root,
                     self.owner_dataset_id(),
                     installed,
@@ -716,44 +838,87 @@ impl Store {
                     return Ok(None);
                 }
                 for cf in captured? {
-                    if cf.path.starts_with("evidence-history/imports/") {
-                        continue;
-                    }
-                    let mut buf = vec![0u8; usize::try_from(cf.len).map_err(|_| prep.exhausted())?];
+                    prep.check()?;
+                    let held = prep.reserve(cf.len.saturating_add(64))?;
+                    let len = usize::try_from(cf.len).map_err(|_| prep.exhausted())?;
+                    let mut buf = Vec::new();
+                    buf.try_reserve_exact(len).map_err(|_| prep.exhausted())?;
+                    buf.resize(len, 0u8);
                     if !buf.is_empty() {
                         cf.read_exact_at(0, &mut buf)?;
                     }
-                    source_files.push((cf.path, buf));
+                    push_src(
+                        &mut source_files,
+                        cf.path,
+                        super::managed_history::Bytes {
+                            value: buf,
+                            _held: held,
+                        },
+                    )?;
+                }
+                // Include family's top-level origin.json as a source member when present.
+                if let Some(origin_bytes) = super::configuration_history::read_anchored_local_file(
+                    &family_root,
+                    "evidence-history/origin.json",
+                    true,
+                    &prep,
+                )? {
+                    push_src(
+                        &mut source_files,
+                        "evidence-history/origin.json".into(),
+                        origin_bytes,
+                    )?;
                 }
                 super::configuration_history::read_prior_imports_for_clone(&family_root, &prep)?
             } else {
                 let memory = installed.history_memory.as_ref().ok_or_else(|| {
                     super::managed_history::unavailable("in-memory configuration history missing")
                 })?;
-                source_files.push((crate::managed::FILE.into(), installed.file_bytes()));
+                push_src(
+                    &mut source_files,
+                    crate::managed::FILE.into(),
+                    super::managed_history::Bytes::from_vec(installed.file_bytes(), &prep)?,
+                )?;
                 for (owner, bytes) in &installed.settings {
-                    source_files.push((owner.settings_file().into(), bytes.to_vec()));
+                    push_src(
+                        &mut source_files,
+                        owner.settings_file().into(),
+                        super::managed_history::Bytes::from_vec(bytes.to_vec(), &prep)?,
+                    )?;
                 }
                 let lineage = memory.coverage.value.lineage_id;
                 let cov_bytes = super::managed_history::encode(&memory.coverage.value, &prep)?;
-                source_files.push((
+                push_src(
+                    &mut source_files,
                     format!("evidence-history/{lineage}/coverage.json"),
-                    cov_bytes.value,
-                ));
+                    cov_bytes,
+                )?;
                 let mut node = Some(memory.as_ref());
                 while let Some(cur) = node {
                     prep.check()?;
                     let hex = cur.prepared.identity.generation.to_string();
                     let hex = hex.strip_prefix("sha256:").expect("canonical digest");
-                    source_files.push((
+                    let held =
+                        prep.reserve((cur.prepared.bytes.value.len() as u64).saturating_add(64))?;
+                    let mut copied = Vec::new();
+                    copied
+                        .try_reserve_exact(cur.prepared.bytes.value.len())
+                        .map_err(|_| prep.exhausted())?;
+                    copied.extend_from_slice(&cur.prepared.bytes.value);
+                    push_src(
+                        &mut source_files,
                         format!("evidence-history/{lineage}/generations/{hex}.json"),
-                        cur.prepared.bytes.value.clone(),
-                    ));
+                        super::managed_history::Bytes {
+                            value: copied,
+                            _held: held,
+                        },
+                    )?;
                     node = cur.previous.as_deref();
                 }
                 (Vec::new(), Vec::new())
             };
             Some(ActivatedCapture {
+                prep,
                 managed_state: locked.managed_state,
                 src_family: locked.identities.family(),
                 src_logical: locked.identities.logical(),

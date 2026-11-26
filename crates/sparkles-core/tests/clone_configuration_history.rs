@@ -25,6 +25,10 @@ fn upd(store: &Store, sparql: &str) {
     update(store, sparql, &QueryOptions::default()).unwrap();
 }
 
+fn insert(store: &Store, label: &str) {
+    upd(store, &format!("INSERT DATA {{ <urn:{label}> <urn:p> 1 }}"));
+}
+
 fn configure_evidence(store: &Store, source_graph: &str, proposal_graph: &str) {
     let settings = Settings {
         enabled: true,
@@ -596,4 +600,489 @@ fn clone_of_activated_store_keeps_paused_views_and_empty_control_keyspace() {
             .dataset_id(),
         dst.dataset_id()
     );
+}
+
+#[test]
+fn cold_retained_clone_generation_0_serves_evidence_view_and_past_state_clone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    let src = activated_store(&src_root);
+    let clone_root = tmp.path().join("clone");
+    src.clone_to(&clone_root, &Default::default()).unwrap();
+
+    // Open with generation retention, write own commit, and compact past gen-0001.
+    let retain_opts = StoreOptions {
+        history_max_generations: 4,
+        ..StoreOptions::default()
+    };
+    let dst = Store::open(&clone_root, retain_opts).unwrap();
+    dst.set_retention(sparkles_core::history::Retention {
+        keep_commits: Some(100),
+        ..Default::default()
+    })
+    .unwrap();
+    let gen0_cfg = dst
+        .evidence_view(&At::Head, &prep())
+        .unwrap()
+        .configuration();
+    insert(&dst, "own-after-clone");
+    dst.compact().unwrap();
+    assert_ne!(
+        std::fs::read_to_string(clone_root.join("CURRENT"))
+            .unwrap()
+            .trim(),
+        "gen-0001"
+    );
+
+    // Cold read of retained sequence 0 must succeed via creationCommit authentication.
+    let cold_at0 = dst
+        .evidence_view(&At::Commit(0), &prep())
+        .expect("cold retained sequence 0 evidence view must succeed");
+    assert_eq!(cold_at0.configuration(), gen0_cfg);
+
+    // Past-state clone from retained sequence 0 must also succeed and reopen cleanly.
+    let past_root = tmp.path().join("past-clone");
+    dst.clone_to(
+        &past_root,
+        &CloneOptions {
+            at: Some(At::Commit(0)),
+            ..Default::default()
+        },
+    )
+    .expect("past-state clone of retained sequence 0 must succeed");
+    let past = Store::open(&past_root, StoreOptions::default()).unwrap();
+    assert_eq!(past.snapshot().len(), src.snapshot().len());
+    assert_eq!(
+        past.evidence_view(&At::Commit(0), &prep())
+            .unwrap()
+            .configuration()
+            .dataset_id(),
+        past.dataset_id()
+    );
+}
+
+#[test]
+fn imported_destination_branch_cutoff_origin_and_cold_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    let src = activated_store(&src_root);
+    insert(&src, "bound-1");
+    let src_cfg = src
+        .evidence_view(&At::Head, &prep())
+        .unwrap()
+        .configuration();
+
+    // Reidentify a copy of `src` so its head has an `ImportedUnbound` binding at seq_head.
+    let dst_root = tmp.path().join("reid");
+    let cap = src.backup_capture("b").unwrap();
+    cap.write_to(&dst_root).unwrap();
+    let new_id = uuid::Uuid::new_v4();
+    sparkles_core::commit::reidentify_configuration_history(
+        &dst_root,
+        new_id,
+        sparkles_core::commit::ForkedFrom {
+            id: src.dataset_id(),
+            seq: src.head_commit().seq,
+        },
+        &Control::none(),
+    )
+    .unwrap();
+    let imported_seq = src.head_commit().seq;
+
+    let dst = Store::open(&dst_root, StoreOptions::default()).unwrap();
+    insert(&dst, "dst-own-write");
+    let own_seq = dst.head_commit().seq;
+
+    // 1. Valid branch forked at imported commit (`ImportedUnbound`) opens, checks,
+    //    compacts, and supports a child branch / cold read.
+    let b_imp = dst
+        .create_branch(
+            "from-imported",
+            &sparkles_core::branch::BranchOptions {
+                at: At::Commit(imported_seq),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b_imp_store = dst.branch("from-imported").unwrap();
+    b_imp_store.compact().unwrap();
+    dst.create_branch(
+        "child-of-imported",
+        &sparkles_core::branch::BranchOptions {
+            from: "from-imported".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let child = dst.branch("child-of-imported").unwrap();
+    assert_eq!(child.snapshot().len(), b_imp_store.snapshot().len());
+    drop(child);
+    drop(b_imp_store);
+    drop(dst);
+
+    assert_eq!(
+        check(&dst_root, &CheckOptions { quick: false })
+            .unwrap()
+            .errors,
+        0
+    );
+    // Reopen family and open the compacted ImportedUnbound branch + child branch.
+    let dst = Store::open(&dst_root, StoreOptions::default()).unwrap();
+    let b_imp_reopened = dst.branch("from-imported").unwrap();
+    assert_eq!(b_imp_reopened.head_commit().seq, imported_seq);
+    let _child_reopened = dst.branch("child-of-imported").unwrap();
+
+    // Create a second branch at `own_seq` (`Known` origin) and write a post-cutoff own commit.
+    let b_head = dst.create_branch("from-head", &Default::default()).unwrap();
+    let b_head_store = dst.branch("from-head").unwrap();
+    insert(&b_head_store, "branch-own-1");
+    b_head_store.compact().unwrap();
+    let b_head_gen = std::fs::read_to_string(
+        dst_root
+            .join("branches")
+            .join(b_head.id.to_string())
+            .join("CURRENT"),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    // Create a third branch at `own_seq` (no own writes -> `branch.json` pins `Known` at `own_seq`).
+    let b_pinned = dst
+        .create_branch("from-head-pinned", &Default::default())
+        .unwrap();
+    drop(_child_reopened);
+    drop(b_imp_reopened);
+    drop(b_head_store);
+    drop(dst);
+    let _ = (b_imp, own_seq);
+
+    // 2. Post-cutoff tamper: rewrite `from-head`'s compacted post-cutoff `commit.json`
+    //    to `ImportedUnbound { source: src_cfg }`. Both `validate_copy` and `open_branch`
+    //    must refuse.
+    let post_tamper = tmp.path().join("tamper-post-cutoff");
+    copy_dir_recursive(&dst_root, &post_tamper);
+    let post_commit_path = post_tamper
+        .join("branches")
+        .join(b_head.id.to_string())
+        .join(&b_head_gen)
+        .join("commit.json");
+    let mut cj: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&post_commit_path).unwrap()).unwrap();
+    cj["configurationBinding"] = serde_json::json!({
+        "kind": "imported-unbound",
+        "source": src_cfg,
+    });
+    std::fs::write(&post_commit_path, serde_json::to_vec_pretty(&cj).unwrap()).unwrap();
+    assert!(
+        sparkles_core::check::configuration_history(&post_tamper, true, &Control::none()).is_err(),
+        "validate_copy must refuse post-cutoff ImportedUnbound branch base"
+    );
+    let reopened = Store::open(&post_tamper, StoreOptions::default()).unwrap();
+    assert!(
+        reopened.branch("from-head").is_err(),
+        "Store::branch must refuse post-cutoff ImportedUnbound branch base"
+    );
+    drop(reopened);
+
+    // 3. Branch-origin mismatch tamper: rewrite `from-head-pinned`'s root `commit.json`
+    //    from `Known` to `ImportedUnbound { source: src_cfg }` while `branch.json` still
+    //    pins `Known`. Both `validate_copy` and `open_branch` must refuse.
+    let origin_tamper = tmp.path().join("tamper-origin-mismatch");
+    copy_dir_recursive(&dst_root, &origin_tamper);
+    let pinned_dir = origin_tamper.join("branches").join(b_pinned.id.to_string());
+    let pinned_gen = std::fs::read_to_string(pinned_dir.join("CURRENT"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let pinned_commit_path = pinned_dir.join(&pinned_gen).join("commit.json");
+    let mut cj: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&pinned_commit_path).unwrap()).unwrap();
+    cj["configurationBinding"] = serde_json::json!({
+        "kind": "imported-unbound",
+        "source": src_cfg,
+    });
+    std::fs::write(&pinned_commit_path, serde_json::to_vec_pretty(&cj).unwrap()).unwrap();
+    assert!(
+        sparkles_core::check::configuration_history(&origin_tamper, true, &Control::none())
+            .is_err(),
+        "validate_copy must refuse origin-mismatched ImportedUnbound branch base"
+    );
+    let reopened = Store::open(&origin_tamper, StoreOptions::default()).unwrap();
+    assert!(
+        reopened.branch("from-head-pinned").is_err(),
+        "Store::branch must refuse origin-mismatched ImportedUnbound branch base"
+    );
+}
+
+#[test]
+fn reader_10_compacted_native_only_refuses_missing_origin_and_format_1_substitution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    let src = activated_store(&src_root);
+    let good = tmp.path().join("clone");
+    src.clone_to(&good, &Default::default()).unwrap();
+    // Write a native commit and compact so CURRENT is native-only (no imported base/ranges).
+    {
+        let s = Store::open(&good, StoreOptions::default()).unwrap();
+        insert(&s, "own-1");
+        s.compact().unwrap();
+    }
+
+    // 1. Delete BOTH origin.json and imports/ -> reader 10 must refuse open and check.
+    let stripped = tmp.path().join("stripped");
+    copy_dir_recursive(&good, &stripped);
+    std::fs::remove_file(stripped.join("evidence-history/origin.json")).unwrap();
+    std::fs::remove_dir_all(stripped.join("evidence-history/imports")).unwrap();
+    assert!(Store::open(&stripped, StoreOptions::default()).is_err());
+    assert!(
+        sparkles_core::check::configuration_history(&stripped, true, &Control::none()).is_err()
+    );
+
+    // 2. Substitute a format-1 origin.json with the same datasetId -> reader 10 must refuse.
+    let fmt1 = tmp.path().join("format1-sub");
+    copy_dir_recursive(&good, &fmt1);
+    let mut origin: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fmt1.join("evidence-history/origin.json")).unwrap())
+            .unwrap();
+    origin["format"] = 1.into();
+    origin.as_object_mut().unwrap().remove("destination");
+    std::fs::write(
+        fmt1.join("evidence-history/origin.json"),
+        serde_json::to_vec(&origin).unwrap(),
+    )
+    .unwrap();
+    assert!(Store::open(&fmt1, StoreOptions::default()).is_err());
+    assert!(sparkles_core::check::configuration_history(&fmt1, true, &Control::none()).is_err());
+}
+
+#[test]
+fn migrate_plan_reports_unsupported_and_under_reader_origin_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    let src = activated_store(&src_root);
+    let good = tmp.path().join("clone");
+    src.clone_to(&good, &Default::default()).unwrap();
+
+    // 1. Unknown origin format 99 reported by migrate::plan.
+    let bad_fmt = tmp.path().join("bad-fmt");
+    copy_dir_recursive(&good, &bad_fmt);
+    let mut origin: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(bad_fmt.join("evidence-history/origin.json")).unwrap(),
+    )
+    .unwrap();
+    origin["format"] = 99.into();
+    std::fs::write(
+        bad_fmt.join("evidence-history/origin.json"),
+        serde_json::to_vec(&origin).unwrap(),
+    )
+    .unwrap();
+    let plan = sparkles_core::migrate::plan(&bad_fmt).unwrap();
+    assert!(
+        plan.refused
+            .iter()
+            .any(|msg| msg.contains("origin.json") && msg.contains("99")),
+        "{plan:?}"
+    );
+
+    // 2. Format 2 origin.json paired with minimumReader 9 reported by migrate::plan.
+    let low_reader = tmp.path().join("low-reader");
+    copy_dir_recursive(&good, &low_reader);
+    let mut ds: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(low_reader.join("dataset.json")).unwrap()).unwrap();
+    ds["minimumReader"] = 9.into();
+    std::fs::write(
+        low_reader.join("dataset.json"),
+        serde_json::to_vec_pretty(&ds).unwrap(),
+    )
+    .unwrap();
+    let plan = sparkles_core::migrate::plan(&low_reader).unwrap();
+    assert!(
+        plan.refused
+            .iter()
+            .any(|msg| msg.contains("origin.json") && msg.contains("reader 10")),
+        "{plan:?}"
+    );
+}
+
+#[test]
+fn live_origin_substitution_is_refused_on_runtime_binding_lookup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    let src = activated_store(&src_root);
+    let clone_root = tmp.path().join("clone");
+    src.clone_to(&clone_root, &Default::default()).unwrap();
+    let dst = Store::open(&clone_root, StoreOptions::default()).unwrap();
+    insert(&dst, "own-live-1");
+    let seq = dst.head_commit().seq;
+    // Sanity check: lookup succeeds before tampering.
+    dst.evidence_view(&At::Commit(seq), &prep()).unwrap();
+
+    // Externally substitute origin.json bytes (whitespace change -> valid JSON, different digest).
+    let origin_path = clone_root.join("evidence-history/origin.json");
+    let mut bytes = std::fs::read(&origin_path).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(&origin_path, &bytes).unwrap();
+
+    assert!(
+        dst.evidence_view(&At::Commit(seq), &prep()).is_err(),
+        "live origin substitution must be detected on runtime configuration lookup"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn disk_closure_refuses_import_symlink_and_dag_cycle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    let src = activated_store(&src_root);
+    let good = tmp.path().join("clone");
+    src.clone_to(&good, &Default::default()).unwrap();
+
+    // 1. Intermediate directory symlink under evidence-history/imports/<hex>/source -> refused.
+    let sym = tmp.path().join("symlinked");
+    copy_dir_recursive(&good, &sym);
+    let imp_dir = std::fs::read_dir(sym.join("evidence-history/imports"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let real_src = tmp.path().join("outside-source");
+    std::fs::rename(imp_dir.join("source"), &real_src).unwrap();
+    std::os::unix::fs::symlink(&real_src, imp_dir.join("source")).unwrap();
+    assert!(Store::open(&sym, StoreOptions::default()).is_err());
+    assert!(sparkles_core::check::configuration_history(&sym, true, &Control::none()).is_err());
+
+    // 2. Self-referential / cyclic dependency in descriptor -> refused by DiskClosure::load.
+    let cyc = tmp.path().join("cycle");
+    copy_dir_recursive(&good, &cyc);
+    let imp_dir = std::fs::read_dir(cyc.join("evidence-history/imports"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let desc_bytes = std::fs::read(imp_dir.join("origin.json")).unwrap();
+    let mut desc: serde_json::Value = serde_json::from_slice(&desc_bytes).unwrap();
+    let self_hex = imp_dir.file_name().unwrap().to_str().unwrap().to_string();
+    desc["sources"] = serde_json::json!([format!("sha256:{self_hex}")]);
+    let new_desc_bytes = serde_json::to_vec(&desc).unwrap();
+    std::fs::write(imp_dir.join("origin.json"), &new_desc_bytes).unwrap();
+    assert!(Store::open(&cyc, StoreOptions::default()).is_err());
+    assert!(sparkles_core::check::configuration_history(&cyc, true, &Control::none()).is_err());
+}
+
+#[test]
+fn reidentify_streams_annotations_respects_cancel_and_guards_misuse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    let src = activated_store(&src_root);
+    // Write multiple annotated commits to exercise streaming annotations.bin & commits.bin.
+    for i in 0..8 {
+        let mut w = src.write_with(
+            sparkles_core::commit::CommitKind::Update,
+            sparkles_core::guard::WriteOptions {
+                message: Some(Arc::from(format!("commit-{i}-{}", "x".repeat(512)))),
+                ..Default::default()
+            },
+        );
+        let s = w
+            .intern(&oxrdf::Term::NamedNode(
+                oxrdf::NamedNode::new(format!("urn:ann:{i}")).unwrap(),
+            ))
+            .unwrap();
+        let p = w
+            .intern(&oxrdf::Term::NamedNode(
+                oxrdf::NamedNode::new("urn:p").unwrap(),
+            ))
+            .unwrap();
+        let o = w
+            .intern(&oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
+                format!("v{i}"),
+            )))
+            .unwrap();
+        w.insert([s, p, o, sparkles_core::id::Id::DEFAULT_GRAPH])
+            .unwrap();
+        w.commit().unwrap();
+    }
+    let src_id = src.dataset_id();
+    let src_seq = src.head_commit().seq;
+    let cap = src.backup_capture("b-ann").unwrap();
+
+    // 1. Plain `commit::reidentify` must refuse an activated directory.
+    let plain_dir = tmp.path().join("plain-reid");
+    cap.write_to(&plain_dir).unwrap();
+    assert!(
+        sparkles_core::commit::reidentify(
+            &plain_dir,
+            uuid::Uuid::new_v4(),
+            sparkles_core::commit::ForkedFrom {
+                id: src_id,
+                seq: src_seq,
+            },
+        )
+        .is_err(),
+        "commit::reidentify must refuse activated stores"
+    );
+
+    // 2. Multi-generation directory must be refused by `reidentify_configuration_history`.
+    let multi_dir = tmp.path().join("multi-gen");
+    cap.write_to(&multi_dir).unwrap();
+    std::fs::create_dir(multi_dir.join("gen-9999")).unwrap();
+    assert!(
+        sparkles_core::commit::reidentify_configuration_history(
+            &multi_dir,
+            uuid::Uuid::new_v4(),
+            sparkles_core::commit::ForkedFrom {
+                id: src_id,
+                seq: src_seq,
+            },
+            &Control::none(),
+        )
+        .is_err(),
+        "reidentify_configuration_history must refuse directories with extra generations"
+    );
+
+    // 3. Cancelled control must return Error::Cancelled cleanly.
+    let cancel_dir = tmp.path().join("cancel-reid");
+    cap.write_to(&cancel_dir).unwrap();
+    let control = Control::none();
+    control.cancel.cancel();
+    assert!(matches!(
+        sparkles_core::commit::reidentify_configuration_history(
+            &cancel_dir,
+            uuid::Uuid::new_v4(),
+            sparkles_core::commit::ForkedFrom {
+                id: src_id,
+                seq: src_seq,
+            },
+            &control,
+        ),
+        Err(sparkles_core::Error::Cancelled)
+    ));
+
+    // 4. Successful streaming reidentification preserves all annotations and checks cleanly.
+    let ok_dir = tmp.path().join("ok-reid");
+    cap.write_to(&ok_dir).unwrap();
+    let new_id = uuid::Uuid::new_v4();
+    sparkles_core::commit::reidentify_configuration_history(
+        &ok_dir,
+        new_id,
+        sparkles_core::commit::ForkedFrom {
+            id: src_id,
+            seq: src_seq,
+        },
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(
+        check(&ok_dir, &CheckOptions { quick: false })
+            .unwrap()
+            .errors,
+        0
+    );
+    let reopened = Store::open(&ok_dir, StoreOptions::default()).unwrap();
+    assert_eq!(reopened.dataset_id(), new_id);
+    let anns = sparkles_core::annotations::read(&ok_dir).unwrap();
+    assert_eq!(anns.len(), 8);
 }

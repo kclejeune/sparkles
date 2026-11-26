@@ -556,27 +556,36 @@ pub(crate) fn read_dataset_file_controlled(
 }
 
 /// Decode an already admitted original dataset document with the same version
-/// and field grammar as the named cold reader. Only a scalar identity escapes.
-pub(crate) fn dataset_id_bytes_controlled(
+/// and field grammar as the named cold reader. Only scalar identity fields escape.
+pub(crate) fn dataset_identity_and_reader_bytes_controlled(
     bytes: &[u8],
     budget: &mut crate::store::cold::ColdBudget<'_>,
-) -> Result<uuid::Uuid> {
+) -> Result<(uuid::Uuid, u32)> {
     budget.check()?;
     let start = budget.used();
     let result = (|| {
         let raw: crate::store::cold::Loaded<serde_json::Value> = budget.json(bytes)?;
         check_dataset_value(&raw.value)?;
         let parsed: DatasetFile = budget.value_fields(raw.value, DATASET_FIELDS)?;
-        let id = parsed.id;
+        let out = (parsed.id, parsed.minimum_reader);
         drop(parsed);
         budget.release(raw.charge);
         budget.check()?;
-        Ok(id)
+        Ok(out)
     })();
     if result.is_err() {
         budget.release(budget.used() - start);
     }
     result
+}
+
+/// Decode an already admitted original dataset document with the same version
+/// and field grammar as the named cold reader. Only a scalar identity escapes.
+pub(crate) fn dataset_id_bytes_controlled(
+    bytes: &[u8],
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+) -> Result<uuid::Uuid> {
+    dataset_identity_and_reader_bytes_controlled(bytes, budget).map(|(id, _)| id)
 }
 
 /// Exercise the actual closed scalar reader with caller-attributed allocation
@@ -733,6 +742,11 @@ pub struct RestoredFrom {
 pub fn reidentify(root: &Path, new_id: uuid::Uuid, forked_from: ForkedFrom) -> Result<()> {
     // a generation version that this dataset does not admit refuses before any rewrite
     crate::formats::check_configuration_versions(root)?;
+    if crate::store::managed_history::activation_recorded(root)? {
+        return Err(Error::Invalid(
+            "activated configuration history requires reidentify_configuration_history".into(),
+        ));
+    }
     let mut ds = read_dataset(root)?
         .ok_or_else(|| Error::Invalid(format!("{} has no dataset.json", root.display())))?;
     let old_id = ds.id;

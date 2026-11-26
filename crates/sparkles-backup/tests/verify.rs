@@ -905,3 +905,546 @@ async fn describe_and_aggregate_errors_settings_round_trip() {
         assert_eq!(r.describe_settings(), describe, "{name}");
     }
 }
+
+#[tokio::test]
+async fn new_identity_restore_compaction_at_pre_activation_legacy_head_reopens_and_reidentifies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let prep =
+        sparkles_core::access::Preparation::new(sparkles_core::task::Control::none(), 64 << 20)
+            .unwrap();
+    let (repo, _) = memory_repo().await;
+
+    for (label, pre_writes) in [("seq0", 0usize), ("legacy2", 2usize)] {
+        let src_root = tmp.path().join(format!("src-{label}"));
+        {
+            let s = Store::open(&src_root, StoreOptions::default()).unwrap();
+            for i in 0..pre_writes {
+                upd(
+                    &s,
+                    &format!("INSERT DATA {{ <urn:pre:{label}:{i}> <urn:p> {i} }}"),
+                );
+            }
+        }
+        // Activate with NO subsequent bound writes -> head is LegacyUnbound.
+        sparkles_core::migrate::activate_configuration_history(&src_root, false, &prep).unwrap();
+        let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+        let b_name = format!("b-{label}");
+        repo.create(
+            src.backup_capture(&b_name).unwrap().into(),
+            &opts(&b_name, "ds"),
+        )
+        .await
+        .unwrap();
+
+        let b_root = tmp.path().join(format!("restored-{label}"));
+        repo.restore(
+            &b_name,
+            &b_root,
+            &RestoreOptions {
+                identity: sparkles_backup::Identity::New,
+                check: sparkles_backup::CheckLevel::Full,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Compact BEFORE any destination own writes -> writes gen-0002 with LegacyUnbound.
+        {
+            let b = Store::open(&b_root, StoreOptions::default()).unwrap();
+            b.compact().unwrap();
+        }
+        let report = sparkles_core::check::check(
+            &b_root,
+            &sparkles_core::check::CheckOptions { quick: false },
+        )
+        .unwrap();
+        assert_eq!(report.errors, 0, "{label}: {report:?}");
+
+        // Reopen, back up compacted copy, and reidentify a second time.
+        let b = Store::open(&b_root, StoreOptions::default()).unwrap();
+        let b2_name = format!("b2-{label}");
+        repo.create(
+            b.backup_capture(&b2_name).unwrap().into(),
+            &opts(&b2_name, "ds"),
+        )
+        .await
+        .unwrap();
+        let c_root = tmp.path().join(format!("reid2-{label}"));
+        repo.restore(
+            &b2_name,
+            &c_root,
+            &RestoreOptions {
+                identity: sparkles_backup::Identity::New,
+                check: sparkles_backup::CheckLevel::Full,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        {
+            let c = Store::open(&c_root, StoreOptions::default()).unwrap();
+            c.compact().unwrap();
+        }
+        let report_c = sparkles_core::check::check(
+            &c_root,
+            &sparkles_core::check::CheckOptions { quick: false },
+        )
+        .unwrap();
+        assert_eq!(report_c.errors, 0, "{label} hop2: {report_c:?}");
+        let c = Store::open(&c_root, StoreOptions::default()).unwrap();
+        upd(
+            &c,
+            &format!("INSERT DATA {{ <urn:own:{label}> <urn:p> 99 }}"),
+        );
+        assert_eq!(
+            c.evidence_view(
+                &sparkles_core::history::At::Commit(c.head_commit().seq),
+                &prep
+            )
+            .unwrap()
+            .configuration()
+            .dataset_id(),
+            c.dataset_id()
+        );
+    }
+
+    // Negative control: tampering a compacted ImportedUnbound base (from a bound source)
+    // down to LegacyUnbound must be refused.
+    let bound_src_root = tmp.path().join("bound-src");
+    let bound_src = configuration_store(&bound_src_root);
+    repo.create(
+        bound_src.backup_capture("b-bound").unwrap().into(),
+        &opts("b-bound", "ds"),
+    )
+    .await
+    .unwrap();
+    let bound_dst = tmp.path().join("bound-dst");
+    repo.restore(
+        "b-bound",
+        &bound_dst,
+        &RestoreOptions {
+            identity: sparkles_backup::Identity::New,
+            check: sparkles_backup::CheckLevel::Full,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    {
+        let s = Store::open(&bound_dst, StoreOptions::default()).unwrap();
+        s.compact().unwrap();
+    }
+    let cur = std::fs::read_to_string(bound_dst.join("CURRENT"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let cj_path = bound_dst.join(&cur).join("commit.json");
+    let mut cj: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cj_path).unwrap()).unwrap();
+    cj["configurationBinding"] = serde_json::json!({ "kind": "legacy-unbound" });
+    std::fs::write(&cj_path, serde_json::to_vec_pretty(&cj).unwrap()).unwrap();
+    assert!(Store::open(&bound_dst, StoreOptions::default()).is_err());
+    assert!(
+        sparkles_core::check::configuration_history(
+            &bound_dst,
+            true,
+            &sparkles_core::task::Control::none()
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn new_identity_restore_retained_imported_wal_allows_cold_rdf_reads_after_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    let src = configuration_store(&src_root);
+    let imported_seq = src.head_commit().seq;
+    let imported_quads = src.snapshot().len();
+    let (repo, _) = memory_repo().await;
+    repo.create(
+        src.backup_capture("b-ret").unwrap().into(),
+        &opts("b-ret", "ds"),
+    )
+    .await
+    .unwrap();
+
+    let dst_root = tmp.path().join("dst-ret");
+    repo.restore(
+        "b-ret",
+        &dst_root,
+        &RestoreOptions {
+            identity: sparkles_backup::Identity::New,
+            check: sparkles_backup::CheckLevel::Full,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let retain_opts = StoreOptions {
+        history_max_generations: 4,
+        ..StoreOptions::default()
+    };
+    let dst = Store::open(&dst_root, retain_opts).unwrap();
+    dst.set_retention(sparkles_core::history::Retention {
+        keep_commits: Some(100),
+        ..Default::default()
+    })
+    .unwrap();
+    upd(&dst, "INSERT DATA { <urn:dst-own> <urn:p> 42 }");
+    dst.compact().unwrap();
+    assert_ne!(
+        std::fs::read_to_string(dst_root.join("CURRENT"))
+            .unwrap()
+            .trim(),
+        "gen-0001"
+    );
+
+    // Cold historical RDF read of the retained imported revision must succeed.
+    let (snap, _) = dst
+        .snapshot_at(
+            &sparkles_core::history::At::Commit(imported_seq),
+            &Default::default(),
+        )
+        .expect("cold RDF snapshot of retained imported WAL must succeed");
+    assert_eq!(snap.len(), imported_quads);
+
+    // Explicit native evidence view for the imported revision must still refuse.
+    let prep =
+        sparkles_core::access::Preparation::new(sparkles_core::task::Control::none(), 64 << 20)
+            .unwrap();
+    assert!(
+        dst.evidence_view(&sparkles_core::history::At::Commit(imported_seq), &prep)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn memory_clone_at_seq_zero_and_materialized_branch_backups_restore_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    let src = configuration_store(&src_root);
+    let prep =
+        sparkles_core::access::Preparation::new(sparkles_core::task::Control::none(), 64 << 20)
+            .unwrap();
+    let (repo, _) = memory_repo().await;
+
+    // 1. Fresh in-memory clone at seq == 0 -> backup & restore (Keep and New).
+    let (mem_clone, _) = src
+        .clone_to_memory(&Default::default(), StoreOptions::default())
+        .unwrap();
+    let mem_cap = mem_clone
+        .memory_backup_capture(
+            "mem-clone-0",
+            &sparkles_core::store::MemoryCaptureOptions {
+                tmp_dir: tmp.path().join("scratch-mem"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    repo.create(mem_cap.into(), &opts("mem-clone-0", "ds-mem"))
+        .await
+        .unwrap();
+    let mem_manifest = repo.manifest("mem-clone-0").await.unwrap();
+    assert!(
+        mem_manifest
+            .requires
+            .iter()
+            .any(|f| f == "evidence-configuration-history/2")
+    );
+    for (name, identity) in [
+        ("mem-kept", sparkles_backup::Identity::Keep),
+        ("mem-new", sparkles_backup::Identity::New),
+    ] {
+        let dir = tmp.path().join(name);
+        repo.restore(
+            "mem-clone-0",
+            &dir,
+            &RestoreOptions {
+                identity,
+                check: sparkles_backup::CheckLevel::Full,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let reopened = Store::open(&dir, StoreOptions::default()).unwrap();
+        assert_eq!(reopened.snapshot().len(), src.snapshot().len());
+        let head = reopened
+            .evidence_view(&sparkles_core::history::At::Head, &prep)
+            .unwrap();
+        assert_eq!(head.configuration().dataset_id(), reopened.dataset_id());
+    }
+
+    // 2. Persistent imported destination -> materialized backup -> restore (Keep & New).
+    let clone_root = tmp.path().join("persistent-clone");
+    src.clone_to(&clone_root, &Default::default()).unwrap();
+    let pclone = Store::open(&clone_root, StoreOptions::default()).unwrap();
+    let mat_cap = pclone
+        .materialized_backup_capture(
+            "pclone-mat",
+            &sparkles_core::store::MemoryCaptureOptions {
+                tmp_dir: tmp.path().join("scratch-pmat"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    repo.create(mat_cap.into(), &opts("pclone-mat", "ds-pclone"))
+        .await
+        .unwrap();
+    for (name, identity) in [
+        ("pmat-kept", sparkles_backup::Identity::Keep),
+        ("pmat-new", sparkles_backup::Identity::New),
+    ] {
+        let dir = tmp.path().join(name);
+        repo.restore(
+            "pclone-mat",
+            &dir,
+            &RestoreOptions {
+                identity,
+                check: sparkles_backup::CheckLevel::Full,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let reopened = Store::open(&dir, StoreOptions::default()).unwrap();
+        assert_eq!(reopened.snapshot().len(), pclone.snapshot().len());
+    }
+
+    // 3. Linked branch (materialized) AND unlinked compacted branch (direct) of an
+    //    imported family -> backup & restore (Keep & New).
+    upd(&pclone, "INSERT DATA { <urn:pclone:1> <urn:p> 1 }");
+    pclone
+        .create_branch("dev-linked", &Default::default())
+        .unwrap();
+    let linked = pclone.branch("dev-linked").unwrap();
+    upd(&linked, "INSERT DATA { <urn:dev:1> <urn:p> 1 }");
+    let linked_cap = linked
+        .materialized_backup_capture(
+            "branch-linked",
+            &sparkles_core::store::MemoryCaptureOptions {
+                tmp_dir: tmp.path().join("scratch-bl"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    repo.create(linked_cap.into(), &opts("branch-linked", "ds-bl"))
+        .await
+        .unwrap();
+
+    pclone
+        .create_branch("dev-unlinked", &Default::default())
+        .unwrap();
+    let unlinked = pclone.branch("dev-unlinked").unwrap();
+    upd(&unlinked, "INSERT DATA { <urn:dev:2> <urn:p> 2 }");
+    unlinked.compact().unwrap();
+    upd(&unlinked, "INSERT DATA { <urn:dev:3> <urn:p> 3 }");
+    repo.create(
+        unlinked.backup_capture("branch-unlinked").unwrap().into(),
+        &opts("branch-unlinked", "ds-bu"),
+    )
+    .await
+    .unwrap();
+
+    for (bname, expected_quads) in [
+        ("branch-linked", linked.snapshot().len()),
+        ("branch-unlinked", unlinked.snapshot().len()),
+    ] {
+        // Branch backups intentionally require a new dataset identity (Keep refuses).
+        let refused = repo
+            .restore(
+                bname,
+                &tmp.path().join(format!("{bname}-kept-refused")),
+                &RestoreOptions {
+                    identity: sparkles_backup::Identity::Keep,
+                    check: sparkles_backup::CheckLevel::Full,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), Code::DuplicateDatasetId, "{bname}");
+
+        for (suffix, identity) in [
+            ("auto", sparkles_backup::Identity::Auto),
+            ("new", sparkles_backup::Identity::New),
+        ] {
+            let dir = tmp.path().join(format!("{bname}-{suffix}"));
+            repo.restore(
+                bname,
+                &dir,
+                &RestoreOptions {
+                    identity,
+                    check: sparkles_backup::CheckLevel::Full,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let reopened = Store::open(&dir, StoreOptions::default()).unwrap();
+            assert_eq!(
+                reopened.snapshot().len(),
+                expected_quads,
+                "{bname}-{suffix}"
+            );
+            upd(&reopened, "INSERT DATA { <urn:after:branch> <urn:p> 9 }");
+            assert_eq!(
+                reopened
+                    .evidence_view(
+                        &sparkles_core::history::At::Commit(reopened.head_commit().seq),
+                        &prep
+                    )
+                    .unwrap()
+                    .configuration()
+                    .dataset_id(),
+                reopened.dataset_id()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn manifest_validate_enforces_v2_origin_and_imports_rules() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    let src = configuration_store(&src_root);
+    let clone_root = tmp.path().join("clone");
+    src.clone_to(&clone_root, &Default::default()).unwrap();
+    let cloned = Store::open(&clone_root, StoreOptions::default()).unwrap();
+    let (repo, _) = memory_repo().await;
+    repo.create(
+        cloned.backup_capture("b-v2").unwrap().into(),
+        &opts("b-v2", "ds"),
+    )
+    .await
+    .unwrap();
+    let valid = repo.manifest("b-v2").await.unwrap();
+    let piece_bytes = sparkles_backup::layout::PIECE_BYTES;
+    let formats = sparkles_core::formats::READABLE_INDEX_FORMATS;
+
+    // 1. evidence-history/origin.json under evidence-configuration-history/1 must fail.
+    let mut v1_with_origin = valid.clone();
+    v1_with_origin.requires = vec!["evidence-configuration-history/1".into()];
+    v1_with_origin
+        .files
+        .retain(|f| !f.path.starts_with("evidence-history/imports/"));
+    assert!(
+        sparkles_backup::manifest::validate(&v1_with_origin, piece_bytes, formats).is_err(),
+        "evidence-history/origin.json must not be accepted under /1"
+    );
+
+    // 2. evidence-configuration-history/2 missing origin.json and imports/ must fail.
+    let mut v2_no_origin = valid.clone();
+    v2_no_origin.files.retain(|f| {
+        f.path != "evidence-history/origin.json" && !f.path.starts_with("evidence-history/imports/")
+    });
+    assert!(
+        sparkles_backup::manifest::validate(&v2_no_origin, piece_bytes, formats).is_err(),
+        "v2 manifest missing origin.json and imports/ must fail"
+    );
+
+    // 3. evidence-configuration-history/2 with origin.json but no imports/ must fail.
+    let mut v2_no_imports = valid.clone();
+    v2_no_imports
+        .files
+        .retain(|f| !f.path.starts_with("evidence-history/imports/"));
+    assert!(
+        sparkles_backup::manifest::validate(&v2_no_imports, piece_bytes, formats).is_err(),
+        "v2 manifest missing imports/ must fail"
+    );
+}
+
+#[tokio::test]
+async fn new_identity_restore_with_check_none_succeeds_and_encrypted_repo_works() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    let src = configuration_store(&src_root);
+    let prep =
+        sparkles_core::access::Preparation::new(sparkles_core::task::Control::none(), 64 << 20)
+            .unwrap();
+    let (repo, _) = memory_repo().await;
+    repo.create(
+        src.backup_capture("b-none").unwrap().into(),
+        &opts("b-none", "ds"),
+    )
+    .await
+    .unwrap();
+
+    // New-identity restore with CheckLevel::None still runs mandatory configuration
+    // verification and opens cleanly.
+    let none_dir = tmp.path().join("new-check-none");
+    let report = repo
+        .restore(
+            "b-none",
+            &none_dir,
+            &RestoreOptions {
+                identity: sparkles_backup::Identity::New,
+                check: sparkles_backup::CheckLevel::None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.identity, "new");
+    assert!(report.check.is_none());
+    let opened = Store::open(&none_dir, StoreOptions::default()).unwrap();
+    assert_eq!(
+        opened
+            .evidence_view(&sparkles_core::history::At::Head, &prep)
+            .unwrap()
+            .configuration()
+            .dataset_id(),
+        opened.dataset_id()
+    );
+
+    #[cfg(feature = "encryption")]
+    {
+        use sparkles_backup::crypto::{EncryptionOptions, LocalKey, LocalKeySource};
+        let enc_repo_dir = tmp.path().join("enc-repo");
+        std::fs::create_dir_all(&enc_repo_dir).unwrap();
+        let url = format!("file://{}", enc_repo_dir.display());
+        let cfg = RepoConfig::from_url("enc", &url).unwrap();
+        let keys = EncryptionOptions {
+            keys: vec![LocalKey::new("online", LocalKeySource::File, [42; 32]).unwrap()],
+            single_key_ok: true,
+            ..Default::default()
+        };
+        let enc_repo = Repository::open_encrypted(&cfg, &OpenEnv::default(), &keys)
+            .await
+            .unwrap();
+        enc_repo
+            .create(
+                src.backup_capture("b-enc").unwrap().into(),
+                &opts("b-enc", "ds"),
+            )
+            .await
+            .unwrap();
+        let enc_dst = tmp.path().join("enc-new");
+        let enc_rep = enc_repo
+            .restore(
+                "b-enc",
+                &enc_dst,
+                &RestoreOptions {
+                    identity: sparkles_backup::Identity::New,
+                    check: sparkles_backup::CheckLevel::None,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(enc_rep.identity, "new");
+        let enc_store = Store::open(&enc_dst, StoreOptions::default()).unwrap();
+        assert_eq!(enc_store.snapshot().len(), src.snapshot().len());
+        assert_eq!(
+            enc_store
+                .evidence_view(&sparkles_core::history::At::Head, &prep)
+                .unwrap()
+                .configuration()
+                .dataset_id(),
+            enc_store.dataset_id()
+        );
+    }
+}

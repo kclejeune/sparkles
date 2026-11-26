@@ -181,9 +181,6 @@ pub fn configuration_history_path(path: &str) -> bool {
     let Some(lineage) = parts.next() else {
         return false;
     };
-    if lineage == "origin.json" {
-        return parts.next().is_none();
-    }
     if !canonical_uuid(lineage) {
         return false;
     }
@@ -199,6 +196,9 @@ pub fn configuration_history_path(path: &str) -> bool {
 /// Closed path grammar for imported provenance closures carried by backups of
 /// cloned or new-identity-restored activated stores (`evidence-configuration-history/2`).
 pub fn imported_configuration_history_path(path: &str) -> bool {
+    if path == "evidence-history/origin.json" {
+        return true;
+    }
     let Some(rest) = path.strip_prefix("evidence-history/imports/") else {
         return false;
     };

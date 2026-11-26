@@ -41,6 +41,30 @@ impl Header {
         self.cutoff.is_some_and(|cutoff| seq < cutoff)
     }
 
+    /// Check cutoff and branch-origin rules for an `ImportedUnbound` generation base.
+    /// The caller authenticates the referenced source publication separately.
+    pub(crate) fn check_imported_unbound_base(
+        &self,
+        seq: u64,
+        binding: ConfigurationBinding,
+    ) -> Result<()> {
+        binding.validate(self.dataset)?;
+        if self
+            .origin
+            .is_some_and(|(root_seq, origin)| root_seq == seq && binding != origin)
+        {
+            return Err(managed_history::unavailable(
+                "branch root configuration differs from its primary origin",
+            ));
+        }
+        if !self.is_pre_cutoff(seq) {
+            return Err(managed_history::unavailable(
+                "covered primary commit is missing its configuration reference",
+            ));
+        }
+        Ok(())
+    }
+
     /// Fixed original facts can be retained, but a prior operation's successful
     /// publication lookup must not hide a missing reference on the next read.
     pub(crate) fn fresh(&self) -> Self {
@@ -387,6 +411,14 @@ impl<'a> References<'a> {
     pub(crate) fn generation(&mut self, seq: u64, binding: ConfigurationBinding) -> Result<()> {
         self.header
             .generation(self.root, self.preparation, seq, binding)
+    }
+
+    pub(crate) fn check_imported_unbound_base(
+        &self,
+        seq: u64,
+        binding: ConfigurationBinding,
+    ) -> Result<()> {
+        self.header.check_imported_unbound_base(seq, binding)
     }
 
     /// Called by the existing replay only after its original complete-commit

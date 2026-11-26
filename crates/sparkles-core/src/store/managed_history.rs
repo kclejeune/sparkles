@@ -181,7 +181,33 @@ pub(crate) struct Owned<T> {
 
 pub(crate) struct Bytes {
     pub(crate) value: Vec<u8>,
-    _held: Reservation,
+    pub(crate) _held: Reservation,
+}
+
+impl Bytes {
+    pub(crate) fn from_vec(value: Vec<u8>, preparation: &Preparation) -> Result<Self> {
+        let held = preparation.reserve((value.capacity() as u64).saturating_add(64))?;
+        Ok(Self { value, _held: held })
+    }
+
+    pub(crate) fn held_bytes(&self) -> u64 {
+        self._held.bytes()
+    }
+}
+
+/// Source provenance retained by an in-memory clone of an activated dataset so
+/// materialized backups and downstream clones preserve its format 2 origin and
+/// creation-commit pin.
+pub(crate) struct MemoryOrigin {
+    pub(crate) creation_commit: Sha256Digest,
+    pub(crate) src_family: Uuid,
+    pub(crate) src_logical: Uuid,
+    pub(crate) src_head: u64,
+    pub(crate) src_generation: String,
+    pub(crate) source_files: Vec<(String, Bytes)>,
+    pub(crate) prior_imports: Vec<(Sha256Digest, Vec<(String, Bytes)>)>,
+    pub(crate) prior_direct_sources: Vec<Sha256Digest>,
+    pub(crate) retained_bytes: u64,
 }
 
 pub(crate) struct Prepared {
@@ -214,6 +240,7 @@ pub(crate) fn administrative_preparation_with(
 pub(crate) struct MemoryHistory {
     pub(crate) prepared: Prepared,
     pub(crate) coverage: std::sync::Arc<Owned<Coverage>>,
+    pub(crate) origin: Option<std::sync::Arc<MemoryOrigin>>,
     pub(crate) previous: Option<std::sync::Arc<MemoryHistory>>,
     pub(crate) retained_bytes: u64,
 }
@@ -247,6 +274,15 @@ impl MemoryHistory {
         coverage: Coverage,
         preparation: &Preparation,
     ) -> Result<(std::sync::Arc<Self>, Root)> {
+        Self::initial_with_origin(prepared, coverage, None, preparation)
+    }
+
+    pub(crate) fn initial_with_origin(
+        prepared: Prepared,
+        coverage: Coverage,
+        origin: Option<std::sync::Arc<MemoryOrigin>>,
+        preparation: &Preparation,
+    ) -> Result<(std::sync::Arc<Self>, Root)> {
         coverage.validate()?;
         let encoded = encode(&coverage, preparation)?;
         let digest = Sha256Digest::of_bytes(&encoded.value, preparation.control())?;
@@ -257,17 +293,20 @@ impl MemoryHistory {
             coverage: digest,
             current_generation: prepared.identity.generation,
         };
+        let origin_bytes = origin.as_ref().map_or(0, |o| o.retained_bytes);
         let retained_bytes = prepared
             .document
             ._held
             .bytes()
             .checked_add(prepared.bytes._held.bytes())
             .and_then(|n| n.checked_add(owned._held.bytes()))
+            .and_then(|n| n.checked_add(origin_bytes))
             .ok_or_else(|| unavailable("configuration memory size overflow"))?;
         Ok((
             std::sync::Arc::new(Self {
                 prepared,
                 coverage: std::sync::Arc::new(owned),
+                origin,
                 previous: None,
                 retained_bytes,
             }),
@@ -306,6 +345,7 @@ impl MemoryHistory {
         Ok(std::sync::Arc::new(Self {
             prepared,
             coverage: previous.coverage.clone(),
+            origin: previous.origin.clone(),
             previous: Some(previous),
             retained_bytes,
         }))

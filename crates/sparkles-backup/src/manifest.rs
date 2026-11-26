@@ -219,12 +219,16 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_formats: &[u32]) -> Result
             .iter()
             .any(|feature| feature == "evidence-configuration-history/1");
     let mut history_files = false;
+    let mut imported_source_files = false;
     for (i, f) in m.files.iter().enumerate() {
         let field = |k: &str| format!("files[{i}].{k}");
         let history = crate::layout::configuration_history_path(&f.path);
         let imported = crate::layout::imported_configuration_history_path(&f.path);
         if history {
             history_files = true;
+            if f.path.starts_with("evidence-history/imports/") {
+                imported_source_files = true;
+            }
             if imported && !history_v2 {
                 return bad(
                     &field("path"),
@@ -307,6 +311,12 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_formats: &[u32]) -> Result
         return bad(
             "files",
             "configuration history needs its primary closure and managed.json".into(),
+        );
+    }
+    if history_v2 && (!seen.contains("evidence-history/origin.json") || !imported_source_files) {
+        return bad(
+            "files",
+            "evidence-configuration-history/2 requires evidence-history/origin.json and evidence-history/imports/".into(),
         );
     }
     // The control closure (spec C26 §7.3): the feature and the jobs settings each need

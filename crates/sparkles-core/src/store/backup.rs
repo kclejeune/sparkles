@@ -278,6 +278,13 @@ pub(super) struct ConfigurationCapture {
     original: CapturedOriginal,
 }
 
+#[cfg(test)]
+impl ConfigurationCapture {
+    pub(in crate::store) fn into_data(self) -> BackupCapture {
+        self.data
+    }
+}
+
 /// The closed primary members needed by the original framing proof. A member
 /// selects an already captured descriptor, never a new filesystem open.
 #[allow(
@@ -1568,6 +1575,7 @@ impl Store {
             managed_state,
             binding,
             mut original,
+            branch_identities,
         ) = {
             let w = self.lock_writer(&control)?;
             check_preparation()?;
@@ -1582,8 +1590,8 @@ impl Store {
             } else {
                 self.managed_files_at(state.as_deref())?
             };
-            let binding = if history {
-                let preparation = super::managed_history::administrative_preparation_with(
+            let (binding, branch_identities) = if history {
+                let adm_prep = super::managed_history::administrative_preparation_with(
                     crate::task::Control {
                         cancel: control
                             .cancel
@@ -1594,9 +1602,17 @@ impl Store {
                         ..Default::default()
                     },
                 )?;
-                self.configuration_binding_at(w.head.seq, &preparation)?
+                let binding = self.configuration_binding_at(w.head.seq, &adm_prep)?;
+                let branch_identities = if preparation.is_none() && self.is_branch() {
+                    Some(super::configuration_history::OriginalIdentities::capture(
+                        self, &w, &state, &adm_prep,
+                    )?)
+                } else {
+                    None
+                };
+                (binding, branch_identities)
             } else {
-                crate::history::ConfigurationBinding::LegacyUnbound
+                (crate::history::ConfigurationBinding::LegacyUnbound, None)
             };
             let original = preparation
                 .map(|preparation| CapturedOriginal::under_writer(self, &w, &state, preparation))
@@ -1619,6 +1635,7 @@ impl Store {
                 state,
                 binding,
                 original,
+                branch_identities,
             )
         };
         let lock_hold = t0.elapsed();
@@ -1634,26 +1651,114 @@ impl Store {
             managed_state.as_deref(),
             self.managed_root().as_deref(),
         );
-        let history_files = match managed_state.as_deref() {
+        let generation = "gen-0001";
+        let (history_files, commit_binding) = match managed_state.as_deref() {
             Some(crate::managed::ManagedState::Installed(installed))
                 if installed.configuration_history.is_some() =>
             {
-                match self.managed_root() {
-                    Some(root) => super::managed_history::capture::files(
+                let adm_control = crate::task::Control {
+                    cancel: control
+                        .cancel
+                        .clone()
+                        .map(crate::task::Cancel::from_flag)
+                        .unwrap_or_default(),
+                    deadline: control.deadline,
+                    ..Default::default()
+                };
+                if preparation.is_none() && self.is_branch() {
+                    let adm_prep =
+                        super::managed_history::administrative_preparation_with(adm_control)?;
+                    let identities = branch_identities.as_ref().ok_or_else(|| {
+                        Error::Corrupt("captured branch has no identities".into())
+                    })?;
+                    let files = super::configuration_history::build_branch_standalone_provenance(
+                        dir,
+                        self.managed_root().as_deref(),
+                        self.root.as_deref(),
+                        self.owner_dataset_id(),
+                        self.dataset_id,
+                        head.seq,
+                        generation,
+                        installed,
+                        identities,
+                        None,
+                        &adm_prep,
+                        &control,
+                    )?;
+                    let retagged = match binding {
+                        crate::history::ConfigurationBinding::Known { configuration } => {
+                            crate::history::ConfigurationBinding::ImportedUnbound {
+                                source: configuration,
+                            }
+                        }
+                        other => other,
+                    };
+                    (files, retagged)
+                } else if preparation.is_none()
+                    && !self.is_branch()
+                    && self.managed_root().is_some()
+                    && self.family.has_destination_origin()
+                {
+                    let root = self.managed_root().expect("checked");
+                    let adm_prep =
+                        super::managed_history::administrative_preparation_with(adm_control)?;
+                    let mut files = super::managed_history::capture::files_native_only(
                         &root,
                         self.owner_dataset_id(),
                         installed,
                         &control,
-                    )?,
-                    None => super::managed_history::capture::memory_files(
-                        dir,
-                        self.owner_dataset_id(),
-                        installed,
-                        &control,
-                    )?,
+                    )?;
+                    let imported =
+                        super::configuration_history::capture_materialized_imported_origin(
+                            &root, dir, &adm_prep, &control,
+                        )?;
+                    files.extend(imported);
+                    (files, binding)
+                } else {
+                    let mut files = match self.managed_root() {
+                        Some(root) => super::managed_history::capture::files(
+                            &root,
+                            self.owner_dataset_id(),
+                            installed,
+                            &control,
+                        )?,
+                        None => super::managed_history::capture::memory_files(
+                            dir,
+                            self.owner_dataset_id(),
+                            installed,
+                            &control,
+                        )?,
+                    };
+                    if preparation.is_none()
+                        && self.managed_root().is_none()
+                        && let (Some(history), Some(memory)) = (
+                            installed.configuration_history.as_ref(),
+                            installed.history_memory.as_ref(),
+                        )
+                        && let Some(mem_origin) = memory.origin.as_ref()
+                    {
+                        let adm_prep =
+                            super::managed_history::administrative_preparation_with(adm_control)?;
+                        let genesis = crate::history::ConfigurationIdentity {
+                            dataset_id: self.owner_dataset_id(),
+                            lineage_id: history.lineage_id,
+                            generation: memory.coverage.value.activation_generation,
+                        };
+                        let origin_files = super::configuration_history::write_memory_clone_origin(
+                            dir,
+                            self.dataset_id,
+                            genesis,
+                            history.coverage,
+                            mem_origin,
+                            &adm_prep,
+                            &control,
+                        )?;
+                        files.extend(origin_files);
+                    }
+                    (files, binding)
                 }
             }
-            _ => Vec::new(),
+            _ => (Vec::new(), binding),
         };
         check_preparation()?;
         if !self.same_managed_state(&managed_state) {
@@ -1661,7 +1766,6 @@ impl Store {
                 "configuration changed while establishing a materialized capture; retry".into(),
             ));
         }
-        let generation = "gen-0001";
         let gdir = dir.join(generation);
         let total = snap.len().max(1);
         let mut seen = 0u64;
@@ -1710,7 +1814,7 @@ impl Store {
                 "memory",
                 &commit,
                 activated,
-                binding,
+                commit_binding,
             ),
         )?;
         super::wal::create(
@@ -1765,7 +1869,13 @@ impl Store {
             dataset = crate::commit::with_reader(&dataset, crate::managed::READER)?;
         }
         // the capture holds version 2 files of an activated store, which need its reader
-        if activated {
+        if history_files
+            .iter()
+            .any(|file| file.path == "evidence-history/origin.json")
+        {
+            dataset =
+                crate::commit::with_reader(&dataset, crate::commit::IMPORTED_DESTINATION_READER)?;
+        } else if activated {
             dataset = crate::commit::with_reader(&dataset, super::managed_history::READER)?;
         }
         if control_state.is_some() {
@@ -1984,17 +2094,43 @@ impl Store {
                 CapturedOriginal::under_writer(self, &w, &managed_state, preparation)
             })
             .transpose()?;
+        let branch_identities =
+            if preparation.is_none() && self.is_branch() && history_installed.is_some() {
+                let adm_prep = super::managed_history::administrative_preparation_with(
+                    crate::task::Control {
+                        cancel: control
+                            .cancel
+                            .clone()
+                            .map(crate::task::Cancel::from_flag)
+                            .unwrap_or_default(),
+                        deadline: control.deadline,
+                        ..Default::default()
+                    },
+                )?;
+                Some(super::configuration_history::OriginalIdentities::capture(
+                    self,
+                    &w,
+                    &managed_state,
+                    &adm_prep,
+                )?)
+            } else {
+                None
+            };
         self.failpoint("backup-capture-locked");
         check_preparation()?;
         let lease_id = hist.lock().lease(gen_no, label);
         drop(w);
         let lock_hold = t0.elapsed();
-        // from here on, dropping the guard releases the lease
+        // from here on, dropping the guard releases the lease (and any branch staging dir)
         let collector = self.collector();
+        let branch_staging: Arc<parking_lot::Mutex<Option<tempfile::TempDir>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let branch_staging_drop = branch_staging.clone();
         let lease = LeaseGuard {
             generation: gen_no,
             label: label.to_string(),
             release: Some(Box::new(move || {
+                drop(branch_staging_drop.lock().take());
                 if let Some(c) = collector {
                     c.release(lease_id);
                 }
@@ -2035,31 +2171,95 @@ impl Store {
         if !self.same_managed_state(&managed_state) {
             return Ok(None);
         }
-        let history_files = match history_installed {
+        let (history_files, branch_retagged_commit) = match history_installed {
             Some(installed) => {
                 let family_root = self.managed_root().ok_or_else(|| {
                     Error::Corrupt("captured configuration has no family root".into())
                 })?;
-                let captured = super::managed_history::capture::files(
-                    &family_root,
-                    self.owner_dataset_id(),
-                    installed,
-                    control,
-                );
-                control.check()?;
-                check_preparation()?;
-                // Configure may replace settings names while descriptors open.
-                // Retry an unstable selection before interpreting its I/O result.
-                if !self.same_managed_state(&managed_state) {
-                    return Ok(None);
+                if preparation.is_none() && self.is_branch() {
+                    let adm_prep = super::managed_history::administrative_preparation_with(
+                        crate::task::Control {
+                            cancel: control
+                                .cancel
+                                .clone()
+                                .map(crate::task::Cancel::from_flag)
+                                .unwrap_or_default(),
+                            deadline: control.deadline,
+                            ..Default::default()
+                        },
+                    )?;
+                    let identities = branch_identities.as_ref().ok_or_else(|| {
+                        Error::Corrupt("captured branch has no identities".into())
+                    })?;
+                    let orig_commit_bytes =
+                        super::managed_history::read_bytes(&gdir.join("commit.json"), &adm_prep)?;
+                    let physical_base =
+                        crate::commit::read_gen_commit_full(&gdir)?.ok_or_else(|| {
+                            Error::Corrupt("captured branch generation commit is missing".into())
+                        })?;
+                    let retagged = crate::commit::reidentified_generation_bytes(
+                        &orig_commit_bytes.value,
+                        self.dataset_id,
+                        self.dataset_id,
+                        &adm_prep,
+                    )?;
+                    let staging = tempfile::Builder::new()
+                        .prefix("sparkles-branch-bak-")
+                        .tempdir()?;
+                    let captured = super::configuration_history::build_branch_standalone_provenance(
+                        staging.path(),
+                        Some(&family_root),
+                        Some(root),
+                        self.owner_dataset_id(),
+                        self.dataset_id,
+                        head.seq,
+                        &generation,
+                        installed,
+                        identities,
+                        Some((&gdir, physical_base.commit.seq, wal_len)),
+                        &adm_prep,
+                        control,
+                    );
+                    control.check()?;
+                    check_preparation()?;
+                    if !self.same_managed_state(&managed_state) {
+                        return Ok(None);
+                    }
+                    *branch_staging.lock() = Some(staging);
+                    (captured?, Some(retagged.value))
+                } else {
+                    let captured = super::managed_history::capture::files(
+                        &family_root,
+                        self.owner_dataset_id(),
+                        installed,
+                        control,
+                    );
+                    control.check()?;
+                    check_preparation()?;
+                    // Configure may replace settings names while descriptors open.
+                    // Retry an unstable selection before interpreting its I/O result.
+                    if !self.same_managed_state(&managed_state) {
+                        return Ok(None);
+                    }
+                    (captured?, None)
                 }
-                captured?
             }
-            None => Vec::new(),
+            None => (Vec::new(), None),
         };
         let mut files = Vec::with_capacity(gen_files.len() + 8);
         gen_files.sort_by(|a, b| a.0.cmp(&b.0));
         for (name, f, len) in gen_files {
+            if name == "commit.json"
+                && let Some(retagged) = branch_retagged_commit.as_ref()
+            {
+                files.push(CapturedFile {
+                    path: format!("{generation}/{name}"),
+                    kind: FileKind::Immutable,
+                    len: retagged.len() as u64,
+                    src: FileSource::Bytes(retagged.clone().into()),
+                });
+                continue;
+            }
             let kind = if APPEND_FILES.contains(&name.as_str()) {
                 FileKind::Append
             } else {

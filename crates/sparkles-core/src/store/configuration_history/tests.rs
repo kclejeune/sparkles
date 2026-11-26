@@ -1093,3 +1093,208 @@ fn validation_reads_a_log_trimmed_after_its_length_was_taken() {
     );
     result.unwrap();
 }
+
+#[test]
+fn clone_destination_syncs_intermediate_import_directories_deepest_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+    crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+    let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+    update(&src, "seed");
+    let state = src.managed_state_shared();
+    let installed = match state.as_deref() {
+        Some(crate::managed::ManagedState::Installed(i)) => i,
+        _ => panic!("expected installed"),
+    };
+    let prep = preparation();
+    let mut source_files = Vec::new();
+    for rel in [
+        "dataset.json",
+        "CURRENT",
+        "managed.json",
+        "gen-0001/commit.json",
+        "gen-0001/meta.json",
+    ] {
+        let bytes = read_anchored_local_file(&src_root, rel, false, &prep)
+            .unwrap()
+            .unwrap();
+        if rel == "dataset.json" {
+            source_files.push((
+                "family-dataset.json".into(),
+                managed_history::Bytes::from_vec(bytes.value.clone(), &prep).unwrap(),
+            ));
+        }
+        source_files.push((rel.into(), bytes));
+    }
+    let history = installed.configuration_history.as_ref().unwrap();
+    let lineage = history.lineage_id;
+    let cov_rel = format!("evidence-history/{lineage}/coverage.json");
+    source_files.push((
+        cov_rel.clone(),
+        read_anchored_local_file(&src_root, &cov_rel, false, &prep)
+            .unwrap()
+            .unwrap(),
+    ));
+    let hex = history.current_generation.to_string();
+    let hex = hex.strip_prefix("sha256:").unwrap();
+    let gen_rel = format!("evidence-history/{lineage}/generations/{hex}.json");
+    source_files.push((
+        gen_rel.clone(),
+        read_anchored_local_file(&src_root, &gen_rel, false, &prep)
+            .unwrap()
+            .unwrap(),
+    ));
+
+    let dst_root = dir.path().join("dst");
+    std::fs::create_dir(&dst_root).unwrap();
+    let mut synced: Vec<std::path::PathBuf> = Vec::new();
+    let root_commit = crate::commit::CommitInfo {
+        seq: 0,
+        timestamp_ms: 100,
+        kind: crate::commit::CommitKind::Create,
+        inserted: 1,
+        deleted: 0,
+        quads: 1,
+        generation: 1,
+        bulk: true,
+        exact: true,
+        reconstructed: false,
+        default_graph: true,
+        unvalidated: false,
+    };
+    write_clone_destination_with_sync(
+        &dst_root,
+        uuid::Uuid::new_v4(),
+        &root_commit,
+        installed,
+        src.dataset_id(),
+        src.dataset_id(),
+        src.head_commit().seq,
+        "gen-0001",
+        source_files,
+        &[],
+        Vec::new(),
+        &prep,
+        &mut |path| {
+            assert!(path.is_dir(), "{} must be a directory", path.display());
+            synced.push(path.to_path_buf());
+            crate::store::sync_dir(path)
+        },
+    )
+    .unwrap();
+    let eh = dst_root.join("evidence-history");
+    let imports = eh.join("imports");
+    assert!(
+        synced.iter().any(|p| p == &imports),
+        "evidence-history/imports must be synced: {synced:?}"
+    );
+    assert!(
+        synced.iter().any(|p| p.ends_with("generations")),
+        "nested generations dir must be synced: {synced:?}"
+    );
+    assert_eq!(synced.last().unwrap(), &eh);
+    for (idx, path) in synced.iter().enumerate() {
+        if path != &eh {
+            let parent = path.parent().unwrap();
+            if parent.starts_with(&eh) {
+                let parent_pos = synced.iter().position(|p| p == parent).unwrap_or_else(|| {
+                    panic!(
+                        "parent {} of {} was never synced: {synced:?}",
+                        parent.display(),
+                        path.display()
+                    )
+                });
+                assert!(
+                    parent_pos > idx,
+                    "child {} synced at {idx} after parent {} at {parent_pos}",
+                    path.display(),
+                    parent.display()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn clone_to_with_preparation_accounts_aggregate_metadata_and_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+    crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+    let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+    for i in 0..5 {
+        let settings = crate::evidence::Settings {
+            enabled: true,
+            source_records: vec![format!("urn:src:{i}")],
+            proposals: vec![format!("urn:prop:{i}")],
+            ..Default::default()
+        };
+        let canonical = settings.canonical(&crate::task::Control::none()).unwrap();
+        src.enable_managed(
+            crate::managed::OwnerKind::Evidence,
+            crate::managed::OwnerEntry::for_settings(
+                1,
+                settings.managed_graphs(),
+                canonical.bytes(),
+            ),
+            canonical.bytes(),
+        )
+        .unwrap();
+        update(&src, &format!("gen-{i}"));
+    }
+    // A tiny preparation budget cannot retain all 5 captured generations simultaneously
+    // and must fail with BudgetExceeded and restore its room cleanly.
+    let tight = Preparation::new(crate::task::Control::none(), 8 << 10).unwrap();
+    let before = tight.room();
+    let dst = dir.path().join("tight-clone");
+    let err = src
+        .clone_to_with_preparation(&dst, &Default::default(), &tight)
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(_)),
+        "expected BudgetExceeded, got {err:?}"
+    );
+    assert_eq!(tight.room(), before, "preparation credit must roll back");
+    assert!(!dst.exists(), "failed clone must not leave destination");
+}
+
+#[test]
+fn native_wal_binding_lookup_uses_retained_imports_under_tight_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+    crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+    let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+    // Create several configuration generations so a full DiskClosure::load would be expensive.
+    for i in 0..6 {
+        let settings = crate::evidence::Settings {
+            enabled: true,
+            source_records: vec![format!("urn:s:{i}")],
+            proposals: vec![format!("urn:p:{i}")],
+            ..Default::default()
+        };
+        let canonical = settings.canonical(&crate::task::Control::none()).unwrap();
+        src.enable_managed(
+            crate::managed::OwnerKind::Evidence,
+            crate::managed::OwnerEntry::for_settings(
+                1,
+                settings.managed_graphs(),
+                canonical.bytes(),
+            ),
+            canonical.bytes(),
+        )
+        .unwrap();
+        update(&src, &format!("s-{i}"));
+    }
+    let clone_root = dir.path().join("clone");
+    src.clone_to(&clone_root, &Default::default()).unwrap();
+    let dst = Store::open(&clone_root, StoreOptions::default()).unwrap();
+    update(&dst, "native-own");
+    let seq = dst.head_commit().seq;
+    // A modest 256 KiB budget resolves the native WAL commit cleanly via retained imports
+    // without reloading/re-hashing all 6 source generations.
+    let small = Preparation::new(crate::task::Control::none(), 256 << 10).unwrap();
+    let binding = dst.configuration_binding_at(seq, &small).unwrap();
+    assert!(binding.configuration().is_some());
+}

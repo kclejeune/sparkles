@@ -2119,6 +2119,9 @@ pub struct Store {
     control_refusal: Mutex<Option<fn() -> Error>>,
     /// the published control state (spec C26 §2.1), when the keyspace is enabled
     control: arc_swap::ArcSwapOption<crate::control::ControlState>,
+    /// Verified imported-origin closure and proven WAL intervals retained from the
+    /// opening proof of an imported destination (drops before `_lock` and `family`).
+    imported_opening: Option<Arc<configuration_history::ImportedRetained>>,
     /// Keep exclusion through Drop and every other owned field's destructor.
     /// Fields drop in declaration order. Only the family root lease follows this.
     _lock: Option<Arc<ProcessLock>>,
@@ -2436,6 +2439,7 @@ impl Store {
             prefixes: Mutex::new(prefixes),
             removed_prefixes: Mutex::new(BTreeSet::new()),
             prefix_filter: Mutex::new(None),
+            imported_opening: None,
             _lock: None,
             family: family.clone(),
             _close_complete: Arc::new(()),
@@ -2752,8 +2756,10 @@ impl Store {
                 && let crate::history::ConfigurationBinding::ImportedUnbound { source } =
                     base_configuration
             {
-                configuration_history::verify_imported_identity(
+                refs.check_imported_unbound_base(base.seq, base_configuration)?;
+                configuration_history::verify_imported_identity_for_family(
                     &configuration_root,
+                    &family,
                     source,
                     &configuration_preparation,
                 )?;
@@ -2777,6 +2783,7 @@ impl Store {
         let mut wal_control = Vec::new();
         // the repair of the log's tail, made only once the control keyspace recovered
         let mut wal_repair = None;
+        let mut imported_retained: Option<Arc<configuration_history::ImportedRetained>> = None;
         if wal_path.exists() {
             let mut buf = Vec::new();
             File::open(&wal_path)?.read_to_end(&mut buf)?;
@@ -2793,9 +2800,9 @@ impl Store {
                 annotated: annotated.as_ref(),
             };
             let r = if let Some(pending) = imported_opening {
-                pending
-                    .replay(&from, &buf, &configuration_preparation)?
-                    .replay
+                let completed = pending.replay(&from, &buf, &configuration_preparation)?;
+                imported_retained = Some(Arc::new(completed.imports));
+                completed.replay
             } else {
                 let refs = configuration_references
                     .as_mut()
@@ -2816,7 +2823,7 @@ impl Store {
             wal_text = r.touched;
             wal_control = r.control;
         } else if let Some(pending) = imported_opening {
-            pending.verify_no_wal()?;
+            imported_retained = Some(Arc::new(pending.verify_no_wal()?));
         }
         drop(configuration_references);
         drop(configuration_state);
@@ -3020,6 +3027,7 @@ impl Store {
             prefixes: Mutex::new(prefixes),
             removed_prefixes: Mutex::new(removed_prefixes),
             prefix_filter: Mutex::new(None),
+            imported_opening: imported_retained,
             _lock: Some(lock.clone()),
             family: family.clone(),
             _close_complete: Arc::new(()),

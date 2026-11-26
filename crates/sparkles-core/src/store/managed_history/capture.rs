@@ -78,6 +78,27 @@ pub(in crate::store) fn files(
     installed: &Installed,
     control: &WriteOptions,
 ) -> Result<Vec<CapturedFile>> {
+    files_with_imports(root, dataset_id, installed, control, true)
+}
+
+/// Capture only the native lineage closure, `managed.json`, and owner settings
+/// without including `evidence-history/origin.json` or `evidence-history/imports/`.
+pub(in crate::store) fn files_native_only(
+    root: &Path,
+    dataset_id: Uuid,
+    installed: &Installed,
+    control: &WriteOptions,
+) -> Result<Vec<CapturedFile>> {
+    files_with_imports(root, dataset_id, installed, control, false)
+}
+
+fn files_with_imports(
+    root: &Path,
+    dataset_id: Uuid,
+    installed: &Installed,
+    control: &WriteOptions,
+    include_imports: bool,
+) -> Result<Vec<CapturedFile>> {
     control.check()?;
     let preparation = controlled_preparation(control)?;
     let history = installed
@@ -196,14 +217,16 @@ pub(in crate::store) fn files(
             src: FileSource::File(file),
         });
     }
-    let imported_files =
-        crate::store::configuration_history::capture_import_files(root, &preparation, control)?;
-    if files.len().saturating_add(imported_files.len()) >= MAX_FILES {
-        return Err(unavailable(
-            "configuration closure exceeds backup manifest limits",
-        ));
+    if include_imports {
+        let imported_files =
+            crate::store::configuration_history::capture_import_files(root, &preparation, control)?;
+        if files.len().saturating_add(imported_files.len()) >= MAX_FILES {
+            return Err(unavailable(
+                "configuration closure exceeds backup manifest limits",
+            ));
+        }
+        files.extend(imported_files);
     }
-    files.extend(imported_files);
     control.check()?;
     Ok(files)
 }
@@ -223,7 +246,18 @@ pub(in crate::store) fn pinned_file(
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let mut file = options.open(path)?;
+    let file = options.open(path)?;
+    pin_opened_file(file, expected, preparation, control)
+}
+
+/// Verify an already-opened (anchored `openat`) file descriptor against its
+/// expected SHA-256 digest without reopening by path.
+pub(in crate::store) fn pin_opened_file(
+    mut file: File,
+    expected: Sha256Digest,
+    preparation: &Preparation,
+    control: &WriteOptions,
+) -> Result<File> {
     let before = file.metadata()?;
     if !before.is_file() || before.len() > MAX_BYTES as u64 {
         return Err(unavailable("invalid captured configuration file"));

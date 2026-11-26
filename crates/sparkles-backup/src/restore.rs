@@ -245,16 +245,27 @@ impl Repository {
         {
             let dir = tmp.to_path_buf();
             let control = o.ctl.control();
-            let configuration_required = m.requires.iter().any(|feature| {
-                feature == "evidence-configuration-history/1"
-                    || feature == "evidence-configuration-history/2"
-            });
+            let configuration_v2 = m
+                .requires
+                .iter()
+                .any(|feature| feature == "evidence-configuration-history/2");
+            let configuration_required = configuration_v2
+                || m.requires
+                    .iter()
+                    .any(|feature| feature == "evidence-configuration-history/1");
             let control_required = m.requires.iter().any(|feature| feature == "control/1");
             let (source, captured) = (m.dataset.id, m.commit.seq);
             blocking(move || {
                 // Refuse a newer dataset before reidentification or publication,
                 // including restores that request no integrity check.
                 sparkles_core::commit::check_dataset_compatibility(&dir)?;
+                if configuration_v2 && !dir.join("evidence-history/origin.json").is_file() {
+                    return Err(BackupError::new(
+                        Code::InvalidBackup,
+                        "evidence-configuration-history/2 backup is missing evidence-history/origin.json",
+                    )
+                    .into());
+                }
                 sparkles_core::check::configuration_history(
                     &dir,
                     configuration_required,
