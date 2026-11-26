@@ -20,10 +20,13 @@ pub use export::{
 };
 pub use profile::{
     CANONICALIZATION_ALGORITHM, CanonicalGraphEntry, CanonicalGraphKind, CanonicalManifest,
-    CanonicalSyntax, CanonicalTree, GRAPHS_DIR, MANIFEST_FORMAT_VERSION, MANIFEST_PROFILE_NAME,
-    MANIFEST_REL_PATH, METADATA_DIR, ReadOptions, WriteOptions, collect_dataset_quads,
-    dataset_matches_tree, datasets_isomorphic, import_git_tree, import_git_tree_with,
-    read_git_tree, read_git_tree_with, write_git_tree, write_snapshot_git_tree,
+    CanonicalSyntax, CanonicalTree, DEFAULT_MAX_AMBIGUOUS_GROUP, DEFAULT_MAX_BLANK_NODES,
+    DEFAULT_MAX_GRAPH_FILE_BYTES, DEFAULT_MAX_MANIFEST_BYTES, DEFAULT_MAX_QUADS,
+    DEFAULT_MAX_TOTAL_BYTES, GRAPHS_DIR, MANIFEST_FORMAT_VERSION, MANIFEST_PROFILE_NAME,
+    MANIFEST_REL_PATH, METADATA_DIR, ReadOptions, VerifyReport, WriteOptions,
+    collect_dataset_quads, dataset_matches_tree, datasets_isomorphic, import_git_tree,
+    import_git_tree_with, read_git_tree, read_git_tree_with, try_datasets_isomorphic,
+    verify_git_tree, verify_git_tree_with, write_git_tree, write_snapshot_git_tree,
 };
 
 use crate::Dataset;
