@@ -13780,10 +13780,30 @@ results that depend on them. A replay answers the first receipt with an empty
 | `409 idempotency-conflict` | The key was used with a different payload. |
 | `422 evidence-unavailable` | A target, or evidence that an acceptance must read, is missing, unreadable or outside the policy's boundary. |
 | `422 incomplete-evidence` | The acceptances need more than 10,000 evidence records. |
-| `503 projection-unavailable` | A graph of the policy's projection was detached and protected again, so its supports no longer authenticate, or its output holds triples without a projection record. |
+| `503 projection-unavailable` | A graph of the policy's projection was detached and protected again, so its supports no longer authenticate, or its output holds triples without a projection record. An administrator reconciles a review policy's projection through `POST /$/evidence/{ds}/projections/reconcile`. |
 | `503 authority-changed` | The caller's credential or the access policy changed before the commit published. |
 
 A refusal writes nothing. `GET /$/server` lists both routes in `capabilities.claims`.
+
+`POST /$/evidence/{ds}/projections/reconcile` needs `admin` on the dataset or selected
+branch (`?branch=NAME`, `main` by default), update grants on the policy's supports and
+output graphs and unmasked read grants on its decisions, supports and output graphs and
+on every configured proposal graph. Its body is
+`{"policy", "policyVersion"?, "ifHead"?, "idempotencyKey"?, "dryRun"?, "message"?}`. It
+rebuilds the review policy's output graph to hold exactly the triples owned by live
+acceptance supports that authenticate under the current protections, or empties it when
+none vouch, and records the new protection nonces in a fresh `ev:Projection` record in
+the supports graph that supersedes prior unsuperseded projection records of the policy.
+The answer is `{operation, committed, replayed, commit, branchId, policy,
+policyVersion, output, projection, vouchedSupports, changed}` with `dryRun` on a
+preview. Reconciling restores normal reviews, withdrawals and policy reads. It refuses
+with `400` for a malformed request, unknown policy or matching policy, `403` for a
+read-only server or missing or masked grants, `409` for `evidence-settings-drift`,
+`policy-changed`, `head-changed`, `idempotency-conflict`, `immutable-record-conflict`
+or `unsupported-profile` while a policy graph is still detached, `422
+incomplete-evidence` beyond the record or memory bounds, and `503` for
+`managed-unavailable`, `projection-unavailable` when the output or conflict mode
+changed without raising `policyVersion`, or `authority-changed`.
 
 ### Evidence identities
 

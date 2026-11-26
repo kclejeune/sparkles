@@ -1148,8 +1148,9 @@ conformance of the written records to the shapes, and the HTTP routes.
    version change records a new projection record and applies to later decisions only.
 4. **Withdrawal rights.** Any caller with the grants may withdraw a claim, as for every
    other typed operation. A withdrawal is final, and a new occurrence must be proposed.
-5. **Reconciliation.** A projection whose protections changed is refused rather than
-   repaired. Roadmap item 581 tracks an administered reconciliation.
+5. **Reconciliation.** A review or withdrawal refuses a projection whose protections
+   changed rather than repairing it silently. An administrator reconciles it explicitly
+   through [Reconciling a projection after a changed protection](#reconciling-a-projection-after-a-changed-protection).
 6. **Identity decisions.** Identity proposals need their own record input, a matching
    policy and resolution-map semantics, so they are a later step of this phase. The
    current review policy is specific to claims.
@@ -2345,6 +2346,39 @@ graph, the state, the head commit, the model requests and the task list unchange
 also covers a withdrawal behind a cited claim and a state left behind the reports graph
 at the next server start, each of which starts one refresh. A hidden superseding decision
 under a triple protection has no test of the check.
+
+### Reconciling a projection after a changed protection
+
+Roadmap item 581 adds `sparkles::evidence::reconcile_projection` and
+`POST /$/evidence/{ds}/projections/reconcile` for an administrator to reconcile a
+review policy's accepted projection after a detach and new protection of its decisions,
+supports or output graph. The route needs `admin` on the dataset or selected branch,
+update grants on the policy's supports and output graphs and unmasked read grants on its
+decisions, supports and output graphs and on every configured proposal graph. It
+refuses while the server is read-only or while declared and recorded evidence settings
+differ (`409 evidence-settings-drift`), and publishes under the caller's authority
+fence (`503 authority-changed`).
+
+At the branch head (checked against optional `ifHead` and again under the writer), the
+operation collects every live `ev:AcceptanceSupport` of the policy in its supports graph
+that authenticates under the current protections, whose accepted `ev:ReviewDecision`
+authenticates in the decisions graph and is not superseded, and whose claim has no
+authenticated `ev:Withdrawal` in any configured proposal graph. It scans the output
+graph under the shared 64 MiB memory allowance and 1,000,000-triple bound, removes every
+quad not owned by a vouched support (deleting by physical quad ID so blank nodes
+inserted while detached are removed), and inserts every missing vouched triple. When
+decisions or supports were detached and re-protected, prior records no longer
+authenticate, so the output graph is emptied.
+
+In the same atomic commit of the evidence owner, the operation appends a fresh immutable
+`ev:Projection` record to the supports graph, minted from the policy, version and three
+current protection nonces, with `prov:wasRevisionOf` naming every prior unsuperseded
+projection record of the policy. `check_projection` ignores any projection record
+superseded through `prov:wasRevisionOf` by a currently authenticated projection record
+of the same policy, while still refusing an output or conflict-mode change made without
+raising `policy.version` under unchanged protections. Reconciling an already-valid
+projection whose output matches its vouched supports reuses its active projection
+record. Normal reviews, withdrawals and policy reads resume after reconciliation.
 
 ### Scope changes
 
