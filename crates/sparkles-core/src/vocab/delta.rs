@@ -276,9 +276,9 @@ impl VocabMark {
         self.entries
     }
 
-    /// Whether the next chunk also writes the file header.
-    pub(crate) fn file_is_empty(&self) -> bool {
-        self.end == 0
+    /// The logical end of the file when the mark was taken.
+    pub(crate) fn file_end(&self) -> u64 {
+        self.end
     }
 }
 

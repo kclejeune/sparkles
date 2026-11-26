@@ -4757,7 +4757,6 @@ impl Store {
         &self,
         c: &CommitInfo,
         message: Option<Arc<str>>,
-        account_header: bool,
         changes: impl FnOnce() -> Option<(Vec<String>, Vec<String>)>,
     ) -> Result<(
         crate::annotations::Annotation,
@@ -4765,7 +4764,7 @@ impl Store {
     )> {
         let mut a = self.annotations.lock();
         let ann = self.annotation_of(&a, c, message, changes);
-        let header = if account_header && !ann.is_empty() {
+        let header = if !ann.is_empty() {
             a.pending_header()
         } else {
             0
@@ -6931,7 +6930,6 @@ impl Store {
             snapshot: Arc::new(new_snap),
             configuration,
             log_end: None,
-            account_catalog: false,
             changes: None,
             change,
             validated: validation.is_some(),
@@ -8487,7 +8485,6 @@ impl WriteTxn<'_> {
             snapshot: snap,
             configuration: self.configuration,
             log_end: None,
-            account_catalog: false,
             changes: Some(&self.log),
             change,
             validated: validation.is_some(),

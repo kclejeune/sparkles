@@ -29,6 +29,16 @@ const MAX_COMMITS: usize = 64;
 /// The most commits a WAL commit record can say may not be durable before it.
 const MAX_UNFENCED: u64 = u8::MAX as u64;
 
+/// The free-space reservation for preallocating a fence's WAL, terms and annotations.
+pub(super) fn preallocation_promise(prealloc: u64, annotations: bool) -> u64 {
+    2 * prealloc.saturating_add(4096)
+        + if annotations {
+            crate::annotations::MAX_PREALLOC + 4096
+        } else {
+            0
+        }
+}
+
 #[derive(Default)]
 pub(super) struct Ticket(AtomicU8);
 
@@ -681,14 +691,8 @@ impl Store {
             crate::annotations::MAX_PREALLOC
         };
         let promise = (last.prealloc > 0).then(|| {
-            self.quota.promise(
-                2 * last.prealloc.saturating_add(4096)
-                    + if ann_prealloc > 0 {
-                        ann_prealloc + 4096
-                    } else {
-                        0
-                    },
-            )
+            self.quota
+                .promise(preallocation_promise(last.prealloc, !anns.is_empty()))
         });
         let promise = promise.filter(|_| self.check_disk(self.quota.unwritten()).is_ok());
         let prealloc = if promise.is_some() { last.prealloc } else { 0 };
@@ -830,7 +834,6 @@ impl Store {
             snapshot: p.snapshot.clone(),
             configuration: p.configuration,
             log_end: Some(p.wal_end),
-            account_catalog: p.merge.is_some(),
             changes: Some(&p.changes),
             change,
             validated: p.validation.is_some(),
@@ -991,9 +994,7 @@ impl WriteTxn<'_> {
         // the record is never taken back: if the commit is recovered, its annotation is
         // there.
         let (annotation, ann) =
-            match store.annotate_queued(&c, message, self.merge.is_some(), || {
-                Some(self.change_lines())
-            }) {
+            match store.annotate_queued(&c, message, || Some(self.change_lines())) {
                 Ok(a) => a,
                 Err(e) => {
                     if self.merge.is_some() {

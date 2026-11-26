@@ -482,6 +482,15 @@ pub(crate) fn open_for_append(path: &Path, version: u32) -> std::io::Result<File
 /// The smallest preallocation step: a small log grows by this much at a time.
 const PREALLOC_MIN: u64 = 64 << 10;
 
+/// The file length after a write ending at `end`, including any new zero tail.
+pub(super) fn allocation_after_write(alloc: u64, end: u64, prealloc: u64) -> u64 {
+    if end <= alloc || prealloc == 0 {
+        return alloc.max(end);
+    }
+    let step = alloc.max(PREALLOC_MIN).min(prealloc);
+    (end + step).next_multiple_of(4096).min(end + prealloc)
+}
+
 /// Write a transaction's records `data` at byte `at` of the log file, its logical end,
 /// without syncing. `alloc` is the file's length. With preallocation (`prealloc` above 0,
 /// the largest step), a write past `alloc` also writes zero bytes after the records, so
@@ -505,8 +514,7 @@ pub(crate) fn write_commit(
         *alloc = end;
         return Ok(());
     }
-    let step = (*alloc).max(PREALLOC_MIN).min(prealloc);
-    let to = (end + step).next_multiple_of(4096).min(end + prealloc);
+    let to = allocation_after_write(*alloc, end, prealloc);
     let zeros = vec![0u8; ((to - end) as usize).min(1 << 20)];
     let mut pos = end;
     while pos < to {

@@ -12,11 +12,21 @@ use super::*;
 use crate::branch::{self, CommitRef, MergeOptions, MergeOutcome, MergeReport, ReplayedCommit};
 use crate::history::At;
 
-/// Consume space in an existing file tail and return the bytes that require growth.
-fn grow_past_tail(bytes: u64, tail: &mut u64) -> u64 {
-    let covered = bytes.min(*tail);
-    *tail -= covered;
-    bytes - covered
+struct FileProjection {
+    end: u64,
+    alloc: u64,
+}
+
+impl FileProjection {
+    /// Carry the file's new logical end and tail into the next step, returning its
+    /// growth on disk.
+    fn append(&mut self, bytes: u64, prealloc: u64) -> u64 {
+        self.end += bytes;
+        let alloc = wal::allocation_after_write(self.alloc, self.end, prealloc);
+        let growth = alloc - self.alloc;
+        self.alloc = alloc;
+        growth
+    }
 }
 
 impl Store {
@@ -217,12 +227,18 @@ impl Store {
         }
         let inferred: Arc<[u8]> = crate::id::iri_key(INFERRED_GRAPH).into();
         let mut terms_from = txn.mark.entries();
-        let mut vocab_file_is_empty = txn.mark.file_is_empty();
-        let mut wal_tail = txn.guard.tail.alloc().saturating_sub(txn.guard.wal_len);
-        let mut vocab_tail = txn.base.generation.dvocab.preallocated();
-        let (mut annotation_header, mut annotation_tail) = {
+        let mut wal_file = FileProjection {
+            end: txn.guard.wal_len,
+            alloc: txn.guard.tail.alloc(),
+        };
+        let mut vocab_file = FileProjection {
+            end: txn.mark.file_end(),
+            alloc: txn.base.generation.dvocab.allocated(),
+        };
+        let (mut annotation_header, mut annotation_file) = {
             let annotations = target.annotations.lock();
-            (annotations.pending_header(), annotations.preallocated())
+            let (end, alloc) = annotations.file_lengths();
+            (annotations.pending_header(), FileProjection { end, alloc })
         };
         let mut fenced_quota = 0u64;
         let mut fenced_disk = 0u64;
@@ -337,28 +353,52 @@ impl Store {
             }
             if target.root.is_some() {
                 // The next step sees the metadata records and the framed vocabulary.
-                // Filling existing file tails uses quota but leaves the disk reserve intact.
                 let vocab = &txn.base.generation.dvocab;
-                let framing = vocab.framing_bytes(terms_from, vocab_file_is_empty);
+                let framing = vocab.framing_bytes(terms_from, vocab_file.end == 0);
                 let header = if annotation > 0 {
                     std::mem::take(&mut annotation_header)
                 } else {
                     0
                 };
-                let metadata = MERGE_REC as u64 + commit::REC as u64 + header;
+                let before_fence = MERGE_REC as u64 + header;
+                let metadata = before_fence + commit::REC as u64;
                 fenced_quota = fenced_quota
                     .saturating_add(pending)
                     .saturating_add(framing)
                     .saturating_add(metadata);
+                // The merge record and any annotation header exist before the fence
+                // checks its promise. The promise also covers the earlier WAL-only
+                // preallocation check, and the catalog is appended after the fence.
+                let cap = target.opts.wal_prealloc_bytes;
+                let prealloc = if cap > 0
+                    && target
+                        .check_disk(
+                            fenced_disk
+                                .saturating_add(before_fence)
+                                .saturating_add(pending)
+                                .saturating_add(target.quota.unwritten())
+                                .saturating_add(group::preallocation_promise(cap, annotation > 0)),
+                        )
+                        .is_ok()
+                {
+                    cap
+                } else {
+                    0
+                };
+                let annotation_prealloc = if prealloc > 0 {
+                    crate::annotations::MAX_PREALLOC
+                } else {
+                    0
+                };
+                annotation_file.append(header, 0);
                 fenced_disk = fenced_disk
                     .saturating_add(metadata)
-                    .saturating_add(grow_past_tail(wal_bytes, &mut wal_tail))
-                    .saturating_add(grow_past_tail(
+                    .saturating_add(wal_file.append(wal_bytes, prealloc))
+                    .saturating_add(vocab_file.append(
                         vocab_bytes.saturating_add(framing),
-                        &mut vocab_tail,
+                        prealloc.min(crate::vocab::delta::MAX_PREALLOC),
                     ))
-                    .saturating_add(grow_past_tail(annotation, &mut annotation_tail));
-                vocab_file_is_empty &= framing == 0;
+                    .saturating_add(annotation_file.append(annotation, annotation_prealloc));
                 terms_from = vocab.len();
             }
         }
@@ -373,6 +413,7 @@ mod tests {
     use super::*;
     use crate::preview::{DryRun, Outcome, Preview};
     use crate::sparql::update::update;
+    use std::fs;
 
     fn target(root: &Path, opts: StoreOptions) -> Store {
         let main = Store::open(root, opts).unwrap();
@@ -423,24 +464,30 @@ mod tests {
             },
         )
         .unwrap();
+        main.set_quota(Some(u64::MAX)).unwrap();
+        main.set_quota(Some(preview(&main).storage.projected.unwrap() + 1024))
+            .unwrap();
+        main.quota.remeasure();
+        main.quota.used();
+        let quota_file = dir.path().join(quota::QUOTA_FILE);
+        let quota_file_len = fs::metadata(&quota_file).unwrap().len();
+        let measures = main.quota.measures();
+        // This ordinary source commit appends to the shared catalog after the walk.
         update(
             &dev,
             "INSERT DATA {<urn:base> <urn:p> 2}",
             &Default::default(),
         )
         .unwrap();
-        main.set_quota(Some(u64::MAX)).unwrap();
-        main.set_quota(Some(preview(&main).storage.projected.unwrap()))
-            .unwrap();
-        main.quota.remeasure();
         let limit = preview(&main).storage.projected.unwrap();
         main.set_quota(Some(limit - 1)).unwrap();
         assert_eq!(preview(&main).outcome(), Outcome::StorageRefused);
         main.set_quota(Some(limit)).unwrap();
-        main.quota.remeasure();
+        assert_eq!(fs::metadata(quota_file).unwrap().len(), quota_file_len);
         let candidate = preview(&main);
         assert_eq!(candidate.storage.projected, Some(limit));
         assert_eq!(candidate.outcome(), Outcome::Commit);
+        assert_eq!(main.quota.measures(), measures);
 
         let head = main.snapshot().commit;
         let refreshed = Arc::new(parking_lot::Mutex::new(None));
@@ -514,5 +561,65 @@ mod tests {
             "{:?}",
             candidate.storage.refused
         );
+    }
+
+    #[test]
+    fn replay_preview_reserve_counts_a_predecessors_new_tail() {
+        const RESERVE: u64 = 1 << 20;
+        const HEADROOM: u64 = 512 << 10;
+        let dir = tempfile::tempdir().unwrap();
+        let main = target(
+            dir.path(),
+            StoreOptions {
+                change_log: false,
+                wal_prealloc_bytes: 16 << 10,
+                min_free_disk_bytes: Some(RESERVE),
+                ..Default::default()
+            },
+        );
+        let dev = main.branch("dev").unwrap();
+        let first = (1..=64)
+            .map(|n| format!("<urn:base> <urn:p> {n} ."))
+            .collect::<Vec<_>>()
+            .join(" ");
+        update(
+            &dev,
+            &format!("INSERT DATA {{ {first} }}"),
+            &crate::sparql::QueryOptions {
+                write: crate::guard::WriteOptions {
+                    message: Some("first replay step".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        update(
+            &dev,
+            &format!(
+                "INSERT DATA {{<urn:base> <urn:p> \"{}\"}}",
+                "x".repeat(511 * 1024 - 128)
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let wal_alloc = main.writer.lock().tail.alloc();
+        assert!(wal_alloc - main.wal_bytes() >= 65 * WAL_REC as u64);
+        assert!(main.annotations.lock().pending_header() > 0);
+        let _disk =
+            crate::disk::fake::install(dir.path(), dir_size(dir.path()) + RESERVE + HEADROOM);
+
+        let head = main.snapshot().commit;
+        let candidate = preview(&main);
+        assert_eq!(main.snapshot().commit, head);
+        assert!(matches!(
+            main.merge("dev", "main", &replay()),
+            Err(Error::StorageFull(_))
+        ));
+        assert_eq!(main.snapshot().commit, head + 1);
+        assert_eq!(main.writer.lock().tail.alloc(), wal_alloc);
+        let (annotation_end, annotation_alloc) = main.annotations.lock().file_lengths();
+        assert!(annotation_alloc > annotation_end);
+        assert_eq!(candidate.outcome(), Outcome::StorageRefused);
     }
 }

@@ -349,11 +349,11 @@ impl Annotations {
         (was + std::mem::take(&mut self.retired), now)
     }
 
-    /// The space available for another record in the existing file.
-    pub(crate) fn preallocated(&self) -> u64 {
-        self.tail.as_ref().map_or(0, |tail| {
+    /// The annotations file's written end and allocated length.
+    pub(crate) fn file_lengths(&self) -> (u64, u64) {
+        self.tail.as_ref().map_or((0, 0), |tail| {
             let io = tail.io.lock();
-            io.alloc.saturating_sub(io.end)
+            (io.end, io.alloc)
         })
     }
 

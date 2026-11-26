@@ -51,8 +51,6 @@ pub(super) struct Committed<'a> {
     /// where the commit's records end in its generation's log, when it wrote records
     /// (a bulk commit and a commit of an in-memory store write none)
     pub log_end: Option<u64>,
-    /// Charge the catalog append across the steps of a persistent merge or replay.
-    pub account_catalog: bool,
     /// the commit's changes, from which the view runtimes and the embedding worker
     /// read; a bulk commit has none and schedules that work itself
     pub changes: Option<&'a [(u8, [Id; 4])]>,
@@ -117,7 +115,9 @@ impl Store {
         {
             log.push(change);
         }
-        let measures = c.account_catalog.then(|| self.quota.measures());
+        // Persistent WAL commits share their quota across branches. Count catalog
+        // growth before the next commit can check that quota.
+        let measures = c.log_end.map(|_| self.quota.measures());
         let catalog_growth = self.catalog.lock().append(c.info);
         if let Some(measures) = measures {
             match catalog_growth {

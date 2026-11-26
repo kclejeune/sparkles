@@ -769,7 +769,7 @@ complete replay, including zero-net steps that still create commits. Change coun
 summarize the net candidate. Quota projections include each source commit's WAL marker
 and carry forward the merge records, commit catalog entries and file framing of
 completed steps. The disk reserve projection credits space already allocated in the
-files that those steps fill.
+files that those steps fill and carries forward new tails that their fences can allocate.
 Insertion admission is evaluated for each step, so deletion followed by reinsertion
 cannot bypass an exceeded quota. Disk-size estimates remain approximate.
 The source and target heads, published snapshot, files and guard publication state stay
