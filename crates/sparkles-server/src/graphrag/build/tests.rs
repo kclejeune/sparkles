@@ -1510,7 +1510,8 @@ async fn circuit_refresh_handles_insertions_deletions_updates_and_joining_across
             tasks(&f.st)[1].message
         );
 
-        // Changing projection settings replaces the circuit cleanly without conflict.
+        // Changing projection settings replaces the circuit cleanly without conflict and
+        // starts counting writes to the newly included graph.
         let wider = settings(json!({
             "projection": { "graphs": [ORG, "urn:g:extra"] },
             "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 0.15 }
@@ -1519,6 +1520,27 @@ async fn circuit_refresh_handles_insertions_deletions_updates_and_joining_across
         now += sec;
         tick_once(&f.st, &mut w, now);
         assert_eq!(ds.dataset.inner_state().views.internal_count(), 1);
+        upd("INSERT DATA { GRAPH <urn:g:extra> { <http://ex/newcomer2> <http://ex/knows> <http://ex/y1> } }");
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        assert_eq!(
+            tasks(&f.st).len(),
+            3,
+            "replaced circuit must count writes to the newly added graph: {:?}",
+            tasks(&f.st)
+        );
+        wait(&f.st);
+        assert_eq!(tasks(&f.st)[2].state, "done", "{:?}", tasks(&f.st)[2]);
+        assert!(
+            tasks(&f.st)[2]
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("newcomer2") && m.contains("joined")),
+            "{:?}",
+            tasks(&f.st)[2].message
+        );
 
         // Switching to manual detaches and collects the internal circuit.
         let manual = settings(json!({ "refresh": { "mode": "manual" } }));
@@ -1816,7 +1838,8 @@ async fn circuit_refresh_enforces_memory_bounds_and_recovers_after_eviction() {
     .unwrap();
 }
 
-/// Deleting a dataset detaches its internal refresh circuit cleanly without pinning it.
+/// Deleting a dataset detaches its internal refresh circuit cleanly without pinning it,
+/// clearing runtime state so recreating the dataset under the same name starts clean.
 #[tokio::test(flavor = "multi_thread")]
 async fn circuit_refresh_detaches_on_dataset_delete() {
     let f = fixture(4);
@@ -1830,6 +1853,250 @@ async fn circuit_refresh_detaches_on_dataset_delete() {
         assert!(f.st.graphrag.has_refresh_circuit("org", &ds));
         drop(ds);
         assert!(f.st.delete("org").unwrap());
+        let recreated = f.st.create("org", DbType::Mem).unwrap();
+        assert!(
+            !f.st.graphrag.has_refresh_circuit("org", &recreated),
+            "recreated dataset must not inherit a stale refresh circuit"
+        );
+        assert_eq!(recreated.dataset.inner_state().views.internal_count(), 0);
+    })
+    .await
+    .unwrap();
+}
+
+/// A finishing build hook (`after_build`) reads live settings under the per-dataset
+/// circuit lock, so it neither clobbers a newer projection installed by `tick_once` nor
+/// re-attaches when settings switched to manual mode before the hook ran.
+#[tokio::test(flavor = "multi_thread")]
+async fn circuit_refresh_after_build_does_not_clobber_newer_projection() {
+    use crate::graphrag::refresh::{Watch, after_build, due_reason, tick_once};
+    let f = fixture(4);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let initial = settings(json!({
+            "projection": { "graphs": [ORG] },
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 0.5 }
+        }));
+        f.run(initial, Mode::Build).unwrap();
+        let ds = f.st.datasets().get("org").cloned().unwrap();
+        let state = state_of(&f.st, &ds).unwrap();
+        let source_commit = state.last_build.unwrap().source_commit;
+
+        // Settings update installs a wider projection via `tick_once` before a finishing
+        // build runs its `after_build` hook.
+        let wider = settings(json!({
+            "projection": { "graphs": [ORG, "urn:g:extra"] },
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 0.5 }
+        }));
+        store_settings(&f.st, &ds, &wider);
+        let mut w: HashMap<String, Watch> = HashMap::new();
+        let now = Instant::now();
+        tick_once(&f.st, &mut w, now);
+
+        // Simulate the older build completing its hook now.
+        after_build(&f.st, &ds, source_commit);
+
+        // Idle ticks and due checks must still observe the newer projection (`urn:g:extra`).
+        tick_once(&f.st, &mut w, now + Duration::from_secs(1));
+        sparkles::sparql::update::update(
+            &ds.store,
+            "INSERT DATA { GRAPH <urn:g:extra> { <http://ex/extra_join> <http://ex/knows> <http://ex/x0> } }",
+            &Default::default(),
+        )
+        .unwrap();
+        let reason = due_reason(&f.st, &ds, &wider, &mut Watch::default()).unwrap();
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("extra_join") && r.contains("joined")),
+            "newer projection must survive after_build: {reason:?}"
+        );
+
+        // If settings switched to manual before `after_build`, the hook detaches instead
+        // of re-attaching.
+        let manual = settings(json!({ "refresh": { "mode": "manual" } }));
+        store_settings(&f.st, &ds, &manual);
+        after_build(&f.st, &ds, source_commit);
+        ds.dataset.inner_state().views.settle(Duration::from_secs(10));
+        assert!(!f.st.graphrag.has_refresh_circuit("org", &ds));
+        assert_eq!(ds.dataset.inner_state().views.internal_count(), 0);
+    })
+    .await
+    .unwrap();
+}
+
+/// While a dataset holds a `Restore` reservation, `tick_once` detaches any existing
+/// refresh circuit and does not re-attach to the draining dataset.
+#[tokio::test(flavor = "multi_thread")]
+async fn circuit_refresh_skips_and_detaches_during_restore_reservation() {
+    use crate::graphrag::refresh::{Watch, tick_once};
+    let f = fixture(4);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let s = settings(json!({
+            "refresh": { "mode": "auto", "debounceSeconds": 1 }
+        }));
+        f.run(s, Mode::Build).unwrap();
+        let ds = f.st.datasets().get("org").cloned().unwrap();
+        assert!(f.st.graphrag.has_refresh_circuit("org", &ds));
+
+        let reservation =
+            f.st.catalog
+                .reserve(
+                    "org",
+                    sparkles::catalog::ReservationKind::Restore,
+                    "restore-test",
+                )
+                .unwrap();
+        let mut w: HashMap<String, Watch> = HashMap::new();
+        let now = Instant::now();
+        tick_once(&f.st, &mut w, now);
+        ds.dataset
+            .inner_state()
+            .views
+            .settle(Duration::from_secs(10));
+        assert!(
+            !f.st.graphrag.has_refresh_circuit("org", &ds),
+            "tick_once must detach and skip attaching during restore reservation"
+        );
+        assert_eq!(ds.dataset.inner_state().views.internal_count(), 0);
+
+        drop(reservation);
+        tick_once(&f.st, &mut w, now + Duration::from_secs(1));
+        assert!(
+            f.st.graphrag.has_refresh_circuit("org", &ds),
+            "circuit re-attaches cleanly once restore reservation ends"
+        );
+        assert_eq!(ds.dataset.inner_state().views.internal_count(), 1);
+    })
+    .await
+    .unwrap();
+}
+
+/// Renaming an in-memory or persistent dataset detaches the old dataset name's refresh
+/// circuit cleanly so the renamed dataset can attach a different projection without
+/// `internal-conflict`.
+#[tokio::test(flavor = "multi_thread")]
+async fn circuit_refresh_detaches_and_reattaches_cleanly_on_rename() {
+    use crate::graphrag::refresh::{Watch, tick_once};
+    for kind in [DbType::Mem, DbType::Persistent] {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockModel::start(|r, _| (200, mock::openai(&answer(r))));
+        let pair = json!({ "provider": "p", "model": "m" });
+        let mut st = AppState::standalone(Default::default(), Duration::from_secs(30));
+        st.data_dir = dir.path().to_path_buf();
+        st.catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+        st.models = arc_swap::ArcSwapOption::from_pointee(models_for(&mock.url(), &pair));
+        let st = Arc::new(st);
+        let ds = st.create("org", kind).unwrap();
+        ds.store
+            .load(&[Source::from_bytes(
+                data(4).into_bytes(),
+                RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        let mut assistant: crate::assistant::AssistantSettings =
+            crate::settings::effective(&st, &ds, &crate::settings::ASSISTANT);
+        assistant.send = crate::assistant::Send::Rows;
+        crate::settings::store_runtime(
+            &st,
+            &ds,
+            &crate::settings::ASSISTANT,
+            &serde_json::to_value(assistant).unwrap(),
+        )
+        .unwrap();
+        let s1 = settings(json!({
+            "projection": { "graphs": [ORG] },
+            "refresh": { "mode": "auto", "debounceSeconds": 1 }
+        }));
+        store_settings(&st, &ds, &s1);
+        tokio::task::spawn_blocking(move || {
+            run(&Run {
+                st: &st,
+                ds: ds.clone(),
+                settings: s1,
+                mode: Mode::Build,
+                confirmed: true,
+                task: None,
+                task_id: String::new(),
+                cancel: Default::default(),
+                limits: Default::default(),
+            })
+            .unwrap();
+            assert!(st.graphrag.has_refresh_circuit("org", &ds));
+            // Copy in-memory build state under the new name so the renamed in-memory
+            // dataset has a build record to attach against.
+            if kind == DbType::Mem {
+                let state = st.graphrag.state("org");
+                st.graphrag.set_state("org2", state);
+            }
+            drop(ds);
+            st.rename("org", "org2").unwrap();
+            let ds2 = st.datasets().get("org2").cloned().unwrap();
+            assert!(!st.graphrag.has_refresh_circuit("org", &ds2));
+            // Give the renamed dataset a DIFFERENT projection so an uncollected old
+            // handle on the shared in-memory views runtime would hit `internal-conflict`.
+            let s2 = settings(json!({
+                "projection": { "graphs": [ORG, "urn:g:renamed"] },
+                "refresh": { "mode": "auto", "debounceSeconds": 1 }
+            }));
+            store_settings(&st, &ds2, &s2);
+            let mut w: HashMap<String, Watch> = HashMap::new();
+            tick_once(&st, &mut w, Instant::now());
+            assert!(
+                st.graphrag.has_refresh_circuit("org2", &ds2),
+                "{kind:?}: renamed dataset must attach new circuit cleanly"
+            );
+            assert_eq!(ds2.dataset.inner_state().views.internal_count(), 1);
+        })
+        .await
+        .unwrap();
+    }
+}
+
+/// An attachment failure in `due_reason` routes through the C22 uncounted refresh
+/// fallback instead of failing and stalling behind backoff.
+#[tokio::test(flavor = "multi_thread")]
+async fn circuit_refresh_falls_back_on_attachment_failure() {
+    use crate::graphrag::refresh::{Watch, due_reason, tick_once};
+    let f = fixture(4);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let s = settings(json!({
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 0.5 }
+        }));
+        f.run(s.clone(), Mode::Build).unwrap();
+        let ds = f.st.datasets().get("org").cloned().unwrap();
+        // Detach the circuit and set `pass_timeout = 0` so `attach_internal`'s initial
+        // build fails immediately with `pass-timeout`.
+        f.st.graphrag.detach_circuit("org");
+        let views = &ds.dataset.inner_state().views;
+        views.settle(Duration::from_secs(10));
+        let prev_opts = views.options();
+        let mut failing_opts = prev_opts.clone();
+        failing_opts.pass_timeout = Duration::ZERO;
+        views.set_options(failing_opts);
+
+        sparkles::sparql::update::update(
+            &ds.store,
+            &format!("INSERT DATA {{ GRAPH <{ORG}> {{ <http://ex/x0> <http://ex/n> \"chg\" }} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        let reason = due_reason(&f.st, &ds, &s, &mut Watch::default()).unwrap();
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("could not attach")),
+            "attach failure must route through fallback refresh: {reason:?}"
+        );
+
+        // Once the failure clears, the next tick attaches cleanly again.
+        views.set_options(prev_opts);
+        let mut w: HashMap<String, Watch> = HashMap::new();
+        tick_once(&f.st, &mut w, Instant::now());
+        assert!(f.st.graphrag.has_refresh_circuit("org", &ds));
     })
     .await
     .unwrap();

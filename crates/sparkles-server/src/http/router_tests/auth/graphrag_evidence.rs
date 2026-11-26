@@ -1587,6 +1587,70 @@ async fn auto_circuit_counts_only_policy_readable_graphs_without_uncounted_fallb
                 .is_some_and(|r| r.contains("http://ex/fresh") && r.contains("joined")),
             "{reason:?}"
         );
+
+        // An attach-time failure under `reviewPolicy` must route through the C25 private
+        // check fallback (`Ok(None)` + `private.due = true`) rather than returning `Err`.
+        e.s.state.graphrag.detach_circuit("ev");
+        let views = &srv_ds.dataset.inner_state().views;
+        views.settle(std::time::Duration::from_secs(10));
+        let prev_opts = views.options();
+        let mut failing_opts = prev_opts.clone();
+        failing_opts.pass_timeout = std::time::Duration::ZERO;
+        views.set_options(failing_opts);
+        // Write to ORG (not an evidence graph), while `watches["ev"].private().due` is
+        // false, so only the attach failure can set `private.due = true`.
+        assert!(!watches["ev"].private().due);
+        sparkles::sparql::update::update(
+            &srv_ds.store,
+            &format!("INSERT DATA {{ GRAPH <{ORG}> {{ <http://ex/x0> <http://ex/note> \"af\" }} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        let r = crate::graphrag::refresh::due_reason(
+            &e.s.state,
+            &srv_ds,
+            &s,
+            watches.get_mut("ev").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            r, None,
+            "attach failure under reviewPolicy must not surface as a direct refresh reason"
+        );
+        assert!(
+            watches["ev"].private().due,
+            "attach failure under reviewPolicy must schedule the private check"
+        );
+        views.set_options(prev_opts);
+
+        // Re-attach cleanly, then break `reviewPolicy` so `Evidence::admit` fails:
+        // `tick_once` must detach the previously attached internal circuit.
+        let now2 = std::time::Instant::now();
+        crate::graphrag::refresh::tick_once(&e.s.state, &mut watches, now2);
+        assert_eq!(views.internal_count(), 1);
+        let broken = settings(serde_json::json!({
+            "projection": { "graphs": [ORG, "urn:ev:*"] },
+            "reviewPolicy": "missing-policy",
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 1.0 }
+        }));
+        crate::settings::store_runtime(
+            &e.s.state,
+            &srv_ds,
+            &crate::settings::GRAPHRAG,
+            &serde_json::to_value(&broken).unwrap(),
+        )
+        .unwrap();
+        crate::graphrag::refresh::tick_once(
+            &e.s.state,
+            &mut watches,
+            now2 + std::time::Duration::from_secs(1),
+        );
+        views.settle(std::time::Duration::from_secs(10));
+        assert!(
+            !e.s.state.graphrag.has_refresh_circuit("ev", &srv_ds),
+            "failing evidence admission must detach the stale internal circuit"
+        );
+        assert_eq!(views.internal_count(), 0);
     })
     .await
     .unwrap();

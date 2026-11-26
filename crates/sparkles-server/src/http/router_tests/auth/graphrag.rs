@@ -1423,3 +1423,181 @@ async fn circuit_refresh_respects_principal_visibility_and_protections() {
     .await
     .unwrap();
 }
+
+/// Revoking the configured GraphRAG principal's query access or switching it to a
+/// data-dependent protection via an auth policy reload detaches the existing internal
+/// refresh circuit on the next idle tick, and restoring access re-attaches it cleanly.
+#[tokio::test(flavor = "multi_thread")]
+async fn circuit_refresh_detaches_on_principal_revocation_and_protection_reload() {
+    use crate::graphrag::build::{self, Mode, Run};
+    use crate::graphrag::refresh::{Watch, tick_once};
+    use crate::graphrag::settings::GraphragSettings;
+    use crate::models::mock;
+
+    let s = build(Fixture {
+        extra: users(r#""urn:g:a", "urn:x-sparkles:graphrag:reports""#, false),
+        ..Default::default()
+    });
+    let ds = s.state.attach("rag", DbType::Persistent, None).unwrap();
+    let mock = mock::MockModel::start(|r, _| {
+        (200, mock::openai(&crate::graphrag::build::tests::answer(r)))
+    });
+    let pair = serde_json::json!({ "provider": "p", "model": "m" });
+    s.state
+        .models
+        .store(Some(Arc::new(crate::graphrag::build::tests::models_for(
+            &mock.url(),
+            &pair,
+        ))));
+    let mut cluster = String::from("<urn:g:a> {\n");
+    for i in 0..4 {
+        cluster.push_str(&format!(
+            "<http://ex/a{i}> <http://www.w3.org/2000/01/rdf-schema#label> \"a{i}\" .\n"
+        ));
+        for j in (i + 1)..4 {
+            cluster.push_str(&format!(
+                "<http://ex/a{i}> <http://ex/knows> <http://ex/a{j}> .\n"
+            ));
+        }
+    }
+    cluster.push_str("}\n");
+    ds.store
+        .load(&[sparkles::io::Source::from_bytes(
+            cluster.into_bytes(),
+            sparkles::io::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+
+    let mut assistant: crate::assistant::AssistantSettings =
+        crate::settings::effective(&s.state, &ds, &crate::settings::ASSISTANT);
+    assistant.send = crate::assistant::Send::Rows;
+    crate::settings::store_runtime(
+        &s.state,
+        &ds,
+        &crate::settings::ASSISTANT,
+        &serde_json::to_value(assistant).unwrap(),
+    )
+    .unwrap();
+
+    let gr_settings: GraphragSettings = serde_json::from_value(serde_json::json!({
+        "enabled": true,
+        "principal": "tua",
+        "projection": { "graphs": ["urn:g:*"] },
+        "minCommunitySize": 3,
+        "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 0.25 }
+    }))
+    .unwrap();
+    crate::settings::store_runtime(
+        &s.state,
+        &ds,
+        &crate::settings::GRAPHRAG,
+        &serde_json::to_value(&gr_settings).unwrap(),
+    )
+    .unwrap();
+
+    let st = s.state.clone();
+    let ds2 = ds.clone();
+    tokio::task::spawn_blocking(move || {
+        build::run(&Run {
+            st: &st,
+            ds: ds2.clone(),
+            settings: gr_settings,
+            mode: Mode::Build,
+            confirmed: true,
+            task: None,
+            task_id: String::new(),
+            cancel: Default::default(),
+            limits: Default::default(),
+        })
+        .unwrap();
+        assert_eq!(ds2.dataset.inner_state().views.internal_count(), 1);
+    })
+    .await
+    .unwrap();
+
+    let mut watches: std::collections::HashMap<String, Watch> = std::collections::HashMap::new();
+    let mut now = std::time::Instant::now();
+    let sec = std::time::Duration::from_secs(1);
+
+    // Prime the watch on an idle tick while `tua` is authorized.
+    let st = s.state.clone();
+    let mut w = watches;
+    w = tokio::task::spawn_blocking(move || {
+        tick_once(&st, &mut w, now);
+        w
+    })
+    .await
+    .unwrap();
+    assert!(s.state.graphrag.has_refresh_circuit("rag", &ds));
+
+    // 1. Reload auth policy removing `tua` completely (idle dataset, no new commits).
+    s.write_config(&Fixture::default());
+    s.auth().reload().unwrap();
+    now += sec;
+    let st = s.state.clone();
+    let ds2 = ds.clone();
+    w = tokio::task::spawn_blocking(move || {
+        tick_once(&st, &mut w, now);
+        ds2.dataset
+            .inner_state()
+            .views
+            .settle(std::time::Duration::from_secs(10));
+        w
+    })
+    .await
+    .unwrap();
+    assert!(
+        !s.state.graphrag.has_refresh_circuit("rag", &ds),
+        "revoking principal must detach its refresh circuit"
+    );
+    assert_eq!(
+        ds.dataset.inner_state().views.internal_count(),
+        0,
+        "revoked principal's circuit must be collected"
+    );
+
+    // 2. Restore `tua`'s grant via reload: next idle tick re-attaches cleanly.
+    s.write_config(&Fixture {
+        extra: users(r#""urn:g:a", "urn:x-sparkles:graphrag:reports""#, false),
+        ..Default::default()
+    });
+    s.auth().reload().unwrap();
+    now += sec;
+    let st = s.state.clone();
+    w = tokio::task::spawn_blocking(move || {
+        tick_once(&st, &mut w, now);
+        w
+    })
+    .await
+    .unwrap();
+    assert!(s.state.graphrag.has_refresh_circuit("rag", &ds));
+    assert_eq!(ds.dataset.inner_state().views.internal_count(), 1);
+
+    // 3. Reload auth policy adding a data-dependent `own` protection: must detach.
+    s.write_config(&Fixture {
+        extra: users(r#""urn:g:a", "urn:x-sparkles:graphrag:reports""#, true),
+        ..Default::default()
+    });
+    s.auth().reload().unwrap();
+    now += sec;
+    let st = s.state.clone();
+    let ds2 = ds.clone();
+    watches = tokio::task::spawn_blocking(move || {
+        tick_once(&st, &mut w, now);
+        ds2.dataset
+            .inner_state()
+            .views
+            .settle(std::time::Duration::from_secs(10));
+        w
+    })
+    .await
+    .unwrap();
+    drop(watches);
+    assert!(!s.state.graphrag.has_refresh_circuit("rag", &ds));
+    assert_eq!(
+        ds.dataset.inner_state().views.internal_count(),
+        0,
+        "reloading into data-dependent protection must detach the circuit"
+    );
+}

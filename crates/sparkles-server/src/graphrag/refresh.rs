@@ -180,6 +180,14 @@ impl Watch {
             })
     }
 
+    /// Clear cached attachment tracking so the next tick re-evaluates attachment state.
+    fn clear_attached(&mut self) {
+        self.attached_settings = None;
+        self.attached_epoch = None;
+        self.attached_head = None;
+        self.attached_uncountable = false;
+    }
+
     /// The private check's record, for tests.
     pub(crate) fn private(&self) -> &Private {
         &self.private
@@ -297,11 +305,16 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
     st.graphrag
         .retain_circuits(|name| datasets.contains_key(name));
     for (name, ds) in datasets {
+        if st.catalog.restoring_by(&name).is_some() {
+            watches.remove(&name);
+            st.graphrag.detach_circuit(&name);
+            continue;
+        }
         let settings: GraphragSettings =
             crate::settings::effective(st, &ds, &crate::settings::GRAPHRAG);
         if !settings.enabled || settings.refresh.mode != RefreshMode::Auto {
             watches.remove(&name);
-            st.graphrag.detach_circuit(&name);
+            st.graphrag.detach_circuit_for(&name, &ds);
             continue;
         }
         let head = ds.store.head_commit().seq;
@@ -583,14 +596,14 @@ pub(crate) fn build_accumulator_query(
         pred_filters.push(format!("?p NOT IN ({})", list.join(", ")));
     }
     if rdf_type_excluded {
-        pred_filters.push("(isIRI(?o) || isLiteral(?o))".into());
+        pred_filters.push("isIRI(?s) && (isIRI(?o) || isLiteral(?o))".into());
     } else {
         pred_filters.push(format!(
-            "((?p != {RDF_TYPE} && (isIRI(?o) || isLiteral(?o))) || (isIRI(?s) && isIRI(?o) && ?s != ?o))"
+            "isIRI(?s) && ((?p != {RDF_TYPE} && (isIRI(?o) || isLiteral(?o))) || (isIRI(?o) && ?s != ?o))"
         ));
     }
 
-    let peer_bind = "BIND(IF(isIRI(?s) && isIRI(?o) && ?s != ?o, ?o, ?_unset) AS ?peer)";
+    let peer_bind = "BIND(IF(isIRI(?o) && ?s != ?o, ?o, ?_unset) AS ?peer)";
     let (key_select, keys, nonfact_bind) = if rdf_type_excluded {
         ("?s ?peer", vec!["s", "peer"], String::new())
     } else {
@@ -601,19 +614,25 @@ pub(crate) fn build_accumulator_query(
         )
     };
 
-    let exact_iris: Option<Vec<String>> =
-        if prefix_graphs.is_empty() && exact_graphs.len() <= MAX_EXACT_GRAPHS_UNION {
-            exact_graphs
-                .iter()
-                .map(|g| {
-                    oxrdf::NamedNode::new(g.as_str())
-                        .ok()
-                        .map(|n| n.to_string())
-                })
-                .collect()
-        } else {
-            None
-        };
+    // Route `urn:x-arq:*` IRIs through the `GRAPH ?g` filter path: F13 compiles constant
+    // `GRAPH <urn:x-arq:...>` clauses to `Recompute` (scanning and retaining rows), and
+    // the SPARQL planner interprets `UnionGraph`/`DefaultGraph` as aliases rather than
+    // physical named graphs.
+    let exact_iris: Option<Vec<String>> = if prefix_graphs.is_empty()
+        && exact_graphs.len() <= MAX_EXACT_GRAPHS_UNION
+        && !exact_graphs.iter().any(|g| g.starts_with("urn:x-arq:"))
+    {
+        exact_graphs
+            .iter()
+            .map(|g| {
+                oxrdf::NamedNode::new(g.as_str())
+                    .ok()
+                    .map(|n| n.to_string())
+            })
+            .collect()
+    } else {
+        None
+    };
 
     let query = match exact_iris {
         Some(iris) if iris.len() == 1 => {
@@ -674,17 +693,70 @@ enum CircuitPlan {
     },
 }
 
-/// Plan the internal F13 accumulator circuit for `ds` under `settings` and `evidence`.
-fn plan_circuit(
+enum EnsureCircuit {
+    Attached(InternalCircuit),
+    NotLive,
+    Failed(String),
+}
+
+/// Whether `ds` is still the live, non-restoring dataset registered under `ds.name`.
+fn is_live_dataset(st: &AppState, ds: &Dataset) -> bool {
+    if st.catalog.restoring_by(&ds.name).is_some() {
+        return false;
+    }
+    st.get(&ds.name).is_some_and(|cur| {
+        cur.store.dataset_id() == ds.store.dataset_id()
+            && Arc::ptr_eq(
+                &cur.dataset.inner_state().views,
+                &ds.dataset.inner_state().views,
+            )
+    })
+}
+
+fn is_internal_conflict(e: &sparkles::Error) -> bool {
+    matches!(e, sparkles::Error::Component(c) if c.code == "internal-conflict")
+}
+
+fn resolve_evidence(
+    st: &AppState,
+    ds: &Dataset,
+    settings: &GraphragSettings,
+) -> Result<Option<super::evidence::Evidence>, String> {
+    let Some(name) = &settings.review_policy else {
+        return Ok(None);
+    };
+    crate::settings::evidence::require_reconciled(st, ds)
+        .map_err(|e| super::evidence::engine(e).to_string())?;
+    super::evidence::Evidence::admit(
+        ds,
+        Some(name),
+        None,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Default::default(),
+        &ds.dataset.query_options(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Plan the internal F13 accumulator circuit for `ds` under `settings` and `evidence`,
+/// detaching any existing handle for `ds` when authorization fails or the projection is
+/// empty or uncountable. Caller must hold `st.graphrag.circuit_lock(&ds.name)`.
+fn plan_circuit_locked(
     st: &AppState,
     ds: &Dataset,
     settings: &GraphragSettings,
     evidence: Option<&super::evidence::Evidence>,
 ) -> Result<CircuitPlan, String> {
-    let principal = build::authorized_principal(st, ds, &settings.principal)?;
+    let principal = match build::authorized_principal(st, ds, &settings.principal) {
+        Ok(p) => p,
+        Err(e) => {
+            st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+            return Err(e);
+        }
+    };
     let access = principal.view(&ds.name, Endpoint::Query);
     if let Some(reason) = sparkles::incr::runtime::whole_reason(access.as_ref()) {
-        st.graphrag.detach_circuit(&ds.name);
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
         return Ok(CircuitPlan::Uncountable(reason));
     }
     let extra = super::projection::Extra {
@@ -692,7 +764,7 @@ fn plan_circuit(
         excluded: evidence.map(|e| &e.excluded),
     };
     let Some((query, keys)) = build_accumulator_query(settings, &extra) else {
-        st.graphrag.detach_circuit(&ds.name);
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
         return Ok(CircuitPlan::Empty);
     };
     let spec =
@@ -706,71 +778,127 @@ fn plan_circuit(
 }
 
 /// Return the attached refresh circuit matching `(spec, access_fp)`, replacing any
-/// stale handle for `ds.name` after waiting for the worker to collect it.
-fn ensure_circuit(
-    st: &AppState,
-    ds: &Dataset,
-    spec: InternalSpec,
-    access: Option<Arc<sparkles::access::GraphAccess>>,
-    access_fp: u64,
-) -> Result<InternalCircuit, String> {
-    if let Some(handle) = st.graphrag.refresh_circuit(&ds.name, ds, &spec, access_fp) {
-        return Ok(handle);
-    }
-    if let Some(old) = st.graphrag.take_refresh_circuit(&ds.name) {
-        let same_store = old.same_store(ds);
-        drop(old);
-        if same_store && !ds.dataset.inner_state().views.is_closed() {
-            ds.dataset
-                .inner_state()
-                .views
-                .settle(CIRCUIT_SETTLE_TIMEOUT);
-        }
-    }
-    let internal_access = match access {
-        Some(g) => InternalAccess::reading(g),
-        None => InternalAccess::everything(),
-    };
-    let handle = ds
-        .dataset
-        .attach_internal(spec.clone(), internal_access)
-        .map_err(|e| e.to_string())?;
-    let displaced = st.graphrag.set_refresh_circuit(
-        &ds.name,
-        RefreshCircuit::new(ds, spec, access_fp, handle.clone()),
-    );
-    drop(displaced);
-    Ok(handle)
-}
-
-/// Sync the refresh circuit right after a build or refresh saves its state on `main`,
-/// discarding counts that the completed run already covers.
-pub(crate) fn after_build(
+/// stale handle for `ds.name` after waiting for the worker to collect it. Caller must
+/// hold `st.graphrag.circuit_lock(&ds.name)`.
+fn ensure_circuit_locked(
     st: &AppState,
     ds: &Dataset,
     settings: &GraphragSettings,
-    source_commit: u64,
-    evidence: Option<&super::evidence::Evidence>,
-) {
+    access_epoch: u64,
+    spec: InternalSpec,
+    access: Option<Arc<sparkles::access::GraphAccess>>,
+    access_fp: u64,
+) -> EnsureCircuit {
+    if !is_live_dataset(st, ds) {
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+        return EnsureCircuit::NotLive;
+    }
+    if let Some(handle) = st.graphrag.refresh_circuit_sync_locked(
+        &ds.name,
+        ds,
+        settings,
+        access_epoch,
+        &spec,
+        access_fp,
+    ) {
+        return EnsureCircuit::Attached(handle);
+    }
+    let views = &ds.dataset.inner_state().views;
+    let deadline = Instant::now() + CIRCUIT_SETTLE_TIMEOUT;
+    if let Some(old) = st.graphrag.take_refresh_circuit_locked(&ds.name) {
+        let same_store = old.same_store(ds);
+        drop(old);
+        if same_store && !views.is_closed() {
+            views.settle(deadline.saturating_duration_since(Instant::now()));
+        }
+    }
+    let handle = loop {
+        if !is_live_dataset(st, ds) {
+            return EnsureCircuit::NotLive;
+        }
+        let internal_access = match &access {
+            Some(g) => InternalAccess::reading(g.clone()),
+            None => InternalAccess::everything(),
+        };
+        match ds.dataset.attach_internal(spec.clone(), internal_access) {
+            Ok(h) => break h,
+            Err(e) if is_internal_conflict(&e) && !views.is_closed() => {
+                // A single `settle()` can finish an in-flight round that had already
+                // passed `collect_internal`, or follow an earlier unsettled detach; retry
+                // across subsequent rounds until collection completes or the budget ends.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return EnsureCircuit::Failed(e.to_string());
+                }
+                views.settle(remaining);
+            }
+            Err(e) => return EnsureCircuit::Failed(e.to_string()),
+        }
+    };
+    if !is_live_dataset(st, ds) {
+        drop(handle);
+        return EnsureCircuit::NotLive;
+    }
+    let displaced = st.graphrag.set_refresh_circuit_locked(
+        &ds.name,
+        RefreshCircuit::new(
+            ds,
+            settings.clone(),
+            access_epoch,
+            spec,
+            access_fp,
+            handle.clone(),
+        ),
+    );
+    drop(displaced);
+    EnsureCircuit::Attached(handle)
+}
+
+/// Sync the refresh circuit right after a build or refresh saves its state on `main`,
+/// discarding counts that the completed run already covers. Always reads live settings,
+/// access epoch and review policy under the per-dataset circuit lock so a finishing
+/// build never clobbers a newer projection or re-attaches during a restore or delete.
+pub(crate) fn after_build(st: &AppState, ds: &Dataset, source_commit: u64) {
     if ds.branch.is_some() {
         return;
     }
-    if !settings.enabled || settings.refresh.mode != RefreshMode::Auto {
-        st.graphrag.detach_circuit(&ds.name);
+    let lock = st.graphrag.circuit_lock(&ds.name);
+    let _held = lock.lock();
+    if !is_live_dataset(st, ds) {
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
         return;
     }
-    match plan_circuit(st, ds, settings, evidence) {
+    let settings: GraphragSettings = crate::settings::effective(st, ds, &crate::settings::GRAPHRAG);
+    let epoch = st.access_epoch();
+    if !settings.enabled || settings.refresh.mode != RefreshMode::Auto {
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+        return;
+    }
+    let evidence = match resolve_evidence(st, ds, &settings) {
+        Ok(e) => e,
+        Err(e) => {
+            st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+            tracing::warn!(
+                target: "sparkles::graphrag",
+                dataset = %ds.name,
+                "automatic refresh circuit: {e}"
+            );
+            return;
+        }
+    };
+    match plan_circuit_locked(st, ds, &settings, evidence.as_ref()) {
         Ok(CircuitPlan::Attach {
             spec,
             access,
             access_fp,
-        }) => match ensure_circuit(st, ds, spec, access, access_fp) {
-            Ok(handle) => {
+        }) => match ensure_circuit_locked(st, ds, &settings, epoch, spec, access, access_fp) {
+            EnsureCircuit::Attached(handle) => {
                 let head = ds.store.head_commit().seq;
                 let through = advance_past_graphrag(&ds.store, source_commit, head);
                 handle.discard_through(through);
             }
-            Err(e) => {
+            EnsureCircuit::NotLive => {}
+            EnsureCircuit::Failed(e) => {
                 tracing::warn!(
                     target: "sparkles::graphrag",
                     dataset = %ds.name,
@@ -802,16 +930,32 @@ fn ensure_attached(
     let settings_same = w.attached_settings.as_ref() == Some(settings);
     let epoch_same = w.attached_epoch == Some(epoch);
     let evidence_moved = settings.review_policy.is_some() && w.attached_head != Some(head);
-    let has_circuit = st.graphrag.has_refresh_circuit(&ds.name, ds);
-    if settings_same && epoch_same && !evidence_moved && (has_circuit || w.attached_uncountable) {
+    let has_matching = st
+        .graphrag
+        .has_matching_circuit(&ds.name, ds, settings, epoch);
+    if settings_same && epoch_same && !evidence_moved && (has_matching || w.attached_uncountable) {
         return;
     }
-    if !has_circuit && w.no_build_head == Some(head) && settings_same && epoch_same {
+    if !st.graphrag.has_refresh_circuit(&ds.name, ds)
+        && w.no_build_head == Some(head)
+        && settings_same
+        && epoch_same
+    {
         return;
     }
     let Ok(state) = build::state_of(st, ds) else {
         return;
     };
+    let lock = st.graphrag.circuit_lock(&ds.name);
+    let _held = lock.lock();
+    if !is_live_dataset(st, ds) {
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+        w.clear_attached();
+        return;
+    }
+    // Re-read the live epoch under the circuit lock so any access reload racing with
+    // `state_of` is reflected in the attached handle and watch cache.
+    let epoch = st.access_epoch();
     let Some(b) = state
         .last_build
         .as_ref()
@@ -822,36 +966,25 @@ fn ensure_attached(
         w.attached_epoch = Some(epoch);
         w.attached_head = Some(head);
         w.attached_uncountable = false;
-        st.graphrag.detach_circuit(&ds.name);
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
         return;
     };
     w.no_build_head = None;
-    let evidence = match &settings.review_policy {
-        Some(name) => {
-            if crate::settings::evidence::require_reconciled(st, ds).is_err() {
-                return;
-            }
-            match super::evidence::Evidence::admit(
-                ds,
-                Some(name),
-                None,
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                Default::default(),
-                &ds.dataset.query_options(),
-            ) {
-                Ok(e) => e,
-                Err(_) => return,
-            }
+    let evidence = match resolve_evidence(st, ds, settings) {
+        Ok(e) => e,
+        Err(_) => {
+            st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+            w.clear_attached();
+            return;
         }
-        None => None,
     };
-    match plan_circuit(st, ds, settings, evidence.as_ref()) {
+    match plan_circuit_locked(st, ds, settings, evidence.as_ref()) {
         Ok(CircuitPlan::Attach {
             spec,
             access,
             access_fp,
-        }) => {
-            if let Ok(handle) = ensure_circuit(st, ds, spec, access, access_fp) {
+        }) => match ensure_circuit_locked(st, ds, settings, epoch, spec, access, access_fp) {
+            EnsureCircuit::Attached(handle) => {
                 let through = advance_past_graphrag(&ds.store, b.source_commit, head);
                 handle.discard_through(through);
                 w.attached_settings = Some(settings.clone());
@@ -859,14 +992,16 @@ fn ensure_attached(
                 w.attached_head = Some(head);
                 w.attached_uncountable = false;
             }
-        }
-        Ok(CircuitPlan::Empty | CircuitPlan::Uncountable(_)) => {
+            EnsureCircuit::NotLive | EnsureCircuit::Failed(_) => {
+                w.clear_attached();
+            }
+        },
+        Ok(CircuitPlan::Empty | CircuitPlan::Uncountable(_)) | Err(_) => {
             w.attached_settings = Some(settings.clone());
             w.attached_epoch = Some(epoch);
             w.attached_head = Some(head);
             w.attached_uncountable = true;
         }
-        Err(_) => {}
     }
 }
 
@@ -877,6 +1012,10 @@ pub(crate) fn due_reason(
     settings: &GraphragSettings,
     w: &mut Watch,
 ) -> Result<Option<String>, String> {
+    if !is_live_dataset(st, ds) {
+        st.graphrag.detach_circuit_for(&ds.name, ds);
+        return Ok(None);
+    }
     let state = build::state_of(st, ds)?;
     let Some(b) = &state.last_build else {
         return Ok(None);
@@ -888,24 +1027,12 @@ pub(crate) fn due_reason(
     w.had_policy = b.policy.is_some();
     // the policy the reports read under: enabling, switching or removing it, or a new
     // version, rewrites every report (spec C25, "Reports on accepted evidence")
-    let evidence = match &settings.review_policy {
-        Some(name) => {
-            crate::settings::evidence::require_reconciled(st, ds)
-                .map_err(|e| super::evidence::engine(e).to_string())?;
-            Some(
-                super::evidence::Evidence::admit(
-                    ds,
-                    Some(name),
-                    None,
-                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                    Default::default(),
-                    &ds.dataset.query_options(),
-                )
-                .map_err(|e| e.to_string())?
-                .expect("a named policy"),
-            )
+    let evidence = match resolve_evidence(st, ds, settings) {
+        Ok(e) => e,
+        Err(e) => {
+            st.graphrag.detach_circuit_for(&ds.name, ds);
+            return Err(e);
         }
-        None => None,
     };
     if let Some(e) = &evidence {
         note_private(st, ds, e, w);
@@ -953,30 +1080,45 @@ pub(crate) fn due_reason(
             Ok(Some(msg))
         }
     };
-    let (spec, access, access_fp) = match plan_circuit(st, ds, settings, evidence.as_ref())? {
-        CircuitPlan::Empty => return Ok(None),
-        CircuitPlan::Uncountable(why) => {
-            return fallback(
-                w,
-                format!("the incremental refresh circuit cannot count the changes: {why}"),
-            );
-        }
-        CircuitPlan::Attach {
-            spec,
-            access,
-            access_fp,
-        } => (spec, access, access_fp),
-    };
-    let handle = if settings.refresh.mode == RefreshMode::Auto {
-        ensure_circuit(st, ds, spec, access, access_fp)?
-    } else {
-        match st.graphrag.refresh_circuit(&ds.name, ds, &spec, access_fp) {
-            Some(h) => h,
-            None => {
-                return fallback(
-                    w,
-                    "the incremental refresh circuit is not attached in manual mode".into(),
-                );
+    let handle = {
+        let lock = st.graphrag.circuit_lock(&ds.name);
+        let _held = lock.lock();
+        let epoch = st.access_epoch();
+        let (spec, access, access_fp) =
+            match plan_circuit_locked(st, ds, settings, evidence.as_ref())? {
+                CircuitPlan::Empty => return Ok(None),
+                CircuitPlan::Uncountable(why) => {
+                    return fallback(
+                        w,
+                        format!("the incremental refresh circuit cannot count the changes: {why}"),
+                    );
+                }
+                CircuitPlan::Attach {
+                    spec,
+                    access,
+                    access_fp,
+                } => (spec, access, access_fp),
+            };
+        if settings.refresh.mode == RefreshMode::Auto {
+            match ensure_circuit_locked(st, ds, settings, epoch, spec, access, access_fp) {
+                EnsureCircuit::Attached(h) => h,
+                EnsureCircuit::NotLive => return Ok(None),
+                EnsureCircuit::Failed(e) => {
+                    return fallback(
+                        w,
+                        format!("the incremental refresh circuit could not attach: {e}"),
+                    );
+                }
+            }
+        } else {
+            match st.graphrag.refresh_circuit(&ds.name, ds, &spec, access_fp) {
+                Some(h) => h,
+                None => {
+                    return fallback(
+                        w,
+                        "the incremental refresh circuit is not attached in manual mode".into(),
+                    );
+                }
             }
         }
     };
@@ -1774,6 +1916,201 @@ mod tests {
                 want_join,
                 "{update}"
             );
+        }
+    }
+
+    /// Exact `urn:x-arq:*` graph IRIs must route through `GRAPH ?g` physical-name
+    /// filtering rather than `GRAPH <iri>`, staying stateless (no `Recompute` scan) and
+    /// never counting quads from unrelated named graphs or the default graph.
+    #[test]
+    fn accumulator_query_routes_arq_special_graphs_through_physical_filter() {
+        use sparkles::incr::{InternalAccess, InternalSpec, OpenHost, Runtime};
+        use sparkles::io::{RdfFormat, Source};
+
+        let mut settings = GraphragSettings::default();
+        settings.projection.graphs = vec![
+            "urn:x-arq:UnionGraph".into(),
+            "urn:x-arq:DefaultGraph".into(),
+            "urn:x-arq:custom".into(),
+        ];
+        let (query, keys) =
+            build_accumulator_query(&settings, &super::super::projection::Extra::default())
+                .unwrap();
+        assert!(
+            query.contains("GRAPH ?g"),
+            "urn:x-arq:* IRIs must use physical GRAPH ?g filter: {query}"
+        );
+        let s = sparkles::store::Store::in_memory(Default::default());
+        s.load(&[Source::from_bytes(
+            b"<urn:other> { <http://ex/a> <http://ex/name> \"A\" . } \
+              <http://ex/a> <http://ex/def> \"D\" ."
+                .to_vec(),
+            RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+        let rt = Runtime::open(None, s.dataset_id(), Default::default());
+        rt.set_host(Arc::new(OpenHost));
+        let c = rt
+            .attach_internal(
+                &s,
+                InternalSpec::accumulator(CIRCUIT_ID, query, keys),
+                InternalAccess::everything(),
+            )
+            .unwrap();
+        assert_eq!(
+            c.bytes(),
+            0,
+            "urn:x-arq:* filter path must compile statelessly with zero retained state"
+        );
+        let after = s.head_commit().seq;
+        // Writes to unrelated named graphs and the default graph must NOT be counted
+        // despite `urn:x-arq:UnionGraph` and `urn:x-arq:DefaultGraph` in projection.graphs.
+        sparkles::sparql::update::update(
+            &s,
+            "INSERT DATA { \
+               GRAPH <urn:unrelated> { <http://ex/a> <http://ex/p> \"u\" } \
+               <http://ex/a> <http://ex/p> \"d\" \
+             }",
+            &Default::default(),
+        )
+        .unwrap();
+        rt.round(&s);
+        let counts = c.counts(after).unwrap();
+        assert!(counts.complete());
+        assert!(
+            counts.keys.is_empty(),
+            "unrelated named graph and default graph must not match ARQ aliases: {counts:?}"
+        );
+        // Writes to the physical named graph `<urn:x-arq:custom>` ARE counted.
+        sparkles::sparql::update::update(
+            &s,
+            "INSERT DATA { GRAPH <urn:x-arq:custom> { <http://ex/a> <http://ex/p> \"hit\" } }",
+            &Default::default(),
+        )
+        .unwrap();
+        rt.round(&s);
+        let counts = c.counts(after).unwrap();
+        assert!(counts.complete());
+        let st = state();
+        let mut counter = Counter::new(&st, &settings);
+        counter.apply_counts(&counts);
+        assert_eq!(counter.changed, vec![1]);
+    }
+
+    /// Blank-node subjects are filtered out by `isIRI(?s)` so they never pollute the
+    /// bounded accumulator tally under either `rdf:type` exclusion setting.
+    #[test]
+    fn accumulator_query_excludes_blank_node_subjects_from_tally() {
+        use sparkles::incr::{InternalAccess, InternalSpec, OpenHost, Runtime};
+
+        for exclude in [
+            vec!["http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_string()],
+            Vec::new(),
+        ] {
+            let mut settings = GraphragSettings::default();
+            settings.projection.graphs = vec!["urn:g:a".into()];
+            settings.projection.exclude = exclude;
+            let (query, keys) =
+                build_accumulator_query(&settings, &super::super::projection::Extra::default())
+                    .unwrap();
+            let s = sparkles::store::Store::in_memory(Default::default());
+            let rt = Runtime::open(None, s.dataset_id(), Default::default());
+            rt.set_host(Arc::new(OpenHost));
+            let c = rt
+                .attach_internal(
+                    &s,
+                    InternalSpec::accumulator(CIRCUIT_ID, query, keys),
+                    InternalAccess::everything(),
+                )
+                .unwrap();
+            let after = s.head_commit().seq;
+            sparkles::sparql::update::update(
+                &s,
+                "INSERT DATA { GRAPH <urn:g:a> { \
+                   _:b1 <http://ex/name> \"anon\" . \
+                   _:b2 <http://ex/knows> <http://ex/a> . \
+                   _:b3 a <http://ex/Thing> \
+                 } }",
+                &Default::default(),
+            )
+            .unwrap();
+            rt.round(&s);
+            let counts = c.counts(after).unwrap();
+            assert!(counts.complete());
+            assert!(
+                counts.keys.is_empty(),
+                "blank-node subjects must not enter the accumulator tally: {counts:?}"
+            );
+        }
+    }
+
+    /// Exact graph lists compile to per-graph `UNION` up to 16 distinct IRIs (after
+    /// deduplication and `extra.output` insertion) and switch to `GRAPH ?g` at 17, while
+    /// both produce identical counts.
+    #[test]
+    fn accumulator_query_exact_graph_cutoff_at_16_and_17() {
+        use sparkles::incr::{InternalAccess, InternalSpec, OpenHost, Runtime};
+
+        // 15 unique graphs + 1 duplicate + 1 distinct extra.output => 16 unique IRIs (UNION).
+        let mut settings16 = GraphragSettings::default();
+        settings16.projection.graphs = (0..15).map(|i| format!("urn:g:{i}")).collect();
+        settings16.projection.graphs.push("urn:g:0".into());
+        let extra16 = super::super::projection::Extra {
+            output: Some("urn:ev:out"),
+            excluded: None,
+        };
+        let (q16, k16) = build_accumulator_query(&settings16, &extra16).unwrap();
+        assert!(
+            !q16.contains("GRAPH ?g") && q16.contains("UNION"),
+            "16 distinct exact graphs should compile to per-graph UNION: {q16}"
+        );
+
+        // 16 unique graphs + 1 distinct extra.output => 17 unique IRIs (GRAPH ?g filter).
+        let mut settings17 = GraphragSettings::default();
+        settings17.projection.graphs = (0..16).map(|i| format!("urn:g:{i}")).collect();
+        let extra17 = super::super::projection::Extra {
+            output: Some("urn:ev:out"),
+            excluded: None,
+        };
+        let (q17, k17) = build_accumulator_query(&settings17, &extra17).unwrap();
+        assert!(
+            q17.contains("GRAPH ?g"),
+            "17 distinct exact graphs should compile to GRAPH ?g filter: {q17}"
+        );
+
+        let st = state();
+        for (label, settings, query, keys) in [
+            ("16-exact", &settings16, q16, k16),
+            ("17-exact", &settings17, q17, k17),
+        ] {
+            let s = sparkles::store::Store::in_memory(Default::default());
+            let rt = Runtime::open(None, s.dataset_id(), Default::default());
+            rt.set_host(Arc::new(OpenHost));
+            let c = rt
+                .attach_internal(
+                    &s,
+                    InternalSpec::accumulator(CIRCUIT_ID, query, keys),
+                    InternalAccess::everything(),
+                )
+                .unwrap();
+            let after = s.head_commit().seq;
+            sparkles::sparql::update::update(
+                &s,
+                "INSERT DATA { \
+                   GRAPH <urn:g:0> { <http://ex/a> <http://ex/p> \"1\" } \
+                   GRAPH <urn:ev:out> { <http://ex/a> <http://ex/p> \"2\" } \
+                   GRAPH <urn:outside> { <http://ex/a> <http://ex/p> \"3\" } \
+                 }",
+                &Default::default(),
+            )
+            .unwrap();
+            rt.round(&s);
+            let counts = c.counts(after).unwrap();
+            assert!(counts.complete(), "{label}");
+            let mut counter = Counter::new(&st, settings);
+            counter.apply_counts(&counts);
+            assert_eq!(counter.changed, vec![2], "{label}");
         }
     }
 }

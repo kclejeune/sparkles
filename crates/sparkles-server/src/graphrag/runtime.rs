@@ -11,6 +11,8 @@ use std::time::Duration;
 pub(crate) struct RefreshCircuit {
     pub(crate) dataset_id: uuid::Uuid,
     pub(crate) runtime: Weak<sparkles::incr::Runtime>,
+    pub(crate) settings: super::settings::GraphragSettings,
+    pub(crate) access_epoch: u64,
     pub(crate) spec: sparkles::incr::InternalSpec,
     pub(crate) access_fp: u64,
     pub(crate) handle: sparkles::incr::InternalCircuit,
@@ -19,6 +21,8 @@ pub(crate) struct RefreshCircuit {
 impl RefreshCircuit {
     pub(crate) fn new(
         ds: &crate::state::Dataset,
+        settings: super::settings::GraphragSettings,
+        access_epoch: u64,
         spec: sparkles::incr::InternalSpec,
         access_fp: u64,
         handle: sparkles::incr::InternalCircuit,
@@ -26,6 +30,8 @@ impl RefreshCircuit {
         Self {
             dataset_id: ds.store.dataset_id(),
             runtime: Arc::downgrade(&ds.dataset.inner_state().views),
+            settings,
+            access_epoch,
             spec,
             access_fp,
             handle,
@@ -48,6 +54,15 @@ impl RefreshCircuit {
         access_fp: u64,
     ) -> bool {
         self.same_store(ds) && self.access_fp == access_fp && self.spec == *spec
+    }
+
+    pub(crate) fn matches_attached(
+        &self,
+        ds: &crate::state::Dataset,
+        settings: &super::settings::GraphragSettings,
+        access_epoch: u64,
+    ) -> bool {
+        self.same_store(ds) && self.access_epoch == access_epoch && self.settings == *settings
     }
 }
 
@@ -107,6 +122,9 @@ pub struct Runtime {
     anomalies: Mutex<HashMap<String, Vec<super::budget::Anomaly>>>,
     /// one lock per dataset, so that builds and reviews never interleave their commits
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// one lock per dataset ordering refresh circuit attach, replace and detach transitions
+    /// outside `circuits`, so settling or building one dataset never blocks others
+    circuit_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// internal F13 accumulator circuits for automatic refresh, one per dataset
     circuits: Mutex<HashMap<String, RefreshCircuit>>,
 }
@@ -204,6 +222,15 @@ impl Runtime {
         self.figures.lock().clone()
     }
 
+    /// The lock that serializes a dataset's refresh circuit lifecycle transitions.
+    pub(crate) fn circuit_lock(&self, dataset: &str) -> Arc<Mutex<()>> {
+        self.circuit_locks
+            .lock()
+            .entry(dataset.to_string())
+            .or_default()
+            .clone()
+    }
+
     /// Return the dataset's attached refresh circuit when it still matches `ds`, `spec`
     /// and `access_fp`.
     pub(crate) fn refresh_circuit(
@@ -220,6 +247,29 @@ impl Runtime {
             .map(|c| c.handle.clone())
     }
 
+    /// Return the dataset's attached refresh circuit when it matches `(ds, spec, access_fp)`,
+    /// refreshing its cached `(settings, access_epoch)` in place so non-spec changes
+    /// (such as debounce or threshold tweaks) reuse the live circuit. Caller must hold
+    /// [`Self::circuit_lock`].
+    pub(crate) fn refresh_circuit_sync_locked(
+        &self,
+        dataset: &str,
+        ds: &crate::state::Dataset,
+        settings: &super::settings::GraphragSettings,
+        access_epoch: u64,
+        spec: &sparkles::incr::InternalSpec,
+        access_fp: u64,
+    ) -> Option<sparkles::incr::InternalCircuit> {
+        let mut map = self.circuits.lock();
+        let c = map.get_mut(dataset)?;
+        if !c.matches(ds, spec, access_fp) {
+            return None;
+        }
+        c.settings = settings.clone();
+        c.access_epoch = access_epoch;
+        Some(c.handle.clone())
+    }
+
     /// Whether `dataset` currently holds a refresh circuit attached to `ds`.
     pub(crate) fn has_refresh_circuit(&self, dataset: &str, ds: &crate::state::Dataset) -> bool {
         self.circuits
@@ -228,9 +278,24 @@ impl Runtime {
             .is_some_and(|c| c.same_store(ds))
     }
 
+    /// Whether `dataset` currently holds a refresh circuit attached to `ds` whose
+    /// settings and access epoch match `(settings, access_epoch)`.
+    pub(crate) fn has_matching_circuit(
+        &self,
+        dataset: &str,
+        ds: &crate::state::Dataset,
+        settings: &super::settings::GraphragSettings,
+        access_epoch: u64,
+    ) -> bool {
+        self.circuits
+            .lock()
+            .get(dataset)
+            .is_some_and(|c| c.matches_attached(ds, settings, access_epoch))
+    }
+
     /// Install a refresh circuit for `dataset`, returning any displaced circuit so the
-    /// caller drops it outside the lock.
-    pub(crate) fn set_refresh_circuit(
+    /// caller drops it outside the lock. Caller must hold [`Self::circuit_lock`].
+    pub(crate) fn set_refresh_circuit_locked(
         &self,
         dataset: &str,
         circuit: RefreshCircuit,
@@ -238,30 +303,83 @@ impl Runtime {
         self.circuits.lock().insert(dataset.to_string(), circuit)
     }
 
-    /// Remove and return the refresh circuit of `dataset`, if any.
-    pub(crate) fn take_refresh_circuit(&self, dataset: &str) -> Option<RefreshCircuit> {
+    /// Remove and return the refresh circuit of `dataset`, if any. Caller must hold
+    /// [`Self::circuit_lock`].
+    pub(crate) fn take_refresh_circuit_locked(&self, dataset: &str) -> Option<RefreshCircuit> {
         self.circuits.lock().remove(dataset)
     }
 
-    /// Drop any refresh circuit attached for `dataset`, outside the map lock.
-    pub(crate) fn detach_circuit(&self, dataset: &str) {
+    /// Drop any refresh circuit attached for `dataset`, outside the map lock. Caller must
+    /// hold [`Self::circuit_lock`].
+    pub(crate) fn detach_circuit_locked(&self, dataset: &str) {
         let old = self.circuits.lock().remove(dataset);
         drop(old);
+    }
+
+    /// Drop the refresh circuit of `dataset` only when it belongs to `ds`, outside the
+    /// map lock. Caller must hold [`Self::circuit_lock`].
+    pub(crate) fn detach_circuit_for_locked(&self, dataset: &str, ds: &crate::state::Dataset) {
+        let old = {
+            let mut map = self.circuits.lock();
+            if map.get(dataset).is_some_and(|c| c.same_store(ds)) {
+                map.remove(dataset)
+            } else {
+                None
+            }
+        };
+        drop(old);
+    }
+
+    /// Drop any refresh circuit attached for `dataset`, serialized per dataset.
+    pub(crate) fn detach_circuit(&self, dataset: &str) {
+        let lock = self.circuit_lock(dataset);
+        let _held = lock.lock();
+        self.detach_circuit_locked(dataset);
+    }
+
+    /// Drop the refresh circuit of `dataset` only when it belongs to `ds`, serialized
+    /// per dataset.
+    pub(crate) fn detach_circuit_for(&self, dataset: &str, ds: &crate::state::Dataset) {
+        let lock = self.circuit_lock(dataset);
+        let _held = lock.lock();
+        self.detach_circuit_for_locked(dataset, ds);
+    }
+
+    /// Drop any refresh circuit attached for `dataset` and settle its views runtime when
+    /// it stays open (as on an in-memory dataset rename), so a re-attach under a new name
+    /// does not collide with an uncollected handle.
+    pub(crate) fn detach_circuit_and_settle(&self, dataset: &str) {
+        let lock = self.circuit_lock(dataset);
+        let _held = lock.lock();
+        let old = self.circuits.lock().remove(dataset);
+        if let Some(old) = old {
+            let rt = old.runtime.upgrade();
+            drop(old);
+            if let Some(rt) = rt
+                && !rt.is_closed()
+            {
+                rt.settle(Duration::from_secs(5));
+            }
+        }
     }
 
     /// Keep only refresh circuits for datasets satisfying `keep`, dropping removed
     /// handles outside the map lock.
     pub(crate) fn retain_circuits(&self, keep: impl Fn(&str) -> bool) {
-        let mut removed = Vec::new();
-        {
-            let mut map = self.circuits.lock();
-            let gone: Vec<String> = map.keys().filter(|k| !keep(k)).cloned().collect();
-            for k in gone {
-                if let Some(c) = map.remove(&k) {
-                    removed.push(c);
-                }
+        let gone: Vec<String> = self
+            .circuits
+            .lock()
+            .keys()
+            .filter(|k| !keep(k))
+            .cloned()
+            .collect();
+        for k in gone {
+            let lock = self.circuit_lock(&k);
+            let _held = lock.lock();
+            if !keep(&k) {
+                let old = self.circuits.lock().remove(&k);
+                drop(old);
             }
         }
-        drop(removed);
     }
 }
