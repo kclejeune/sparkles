@@ -21,7 +21,7 @@ pub(crate) struct Shared<'a> {
     pub geo_op_vertices: u64,
     pub change_log: Option<Arc<ChangeLog>>,
     pub managed: Option<Arc<arc_swap::ArcSwapOption<crate::managed::ManagedState>>>,
-    pub history_origin: Option<std::sync::Weak<evidence_view::HistoryOrigin>>,
+    pub history_origin: Option<evidence_view::HistoryOriginHandle>,
 }
 
 /// A [`Snapshot`] under construction (see the module documentation).
@@ -178,7 +178,9 @@ impl Store {
             geo_op_vertices: self.opts.geo_op_vertices,
             change_log: self.changelog.clone(),
             managed: Some(self.family.managed.clone()),
-            history_origin: Some(Arc::downgrade(&self.history_origin)),
+            history_origin: Some(evidence_view::HistoryOriginHandle::Resident(
+                Arc::downgrade(&self.history_origin),
+            )),
         }
     }
 

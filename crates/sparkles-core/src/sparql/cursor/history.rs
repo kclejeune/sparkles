@@ -95,15 +95,7 @@ impl History {
             history_svc::range_vars_bound(ctx, spec)?;
             let log = history_svc::change_log(ctx)?;
             let q = history_svc::history_query(ctx, spec);
-            if q.access.as_ref().is_some_and(|a| !a.reads_everything())
-                && ctx.snap.has_evidence_projection_or_unavailable()
-            {
-                return Err(crate::Error::NotPermitted(
-                    "history queries are not available to a caller whose view is subject to \
-                     support-aware projection visibility"
-                        .into(),
-                ));
-            }
+            history_svc::check_evidence_access(ctx, q.access.as_deref())?;
             let charge = OwnedCharge::new(ctx, 0)?;
             let pages = log.pages_checked(q, ctx.snap.commit, &|| ctx.check())?;
             self.rows = Some(RowMaker::new(spec, &self.node.vars));

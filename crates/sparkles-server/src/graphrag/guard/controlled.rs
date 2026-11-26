@@ -411,7 +411,10 @@ fn parse(name: &str, text: &str, workspace: &mut Workspace<'_>) -> Result<Option
         return Err(error);
     }
     workspace.preparation.check()?;
-    let Some(fp) = parsed.ok().filter(|fp| fp.version == FOOTPRINT_VERSION) else {
+    let Some(fp) = parsed
+        .ok()
+        .filter(|fp| (1..=FOOTPRINT_VERSION).contains(&fp.version))
+    else {
         return Ok(None);
     };
     // The parsing workspace ends here. Only the actual retained model remains
@@ -606,17 +609,18 @@ fn coverage(
             return Ok(Decision::Proven);
         }
     }
-    if fp.version != FOOTPRINT_VERSION {
+    if fp.version != FOOTPRINT_VERSION || fp.evidence_gated {
         return Ok(Decision::Unproven);
     }
     for graph in &fp.graphs {
         if !preparation.allows_iri(&view.read, &graph.graph)? {
             return Ok(Decision::Denied);
         }
-        // Footprints do not capture support-aware projection visibility dependencies;
-        // fail closed for restricted readers whenever an input graph is a review-policy
-        // output graph or evidence configuration is unavailable.
-        if snap.is_evidence_output_or_unavailable(&graph.graph) {
+        // Footprints do not prove support-aware projection visibility dependencies;
+        // fail closed for restricted readers whenever an input graph was support-gated
+        // at capture time, is currently a review-policy output graph, or evidence
+        // configuration is unavailable.
+        if graph.support_gated || snap.is_evidence_output_or_unavailable(&graph.graph) {
             return Ok(Decision::Unproven);
         }
         if let Some(rules) = &view.triples {
@@ -800,6 +804,7 @@ mod tests {
             endpoint: "query".into(),
             graphs: Vec::new(),
             reports: (0..1000).map(|i| format!("urn:report:{i}")).collect(),
+            evidence_gated: false,
         };
         let text = fp.to_json();
         let name = fp.iri();

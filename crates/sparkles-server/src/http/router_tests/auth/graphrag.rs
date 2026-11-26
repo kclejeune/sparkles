@@ -179,6 +179,8 @@ fn server_with(pattern: bool) -> AuthServer {
         caller: &p.caller(),
         graphs: &graphs,
         reports: &[REPORTS.to_string()],
+        snap: None,
+        review_policy: false,
     })
     .unwrap();
     let mut trig = format!(

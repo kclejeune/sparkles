@@ -12,6 +12,8 @@ pub(super) struct ViewEntry {
     /// why the view could not be attached (its query, its principal)
     pub(super) error: Option<String>,
     pub(super) checkpointed: u64,
+    /// evidence visibility key active when `checkpointed` was written
+    pub(super) checkpointed_ev_key: Option<String>,
     /// restored or cloned and not resumed: its `view.json` is the paused format
     pub(super) paused: bool,
 }
@@ -81,6 +83,7 @@ impl ViewEntry {
             suspended: paused.map(paused_reason),
             error,
             checkpointed: 0,
+            checkpointed_ev_key: None,
             paused: paused.is_some(),
         }
     }

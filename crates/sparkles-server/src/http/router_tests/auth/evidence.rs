@@ -1507,16 +1507,19 @@ graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"
 
     // 1. GraphRAG disclosure guard: write a persisted report & footprint covering ACCEPTED.
     const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
+    let snap = ds.store.snapshot();
     let fp = crate::graphrag::guard::capture(&crate::graphrag::guard::CaptureInput {
         dataset: "ev",
         branch: "main",
-        source_commit: ds.store.head_commit().seq,
+        source_commit: snap.commit,
         principal: "alice",
         caller: &sparkles::access::triples::Caller::default(),
         endpoint: "graphrag",
         view: None,
         graphs: &[ACCEPTED.to_string()],
         reports: &["urn:report:1".to_string()],
+        snap: Some(snap.as_ref()),
+        review_policy: false,
     })
     .unwrap();
     {
@@ -1605,7 +1608,8 @@ graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"
         "controlled GraphRAG guard must not exempt reports over review-policy output graph"
     );
 
-    // 2. HTTP /$/graph/{ds}/groups cache must invalidate after detach + re-configure at same commit.
+    // 2. HTTP /$/graph/{ds}/groups and /$/graph/{ds}/facets caches must invalidate after
+    //    detach + re-configure at same commit.
     let groups_req = || {
         let app = s.app.clone();
         async move {
@@ -1627,11 +1631,69 @@ graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"
             r.json()
         }
     };
+    let facets_req = || {
+        let app = s.app.clone();
+        async move {
+            let r = call(
+                &app,
+                "POST",
+                &format!("/$/graph/ev/facets?default-graph-uri={ACCEPTED}"),
+                &[
+                    ("authorization", &b("ra")),
+                    ("content-type", "application/json"),
+                ],
+                &serde_json::json!({
+                    "within": { "class": "urn:Release" },
+                    "candidates": true,
+                })
+                .to_string(),
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            r.json()
+        }
+    };
     let g_before = groups_req().await;
     assert_eq!(
         g_before["within"]["size"], 1,
         "expected urn:release member before detach: {g_before}"
     );
+    let f_before = facets_req().await;
+    assert_eq!(
+        f_before["size"], 1,
+        "expected urn:release in facets before detach: {f_before}"
+    );
+    // Persisted Ask answer access captured while policy is active must be withheld from
+    // restricted `rout` both before AND after policy removal/detach, while visible to `alice`.
+    let ask_snap_before = ds.store.snapshot();
+    let ask_access = crate::assistant::answer_access(
+        Some(&ask_snap_before),
+        Some(&Arc::new(sparkles::access::GraphAccess::graphs(
+            sparkles::access::Graphs::Only(sparkles::access::GraphRule::new([ACCEPTED], &[])),
+            sparkles::access::Graphs::none(),
+        ))),
+        &sparkles::access::triples::Caller::default(),
+        "ev",
+        None,
+        "rout",
+    );
+    let rout_only_view = Arc::new(sparkles::access::GraphAccess::graphs(
+        sparkles::access::Graphs::Only(sparkles::access::GraphRule::new([ACCEPTED], &[])),
+        sparkles::access::Graphs::none(),
+    ));
+    assert!(
+        !crate::assistant::answer_visible(
+            Some(&ask_access),
+            Some(&rout_only_view),
+            &ask_snap_before
+        ),
+        "persisted Ask answer over review-policy output graph must be hidden from restricted reader"
+    );
+    assert!(
+        crate::assistant::answer_visible(Some(&ask_access), None, &ask_snap_before),
+        "unrestricted reader must still see persisted Ask answer"
+    );
+
     // Detach and re-protect ACCEPTED without advancing commit sequence.
     ds.store
         .detach_managed(sparkles::managed::OwnerKind::Evidence, ACCEPTED)
@@ -1641,6 +1703,11 @@ graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"
     assert_eq!(
         g_after["within"]["size"], 0,
         "stale groups cache returned urn:release after detach at same commit: {g_after}"
+    );
+    let f_after = facets_req().await;
+    assert_eq!(
+        f_after["size"], 0,
+        "stale facets cache returned urn:release after detach at same commit: {f_after}"
     );
 
     // 3. MCP Pins: warm vs cold explicit At::Commit and At::Snapshot preserve historical config
@@ -1679,6 +1746,66 @@ graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"
     removed.policies.clear();
     removed.projections.clear();
     ev_api::configure(&ds.dataset, &removed, &Control::none()).unwrap();
+
+    // Even AFTER the source review policy is removed, the persisted GraphRAG report
+    // captured under that policy (and persisted Ask answer) must remain hidden from `rout`!
+    let rout_rep_after = call(
+        &s.app,
+        "POST",
+        "/ev/sparql",
+        &[
+            ("authorization", &b("rout")),
+            ("content-type", "application/sparql-query"),
+            ("accept", "application/sparql-results+json"),
+        ],
+        &report_q,
+    )
+    .await;
+    assert_eq!(
+        rout_rep_after.status,
+        StatusCode::OK,
+        "{}",
+        rout_rep_after.text()
+    );
+    assert!(
+        !rout_rep_after
+            .text()
+            .contains("secret projected release summary"),
+        "persisted GraphRAG report leaked to restricted reader after policy removal: {}",
+        rout_rep_after.text()
+    );
+    let snap_after_removal = ds.store.snapshot();
+    let prepared_after = guarded
+        .masked_controlled(&snap_after_removal, &prep)
+        .unwrap();
+    assert!(
+        !prepared_after.allows_read_iri(REPORTS),
+        "controlled GraphRAG guard must keep report unproven after policy removal"
+    );
+    assert!(
+        !crate::assistant::answer_visible(
+            Some(&ask_access),
+            Some(&rout_only_view),
+            &snap_after_removal
+        ),
+        "persisted Ask answer must remain hidden from restricted reader after policy removal"
+    );
+    // Legacy v1 footprint (without evidence provenance) must also remain unproven for restricted
+    // readers while still proven for unrestricted readers.
+    let mut legacy_fp = fp.clone();
+    legacy_fp.version = 1;
+    legacy_fp.evidence_gated = false;
+    for g in &mut legacy_fp.graphs {
+        g.support_gated = false;
+    }
+    assert_eq!(
+        crate::graphrag::guard::covers(Some(&rout_only_view), &legacy_fp),
+        crate::graphrag::guard::Decision::Unproven
+    );
+    assert_eq!(
+        crate::graphrag::guard::covers(None, &legacy_fp),
+        crate::graphrag::guard::Decision::Proven
+    );
 
     // Both warm and cold explicit At::Commit and At::Snapshot selections must still hide
     // ACCEPTED from `rout` (who has only ACCEPTED grant).

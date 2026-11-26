@@ -189,8 +189,46 @@ impl Runtime {
             return false;
         }
         let from = st.circuit.applied;
-        if from >= store.snapshot().commit {
+        let head = store.snapshot();
+        let restricted = st
+            .circuit
+            .access
+            .as_ref()
+            .is_some_and(|a| !a.reads_everything());
+        let head_ev = if restricted {
+            head.evidence_visibility_key()
+        } else {
+            None
+        };
+        let ev_changed = restricted
+            && (st.circuit.evidence_key() != head_ev.as_deref()
+                || head_ev.as_deref() == Some("unavailable"));
+        if from >= head.commit && !ev_changed {
             return false;
+        }
+        if from >= head.commit && ev_changed {
+            // Managed settings, protection nonces, or availability changed without an RDF
+            // commit: clear commit-keyed replay history and rebuild/reset at `head`.
+            cell.info.lock().status = Status::Building;
+            let t0 = Instant::now();
+            match st
+                .circuit
+                .reset_charged(&DeltaSet::at(head), &self.control())
+            {
+                Ok((c, c_lease)) => {
+                    self.counters.resets.fetch_add(1, Ordering::Relaxed);
+                    cell.info.lock().status = Status::Ready;
+                    self.note_pass(cell, st, t0.elapsed(), false);
+                    st.clear_history();
+                    self.publish(st, from, c, c_lease, true, deferred);
+                }
+                Err(e) => {
+                    self.fail(cell, st, &e, deferred);
+                    return true;
+                }
+            }
+            self.live_budgets(st, deferred);
+            return true;
         }
         let d = deltas
             .entry(from)
@@ -648,14 +686,22 @@ impl Runtime {
         *self.last_checkpoint.lock() = Instant::now();
         let internal: Vec<Arc<InternalCell>> = self.reg.lock().internal.values().cloned().collect();
         self.checkpoint_internal(store, &internal);
-        let todo: Vec<(String, Arc<Cell>, u64)> = self
+        let todo: Vec<(String, Arc<Cell>, u64, Option<String>)> = self
             .reg
             .lock()
             .views
             .iter()
-            .filter_map(|(n, e)| Some((n.clone(), e.cell.clone()?, e.checkpointed)))
+            .filter_map(|(n, e)| {
+                Some((
+                    n.clone(),
+                    e.cell.clone()?,
+                    e.checkpointed,
+                    e.checkpointed_ev_key.clone(),
+                ))
+            })
             .collect();
-        for (name, cell, done) in todo {
+        let live_ev = store.snapshot().evidence_visibility_key();
+        for (name, cell, done, done_ev) in todo {
             // under the state lock, which a switch of the inference takes to replace the
             // circuit
             let st = cell.state.lock();
@@ -663,7 +709,17 @@ impl Runtime {
                 continue;
             }
             let applied = st.circuit.applied;
-            if applied <= done {
+            let restricted = st
+                .circuit
+                .access
+                .as_ref()
+                .is_some_and(|a| !a.reads_everything());
+            let circuit_ev = st.circuit.evidence_key().map(str::to_string);
+            if restricted && (circuit_ev.as_deref() == Some("unavailable") || circuit_ev != live_ev)
+            {
+                continue;
+            }
+            if applied <= done && (!restricted || circuit_ev == done_ev) {
                 continue;
             }
             let Some(snap) = st.circuit.snap.clone() else {
@@ -677,7 +733,7 @@ impl Runtime {
                     &persist::Header {
                         dataset: self.dataset,
                         commit: applied,
-                        fingerprint: st.fingerprint(cell.key),
+                        fingerprint: st.fingerprint(cell.key, circuit_ev.as_deref()),
                     },
                     &body,
                     || store.failpoint("view-checkpoint-written"),
@@ -689,6 +745,7 @@ impl Runtime {
                     self.counters.checkpoints.fetch_add(1, Ordering::Relaxed);
                     if let Some(e) = self.reg.lock().views.get_mut(&name) {
                         e.checkpointed = applied;
+                        e.checkpointed_ev_key = circuit_ev;
                     }
                 }
                 Err(e) => {

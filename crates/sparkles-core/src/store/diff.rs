@@ -811,18 +811,33 @@ impl Store {
                 .is_some_and(|t| t.hides() && !t.state_independent())
                 || (evidence_vis && !a.reads_everything())
         });
-        if lo != hi
-            && let Some(view) = data_view
+        if let Some(view) = data_view
+            && (lo != hi || evidence_vis)
         {
-            for (r, at) in [(&rf, from), (&rt, to)] {
-                self.check_readable(r, at)?;
-            }
-            method = DiffMethod::Compare;
             let (at_lo, at_hi) = if a <= b { (from, to) } else { (to, from) };
-            let (sa, _) = self.snapshot_at(at_lo, &self.history_opts(o))?;
-            let (sb, _) = self.snapshot_at(at_hi, &self.history_opts(o))?;
-            let (sa, sb) = (view.bound(&sa).masked(&sa)?, view.bound(&sb).masked(&sb)?);
-            compared += compare_states(&sa, &sb, &mut net)?;
+            if lo == hi {
+                let (sa, _) = self.snapshot_at(at_lo, &self.history_opts(o))?;
+                let (sb, _) = self.snapshot_at(at_hi, &self.history_opts(o))?;
+                let ka = sa.evidence_visibility_key();
+                let kb = sb.evidence_visibility_key();
+                if ka != kb || ka.as_deref() == Some("unavailable") {
+                    for (r, at) in [(&rf, from), (&rt, to)] {
+                        self.check_readable(r, at)?;
+                    }
+                    method = DiffMethod::Compare;
+                    let (sa, sb) = (view.bound(&sa).masked(&sa)?, view.bound(&sb).masked(&sb)?);
+                    compared += compare_states(&sa, &sb, &mut net)?;
+                }
+            } else {
+                for (r, at) in [(&rf, from), (&rt, to)] {
+                    self.check_readable(r, at)?;
+                }
+                method = DiffMethod::Compare;
+                let (sa, _) = self.snapshot_at(at_lo, &self.history_opts(o))?;
+                let (sb, _) = self.snapshot_at(at_hi, &self.history_opts(o))?;
+                let (sa, sb) = (view.bound(&sa).masked(&sa)?, view.bound(&sb).masked(&sb)?);
+                compared += compare_states(&sa, &sb, &mut net)?;
+            }
         } else if lo != hi
             && let Some(n) = self.diff_via_change_log(&rf, from, &rt, to, o, &mut net)?
         {

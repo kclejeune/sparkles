@@ -178,8 +178,9 @@ impl Slot {
     }
 
     /// The fingerprint of the circuit's checkpoints: the cell's key, the inference its
-    /// state was built with and the reading of errors in aggregates its results follow.
-    pub(super) fn fingerprint(&self, key: u64) -> u64 {
+    /// state was built with, the reading of errors in aggregates its results follow, and
+    /// for restricted circuits the active support-aware evidence visibility key.
+    pub(super) fn fingerprint(&self, key: u64, ev_key: Option<&str>) -> u64 {
         let mut h = Sha256::new();
         h.update(key.to_le_bytes());
         if let Some(i) = &self.circuit.inference {
@@ -188,6 +189,16 @@ impl Slot {
         h.update(b"\0aggregate-errors\0");
         let errors = self.circuit.aggregate_errors.unwrap_or_default();
         h.update(errors.as_str().as_bytes());
+        if self
+            .circuit
+            .access
+            .as_ref()
+            .is_some_and(|a| !a.reads_everything())
+            && let Some(ev) = ev_key
+        {
+            h.update(b"\0evidence\0");
+            h.update(ev.as_bytes());
+        }
         u64::from_le_bytes(h.finalize()[..8].try_into().expect("8 bytes"))
     }
 

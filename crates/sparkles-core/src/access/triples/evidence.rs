@@ -1581,21 +1581,19 @@ impl<'a> Evaluator<'a> {
             // If the target graph is itself a review policy's output graph, also prove
             // support-aware visibility of the cited triple under that policy (with cycle
             // detection via `self.active_outputs`).
-            if let Some(g_iri) = graph_iri {
-                let matching_policy = self
+            if let Some(g_iri) = graph_iri
+                && let Some((pname, policy)) = self
                     .config
                     .settings
                     .policies
                     .iter()
                     .find(|(_, p)| p.output == g_iri)
-                    .map(|(name, p)| (name.clone(), p.clone()));
-                if let Some((pname, policy)) = matching_policy {
-                    let Some(pctx) = self.prepare_policy(&pname, &policy, g_id)? else {
-                        return Ok(false);
-                    };
-                    if !self.triple_supported(&pctx, [s_id, p_id, o_id])? {
-                        return Ok(false);
-                    }
+            {
+                let Some(pctx) = self.prepare_policy(pname, policy, g_id)? else {
+                    return Ok(false);
+                };
+                if !self.triple_supported(&pctx, [s_id, p_id, o_id])? {
+                    return Ok(false);
                 }
             }
             return Ok(true);
@@ -2018,10 +2016,24 @@ fn clone_access_unbound(
     prep: &Preparation,
 ) -> Result<(GraphAccess, Reservation)> {
     let mut held = prep.reserve(1024)?;
+    let charge_strings = |values: &[String], held: &mut Reservation| -> Result<()> {
+        held.grow_by(64u64.saturating_add(
+            (values.len() as u64).saturating_mul(std::mem::size_of::<String>() as u64),
+        ))?;
+        for s in values {
+            prep.check()?;
+            held.grow_by((s.len() as u64).saturating_add(64))?;
+        }
+        Ok(())
+    };
     let strip = |graphs: &Graphs, held: &mut Reservation| -> Result<Graphs> {
         let Graphs::Only(rule) = graphs else {
             return Ok(Graphs::All);
         };
+        charge_strings(&rule.iris, held)?;
+        charge_strings(&rule.patterns, held)?;
+        charge_strings(&rule.protected, held)?;
+        charge_strings(&rule.excluded, held)?;
         let mut guards = Vec::new();
         held.grow_by(
             (rule.guards.len() as u64).saturating_mul(std::mem::size_of::<GraphGuard>() as u64),
@@ -2032,9 +2044,18 @@ fn clone_access_unbound(
         for g in &rule.guards {
             prep.check()?;
             held.grow_by((g.pattern.len() as u64).saturating_add(64))?;
+            // Snapshot-bound or undecided guards were decided at `self.snap`, not at the
+            // earlier commit; fail closed by clearing their exemptions instead of
+            // carrying commit-N exemptions onto earlier commits or transitive support graphs.
+            let exempt = if g.bound_to.is_some() || g.decide.is_some() {
+                Vec::new()
+            } else {
+                charge_strings(&g.exempt, held)?;
+                g.exempt.clone()
+            };
             guards.push(GraphGuard {
                 pattern: g.pattern.clone(),
-                exempt: g.exempt.clone(),
+                exempt,
                 decide: None,
                 bound_to: None,
             });

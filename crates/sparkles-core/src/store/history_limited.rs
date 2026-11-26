@@ -236,7 +236,7 @@ impl Store {
         let (snapshot, resolved, origin, charge) =
             self.snapshot_at_with_branch_limited_charged(store, at, options, max_memory_bytes)?;
         let snapshot = if !matches!(at, At::Head) && self.configuration_activated() {
-            let remaining = max_memory_bytes.saturating_sub(charge.delta_bytes);
+            let remaining = max_memory_bytes.saturating_sub(charge.total());
             let prep = options.temporary(remaining)?;
             let (pinned, _held) =
                 self.pin_historical_evidence(store, at, resolved.commit.seq, snapshot, &prep)?;
@@ -327,7 +327,7 @@ impl Store {
                 "a branch is resolved through the dataset's main store",
             ));
         }
-        let (snapshot, resolved, origin, charge) = if branch == self.dataset_id {
+        let (snapshot, resolved, origin, mut charge) = if branch == self.dataset_id {
             self.snapshot_from_limited(
                 PinnedSource::Resident(branching::BranchStore::Main(self)),
                 at,
@@ -347,15 +347,16 @@ impl Store {
             read
         };
         let snapshot = if !matches!(at, At::Head) && self.configuration_activated() {
-            let remaining = max_memory_bytes.saturating_sub(charge.delta_bytes);
+            let remaining = max_memory_bytes.saturating_sub(charge.total());
             let prep = options.temporary(remaining)?;
-            let (pinned, _held) = self.pin_historical_evidence_for_branch(
+            let (pinned, held) = self.pin_historical_evidence_for_branch(
                 branch,
                 at,
                 resolved.commit.seq,
                 snapshot,
                 &prep,
             )?;
+            charge.delta_bytes = charge.delta_bytes.saturating_add(held.bytes());
             pinned
         } else {
             snapshot
@@ -443,7 +444,9 @@ impl Store {
                 OriginRead::Resident(store) => {
                     selected = Source::Resident(branching::BranchStore::Other(store))
                 }
-                OriginRead::Clock(_) | OriginRead::Configuration { .. } => {
+                OriginRead::Clock(_)
+                | OriginRead::Configuration { .. }
+                | OriginRead::Pin { .. } => {
                     return Err(Error::Corrupt(
                         "snapshot lookup returned only a fork clock".into(),
                     ));

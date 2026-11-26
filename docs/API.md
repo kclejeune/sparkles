@@ -5764,7 +5764,11 @@ retained generation.
 
 **Access.** A caller sees the changes of the graphs it may read, without the triples its
 protections hide. A caller with a protection that depends on the data (classes or
-patterns) gets `403` for history queries, as for the change feed.
+patterns) gets `403` for history queries, as for the change feed. A restricted caller,
+including a graph-only reader without triple protections, also gets `403` when
+support-aware projection visibility applies to its view, when the dataset's managed
+evidence registry is unavailable, or when configuration history is activated and earlier
+change-log commits may hold projected triples from prior review policies.
 
 **The log.** The changes are written by a background thread shortly after each commit,
 so a commit does no extra I/O. The log is synced before a compaction or a bulk commit

@@ -670,7 +670,7 @@ pub struct Snapshot {
     pub(crate) pinned_evidence: Option<crate::access::triples::evidence::EvidenceConfig>,
     /// Non-owning handle to the originating branch's retained history for exact
     /// same-branch `ev:StoredFact` verification without retaining `Family`.
-    pub(crate) history_origin: Option<std::sync::Weak<evidence_view::HistoryOrigin>>,
+    pub(crate) history_origin: Option<evidence_view::HistoryOriginHandle>,
 }
 
 /// The kind of term an id stands for (see [`Snapshot::term_kind`]).
@@ -773,6 +773,48 @@ impl Snapshot {
             EvidenceConfig::None => false,
             EvidenceConfig::Active(cfg) => cfg.is_output_graph(graph_iri),
             EvidenceConfig::Unavailable(_) => true,
+        }
+    }
+
+    /// Whether support-aware projection visibility restricts a caller with `access` on
+    /// this snapshot or across the history range reachable from its dataset family.
+    pub(crate) fn has_evidence_visibility_for_access(
+        &self,
+        access: &crate::access::GraphAccess,
+    ) -> bool {
+        use crate::access::triples::evidence::EvidenceConfig;
+        if access.reads_everything() {
+            return false;
+        }
+        let policy_matches = |cfg: &crate::access::triples::evidence::ProjectionConfig| {
+            cfg.settings.policies.values().any(|p| {
+                oxrdf::NamedNode::new(&p.output).map_or(true, |n| {
+                    access.read.may_allow(Some(&oxrdf::Term::NamedNode(n)))
+                })
+            })
+        };
+        if let Some(pinned) = &self.pinned_evidence {
+            match pinned {
+                EvidenceConfig::Unavailable(_) => return true,
+                EvidenceConfig::Active(cfg) if policy_matches(cfg) => return true,
+                EvidenceConfig::Active(_) | EvidenceConfig::None => {}
+            }
+        }
+        let Some(state) = self.managed.as_ref().and_then(|m| m.load_full()) else {
+            return false;
+        };
+        match state.as_ref() {
+            crate::managed::ManagedState::Unavailable { .. } => true,
+            crate::managed::ManagedState::Installed(installed) => {
+                if installed.configuration_history.is_some() {
+                    return true;
+                }
+                match installed.evidence_visibility() {
+                    EvidenceConfig::Unavailable(_) => true,
+                    EvidenceConfig::Active(cfg) => policy_matches(&cfg),
+                    EvidenceConfig::None => false,
+                }
+            }
         }
     }
     /// Whether this snapshot carries a triple-level access mask.
@@ -2488,7 +2530,9 @@ impl Store {
         ));
         {
             let mut init = (*current.load_full()).clone();
-            init.history_origin = Some(Arc::downgrade(&history_origin));
+            init.history_origin = Some(evidence_view::HistoryOriginHandle::Resident(
+                Arc::downgrade(&history_origin),
+            ));
             current.store(Arc::new(init));
         }
         let store = Store {
@@ -3076,7 +3120,9 @@ impl Store {
         ));
         {
             let mut init = (*current.load_full()).clone();
-            init.history_origin = Some(Arc::downgrade(&history_origin));
+            init.history_origin = Some(evidence_view::HistoryOriginHandle::Resident(
+                Arc::downgrade(&history_origin),
+            ));
             current.store(Arc::new(init));
         }
         let store = Store {
@@ -3508,6 +3554,9 @@ impl Store {
         if access.reads_everything() {
             return false;
         }
+        if self.configuration_activated() {
+            return true;
+        }
         let Some(state) = self.family.managed.load_full() else {
             return false;
         };
@@ -3521,15 +3570,9 @@ impl Store {
                             oxrdf::NamedNode::new(&p.output).map_or(true, |n| {
                                 access.read.may_allow(Some(&oxrdf::Term::NamedNode(n)))
                             })
-                        }) || self.configuration_activated()
+                        })
                     }
-                    crate::access::triples::evidence::EvidenceConfig::None => {
-                        self.configuration_activated()
-                            && installed
-                                .graphs
-                                .owners
-                                .contains_key(&crate::managed::OwnerKind::Evidence)
-                    }
+                    crate::access::triples::evidence::EvidenceConfig::None => false,
                 }
             }
         }
@@ -3569,7 +3612,7 @@ impl Store {
         let (snap, resolved, charge) = self.snapshot_at_inner(at, o, Some(max_memory_bytes))?;
         let snap = if !matches!(at, crate::history::At::Head) && self.configuration_activated() {
             use crate::history::ReadControl;
-            let remaining = max_memory_bytes.saturating_sub(charge.delta_bytes);
+            let remaining = max_memory_bytes.saturating_sub(charge.total());
             let prep = o.temporary(remaining)?;
             let (pinned, _held) =
                 self.pin_historical_evidence(self, at, resolved.commit.seq, snap, &prep)?;

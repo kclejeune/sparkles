@@ -531,7 +531,7 @@ impl Run<'_> {
                 "the community role's providers changed during the run; start a new run".into(),
             ));
         }
-        if &self.footprint(&principal, footprint.source_commit, graphs)? != footprint {
+        if &self.footprint(&principal, footprint.source_commit, graphs, None)? != footprint {
             return Err(RunError::Refused(
                 "the principal's view or the access policy changed during the run; start a new run"
                     .into(),
@@ -551,8 +551,17 @@ impl Run<'_> {
         p: &Principal,
         commit: u64,
         graphs: &[String],
+        snap: Option<&sparkles::store::Snapshot>,
     ) -> Result<Footprint, RunError> {
         let view = p.view(&self.ds.name, Endpoint::Query);
+        let live_snap;
+        let snap = match snap {
+            Some(s) => s,
+            None => {
+                live_snap = self.ds.store.snapshot();
+                live_snap.as_ref()
+            }
+        };
         capture(&CaptureInput {
             dataset: &self.ds.name,
             branch: &branch_name(&self.ds),
@@ -563,6 +572,8 @@ impl Run<'_> {
             caller: &p.caller(),
             graphs,
             reports: &[self.graph().to_string()],
+            snap: Some(snap),
+            review_policy: self.settings.review_policy.is_some(),
         })
         .map_err(|e| RunError::Refused(e.to_string()))
     }
@@ -637,7 +648,11 @@ impl Run<'_> {
             footprint_graphs.sort();
             footprint_graphs.dedup();
         }
-        let footprint = self.footprint(p, view.commit(), &footprint_graphs)?;
+        let view_snap = match &view {
+            BuildView::Snapshot(s) => Some(s.as_ref()),
+            BuildView::Source { .. } => None,
+        };
+        let footprint = self.footprint(p, view.commit(), &footprint_graphs, view_snap)?;
         self.progress(0.03, "finding communities");
         let h = hierarchy::compute(
             &proj.graph,

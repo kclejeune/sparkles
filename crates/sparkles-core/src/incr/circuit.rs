@@ -1152,6 +1152,16 @@ impl Circuit {
         }
     }
 
+    /// Active support-aware evidence visibility key when this circuit was last evaluated.
+    pub(crate) fn evidence_key(&self) -> Option<&str> {
+        self.evidence_key.as_deref()
+    }
+
+    /// Record the evidence visibility key restored alongside a recovered checkpoint.
+    pub(crate) fn set_evidence_key(&mut self, key: Option<String>) {
+        self.evidence_key = key;
+    }
+
     fn pass<'a>(
         &'a mut self,
         snap: Arc<Snapshot>,
@@ -1341,11 +1351,32 @@ impl Circuit {
         self.inferred = InferredFootprint::default();
         self.budget.shrink_state_to(0);
         // When support-aware projection visibility is active or unavailable for a
-        // restricted caller, mask `snap` (or fail closed) before initializing operators.
+        // restricted caller, mask `snap` (or fail closed) under the circuit's own
+        // cancellation/deadline controls and memory budget before initializing operators.
         let ev_key = snap.evidence_visibility_key();
+        let mut _prepared_mask: Option<crate::access::PreparedView> = None;
         let eval_snap = match self.access.as_ref().filter(|a| !a.reads_everything()) {
             Some(a) if snap.has_evidence_projection_or_unavailable() => {
-                a.bound(&snap).masked(&snap)?
+                self.budget.set_local_limit(self.max_memory_bytes);
+                let local_limit = self
+                    .budget
+                    .handle()
+                    .remaining_local()
+                    .or(self.max_memory_bytes)
+                    .unwrap_or(u64::MAX);
+                let prep = match self.budget.handle().child_parent(self.pool.as_ref())? {
+                    Some((parent, grant)) => crate::access::Preparation::with_parent(
+                        control.clone(),
+                        local_limit,
+                        parent,
+                        grant,
+                    )?,
+                    None => crate::access::Preparation::new(control.clone(), local_limit)?,
+                };
+                let prepared = a.masked_controlled(&snap, &prep)?;
+                let masked = prepared.snapshot_arc();
+                _prepared_mask = Some(prepared);
+                masked
             }
             _ => snap.clone(),
         };
@@ -1369,6 +1400,7 @@ impl Circuit {
         #[cfg(test)]
         let (scanned, estimated) = (p.scanned.get(), p.estimated.get());
         drop(p);
+        drop(_prepared_mask);
         let (out, mut out_lease, ann) = match res {
             Ok(v) => v,
             Err(e) => {
@@ -1735,9 +1767,9 @@ impl Circuit {
             ev_restricted && (new_ev_key.is_some() || self.evidence_key.is_some());
         let whole = super::runtime::whole_reason(self.access.as_ref()).is_some();
         // If support-aware projection visibility is active or unavailable (or just turned
-        // off) on an incremental circuit that was not compiled as a whole-query recompute,
-        // rebuild over the masked snapshot so hidden projections never leak via deltas.
-        if ev_active_or_changed && !whole {
+        // off) on a restricted circuit, rebuild over the controlled masked snapshot so
+        // hidden projections never leak via deltas and masking stays under circuit controls.
+        if ev_active_or_changed {
             let (diff, lease) = self.reset_charged(d, control)?;
             return Ok(ChargedAdvance::Reset(diff, lease));
         }

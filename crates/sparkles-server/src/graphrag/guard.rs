@@ -32,8 +32,10 @@ use std::sync::Arc;
 
 mod controlled;
 
-/// The footprint format this server reads and writes.
-pub const FOOTPRINT_VERSION: u32 = 1;
+/// The footprint format this server writes (and requires for restricted coverage).
+/// Version 1 footprints lack support-aware evidence provenance and remain unproven for
+/// restricted readers; older servers cleanly refuse version 2.
+pub const FOOTPRINT_VERSION: u32 = 2;
 /// The pattern that names every guarded graph.
 pub fn guarded_pattern() -> String {
     format!("{GUARDED_PREFIX}*")
@@ -155,6 +157,10 @@ pub struct FpGraph {
     pub graph: String,
     #[serde(default)]
     pub protections: Vec<FpProtection>,
+    /// whether this graph was a review-policy projection output or read under an
+    /// unavailable evidence configuration when the footprint was captured
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub support_gated: bool,
 }
 
 /// What one build read (§6.2).
@@ -171,6 +177,9 @@ pub struct Footprint {
     pub graphs: Vec<FpGraph>,
     #[serde(default)]
     pub reports: Vec<String>,
+    /// whether the build or capture depended on support-aware projection visibility
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub evidence_gated: bool,
 }
 
 /// Why a footprint cannot be captured.
@@ -234,6 +243,11 @@ pub struct CaptureInput<'a> {
     /// the concrete graphs the build reads: IRIs, or `default`
     pub graphs: &'a [String],
     pub reports: &'a [String],
+    /// the snapshot the build or capture read, used to record support-aware projection
+    /// provenance on each input graph at capture time
+    pub snap: Option<&'a Snapshot>,
+    /// whether this capture comes from a review-policy build
+    pub review_policy: bool,
 }
 
 /// Capture the footprint of a build.
@@ -273,11 +287,16 @@ fn capture_inner(i: &CaptureInput<'_>, guarded: bool) -> Result<Footprint, Captu
                 })?);
             }
         }
+        let support_gated = i
+            .snap
+            .is_some_and(|s| s.is_evidence_output_or_unavailable(g));
         graphs.push(FpGraph {
             graph: g.clone(),
             protections,
+            support_gated,
         });
     }
+    let evidence_gated = i.review_policy || graphs.iter().any(|g| g.support_gated);
     Ok(Footprint {
         version: FOOTPRINT_VERSION,
         dataset: i.dataset.to_string(),
@@ -288,6 +307,7 @@ fn capture_inner(i: &CaptureInput<'_>, guarded: bool) -> Result<Footprint, Captu
         endpoint: i.endpoint.to_string(),
         graphs,
         reports: i.reports.to_vec(),
+        evidence_gated,
     })
 }
 
@@ -336,7 +356,7 @@ pub fn covers_with_evidence(
     let Some(v) = reader else {
         return Decision::Proven;
     };
-    if fp.version != FOOTPRINT_VERSION {
+    if fp.version != FOOTPRINT_VERSION || fp.evidence_gated {
         return Decision::Unproven;
     }
     let caller = v
@@ -348,11 +368,11 @@ pub fn covers_with_evidence(
         if !reads(v, &g.graph) {
             return Decision::Denied;
         }
-        // A GraphRAG footprint records only graph names and ordinary triple protections,
-        // not support-aware projection dependencies. Fail closed for restricted readers
-        // whenever an input graph is a review-policy output graph or evidence settings
-        // are unavailable.
-        if is_support_gated(&g.graph) {
+        // A GraphRAG footprint does not prove support-aware projection visibility
+        // dependencies. Fail closed for restricted readers whenever an input graph was
+        // support-gated at capture time, is currently a review-policy output graph, or
+        // evidence settings are unavailable.
+        if g.support_gated || is_support_gated(&g.graph) {
             return Decision::Unproven;
         }
         for r in in_force_on(v, &g.graph) {
@@ -426,10 +446,10 @@ impl Footprint {
         }
         let p: Probe = serde_json::from_str(json).map_err(|e| e.to_string())?;
         match p.version.as_ref().and_then(|v| v.as_u64()) {
-            Some(v) if v == u64::from(FOOTPRINT_VERSION) => {}
+            Some(v) if (1..=u64::from(FOOTPRINT_VERSION)).contains(&v) => {}
             Some(v) => {
                 return Err(format!(
-                    "the footprint has format version {v}, and this server reads version {FOOTPRINT_VERSION}"
+                    "the footprint has format version {v}, and this server reads versions 1..={FOOTPRINT_VERSION}"
                 ));
             }
             None => return Err("the footprint has no version".into()),

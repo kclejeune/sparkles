@@ -207,13 +207,30 @@ impl Runtime {
             let mut loaded = false;
             {
                 let mut st = cell.state.lock();
-                if h.dataset == self.dataset
-                    && h.fingerprint == st.fingerprint(cell.key)
-                    && commit <= snap.commit
+                let restricted = st
+                    .circuit
+                    .access
+                    .as_ref()
+                    .is_some_and(|a| !a.reads_everything());
+                let snap_ev = if restricted {
+                    snap.evidence_visibility_key()
+                } else {
+                    None
+                };
+                let commit_ok = if restricted && snap_ev.is_some() {
+                    commit == snap.commit
+                } else {
+                    commit <= snap.commit
+                };
+                if snap_ev.as_deref() != Some("unavailable")
+                    && h.dataset == self.dataset
+                    && h.fingerprint == st.fingerprint(cell.key, snap_ev.as_deref())
+                    && commit_ok
                 {
                     match st.circuit.decode_with_input_charged(body, &snap) {
                         Ok(()) => {
                             st.circuit.set_applied(h.commit);
+                            st.circuit.set_evidence_key(snap_ev);
                             self.seen.fetch_max(h.commit, Ordering::AcqRel);
                             self.counters.loaded.fetch_add(1, Ordering::Relaxed);
                             let mut info = cell.info.lock();

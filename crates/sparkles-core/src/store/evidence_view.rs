@@ -714,16 +714,95 @@ impl Store {
         let Some(history) = installed.configuration_history.as_ref() else {
             return Ok((snapshot, preparation.reserve(0)?));
         };
-        if matches!(at, At::Snapshot(_)) {
-            // Try resident branch store if open so named snapshot configuration is read.
-            if let Ok(branching::BranchStore::Other(branch_store)) = self.branch_by_id(branch_id) {
+        if let At::Snapshot(_) = at {
+            // Check already-resident branch stores without opening cold branches.
+            if let Ok(set) = self.owned_set()
+                && let Some(branch_store) = preparation.lock(&set.stores)?.get(&branch_id).cloned()
+            {
                 return self.pin_historical_evidence(&branch_store, at, seq, snapshot, preparation);
             }
-            return Self::pin_unavailable(
-                snapshot,
-                "cold branch named snapshot configuration cannot be verified".into(),
-                preparation,
+            let (allowance, temporary) = preparation.reserve_available()?;
+            let options = HistoryOptions {
+                cancel: Some(preparation.control().cancel.flag()),
+                deadline: preparation.control().deadline,
+            };
+            let limit = ReadLimit {
+                options: &options,
+                memory: Some(allowance),
+                held: 0,
+            };
+            let pin_read = self.readonly_branch_read_limited(
+                branch_id,
+                at,
+                branching::readonly::Purpose::Pin,
+                &limit,
             );
+            drop(temporary);
+            match pin_read {
+                Ok(branching::readonly::OriginRead::Resident(branch_store)) => {
+                    return self.pin_historical_evidence(
+                        &branch_store,
+                        at,
+                        seq,
+                        snapshot,
+                        preparation,
+                    );
+                }
+                Ok(branching::readonly::OriginRead::Pin {
+                    seq: pin_seq,
+                    expires_ms,
+                    configuration,
+                }) => {
+                    if pin_seq != seq || expires_ms.is_some_and(|e| e <= self.now_ms()) {
+                        return Self::pin_unavailable(
+                            snapshot,
+                            "cold branch named snapshot changed or expired during configuration selection"
+                                .into(),
+                            preparation,
+                        );
+                    }
+                    let binding = match configuration {
+                        Some(cfg) => {
+                            if let Err(e) = cfg.validate(self.owner_dataset_id()) {
+                                return Self::pin_unavailable(
+                                    snapshot,
+                                    format!(
+                                        "cold branch named snapshot configuration is invalid: {e}"
+                                    ),
+                                    preparation,
+                                );
+                            }
+                            cfg.binding
+                        }
+                        None => ConfigurationBinding::LegacyUnbound,
+                    };
+                    return self.pin_resolved_binding(
+                        installed,
+                        history,
+                        binding,
+                        snapshot,
+                        preparation,
+                    );
+                }
+                Err(e @ (Error::Cancelled | Error::Timeout | Error::BudgetExceeded(_))) => {
+                    return Err(e);
+                }
+                Err(e) => {
+                    return Self::pin_unavailable(
+                        snapshot,
+                        format!("cold branch named snapshot configuration cannot be verified: {e}"),
+                        preparation,
+                    );
+                }
+                Ok(_) => {
+                    return Self::pin_unavailable(
+                        snapshot,
+                        "cold branch named snapshot configuration lookup returned unexpected state"
+                            .into(),
+                        preparation,
+                    );
+                }
+            }
         }
         let binding = match self.configuration_of_branch_id(branch_id, seq, preparation) {
             Ok(b) => b,
@@ -750,7 +829,14 @@ impl Store {
         preparation: &Preparation,
     ) -> Result<(Arc<Snapshot>, Reservation)> {
         let Some(configuration) = binding.configuration() else {
-            return Ok((snapshot, preparation.reserve(0)?));
+            // C25: activation does not certify pre-activation commits or legacy pins
+            // from mutable current settings; fail closed for restricted readers.
+            return Self::pin_unavailable(
+                snapshot,
+                "historical state has no authenticated configuration binding in an activated family"
+                    .into(),
+                preparation,
+            );
         };
         let document = if let Some(root) = self.managed_root() {
             managed_history::resolve(
@@ -812,12 +898,32 @@ enum ConfigSource<'a> {
     Cold(uuid::Uuid),
 }
 
-/// Non-owning handle owned by [`Store`] and weakly referenced by [`Snapshot`] so
-/// support-aware visibility can verify earlier-commit same-branch `ev:StoredFact`
-/// references against retained history without retaining `Family` or its process lock.
+/// Handle from a [`Snapshot`] back to its branch's retained history. Resident stores use
+/// a non-owning [`std::sync::Weak`] reference; cold read-only snapshots own a lightweight
+/// [`Arc`] that holds only paths and shared caches (no `Family`, `Store`, or process lock).
+#[derive(Clone)]
+pub(crate) enum HistoryOriginHandle {
+    Resident(std::sync::Weak<HistoryOrigin>),
+    Cold(Arc<HistoryOrigin>),
+}
+
+impl HistoryOriginHandle {
+    pub(crate) fn upgrade(&self) -> Option<Arc<HistoryOrigin>> {
+        match self {
+            Self::Resident(w) => w.upgrade(),
+            Self::Cold(a) => Some(a.clone()),
+        }
+    }
+}
+
+/// Non-owning handle owned by [`Store`] (or lightweight cold reader owned by cold
+/// snapshots) so support-aware visibility can verify earlier-commit same-branch
+/// `ev:StoredFact` references against retained history without retaining `Family` or its
+/// process lock.
 pub(crate) struct HistoryOrigin {
     dataset_id: uuid::Uuid,
     branch_id: uuid::Uuid,
+    is_cold: bool,
     root: Option<PathBuf>,
     managed_root: Option<PathBuf>,
     history: Option<Arc<Mutex<crate::history::HistoryState>>>,
@@ -843,6 +949,7 @@ impl HistoryOrigin {
         Self {
             dataset_id,
             branch_id,
+            is_cold: false,
             root: None,
             managed_root: None,
             history: None,
@@ -877,6 +984,7 @@ impl HistoryOrigin {
         Self {
             dataset_id,
             branch_id,
+            is_cold: false,
             root: Some(root),
             managed_root: Some(managed_root),
             history,
@@ -892,15 +1000,80 @@ impl HistoryOrigin {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_cold(
+        dataset_id: uuid::Uuid,
+        branch_id: uuid::Uuid,
+        root: PathBuf,
+        managed_root: PathBuf,
+        managed: Arc<arc_swap::ArcSwapOption<ManagedState>>,
+        cache: Arc<BlockCache>,
+        results: Arc<crate::sparql::cache::ResultCache>,
+        union_default_graph: bool,
+        aggregate_errors: crate::sparql::AggregateErrors,
+        geo_op_vertices: u64,
+        history_cache_bytes: u64,
+    ) -> Self {
+        Self {
+            dataset_id,
+            branch_id,
+            is_cold: true,
+            root: Some(root),
+            managed_root: Some(managed_root),
+            history: None,
+            mem_history: None,
+            managed,
+            current: std::sync::Weak::new(),
+            cache: Some(cache),
+            results: Some(results),
+            union_default_graph,
+            aggregate_errors,
+            geo_op_vertices,
+            history_cache_bytes,
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(super) fn cold_parts(
+        &self,
+    ) -> (
+        uuid::Uuid,
+        uuid::Uuid,
+        &Path,
+        &Arc<BlockCache>,
+        &Arc<crate::sparql::cache::ResultCache>,
+        &Arc<arc_swap::ArcSwapOption<ManagedState>>,
+        bool,
+        crate::sparql::AggregateErrors,
+        u64,
+        u64,
+    ) {
+        (
+            self.dataset_id,
+            self.branch_id,
+            self.root.as_deref().expect("cold origin has root"),
+            self.cache.as_ref().expect("cold origin has cache"),
+            self.results.as_ref().expect("cold origin has results"),
+            &self.managed,
+            self.union_default_graph,
+            self.aggregate_errors,
+            self.geo_op_vertices,
+            self.history_cache_bytes,
+        )
+    }
+
     /// Resolve retained commit `seq` on this branch within `preparation`'s controls and
     /// memory budget, pinning its historical evidence configuration when configuration
     /// history is activated. Returns `Ok(None)` when the commit is no longer retained.
     pub(crate) fn snapshot_at_commit(
-        &self,
+        self: &Arc<Self>,
         seq: u64,
         preparation: &Preparation,
     ) -> Result<Option<(Arc<Snapshot>, Reservation)>> {
         preparation.check()?;
+        if self.is_cold {
+            return branching::readonly::cold_commit_snapshot_limited(self, seq, preparation);
+        }
         let Some(current_swap) = self.current.upgrade() else {
             return Ok(None);
         };
@@ -935,7 +1108,7 @@ impl HistoryOrigin {
             cancel: Some(preparation.control().cancel.flag()),
             deadline: preparation.control().deadline,
         };
-        let (allowance, temp_guard) = preparation.reserve_available()?;
+        let (allowance, mut temp_guard) = preparation.reserve_available()?;
         let mem_cap = allowance.min(
             self.history_cache_bytes
                 .max(history_limited::SHARED_SNAPSHOT_BYTES),
@@ -960,13 +1133,21 @@ impl HistoryOrigin {
             return Ok(None);
         };
         let (snap, retained_bytes) = if let Some(cached) = cached {
-            (cached, history_limited::SHARED_SNAPSHOT_BYTES)
+            let gen_bytes = if Arc::ptr_eq(&cached.generation, &live.generation) {
+                0
+            } else {
+                cached.generation.retained_bytes_limited(&limit)?
+            };
+            (
+                cached,
+                history_limited::SHARED_SNAPSHOT_BYTES.saturating_add(gen_bytes),
+            )
         } else if seq == live.commit {
             (live.clone(), history_limited::SHARED_SNAPSHOT_BYTES)
         } else {
             let mut budget = cold::ColdBudget::new(limit)?;
-            let generation = if owner == current_gen {
-                live.generation.clone()
+            let (generation, gen_bytes) = if owner == current_gen {
+                (live.generation.clone(), 0u64)
             } else {
                 let loaded = match cold::read_link_controlled(&entry.dir, &mut budget)? {
                     Some(file) => Generation::open_linked_controlled(
@@ -984,7 +1165,7 @@ impl HistoryOrigin {
                         &mut budget,
                     )?,
                 };
-                Arc::new(loaded.value)
+                (Arc::new(loaded.value), loaded.charge)
             };
             let seed = generation.link.as_ref().map(|link| &link.base_delta);
             let mut delta = seed.cloned().unwrap_or_default();
@@ -997,9 +1178,9 @@ impl HistoryOrigin {
                 let cursor_limit = budget.owned_limit()?;
                 let mut cursor = wal::WalCursor::open_with(&wal_path, from, &cursor_limit, 0)?;
                 let mut target = None;
-                while let Some((found, _, offset)) = cursor.next_with(&cursor_limit, 0)? {
+                while let Some((found, _, _)) = cursor.next_with(&cursor_limit, 0)? {
                     if found == seq {
-                        target = Some(wal::WalPoint { seq: found, offset });
+                        target = Some(cursor.position());
                         break;
                     }
                     if found > seq {
@@ -1034,7 +1215,7 @@ impl HistoryOrigin {
                         geo_op_vertices: self.geo_op_vertices,
                         change_log: None,
                         managed: Some(self.managed.clone()),
-                        history_origin: None,
+                        history_origin: Some(HistoryOriginHandle::Resident(Arc::downgrade(self))),
                     },
                     generation,
                     seq,
@@ -1044,15 +1225,17 @@ impl HistoryOrigin {
                 .historical(true)
                 .build(),
             );
-            (built, delta_bytes)
+            (built, delta_bytes.saturating_add(gen_bytes))
         };
-        drop(temp_guard);
-        let mut held = preparation.reserve(retained_bytes)?;
+        if retained_bytes > allowance {
+            return Err(preparation.exhausted());
+        }
+        temp_guard.release_to(retained_bytes);
         // Resolve historical configuration binding for persistent commit when activated.
         let binding = self.persistent_binding_for(&entry, seq, preparation)?;
         let (snap, pin_held) = self.pin_commit_binding(binding, snap, preparation)?;
-        held.merge(pin_held);
-        Ok(Some((snap, held)))
+        temp_guard.merge(pin_held);
+        Ok(Some((snap, temp_guard)))
     }
 
     fn persistent_binding_for(
@@ -1113,7 +1296,7 @@ impl HistoryOrigin {
         ))
     }
 
-    fn pin_commit_binding(
+    pub(super) fn pin_commit_binding(
         &self,
         binding: ConfigurationBinding,
         snapshot: Arc<Snapshot>,
@@ -1133,7 +1316,14 @@ impl HistoryOrigin {
             return Ok((snapshot, preparation.reserve(0)?));
         };
         let Some(configuration) = binding.configuration() else {
-            return Ok((snapshot, preparation.reserve(0)?));
+            // C25: activation does not certify pre-activation commits from live settings;
+            // fail closed for restricted readers.
+            return Store::pin_unavailable(
+                snapshot,
+                "historical commit has no authenticated configuration binding in an activated family"
+                    .into(),
+                preparation,
+            );
         };
         let document = if let Some(root) = &self.managed_root {
             managed_history::resolve(root, self.dataset_id, history, configuration, preparation)
