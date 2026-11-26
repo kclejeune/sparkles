@@ -13878,11 +13878,15 @@ it.
 
 `POST /{ds}/claims/dependents` with `{"changed", "transitive"}` finds the authenticated
 assessments whose `ev:target` or `prov:used` names one of 1 to 1,000 changed record
-identities, so that a maintained analysis built on them can be reviewed or recomputed.
-It decides nothing about the assessments, whose conclusions may still hold. With
-`transitive: true` it also finds the assessments that depend on a dependent. It needs
-`read` on the dataset or branch through the query endpoint and counts as a query. The
-design is in [C25 §6](specs/C25-evidence-and-assessments.md#6-identity-validity-and-correction).
+identities, together with the community reports in guarded reports graphs proven for the
+caller under the C22 §6 disclosure guard whose generating activity recorded `prov:used`
+for one of them, so that a maintained analysis built on them can be reviewed or
+recomputed. It decides nothing about the assessments or reports, whose conclusions may
+still hold. With `transitive: true` it also finds the assessments and higher-level
+reports that depend on a dependent. It needs `read` on the dataset or branch through the
+query endpoint and counts as a query. The design is in
+[C25 §6](specs/C25-evidence-and-assessments.md#6-identity-validity-and-correction) and
+[Reading reports](specs/C25-evidence-and-assessments.md#reading-reports).
 
 ```json
 {"changed": ["urn:uuid:5c0e…"], "transitive": true}
@@ -13892,17 +13896,25 @@ The changed identities of an operation are the claims it withdrew, the decisions
 superseded, the supports in `changed.supportsEnded`, and for a new resolution map
 revision the revision in `changed.map.previous` and the decisions in
 `changed.map.decisionsEnded`. `sparkles::evidence::Changed::identities` gathers those of
-`changed`. The answer is `{commit, dependents}`, and each dependent is `{assessment,
-graph, on, dependence, depth}`, where `on` is the changed record or, for a transitive
-dependent, the assessment it depends on, `dependence` is `target` or `used`, and `depth`
-is 0 for a direct dependent. Each assessment is reported once, at its smallest depth,
-sorted by depth and IRI. Only the proposal graphs the caller can read are searched, and a
-record any of whose triples the caller's view hides is neither reported nor followed.
+`changed`. The answer is `{commit, dependents, reports}`. Each assessment entry in
+`dependents` is `{assessment, graph, on, dependence, depth}`, where `on` is the changed
+record or, for a transitive dependent, the assessment it depends on, `dependence` is
+`target` or `used`, and `depth` is 0 for a direct dependent. Each report entry in
+`reports` is `{report, community, graph, on, dependence, depth}`, where `community` is
+the report's `gr:community` IRI or `null` when absent, `graph` is its guarded reports
+graph, `dependence` is `used`, and `on` and `depth` follow the same rules. Person-edited
+reports linked through `gr:editOf` inherit the edited report's inputs at the same depth,
+while build replacements linked only by `prov:wasRevisionOf` are not followed. Each
+assessment and each report is reported once, at its smallest depth, sorted by depth and
+IRI. Only proposal graphs the caller can read and guarded reports graphs the caller's
+view both grants and proves at the read snapshot are searched, and a record or activity
+any of whose triples the caller's view hides is neither reported nor followed. Unproven
+or unreadable graphs do not count toward the 10,000-record bound.
 
 | Status and code | Meaning |
 |---|---|
 | `400` | The body is malformed or names no identity. |
-| `422 incomplete-evidence` | More than 10,000 candidate records would be read. |
+| `422 incomplete-evidence` | More than 10,000 visible candidate records would be read. |
 
 `GET /$/server` lists the route in `capabilities.claims.dependents`.
 
