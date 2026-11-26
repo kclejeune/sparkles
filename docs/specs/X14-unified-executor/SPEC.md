@@ -1883,10 +1883,12 @@ writers. Pool-routed cursors, both explicit `execution=streaming` and pool-route
 through `stream::open_and_serialize_controlled`, removing the return wake to the handler
 and the second pool wake while keeping open-phase error responses, concurrency permit
 lifetimes, `StreamControl`, and the execution-to-serialization timing split unchanged.
-Eligible `execution=auto` requests, namely unseen first runs that carry a timeout, arrive
-after a server-idle interval (`FIRST_RUN_QUIET`) and contain no `SERVICE` keyword or
-Unicode escape, along with texts whose quick history retains automatic execution, open and
-drain cursors in place through resumable `Send` `CursorWriter` sessions in `sparkles-core`.
+When a request targets the current snapshot and an in-place runtime is available, eligible
+`execution=auto` requests open and drain cursors in place through resumable `Send`
+`CursorWriter` sessions in `sparkles-core`. Eligibility covers texts whose quick history
+retains automatic execution and unseen first runs that carry a timeout, arrive after a
+server-idle interval (`FIRST_RUN_QUIET`) and pass a conservative text scan rejecting any
+case-insensitive `service` substring or `\u` or `\U` Unicode escape prefix.
 A cursor whose encoded output finishes within `STREAM_AFTER` returns a whole response with
 `Content-Length` and zero thread hops, and a cursor that would cross `STREAM_AFTER` pauses
 before buffering an oversized row, quad or footer and hands off the cursor, encoder state

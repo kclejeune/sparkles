@@ -616,23 +616,65 @@ async fn graph_formats_exact_parity_across_auto_and_streaming() {
             let b = scrub_native_meta(&body_stream);
             assert_eq!(a["queryType"], "CONSTRUCT");
             assert_eq!(b["queryType"], "CONSTRUCT");
-            // Eager native graph puts triples in `triples`, streaming cursor puts quads in `quads`;
-            // verify both return the exact same 300 statements.
-            let stmts = |v: &J| -> Vec<(J, J, J)> {
+            // Native graph JSON encodes triples as 3-term arrays in `triples` and quads
+            // as 4-slot arrays in `quads` (with `null` in slot 3 for the default graph).
+            let stmts = |v: &J, label: &str| -> Vec<(J, J, J)> {
                 let mut out = Vec::new();
-                for field in ["triples", "quads"] {
+                for (field, arity) in [("triples", 3usize), ("quads", 4usize)] {
                     if let Some(arr) = v[field].as_array() {
-                        out.extend(
-                            arr.iter()
-                                .map(|row| (row["s"].clone(), row["p"].clone(), row["o"].clone())),
-                        );
+                        for (row_idx, row) in arr.iter().enumerate() {
+                            let cells = row.as_array().unwrap_or_else(|| {
+                                panic!("{label} {field}[{row_idx}] must be an array: {row}")
+                            });
+                            assert_eq!(
+                                cells.len(),
+                                arity,
+                                "{label} {field}[{row_idx}] arity mismatch: {row}"
+                            );
+                            if arity == 4 {
+                                assert!(
+                                    cells[3].is_null(),
+                                    "{label} {field}[{row_idx}] default-graph slot must be null: {row}"
+                                );
+                            }
+                            for (slot, term) in cells[..3].iter().enumerate() {
+                                let obj = term.as_object().unwrap_or_else(|| {
+                                    panic!(
+                                        "{label} {field}[{row_idx}][{slot}] must be a term object: {term}"
+                                    )
+                                });
+                                assert!(
+                                    obj.get("type")
+                                        .and_then(J::as_str)
+                                        .is_some_and(|s| !s.is_empty()),
+                                    "{label} {field}[{row_idx}][{slot}] missing non-empty type: {term}"
+                                );
+                                assert!(
+                                    obj.get("value")
+                                        .and_then(J::as_str)
+                                        .is_some_and(|s| !s.is_empty()),
+                                    "{label} {field}[{row_idx}][{slot}] missing non-empty value: {term}"
+                                );
+                            }
+                            out.push((cells[0].clone(), cells[1].clone(), cells[2].clone()));
+                        }
                     }
                 }
                 out
             };
-            let a_stmts = stmts(&a);
-            let b_stmts = stmts(&b);
+            let a_stmts = stmts(&a, "auto");
+            let b_stmts = stmts(&b, "streaming");
+            let expected: Vec<(J, J, J)> = (0..300)
+                .map(|i| {
+                    (
+                        serde_json::json!({ "type": "uri", "value": format!("urn:gr:s{i:04}") }),
+                        serde_json::json!({ "type": "uri", "value": "urn:gr:p" }),
+                        serde_json::json!({ "type": "literal", "value": format!("graph-val-{i}-\"<&>") }),
+                    )
+                })
+                .collect();
             assert_eq!(a_stmts.len(), 300);
+            assert_eq!(a_stmts, expected, "native auto statements");
             assert_eq!(a_stmts, b_stmts, "native statement parity");
         } else if *fname == "rt" || *fname == "pb" {
             // Jena binary formats write triple messages on eager and quad messages on cursor;
