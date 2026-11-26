@@ -1114,6 +1114,53 @@ impl Preparation {
         Ok(result)
     }
 
+    /// The lexical form of a stored typed literal with `datatype`, borrowed for `each`
+    /// without decoding it as a term. Only the key's own bytes and the reconstruction
+    /// workspace are charged, so large retained bytes can be read within an allowance
+    /// that would not hold a decoded term of them. `None` for any other term or
+    /// datatype.
+    pub fn with_typed_literal<R>(
+        &self,
+        snap: &Snapshot,
+        id: Id,
+        datatype: &str,
+        each: impl FnOnce(Option<&str>) -> Result<R>,
+    ) -> Result<R> {
+        self.check()?;
+        let mut each = Some(each);
+        let mut call = |key: &[u8]| -> Result<R> {
+            let each = each.take().expect("called once");
+            let _held = self.reserve((key.len() as u64).saturating_add(64))?;
+            let lexical = match crate::id::TextKey::parse(key) {
+                Some(crate::id::TextKey::Typed(text, dt)) if dt == datatype => Some(text),
+                _ => None,
+            };
+            each(lexical)
+        };
+        let mut workspace = self.reserve(0)?;
+        let result = match id.tag() {
+            Tag::Vocab => snap.generation.vocab.get_with_controlled(
+                id.payload(),
+                |bytes| workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256)),
+                |phase| self.checkpoint(phase),
+                &mut call,
+            )?,
+            Tag::Delta => snap.generation.dvocab.with_prepared(self, |vocab| {
+                if id.payload() >= snap.dvocab_len {
+                    return Ok(None);
+                }
+                Ok(vocab.get(id.payload()).map(&mut call))
+            })?,
+            _ => None,
+        };
+        let result = match result {
+            Some(result) => result?,
+            None => (each.take().expect("not called"))(None)?,
+        };
+        self.check()?;
+        Ok(result)
+    }
+
     fn decode_term(&self, key: &[u8]) -> Result<(Term, Reservation)> {
         // Includes decoded strings/boxes. Explicit frame/value buffers below carry
         // separate reservations and avoid a recursive native-stack decoder.

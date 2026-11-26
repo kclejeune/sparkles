@@ -1128,3 +1128,1186 @@ mod crashes {
         let _ = OwnerKind::Evidence;
     }
 }
+
+// ------------------------------------------------ item 551: existing-record selections ---
+
+fn json_method() -> MethodRef {
+    MethodRef {
+        method: iri(evidence::JSON_LEXICAL_UTF8_V1),
+        version: key(evidence::JSON_LEXICAL_UTF8_VERSION),
+    }
+}
+
+#[test]
+fn proposing_passages_against_an_existing_rendition_verifies_revision_and_text() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    let unicode_text = "naïve café 🦀 release 1.2 is affected.";
+    let rev_input = SourceRevisionInput {
+        version: RecordVersion::V1,
+        key: key("rev"),
+        source: iri("urn:bulletin"),
+        source_key: key("bulletin-unicode"),
+        upstream_version: None,
+        content: SourceContent::Retained {
+            bytes: unicode_text.as_bytes().to_vec(),
+            expected_digest: Some(sha(unicode_text)),
+        },
+        metadata: Default::default(),
+        times: Default::default(),
+        lineage: Default::default(),
+    };
+    let rend_input = RenditionInput {
+        version: RecordVersion::V1,
+        key: key("rend"),
+        revision: local("rev"),
+        occurrence_key: key("rend-text"),
+        conversion: method("urn:method:identity"),
+        media_type: "text/plain".into(),
+        language: Some("en".into()),
+        content: RenditionContent::NormalizedText(unicode_text.into()),
+        expected_digest: None,
+    };
+    let first = propose(
+        &ds,
+        &EvidenceInput {
+            revisions: vec![rev_input.clone()],
+            renditions: vec![rend_input.clone()],
+            ..Default::default()
+        },
+        &options(),
+    )
+    .unwrap();
+    let rev_iri = iri_of(&first, "rev");
+    let rend_iri = iri_of(&first, "rend");
+
+    // A second unrelated revision, to check mismatched revision refusal.
+    let other_rev = propose(&ds, &small("other", proposition()), &options()).unwrap();
+    let other_rev_iri = iri_of(&other_rev, "rev");
+
+    // A metadata-only rendition and a retained-bytes rendition (no normalizedText).
+    let no_text = propose(
+        &ds,
+        &EvidenceInput {
+            renditions: vec![
+                RenditionInput {
+                    version: RecordVersion::V1,
+                    key: key("meta"),
+                    revision: RecordRef::Existing(rev_iri.clone()),
+                    occurrence_key: key("rend-meta"),
+                    conversion: method("urn:method:identity"),
+                    media_type: "text/plain".into(),
+                    language: None,
+                    content: RenditionContent::MetadataOnly(sha(unicode_text)),
+                    expected_digest: None,
+                },
+                RenditionInput {
+                    version: RecordVersion::V1,
+                    key: key("bytes"),
+                    revision: RecordRef::Existing(rev_iri.clone()),
+                    occurrence_key: key("rend-bytes"),
+                    conversion: method("urn:method:identity"),
+                    media_type: "application/octet-stream".into(),
+                    language: None,
+                    content: RenditionContent::RetainedBytes(unicode_text.as_bytes().to_vec()),
+                    expected_digest: None,
+                },
+            ],
+            ..Default::default()
+        },
+        &options(),
+    )
+    .unwrap();
+    let meta_rend_iri = iri_of(&no_text, "meta");
+    let bytes_rend_iri = iri_of(&no_text, "bytes");
+
+    let cafe: String = unicode_text.chars().skip(6).take(4).collect();
+    assert_eq!(cafe, "café");
+    let crab: String = unicode_text.chars().skip(11).take(1).collect();
+    assert_eq!(crab, "🦀");
+
+    // Propose two passages against the existing rendition in one batch (one naming
+    // existing rev, one re-sending the identical local rev).
+    let mut o_idem = options();
+    o_idem.idempotency_key = Some("passage-existing-rendition".into());
+    let proposed = propose(
+        &ds,
+        &EvidenceInput {
+            revisions: vec![rev_input.clone()],
+            passages: vec![
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p1"),
+                    revision: RecordRef::Existing(rev_iri.clone()),
+                    rendition: RecordRef::Existing(rend_iri.clone()),
+                    occurrence_key: key("occ-cafe"),
+                    start: 6,
+                    end: 10,
+                    text_digest: sha(&cafe),
+                    quote: Some(cafe.clone()),
+                },
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p2"),
+                    revision: local("rev"),
+                    rendition: RecordRef::Existing(rend_iri.clone()),
+                    occurrence_key: key("occ-crab"),
+                    start: 11,
+                    end: 12,
+                    text_digest: sha(&crab),
+                    quote: None,
+                },
+            ],
+            ..Default::default()
+        },
+        &o_idem,
+    )
+    .unwrap();
+    assert!(proposed.committed && !proposed.replayed);
+    let p1_rec = proposed.records.iter().find(|r| r.key == "p1").unwrap();
+    let p2_rec = proposed.records.iter().find(|r| r.key == "p2").unwrap();
+    assert!(!p1_rec.existing && !p2_rec.existing);
+    assert!(
+        proposed
+            .records
+            .iter()
+            .find(|r| r.key == "rev")
+            .unwrap()
+            .existing
+    );
+    // Both passages resolve through Resolution::record.
+    let v1 = record(&ds, &p1_rec.iri, RecordKind::Passage).unwrap();
+    assert_eq!(
+        (v1.span.as_ref().unwrap().start, v1.span.unwrap().end),
+        (6, 10)
+    );
+    let v2 = record(&ds, &p2_rec.iri, RecordKind::Passage).unwrap();
+    assert_eq!(
+        (v2.span.as_ref().unwrap().start, v2.span.unwrap().end),
+        (11, 12)
+    );
+
+    // Digest & IRI stability: proposing the same passage with a local rendition on a
+    // fresh dataset (same dataset_id cannot be forged, so dry-run on same dataset)
+    // yields the exact same IRI and record_digest!
+    let mut dry = options();
+    dry.dry_run = true;
+    let local_dry = propose(
+        &ds,
+        &EvidenceInput {
+            revisions: vec![rev_input.clone()],
+            renditions: vec![rend_input.clone()],
+            passages: vec![PassageInput {
+                version: RecordVersion::V1,
+                key: key("p1"),
+                revision: local("rev"),
+                rendition: local("rend"),
+                occurrence_key: key("occ-cafe"),
+                start: 6,
+                end: 10,
+                text_digest: sha(&cafe),
+                quote: Some(cafe.clone()),
+            }],
+            ..Default::default()
+        },
+        &dry,
+    )
+    .unwrap();
+    let local_p1 = local_dry.records.iter().find(|r| r.key == "p1").unwrap();
+    assert_eq!(local_p1.iri, p1_rec.iri);
+    assert_eq!(local_p1.digest, p1_rec.digest);
+    assert!(local_p1.existing);
+
+    // Idempotency replay returns the exact first receipt without writing.
+    let head = ds.store().head_commit().seq;
+    let replayed = propose(
+        &ds,
+        &EvidenceInput {
+            revisions: vec![rev_input.clone()],
+            passages: vec![
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p1"),
+                    revision: RecordRef::Existing(rev_iri.clone()),
+                    rendition: RecordRef::Existing(rend_iri.clone()),
+                    occurrence_key: key("occ-cafe"),
+                    start: 6,
+                    end: 10,
+                    text_digest: sha(&cafe),
+                    quote: Some(cafe.clone()),
+                },
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p2"),
+                    revision: local("rev"),
+                    rendition: RecordRef::Existing(rend_iri.clone()),
+                    occurrence_key: key("occ-crab"),
+                    start: 11,
+                    end: 12,
+                    text_digest: sha(&crab),
+                    quote: None,
+                },
+            ],
+            ..Default::default()
+        },
+        &o_idem,
+    )
+    .unwrap();
+    assert!(replayed.replayed && !replayed.committed);
+    assert_eq!(replayed.records, proposed.records);
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Refusals: mismatched quote, mismatched text_digest, out-of-bounds offset,
+    // mismatched revision, metadata-only/retained-bytes existing rendition, local
+    // metadata-only rendition. None writes anything.
+    let attempt = |p: PassageInput| {
+        propose(
+            &ds,
+            &EvidenceInput {
+                passages: vec![p],
+                ..Default::default()
+            },
+            &options(),
+        )
+    };
+    assert_eq!(
+        code(attempt(PassageInput {
+            version: RecordVersion::V1,
+            key: key("bad-quote"),
+            revision: RecordRef::Existing(rev_iri.clone()),
+            rendition: RecordRef::Existing(rend_iri.clone()),
+            occurrence_key: key("bad-quote"),
+            start: 6,
+            end: 10,
+            text_digest: sha(&cafe),
+            quote: Some("cafe".into()),
+        })),
+        "span-mismatch"
+    );
+    assert_eq!(
+        code(attempt(PassageInput {
+            version: RecordVersion::V1,
+            key: key("bad-digest"),
+            revision: RecordRef::Existing(rev_iri.clone()),
+            rendition: RecordRef::Existing(rend_iri.clone()),
+            occurrence_key: key("bad-digest"),
+            start: 6,
+            end: 10,
+            text_digest: sha("wrong"),
+            quote: Some(cafe.clone()),
+        })),
+        "span-mismatch"
+    );
+    assert_eq!(
+        code(attempt(PassageInput {
+            version: RecordVersion::V1,
+            key: key("past-end"),
+            revision: RecordRef::Existing(rev_iri.clone()),
+            rendition: RecordRef::Existing(rend_iri.clone()),
+            occurrence_key: key("past-end"),
+            start: 6,
+            end: 999,
+            text_digest: sha(&cafe),
+            quote: None,
+        })),
+        "span-mismatch"
+    );
+    assert_eq!(
+        code(attempt(PassageInput {
+            version: RecordVersion::V1,
+            key: key("wrong-rev"),
+            revision: RecordRef::Existing(other_rev_iri),
+            rendition: RecordRef::Existing(rend_iri.clone()),
+            occurrence_key: key("wrong-rev"),
+            start: 6,
+            end: 10,
+            text_digest: sha(&cafe),
+            quote: Some(cafe.clone()),
+        })),
+        "invalid"
+    );
+    assert_eq!(
+        code(attempt(PassageInput {
+            version: RecordVersion::V1,
+            key: key("meta-rend"),
+            revision: RecordRef::Existing(rev_iri.clone()),
+            rendition: RecordRef::Existing(meta_rend_iri),
+            occurrence_key: key("meta-rend"),
+            start: 6,
+            end: 10,
+            text_digest: sha(&cafe),
+            quote: Some(cafe.clone()),
+        })),
+        "evidence-unavailable"
+    );
+    assert_eq!(
+        code(attempt(PassageInput {
+            version: RecordVersion::V1,
+            key: key("bytes-rend"),
+            revision: RecordRef::Existing(rev_iri.clone()),
+            rendition: RecordRef::Existing(bytes_rend_iri),
+            occurrence_key: key("bytes-rend"),
+            start: 6,
+            end: 10,
+            text_digest: sha(&cafe),
+            quote: Some(cafe.clone()),
+        })),
+        "evidence-unavailable"
+    );
+    // Local metadata-only rendition cannot verify a passage either.
+    assert_eq!(
+        code(propose(
+            &ds,
+            &EvidenceInput {
+                renditions: vec![RenditionInput {
+                    version: RecordVersion::V1,
+                    key: key("local-meta"),
+                    revision: RecordRef::Existing(rev_iri.clone()),
+                    occurrence_key: key("local-meta-occ"),
+                    conversion: method("urn:method:identity"),
+                    media_type: "text/plain".into(),
+                    language: None,
+                    content: RenditionContent::MetadataOnly(sha(unicode_text)),
+                    expected_digest: None,
+                }],
+                passages: vec![PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("local-meta-p"),
+                    revision: RecordRef::Existing(rev_iri.clone()),
+                    rendition: local("local-meta"),
+                    occurrence_key: key("local-meta-p"),
+                    start: 6,
+                    end: 10,
+                    text_digest: sha(&cafe),
+                    quote: Some(cafe.clone()),
+                }],
+                ..Default::default()
+            },
+            &options(),
+        )),
+        "evidence-unavailable"
+    );
+
+    // Unauthorized caller gets identical evidence-unavailable as for a missing rendition.
+    let limited = || {
+        Some(Arc::new(GraphAccess::graphs(
+            Graphs::Only(GraphRule::new([CLAIMS], &[])),
+            Graphs::All,
+        )))
+    };
+    let missing_iri = iri("urn:uuid:00000000-0000-4000-8000-000000000000");
+    let unauth_answer = |target_rend: NamedNode| {
+        let e = evidence::propose(
+            None,
+            &ds,
+            &ds,
+            &EvidenceInput {
+                passages: vec![PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p-unauth"),
+                    revision: RecordRef::Existing(rev_iri.clone()),
+                    rendition: RecordRef::Existing(target_rend.clone()),
+                    occurrence_key: key("p-unauth"),
+                    start: 6,
+                    end: 10,
+                    text_digest: sha(&cafe),
+                    quote: Some(cafe.clone()),
+                }],
+                ..Default::default()
+            },
+            &options(),
+            &mut |_, _| limited(),
+            &Control::none(),
+        )
+        .unwrap_err();
+        (
+            e.code().to_string(),
+            e.to_string()
+                .replace(rev_iri.as_str(), "REV")
+                .replace(target_rend.as_str(), "REND"),
+        )
+    };
+    let hidden = unauth_answer(rend_iri.clone());
+    let missing = unauth_answer(missing_iri);
+    assert_eq!(hidden.0, "evidence-unavailable");
+    assert_eq!(hidden, missing);
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Detached and re-protected rendition answers origin-not-reproduced.
+    evidence::detach(&ds, SOURCES).unwrap();
+    configured(&ds);
+    assert_eq!(
+        code(attempt(PassageInput {
+            version: RecordVersion::V1,
+            key: key("detached-rend"),
+            revision: RecordRef::Existing(rev_iri),
+            rendition: RecordRef::Existing(rend_iri),
+            occurrence_key: key("detached-rend"),
+            start: 6,
+            end: 10,
+            text_digest: sha(&cafe),
+            quote: Some(cafe),
+        })),
+        "origin-not-reproduced"
+    );
+}
+
+#[test]
+fn referencing_an_existing_passage_verifies_its_revision_and_rendition() {
+    let (_dir, ds) = retained();
+    let fact = with_fact(&ds);
+    configured(&ds);
+    let first = propose(&ds, &batch(&ds, fact), &options()).unwrap();
+    let rev1 = iri_of(&first, "rev");
+    let rend1 = iri_of(&first, "text");
+    let pass1 = iri_of(&first, "span");
+    let claim1 = iri_of(&first, "claim");
+
+    // Publish a second revision and rendition for mismatch tests.
+    let second_text = "Second document text for mismatch tests.";
+    let second = propose(
+        &ds,
+        &EvidenceInput {
+            revisions: vec![SourceRevisionInput {
+                version: RecordVersion::V1,
+                key: key("rev2"),
+                source: iri("urn:bulletin-2"),
+                source_key: key("bulletin-2"),
+                upstream_version: None,
+                content: SourceContent::Retained {
+                    bytes: second_text.as_bytes().to_vec(),
+                    expected_digest: Some(sha(second_text)),
+                },
+                metadata: Default::default(),
+                times: Default::default(),
+                lineage: Default::default(),
+            }],
+            renditions: vec![RenditionInput {
+                version: RecordVersion::V1,
+                key: key("rend2"),
+                revision: local("rev2"),
+                occurrence_key: key("rend2-occ"),
+                conversion: method("urn:method:identity"),
+                media_type: "text/plain".into(),
+                language: None,
+                content: RenditionContent::NormalizedText(second_text.into()),
+                expected_digest: None,
+            }],
+            ..Default::default()
+        },
+        &options(),
+    )
+    .unwrap();
+    let rev2 = iri_of(&second, "rev2");
+    let rend2 = iri_of(&second, "rend2");
+
+    // Propose a reference to the existing passage + a new claim and supporting link.
+    // A caller with write grants ONLY on CLAIMS and read grants on SOURCES succeeds!
+    let mut o_claims_only = options();
+    o_claims_only.write = Some(Arc::new(GraphAccess::graphs(
+        Graphs::All,
+        Graphs::Only(GraphRule::new([CLAIMS], &[])),
+    )));
+    let proposed = propose(
+        &ds,
+        &EvidenceInput {
+            references: vec![EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("existingPassRef"),
+                occurrence_key: key("passageRef"),
+                target: EvidenceRefTarget::Passage {
+                    revision: RecordRef::Existing(rev1.clone()),
+                    rendition: RecordRef::Existing(rend1.clone()),
+                    passage: RecordRef::Existing(pass1.clone()),
+                },
+            }],
+            claims: vec![ClaimInput {
+                version: RecordVersion::V1,
+                key: key("c2"),
+                occurrence_key: key("c2"),
+                revision: RecordRef::Existing(rev1.clone()),
+                proposition: proposition(),
+                kind: ClaimKind::Reported,
+                polarity: Polarity::Positive,
+                attributed_author: iri("urn:publisher"),
+                scope: Default::default(),
+                confidence: Default::default(),
+                validity: None,
+            }],
+            links: vec![EvidenceLinkInput {
+                version: RecordVersion::V1,
+                key: key("l2"),
+                occurrence_key: key("l2"),
+                target: local("c2"),
+                evidence: local("existingPassRef"),
+                relation: EvidenceRelation::Supports,
+                attributed_author: iri("urn:importer"),
+            }],
+            ..Default::default()
+        },
+        &o_claims_only,
+    )
+    .unwrap();
+    assert!(proposed.committed);
+    // Digest & IRI stability: occurrence_key "passageRef" matches the first batch's
+    // local passage reference, so it is marked existing with identical IRI and digest.
+    let first_ref = first
+        .records
+        .iter()
+        .find(|r| r.key == "passageRef")
+        .unwrap();
+    let second_ref = proposed
+        .records
+        .iter()
+        .find(|r| r.key == "existingPassRef")
+        .unwrap();
+    assert_eq!(second_ref.iri, first_ref.iri);
+    assert_eq!(second_ref.digest, first_ref.digest);
+    assert!(second_ref.existing);
+
+    // Refusals: mismatched revision, mismatched rendition, wrong kind, missing passage.
+    let head = ds.store().head_commit().seq;
+    let ref_attempt = |r: NamedNode, rn: NamedNode, p: NamedNode| {
+        propose(
+            &ds,
+            &EvidenceInput {
+                references: vec![EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key("r"),
+                    occurrence_key: key("r-occ"),
+                    target: EvidenceRefTarget::Passage {
+                        revision: RecordRef::Existing(r),
+                        rendition: RecordRef::Existing(rn),
+                        passage: RecordRef::Existing(p),
+                    },
+                }],
+                ..Default::default()
+            },
+            &options(),
+        )
+    };
+    assert_eq!(
+        code(ref_attempt(rev2.clone(), rend1.clone(), pass1.clone())),
+        "invalid"
+    );
+    assert_eq!(
+        code(ref_attempt(rev1.clone(), rend2.clone(), pass1.clone())),
+        "invalid"
+    );
+    assert_eq!(
+        code(ref_attempt(rev1.clone(), rend1.clone(), claim1)),
+        "immutable-record-conflict"
+    );
+    let missing_iri = iri("urn:uuid:00000000-0000-4000-8000-000000000000");
+    assert_eq!(
+        code(ref_attempt(
+            rev1.clone(),
+            rend1.clone(),
+            missing_iri.clone()
+        )),
+        "evidence-unavailable"
+    );
+
+    // Unauthorized caller gets identical evidence-unavailable as for a missing passage.
+    let limited = || {
+        Some(Arc::new(GraphAccess::graphs(
+            Graphs::Only(GraphRule::new([CLAIMS], &[])),
+            Graphs::All,
+        )))
+    };
+    let hidden_answer = |p: NamedNode| {
+        let e = evidence::propose(
+            None,
+            &ds,
+            &ds,
+            &EvidenceInput {
+                references: vec![EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key("r"),
+                    occurrence_key: key("r-unauth"),
+                    target: EvidenceRefTarget::Passage {
+                        revision: RecordRef::Existing(rev1.clone()),
+                        rendition: RecordRef::Existing(rend1.clone()),
+                        passage: RecordRef::Existing(p.clone()),
+                    },
+                }],
+                ..Default::default()
+            },
+            &options(),
+            &mut |_, _| limited(),
+            &Control::none(),
+        )
+        .unwrap_err();
+        (
+            e.code().to_string(),
+            e.to_string()
+                .replace(rev1.as_str(), "REV")
+                .replace(rend1.as_str(), "REND")
+                .replace(p.as_str(), "PASS"),
+        )
+    };
+    let hidden = hidden_answer(pass1.clone());
+    let missing = hidden_answer(missing_iri);
+    assert_eq!(hidden.0, "evidence-unavailable");
+    assert_eq!(hidden, missing);
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Branch isolation: a passage from main resolves on a child branch; a passage
+    // created on a branch does not resolve on main.
+    ds.create_branch("dev", &Default::default()).unwrap();
+    let dev = ds.branch("dev").unwrap();
+    let dev_pass = evidence::propose(
+        None,
+        &ds,
+        &dev,
+        &EvidenceInput {
+            passages: vec![PassageInput {
+                version: RecordVersion::V1,
+                key: key("dev-span"),
+                revision: RecordRef::Existing(rev1.clone()),
+                rendition: RecordRef::Existing(rend1.clone()),
+                occurrence_key: key("dev-span"),
+                start: 12,
+                end: 14,
+                text_digest: sha("is"),
+                quote: Some("is".into()),
+            }],
+            ..Default::default()
+        },
+        &options(),
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    let dev_pass_iri = iri_of(&dev_pass, "dev-span");
+    assert_eq!(
+        code(ref_attempt(
+            rev1.clone(),
+            rend1.clone(),
+            dev_pass_iri.clone()
+        )),
+        "evidence-unavailable"
+    );
+    assert!(
+        evidence::propose(
+            None,
+            &ds,
+            &dev,
+            &EvidenceInput {
+                references: vec![EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key("dev-ref"),
+                    occurrence_key: key("dev-ref"),
+                    target: EvidenceRefTarget::Passage {
+                        revision: RecordRef::Existing(rev1.clone()),
+                        rendition: RecordRef::Existing(rend1.clone()),
+                        passage: RecordRef::Existing(dev_pass_iri),
+                    },
+                }],
+                ..Default::default()
+            },
+            &options(),
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap()
+        .committed
+    );
+
+    // Detached and re-protected source graph invalidates the passage.
+    evidence::detach(&ds, SOURCES).unwrap();
+    configured(&ds);
+    assert_eq!(
+        code(ref_attempt(rev1, rend1, pass1)),
+        "origin-not-reproduced"
+    );
+}
+
+#[test]
+fn structured_references_verify_against_existing_and_non_json_revisions() {
+    let (_dir, ds) = retained();
+    let fact = with_fact(&ds);
+    configured(&ds);
+
+    let json_doc = r#"{"a/b":{"m~n":[null,1.000,"café"]},"affected":["pkg-1","pkg-2"]}"#;
+    let plain_text = "Release 1.2 is not JSON.";
+    let binary_bytes: Vec<u8> = vec![0x89, 0x50, 0x4e, 0x47, 0xff, 0x00, 0xfe];
+    let dup_json = r#"{"x":1,"\u0078":2}"#;
+
+    let seed = propose(
+        &ds,
+        &EvidenceInput {
+            revisions: vec![
+                SourceRevisionInput {
+                    version: RecordVersion::V1,
+                    key: key("json-rev"),
+                    source: iri("urn:advisory:json"),
+                    source_key: key("adv-json"),
+                    upstream_version: None,
+                    content: SourceContent::Retained {
+                        bytes: json_doc.as_bytes().to_vec(),
+                        expected_digest: Some(sha(json_doc)),
+                    },
+                    metadata: Default::default(),
+                    times: Default::default(),
+                    lineage: Default::default(),
+                },
+                SourceRevisionInput {
+                    version: RecordVersion::V1,
+                    key: key("text-rev"),
+                    source: iri("urn:advisory:text"),
+                    source_key: key("adv-text"),
+                    upstream_version: None,
+                    content: SourceContent::Retained {
+                        bytes: plain_text.as_bytes().to_vec(),
+                        expected_digest: Some(sha(plain_text)),
+                    },
+                    metadata: Default::default(),
+                    times: Default::default(),
+                    lineage: Default::default(),
+                },
+                SourceRevisionInput {
+                    version: RecordVersion::V1,
+                    key: key("bin-rev"),
+                    source: iri("urn:advisory:bin"),
+                    source_key: key("adv-bin"),
+                    upstream_version: None,
+                    content: SourceContent::Retained {
+                        bytes: binary_bytes.clone(),
+                        expected_digest: Some(
+                            Sha256Digest::of_bytes(&binary_bytes, &Control::none()).unwrap(),
+                        ),
+                    },
+                    metadata: Default::default(),
+                    times: Default::default(),
+                    lineage: Default::default(),
+                },
+                SourceRevisionInput {
+                    version: RecordVersion::V1,
+                    key: key("dup-rev"),
+                    source: iri("urn:advisory:dup"),
+                    source_key: key("adv-dup"),
+                    upstream_version: None,
+                    content: SourceContent::Retained {
+                        bytes: dup_json.as_bytes().to_vec(),
+                        expected_digest: Some(sha(dup_json)),
+                    },
+                    metadata: Default::default(),
+                    times: Default::default(),
+                    lineage: Default::default(),
+                },
+                SourceRevisionInput {
+                    version: RecordVersion::V1,
+                    key: key("meta-rev"),
+                    source: iri("urn:advisory:meta"),
+                    source_key: key("adv-meta"),
+                    upstream_version: None,
+                    content: SourceContent::MetadataOnly {
+                        digest: sha(json_doc),
+                    },
+                    metadata: Default::default(),
+                    times: Default::default(),
+                    lineage: Default::default(),
+                },
+            ],
+            ..Default::default()
+        },
+        &options(),
+    )
+    .unwrap();
+    let json_rev = iri_of(&seed, "json-rev");
+    let text_rev = iri_of(&seed, "text-rev");
+    let bin_rev = iri_of(&seed, "bin-rev");
+    let dup_rev = iri_of(&seed, "dup-rev");
+    let meta_rev = iri_of(&seed, "meta-rev");
+
+    // Multiple structured references against the existing JSON revision + a stored fact
+    // in one batch, with idempotency key.
+    let mut o_idem = options();
+    o_idem.idempotency_key = Some("structured-existing".into());
+    let valid_batch = EvidenceInput {
+        references: vec![
+            EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("s-num"),
+                occurrence_key: key("s-num"),
+                target: EvidenceRefTarget::Structured {
+                    revision: RecordRef::Existing(json_rev.clone()),
+                    pointer: "/a~1b/m~0n/1".into(),
+                    method: json_method(),
+                    value_digest: sha("1.000"),
+                },
+            },
+            EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("s-str"),
+                occurrence_key: key("s-str"),
+                target: EvidenceRefTarget::Structured {
+                    revision: RecordRef::Existing(json_rev.clone()),
+                    pointer: "/a~1b/m~0n/2".into(),
+                    method: json_method(),
+                    value_digest: sha("\"café\""),
+                },
+            },
+            EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("s-root"),
+                occurrence_key: key("s-root"),
+                target: EvidenceRefTarget::Structured {
+                    revision: RecordRef::Existing(json_rev.clone()),
+                    pointer: "".into(),
+                    method: json_method(),
+                    value_digest: sha(json_doc),
+                },
+            },
+            EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("fact-alongside"),
+                occurrence_key: key("fact-alongside"),
+                target: EvidenceRefTarget::StoredFact(StoredFactRef {
+                    dataset: ds.dataset_id(),
+                    branch: ds.dataset_id(),
+                    commit: fact,
+                    graph: GraphIdentity::Named(iri(FACTS)),
+                    expected: proposition(),
+                    anchor: None,
+                }),
+            },
+        ],
+        ..Default::default()
+    };
+    let proposed = propose(&ds, &valid_batch, &o_idem).unwrap();
+    assert!(proposed.committed && !proposed.replayed);
+    assert!(proposed.hold.is_some());
+    assert_eq!(evidence::holds(&ds).unwrap().len(), 1);
+
+    // Digest & IRI stability: local revision produces the exact same IRI and digest.
+    let mut dry = options();
+    dry.dry_run = true;
+    let local_dry = propose(
+        &ds,
+        &EvidenceInput {
+            revisions: vec![SourceRevisionInput {
+                version: RecordVersion::V1,
+                key: key("json-rev"),
+                source: iri("urn:advisory:json"),
+                source_key: key("adv-json"),
+                upstream_version: None,
+                content: SourceContent::Retained {
+                    bytes: json_doc.as_bytes().to_vec(),
+                    expected_digest: Some(sha(json_doc)),
+                },
+                metadata: Default::default(),
+                times: Default::default(),
+                lineage: Default::default(),
+            }],
+            references: vec![EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("s-num"),
+                occurrence_key: key("s-num"),
+                target: EvidenceRefTarget::Structured {
+                    revision: local("json-rev"),
+                    pointer: "/a~1b/m~0n/1".into(),
+                    method: json_method(),
+                    value_digest: sha("1.000"),
+                },
+            }],
+            ..Default::default()
+        },
+        &dry,
+    )
+    .unwrap();
+    let existing_s = proposed.records.iter().find(|r| r.key == "s-num").unwrap();
+    let local_s = local_dry.records.iter().find(|r| r.key == "s-num").unwrap();
+    assert_eq!(local_s.iri, existing_s.iri);
+    assert_eq!(local_s.digest, existing_s.digest);
+    assert!(local_s.existing);
+
+    // Idempotent replay returns first receipt without committing.
+    let head = ds.store().head_commit().seq;
+    let replayed = propose(&ds, &valid_batch, &o_idem).unwrap();
+    assert!(replayed.replayed && !replayed.committed);
+    assert_eq!(replayed.records, proposed.records);
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Refusals: wrong value_digest (lexical 1 vs 1.000), missing path, duplicate keys,
+    // existing plain-text non-JSON, existing binary non-UTF-8, local plain-text non-JSON,
+    // existing metadata-only, local metadata-only, unsupported method.
+    let structured_attempt = |rev: RecordRef, pointer: &str, m: MethodRef, d: Sha256Digest| {
+        propose(
+            &ds,
+            &EvidenceInput {
+                references: vec![
+                    EvidenceRefInput {
+                        version: RecordVersion::V1,
+                        key: key("sr"),
+                        occurrence_key: key("sr-occ"),
+                        target: EvidenceRefTarget::Structured {
+                            revision: rev,
+                            pointer: pointer.into(),
+                            method: m,
+                            value_digest: d,
+                        },
+                    },
+                    // Include a stored fact to verify failed selections acquire no new hold.
+                    EvidenceRefInput {
+                        version: RecordVersion::V1,
+                        key: key("f"),
+                        occurrence_key: key("f-no-hold"),
+                        target: EvidenceRefTarget::StoredFact(StoredFactRef {
+                            dataset: ds.dataset_id(),
+                            branch: ds.dataset_id(),
+                            commit: fact,
+                            graph: GraphIdentity::Named(iri(FACTS)),
+                            expected: proposition(),
+                            anchor: None,
+                        }),
+                    },
+                ],
+                ..Default::default()
+            },
+            &options(),
+        )
+    };
+    assert_eq!(
+        code(structured_attempt(
+            RecordRef::Existing(json_rev.clone()),
+            "/a~1b/m~0n/1",
+            json_method(),
+            sha("1"),
+        )),
+        "span-mismatch"
+    );
+    assert_eq!(
+        code(structured_attempt(
+            RecordRef::Existing(json_rev.clone()),
+            "/missing/path",
+            json_method(),
+            sha("1.000"),
+        )),
+        "span-mismatch"
+    );
+    assert_eq!(
+        code(structured_attempt(
+            RecordRef::Existing(dup_rev),
+            "/x",
+            json_method(),
+            sha("1"),
+        )),
+        "span-mismatch"
+    );
+    assert_eq!(
+        code(structured_attempt(
+            RecordRef::Existing(text_rev),
+            "",
+            json_method(),
+            sha(plain_text),
+        )),
+        "span-mismatch"
+    );
+    assert_eq!(
+        code(structured_attempt(
+            RecordRef::Existing(bin_rev),
+            "",
+            json_method(),
+            Sha256Digest::of_bytes(&binary_bytes, &Control::none()).unwrap(),
+        )),
+        "span-mismatch"
+    );
+    assert_eq!(
+        code(structured_attempt(
+            RecordRef::Existing(meta_rev),
+            "/a~1b/m~0n/1",
+            json_method(),
+            sha("1.000"),
+        )),
+        "evidence-unavailable"
+    );
+    assert_eq!(
+        code(structured_attempt(
+            RecordRef::Existing(json_rev.clone()),
+            "/a~1b/m~0n/1",
+            method("urn:example:unsupported-norm"),
+            sha("1.000"),
+        )),
+        "incomplete-evidence"
+    );
+    // Local non-JSON revision also returns span-mismatch; local metadata-only returns
+    // evidence-unavailable.
+    assert_eq!(
+        code(propose(
+            &ds,
+            &EvidenceInput {
+                revisions: vec![SourceRevisionInput {
+                    version: RecordVersion::V1,
+                    key: key("local-text"),
+                    source: iri("urn:local:text"),
+                    source_key: key("local-text"),
+                    upstream_version: None,
+                    content: SourceContent::Retained {
+                        bytes: plain_text.as_bytes().to_vec(),
+                        expected_digest: None,
+                    },
+                    metadata: Default::default(),
+                    times: Default::default(),
+                    lineage: Default::default(),
+                }],
+                references: vec![EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key("local-sr"),
+                    occurrence_key: key("local-sr"),
+                    target: EvidenceRefTarget::Structured {
+                        revision: local("local-text"),
+                        pointer: "".into(),
+                        method: json_method(),
+                        value_digest: sha(plain_text),
+                    },
+                }],
+                ..Default::default()
+            },
+            &options(),
+        )),
+        "span-mismatch"
+    );
+    assert_eq!(
+        code(propose(
+            &ds,
+            &EvidenceInput {
+                revisions: vec![SourceRevisionInput {
+                    version: RecordVersion::V1,
+                    key: key("local-meta"),
+                    source: iri("urn:local:meta"),
+                    source_key: key("local-meta"),
+                    upstream_version: None,
+                    content: SourceContent::MetadataOnly {
+                        digest: sha(json_doc),
+                    },
+                    metadata: Default::default(),
+                    times: Default::default(),
+                    lineage: Default::default(),
+                }],
+                references: vec![EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key("local-meta-sr"),
+                    occurrence_key: key("local-meta-sr"),
+                    target: EvidenceRefTarget::Structured {
+                        revision: local("local-meta"),
+                        pointer: "/a~1b/m~0n/1".into(),
+                        method: json_method(),
+                        value_digest: sha("1.000"),
+                    },
+                }],
+                ..Default::default()
+            },
+            &options(),
+        )),
+        "evidence-unavailable"
+    );
+    // No refusal acquired a hold or advanced the head.
+    assert_eq!(evidence::holds(&ds).unwrap().len(), 1);
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Unauthorized caller gets identical evidence-unavailable as for a missing revision.
+    let limited = || {
+        Some(Arc::new(GraphAccess::graphs(
+            Graphs::Only(GraphRule::new([CLAIMS], &[])),
+            Graphs::All,
+        )))
+    };
+    let missing_iri = iri("urn:uuid:00000000-0000-4000-8000-000000000000");
+    let hidden_answer = |r: NamedNode| {
+        let e = evidence::propose(
+            None,
+            &ds,
+            &ds,
+            &EvidenceInput {
+                references: vec![EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key("sr"),
+                    occurrence_key: key("sr-unauth"),
+                    target: EvidenceRefTarget::Structured {
+                        revision: RecordRef::Existing(r.clone()),
+                        pointer: "/a~1b/m~0n/1".into(),
+                        method: json_method(),
+                        value_digest: sha("1.000"),
+                    },
+                }],
+                ..Default::default()
+            },
+            &options(),
+            &mut |_, _| limited(),
+            &Control::none(),
+        )
+        .unwrap_err();
+        (
+            e.code().to_string(),
+            e.to_string().replace(r.as_str(), "REV"),
+        )
+    };
+    let hidden = hidden_answer(json_rev.clone());
+    let missing = hidden_answer(missing_iri);
+    assert_eq!(hidden.0, "evidence-unavailable");
+    assert_eq!(hidden, missing);
+
+    // Large (~4 MiB) existing retained JSON revision verifies cleanly within the 64 MiB
+    // allowance, including after compaction into the base vocabulary.
+    let big_val = "a".repeat(4 * 1024 * 1024 - 32);
+    let big_json = format!(r#"{{"tail":"ok","blob":"{big_val}"}}"#);
+    let big_seed = propose(
+        &ds,
+        &EvidenceInput {
+            revisions: vec![SourceRevisionInput {
+                version: RecordVersion::V1,
+                key: key("big-rev"),
+                source: iri("urn:advisory:big"),
+                source_key: key("adv-big"),
+                upstream_version: None,
+                content: SourceContent::Retained {
+                    bytes: big_json.as_bytes().to_vec(),
+                    expected_digest: None,
+                },
+                metadata: Default::default(),
+                times: Default::default(),
+                lineage: Default::default(),
+            }],
+            ..Default::default()
+        },
+        &options(),
+    )
+    .unwrap();
+    let big_rev = iri_of(&big_seed, "big-rev");
+    ds.store().compact().unwrap();
+    let big_ref = propose(
+        &ds,
+        &EvidenceInput {
+            references: vec![EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("big-tail"),
+                occurrence_key: key("big-tail"),
+                target: EvidenceRefTarget::Structured {
+                    revision: RecordRef::Existing(big_rev),
+                    pointer: "/tail".into(),
+                    method: json_method(),
+                    value_digest: sha("\"ok\""),
+                },
+            }],
+            ..Default::default()
+        },
+        &options(),
+    )
+    .unwrap();
+    assert!(big_ref.committed);
+
+    // Detached and re-protected source graph refuses with origin-not-reproduced.
+    evidence::detach(&ds, SOURCES).unwrap();
+    configured(&ds);
+    assert_eq!(
+        code(structured_attempt(
+            RecordRef::Existing(json_rev),
+            "/a~1b/m~0n/1",
+            json_method(),
+            sha("1.000"),
+        )),
+        "origin-not-reproduced"
+    );
+}

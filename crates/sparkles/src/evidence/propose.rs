@@ -23,7 +23,7 @@
 //! passed, which every published proposal runs, and a retry with the same idempotency
 //! key acquires the same hold again.
 
-use super::resolve::{Reference, Resolution};
+use super::resolve::{ProposedPassage, ProposedStructured, Reference, Resolution, unavailable};
 use crate::access::GraphAccess;
 use crate::managed::{ManagedError, ManagedErrorKind, OwnerKind};
 use crate::task::Control;
@@ -34,9 +34,10 @@ use sparkles_core::evidence::write::{
     self, ExistingRecord, Plan, ProposalOptions, ProtectedGraph, Reads, Stamp,
 };
 use sparkles_core::evidence::{
-    EvidenceInput, EvidenceRefTarget, RecordKind, RecordRef, RenditionContent,
-    ResolutionRequirement, Settings, Sha256Digest,
+    EvidenceInput, EvidenceRefTarget, JSON_LEXICAL_UTF8_V1, JSON_LEXICAL_UTF8_VERSION, RecordKind,
+    RecordRef, RenditionContent, ResolutionRequirement, Settings, Sha256Digest,
 };
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -341,25 +342,42 @@ fn replay(
     })
 }
 
-/// The references a proposal must resolve, and a refusal of a requirement this build
-/// cannot verify.
-fn references(
+/// Verify every requirement of a proposal under one shared [`Resolution`] (64 MiB
+/// preparation allowance, request deadline and cancellation) through the caller's read
+/// access before any source hold is acquired or commit is written.
+#[allow(clippy::too_many_arguments)]
+fn verify_requirements(
+    catalog: Option<&Catalog>,
+    main: &Dataset,
+    logical: &Dataset,
     input: &EvidenceInput,
     plan: &Plan,
     requirements: &[ResolutionRequirement],
-) -> Result<Vec<(String, Reference)>> {
-    let minted = |key: &str| plan.records.iter().find(|r| r.key == key).map(|r| &r.iri);
-    let resolve = |r: &RecordRef| match r {
-        RecordRef::Local(k) => minted(k.as_str()).cloned(),
-        RecordRef::Existing(iri) => Some(iri.clone()),
-    };
-    let unverifiable = |key: &str, what: &str| {
-        managed(
-            ManagedErrorKind::IncompleteEvidence,
-            format!("{key}: {what} cannot be verified by this build, so nothing was written"),
-        )
-    };
-    let mut out: Vec<(String, Reference)> = Vec::new();
+    read: &mut dyn FnMut(&Dataset, &str) -> Option<Arc<GraphAccess>>,
+    control: &Control,
+) -> Result<()> {
+    if requirements.is_empty() {
+        return Ok(());
+    }
+    fn resolve_ref<'a>(plan: &'a Plan, r: &'a RecordRef) -> Option<&'a NamedNode> {
+        match r {
+            RecordRef::Local(k) => plan
+                .records
+                .iter()
+                .find(|rec| rec.key == k.as_str())
+                .map(|rec| &rec.iri),
+            RecordRef::Existing(iri) => Some(iri),
+        }
+    }
+    let resolve = |r| resolve_ref(plan, r);
+    let mut refs: Vec<(String, Reference)> = Vec::new();
+    let mut passage_groups: Vec<(NamedNode, Vec<ProposedPassage<'_>>)> = Vec::new();
+    let mut passage_group_idx: BTreeMap<NamedNode, usize> = BTreeMap::new();
+    let mut queued_passages: BTreeSet<&str> = BTreeSet::new();
+    let mut passage_refs: Vec<(&str, &NamedNode, &NamedNode, &NamedNode)> = Vec::new();
+    let mut structured_groups: Vec<(NamedNode, Vec<ProposedStructured<'_>>)> = Vec::new();
+    let mut structured_group_idx: BTreeMap<NamedNode, usize> = BTreeMap::new();
+    let mut local_checks: Vec<Result<()>> = Vec::new();
     for requirement in requirements {
         match requirement {
             ResolutionRequirement::ExistingRecord {
@@ -368,7 +386,7 @@ fn references(
             } => {
                 // every use is resolved with its own kinds, and record IRIs never stand
                 // for the batch keys of other references
-                out.push((
+                refs.push((
                     record.as_str().to_string(),
                     Reference::Record(RecordRequest {
                         iri: record.clone(),
@@ -387,7 +405,7 @@ fn references(
                         _ => None,
                     })
                     .ok_or_else(|| Error::invalid(format!("{reference_key}: no stored fact")))?;
-                out.push((reference_key.clone(), Reference::StoredFact(fact)));
+                refs.push((reference_key.clone(), Reference::StoredFact(fact)));
             }
             ResolutionRequirement::PassageIdentity { passage_key } => {
                 let passage = input
@@ -395,21 +413,44 @@ fn references(
                     .iter()
                     .find(|p| p.key.as_str() == passage_key)
                     .ok_or_else(|| Error::invalid(format!("{passage_key}: no passage")))?;
-                let RecordRef::Local(rendition) = &passage.rendition else {
-                    return Err(unverifiable(
-                        passage_key,
-                        "a passage of an existing rendition",
-                    ));
-                };
-                let rendition = input
-                    .renditions
-                    .iter()
-                    .find(|r| r.key.as_str() == rendition.as_str())
-                    .ok_or_else(|| Error::invalid(format!("{passage_key}: no rendition")))?;
-                if resolve(&rendition.revision) != resolve(&passage.revision) {
-                    return Err(Error::invalid(format!(
-                        "{passage_key}: the passage and its rendition name different revisions"
-                    )));
+                match &passage.rendition {
+                    RecordRef::Local(rendition) => {
+                        let rendition = input
+                            .renditions
+                            .iter()
+                            .find(|r| r.key.as_str() == rendition.as_str())
+                            .ok_or_else(|| {
+                                Error::invalid(format!("{passage_key}: no rendition"))
+                            })?;
+                        if resolve(&rendition.revision) != resolve(&passage.revision) {
+                            local_checks.push(Err(Error::invalid(format!(
+                                "{passage_key}: the passage and its rendition name different revisions"
+                            ))));
+                        }
+                    }
+                    RecordRef::Existing(rendition) => {
+                        if queued_passages.insert(passage.key.as_str()) {
+                            let revision = resolve(&passage.revision).ok_or_else(|| {
+                                Error::invalid(format!("{passage_key}: no revision"))
+                            })?;
+                            let idx =
+                                *passage_group_idx
+                                    .entry(rendition.clone())
+                                    .or_insert_with(|| {
+                                        let i = passage_groups.len();
+                                        passage_groups.push((rendition.clone(), Vec::new()));
+                                        i
+                                    });
+                            passage_groups[idx].1.push(ProposedPassage {
+                                key: passage.key.as_str(),
+                                revision,
+                                start: passage.start,
+                                end: passage.end,
+                                text_digest: passage.text_digest,
+                                quote: passage.quote.as_deref(),
+                            });
+                        }
+                    }
                 }
             }
             ResolutionRequirement::RetainedPassage { passage_key } => {
@@ -418,18 +459,39 @@ fn references(
                     .iter()
                     .find(|p| p.key.as_str() == passage_key)
                     .ok_or_else(|| Error::invalid(format!("{passage_key}: no passage")))?;
-                let local_text = match &passage.rendition {
-                    RecordRef::Local(k) => input.renditions.iter().any(|r| {
-                        r.key.as_str() == k.as_str()
-                            && matches!(r.content, RenditionContent::NormalizedText(_))
-                    }),
-                    RecordRef::Existing(_) => false,
-                };
-                if !local_text {
-                    return Err(unverifiable(
-                        passage_key,
-                        "a passage of a rendition without normalized text in this batch",
-                    ));
+                match &passage.rendition {
+                    RecordRef::Local(k) => {
+                        let local_text = input.renditions.iter().any(|r| {
+                            r.key.as_str() == k.as_str()
+                                && matches!(r.content, RenditionContent::NormalizedText(_))
+                        });
+                        if !local_text {
+                            local_checks.push(Err(unavailable(passage_key)));
+                        }
+                    }
+                    RecordRef::Existing(rendition) => {
+                        if queued_passages.insert(passage.key.as_str()) {
+                            let revision = resolve(&passage.revision).ok_or_else(|| {
+                                Error::invalid(format!("{passage_key}: no revision"))
+                            })?;
+                            let idx =
+                                *passage_group_idx
+                                    .entry(rendition.clone())
+                                    .or_insert_with(|| {
+                                        let i = passage_groups.len();
+                                        passage_groups.push((rendition.clone(), Vec::new()));
+                                        i
+                                    });
+                            passage_groups[idx].1.push(ProposedPassage {
+                                key: passage.key.as_str(),
+                                revision,
+                                start: passage.start,
+                                end: passage.end,
+                                text_digest: passage.text_digest,
+                                quote: passage.quote.as_deref(),
+                            });
+                        }
+                    }
                 }
             }
             ResolutionRequirement::PassageReferenceIdentity { reference_key } => {
@@ -446,34 +508,141 @@ fn references(
                 else {
                     return Err(Error::invalid(format!("{reference_key}: no passage")));
                 };
-                let RecordRef::Local(passage) = passage else {
-                    return Err(unverifiable(
-                        reference_key,
-                        "a reference to an existing passage",
-                    ));
-                };
-                let passage = input
-                    .passages
-                    .iter()
-                    .find(|p| p.key.as_str() == passage.as_str())
-                    .ok_or_else(|| Error::invalid(format!("{reference_key}: no passage")))?;
-                if resolve(revision) != resolve(&passage.revision)
-                    || resolve(rendition) != resolve(&passage.rendition)
-                {
-                    return Err(Error::invalid(format!(
-                        "{reference_key}: the reference names another revision or rendition than its passage"
-                    )));
+                match passage {
+                    RecordRef::Local(p_key) => {
+                        let local_passage = input
+                            .passages
+                            .iter()
+                            .find(|p| p.key.as_str() == p_key.as_str())
+                            .ok_or_else(|| {
+                                Error::invalid(format!("{reference_key}: no passage"))
+                            })?;
+                        if resolve(revision) != resolve(&local_passage.revision)
+                            || resolve(rendition) != resolve(&local_passage.rendition)
+                        {
+                            local_checks.push(Err(Error::invalid(format!(
+                                "{reference_key}: the reference names another revision or rendition than its passage"
+                            ))));
+                        }
+                    }
+                    RecordRef::Existing(p_iri) => {
+                        let expected_rev = resolve(revision).ok_or_else(|| {
+                            Error::invalid(format!("{reference_key}: no revision"))
+                        })?;
+                        let expected_rend = resolve(rendition).ok_or_else(|| {
+                            Error::invalid(format!("{reference_key}: no rendition"))
+                        })?;
+                        passage_refs.push((
+                            reference.key.as_str(),
+                            p_iri,
+                            expected_rev,
+                            expected_rend,
+                        ));
+                    }
                 }
             }
             ResolutionRequirement::StructuredValue { reference_key } => {
-                return Err(unverifiable(
-                    reference_key,
-                    "a structured value outside a retained JSON revision of this batch",
-                ));
+                let reference = input
+                    .references
+                    .iter()
+                    .find(|r| r.key.as_str() == reference_key)
+                    .ok_or_else(|| Error::invalid(format!("{reference_key}: no reference")))?;
+                let EvidenceRefTarget::Structured {
+                    revision,
+                    pointer,
+                    method,
+                    value_digest,
+                } = &reference.target
+                else {
+                    return Err(Error::invalid(format!(
+                        "{reference_key}: no structured reference"
+                    )));
+                };
+                if method.method.as_str() != JSON_LEXICAL_UTF8_V1
+                    || method.version.as_str() != JSON_LEXICAL_UTF8_VERSION
+                {
+                    local_checks.push(Err(managed(
+                        ManagedErrorKind::IncompleteEvidence,
+                        format!(
+                            "{reference_key}: structured normalization method <{}> version `{}` is not supported by this build, so nothing was written",
+                            method.method.as_str(),
+                            method.version.as_str()
+                        ),
+                    )));
+                    continue;
+                }
+                match revision {
+                    RecordRef::Local(_) => {
+                        // A local retained revision was already verified by `prepare_input`;
+                        // a local metadata-only revision carries no retained bytes.
+                        local_checks.push(Err(unavailable(reference_key)));
+                    }
+                    RecordRef::Existing(rev_iri) => {
+                        let idx =
+                            *structured_group_idx
+                                .entry(rev_iri.clone())
+                                .or_insert_with(|| {
+                                    let i = structured_groups.len();
+                                    structured_groups.push((rev_iri.clone(), Vec::new()));
+                                    i
+                                });
+                        structured_groups[idx].1.push(ProposedStructured {
+                            key: reference.key.as_str(),
+                            pointer: pointer.as_str(),
+                            value_digest: *value_digest,
+                        });
+                    }
+                }
             }
         }
     }
-    Ok(out)
+    let mut resolution = Resolution::new(control.clone())?;
+    // Resolve every ExistingRecord and StoredFact first so missing or unauthorized
+    // records always answer identically as `evidence-unavailable` before any content
+    // or identity comparison runs.
+    if !refs.is_empty() {
+        resolution.all(catalog, main, logical, &refs, read)?;
+    }
+    for check in local_checks {
+        check?;
+    }
+    if !(passage_groups.is_empty() && passage_refs.is_empty() && structured_groups.is_empty()) {
+        let access = resolution.logical_access(main, logical, read)?;
+        for (rendition, passages) in &passage_groups {
+            resolution.verify_proposed_passages(
+                main,
+                logical,
+                access.clone(),
+                rendition,
+                passages,
+            )?;
+        }
+        let mut checked_passage_refs: BTreeSet<(&NamedNode, &NamedNode, &NamedNode)> =
+            BTreeSet::new();
+        for (ref_key, passage, expected_rev, expected_rend) in passage_refs {
+            if checked_passage_refs.insert((passage, expected_rev, expected_rend)) {
+                resolution.verify_passage_reference(
+                    ref_key,
+                    main,
+                    logical,
+                    access.clone(),
+                    passage,
+                    expected_rev,
+                    expected_rend,
+                )?;
+            }
+        }
+        for (revision, structured) in &structured_groups {
+            resolution.verify_structured_references(
+                main,
+                logical,
+                access.clone(),
+                revision,
+                structured,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Publish `input` as one commit of the evidence owner on `logical`, which is `main` or
@@ -599,12 +768,18 @@ pub fn propose(
             return replay(&plan, found, &mut reads, branch, hold);
         }
     }
-    // The caller's reads decide every reference, before anything is written.
-    let refs = references(input, &plan, prepared.requirements())?;
-    if !refs.is_empty() {
-        let mut resolution = Resolution::new(control.clone())?;
-        resolution.all(catalog, main, logical, &refs, read)?;
-    }
+    // The caller's reads decide every reference and existing-record selection before
+    // anything is held or written.
+    verify_requirements(
+        catalog,
+        main,
+        logical,
+        input,
+        &plan,
+        prepared.requirements(),
+        read,
+        control,
+    )?;
     // The hold is durable before the commit that records it.
     let commits: Vec<crate::branch::CommitRef> = plan
         .held

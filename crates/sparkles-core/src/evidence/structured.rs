@@ -13,7 +13,7 @@ pub const JSON_LEXICAL_UTF8_V1: &str = "urn:x-sparkles:evidence:normalization:js
 /// The encoding is identified by both its immutable method IRI and this version.
 pub const JSON_LEXICAL_UTF8_VERSION: &str = "1";
 
-const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+pub(super) const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 const CHUNK: usize = 64 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -42,14 +42,47 @@ pub(super) fn select_json_lexical_utf8_batch<'a>(
     pointers: &[&str],
     control: &Control,
 ) -> Result<Vec<SelectedJsonValue<'a>>> {
+    select_json_lexical_utf8_batch_limited(source, pointers, MEMORY_LIMIT, control)
+}
+
+/// [`select_json_lexical_utf8_batch`] bounded by `memory_limit` bytes.
+pub(super) fn select_json_lexical_utf8_batch_limited<'a>(
+    source: &'a str,
+    pointers: &[&str],
+    memory_limit: usize,
+    control: &Control,
+) -> Result<Vec<SelectedJsonValue<'a>>> {
+    let selected =
+        select_json_lexical_utf8_batch_optional(source, pointers, memory_limit, control)?;
+    selected
+        .into_iter()
+        .map(|value| {
+            value.ok_or_else(|| {
+                Error::invalid("span-mismatch: JSON Pointer does not select a retained value")
+            })
+        })
+        .collect()
+}
+
+/// Like [`select_json_lexical_utf8_batch_limited`], returning `None` at positions whose
+/// pointer does not select a value so callers can attribute a miss to its exact key.
+pub(super) fn select_json_lexical_utf8_batch_optional<'a>(
+    source: &'a str,
+    pointers: &[&str],
+    memory_limit: usize,
+    control: &Control,
+) -> Result<Vec<Option<SelectedJsonValue<'a>>>> {
     control.check()?;
     if pointers.is_empty() {
         return Ok(Vec::new());
     }
     input_bound(source.len())?;
-    let mut memory = Memory::new(pointers.iter().fold(source.len(), |total, pointer| {
-        total.saturating_add(pointer.len())
-    }))?;
+    let mut memory = Memory::new(
+        pointers.iter().fold(source.len(), |total, pointer| {
+            total.saturating_add(pointer.len())
+        }),
+        memory_limit,
+    )?;
     memory.add(
         pointers.len().saturating_mul(
             (std::mem::size_of::<SelectedJsonValue<'_>>()
@@ -120,11 +153,10 @@ pub(super) fn select_json_lexical_utf8_batch<'a>(
                 let mut digests = std::collections::BTreeMap::new();
                 for range in selected {
                     control.check()?;
-                    let (start, end) = range.ok_or_else(|| {
-                        Error::invalid(
-                            "span-mismatch: JSON Pointer does not select a retained value",
-                        )
-                    })?;
+                    let Some((start, end)) = range else {
+                        values.push(None);
+                        continue;
+                    };
                     let utf8 = &source[start..end];
                     let digest = match digests.entry((start, end)) {
                         std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
@@ -133,7 +165,7 @@ pub(super) fn select_json_lexical_utf8_batch<'a>(
                             *entry.insert(Sha256Digest::of_bytes(utf8.as_bytes(), control)?)
                         }
                     };
-                    values.push(SelectedJsonValue { utf8, digest });
+                    values.push(Some(SelectedJsonValue { utf8, digest }));
                 }
                 return Ok(values);
             };
@@ -395,8 +427,9 @@ fn decode_string(raw: &str, memory: &mut Memory, control: &Control) -> Result<St
     // before allocating, then retain only the actual string and tree-node bound.
     let temporary = raw.len().saturating_mul(4).saturating_add(96);
     memory.add(temporary)?;
-    let decoded: String = serde_json::from_str(raw)
-        .map_err(|_| Error::invalid("JSON strings require valid Unicode scalar values"))?;
+    let decoded: String = serde_json::from_str(raw).map_err(|_| {
+        Error::invalid("span-mismatch: JSON strings require valid Unicode scalar values")
+    })?;
     let retained = decoded.capacity().saturating_add(96);
     memory.remove(temporary);
     memory.add(retained)?;
@@ -404,27 +437,30 @@ fn decode_string(raw: &str, memory: &mut Memory, control: &Control) -> Result<St
     Ok(decoded)
 }
 
-struct Memory(usize);
+struct Memory {
+    used: usize,
+    limit: usize,
+}
 impl Memory {
-    fn new(bytes: usize) -> Result<Self> {
-        let mut memory = Self(0);
+    fn new(bytes: usize, limit: usize) -> Result<Self> {
+        let mut memory = Self { used: 0, limit };
         memory.add(bytes)?;
         Ok(memory)
     }
     fn add(&mut self, bytes: usize) -> Result<()> {
-        let requested = self.0.saturating_add(bytes);
-        if requested > MEMORY_LIMIT {
+        let requested = self.used.saturating_add(bytes);
+        if requested > self.limit {
             return Err(Error::BudgetExceeded(Budget {
                 kind: BudgetKind::Memory,
-                limit: MEMORY_LIMIT as u64,
+                limit: self.limit as u64,
                 requested: requested as u64,
             }));
         }
-        self.0 = requested;
+        self.used = requested;
         Ok(())
     }
     fn remove(&mut self, bytes: usize) {
-        self.0 = self.0.saturating_sub(bytes);
+        self.used = self.used.saturating_sub(bytes);
     }
 }
 
@@ -439,9 +475,9 @@ fn validate_json(source: &str, control: &Control) -> Result<()> {
     let mut nesting = nesting::Scanner::new(nesting::Syntax::Json, nesting::MAX_ELEMENTS);
     for chunk in source.as_bytes().chunks(CHUNK) {
         control.check()?;
-        nesting
-            .feed(chunk)
-            .map_err(|_| Error::invalid("JSON reference exceeds the nesting bound"))?;
+        nesting.feed(chunk).map_err(|_| {
+            Error::invalid("span-mismatch: JSON reference exceeds the nesting bound")
+        })?;
     }
     let mut reader = ControlledRead {
         bytes: source.as_bytes(),
@@ -456,7 +492,7 @@ fn validate_json(source: &str, control: &Control) -> Result<()> {
     if let Some(error) = reader.failure {
         return Err(error);
     }
-    parsed.map_err(|_| Error::invalid("invalid retained JSON revision"))?;
+    parsed.map_err(|_| Error::invalid("span-mismatch: invalid retained JSON revision"))?;
     control.check()
 }
 
@@ -707,13 +743,13 @@ mod tests {
         let values = select_json_lexical_utf8_batch(&source, &pointers, &Control::none()).unwrap();
         assert_eq!(values.len(), 2000);
         assert!(values.iter().all(|value| value.utf8 == "0"));
-        let mut once = Memory::new(0).unwrap();
+        let mut once = Memory::new(0, MEMORY_LIMIT).unwrap();
         let one = pointer_trie(&[&pointer], &mut once, &Control::none()).unwrap();
-        let mut repeated = Memory::new(0).unwrap();
+        let mut repeated = Memory::new(0, MEMORY_LIMIT).unwrap();
         let many = pointer_trie(&pointers, &mut repeated, &Control::none()).unwrap();
         assert_eq!(one.len(), 1025);
         assert_eq!(many.len(), one.len());
-        assert!(repeated.0 < once.0 + pointers.len() * 64);
+        assert!(repeated.used < once.used + pointers.len() * 64);
         let source = format!("{}0{}", "{\"é/x~\":".repeat(1024), "}".repeat(1024));
         let pointer = "/é~1x~0".repeat(1024);
         let values =
@@ -813,7 +849,7 @@ mod tests {
             select_json_lexical_utf8("{}", "", &control),
             Err(Error::Cancelled)
         ));
-        let mut memory = Memory::new(MEMORY_LIMIT).unwrap();
+        let mut memory = Memory::new(MEMORY_LIMIT, MEMORY_LIMIT).unwrap();
         assert!(matches!(
             memory.add(1),
             Err(Error::BudgetExceeded(Budget {

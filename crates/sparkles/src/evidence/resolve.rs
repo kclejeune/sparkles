@@ -12,8 +12,8 @@
 //! capability.
 
 pub use sparkles_core::evidence::resolve::{
-    MAX_REFERENCES, MEMORY_BYTES, Receipt, RecordRequest, VerifiedFact, VerifiedRecord,
-    VerifiedSpan, check_anchor, kind_iri, unavailable,
+    MAX_REFERENCES, MEMORY_BYTES, ProposedPassage, ProposedStructured, Receipt, RecordRequest,
+    VerifiedFact, VerifiedRecord, VerifiedSpan, check_anchor, kind_iri, unavailable,
 };
 pub use sparkles_core::evidence::{BlankAnchor, GraphIdentity, RecordKind, StoredFactRef};
 
@@ -21,6 +21,7 @@ use crate::access::GraphAccess;
 use crate::guard::WriteOptions;
 use crate::task::Control;
 use crate::{Catalog, Dataset, Result};
+use oxrdf::NamedNode;
 use sparkles_core::evidence::resolve::Resolver;
 use std::sync::Arc;
 
@@ -139,6 +140,86 @@ impl Resolution {
     ) -> Result<VerifiedRecord> {
         self.resolver
             .record(key, main.store(), logical.store(), access.as_ref(), request)
+    }
+
+    /// Resolve the caller's read access for `logical` (`main` or one of its listed
+    /// branches) by its current branch name.
+    pub(crate) fn logical_access(
+        &self,
+        main: &Dataset,
+        logical: &Dataset,
+        access: &mut dyn FnMut(&Dataset, &str) -> Option<Arc<GraphAccess>>,
+    ) -> Result<Option<Arc<GraphAccess>>> {
+        let branch = if logical.store().is_branch() {
+            main.store()
+                .listed_branch_name(logical.store().branch_id(), &self.options())?
+        } else {
+            Some(crate::branch::MAIN.to_string())
+        };
+        Ok(branch.as_deref().and_then(|name| access(main, name)))
+    }
+
+    /// Verify one or more proposed passages against an existing authenticated rendition
+    /// at the current state of `logical`.
+    pub fn verify_proposed_passages(
+        &mut self,
+        main: &Dataset,
+        logical: &Dataset,
+        access: Option<Arc<GraphAccess>>,
+        rendition: &NamedNode,
+        passages: &[ProposedPassage<'_>],
+    ) -> Result<()> {
+        self.resolver.verify_proposed_passages(
+            main.store(),
+            logical.store(),
+            access.as_ref(),
+            rendition,
+            passages,
+        )
+    }
+
+    /// Verify that an existing authenticated passage belongs to `expected_revision` and
+    /// `expected_rendition`, and that its own selector verifies against its rendition's
+    /// retained text.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_passage_reference(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: Option<Arc<GraphAccess>>,
+        passage: &NamedNode,
+        expected_revision: &NamedNode,
+        expected_rendition: &NamedNode,
+    ) -> Result<()> {
+        self.resolver.verify_passage_reference(
+            key,
+            main.store(),
+            logical.store(),
+            access.as_ref(),
+            passage,
+            expected_revision,
+            expected_rendition,
+        )
+    }
+
+    /// Verify one or more structured JSON Pointer references (`json-lexical-utf8:1`)
+    /// against an existing authenticated source revision's retained bytes.
+    pub fn verify_structured_references(
+        &mut self,
+        main: &Dataset,
+        logical: &Dataset,
+        access: Option<Arc<GraphAccess>>,
+        revision: &NamedNode,
+        references: &[ProposedStructured<'_>],
+    ) -> Result<()> {
+        self.resolver.verify_structured_references(
+            main.store(),
+            logical.store(),
+            access.as_ref(),
+            revision,
+            references,
+        )
     }
 
     /// Verify each reference in order, stopping at the first that does not verify.

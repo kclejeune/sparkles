@@ -837,3 +837,475 @@ async fn evidence_settings_reads_use_admin_middleware() {
         }
     }
 }
+
+#[tokio::test]
+async fn proposals_selecting_existing_records_verify_over_http() {
+    let s = proposal_server();
+    let ds = s.state.get("ev").unwrap();
+    let sha = |text: &str| {
+        sparkles::evidence::Sha256Digest::of_bytes(
+            text.as_bytes(),
+            &sparkles::task::Control::none(),
+        )
+        .unwrap()
+        .to_string()
+    };
+    let text = "naïve café release 1.2 is affected.";
+    let json_doc = r#"{"affected":["pkg-1","pkg-2"],"score":1.000}"#;
+    let plain_doc = "plain non-JSON bulletin";
+
+    // Seed revisions, a normalized-text rendition, a metadata-only revision, a plain-text
+    // revision, and an initial passage.
+    let seed = propose(
+        &s,
+        &b("evw"),
+        &serde_json::json!({
+            "revisions": [
+                {
+                    "key": "revText",
+                    "source": "urn:src:text",
+                    "sourceKey": "src-text",
+                    "content": {"text": text}
+                },
+                {
+                    "key": "revJson",
+                    "source": "urn:src:json",
+                    "sourceKey": "src-json",
+                    "content": {"text": json_doc}
+                },
+                {
+                    "key": "revPlain",
+                    "source": "urn:src:plain",
+                    "sourceKey": "src-plain",
+                    "content": {"text": plain_doc}
+                },
+                {
+                    "key": "revMeta",
+                    "source": "urn:src:meta",
+                    "sourceKey": "src-meta",
+                    "content": {"digest": sha(json_doc)}
+                }
+            ],
+            "renditions": [
+                {
+                    "key": "rendText",
+                    "revision": {"key": "revText"},
+                    "occurrenceKey": "rend-text",
+                    "conversion": {"method": "urn:method:identity", "version": "1"},
+                    "mediaType": "text/plain",
+                    "content": {"text": text}
+                }
+            ],
+            "passages": [
+                {
+                    "key": "pass1",
+                    "revision": {"key": "revText"},
+                    "rendition": {"key": "rendText"},
+                    "occurrenceKey": "pass-1",
+                    "start": 6,
+                    "end": 10,
+                    "textDigest": sha("café"),
+                    "quote": "café"
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(seed.status, StatusCode::OK, "{}", seed.text());
+    let find_iri = |r: &R, key: &str| {
+        r.json()["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rec| rec["key"] == key)
+            .unwrap()["iri"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let rev_text = find_iri(&seed, "revText");
+    let rev_json = find_iri(&seed, "revJson");
+    let rev_plain = find_iri(&seed, "revPlain");
+    let rev_meta = find_iri(&seed, "revMeta");
+    let rend_text = find_iri(&seed, "rendText");
+    let pass1 = find_iri(&seed, "pass1");
+
+    // 1. Propose a passage against the existing rendition: matching succeeds.
+    let ok_passage = propose(
+        &s,
+        &b("evw"),
+        &serde_json::json!({
+            "idempotencyKey": "http-existing-passage",
+            "passages": [{
+                "key": "p2",
+                "revision": {"iri": rev_text},
+                "rendition": {"iri": rend_text},
+                "occurrenceKey": "pass-2",
+                "start": 11,
+                "end": 22,
+                "textDigest": sha("release 1.2"),
+                "quote": "release 1.2"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(ok_passage.status, StatusCode::OK, "{}", ok_passage.text());
+    assert_eq!(ok_passage.json()["committed"], true);
+    // Replay returns identical receipt.
+    let replay_passage = propose(
+        &s,
+        &b("evw"),
+        &serde_json::json!({
+            "idempotencyKey": "http-existing-passage",
+            "passages": [{
+                "key": "p2",
+                "revision": {"iri": rev_text},
+                "rendition": {"iri": rend_text},
+                "occurrenceKey": "pass-2",
+                "start": 11,
+                "end": 22,
+                "textDigest": sha("release 1.2"),
+                "quote": "release 1.2"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(replay_passage.status, StatusCode::OK);
+    assert_eq!(replay_passage.json()["replayed"], true);
+    assert_eq!(
+        replay_passage.json()["records"],
+        ok_passage.json()["records"]
+    );
+
+    // Mismatched quote/span -> 422 span-mismatch; mismatched revision -> 400 invalid-proposal.
+    let bad_span = propose(
+        &s,
+        &b("evw"),
+        &serde_json::json!({
+            "passages": [{
+                "key": "p-bad",
+                "revision": {"iri": rev_text},
+                "rendition": {"iri": rend_text},
+                "occurrenceKey": "p-bad",
+                "start": 11,
+                "end": 22,
+                "textDigest": sha("release 1.2"),
+                "quote": "wrong quote"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        bad_span.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        bad_span.text()
+    );
+    assert_eq!(bad_span.json()["code"], "span-mismatch");
+
+    let bad_rev = propose(
+        &s,
+        &b("evw"),
+        &serde_json::json!({
+            "passages": [{
+                "key": "p-rev",
+                "revision": {"iri": rev_json},
+                "rendition": {"iri": rend_text},
+                "occurrenceKey": "p-rev",
+                "start": 11,
+                "end": 22,
+                "textDigest": sha("release 1.2"),
+                "quote": "release 1.2"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        bad_rev.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        bad_rev.text()
+    );
+    assert_eq!(bad_rev.json()["code"], "invalid-proposal");
+
+    // 2. Reference an existing passage: matching succeeds, mismatched revision -> 400,
+    // unauthorized evp gets identical 422 evidence-unavailable as for missing.
+    let ok_ref = propose(
+        &s,
+        &b("evw"),
+        &serde_json::json!({
+            "references": [{
+                "key": "refPass",
+                "occurrenceKey": "ref-pass-1",
+                "passage": {
+                    "revision": {"iri": rev_text},
+                    "rendition": {"iri": rend_text},
+                    "passage": {"iri": pass1}
+                }
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(ok_ref.status, StatusCode::OK, "{}", ok_ref.text());
+
+    let bad_pass_ref = propose(
+        &s,
+        &b("evw"),
+        &serde_json::json!({
+            "references": [{
+                "key": "refBad",
+                "occurrenceKey": "ref-bad",
+                "passage": {
+                    "revision": {"iri": rev_json},
+                    "rendition": {"iri": rend_text},
+                    "passage": {"iri": pass1}
+                }
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        bad_pass_ref.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        bad_pass_ref.text()
+    );
+    assert_eq!(bad_pass_ref.json()["code"], "invalid-proposal");
+
+    let missing_iri = "urn:uuid:00000000-0000-4000-8000-000000000000";
+    let unauth_pass_ref = |p_iri: &str| {
+        serde_json::json!({
+            "references": [{
+                "key": "refHidden",
+                "occurrenceKey": "ref-hidden",
+                "passage": {
+                    "revision": {"iri": rev_text},
+                    "rendition": {"iri": rend_text},
+                    "passage": {"iri": p_iri}
+                }
+            }]
+        })
+    };
+    let hidden_p = propose(&s, &b("evp"), &unauth_pass_ref(&pass1)).await;
+    let missing_p = propose(&s, &b("evp"), &unauth_pass_ref(missing_iri)).await;
+    assert_eq!(
+        hidden_p.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        hidden_p.text()
+    );
+    assert_eq!(hidden_p.json()["code"], "evidence-unavailable");
+    let scrub = |r: &R, iri: &str| {
+        let mut v = r.json();
+        v.as_object_mut().unwrap().remove("requestId");
+        serde_json::to_string(&v)
+            .unwrap()
+            .replace(&rev_text, "REV")
+            .replace(&rend_text, "REND")
+            .replace(iri, "TARGET")
+    };
+    assert_eq!(scrub(&hidden_p, &pass1), scrub(&missing_p, missing_iri));
+
+    // 3. Structured values against existing JSON, non-JSON, metadata-only and
+    // unauthorized revisions, plus unsupported normalization method.
+    let norm = serde_json::json!({
+        "method": sparkles::evidence::JSON_LEXICAL_UTF8_V1,
+        "version": sparkles::evidence::JSON_LEXICAL_UTF8_VERSION
+    });
+    let ok_struct = propose(
+        &s,
+        &b("evw"),
+        &serde_json::json!({
+            "references": [
+                {
+                    "key": "s1",
+                    "occurrenceKey": "s1",
+                    "structured": {
+                        "revision": {"iri": rev_json},
+                        "pointer": "/affected/1",
+                        "method": norm,
+                        "valueDigest": sha("\"pkg-2\"")
+                    }
+                },
+                {
+                    "key": "s2",
+                    "occurrenceKey": "s2",
+                    "structured": {
+                        "revision": {"iri": rev_json},
+                        "pointer": "/score",
+                        "method": norm,
+                        "valueDigest": sha("1.000")
+                    }
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(ok_struct.status, StatusCode::OK, "{}", ok_struct.text());
+
+    let head = ds.store.head_commit().seq;
+    // Wrong valueDigest -> 422 span-mismatch.
+    let bad_digest = propose(
+        &s,
+        &b("evw"),
+        &serde_json::json!({
+            "references": [{
+                "key": "s-bad",
+                "occurrenceKey": "s-bad",
+                "structured": {
+                    "revision": {"iri": rev_json},
+                    "pointer": "/score",
+                    "method": norm,
+                    "valueDigest": sha("1")
+                }
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        bad_digest.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        bad_digest.text()
+    );
+    assert_eq!(bad_digest.json()["code"], "span-mismatch");
+
+    // Existing non-JSON revision -> 422 span-mismatch.
+    let non_json = propose(
+        &s,
+        &b("evw"),
+        &serde_json::json!({
+            "references": [{
+                "key": "s-plain",
+                "occurrenceKey": "s-plain",
+                "structured": {
+                    "revision": {"iri": rev_plain},
+                    "pointer": "",
+                    "method": norm,
+                    "valueDigest": sha(plain_doc)
+                }
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        non_json.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        non_json.text()
+    );
+    assert_eq!(non_json.json()["code"], "span-mismatch");
+
+    // Existing metadata-only revision -> 422 evidence-unavailable.
+    let meta_only = propose(
+        &s,
+        &b("evw"),
+        &serde_json::json!({
+            "references": [{
+                "key": "s-meta",
+                "occurrenceKey": "s-meta",
+                "structured": {
+                    "revision": {"iri": rev_meta},
+                    "pointer": "/score",
+                    "method": norm,
+                    "valueDigest": sha("1.000")
+                }
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        meta_only.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        meta_only.text()
+    );
+    assert_eq!(meta_only.json()["code"], "evidence-unavailable");
+
+    // Unsupported normalization method -> 422 incomplete-evidence.
+    let unsupported = propose(
+        &s,
+        &b("evw"),
+        &serde_json::json!({
+            "references": [{
+                "key": "s-unsup",
+                "occurrenceKey": "s-unsup",
+                "structured": {
+                    "revision": {"iri": rev_json},
+                    "pointer": "/score",
+                    "method": {"method": "urn:example:custom-norm", "version": "1"},
+                    "valueDigest": sha("1.000")
+                }
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        unsupported.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        unsupported.text()
+    );
+    assert_eq!(unsupported.json()["code"], "incomplete-evidence");
+
+    // Unauthorized caller on existing JSON revision matches missing byte for byte.
+    let unauth_struct = |r_iri: &str| {
+        serde_json::json!({
+            "references": [{
+                "key": "s-unauth",
+                "occurrenceKey": "s-unauth",
+                "structured": {
+                    "revision": {"iri": r_iri},
+                    "pointer": "/score",
+                    "method": norm,
+                    "valueDigest": sha("1.000")
+                }
+            }]
+        })
+    };
+    let hidden_s = propose(&s, &b("evp"), &unauth_struct(&rev_json)).await;
+    let missing_s = propose(&s, &b("evp"), &unauth_struct(missing_iri)).await;
+    assert_eq!(
+        hidden_s.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        hidden_s.text()
+    );
+    assert_eq!(hidden_s.json()["code"], "evidence-unavailable");
+    assert_eq!(scrub(&hidden_s, &rev_json), scrub(&missing_s, missing_iri));
+    assert_eq!(ds.store.head_commit().seq, head);
+
+    // Detaching and re-protecting invalidates the existing passage -> 422 origin-not-reproduced.
+    sparkles::evidence::detach(&ds.dataset, "urn:ev:sources").unwrap();
+    let settings = sparkles::evidence::Settings {
+        enabled: true,
+        source_records: vec!["urn:ev:sources".into()],
+        proposals: vec!["urn:ev:claims".into()],
+        ..Default::default()
+    };
+    sparkles::evidence::configure(&ds.dataset, &settings, &sparkles::task::Control::none())
+        .unwrap();
+    let stale_pass = propose(
+        &s,
+        &b("evw"),
+        &serde_json::json!({
+            "references": [{
+                "key": "refStale",
+                "occurrenceKey": "ref-stale",
+                "passage": {
+                    "revision": {"iri": rev_text},
+                    "rendition": {"iri": rend_text},
+                    "passage": {"iri": pass1}
+                }
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        stale_pass.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        stale_pass.text()
+    );
+    assert_eq!(stale_pass.json()["code"], "origin-not-reproduced");
+}

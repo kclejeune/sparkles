@@ -617,3 +617,328 @@ fn static_graph_denials_hold_under_an_undecided_guard() {
         "incomplete-evidence"
     );
 }
+
+/// Helper: configure an in-memory store with evidence source/proposal graphs and insert
+/// authenticated records signed with the current graph protection nonce.
+fn configured_evidence_store() -> (Store, Uuid) {
+    let s = Store::in_memory(StoreOptions::default());
+    let settings = super::super::Settings {
+        enabled: true,
+        source_records: vec!["urn:ev:sources".into()],
+        proposals: vec!["urn:ev:claims".into()],
+        ..Default::default()
+    };
+    let canonical = settings.canonical(&Control::none()).unwrap();
+    let entry = crate::managed::OwnerEntry::for_settings(
+        settings.profile,
+        settings.managed_graphs(),
+        canonical.bytes(),
+    );
+    let graphs = s
+        .enable_managed_at(OwnerKind::Evidence, entry, canonical.bytes(), 0)
+        .unwrap();
+    let nonce = graphs.owners[&OwnerKind::Evidence].protections["urn:ev:sources"];
+    (s, nonce)
+}
+
+fn insert_managed_quads(s: &Store, quads: Vec<oxrdf::Quad>) {
+    let cap = s
+        .managed_writer(OwnerKind::Evidence, Uuid::new_v4())
+        .unwrap();
+    let mut txn = s
+        .try_write_with(crate::commit::CommitKind::Transaction, Default::default())
+        .unwrap();
+    txn.set_managed(cap).unwrap();
+    let mut labels = std::collections::HashMap::new();
+    for q in &quads {
+        let ids = txn.encode_quad(q, &mut labels).unwrap();
+        txn.insert(ids).unwrap();
+    }
+    txn.commit().unwrap();
+}
+
+#[test]
+fn existing_record_verifiers_enforce_memory_cancellation_and_triple_masks() {
+    let (s, nonce) = configured_evidence_store();
+    let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
+    let op = iri("urn:op:1");
+    let rev = iri("urn:rev:1");
+    let rend = iri("urn:rend:1");
+    let pass = iri("urn:pass:1");
+    let json_bytes = format!(r#"{{"payload":"{}"}}"#, "x".repeat(4096));
+    let json_digest = Sha256Digest::of_bytes(json_bytes.as_bytes(), &Control::none()).unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(json_bytes.as_bytes());
+    let rend_text = "alpha café beta".repeat(256);
+    let selected: String = rend_text.chars().skip(6).take(4).collect();
+    assert_eq!(selected, "café");
+    let span_digest = Sha256Digest::of_bytes(selected.as_bytes(), &Control::none()).unwrap();
+    let q =
+        |sub: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(sub.clone(), iri(p), o, sg.clone());
+    let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+    let int_lit =
+        |n: u64| Term::Literal(Literal::new_typed_literal(n.to_string(), iri(XSD_INTEGER)));
+    let sel = iri("urn:pass:1#selector");
+    insert_managed_quads(
+        &s,
+        vec![
+            q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+            q(
+                &op,
+                &format!("{EV}datasetId"),
+                lit(&s.dataset_id().to_string()),
+            ),
+            q(
+                &op,
+                &format!("{EV}branchId"),
+                lit(&s.branch_id().to_string()),
+            ),
+            q(&op, &format!("{EV}commit"), int_lit(1)),
+            q(
+                &op,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            // SourceRevision with retained JSON bytes
+            q(
+                &rev,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(&rev, &format!("{EV}availabilityReceipt"), op.clone().into()),
+            q(
+                &rev,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev,
+                &format!("{EV}contentDigest"),
+                lit(&json_digest.to_string()),
+            ),
+            q(
+                &rev,
+                &format!("{EV}retainedBytes"),
+                Term::Literal(Literal::new_typed_literal(b64, iri(XSD_BASE64_BINARY))),
+            ),
+            // Rendition with normalizedText
+            q(&rend, RDF_TYPE, iri(kind_iri(RecordKind::Rendition)).into()),
+            q(
+                &rend,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rend,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&rend, PROV_WAS_DERIVED_FROM, rev.clone().into()),
+            q(&rend, &format!("{EV}normalizedText"), lit(&rend_text)),
+            // Passage referencing rend and rev
+            q(&pass, RDF_TYPE, iri(kind_iri(RecordKind::Passage)).into()),
+            q(
+                &pass,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &pass,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&pass, &format!("{EV}sourceRevision"), rev.clone().into()),
+            q(&pass, &format!("{OA}hasSource"), rend.clone().into()),
+            q(&pass, &format!("{OA}hasSelector"), sel.clone().into()),
+            q(&sel, &format!("{OA}start"), int_lit(6)),
+            q(&sel, &format!("{OA}end"), int_lit(10)),
+            q(
+                &pass,
+                &format!("{EV}textDigest"),
+                lit(&span_digest.to_string()),
+            ),
+        ],
+    );
+
+    let val_digest = Sha256Digest::of_bytes(
+        format!(r#""{}""#, "x".repeat(4096)).as_bytes(),
+        &Control::none(),
+    )
+    .unwrap();
+
+    // Baseline verification succeeds in both Delta and compacted Vocab states.
+    for compacted in [false, true] {
+        if compacted {
+            s.compact().unwrap();
+        }
+        let mut r = resolver();
+        r.verify_proposed_passages(
+            &s,
+            &s,
+            Some(&all()),
+            &rend,
+            &[ProposedPassage {
+                key: "p1",
+                revision: &rev,
+                start: 6,
+                end: 10,
+                text_digest: span_digest,
+                quote: Some("café"),
+            }],
+        )
+        .unwrap();
+        r.verify_passage_reference("ref1", &s, &s, Some(&all()), &pass, &rev, &rend)
+            .unwrap();
+        r.verify_structured_references(
+            &s,
+            &s,
+            Some(&all()),
+            &rev,
+            &[ProposedStructured {
+                key: "s1",
+                pointer: "/payload",
+                value_digest: val_digest,
+            }],
+        )
+        .unwrap();
+    }
+
+    // Tight memory allowance refuses with incomplete-evidence (not unavailable).
+    let mut tight = Resolver::new(Control::none(), 16 * 1024).unwrap();
+    assert_eq!(
+        code(tight.verify_structured_references(
+            &s,
+            &s,
+            Some(&all()),
+            &rev,
+            &[ProposedStructured {
+                key: "s1",
+                pointer: "/payload",
+                value_digest: val_digest,
+            }],
+        )),
+        "incomplete-evidence"
+    );
+    let mut tight_p = Resolver::new(Control::none(), 12 * 1024).unwrap();
+    assert_eq!(
+        code(tight_p.verify_proposed_passages(
+            &s,
+            &s,
+            Some(&all()),
+            &rend,
+            &[ProposedPassage {
+                key: "p1",
+                revision: &rev,
+                start: 6,
+                end: 10,
+                text_digest: span_digest,
+                quote: Some("café"),
+            }],
+        )),
+        "incomplete-evidence"
+    );
+
+    // Cancellation propagates Error::Cancelled.
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut cancelled = Resolver::new(Control::with_cancel(flag.clone()), MEMORY_BYTES).unwrap();
+    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(matches!(
+        cancelled.verify_structured_references(
+            &s,
+            &s,
+            Some(&all()),
+            &rev,
+            &[ProposedStructured {
+                key: "s1",
+                pointer: "/payload",
+                value_digest: val_digest,
+            }],
+        ),
+        Err(Error::Cancelled)
+    ));
+
+    // Triple-level protections hiding retainedBytes, normalizedText, or sourceRevision
+    // answer identically with evidence-unavailable.
+    let hide_pred = |pred: &str| {
+        let protection = Protection {
+            name: "hidden".into(),
+            predicates: Some(vec![pred.to_string()]),
+            classes: None,
+            subclasses: false,
+            graphs: None,
+            pattern: None,
+            prefixes: Default::default(),
+            hide_inferences: false,
+        };
+        let rules = TripleRules {
+            rules: vec![Rule {
+                protection: Arc::new(protection),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Default::default(),
+            limits: Default::default(),
+        };
+        Arc::new(GraphAccess::with_triples(Graphs::All, Graphs::All, rules))
+    };
+    let mut r = resolver();
+    assert_eq!(
+        code(r.verify_structured_references(
+            &s,
+            &s,
+            Some(&hide_pred(&format!("{EV}retainedBytes"))),
+            &rev,
+            &[ProposedStructured {
+                key: "s1",
+                pointer: "/payload",
+                value_digest: val_digest,
+            }],
+        )),
+        "evidence-unavailable"
+    );
+    assert_eq!(
+        code(r.verify_proposed_passages(
+            &s,
+            &s,
+            Some(&hide_pred(&format!("{EV}normalizedText"))),
+            &rend,
+            &[ProposedPassage {
+                key: "p1",
+                revision: &rev,
+                start: 6,
+                end: 10,
+                text_digest: span_digest,
+                quote: Some("café"),
+            }],
+        )),
+        "evidence-unavailable"
+    );
+    assert_eq!(
+        code(r.verify_proposed_passages(
+            &s,
+            &s,
+            Some(&hide_pred(PROV_WAS_DERIVED_FROM)),
+            &rend,
+            &[ProposedPassage {
+                key: "p1",
+                revision: &rev,
+                start: 6,
+                end: 10,
+                text_digest: span_digest,
+                quote: Some("café"),
+            }],
+        )),
+        "evidence-unavailable"
+    );
+    assert_eq!(
+        code(r.verify_passage_reference(
+            "ref1",
+            &s,
+            &s,
+            Some(&hide_pred(&format!("{EV}sourceRevision"))),
+            &pass,
+            &rev,
+            &rend,
+        )),
+        "evidence-unavailable"
+    );
+}
