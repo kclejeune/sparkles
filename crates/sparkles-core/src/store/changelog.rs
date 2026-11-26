@@ -67,7 +67,7 @@ use super::diff::{Keys, QuadKey};
 use super::*;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Weak;
 use std::time::{Duration, Instant};
 
@@ -1091,6 +1091,9 @@ pub struct ChangeLogStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
+
+/// `(author, message)` metadata recorded for one commit in the change log.
+pub type CommitChangeMeta = (Option<Arc<str>>, Option<Arc<str>>);
 
 impl ChangeLog {
     pub(super) fn read_only_through(&self) -> Option<u64> {
@@ -2177,6 +2180,69 @@ impl ChangeLog {
         Ok(())
     }
 
+    /// Read only the commit metadata `(author, message)` for the requested commit
+    /// sequence numbers without decoding term tables or quad changes. Flushes pending
+    /// queued entries first so recent commits are visible immediately, and covers both
+    /// change records (including 0-quad commits) and summary-only bulk commits.
+    pub(crate) fn commit_metas(&self, seqs: &[u64]) -> Result<HashMap<u64, CommitChangeMeta>> {
+        let mut out = HashMap::new();
+        if seqs.is_empty() || !self.is_enabled() || self.readonly.is_some() {
+            return Ok(out);
+        }
+        self.flush(false)?;
+        let mut wanted: Vec<u64> = seqs.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+
+        let mut inner = self.inner.lock();
+        let seg_count = inner.segs.len();
+        let mut wi = 0usize;
+        for seg_idx in 0..seg_count {
+            while wi < wanted.len() && wanted[wi] < inner.segs[seg_idx].first {
+                wi += 1;
+            }
+            if wi >= wanted.len() {
+                break;
+            }
+            let seg_last = inner.segs[seg_idx].last;
+            if wanted[wi] > seg_last {
+                continue;
+            }
+            let start_wi = wi;
+            while wi < wanted.len() && wanted[wi] <= seg_last {
+                wi += 1;
+            }
+            let ix = self.index(&mut inner, seg_idx)?;
+            let seg = &inner.segs[seg_idx];
+            let file = match &seg.path {
+                Some(path) => Some(File::open(path)?),
+                None => None,
+            };
+            for &seq in &wanted[start_wi..wi] {
+                let pos = ix.recs.partition_point(|r| r.seq < seq);
+                let Some(rec) = ix.recs.get(pos) else {
+                    continue;
+                };
+                if rec.seq != seq {
+                    continue;
+                }
+                if matches!(rec.hole, Some((_, UnrecordedReason::Gap))) {
+                    continue;
+                }
+                let meta = match (&file, &seg.mem) {
+                    (Some(f), _) => read_record_meta_from_file(f, rec.offset)?,
+                    (None, mem) => read_record_meta_from_mem(mem, rec.offset as usize),
+                };
+                if let Some(m) = meta
+                    && (m.author.is_some() || m.message.is_some())
+                {
+                    out.insert(seq, (m.author, m.message));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The bytes on disk (or in memory).
     pub fn bytes(&self) -> u64 {
         if let Some(reader) = &self.readonly {
@@ -2206,6 +2272,49 @@ impl Inner {
 fn sorted(mut v: Vec<(QuadKey, bool)>) -> Vec<(bool, QuadKey)> {
     v.sort_unstable_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
     v.into_iter().map(|(k, add)| (add, k)).collect()
+}
+
+fn decode_record_meta_prefix(prefix: &[u8]) -> Option<ChangeCommit> {
+    let mut c = Cur { b: prefix, i: 0 };
+    let ty = c.u8()?;
+    let seq = c.u64()?;
+    match ty {
+        REC_CHANGES | REC_SUMMARY => decode_meta(&mut c, seq),
+        _ => None,
+    }
+}
+
+fn read_record_meta_from_mem(mem: &[u8], offset: usize) -> Option<ChangeCommit> {
+    let header = mem.get(offset..offset.checked_add(8)?)?;
+    let len = u32::from_le_bytes(header[0..4].try_into().ok()?) as usize;
+    let body = mem.get(offset + 8..offset.checked_add(8)?.checked_add(len)?)?;
+    decode_record_meta_prefix(body)
+}
+
+fn read_record_meta_from_file(f: &File, offset: u64) -> Result<Option<ChangeCommit>> {
+    const INITIAL_PREFIX: usize = 4096;
+    const MAX_META_PREFIX: usize = 1 << 20;
+    let mut h = [0u8; 8];
+    read_exact_at(f, &mut h, offset)?;
+    let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
+    if len == 0 {
+        return Ok(None);
+    }
+    let first_read = len.min(INITIAL_PREFIX);
+    let mut buf = vec![0u8; first_read];
+    read_exact_at(f, &mut buf, offset + 8)?;
+    if let Some(meta) = decode_record_meta_prefix(&buf) {
+        return Ok(Some(meta));
+    }
+    // Only retry with a larger prefix if the record is larger than INITIAL_PREFIX and
+    // starts with a metadata-bearing record type (e.g. a very long commit message).
+    if len > first_read && matches!(buf.first().copied(), Some(REC_CHANGES | REC_SUMMARY)) {
+        let cap = len.min(MAX_META_PREFIX);
+        buf.resize(cap, 0);
+        read_exact_at(f, &mut buf[first_read..], offset + 8 + first_read as u64)?;
+        return Ok(decode_record_meta_prefix(&buf));
+    }
+    Ok(None)
 }
 
 /// Write a file through a temporary one, durably.
@@ -2513,6 +2622,17 @@ impl Store {
     /// does this on its own shortly after each commit).
     pub fn flush_change_log(&self) -> Result<()> {
         self.sync_change_log()
+    }
+
+    /// Read `(author, message)` commit metadata for the given `seqs` from this store's
+    /// change log without decoding quad changes. Flushes pending queued entries first so
+    /// recent writes are immediately visible.
+    pub fn commit_change_metas(&self, seqs: &[u64]) -> Result<HashMap<u64, CommitChangeMeta>> {
+        crate::sparql::extensions::check_family(self.owner_dataset_id())?;
+        match &self.changelog {
+            Some(log) if log.is_enabled() => log.commit_metas(seqs),
+            _ => Ok(HashMap::new()),
+        }
     }
 
     /// Append what is queued and sync, before the generation whose write-ahead log holds

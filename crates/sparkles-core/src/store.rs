@@ -122,7 +122,7 @@ pub use branching::{
 };
 pub use changelog::{
     CHANGE_LOG_FILE, CHANGES_DIR, ChangeCommit, ChangeLog, ChangeLogSettings, ChangeLogStatus,
-    Unrecorded, UnrecordedReason,
+    CommitChangeMeta, Unrecorded, UnrecordedReason,
 };
 pub use changes::{ChangePage, ChangesOptions, CommitChanges};
 pub use clone::{CloneMethod, CloneMode, CloneOptions, CloneReport};

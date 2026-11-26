@@ -50,8 +50,9 @@ impl Dataset {
             .branch(name)?
             .shared()
             .expect("non-main branch");
-        let ds = Dataset::from_shared(
+        let ds = Dataset::from_shared_with_owner(
             store,
+            self.state_reference(),
             crate::DatasetOptions {
                 store: self.store().options().clone(),
                 name: self.name().map(str::to_string),

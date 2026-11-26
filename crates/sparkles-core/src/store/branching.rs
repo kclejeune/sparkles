@@ -3085,6 +3085,20 @@ impl Store {
         Ok(out)
     }
 
+    /// Read `(author, message)` commit metadata for `seqs` from the change log of branch
+    /// `branch_id` (covering `main`, listed branches, and retired ancestor branches).
+    pub fn branch_commit_change_metas(
+        &self,
+        branch_id: uuid::Uuid,
+        seqs: &[u64],
+    ) -> Result<HashMap<u64, super::changelog::CommitChangeMeta>> {
+        if seqs.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let store = self.branch_by_id(branch_id)?;
+        store.commit_change_metas(seqs)
+    }
+
     /// The state of branch `name` at `at`, following the branch's history into its
     /// upstream for commits it shares with it.
     pub fn branch_snapshot_at(
