@@ -1550,4 +1550,52 @@ async fn evidence_reauthenticate_http_route_and_openapi_contract() {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{j}");
     }
+
+    // Local preparation budget exhaustion during whole-graph discovery must return
+    // HTTP 422 `incomplete-evidence` (never HTTP 507 Insufficient Storage).
+    {
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/$/evidence/d/detach",
+            Some("application/json"),
+            &json!({ "graph": "urn:ev:claims" }).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        {
+            let ds = state.datasets().remove("d").unwrap();
+            let mut t = ds.dataset.store().write();
+            let mut labels = std::collections::HashMap::new();
+            let gn = oxrdf::GraphName::NamedNode(oxrdf::NamedNode::new_unchecked("urn:ev:claims"));
+            let rdf_type =
+                oxrdf::NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+            let claim_cls = oxrdf::NamedNode::new_unchecked("urn:x-sparkles:evidence:Claim");
+            // 520 subjects x ~132 KiB IRI ≈ 68 MiB > 64 MiB local preparation budget.
+            let pad = "a".repeat(132 * 1024);
+            for i in 0..520 {
+                let subj = oxrdf::NamedNode::new_unchecked(format!("urn:long:{i}:{pad}"));
+                let q = oxrdf::Quad::new(subj, rdf_type.clone(), claim_cls.clone(), gn.clone());
+                let ids = t.encode_quad(&q, &mut labels).unwrap();
+                t.insert(ids).unwrap();
+            }
+            t.commit().unwrap();
+        }
+        let (status, _) = call(
+            &app,
+            "PUT",
+            "/$/evidence/d/settings",
+            Some("application/json"),
+            &settings.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, budget_err) = post(
+            "/$/evidence/d/reauthenticate",
+            json!({ "graph": "urn:ev:claims" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{budget_err}");
+        assert_eq!(budget_err["code"], "incomplete-evidence");
+    }
 }

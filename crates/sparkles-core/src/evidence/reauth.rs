@@ -21,7 +21,7 @@ use super::structured::select_json_lexical_utf8_prepared;
 use super::write::{Reads, Stamp, date_time, ev, no_blank, prov, rdf_type, record_digest, string};
 use super::{JSON_LEXICAL_UTF8_V1, JSON_LEXICAL_UTF8_VERSION, RecordKind, Sha256Digest};
 use crate::access::{Preparation, Reservation};
-use crate::history::At;
+use crate::error::BudgetKind;
 use crate::id::Id;
 use crate::index::Perm;
 use crate::managed::{ManagedError, ManagedErrorKind, OwnerKind};
@@ -32,7 +32,7 @@ use base64::Engine as _;
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term, Triple, vocab::xsd};
 use oxsdatatypes::DateTime;
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::Read as _;
 use uuid::Uuid;
 
@@ -130,16 +130,20 @@ impl PublicationViews {
         Self::default()
     }
 
-    fn open_view(
+    fn open_publication_view(
         main: &Store,
-        branch_store: &Store,
+        logical: &Store,
+        logical_head: u64,
+        receipt_branch: Uuid,
         commit: u64,
         preparation: &Preparation,
         label: &str,
     ) -> Result<BoundEvidenceView> {
-        let view = match main.evidence_view_with_branch(
-            branch_store,
-            &At::Commit(commit),
+        let view = match main.publication_evidence_view(
+            logical,
+            logical_head,
+            receipt_branch,
+            commit,
             preparation,
         ) {
             Ok(view) => view,
@@ -149,13 +153,13 @@ impl PublicationViews {
                 return Err(Error::Managed(m));
             }
             Err(e @ (Error::BudgetExceeded(_) | Error::Unsupported(_))) => {
-                return Err(classify(label, e));
+                return Err(classify_error(label, e));
             }
             Err(_) => {
                 return Err(managed(
                     ManagedErrorKind::OriginNotReproduced,
                     format!(
-                        "{label}: publication commit {commit} is not a retained, configuration-bound commit of this branch"
+                        "{label}: publication commit {commit} on branch {receipt_branch} is not a retained, configuration-bound commit in this branch's lineage"
                     ),
                 ));
             }
@@ -169,10 +173,12 @@ impl PublicationViews {
         Ok(view)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn get_or_open(
         &mut self,
         main: &Store,
         logical: &Store,
+        logical_head: u64,
         receipt_branch: Uuid,
         commit: u64,
         preparation: &Preparation,
@@ -187,31 +193,15 @@ impl PublicationViews {
         {
             self.views.remove(&evict);
         }
-        let logical_view = Self::open_view(main, logical, commit, preparation, label)?;
-        // When `logical` is a branch forked from `main` after a detach/re-protect at the
-        // exact fork commit (`from.seq`), `logical`'s root origin records the fork-time
-        // Head configuration rather than `main`'s original publication configuration.
-        // Verify `logical` genuinely shares commit `commit` with `main` (same timestamp
-        // and sequence) and read the original protection configuration from `main`.
-        let view = if receipt_branch == main.dataset_id()
-            && logical.branch_id() != main.dataset_id()
-        {
-            let main_view = Self::open_view(main, main, commit, preparation, label)?;
-            if main_view.commit().timestamp_ms != logical_view.commit().timestamp_ms
-                || main_view.commit().quads != logical_view.commit().quads
-            {
-                return Err(managed(
-                    ManagedErrorKind::OriginNotReproduced,
-                    format!(
-                        "{label}: publication commit {commit} on main is not in this branch's history"
-                    ),
-                ));
-            }
-            drop(logical_view);
-            main_view
-        } else {
-            logical_view
-        };
+        let view = Self::open_publication_view(
+            main,
+            logical,
+            logical_head,
+            receipt_branch,
+            commit,
+            preparation,
+            label,
+        )?;
         self.order.push_back(key);
         self.views.insert(key, view);
         Ok(self.views.get(&key).expect("just inserted"))
@@ -234,9 +224,14 @@ fn managed(kind: ManagedErrorKind, message: impl Into<String>) -> Error {
     ManagedError::error(kind, message)
 }
 
-fn classify(context: &str, e: Error) -> Error {
+/// Classify local preparation errors consistently at the re-authentication boundary:
+/// preserve cancellation, timeout, server-wide pool exhaustion, I/O/corruption/storage
+/// errors, and already-classified managed errors, while mapping local preparation memory
+/// limits and unsupported encodings to `422 incomplete-evidence`.
+pub fn classify_error(context: &str, e: Error) -> Error {
     match e {
         Error::Managed(_) | Error::Cancelled | Error::Timeout => e,
+        Error::BudgetExceeded(ref b) if b.kind == BudgetKind::ServerMemory => e,
         Error::BudgetExceeded(_) | Error::Unsupported(_) => managed(
             ManagedErrorKind::IncompleteEvidence,
             format!("{context}: verification exceeded the preparation limit"),
@@ -247,6 +242,10 @@ fn classify(context: &str, e: Error) -> Error {
             format!("{context}: {other}"),
         ),
     }
+}
+
+fn classify(context: &str, e: Error) -> Error {
+    classify_error(context, e)
 }
 
 /// The payload digest of a re-authentication request, compared when its idempotency key
@@ -287,14 +286,22 @@ pub fn discover_records(
     graph: &NamedNode,
     limit: usize,
 ) -> Result<(Vec<NamedNode>, Reservation)> {
+    let label = format!("graph <{}>", graph.as_str());
     let mut found = BTreeSet::new();
-    let mut held = reads.preparation().reserve(0)?;
+    let mut held = reads
+        .preparation()
+        .reserve(0)
+        .map_err(|e| classify(&label, e))?;
     for kind in KINDS {
         reads.preparation().check()?;
         let class = Term::NamedNode(NamedNode::new_unchecked(kind_iri(kind)));
-        let mut scan_held = reads.preparation().reserve(0)?;
-        let (subjects, more) =
-            reads.subjects_up_to_held(RDF_TYPE, &class, graph.as_str(), limit, &mut scan_held)?;
+        let mut scan_held = reads
+            .preparation()
+            .reserve(0)
+            .map_err(|e| classify(&label, e))?;
+        let (subjects, more) = reads
+            .subjects_up_to_held(RDF_TYPE, &class, graph.as_str(), limit, &mut scan_held)
+            .map_err(|e| classify(&label, e))?;
         if more {
             return Err(managed(
                 ManagedErrorKind::IncompleteEvidence,
@@ -315,13 +322,15 @@ pub fn discover_records(
                         ),
                     ));
                 }
-                held.grow_by((s.as_str().len() as u64).saturating_add(96))?;
+                held.grow_by((s.as_str().len() as u64).saturating_add(96))
+                    .map_err(|e| classify(&label, e))?;
                 found.insert(s);
             }
         }
     }
+    held.grow_by((found.len() * std::mem::size_of::<NamedNode>()) as u64)
+        .map_err(|e| classify(&label, e))?;
     let out: Vec<NamedNode> = found.into_iter().collect();
-    held.grow_by((out.len() * std::mem::size_of::<NamedNode>()) as u64)?;
     Ok((out, held))
 }
 
@@ -358,24 +367,27 @@ fn term_estimate(t: &Term) -> u64 {
     }
 }
 
+type SubjectPairs = (Vec<(Id, Id)>, Reservation, bool);
+
 /// Scan all `(predicate, object)` id pairs of `subject` in `graph`, bounded by `limit`.
-/// Looks up `subject` without inserting absent or one-shot IRIs into `Reads::ids`.
+/// Looks up `subject` without inserting absent or one-shot IRIs into `Reads::ids`, and
+/// returns the [`Reservation`] keeping the id vector charged until the caller drops it.
 fn scan_subject_pairs(
     reads: &mut Reads<'_>,
     subject: &str,
     graph: &str,
     limit: usize,
-) -> Result<(Vec<(Id, Id)>, bool)> {
+) -> Result<SubjectPairs> {
+    let mut held = reads.preparation().reserve(0)?;
     let Some(g_id) = reads.id(graph)? else {
-        return Ok((Vec::new(), false));
+        return Ok((Vec::new(), held, false));
     };
     let Some(s_id) = reads.preparation().lookup_iri(reads.snap(), subject)? else {
-        return Ok((Vec::new(), false));
+        return Ok((Vec::new(), held, false));
     };
     let preparation = reads.preparation();
     let snap = reads.snap();
     let mut pairs = Vec::new();
-    let mut held = preparation.reserve(0)?;
     let mut more = false;
     preparation.scan(snap, Perm::Gspo, &[g_id.0, s_id.0], |q| {
         if pairs.len() == limit {
@@ -390,7 +402,7 @@ fn scan_subject_pairs(
         pairs.push((q[1], q[2]));
         Ok(true)
     })?;
-    Ok((pairs, more))
+    Ok((pairs, held, more))
 }
 
 fn decode_predicate(reads: &Reads<'_>, p_id: Id) -> Result<Option<NamedNode>> {
@@ -462,8 +474,9 @@ fn scan_record(
     iri: &NamedNode,
     label: &str,
 ) -> Result<ScannedRecord> {
-    let (pairs, more) = scan_subject_pairs(reads, iri.as_str(), graph.as_str(), MAX_RECORD_TRIPLES)
-        .map_err(|e| classify(label, e))?;
+    let (pairs, _pairs_held, more) =
+        scan_subject_pairs(reads, iri.as_str(), graph.as_str(), MAX_RECORD_TRIPLES)
+            .map_err(|e| classify(label, e))?;
     if more {
         return Err(managed(
             ManagedErrorKind::IncompleteEvidence,
@@ -530,6 +543,7 @@ fn scan_record(
     let mut content_digest_count: usize = 0;
     let mut retained_bytes_id: Option<Id> = None;
     let mut normalized_text_id: Option<Id> = None;
+    let mut expected_triple_count: usize = 0;
     let mut has_blank_expected_triple = false;
 
     let mut immutable_triples: Vec<Triple> = Vec::new();
@@ -710,15 +724,26 @@ fn scan_record(
         }
 
         // Blank nodes are refused in immutable record content except inside a stored
-        // fact's `ev:expectedTriple` (C25 proposal decision 4).
-        let allow_blank = kind == RecordKind::EvidenceRef && p == p_expected_triple;
-        if allow_blank
-            && let Term::Triple(inner) = &obj
-            && has_blank(inner)
-        {
-            has_blank_expected_triple = true;
-        }
-        if !allow_blank && no_blank(label, &obj).is_err() {
+        // fact's single `ev:expectedTriple` triple term (C25 proposal decision 4).
+        let is_expected_triple = kind == RecordKind::EvidenceRef && p == p_expected_triple;
+        if is_expected_triple {
+            expected_triple_count += 1;
+            if expected_triple_count > 1 {
+                return Err(managed(
+                    ManagedErrorKind::ImmutableRecordConflict,
+                    format!("{label} has more than one ev:expectedTriple"),
+                ));
+            }
+            let Term::Triple(inner) = &obj else {
+                return Err(managed(
+                    ManagedErrorKind::ImmutableRecordConflict,
+                    format!("{label} has a non-triple ev:expectedTriple"),
+                ));
+            };
+            if has_blank(inner) {
+                has_blank_expected_triple = true;
+            }
+        } else if no_blank(label, &obj).is_err() {
             return Err(managed(
                 ManagedErrorKind::ImmutableRecordConflict,
                 format!("{label} contains a blank node outside a stored-fact expectedTriple"),
@@ -732,13 +757,14 @@ fn scan_record(
         triples_held.grow_by(est).map_err(|e| classify(label, e))?;
         immutable_triples.push(Triple::new(iri.clone(), pred, obj));
     }
+    drop(_pairs_held);
 
     // Collect triples of all fragment sub-nodes owned by this record, counting all direct
     // and fragment triples against `MAX_RECORD_TRIPLES`.
     for frag in FRAGMENTS {
         reads.preparation().check()?;
         let sub_str = format!("{}#{frag}", iri.as_str());
-        let (sub_pairs, sub_more) = scan_subject_pairs(
+        let (sub_pairs, _sub_pairs_held, sub_more) = scan_subject_pairs(
             reads,
             &sub_str,
             graph.as_str(),
@@ -987,19 +1013,22 @@ pub fn verify_candidate(
     }
 
     let already_authenticated = record_nonce == current_nonce && op.nonce == current_nonce;
+    let logical_head = reads.snap().commit;
 
     // Independently establish from the retained, configuration-bound publication view
     // that `iri` and `receipt` were genuinely published together at `op.commit` while
-    // `graph` was protected, with exact matching digest, receipt metadata and commit
-    // timestamp. This stops detached edits that replace content + digest together,
-    // plant records citing an earlier receipt, forge a receipt at a detached commit, or
-    // modify both timestamps together.
+    // `graph` was protected, with exact matching digest, complete non-nonce receipt
+    // triple set, receipt metadata and commit timestamp. This stops detached edits that
+    // replace content + digest together, plant records citing an earlier receipt, plant
+    // extra triples onto a receipt IRI, forge a receipt at a detached commit, or modify
+    // both timestamps together.
     if !already_authenticated || needs_legacy_blank_check {
         let orig_nonce = verify_publication_view(
-            reads.preparation(),
+            reads,
             views,
             main,
             logical,
+            logical_head,
             graph,
             iri,
             kind,
@@ -1022,7 +1051,9 @@ pub fn verify_candidate(
                     views,
                     main,
                     logical,
+                    logical_head,
                     graph,
+                    other_record_graphs,
                     &receipt,
                     Some(iri),
                     record_nonce,
@@ -1043,7 +1074,9 @@ pub fn verify_candidate(
                     views,
                     main,
                     logical,
+                    logical_head,
                     graph,
+                    other_record_graphs,
                     &receipt,
                     None,
                     op.nonce,
@@ -1196,15 +1229,255 @@ fn verify_receipt_operation(
     })
 }
 
+/// Immutable identity and stamp of a verified reconciliation audit `ev:Operation`, shared
+/// between idempotency replay and multi-detach lineage verification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedAuditOp {
+    pub branch_id: Uuid,
+    pub commit: u64,
+    pub agent: NamedNode,
+    pub payload_digest: Sha256Digest,
+    pub nonce: Uuid,
+    pub ended_at: Literal,
+}
+
+/// Validate a reconciliation audit `ev:Operation`'s immutable stamp and cross-graph
+/// subject uniqueness in `graph`.
+pub fn verify_audit_operation(
+    reads: &mut Reads<'_>,
+    main: &Store,
+    graph: &NamedNode,
+    op_iri: &NamedNode,
+    other_record_graphs: &[NamedNode],
+    expected_principal: Option<&NamedNode>,
+    label: &str,
+) -> Result<VerifiedAuditOp> {
+    let g = graph.as_str();
+    let op = op_iri.as_str();
+    for other in other_record_graphs {
+        if reads
+            .has_subject_in(op, other.as_str())
+            .map_err(|e| classify(label, e))?
+        {
+            return Err(managed(
+                ManagedErrorKind::ImmutableRecordConflict,
+                format!(
+                    "{label}: audit operation <{op}> also has triples in graph <{}>",
+                    other.as_str()
+                ),
+            ));
+        }
+    }
+    if !reads.is_operation(op, g).map_err(|e| classify(label, e))?
+        || !reads
+            .contains(op, RDF_TYPE, &Term::NamedNode(prov("Activity")), g)
+            .map_err(|e| classify(label, e))?
+    {
+        return Err(managed(
+            ManagedErrorKind::ImmutableRecordConflict,
+            format!("{label}: audit operation <{op}> is not an ev:Operation in graph <{g}>"),
+        ));
+    }
+    let kind_ok = match reads
+        .single(op, EV_OPERATION_KIND, g)
+        .map_err(|e| classify(label, e))?
+    {
+        Some(Term::NamedNode(n)) => n.as_str() == OPERATION_KIND_REAUTH,
+        _ => false,
+    };
+    let graph_ok = match reads
+        .single(op, EV_REAUTHENTICATED_GRAPH, g)
+        .map_err(|e| classify(label, e))?
+    {
+        Some(Term::NamedNode(n)) => &n == graph,
+        _ => false,
+    };
+    if !kind_ok || !graph_ok {
+        return Err(managed(
+            ManagedErrorKind::ImmutableRecordConflict,
+            format!(
+                "{label}: operation <{op}> does not carry valid reconciliation audit provenance"
+            ),
+        ));
+    }
+    let ds_id = reads
+        .one_string(op, &format!("{EV}datasetId"), g)
+        .map_err(|e| classify(label, e))?
+        .and_then(|v| Uuid::parse_str(&v).ok());
+    if ds_id != Some(main.dataset_id()) {
+        return Err(managed(
+            ManagedErrorKind::ImmutableRecordConflict,
+            format!("{label}: audit operation <{op}> does not name this dataset"),
+        ));
+    }
+    let branch_id = reads
+        .one_string(op, &format!("{EV}branchId"), g)
+        .map_err(|e| classify(label, e))?
+        .and_then(|v| Uuid::parse_str(&v).ok());
+    let Some(branch_id) = branch_id else {
+        return Err(managed(
+            ManagedErrorKind::ImmutableRecordConflict,
+            format!("{label}: audit operation <{op}> has no valid branchId"),
+        ));
+    };
+    if !main
+        .branch_known_prepared(branch_id, reads.preparation())
+        .map_err(|e| classify(label, e))?
+    {
+        return Err(managed(
+            ManagedErrorKind::ImmutableRecordConflict,
+            format!("{label}: audit operation <{op}> names an unknown branch"),
+        ));
+    }
+    let commit = match reads
+        .single(op, &format!("{EV}commit"), g)
+        .map_err(|e| classify(label, e))?
+    {
+        Some(Term::Literal(l)) => integer(&l),
+        _ => None,
+    };
+    let Some(commit) = commit else {
+        return Err(managed(
+            ManagedErrorKind::ImmutableRecordConflict,
+            format!("{label}: audit operation <{op}> has no valid commit"),
+        ));
+    };
+    let Some(Term::NamedNode(agent)) = reads
+        .single(op, &format!("{PROV}wasAssociatedWith"), g)
+        .map_err(|e| classify(label, e))?
+    else {
+        return Err(managed(
+            ManagedErrorKind::ImmutableRecordConflict,
+            format!("{label}: audit operation <{op}> has no associated principal"),
+        ));
+    };
+    if let Some(expected) = expected_principal
+        && &agent != expected
+    {
+        return Err(managed(
+            ManagedErrorKind::ImmutableRecordConflict,
+            format!("{label}: audit operation <{op}> principal does not match"),
+        ));
+    }
+    let ended_at = match reads
+        .single(op, &format!("{PROV}endedAtTime"), g)
+        .map_err(|e| classify(label, e))?
+    {
+        Some(Term::Literal(l)) if valid_date_time(&l) => l,
+        _ => {
+            return Err(managed(
+                ManagedErrorKind::ImmutableRecordConflict,
+                format!("{label}: audit operation <{op}> has no valid endedAtTime"),
+            ));
+        }
+    };
+    let payload_digest = reads
+        .one_string(op, &format!("{EV}payloadDigest"), g)
+        .map_err(|e| classify(label, e))?
+        .and_then(|v| v.parse::<Sha256Digest>().ok());
+    let Some(payload_digest) = payload_digest else {
+        return Err(managed(
+            ManagedErrorKind::ImmutableRecordConflict,
+            format!("{label}: audit operation <{op}> has no valid payloadDigest"),
+        ));
+    };
+    let Some(nonce) = canonical_nonce_of(reads, op, g).map_err(|e| classify(label, e))? else {
+        return Err(managed(
+            ManagedErrorKind::ImmutableRecordConflict,
+            format!("{label}: audit operation <{op}> has no valid canonical graphProtection nonce"),
+        ));
+    };
+    Ok(VerifiedAuditOp {
+        branch_id,
+        commit,
+        agent,
+        payload_digest,
+        nonce,
+        ended_at,
+    })
+}
+
+type ReceiptTriples = (HashSet<(NamedNode, Term)>, Reservation);
+
+/// Scan the complete non-`ev:graphProtection` triple set of `receipt` in `graph`,
+/// bounded by `MAX_RECORD_TRIPLES`, charging all retained terms to the preparation
+/// allowance.
+fn scan_receipt_triples(
+    reads: &mut Reads<'_>,
+    graph: &NamedNode,
+    receipt: &NamedNode,
+    label: &str,
+) -> Result<ReceiptTriples> {
+    let p_graph_protection = format!("{EV}graphProtection");
+    let (pairs, pairs_held, more) =
+        scan_subject_pairs(reads, receipt.as_str(), graph.as_str(), MAX_RECORD_TRIPLES)
+            .map_err(|e| classify(label, e))?;
+    if more {
+        return Err(managed(
+            ManagedErrorKind::IncompleteEvidence,
+            format!(
+                "{label}: receipt <{}> exceeds {MAX_RECORD_TRIPLES} triples",
+                receipt.as_str()
+            ),
+        ));
+    }
+    let mut held = reads
+        .preparation()
+        .reserve(0)
+        .map_err(|e| classify(label, e))?;
+    let mut out = HashSet::new();
+    for (p_id, o_id) in pairs {
+        reads.preparation().check()?;
+        let Some(pred) = decode_predicate(reads, p_id).map_err(|e| classify(label, e))? else {
+            return Err(managed(
+                ManagedErrorKind::ImmutableRecordConflict,
+                format!(
+                    "{label}: receipt <{}> has a non-IRI predicate",
+                    receipt.as_str()
+                ),
+            ));
+        };
+        if pred.as_str() == p_graph_protection {
+            continue;
+        }
+        let Some(obj) = decode_term(reads, o_id).map_err(|e| classify(label, e))? else {
+            return Err(managed(
+                ManagedErrorKind::ImmutableRecordConflict,
+                format!(
+                    "{label}: receipt <{}> has an unreadable object term",
+                    receipt.as_str()
+                ),
+            ));
+        };
+        if no_blank(label, &obj).is_err() {
+            return Err(managed(
+                ManagedErrorKind::ImmutableRecordConflict,
+                format!(
+                    "{label}: receipt <{}> contains a blank node",
+                    receipt.as_str()
+                ),
+            ));
+        }
+        let est = (pred.as_str().len() as u64)
+            .saturating_add(term_estimate(&obj))
+            .saturating_add(96);
+        held.grow_by(est).map_err(|e| classify(label, e))?;
+        out.insert((pred, obj));
+    }
+    drop(pairs_held);
+    Ok((out, held))
+}
+
 /// Verify `iri` and `receipt` against the retained, independently authenticated
 /// `BoundEvidenceView` at `op.commit`, returning the graph's original protection nonce
 /// at that commit.
 #[allow(clippy::too_many_arguments)]
 fn verify_publication_view(
-    preparation: &Preparation,
+    reads: &mut Reads<'_>,
     views: &mut PublicationViews,
     main: &Store,
     logical: &Store,
+    logical_head: u64,
     graph: &NamedNode,
     iri: &NamedNode,
     kind: RecordKind,
@@ -1217,7 +1490,16 @@ fn verify_publication_view(
     invalidated_at: Option<&Literal>,
     label: &str,
 ) -> Result<Uuid> {
-    let pub_view = views.get_or_open(main, logical, op.branch_id, op.commit, preparation, label)?;
+    let preparation = reads.preparation();
+    let pub_view = views.get_or_open(
+        main,
+        logical,
+        logical_head,
+        op.branch_id,
+        op.commit,
+        preparation,
+        label,
+    )?;
     let g = graph.as_str();
 
     // 1. At `op.commit`, `graph` must have been protected by the evidence owner under a
@@ -1249,7 +1531,9 @@ fn verify_publication_view(
     }
 
     // 3. Verify `receipt` existed in `graph` at `op.commit` under `orig_nonce` with
-    //    identical immutable metadata.
+    //    identical immutable metadata AND identical complete non-`ev:graphProtection`
+    //    triple set so detached writes planted onto a receipt IRI can never gain
+    //    `current_nonce`.
     let mut hist_reads = Reads::from_evidence(preparation, pub_view);
     let hist_op = verify_receipt_operation(&mut hist_reads, main, graph, receipt, label)?;
     if hist_op.nonce != orig_nonce {
@@ -1277,6 +1561,24 @@ fn verify_publication_view(
             ),
         ));
     }
+    let (current_receipt_triples, current_receipt_held) =
+        scan_receipt_triples(reads, graph, receipt, label)?;
+    let (hist_receipt_triples, hist_receipt_held) =
+        scan_receipt_triples(&mut hist_reads, graph, receipt, label)?;
+    if current_receipt_triples != hist_receipt_triples {
+        return Err(managed(
+            ManagedErrorKind::ImmutableRecordConflict,
+            format!(
+                "{label}: receipt <{}> triples differ from publication commit {}",
+                receipt.as_str(),
+                op.commit
+            ),
+        ));
+    }
+    drop(current_receipt_triples);
+    drop(current_receipt_held);
+    drop(hist_receipt_triples);
+    drop(hist_receipt_held);
 
     // 4. Verify `iri` existed in `graph` at `op.commit` under `orig_nonce` with matching
     //    kind, receipt, `ev:recordDigest`, and server-owned timestamps.
@@ -1435,7 +1737,9 @@ fn audit_moved_subject(
     views: &mut PublicationViews,
     main: &Store,
     logical: &Store,
+    logical_head: u64,
     graph: &NamedNode,
+    other_record_graphs: &[NamedNode],
     receipt: &NamedNode,
     target_record: Option<&NamedNode>,
     target_nonce: Uuid,
@@ -1443,7 +1747,10 @@ fn audit_moved_subject(
     label: &str,
 ) -> Result<bool> {
     let g = graph.as_str();
-    let mut scan_held = reads.preparation().reserve(0)?;
+    let mut scan_held = reads
+        .preparation()
+        .reserve(0)
+        .map_err(|e| classify(label, e))?;
     let (subjects, more) = reads
         .subjects_up_to_held(
             &format!("{PROV}wasInformedBy"),
@@ -1460,26 +1767,30 @@ fn audit_moved_subject(
         ));
     }
 
-    let kind_obj = Term::NamedNode(NamedNode::new_unchecked(OPERATION_KIND_REAUTH));
-    let graph_obj = Term::NamedNode(graph.clone());
-    let mut candidates: Vec<(NamedNode, Uuid, u64)> = Vec::new();
-    let mut cand_held = reads.preparation().reserve(0)?;
+    let mut candidates: Vec<(NamedNode, VerifiedAuditOp)> = Vec::new();
+    let mut cand_held = reads
+        .preparation()
+        .reserve(0)
+        .map_err(|e| classify(label, e))?;
 
     for s in subjects {
         let s_str = s.as_str();
-        if !reads
-            .is_operation(s_str, g)
-            .map_err(|e| classify(label, e))?
-            || !reads
-                .contains(s_str, RDF_TYPE, &Term::NamedNode(prov("Activity")), g)
-                .map_err(|e| classify(label, e))?
-            || !reads
-                .contains(s_str, EV_OPERATION_KIND, &kind_obj, g)
-                .map_err(|e| classify(label, e))?
-            || !reads
-                .contains(s_str, EV_REAUTHENTICATED_GRAPH, &graph_obj, g)
-                .map_err(|e| classify(label, e))?
-        {
+        let audit = match verify_audit_operation(
+            reads,
+            main,
+            graph,
+            &s,
+            other_record_graphs,
+            None,
+            label,
+        ) {
+            Ok(audit) => audit,
+            Err(Error::Managed(m)) if m.kind == ManagedErrorKind::ImmutableRecordConflict => {
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if audit.nonce != target_nonce {
             continue;
         }
         if let Some(rec) = target_record
@@ -1494,57 +1805,29 @@ fn audit_moved_subject(
         {
             continue;
         }
-        let Some(audit_nonce) =
-            canonical_nonce_of(reads, s_str, g).map_err(|e| classify(label, e))?
-        else {
-            continue;
-        };
-        if audit_nonce != target_nonce {
-            continue;
-        }
-        let ds_id = reads
-            .one_string(s_str, &format!("{EV}datasetId"), g)
-            .map_err(|e| classify(label, e))?
-            .and_then(|v| Uuid::parse_str(&v).ok());
-        if ds_id != Some(main.dataset_id()) {
-            continue;
-        }
-        let Some(audit_branch) = reads
-            .one_string(s_str, &format!("{EV}branchId"), g)
-            .map_err(|e| classify(label, e))?
-            .and_then(|v| Uuid::parse_str(&v).ok())
-        else {
-            continue;
-        };
-        let Some(audit_commit) = (match reads
-            .single(s_str, &format!("{EV}commit"), g)
-            .map_err(|e| classify(label, e))?
-        {
-            Some(Term::Literal(l)) => integer(&l),
-            _ => None,
-        }) else {
-            continue;
-        };
         if target_nonce == current_nonce {
             return Ok(true);
         }
-        cand_held
-            .grow_by((s_str.len() as u64).saturating_add(80))
-            .map_err(|e| classify(label, e))?;
-        candidates.push((s, audit_branch, audit_commit));
+        let est = (s_str.len() as u64)
+            .saturating_add(audit.agent.as_str().len() as u64)
+            .saturating_add(audit.ended_at.value().len() as u64)
+            .saturating_add(160);
+        cand_held.grow_by(est).map_err(|e| classify(label, e))?;
+        candidates.push((s, audit));
     }
     drop(scan_held);
 
     // For prior epochs (`target_nonce != current_nonce`), verify the audit operation
-    // against its own retained publication view so a detached write cannot fabricate an
-    // audit operation to bless an unrelated nonce.
+    // against its own retained publication view so a detached write cannot fabricate or
+    // alter an audit operation to bless an unrelated nonce.
     let preparation = reads.preparation();
-    for (audit_iri, audit_branch, audit_commit) in candidates {
+    for (audit_iri, audit) in candidates {
         let audit_view = match views.get_or_open(
             main,
             logical,
-            audit_branch,
-            audit_commit,
+            logical_head,
+            audit.branch_id,
+            audit.commit,
             preparation,
             label,
         ) {
@@ -1559,37 +1842,49 @@ fn audit_moved_subject(
         if hist_nonce != Some(target_nonce) {
             continue;
         }
+        if date_time(audit_view.commit().timestamp_ms) != audit.ended_at {
+            continue;
+        }
         let mut hist_reads = Reads::from_evidence(preparation, audit_view);
+        let hist_audit = match verify_audit_operation(
+            &mut hist_reads,
+            main,
+            graph,
+            &audit_iri,
+            other_record_graphs,
+            Some(&audit.agent),
+            label,
+        ) {
+            Ok(ha) => ha,
+            Err(Error::Managed(m)) if m.kind == ManagedErrorKind::ImmutableRecordConflict => {
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if hist_audit.branch_id != audit.branch_id
+            || hist_audit.commit != audit.commit
+            || hist_audit.ended_at != audit.ended_at
+            || hist_audit.payload_digest != audit.payload_digest
+            || hist_audit.nonce != target_nonce
+        {
+            continue;
+        }
         let a = audit_iri.as_str();
-        let valid_hist = hist_reads
-            .is_operation(a, g)
+        let links_ok = hist_reads
+            .contains(
+                a,
+                &format!("{PROV}wasInformedBy"),
+                &Term::NamedNode(receipt.clone()),
+                g,
+            )
             .map_err(|e| classify(label, e))?
-            && hist_reads
-                .contains(a, RDF_TYPE, &Term::NamedNode(prov("Activity")), g)
-                .map_err(|e| classify(label, e))?
-            && hist_reads
-                .contains(a, EV_OPERATION_KIND, &kind_obj, g)
-                .map_err(|e| classify(label, e))?
-            && hist_reads
-                .contains(a, EV_REAUTHENTICATED_GRAPH, &graph_obj, g)
-                .map_err(|e| classify(label, e))?
-            && hist_reads
-                .contains(
-                    a,
-                    &format!("{PROV}wasInformedBy"),
-                    &Term::NamedNode(receipt.clone()),
-                    g,
-                )
-                .map_err(|e| classify(label, e))?
-            && canonical_nonce_of(&mut hist_reads, a, g).map_err(|e| classify(label, e))?
-                == Some(target_nonce)
             && match target_record {
                 Some(rec) => hist_reads
                     .contains(a, &format!("{PROV}used"), &Term::NamedNode(rec.clone()), g)
                     .map_err(|e| classify(label, e))?,
                 None => true,
             };
-        if valid_hist {
+        if links_ok {
             return Ok(true);
         }
     }
@@ -2356,15 +2651,59 @@ mod tests {
         let mut reads = Reads::new(&tight, &snap);
         let err = match discover_records(&mut reads, &g, MAX_REAUTHENTICATE) {
             Err(e) => e,
-            Ok((found, _)) => panic!("expected BudgetExceeded, got {} records", found.len()),
+            Ok((found, _)) => {
+                panic!("expected incomplete-evidence, got {} records", found.len())
+            }
         };
-        assert!(matches!(err, Error::BudgetExceeded(_)), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::Managed(ref m) if m.kind == ManagedErrorKind::IncompleteEvidence
+            ),
+            "got {err:?}"
+        );
         // A generous budget succeeds and keeps its reservation alive.
         let roomy = Preparation::new(Control::none(), 4 << 20).unwrap();
         let mut reads = Reads::new(&roomy, &snap);
         let (found, held) = discover_records(&mut reads, &g, MAX_REAUTHENTICATE).unwrap();
         assert_eq!(found.len(), 40);
         assert!(held.bytes() >= 40 * 2048);
+    }
+
+    #[test]
+    fn scan_subject_pairs_keeps_reservation_alive_while_pairs_live() {
+        let store = Store::in_memory(StoreOptions::default());
+        let g = NamedNode::new_unchecked("urn:ev:claims");
+        let s = NamedNode::new_unchecked("urn:ev:subject:pairs");
+        let mut t = store.write();
+        let mut labels = std::collections::HashMap::new();
+        for i in 0..300 {
+            let q = Quad::new(
+                s.clone(),
+                NamedNode::new_unchecked(format!("urn:p:{i}")),
+                Literal::new_simple_literal(format!("v{i}")),
+                GraphName::NamedNode(g.clone()),
+            );
+            let ids = t.encode_quad(&q, &mut labels).unwrap();
+            t.insert(ids).unwrap();
+        }
+        t.commit().unwrap();
+        let snap = store.snapshot();
+        let prep = Preparation::new(Control::none(), 4 << 20).unwrap();
+        let mut reads = Reads::new(&prep, &snap);
+        let (pairs, held, more) =
+            scan_subject_pairs(&mut reads, s.as_str(), g.as_str(), MAX_RECORD_TRIPLES).unwrap();
+        assert!(!more);
+        assert_eq!(pairs.len(), 300);
+        assert!(
+            held.bytes() >= (pairs.len() * std::mem::size_of::<(Id, Id)>()) as u64,
+            "expected held bytes to cover live pairs vector, got {}",
+            held.bytes()
+        );
+        let used_with_pairs = prep.inner_used();
+        drop(pairs);
+        drop(held);
+        assert!(prep.inner_used() < used_with_pairs);
     }
 
     #[test]
@@ -2477,7 +2816,8 @@ mod tests {
         for i in 0..500 {
             for frag in FRAGMENTS {
                 let sub = format!("urn:absent:record:{i:04}:{}#{frag}", "x".repeat(128));
-                let (pairs, more) = scan_subject_pairs(&mut reads, &sub, g.as_str(), 100).unwrap();
+                let (pairs, _held, more) =
+                    scan_subject_pairs(&mut reads, &sub, g.as_str(), 100).unwrap();
                 assert!(pairs.is_empty());
                 assert!(!more);
             }

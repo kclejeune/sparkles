@@ -280,7 +280,7 @@ fn prepared_error(e: Error) -> Error {
     }
 }
 
-fn result(plan: &Plan, skip: &[bool]) -> Vec<ProposedRecord> {
+fn result(plan: &Plan, skip: &[bool], digests: &[Sha256Digest]) -> Vec<ProposedRecord> {
     plan.records
         .iter()
         .enumerate()
@@ -289,7 +289,7 @@ fn result(plan: &Plan, skip: &[bool]) -> Vec<ProposedRecord> {
             kind: r.kind,
             iri: r.iri.clone(),
             graph: r.graph.clone(),
-            digest: r.digest,
+            digest: digests.get(i).copied().unwrap_or(r.digest),
             existing: skip.get(i).copied().unwrap_or(false),
         })
         .collect()
@@ -303,6 +303,7 @@ fn replay(
     records: &[ProtectedGraph],
     branch: Uuid,
     hold: Option<Uuid>,
+    control: &Control,
 ) -> Result<Proposed> {
     if !found.authenticated {
         return Err(managed(
@@ -320,18 +321,19 @@ fn replay(
         ));
     }
     // Every record of the replayed payload must still be present and authenticated in
-    // its graph with the same digest (for instance, after a partial re-authentication
-    // following a detach where another record of the operation was left unvouched).
+    // its graph with the same digest (or its reproducible legacy blank-node digest for
+    // records published before canonical blank-node digesting).
     // A record whose receipt is another operation was already published when the
     // first operation ran, which reported it as existing.
     let mut existing = Vec::with_capacity(plan.records.len());
+    let mut digests = Vec::with_capacity(plan.records.len());
     for r in &plan.records {
-        match reads.record(&r.iri, records)? {
+        let recorded = match reads.record(&r.iri, records)? {
             ExistingRecord::Present {
                 graph,
-                digest,
+                digest: Some(recorded),
                 authenticated: true,
-            } if graph == r.graph && digest == Some(r.digest) => {}
+            } if graph == r.graph && r.matches_recorded_digest(recorded, control)? => recorded,
             _ => {
                 return Err(managed(
                     ManagedErrorKind::ImmutableRecordConflict,
@@ -343,7 +345,8 @@ fn replay(
                     ),
                 ));
             }
-        }
+        };
+        digests.push(recorded);
         existing.push(
             reads
                 .receipt_of(&r.iri, &r.graph)?
@@ -358,7 +361,7 @@ fn replay(
         branch: found.branch.unwrap_or(branch),
         first_available_at: found.ended_at.map(|l| l.value().to_string()),
         hold: (!plan.held.is_empty()).then_some(hold).flatten(),
-        records: result(plan, &existing),
+        records: result(plan, &existing, &digests),
         preview: None,
     })
 }
@@ -618,7 +621,7 @@ pub fn propose(
         let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
         let mut reads = Reads::new(&preparation, &head);
         if let Some(found) = reads.operation(&plan.operation_iri, &records)? {
-            return replay(&plan, found, &mut reads, &records, branch, hold);
+            return replay(&plan, found, &mut reads, &records, branch, hold, control);
         }
     }
     // The caller's reads decide every reference, before anything is written.
@@ -698,22 +701,25 @@ pub fn propose(
     if options.idempotency_key.is_some()
         && let Some(found) = reads.operation(&plan.operation_iri, &records)?
     {
-        return replay(&plan, found, &mut reads, &records, branch, hold);
+        return replay(&plan, found, &mut reads, &records, branch, hold, control);
     }
     // An identity already published with equal content is not written again. Any other
     // content under the identity, or content that is not an authenticated record, is
     // an immutable-record conflict.
     let mut skip = Vec::with_capacity(plan.records.len());
+    let mut digests = Vec::with_capacity(plan.records.len());
     for r in &plan.records {
         control.check()?;
         let existing = reads.record(&r.iri, &records)?;
-        skip.push(match existing {
-            ExistingRecord::Absent => false,
+        let (reused, recorded_digest) = match existing {
+            ExistingRecord::Absent => (false, r.digest),
             ExistingRecord::Present {
                 graph,
-                digest,
+                digest: Some(recorded),
                 authenticated: true,
-            } if graph == r.graph && digest == Some(r.digest) => true,
+            } if graph == r.graph && r.matches_recorded_digest(recorded, control)? => {
+                (true, recorded)
+            }
             _ => {
                 return Err(managed(
                     ManagedErrorKind::ImmutableRecordConflict,
@@ -724,7 +730,9 @@ pub fn propose(
                     ),
                 ));
             }
-        });
+        };
+        skip.push(reused);
+        digests.push(recorded_digest);
     }
     drop(reads);
     let (seq, time_ms) = t.managed_stamp()?;
@@ -763,7 +771,7 @@ pub fn propose(
     let committed = t.commit();
     // The authority guard is released once the commit published or was refused.
     drop(release);
-    let records = result(&plan, &skip);
+    let records = result(&plan, &skip, &digests);
     match committed {
         Err(Error::DryRun(preview)) => Ok(Proposed {
             operation: plan.operation_iri.clone(),

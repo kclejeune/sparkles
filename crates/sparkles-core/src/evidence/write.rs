@@ -168,6 +168,33 @@ pub struct PlannedRecord {
     pub(super) triples: Vec<Triple>,
 }
 
+impl PlannedRecord {
+    /// Whether `recorded` matches this record's digest, including the pre-canonicalization
+    /// legacy digest for stored-fact `EvidenceRef` records whose `ev:expectedTriple`
+    /// carries caller-supplied blank-node labels.
+    pub fn matches_recorded_digest(
+        &self,
+        recorded: Sha256Digest,
+        control: &Control,
+    ) -> Result<bool> {
+        if recorded == self.digest {
+            return Ok(true);
+        }
+        if self.kind != RecordKind::EvidenceRef {
+            return Ok(false);
+        }
+        const EXPECTED_TRIPLE: &str = "urn:x-sparkles:evidence:expectedTriple";
+        let has_blank_expected = self.triples.iter().any(|t| {
+            t.predicate.as_str() == EXPECTED_TRIPLE
+                && matches!(&t.object, Term::Triple(inner) if super::prepare::has_blank(inner))
+        });
+        if !has_blank_expected {
+            return Ok(false);
+        }
+        Ok(legacy_record_digest(self.kind, &self.triples, control)? == recorded)
+    }
+}
+
 /// A stored fact of the plan's dataset that the operation keeps readable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HeldCommit {
@@ -446,20 +473,32 @@ pub(super) fn canonicalize_triple_blanks(triple: &Triple) -> Triple {
 /// framed under the record kind, without the large values listed in [`LARGE`].
 /// Blank nodes inside a stored fact's `ev:expectedTriple` are canonicalized in
 /// deterministic traversal order so the digest survives scoped storage allocation.
+/// Exact raw triples are deduplicated before blank-node canonicalization so two
+/// distinct RDF `ev:expectedTriple` values whose blank nodes differ never collapse
+/// to a single digest.
 pub fn record_digest(
     kind: RecordKind,
     triples: &[Triple],
     control: &Control,
 ) -> Result<Sha256Digest> {
     const EXPECTED_TRIPLE: &str = "urn:x-sparkles:evidence:expectedTriple";
+    let mut seen_raw: std::collections::HashSet<&Triple> =
+        std::collections::HashSet::with_capacity(triples.len());
+    let mut seen_large: BTreeSet<&str> = BTreeSet::new();
     let mut each = Vec::with_capacity(triples.len());
     for t in triples {
         if LARGE.contains(&t.predicate.as_str()) {
             // which form of retained content the record has is part of its identity,
             // so that a metadata-only rendition never stands for one with text
+            if !seen_large.insert(t.predicate.as_str()) {
+                continue;
+            }
             let mut frame = FrameHash::new(b"sparkles-evidence-record-retained-v1", control)?;
             frame.field(1, t.predicate.as_str().as_bytes())?;
             each.push(frame.finish()?);
+            continue;
+        }
+        if !seen_raw.insert(t) {
             continue;
         }
         let mut frame = FrameHash::new(b"sparkles-evidence-record-triple-v1", control)?;
@@ -476,6 +515,35 @@ pub fn record_digest(
         } else {
             frame.triple(t)?;
         }
+        each.push(frame.finish()?);
+    }
+    each.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    let mut frame = FrameHash::new(b"sparkles-evidence-record-v1", control)?;
+    frame.field(20, &[kind.tag()])?;
+    for d in &each {
+        frame.field(12, d.as_bytes())?;
+    }
+    frame.finish()
+}
+
+/// Legacy pre-canonicalization record digest that hashes caller blank-node labels
+/// verbatim, used only to recognize existing stored-fact `EvidenceRef` records on
+/// proposal replay and equal-record reuse after upgrade.
+pub fn legacy_record_digest(
+    kind: RecordKind,
+    triples: &[Triple],
+    control: &Control,
+) -> Result<Sha256Digest> {
+    let mut each = Vec::with_capacity(triples.len());
+    for t in triples {
+        if LARGE.contains(&t.predicate.as_str()) {
+            let mut frame = FrameHash::new(b"sparkles-evidence-record-retained-v1", control)?;
+            frame.field(1, t.predicate.as_str().as_bytes())?;
+            each.push(frame.finish()?);
+            continue;
+        }
+        let mut frame = FrameHash::new(b"sparkles-evidence-record-triple-v1", control)?;
+        frame.triple(t)?;
         each.push(frame.finish()?);
     }
     each.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
@@ -1373,8 +1441,8 @@ impl<'a> Reads<'a> {
                 ids.push(q[2]);
                 Ok(true)
             })?;
-        let mut out = Vec::with_capacity(ids.len());
         held.grow_by((ids.len() * std::mem::size_of::<Term>()) as u64)?;
+        let mut out = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(t) = self.preparation.with_term(self.snap, id, |t| match t {
                 Some(t) => {
@@ -1442,8 +1510,8 @@ impl<'a> Reads<'a> {
                 ids.push(q[0]);
                 Ok(true)
             })?;
-        let mut out = Vec::with_capacity(ids.len());
         held.grow_by((ids.len() * std::mem::size_of::<NamedNode>()) as u64)?;
+        let mut out = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(n) = self.preparation.with_term(self.snap, id, |t| match t {
                 Some(Term::NamedNode(n)) => {

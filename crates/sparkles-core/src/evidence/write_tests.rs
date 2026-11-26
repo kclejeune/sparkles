@@ -385,3 +385,47 @@ fn single_identities_charge_their_first_allocations() {
     drop(held);
     assert!(preparation.reserve(LIMIT - 2048).is_ok());
 }
+
+#[test]
+fn record_digest_distinguishes_duplicate_isomorphic_blank_expected_triples() {
+    use oxrdf::{BlankNode, Literal, NamedNode, Term, Triple};
+    let s = NamedNode::new_unchecked("urn:uuid:11111111-1111-4111-8111-111111111111");
+    let p_exp = NamedNode::new_unchecked("urn:x-sparkles:evidence:expectedTriple");
+    let p_pred = NamedNode::new_unchecked("https://example.org/label");
+    let t1 = Triple::new(
+        s.clone(),
+        p_exp.clone(),
+        Term::Triple(Box::new(Triple::new(
+            BlankNode::new_unchecked("a"),
+            p_pred.clone(),
+            Literal::new_simple_literal("alpha"),
+        ))),
+    );
+    let t2 = Triple::new(
+        s,
+        p_exp,
+        Term::Triple(Box::new(Triple::new(
+            BlankNode::new_unchecked("b"),
+            p_pred,
+            Literal::new_simple_literal("alpha"),
+        ))),
+    );
+    let single = record_digest(
+        RecordKind::EvidenceRef,
+        std::slice::from_ref(&t1),
+        &Control::none(),
+    )
+    .unwrap();
+    let same_twice = record_digest(
+        RecordKind::EvidenceRef,
+        &[t1.clone(), t1.clone()],
+        &Control::none(),
+    )
+    .unwrap();
+    let two_distinct = record_digest(RecordKind::EvidenceRef, &[t1, t2], &Control::none()).unwrap();
+    assert_eq!(single, same_twice);
+    assert_ne!(
+        single, two_distinct,
+        "two distinct RDF blank-node expectedTriple values must not collapse to one digest"
+    );
+}

@@ -2822,3 +2822,1065 @@ fn reauthenticate_counts_direct_and_fragment_triples_against_max_record_triples(
         "incomplete-evidence"
     );
 }
+
+#[test]
+fn reauthenticate_refuses_duplicate_isomorphic_blank_expected_triple_in_both_digest_schemes() {
+    // 1. Canonical digest scheme: adding a second distinct blank-node `ev:expectedTriple`
+    //    with the same structure while detached must refuse atomically.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let data_graph = iri("urn:data:dup-bnode");
+        let reifier = iri("urn:reifier:dup-bnode-1");
+        ds.update(&format!(
+            "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+             INSERT DATA {{ GRAPH <{g}> {{
+                 _:x <https://example.org/label> \"alpha\" .
+                 <{r}> rdf:reifies <<( _:x <https://example.org/label> \"alpha\" )>> .
+             }} }}",
+            g = data_graph.as_str(),
+            r = reifier.as_str(),
+        ))
+        .unwrap();
+        let fact_commit = ds.store().head_commit().seq;
+        let caller_triple = Triple::new(
+            oxrdf::BlankNode::new("caller_a").unwrap(),
+            iri("https://example.org/label"),
+            Literal::new_simple_literal("alpha"),
+        );
+        let batch = EvidenceInput {
+            references: vec![EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("bref"),
+                occurrence_key: key("bref-dup-1"),
+                target: EvidenceRefTarget::StoredFact(sparkles_core::evidence::StoredFactRef {
+                    dataset: ds.dataset_id(),
+                    branch: ds.dataset_id(),
+                    commit: fact_commit,
+                    graph: sparkles_core::evidence::GraphIdentity::Named(data_graph),
+                    expected: caller_triple,
+                    anchor: Some(sparkles_core::evidence::BlankAnchor::Reifier(reifier)),
+                }),
+            }],
+            ..EvidenceInput::default()
+        };
+        let p = propose(&ds, &batch, &propose_options()).unwrap();
+        let bref = iri_of(&p, "bref");
+
+        evidence::detach(&ds, CLAIMS).unwrap();
+        ds.update(&format!(
+            "PREFIX ev: <{EV}>
+             INSERT DATA {{ GRAPH <{CLAIMS}> {{
+                 <{b}> ev:expectedTriple <<( _:second_bnode <https://example.org/label> \"alpha\" )>> .
+             }} }}",
+            b = bref.as_str(),
+        ))
+        .unwrap();
+        configure(&ds);
+        let head = ds.store().head_commit().seq;
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &reauth_options(),
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+        assert_eq!(ds.store().head_commit().seq, head);
+    }
+
+    // 2. Legacy digest scheme: adding a second distinct isomorphic blank-node
+    //    `ev:expectedTriple` while detached must also refuse atomically.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let data_g = iri("urn:data:legacy-dup");
+        let reif = iri("urn:reifier:legacy-dup-1");
+        ds.update(&format!(
+            "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+             INSERT DATA {{ GRAPH <{g}> {{
+                 _:s <https://example.org/p> \"v\" .
+                 <{r}> rdf:reifies <<( _:s <https://example.org/p> \"v\" )>> .
+             }} }}",
+            g = data_g.as_str(),
+            r = reif.as_str(),
+        ))
+        .unwrap();
+        let fc = ds.store().head_commit().seq;
+        let expected_triple = Triple::new(
+            oxrdf::BlankNode::new("legacy_caller_dup").unwrap(),
+            iri("https://example.org/p"),
+            Literal::new_simple_literal("v"),
+        );
+        let batch = EvidenceInput {
+            references: vec![EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("bref"),
+                occurrence_key: key("bref-legacy-dup"),
+                target: EvidenceRefTarget::StoredFact(sparkles_core::evidence::StoredFactRef {
+                    dataset: ds.dataset_id(),
+                    branch: ds.dataset_id(),
+                    commit: fc,
+                    graph: sparkles_core::evidence::GraphIdentity::Named(data_g.clone()),
+                    expected: expected_triple.clone(),
+                    anchor: Some(sparkles_core::evidence::BlankAnchor::Reifier(reif.clone())),
+                }),
+            }],
+            ..EvidenceInput::default()
+        };
+        let popts = propose_options();
+        let prepared = sparkles_core::evidence::prepare_input(&batch, &Control::none()).unwrap();
+        let plan = sparkles_core::evidence::write::plan(
+            &prepared,
+            ds.dataset_id(),
+            &settings(),
+            &sparkles_core::evidence::write::ProposalOptions {
+                principal: &popts.principal,
+                idempotency_key: None,
+                source_graph: None,
+                proposal_graph: None,
+                identity_graph: None,
+            },
+            &Control::none(),
+        )
+        .unwrap();
+        let mut legacy_plan = plan.clone();
+        let legacy_triples = vec![
+            Triple::new(
+                legacy_plan.records[0].iri.clone(),
+                iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                iri(&format!("{EV}EvidenceRef")),
+            ),
+            Triple::new(
+                legacy_plan.records[0].iri.clone(),
+                iri(&format!("{EV}datasetId")),
+                Literal::new_simple_literal(ds.dataset_id().to_string()),
+            ),
+            Triple::new(
+                legacy_plan.records[0].iri.clone(),
+                iri(&format!("{EV}branchId")),
+                Literal::new_simple_literal(ds.dataset_id().to_string()),
+            ),
+            Triple::new(
+                legacy_plan.records[0].iri.clone(),
+                iri(&format!("{EV}commit")),
+                Literal::new_typed_literal(fc.to_string(), xsd::INTEGER),
+            ),
+            Triple::new(
+                legacy_plan.records[0].iri.clone(),
+                iri(&format!("{EV}expectedTriple")),
+                oxrdf::Term::Triple(Box::new(expected_triple)),
+            ),
+            Triple::new(
+                legacy_plan.records[0].iri.clone(),
+                iri(&format!("{EV}graphKind")),
+                iri(&format!("{EV}NamedGraph")),
+            ),
+            Triple::new(
+                legacy_plan.records[0].iri.clone(),
+                iri(&format!("{EV}graph")),
+                data_g,
+            ),
+            Triple::new(
+                legacy_plan.records[0].iri.clone(),
+                iri(&format!("{EV}reifier")),
+                reif,
+            ),
+        ];
+        let legacy_digest = sparkles_core::evidence::write::legacy_record_digest(
+            RecordKind::EvidenceRef,
+            &legacy_triples,
+            &Control::none(),
+        )
+        .unwrap();
+        assert_ne!(legacy_digest, legacy_plan.records[0].digest);
+        legacy_plan.records[0].digest = legacy_digest;
+
+        let cap = ds
+            .store()
+            .managed_writer(
+                sparkles::managed::OwnerKind::Evidence,
+                legacy_plan.operation,
+            )
+            .unwrap();
+        let mut t = ds
+            .store()
+            .try_write_with(
+                sparkles_core::commit::CommitKind::Transaction,
+                Default::default(),
+            )
+            .unwrap();
+        t.set_managed(cap).unwrap();
+        let (seq, time_ms) = t.managed_stamp().unwrap();
+        let quads = {
+            let cap = t.managed().unwrap();
+            legacy_plan
+                .quads(
+                    &sparkles_core::evidence::write::Stamp {
+                        dataset: ds.dataset_id(),
+                        branch: ds.dataset_id(),
+                        commit: seq,
+                        time_ms,
+                    },
+                    |g| cap.protection(g.as_str()),
+                    None,
+                    &[false],
+                )
+                .unwrap()
+        };
+        let mut labels = std::collections::HashMap::new();
+        for q in &quads {
+            let ids = t.encode_quad(q, &mut labels).unwrap();
+            t.insert(ids).unwrap();
+        }
+        t.commit().unwrap();
+
+        let bref = legacy_plan.records[0].iri.clone();
+        evidence::detach(&ds, CLAIMS).unwrap();
+        ds.update(&format!(
+            "PREFIX ev: <{EV}>
+             INSERT DATA {{ GRAPH <{CLAIMS}> {{
+                 <{b}> ev:expectedTriple <<( _:extra_legacy <https://example.org/p> \"v\" )>> .
+             }} }}",
+            b = bref.as_str(),
+        ))
+        .unwrap();
+        configure(&ds);
+        let head = ds.store().head_commit().seq;
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &reauth_options(),
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+        assert_eq!(ds.store().head_commit().seq, head);
+    }
+
+    // 3. Planting a bare blank node directly as `ev:expectedTriple` object -> refused.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let p = propose(&ds, &small_batch("bare-b", "r-bare-b"), &propose_options()).unwrap();
+        let claim = iri_of(&p, "claim");
+        evidence::detach(&ds, CLAIMS).unwrap();
+        ds.update(&format!(
+            "PREFIX ev: <{EV}>
+             INSERT DATA {{ GRAPH <{CLAIMS}> {{
+                 <{c}> ev:expectedTriple _:bare .
+             }} }}",
+            c = claim.as_str(),
+        ))
+        .unwrap();
+        configure(&ds);
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &reauth_options(),
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+    }
+}
+
+#[test]
+fn reauthenticate_refuses_detached_writes_planted_on_receipt_operation() {
+    // 1. Selective sibling reconciliation: attacker plants a forged `ev:Claim` with
+    //    `ev:availabilityReceipt <op1>` directly onto `<op1>` while detached, then admin
+    //    selectively reconciles untouched sibling `c1`. Must refuse with
+    //    `immutable-record-conflict` without moving head or authenticating `<op1>`.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let p = propose(&ds, &small_batch("rcpt-forged", "r-rf"), &propose_options()).unwrap();
+        let c1 = iri_of(&p, "claim");
+        let op1 = p.operation.clone();
+
+        evidence::detach(&ds, CLAIMS).unwrap();
+        ds.update(&format!(
+            "PREFIX ev: <{EV}>
+             PREFIX prov: <http://www.w3.org/ns/prov#>
+             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+             INSERT DATA {{ GRAPH <{CLAIMS}> {{
+                 <{op}> a ev:Claim ;
+                     ev:availabilityReceipt <{op}> ;
+                     prov:wasGeneratedBy <{op}> ;
+                     ev:recordDigest \"{d}\" ;
+                     rdf:reifies <<( <urn:forged:s> <urn:forged:p> \"evil\" )>> ;
+                     ev:claimKind ev:Reported ;
+                     ev:polarity ev:Positive ;
+                     prov:wasAttributedTo <https://example.org/evil> .
+             }} }}",
+            op = op1.as_str(),
+            d = sha256(b"forged-claim-on-receipt"),
+        ))
+        .unwrap();
+        configure(&ds);
+        let head = ds.store().head_commit().seq;
+        let mut sel = reauth_options();
+        sel.records = Some(vec![ReauthenticateRecord {
+            iri: c1,
+            expected_digest: None,
+        }]);
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &sel,
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+        assert_eq!(ds.store().head_commit().seq, head);
+        assert_eq!(
+            code(resolve_record(&ds, &ds, &op1, RecordKind::Claim)),
+            "origin-not-reproduced"
+        );
+    }
+
+    // 2. Whole-graph mode: planting `ev:operationKind ev:Reauthentication` or tampering
+    //    `ev:idempotencyKey` on a legitimate receipt while detached must refuse.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let mut popts = propose_options();
+        popts.idempotency_key = Some("rcpt-tamper-key".into());
+        let p = propose(&ds, &small_batch("rcpt-tamp", "r-rt"), &popts).unwrap();
+        let op1 = p.operation.clone();
+
+        evidence::detach(&ds, CLAIMS).unwrap();
+        ds.update(&format!(
+            "PREFIX ev: <{EV}>
+             INSERT DATA {{ GRAPH <{CLAIMS}> {{
+                 <{op}> ev:operationKind ev:Reauthentication ;
+                     ev:reauthenticatedGraph <{CLAIMS}> .
+             }} }}",
+            op = op1.as_str(),
+        ))
+        .unwrap();
+        configure(&ds);
+        let head = ds.store().head_commit().seq;
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &reauth_options(),
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+        assert_eq!(ds.store().head_commit().seq, head);
+    }
+
+    // 3. Whole-graph mode: deleting `ev:idempotencyKey` from a receipt while detached
+    //    must refuse with `immutable-record-conflict`.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let mut popts = propose_options();
+        popts.idempotency_key = Some("rcpt-del-key".into());
+        let p = propose(&ds, &small_batch("rcpt-del", "r-rd"), &popts).unwrap();
+        let op1 = p.operation.clone();
+
+        evidence::detach(&ds, CLAIMS).unwrap();
+        ds.update(&format!(
+            "PREFIX ev: <{EV}>
+             DELETE DATA {{ GRAPH <{CLAIMS}> {{
+                 <{op}> ev:idempotencyKey \"rcpt-del-key\" .
+             }} }}",
+            op = op1.as_str(),
+        ))
+        .unwrap();
+        configure(&ds);
+        let head = ds.store().head_commit().seq;
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &reauth_options(),
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+        assert_eq!(ds.store().head_commit().seq, head);
+    }
+}
+
+#[test]
+fn legacy_blank_node_proposal_supports_keyed_replay_and_equal_record_reuse_after_upgrade() {
+    let ds = memory_ds();
+    configure(&ds);
+    let data_g = iri("urn:data:legacy-upgrade");
+    let reif = iri("urn:reifier:legacy-upgrade-1");
+    ds.update(&format!(
+        "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+         INSERT DATA {{ GRAPH <{g}> {{
+             _:s <https://example.org/p> \"v\" .
+             <{r}> rdf:reifies <<( _:s <https://example.org/p> \"v\" )>> .
+         }} }}",
+        g = data_g.as_str(),
+        r = reif.as_str(),
+    ))
+    .unwrap();
+    let fc = ds.store().head_commit().seq;
+    let caller_triple = Triple::new(
+        oxrdf::BlankNode::new("pre_upgrade_caller_label").unwrap(),
+        iri("https://example.org/p"),
+        Literal::new_simple_literal("v"),
+    );
+    let batch = EvidenceInput {
+        references: vec![EvidenceRefInput {
+            version: RecordVersion::V1,
+            key: key("bref"),
+            occurrence_key: key("bref-upgrade-1"),
+            target: EvidenceRefTarget::StoredFact(sparkles_core::evidence::StoredFactRef {
+                dataset: ds.dataset_id(),
+                branch: ds.dataset_id(),
+                commit: fc,
+                graph: sparkles_core::evidence::GraphIdentity::Named(data_g.clone()),
+                expected: caller_triple.clone(),
+                anchor: Some(sparkles_core::evidence::BlankAnchor::Reifier(reif.clone())),
+            }),
+        }],
+        ..EvidenceInput::default()
+    };
+
+    // Publish the genuine old-format keyed proposal receipt & record whose `ev:recordDigest`
+    // was computed by the pre-upgrade raw-label `legacy_record_digest`.
+    let mut popts = propose_options();
+    popts.idempotency_key = Some("legacy-bnode-key-1".into());
+    let prepared = sparkles_core::evidence::prepare_input(&batch, &Control::none()).unwrap();
+    let mut legacy_plan = sparkles_core::evidence::write::plan(
+        &prepared,
+        ds.dataset_id(),
+        &settings(),
+        &sparkles_core::evidence::write::ProposalOptions {
+            principal: &popts.principal,
+            idempotency_key: popts.idempotency_key.as_deref(),
+            source_graph: None,
+            proposal_graph: None,
+            identity_graph: None,
+        },
+        &Control::none(),
+    )
+    .unwrap();
+    let bref_iri = legacy_plan.records[0].iri.clone();
+    let legacy_triples = vec![
+        Triple::new(
+            bref_iri.clone(),
+            iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            iri(&format!("{EV}EvidenceRef")),
+        ),
+        Triple::new(
+            bref_iri.clone(),
+            iri(&format!("{EV}datasetId")),
+            Literal::new_simple_literal(ds.dataset_id().to_string()),
+        ),
+        Triple::new(
+            bref_iri.clone(),
+            iri(&format!("{EV}branchId")),
+            Literal::new_simple_literal(ds.dataset_id().to_string()),
+        ),
+        Triple::new(
+            bref_iri.clone(),
+            iri(&format!("{EV}commit")),
+            Literal::new_typed_literal(fc.to_string(), xsd::INTEGER),
+        ),
+        Triple::new(
+            bref_iri.clone(),
+            iri(&format!("{EV}expectedTriple")),
+            oxrdf::Term::Triple(Box::new(caller_triple)),
+        ),
+        Triple::new(
+            bref_iri.clone(),
+            iri(&format!("{EV}graphKind")),
+            iri(&format!("{EV}NamedGraph")),
+        ),
+        Triple::new(bref_iri.clone(), iri(&format!("{EV}graph")), data_g.clone()),
+        Triple::new(bref_iri.clone(), iri(&format!("{EV}reifier")), reif.clone()),
+    ];
+    let legacy_digest = sparkles_core::evidence::write::legacy_record_digest(
+        RecordKind::EvidenceRef,
+        &legacy_triples,
+        &Control::none(),
+    )
+    .unwrap();
+    assert_ne!(legacy_digest, legacy_plan.records[0].digest);
+    legacy_plan.records[0].digest = legacy_digest;
+
+    let cap = ds
+        .store()
+        .managed_writer(
+            sparkles::managed::OwnerKind::Evidence,
+            legacy_plan.operation,
+        )
+        .unwrap();
+    let mut t = ds
+        .store()
+        .try_write_with(
+            sparkles_core::commit::CommitKind::Transaction,
+            Default::default(),
+        )
+        .unwrap();
+    t.set_managed(cap).unwrap();
+    let (seq, time_ms) = t.managed_stamp().unwrap();
+    let quads = {
+        let cap = t.managed().unwrap();
+        legacy_plan
+            .quads(
+                &sparkles_core::evidence::write::Stamp {
+                    dataset: ds.dataset_id(),
+                    branch: ds.dataset_id(),
+                    commit: seq,
+                    time_ms,
+                },
+                |g| cap.protection(g.as_str()),
+                Some(legacy_plan.operation),
+                &[false],
+            )
+            .unwrap()
+    };
+    let mut labels = std::collections::HashMap::new();
+    for q in &quads {
+        let ids = t.encode_quad(q, &mut labels).unwrap();
+        t.insert(ids).unwrap();
+    }
+    t.commit().unwrap();
+
+    // 1. Keyed replay BEFORE any detach succeeds and returns the recorded legacy digest.
+    let replayed = propose(&ds, &batch, &popts).unwrap();
+    assert!(replayed.replayed);
+    assert!(!replayed.committed);
+    assert_eq!(replayed.records[0].iri, bref_iri);
+    assert_eq!(replayed.records[0].digest, legacy_digest);
+
+    // 2. Equal-record reuse via a new proposal (different key) succeeds and returns the
+    //    recorded legacy digest with `existing: true`.
+    let mut reuse_opts = propose_options();
+    reuse_opts.idempotency_key = Some("legacy-bnode-reuse-1".into());
+    let reused = propose(&ds, &batch, &reuse_opts).unwrap();
+    assert!(!reused.replayed);
+    assert!(reused.records[0].existing);
+    assert_eq!(reused.records[0].iri, bref_iri);
+    assert_eq!(reused.records[0].digest, legacy_digest);
+
+    // 3. Different blank-node label that does not reproduce the legacy digest is refused.
+    let mut other_batch = batch.clone();
+    other_batch.references[0].target =
+        EvidenceRefTarget::StoredFact(sparkles_core::evidence::StoredFactRef {
+            dataset: ds.dataset_id(),
+            branch: ds.dataset_id(),
+            commit: fc,
+            graph: sparkles_core::evidence::GraphIdentity::Named(data_g),
+            expected: Triple::new(
+                oxrdf::BlankNode::new("different_caller_label").unwrap(),
+                iri("https://example.org/p"),
+                Literal::new_simple_literal("v"),
+            ),
+            anchor: Some(sparkles_core::evidence::BlankAnchor::Reifier(reif)),
+        });
+    assert_eq!(
+        code(propose(&ds, &other_batch, &propose_options())),
+        "immutable-record-conflict"
+    );
+
+    // 4. After detach, re-protect, and re-authentication (which preserves `legacy_digest`),
+    //    both keyed replay and equal-record reuse continue to succeed with `legacy_digest`.
+    evidence::detach(&ds, CLAIMS).unwrap();
+    configure(&ds);
+    let rec = evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &reauth_options(), &Control::none())
+        .unwrap();
+    assert!(rec.committed);
+    assert_eq!(rec.records[0].digest, legacy_digest);
+
+    let replayed_after = propose(&ds, &batch, &popts).unwrap();
+    assert!(replayed_after.replayed);
+    assert_eq!(replayed_after.records[0].digest, legacy_digest);
+
+    let mut reuse_after_opts = propose_options();
+    reuse_after_opts.idempotency_key = Some("legacy-bnode-reuse-2".into());
+    let reused_after = propose(&ds, &batch, &reuse_after_opts).unwrap();
+    assert!(reused_after.records[0].existing);
+    assert_eq!(reused_after.records[0].digest, legacy_digest);
+}
+
+#[test]
+fn reauthenticate_resolves_non_main_parent_record_and_audit_at_fork_boundary_and_rejects_unrelated_branch()
+ {
+    // 1. Parent branch `b1` (forked from `main`) publishes a claim at `seq`, then `CLAIMS`
+    //    is detached and re-protected while `b1` stays at `seq`. Child `b2` forks from `b1`
+    //    at `Head` (`from = (b1, seq)`), and nested `b3` forks from `b2` at `Head`.
+    //    Re-authenticating on `b2` and `b3` must resolve `b1`'s original publication view!
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        ds.create_branch("b1", &Default::default()).unwrap();
+        let b1 = ds.branch("b1").unwrap();
+        let p = evidence::propose(
+            None,
+            &ds,
+            &b1,
+            &small_batch("b1-claim", "r-b1"),
+            &propose_options(),
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+        let claim = iri_of(&p, "claim");
+
+        // Detach and re-protect while b1 is STILL at the publication commit `seq`.
+        evidence::detach(&ds, CLAIMS).unwrap();
+        configure(&ds);
+
+        // Fork b2 from b1 at Head (exact publication boundary), and b3 from b2 at Head.
+        ds.create_branch(
+            "b2",
+            &sparkles::branch::BranchOptions {
+                from: "b1".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        ds.create_branch(
+            "b3",
+            &sparkles::branch::BranchOptions {
+                from: "b2".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let b2 = ds.branch("b2").unwrap();
+        let b3 = ds.branch("b3").unwrap();
+
+        let res2 =
+            evidence::reauthenticate(&ds, &b2, &iri(CLAIMS), &reauth_options(), &Control::none())
+                .unwrap();
+        assert!(res2.committed);
+        assert_eq!(res2.records.len(), 1);
+        assert_eq!(res2.records[0].iri, claim);
+        assert!(resolve_record(&ds, &b2, &claim, RecordKind::Claim).is_ok());
+
+        let res3 =
+            evidence::reauthenticate(&ds, &b3, &iri(CLAIMS), &reauth_options(), &Control::none())
+                .unwrap();
+        assert!(res3.committed);
+        assert_eq!(res3.records.len(), 1);
+        assert_eq!(res3.records[0].iri, claim);
+        assert!(resolve_record(&ds, &b3, &claim, RecordKind::Claim).is_ok());
+    }
+
+    // 2. Parent-authored reconciliation audit inherited at the exact fork boundary after
+    //    a subsequent detach/re-protect.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        ds.create_branch("b1", &Default::default()).unwrap();
+        let b1 = ds.branch("b1").unwrap();
+        let p = evidence::propose(
+            None,
+            &ds,
+            &b1,
+            &small_batch("b1-audit", "r-b1-a"),
+            &propose_options(),
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+        let claim = iri_of(&p, "claim");
+
+        // Detach #1 -> N2, reconcile on b1 (creates audit commit A on b1 under N2).
+        evidence::detach(&ds, CLAIMS).unwrap();
+        configure(&ds);
+        let r1 =
+            evidence::reauthenticate(&ds, &b1, &iri(CLAIMS), &reauth_options(), &Control::none())
+                .unwrap();
+        assert!(r1.committed);
+
+        // Detach #2 -> N3 while b1 is STILL at audit commit A, then fork b2 from b1 at Head.
+        evidence::detach(&ds, CLAIMS).unwrap();
+        configure(&ds);
+        ds.create_branch(
+            "b2",
+            &sparkles::branch::BranchOptions {
+                from: "b1".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let b2 = ds.branch("b2").unwrap();
+
+        // Re-authenticating on b2 under N3 must trace b1's audit commit A at the exact fork
+        // boundary and succeed!
+        let r2 =
+            evidence::reauthenticate(&ds, &b2, &iri(CLAIMS), &reauth_options(), &Control::none())
+                .unwrap();
+        assert!(r2.committed);
+        assert_eq!(r2.records[0].iri, claim);
+        assert!(resolve_record(&ds, &b2, &claim, RecordKind::Claim).is_ok());
+    }
+
+    // 3. Same-sequence commit on an unrelated branch must be refused as
+    //    `origin-not-reproduced` (ancestry is proven from the branch table, never a
+    //    `(timestamp_ms, quads)` heuristic).
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        ds.create_branch("branch-a", &Default::default()).unwrap();
+        ds.create_branch("branch-b", &Default::default()).unwrap();
+        let ba = ds.branch("branch-a").unwrap();
+        let bb = ds.branch("branch-b").unwrap();
+
+        // Publish a genuine claim on branch-a at commit seq S.
+        let pa = evidence::propose(
+            None,
+            &ds,
+            &ba,
+            &small_batch("same-seq", "r-same-seq"),
+            &propose_options(),
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+        let claim_a = iri_of(&pa, "claim");
+        let op_a = pa.operation.clone();
+
+        // Copy the exact triples of `claim_a` and `op_a` onto `branch-b` while detached at
+        // the SAME commit sequence number `S` (so `branch-b` has a commit at `S`, and
+        // `branch-a` has a protected commit at `S`, yet `branch-a` is NOT an ancestor of
+        // `branch-b`!).
+        let copied_quads: Vec<oxrdf::Quad> = {
+            let mut out = Vec::new();
+            let snap = ba.store().snapshot();
+            let prep = sparkles_core::access::Preparation::new(Control::none(), 16 << 20).unwrap();
+            let mut reads = sparkles_core::evidence::write::Reads::new(&prep, &snap);
+            for subj in [claim_a.as_str(), op_a.as_str()] {
+                let (objs, _) = reads
+                    .objects_up_to(
+                        subj,
+                        "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                        CLAIMS,
+                        10,
+                    )
+                    .unwrap();
+                assert!(!objs.is_empty());
+            }
+            // Extract all quads of CLAIMS from ba using a SPARQL CONSTRUCT query.
+            let res = ba
+                .query(&format!(
+                    "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{CLAIMS}> {{ ?s ?p ?o }} }}"
+                ))
+                .unwrap();
+            for tr in res.triples() {
+                out.push(oxrdf::Quad::new(
+                    tr.subject.clone(),
+                    tr.predicate.clone(),
+                    tr.object.clone(),
+                    oxrdf::GraphName::NamedNode(iri(CLAIMS)),
+                ));
+            }
+            out
+        };
+        evidence::detach(&ds, CLAIMS).unwrap();
+        {
+            let mut t = bb.store().write();
+            let mut labels = std::collections::HashMap::new();
+            for q in &copied_quads {
+                let ids = t.encode_quad(q, &mut labels).unwrap();
+                t.insert(ids).unwrap();
+            }
+            t.commit().unwrap();
+        }
+        assert_eq!(
+            bb.store().head_commit().seq,
+            ba.store().head_commit().seq,
+            "branch-b and branch-a must be at the exact same commit sequence"
+        );
+        configure(&ds);
+
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &bb,
+                &iri(CLAIMS),
+                &reauth_options(),
+                &Control::none(),
+            )),
+            "origin-not-reproduced"
+        );
+    }
+}
+
+#[test]
+fn review_replay_refuses_missing_sibling_support_after_detach_and_allows_non_projected() {
+    // 1. Multi-support keyed review: delete `sup2` while `SUPPORTS` is detached, then
+    //    re-protect and selectively reconcile `sup1` (moving the shared receipt to
+    //    `current_nonce`). Replay MUST refuse with `immutable-record-conflict`, NOT
+    //    silently return `support: None` for `d2`!
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let p1 = propose(&ds, &small_batch("ms1", "rms1"), &propose_options()).unwrap();
+        let p2 = propose(&ds, &small_batch("ms2", "rms2"), &propose_options()).unwrap();
+        let decisions = vec![
+            DecisionInput {
+                key: "d1".into(),
+                target: iri_of(&p1, "claim"),
+                target_digest: digest_of(&p1, "claim"),
+                disposition: Disposition::Accepted,
+                supersedes: None,
+            },
+            DecisionInput {
+                key: "d2".into(),
+                target: iri_of(&p2, "claim"),
+                target_digest: digest_of(&p2, "claim"),
+                disposition: Disposition::Accepted,
+                supersedes: None,
+            },
+        ];
+        let mut ropts = ReviewOptions::new(iri("urn:x-sparkles:principal:reviewer"));
+        ropts.if_head = Some(ds.store().head_commit().seq);
+        ropts.idempotency_key = Some("review-missing-sup-1".into());
+        let rev = evidence::review(
+            None,
+            &ds,
+            &ds,
+            "advisories",
+            1,
+            &decisions,
+            &ropts,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+        let sup1 = rev.decisions[0].support.clone().unwrap();
+        let sup2 = rev.decisions[1].support.clone().unwrap();
+
+        evidence::detach(&ds, SUPPORTS).unwrap();
+        ds.update(&format!(
+            "DELETE WHERE {{ GRAPH <{SUPPORTS}> {{ <{s2}> ?p ?o }} }}",
+            s2 = sup2.as_str(),
+        ))
+        .unwrap();
+        configure(&ds);
+
+        let mut sel = reauth_options();
+        sel.records = Some(vec![ReauthenticateRecord {
+            iri: sup1,
+            expected_digest: None,
+        }]);
+        assert!(
+            evidence::reauthenticate(&ds, &ds, &iri(SUPPORTS), &sel, &Control::none())
+                .unwrap()
+                .committed
+        );
+        assert_eq!(
+            code(evidence::review(
+                None,
+                &ds,
+                &ds,
+                "advisories",
+                1,
+                &decisions,
+                &ropts,
+                &mut |_, _| all(),
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+    }
+
+    // 2. Keyed review mixing an accepted projected claim and a rejected claim (no support
+    //    originally produced) still replays cleanly with `support: None` for the rejected one.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let p1 = propose(&ds, &small_batch("mix1", "rmix1"), &propose_options()).unwrap();
+        let p2 = propose(&ds, &small_batch("mix2", "rmix2"), &propose_options()).unwrap();
+        let decisions = vec![
+            DecisionInput {
+                key: "d1".into(),
+                target: iri_of(&p1, "claim"),
+                target_digest: digest_of(&p1, "claim"),
+                disposition: Disposition::Accepted,
+                supersedes: None,
+            },
+            DecisionInput {
+                key: "d2".into(),
+                target: iri_of(&p2, "claim"),
+                target_digest: digest_of(&p2, "claim"),
+                disposition: Disposition::Rejected,
+                supersedes: None,
+            },
+        ];
+        let mut ropts = ReviewOptions::new(iri("urn:x-sparkles:principal:reviewer"));
+        ropts.if_head = Some(ds.store().head_commit().seq);
+        ropts.idempotency_key = Some("review-mixed-proj-1".into());
+        let first = evidence::review(
+            None,
+            &ds,
+            &ds,
+            "advisories",
+            1,
+            &decisions,
+            &ropts,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+        let replay = evidence::review(
+            None,
+            &ds,
+            &ds,
+            "advisories",
+            1,
+            &decisions,
+            &ropts,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.decisions[0].support, first.decisions[0].support);
+        assert!(replay.decisions[0].support.is_some());
+        assert_eq!(replay.decisions[1].support, None);
+    }
+}
+
+#[test]
+fn reauthenticate_replay_and_lineage_enforce_full_audit_identity() {
+    // 1. Replay refuses an audit operation that also has untyped triples in another
+    //    record graph.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let _p = propose(&ds, &small_batch("aud-cg", "r-acg"), &propose_options()).unwrap();
+        evidence::detach(&ds, CLAIMS).unwrap();
+        configure(&ds);
+        let mut opts = reauth_options();
+        opts.idempotency_key = Some("audit-cross-graph-1".into());
+        let first =
+            evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &opts, &Control::none()).unwrap();
+        assert!(first.committed);
+
+        // Detach SOURCES (leaving CLAIMS's protection intact!) and plant an untyped
+        // triple on `first.operation` in SOURCES.
+        evidence::detach(&ds, SOURCES).unwrap();
+        ds.update(&format!(
+            "INSERT DATA {{ GRAPH <{SOURCES}> {{ <{op}> <urn:extra> \"1\" }} }}",
+            op = first.operation.as_str(),
+        ))
+        .unwrap();
+        configure(&ds);
+
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &opts,
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+    }
+
+    // 2. Replay refuses an audit operation with a missing `ev:branchId` (does not fall
+    //    back to the requested branch).
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let _p = propose(&ds, &small_batch("aud-br", "r-abr"), &propose_options()).unwrap();
+        evidence::detach(&ds, CLAIMS).unwrap();
+        configure(&ds);
+        let mut opts = reauth_options();
+        opts.idempotency_key = Some("audit-branch-1".into());
+        let first =
+            evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &opts, &Control::none()).unwrap();
+        assert!(first.committed);
+
+        // Remove `ev:branchId` from the audit operation using a managed write under the
+        // current protection so the operation still carries `current_nonce`.
+        let cap = ds
+            .store()
+            .managed_writer(sparkles::managed::OwnerKind::Evidence, uuid::Uuid::new_v4())
+            .unwrap();
+        let mut t = ds
+            .store()
+            .try_write_with(
+                sparkles_core::commit::CommitKind::Transaction,
+                Default::default(),
+            )
+            .unwrap();
+        t.set_managed(cap).unwrap();
+        let q = oxrdf::Quad::new(
+            first.operation.clone(),
+            iri(&format!("{EV}branchId")),
+            Literal::new_simple_literal(ds.dataset_id().to_string()),
+            oxrdf::GraphName::NamedNode(iri(CLAIMS)),
+        );
+        let mut labels = std::collections::HashMap::new();
+        let ids = t.encode_quad(&q, &mut labels).unwrap();
+        t.delete(ids).unwrap();
+        t.commit().unwrap();
+
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &opts,
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+    }
+
+    // 3. Multi-detach lineage refuses an audit operation whose `prov:wasAssociatedWith`
+    //    was altered while detached.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let _p = propose(&ds, &small_batch("aud-lin", "r-alin"), &propose_options()).unwrap();
+        // Detach #1 -> N2, reconcile under N2.
+        evidence::detach(&ds, CLAIMS).unwrap();
+        configure(&ds);
+        let r1 =
+            evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &reauth_options(), &Control::none())
+                .unwrap();
+        assert!(r1.committed);
+
+        // Detach #2 -> alter `prov:wasAssociatedWith` on the N2 audit op, then re-protect N3.
+        evidence::detach(&ds, CLAIMS).unwrap();
+        ds.update(&format!(
+            "PREFIX prov: <http://www.w3.org/ns/prov#>
+             DELETE {{ GRAPH <{CLAIMS}> {{ <{op}> prov:wasAssociatedWith ?a }} }}
+             INSERT {{ GRAPH <{CLAIMS}> {{ <{op}> prov:wasAssociatedWith <urn:x-sparkles:principal:tampered> }} }}
+             WHERE {{ GRAPH <{CLAIMS}> {{ <{op}> prov:wasAssociatedWith ?a }} }}",
+            op = r1.operation.as_str(),
+        ))
+        .unwrap();
+        configure(&ds);
+
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &reauth_options(),
+                &Control::none(),
+            )),
+            "origin-not-reproduced"
+        );
+    }
+}
