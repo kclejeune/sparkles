@@ -713,6 +713,7 @@ pub(super) fn review(
             payload_digest: payload,
             principal: options.principal.clone(),
             idempotency_key: options.idempotency_key.clone(),
+            used: None,
             graphs: Vec::new(),
             records: Vec::new(),
         };
@@ -961,6 +962,7 @@ pub(super) fn review(
         payload_digest: payload,
         principal: options.principal.clone(),
         idempotency_key: options.idempotency_key.clone(),
+        used: None,
         graphs: vec![m.decisions.0.clone()],
         records: Vec::new(),
     };
@@ -1022,6 +1024,7 @@ pub(super) fn review(
         logical,
         capability,
         r.if_head,
+        None,
         &batch,
         &skip,
         &changes,

@@ -994,6 +994,7 @@ impl Plan {
                 payload_digest: self.payload_digest,
                 idempotency_key: self.idempotency_key.as_deref(),
                 hold,
+                used: None,
             },
             &self.graphs,
             &self.records,
@@ -1022,6 +1023,7 @@ pub(super) struct Operation<'a> {
     pub(super) payload_digest: Sha256Digest,
     pub(super) idempotency_key: Option<&'a str>,
     pub(super) hold: Option<Uuid>,
+    pub(super) used: Option<&'a NamedNode>,
 }
 
 /// The operation's description in every graph of `graphs`, each with that graph's
@@ -1071,6 +1073,9 @@ pub(super) fn publish_quads(
         }
         if let Some(h) = op.hold {
             quad(iri, ev("sourceHold"), string(&h.to_string()), g);
+        }
+        if let Some(u) = op.used {
+            quad(iri, prov("used"), u.clone().into(), g);
         }
     }
     for (i, r) in records.iter().enumerate() {
@@ -1167,6 +1172,37 @@ pub enum ExistingRecord {
     },
     /// The identity has content in more than one graph.
     Many,
+}
+
+/// Conservative heap byte charge for a retained [`NamedOrBlankNode`], computed without
+/// allocating.
+fn subject_bytes(subject: &NamedOrBlankNode) -> u64 {
+    match subject {
+        NamedOrBlankNode::NamedNode(n) => (n.as_str().len() as u64).saturating_add(32),
+        NamedOrBlankNode::BlankNode(b) => (b.as_str().len() as u64).saturating_add(32),
+    }
+}
+
+/// Conservative heap byte charge for a retained [`Term`], computed without allocating.
+pub fn term_bytes(term: &Term) -> u64 {
+    match term {
+        Term::NamedNode(n) => (n.as_str().len() as u64).saturating_add(32),
+        Term::BlankNode(b) => (b.as_str().len() as u64).saturating_add(32),
+        Term::Literal(l) => (l.value().len() as u64)
+            .saturating_add(l.datatype().as_str().len() as u64)
+            .saturating_add(l.language().map_or(0, |s| s.len() as u64))
+            .saturating_add(64),
+        Term::Triple(t) => triple_bytes(t).saturating_add(64),
+    }
+}
+
+/// Conservative heap byte charge for a retained [`Triple`], computed without allocating.
+pub fn triple_bytes(triple: &Triple) -> u64 {
+    subject_bytes(&triple.subject)
+        .saturating_add(triple.predicate.as_str().len() as u64)
+        .saturating_add(32)
+        .saturating_add(term_bytes(&triple.object))
+        .saturating_add(std::mem::size_of::<Triple>() as u64)
 }
 
 /// A graph's stored quad with its physical `[Id; 4]` and decoded triple.
@@ -1387,8 +1423,8 @@ impl<'a> Reads<'a> {
     }
 
     /// Up to `limit` quads of graph `g`, returning each quad's physical `[Id; 4]` and
-    /// decoded triple, plus whether more quads exist in `g`. The scan buffer and every
-    /// retained triple are charged to the preparation before allocation.
+    /// decoded triple, plus whether more quads exist in `g`. The scan buffer, the
+    /// output buffer and every retained term are charged before allocation.
     pub fn graph_quads_up_to(
         &mut self,
         g: &str,
@@ -1400,6 +1436,8 @@ impl<'a> Reads<'a> {
         };
         const ROW: u64 = std::mem::size_of::<[Id; 4]>() as u64;
         const CHUNK: usize = 4096;
+        const OUT_ROW: u64 = std::mem::size_of::<StoredQuad>() as u64;
+        const OUT_CHUNK: usize = 1024;
         let mut rows_held = self.preparation.reserve(0)?;
         let mut rows: Vec<[Id; 4]> = Vec::new();
         let mut more = false;
@@ -1416,34 +1454,47 @@ impl<'a> Reads<'a> {
                 rows.push(q);
                 Ok(true)
             })?;
-        let mut out = Vec::with_capacity(rows.len());
+        let mut out: Vec<StoredQuad> = Vec::new();
         for q in rows {
-            let subject = match self
-                .preparation
-                .with_term(self.snap, q[0], |t| Ok(t.cloned()))?
-            {
-                Some(Term::NamedNode(n)) => NamedOrBlankNode::NamedNode(n),
-                Some(Term::BlankNode(b)) => NamedOrBlankNode::BlankNode(b),
-                _ => continue,
-            };
-            let Some(Term::NamedNode(predicate)) =
-                self.preparation
-                    .with_term(self.snap, q[1], |t| Ok(t.cloned()))?
-            else {
+            if out.len() == out.capacity() {
+                held.grow_by(OUT_CHUNK as u64 * OUT_ROW)?;
+                out.reserve_exact(OUT_CHUNK);
+            }
+            let subject = self.preparation.with_term(self.snap, q[0], |t| match t {
+                Some(Term::NamedNode(n)) => {
+                    held.grow_by((n.as_str().len() as u64).saturating_add(32))?;
+                    Ok(Some(NamedOrBlankNode::NamedNode(n.clone())))
+                }
+                Some(Term::BlankNode(b)) => {
+                    held.grow_by((b.as_str().len() as u64).saturating_add(32))?;
+                    Ok(Some(NamedOrBlankNode::BlankNode(b.clone())))
+                }
+                _ => Ok(None),
+            })?;
+            let Some(subject) = subject else {
                 continue;
             };
-            let Some(object) = self
-                .preparation
-                .with_term(self.snap, q[2], |t| Ok(t.cloned()))?
-            else {
+            let predicate = self.preparation.with_term(self.snap, q[1], |t| match t {
+                Some(Term::NamedNode(n)) => {
+                    held.grow_by((n.as_str().len() as u64).saturating_add(32))?;
+                    Ok(Some(n.clone()))
+                }
+                _ => Ok(None),
+            })?;
+            let Some(predicate) = predicate else {
                 continue;
             };
-            let triple = Triple::new(subject, predicate, object);
-            let bytes = (triple.to_string().len() as u64)
-                .saturating_mul(4)
-                .saturating_add(128);
-            held.grow_by(bytes)?;
-            out.push((q, triple));
+            let object = self.preparation.with_term(self.snap, q[2], |t| match t {
+                Some(term) => {
+                    held.grow_by(term_bytes(term))?;
+                    Ok(Some(term.clone()))
+                }
+                None => Ok(None),
+            })?;
+            let Some(object) = object else {
+                continue;
+            };
+            out.push((q, Triple::new(subject, predicate, object)));
         }
         Ok((out, more))
     }

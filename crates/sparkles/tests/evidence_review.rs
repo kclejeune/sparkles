@@ -1159,14 +1159,18 @@ fn reconciling_after_output_detach_rebuilds_from_vouched_supports() {
     )
     .unwrap();
 
-    // Detach OUTPUT, delete A's triple, inject bogus ground + blank-node triples and
-    // re-insert withdrawn C's triple, then re-protect OUTPUT.
+    // Detach OUTPUT, delete A's triple, inject bogus ground, blank-node subject,
+    // blank-node object, triple-term with blank node, CDT literal with blank node,
+    // and re-inserted withdrawn C's triple, then re-protect OUTPUT.
     evidence::detach(&ds, OUTPUT).unwrap();
     ds.update(&format!(
         "DELETE DATA {{ GRAPH <{OUTPUT}> {{ <urn:release> <urn:affectedBy> <urn:cve1> }} }} ; \
          INSERT DATA {{ GRAPH <{OUTPUT}> {{ \
              <urn:bogus> <urn:p> \"tampered\" . \
              _:b0 <urn:p> \"blank-tampered\" . \
+             <urn:bogus> <urn:blankObj> _:b1 . \
+             <urn:bogus> <urn:nested> <<( _:b2 <urn:q> <urn:r> )>> . \
+             <urn:bogus> <urn:cdt> \"[_:a]\"^^<http://w3id.org/awslabs/neptune/SPARQL-CDTs/List> . \
              <urn:release> <urn:affectedBy> <urn:cve3> \
          }} }}"
     ))
@@ -1220,7 +1224,7 @@ fn reconciling_after_output_detach_rebuilds_from_vouched_supports() {
     assert!(!preview.committed && !preview.replayed);
     assert!(preview.preview.is_some());
     assert_eq!(preview.changed.inserted.len(), 1);
-    assert_eq!(preview.changed.removed.len(), 3);
+    assert_eq!(preview.changed.removed.len(), 6);
     assert_eq!(ds.store().head_commit().seq, head);
 
     // Real reconciliation with idempotency key.
@@ -1234,7 +1238,7 @@ fn reconciling_after_output_detach_rebuilds_from_vouched_supports() {
     expected_supports.sort_by(|x, y| x.as_str().cmp(y.as_str()));
     assert_eq!(rec.vouched_supports, expected_supports);
     assert_eq!(rec.changed.inserted.len(), 1);
-    assert_eq!(rec.changed.removed.len(), 3);
+    assert_eq!(rec.changed.removed.len(), 6);
     assert_eq!(
         accepted(&ds),
         vec![
@@ -1564,6 +1568,45 @@ fn reconciliation_refusals_branches_and_restart_durability() {
         ),
         Err(sparkles::Error::NotPermitted(_))
     ));
+    {
+        use sparkles::access::triples::{Caller, Limits, Protection, Rule, TripleRules};
+        let masked = Some(Arc::new(GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::All,
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "propositions".into(),
+                        predicates: Some(vec![
+                            "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies".into(),
+                        ]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: None,
+                        pattern: None,
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Limits::default(),
+            },
+        )));
+        assert!(matches!(
+            evidence::reconcile_projection(
+                &ds,
+                &ds,
+                "main",
+                None,
+                &reviewer(),
+                masked,
+                &Control::none()
+            ),
+            Err(sparkles::Error::NotPermitted(_))
+        ));
+    }
 
     // Reconciling "main" on main restores "main" while "second" and branch "dev" stay unavailable.
     reconcile(&ds, "main", Some(1), &reviewer()).unwrap();
@@ -1624,5 +1667,394 @@ fn reconciliation_refusals_branches_and_restart_durability() {
     assert_eq!(
         code(reconcile(&ds, "main", Some(1), &reviewer())),
         "projection-unavailable"
+    );
+}
+
+/// Full compaction publishes a fresh generation at the same commit, remapping delta
+/// and base physical IDs. Reconciliation fences on `generation.uid` before applying
+/// physical deletes, refusing with `head-changed` (both dry run and live) rather than
+/// dropping stray quads or touching unrelated quads, and succeeds cleanly on retry.
+#[test]
+fn reconciling_refuses_when_compaction_runs_between_scan_and_publish() {
+    let ds = configured(ConflictMode::Refuse);
+    let a = claim_of(&propose(
+        &ds,
+        &occurrence_with("s1", "urn:cve1", Polarity::Positive),
+    ));
+    review(&ds, &[decision("a", &a, Disposition::Accepted, None)]).unwrap();
+    // Compact once so A's triple lives in base vocab, then inject stray delta quads.
+    ds.compact().unwrap();
+
+    evidence::detach(&ds, OUTPUT).unwrap();
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{OUTPUT}> {{ \
+             <urn:stray> <urn:p> \"delta-stray\" . \
+             _:b0 <urn:p> \"blank-stray\" \
+         }} }}"
+    ))
+    .unwrap();
+    evidence::configure(&ds, &settings(ConflictMode::Refuse), &Control::none()).unwrap();
+
+    let head_before = ds.store().head_commit().seq;
+    let gen_before = ds.store().snapshot().generation.uid;
+    let proj_count_before = count(&ds, "Projection", SUPPORTS);
+
+    // Compact between scan and publish while keeping the branch commit unchanged.
+    let ds_hook = ds.clone();
+    let compacted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let compacted_hook = compacted.clone();
+    ds.store().set_failpoint(
+        "evidence-reconcile-before-publish",
+        Some(Arc::new(move |_| {
+            if !compacted_hook.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                ds_hook.store().compact().unwrap();
+            }
+        })),
+    );
+    assert_eq!(
+        code(reconcile(&ds, "main", Some(1), &reviewer())),
+        "head-changed"
+    );
+    ds.store()
+        .set_failpoint("evidence-reconcile-before-publish", None);
+
+    assert!(compacted.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(ds.store().head_commit().seq, head_before);
+    assert_ne!(ds.store().snapshot().generation.uid, gen_before);
+    assert_eq!(count(&ds, "Projection", SUPPORTS), proj_count_before);
+    // Both stray quads and A's retained triple are still untouched.
+    assert!(
+        ds.ask(&format!(
+            "ASK {{ GRAPH <{OUTPUT}> {{ <urn:stray> <urn:p> \"delta-stray\" }} }}"
+        ))
+        .unwrap()
+    );
+    assert!(
+        ds.ask(&format!(
+            "ASK {{ GRAPH <{OUTPUT}> {{ <urn:release> <urn:affectedBy> <urn:cve1> }} }}"
+        ))
+        .unwrap()
+    );
+
+    // Retrying on the compacted generation succeeds cleanly and removes both stray quads.
+    let rec = reconcile(&ds, "main", Some(1), &reviewer()).unwrap();
+    assert!(rec.committed);
+    assert_eq!(rec.changed.removed.len(), 2);
+    assert!(rec.changed.inserted.is_empty());
+    assert_eq!(
+        accepted(&ds),
+        vec!["<urn:release> <urn:affectedBy> <urn:cve1>".to_string()]
+    );
+}
+
+/// Swapping the continuously protected outputs of two review policies without raising
+/// their policy versions is refused as `projection-unavailable`, leaving both outputs
+/// and the branch head untouched.
+#[test]
+fn same_version_output_swap_between_policies_is_refused() {
+    let ds = Dataset::memory();
+    let output2 = "urn:ev:accepted2";
+    let mut s = settings(ConflictMode::Refuse);
+    s.projections.push(output2.into());
+    s.policies.insert(
+        "second".into(),
+        Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported],
+            required_scope: Vec::new(),
+            conflicts: ConflictMode::Refuse,
+            boundary: vec![SOURCES.into(), CLAIMS.into()],
+            decisions: DECISIONS.into(),
+            supports: SUPPORTS.into(),
+            output: output2.into(),
+        },
+    );
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+
+    let a = claim_of(&propose(
+        &ds,
+        &occurrence_with("s1", "urn:cve1", Polarity::Positive),
+    ));
+    let b = claim_of(&propose(
+        &ds,
+        &occurrence_with("s2", "urn:cve2", Polarity::Positive),
+    ));
+    review(&ds, &[decision("a", &a, Disposition::Accepted, None)]).unwrap();
+    let mut o = reviewer();
+    o.if_head = Some(ds.store().head_commit().seq);
+    evidence::review(
+        None,
+        &ds,
+        &ds,
+        "second",
+        1,
+        &[decision("b", &b, Disposition::Accepted, None)],
+        &o,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+
+    // Swap outputs between "main" and "second" at version 1 while keeping both protected.
+    let mut swapped = s.clone();
+    swapped.policies.get_mut("main").unwrap().output = output2.into();
+    swapped.policies.get_mut("second").unwrap().output = OUTPUT.into();
+    evidence::configure(&ds, &swapped, &Control::none()).unwrap();
+
+    let head = ds.store().head_commit().seq;
+    assert_eq!(
+        code(reconcile(&ds, "main", Some(1), &reviewer())),
+        "projection-unavailable"
+    );
+    assert_eq!(
+        code(reconcile(&ds, "second", Some(1), &reviewer())),
+        "projection-unavailable"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+    assert_eq!(
+        accepted(&ds),
+        vec!["<urn:release> <urn:affectedBy> <urn:cve1>".to_string()]
+    );
+    assert!(
+        ds.ask(&format!(
+            "ASK {{ GRAPH <{output2}> {{ <urn:release> <urn:affectedBy> <urn:cve2> }} }}"
+        ))
+        .unwrap()
+    );
+}
+
+/// Output staging charges per-change graph-name copies and retained triples under the
+/// shared 64 MiB allowance, refusing with `incomplete-evidence` before staging a write
+/// when a long output IRI with many stray triples would exceed the cap.
+#[test]
+fn reconciling_refuses_with_incomplete_evidence_under_long_output_iri_budget() {
+    let ds = Dataset::memory();
+    let long_output = format!("urn:ev:{}", "a".repeat(3900));
+    let mut s = settings(ConflictMode::Refuse);
+    s.projections = vec![long_output.clone()];
+    s.policies.get_mut("main").unwrap().output = long_output.clone();
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+
+    let a = claim_of(&propose(
+        &ds,
+        &occurrence_with("s1", "urn:cve1", Polarity::Positive),
+    ));
+    review(&ds, &[decision("a", &a, Disposition::Accepted, None)]).unwrap();
+
+    evidence::detach(&ds, &long_output).unwrap();
+    // Insert 10,000 stray triples: each removal carries ~8 KiB of graph-name copies
+    // plus triple storage, exceeding the 64 MiB allowance before staging.
+    let mut nq = String::with_capacity(10_000 * (long_output.len() + 48));
+    for i in 0..10_000 {
+        nq.push_str(&format!("<urn:s:{i}> <urn:p> \"x\" <{long_output}> .\n"));
+    }
+    ds.load_str(&nq, oxrdfio::RdfFormat::NQuads).unwrap();
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+
+    let head = ds.store().head_commit().seq;
+    assert_eq!(
+        code(reconcile(&ds, "main", Some(1), &reviewer())),
+        "incomplete-evidence"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+}
+
+/// Keyed replay of a healthy-projection reuse records `prov:used` on the operation and
+/// returns the original commit, projection IRI, policy version and output graph even
+/// after a later output rotation/reconciliation and after a policy version + output change.
+#[test]
+fn keyed_replay_of_reused_projection_preserves_original_receipt() {
+    let ds = configured(ConflictMode::Refuse);
+    let a = claim_of(&propose(
+        &ds,
+        &occurrence_with("s1", "urn:cve1", Polarity::Positive),
+    ));
+    review(&ds, &[decision("a", &a, Disposition::Accepted, None)]).unwrap();
+
+    // First keyed reconciliation reuses the healthy v1 projection (omitting policyVersion).
+    let mut opts = reviewer();
+    opts.idempotency_key = Some("noop-replay-key".into());
+    let first = reconcile(&ds, "main", None, &opts).unwrap();
+    assert!(first.committed && !first.replayed);
+    assert_eq!(first.policy_version, 1);
+    assert_eq!(first.output.as_str(), OUTPUT);
+
+    // Rotate OUTPUT protection and reconcile again (creating a superseding v1 projection).
+    evidence::detach(&ds, OUTPUT).unwrap();
+    evidence::configure(&ds, &settings(ConflictMode::Refuse), &Control::none()).unwrap();
+    let second = reconcile(&ds, "main", Some(1), &reviewer()).unwrap();
+    assert_ne!(second.projection, first.projection);
+
+    // Replaying the original key still returns the original v1 projection and commit.
+    let replay_after_rotate = reconcile(&ds, "main", None, &opts).unwrap();
+    assert!(!replay_after_rotate.committed && replay_after_rotate.replayed);
+    assert_eq!(replay_after_rotate.commit, first.commit);
+    assert_eq!(replay_after_rotate.projection, first.projection);
+    assert_eq!(replay_after_rotate.policy_version, 1);
+    assert_eq!(replay_after_rotate.output.as_str(), OUTPUT);
+
+    // Raise policy to version 2 with a new output graph and publish a v2 projection.
+    evidence::detach(&ds, OUTPUT).unwrap();
+    let output2 = "urn:ev:accepted2";
+    let mut s2 = settings(ConflictMode::Refuse);
+    s2.projections = vec![output2.into()];
+    {
+        let p = s2.policies.get_mut("main").unwrap();
+        p.version = 2;
+        p.output = output2.into();
+    }
+    evidence::configure(&ds, &s2, &Control::none()).unwrap();
+    let v2_rec = reconcile(&ds, "main", Some(2), &reviewer()).unwrap();
+    assert_eq!(v2_rec.policy_version, 2);
+    assert_eq!(v2_rec.output.as_str(), output2);
+
+    // Replaying the original key (omitting policyVersion) STILL returns the first v1 receipt.
+    let replay_after_v2 = reconcile(&ds, "main", None, &opts).unwrap();
+    assert!(!replay_after_v2.committed && replay_after_v2.replayed);
+    assert_eq!(replay_after_v2.commit, first.commit);
+    assert_eq!(replay_after_v2.projection, first.projection);
+    assert_eq!(replay_after_v2.policy_version, 1);
+    assert_eq!(replay_after_v2.output.as_str(), OUTPUT);
+}
+
+/// Including the operation in `reconciled_projection_iri` prevents self-collision and
+/// self-supersession when reconciling again under the same `(version, nonces)`:
+/// (1) detaching and re-protecting a proposal graph invalidates a withdrawal under
+/// current-authentication liveness while `(decisions, supports, output)` nonces stay
+/// unchanged; (2) bumping `v1 -> v2` and configuring back to `v1` under unchanged nonces.
+#[test]
+fn reconciling_again_at_same_version_and_nonces_avoids_self_collision() {
+    let ds = configured(ConflictMode::Refuse);
+    let a = claim_of(&propose(
+        &ds,
+        &occurrence_with("s1", "urn:cve1", Polarity::Positive),
+    ));
+    review(&ds, &[decision("a", &a, Disposition::Accepted, None)]).unwrap();
+
+    // Reconcile once after an output detach so an active reconciled v1 projection P1 exists.
+    evidence::detach(&ds, OUTPUT).unwrap();
+    evidence::configure(&ds, &settings(ConflictMode::Refuse), &Control::none()).unwrap();
+    let p1 = reconcile(&ds, "main", Some(1), &reviewer()).unwrap();
+    assert_eq!(
+        accepted(&ds),
+        vec!["<urn:release> <urn:affectedBy> <urn:cve1>".to_string()]
+    );
+
+    // Withdraw A, then detach and re-protect CLAIMS (its proposal graph). Under
+    // current-authentication liveness, the old withdrawal no longer authenticates while
+    // (decisions, supports, output) nonces stay unchanged, so reconciliation must insert
+    // A's triple again and mint a distinct P2 superseding P1 (never P1 wasRevisionOf P1).
+    withdraw(&ds, &a);
+    assert!(accepted(&ds).is_empty());
+    evidence::detach(&ds, CLAIMS).unwrap();
+    evidence::configure(&ds, &settings(ConflictMode::Refuse), &Control::none()).unwrap();
+
+    let p2 = reconcile(&ds, "main", Some(1), &reviewer()).unwrap();
+    assert!(p2.committed);
+    assert_ne!(p2.projection, p1.projection);
+    assert_eq!(p2.changed.inserted.len(), 1);
+    assert_eq!(
+        accepted(&ds),
+        vec!["<urn:release> <urn:affectedBy> <urn:cve1>".to_string()]
+    );
+    assert!(
+        ds.ask(&format!(
+            "ASK {{ GRAPH <{SUPPORTS}> {{ <{}> <http://www.w3.org/ns/prov#wasRevisionOf> <{}> }} }}",
+            p2.projection.as_str(),
+            p1.projection.as_str()
+        ))
+        .unwrap()
+    );
+    assert!(
+        !ds.ask(&format!(
+            "ASK {{ GRAPH <{SUPPORTS}> {{ <{}> <http://www.w3.org/ns/prov#wasRevisionOf> <{}> }} }}",
+            p2.projection.as_str(),
+            p2.projection.as_str()
+        ))
+        .unwrap()
+    );
+
+    // Trigger 2: bump v1 -> v2 and reconcile, then configure back to v1 under unchanged
+    // nonces and reconcile again without colliding with P1 or P2.
+    let mut s2 = settings(ConflictMode::Refuse);
+    s2.policies.get_mut("main").unwrap().version = 2;
+    evidence::configure(&ds, &s2, &Control::none()).unwrap();
+    let p_v2 = reconcile(&ds, "main", Some(2), &reviewer()).unwrap();
+    assert_ne!(p_v2.projection, p2.projection);
+
+    evidence::configure(&ds, &settings(ConflictMode::Refuse), &Control::none()).unwrap();
+    let p_v1_again = reconcile(&ds, "main", Some(1), &reviewer()).unwrap();
+    assert!(p_v1_again.committed);
+    assert_ne!(p_v1_again.projection, p1.projection);
+    assert_ne!(p_v1_again.projection, p2.projection);
+    assert_ne!(p_v1_again.projection, p_v2.projection);
+}
+
+/// Duplicate live supports owning the same projected triple both appear in
+/// `vouched_supports` while inserting the triple once, and cancellation stops
+/// reconciliation cleanly without mutating the store.
+#[test]
+fn reconciling_handles_duplicate_live_supports_and_cancellation() {
+    let ds = configured(ConflictMode::Refuse);
+    let a1 = claim_of(&propose(
+        &ds,
+        &occurrence_with("dup1", "urn:cve1", Polarity::Positive),
+    ));
+    let a2 = claim_of(&propose(
+        &ds,
+        &occurrence_with("dup2", "urn:cve1", Polarity::Positive),
+    ));
+    review(
+        &ds,
+        &[
+            decision("d1", &a1, Disposition::Accepted, None),
+            decision("d2", &a2, Disposition::Accepted, None),
+        ],
+    )
+    .unwrap();
+
+    evidence::detach(&ds, OUTPUT).unwrap();
+    ds.update(&format!(
+        "DELETE WHERE {{ GRAPH <{OUTPUT}> {{ ?s ?p ?o }} }} ; \
+         INSERT DATA {{ GRAPH <{OUTPUT}> {{ <urn:stray> <urn:p> 1 }} }}"
+    ))
+    .unwrap();
+    evidence::configure(&ds, &settings(ConflictMode::Refuse), &Control::none()).unwrap();
+
+    // Pre-cancelled control refuses immediately.
+    let pre = Control::none();
+    pre.cancel.cancel();
+    let head = ds.store().head_commit().seq;
+    assert!(matches!(
+        evidence::reconcile_projection(&ds, &ds, "main", Some(1), &reviewer(), None, &pre),
+        Err(sparkles::Error::Cancelled)
+    ));
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Cancellation arriving right before publish stops the writer loop without committing.
+    let mid = Control::none();
+    let cancel_hook = mid.cancel.clone();
+    ds.store().set_failpoint(
+        "evidence-reconcile-before-publish",
+        Some(Arc::new(move |_| {
+            cancel_hook.cancel();
+        })),
+    );
+    assert!(matches!(
+        evidence::reconcile_projection(&ds, &ds, "main", Some(1), &reviewer(), None, &mid),
+        Err(sparkles::Error::Cancelled)
+    ));
+    ds.store()
+        .set_failpoint("evidence-reconcile-before-publish", None);
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Normal reconciliation reports both live supports and inserts the shared triple once.
+    let rec = reconcile(&ds, "main", Some(1), &reviewer()).unwrap();
+    assert_eq!(rec.vouched_supports.len(), 2);
+    assert_eq!(rec.changed.inserted.len(), 1);
+    assert_eq!(rec.changed.removed.len(), 1);
+    assert_eq!(
+        accepted(&ds),
+        vec!["<urn:release> <urn:affectedBy> <urn:cve1>".to_string()]
     );
 }

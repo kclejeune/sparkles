@@ -402,13 +402,15 @@ pub fn projection_iri(
 }
 
 /// The identity of a reconciled projection record of `policy` at `version` under the
-/// protection nonces `nonces`. Including the three nonces keeps it distinct from the
-/// initial projection record and from earlier protection epochs.
+/// protection nonces `nonces` and `operation`. Including both the three nonces and the
+/// operation keeps it distinct from the initial projection record, from earlier
+/// protection epochs and from repeated repairs under the same version and nonces.
 pub fn reconciled_projection_iri(
     dataset: Uuid,
     policy: &str,
     version: u32,
     nonces: ProjectionNonces,
+    operation: Uuid,
     control: &Control,
 ) -> Result<NamedNode> {
     mint(
@@ -417,7 +419,7 @@ pub fn reconciled_projection_iri(
         RecordKind::Projection,
         policy,
         &format!(
-            "{version} {} {} {}",
+            "{version} {} {} {} {operation}",
             nonces.decisions, nonces.supports, nonces.output
         ),
         control,
@@ -435,11 +437,12 @@ pub fn reconciled_projection_record(
     output: &NamedNode,
     mode: ConflictMode,
     nonces: ProjectionNonces,
+    operation: Uuid,
     supersedes: &[NamedNode],
     graph: &NamedNode,
     control: &Control,
 ) -> Result<PlannedRecord> {
-    let iri = reconciled_projection_iri(dataset, policy, version, nonces, control)?;
+    let iri = reconciled_projection_iri(dataset, policy, version, nonces, operation, control)?;
     let mut r = Record::new(&iri, RecordKind::Projection);
     r.add(ev("reviewPolicy"), policy_iri(policy));
     r.add(ev("policyVersion"), string(&version.to_string()));
@@ -564,6 +567,9 @@ pub struct Batch {
     pub payload_digest: Sha256Digest,
     pub principal: NamedNode,
     pub idempotency_key: Option<String>,
+    /// An existing record this operation reused, written as `prov:used` on the
+    /// operation so keyed replays recover the first receipt.
+    pub used: Option<NamedNode>,
     /// The record graphs that describe the operation, sorted. A projection graph is
     /// never among them.
     pub graphs: Vec<NamedNode>,
@@ -596,6 +602,7 @@ impl Batch {
                 payload_digest: self.payload_digest,
                 idempotency_key: self.idempotency_key.as_deref(),
                 hold: None,
+                used: self.used.as_ref(),
             },
             &self.graphs,
             &self.records,
