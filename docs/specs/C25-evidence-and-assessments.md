@@ -2384,11 +2384,12 @@ last support can therefore remove a publication link or receipt field. Format 2 
 owner and nonce but has no per-triple origin or history of graph roles.
 
 On upgrade, the store checks every branch in the family before marking a dedicated
-output as `projectionOnly`. The graph retains record history if a record carrying
-the current protection names a publisher IRI through `ev:availabilityReceipt`.
-It also retains history if a record names a currently protected `ev:Operation`
-through `ev:availabilityReceipt` or `prov:wasGeneratedBy`. A projected copy of
-that evidence receives the same protection. A projected operation description alone
+output as `projectionOnly`. A record with a SHA-256 `ev:recordDigest` can identify
+its currently protected `ev:Operation` through either `ev:availabilityReceipt` or
+`prov:wasGeneratedBy`. If the publisher loses its operation type or protection,
+a record with the current protection must name the same `prov:Activity` through
+both links. The activity must retain its operation type or the current protection.
+A projected copy of that evidence receives the same protection. A projected operation description alone
 does not establish record history. Format 4 prevents new mixed histories. The writer
 rejects record writes to outputs marked `projectionOnly`. Moving such an output into a
 record role rotates its nonce. A former record graph with surviving receipt evidence

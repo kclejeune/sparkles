@@ -5261,6 +5261,133 @@ fn project_legacy_triples(
     claims
 }
 
+#[test]
+fn legacy_output_with_a_dangling_receipt_rotates_on_promotion() {
+    check_legacy_output_edge(true);
+}
+
+#[test]
+fn legacy_output_with_a_bare_generation_edge_rotates_on_promotion() {
+    check_legacy_output_edge(false);
+}
+
+fn check_legacy_output_edge(receipt: bool) {
+    use sparkles::managed::OwnerKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ds");
+    let mut s = settings(ConflictMode::Refuse);
+    let ds = Dataset::open(&root).unwrap();
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+    let nonce = ds.store().managed_graphs().unwrap().unwrap().owners[&OwnerKind::Evidence]
+        .protections[OUTPUT];
+    let op = iri("urn:example:activity");
+    project_lookalike(&ds, "main", "edge", op.clone(), nonce, None);
+    let other = iri("urn:example:unrelated");
+    let edge = if receipt {
+        Triple::new(op, iri(&format!("{EV}availabilityReceipt")), other)
+    } else {
+        Triple::new(other, iri("http://www.w3.org/ns/prov#wasGeneratedBy"), op)
+    };
+    project_legacy_triples(&ds, "main", vec![edge]);
+    drop(ds);
+    legacy_settings(&root, &s);
+
+    let ds = Dataset::open(&root).unwrap();
+    assert!(
+        reconcile(&ds, "main", Some(1), &reviewer())
+            .unwrap()
+            .committed
+    );
+    assert_eq!(accepted(&ds).len(), 10);
+    s.supports.push(OUTPUT.into());
+    s.projections = vec!["urn:ev:new-output".into()];
+    s.policies.get_mut("main").unwrap().output = s.projections[0].clone();
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+    let registry = ds.store().managed_graphs().unwrap().unwrap();
+    assert_ne!(
+        registry.owners[&OwnerKind::Evidence].protections[OUTPUT],
+        nonce
+    );
+}
+
+#[test]
+fn legacy_output_without_history_ignores_more_than_the_replay_probe_limit() {
+    use sparkles_core::evidence::review::MAX_EVIDENCE;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ds");
+    let mut s = settings(ConflictMode::Refuse);
+    let mut other = s.policies["main"].clone();
+    other.decisions = "urn:ev:other-decisions".into();
+    other.supports = "urn:ev:other-supports".into();
+    other.output = "urn:ev:other-output".into();
+    s.decisions.push(other.decisions.clone());
+    s.supports.push(other.supports.clone());
+    s.projections.push(other.output.clone());
+    s.policies.insert("other".into(), other);
+    let ds = Dataset::open(&root).unwrap();
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+    let mut opts = reviewer();
+    let key_name = "first-reconciliation";
+    opts.idempotency_key = Some(key_name.into());
+    let op = evidence::operation_iri(evidence::operation_id(
+        ds.dataset_id(),
+        &opts.principal,
+        key_name,
+    ));
+    let used = iri("http://www.w3.org/ns/prov#used");
+    for start in (0..=MAX_EVIDENCE).step_by(250) {
+        let mut input = EvidenceInput {
+            revisions: vec![revision(&format!("batch-{start}"))],
+            ..Default::default()
+        };
+        for i in start..(start + 250).min(MAX_EVIDENCE + 1) {
+            let name = format!("claim-{i}");
+            let triple = Triple::new(op.clone(), used.clone(), iri(&format!("urn:input:{i}")));
+            let mut c = claim(&name, Polarity::Positive, triple);
+            c.key = key(&name);
+            input.claims.push(c);
+        }
+        let proposed = propose(&ds, &input);
+        let decisions: Vec<_> = proposed
+            .records
+            .iter()
+            .filter(|r| r.key.starts_with("claim-"))
+            .map(|r| {
+                decision(
+                    &r.key,
+                    &(r.iri.clone(), r.digest),
+                    Disposition::Accepted,
+                    None,
+                )
+            })
+            .collect();
+        assert_eq!(decisions.len(), input.claims.len());
+        let mut review_opts = reviewer();
+        review_opts.if_head = Some(ds.store().head_commit().seq);
+        let reviewed = evidence::review(
+            None,
+            &ds,
+            &ds,
+            "other",
+            1,
+            &decisions,
+            &review_opts,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+        assert!(reviewed.decisions.iter().all(|d| d.support.is_some()));
+    }
+    drop(ds);
+    legacy_settings(&root, &s);
+    let ds = Dataset::open(&root).unwrap();
+    let first = reconcile(&ds, "main", Some(1), &opts).unwrap();
+    assert!(first.committed && !first.replayed);
+    assert_eq!(first.operation, op);
+}
+
 /// A dataset upgraded from a pre-581 format-2 registry keeps its legacy protection nonces
 /// on dedicated projection outputs without `projectionOnly`. Follow-on projecting reviews,
 /// reconciliation, narrow-grant keyed replay, and supports resets (both retained and

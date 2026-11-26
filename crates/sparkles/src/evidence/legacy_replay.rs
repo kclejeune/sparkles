@@ -248,6 +248,12 @@ impl State<'_> {
         let mut found = None;
         for graph in graphs {
             let Some(nonce) = graph.1 else { continue };
+            if !self
+                .reads
+                .has_published_operation_in_output(graph.0.as_str(), graph.1)?
+            {
+                continue;
+            }
             let mut held = self.reads.preparation().reserve(0)?;
             // The named IRI needs no surviving type or nonce. At other IRIs
             // the key must be on a protected operation, since any record can
@@ -276,13 +282,6 @@ impl State<'_> {
                 .transpose()?;
             let named = self.legacy_operation_field(&probe.operation_iri, graph, owner.as_ref())?
                 || self.legacy_record_names(&probe.operation_iri, graph, nonce, owner.as_ref())?;
-            if (!named && keyed.is_empty() && !more)
-                || !self
-                    .reads
-                    .has_published_operation_in_output(graph.0.as_str(), graph.1)?
-            {
-                continue;
-            }
             if more {
                 return Err(ambiguous_legacy_replay());
             }

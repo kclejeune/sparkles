@@ -1805,6 +1805,29 @@ impl<'a> Reads<'a> {
         Ok(if duplicate { None } else { found })
     }
 
+    /// Whether any object of this graph-local predicate satisfies `accepts`.
+    fn has_value_matching(
+        &self,
+        graph: Id,
+        subject: Id,
+        predicate: Id,
+        accepts: fn(&Term) -> bool,
+    ) -> Result<bool> {
+        let mut found = false;
+        self.preparation.scan(
+            self.snap,
+            Perm::Gspo,
+            &[graph.0, subject.0, predicate.0],
+            |q| {
+                found = self
+                    .preparation
+                    .with_term(self.snap, q[2], |term| Ok(term.is_some_and(accepts)))?;
+                Ok(!found)
+            },
+        )?;
+        Ok(found)
+    }
+
     /// Bounded exact quad existence probe via `Perm::Gspo` `[g, s, p, o]` under
     /// `Preparation` (never bypasses the preparation's reservations or cancellation).
     fn contains_id(&self, s: Id, p: Id, o: Id, g: Id) -> Result<bool> {
@@ -1947,8 +1970,8 @@ impl<'a> Reads<'a> {
     }
 
     /// A record and its publisher can lose a shared quad when an output support
-    /// is withdrawn. A surviving publication edge and current protection on
-    /// either endpoint can still identify record history.
+    /// is withdrawn. Check the surviving writer fields on both ends of the
+    /// link before treating a projected graph as a former record graph.
     pub fn has_published_operation_in_output(
         &self,
         graph: &str,
@@ -1968,7 +1991,10 @@ impl<'a> Reads<'a> {
         };
         let receipt = iri(&format!("{EV}availabilityReceipt"))?;
         let generated = iri(&format!("{PROV}wasGeneratedBy"))?;
-        let operation_type = iri(RDF_TYPE)?.zip(iri(&format!("{EV}Operation"))?);
+        let rdf_type = iri(RDF_TYPE)?;
+        let operation_type = rdf_type.zip(iri(&format!("{EV}Operation"))?);
+        let activity_type = rdf_type.zip(iri(&format!("{PROV}Activity"))?);
+        let digest = iri(&format!("{EV}recordDigest"))?;
         let is_iri = |id| {
             self.preparation.with_term(self.snap, id, |term| {
                 Ok(matches!(term, Some(Term::NamedNode(_))))
@@ -1976,30 +2002,49 @@ impl<'a> Reads<'a> {
         };
         let mut found = false;
         self.for_each_pos_intersection_in_graph(g, &[(protection, nonce)], |subject| {
-            // A protected record still identifies the publisher if the latter
-            // has lost its type or nonce.
-            if let Some(receipt) = receipt {
+            // When the publisher loses its operation type or nonce, the
+            // protected record still names the same activity through both links.
+            if let (Some(receipt), Some(generated), Some((p, activity))) =
+                (receipt, generated, activity_type)
+                && is_iri(subject)?
+            {
                 self.preparation.scan(
                     self.snap,
                     Perm::Gspo,
                     &[g.0, subject.0, receipt.0],
                     |quad| {
-                        found = is_iri(quad[2])?;
+                        let op = quad[2];
+                        found = op != subject
+                            && self.contains_id(subject, generated, op, g)?
+                            && is_iri(op)?
+                            && self.contains_id(op, p, activity, g)?
+                            && (self.contains_id(op, protection, nonce, g)?
+                                || match operation_type {
+                                    Some((p, class)) => self.contains_id(op, p, class, g)?,
+                                    None => false,
+                                });
                         Ok(!found)
                     },
                 )?;
             }
             if !found
+                && let Some(digest) = digest
                 && let Some((p, class)) = operation_type
                 && self.contains_id(subject, p, class, g)?
                 && is_iri(subject)?
             {
-                // A protected operation can still have an incoming publication
-                // edge if the record lost its nonce or its availability receipt.
+                // The record may have lost either link or its nonce. Its
+                // writer digest distinguishes a record from a bare edge.
                 for edge in [receipt, generated].into_iter().flatten() {
-                    self.for_each_pos_intersection_in_graph(g, &[(edge, subject)], |_| {
-                        found = true;
-                        Ok(false)
+                    self.for_each_pos_intersection_in_graph(g, &[(edge, subject)], |record| {
+                        found = record != subject
+                            && is_iri(record)?
+                            && self.has_value_matching(g, record, digest, |term| {
+                                matches!(term, Term::Literal(l)
+                                    if l.datatype() == oxrdf::vocab::xsd::STRING
+                                        && l.value().parse::<Sha256Digest>().is_ok())
+                            })?;
+                        Ok(!found)
                     })?;
                     if found {
                         break;
@@ -2081,17 +2126,7 @@ impl<'a> Reads<'a> {
         // A projection can add other values to a genuinely published subject.
         // Test for the writer's edges even when the subject also carries those values.
         use oxrdf::vocab::xsd;
-        let has_value = |predicate: Id, accepts: fn(&Term) -> bool| -> Result<bool> {
-            let mut found = false;
-            self.preparation
-                .scan(self.snap, Perm::Gspo, &[g_id.0, op.0, predicate.0], |q| {
-                    found = self
-                        .preparation
-                        .with_term(self.snap, q[2], |term| Ok(term.is_some_and(accepts)))?;
-                    Ok(!found)
-                })?;
-            Ok(found)
-        };
+        let has_value = |predicate, accepts| self.has_value_matching(g_id, op, predicate, accepts);
         Ok(has_value(was_assoc, |t| matches!(t, Term::NamedNode(_)))?
             && has_value(
                 ended_at,
