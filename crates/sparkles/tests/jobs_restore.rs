@@ -326,3 +326,95 @@ fn a_restore_adopts_paused_runs_beyond_one_scan() {
     }
     assert_eq!(resumed, runs.len());
 }
+
+/// An activated dataset with durable jobs supports both `Dataset::clone_to_with` (empty
+/// job ledger + independent destination configuration-history root) and new-identity
+/// `Catalog::restore` (paused job recovery + destination configuration-history root).
+#[test]
+fn activated_dataset_with_jobs_clones_and_restores_under_new_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let cat = Catalog::open(dir.path().join("data"), Default::default()).unwrap();
+    let repos = cat.repositories().unwrap();
+    repos
+        .add(RepoConfig {
+            name: "local".into(),
+            kind: RepoType::Fs,
+            path: Some(dir.path().join("repo").display().to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let ds = cat.create("src", &Default::default()).unwrap();
+    let src_root = ds.store().root().unwrap().to_path_buf();
+    ds.update("INSERT DATA { <urn:s> <urn:p> 1 }").unwrap();
+    enable(&ds);
+    drop(ds);
+    drop(cat);
+
+    let prep = sparkles::access::Preparation::new(Default::default(), 64 * 1024 * 1024).unwrap();
+    sparkles::migrate::activate_configuration_history(&src_root, false, &prep).unwrap();
+
+    let cat = Catalog::open(dir.path().join("data"), Default::default()).unwrap();
+    let repo = cat.repositories().unwrap().open("local").unwrap();
+    let ds = cat.get("src").unwrap();
+    let queued = submit(&ds, "q-activated");
+    ds.update("INSERT DATA { <urn:s> <urn:p> 2 }").unwrap();
+
+    // Persistent clone via Dataset::clone_to_with gets an empty ledger and its own root.
+    let clone_path = dir.path().join("cloned-ds");
+    ds.clone_to_with(&clone_path, &Default::default(), &Default::default())
+        .unwrap();
+    let cloned = Dataset::open(&clone_path).unwrap();
+    assert!(cloned.store().control_enabled());
+    assert!(
+        cloned
+            .jobs()
+            .list(&Default::default(), &admin())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        cloned
+            .store()
+            .evidence_view(&sparkles::history::At::Head, &prep)
+            .unwrap()
+            .configuration()
+            .dataset_id(),
+        cloned.store().dataset_id()
+    );
+
+    // Backup and new-identity restore preserves paused job recovery and destination root.
+    ds.backups(&repo)
+        .create_with(
+            &CreateOptions {
+                name: "b-act".into(),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+    let copy = cat
+        .restore(
+            &repo,
+            "b-act",
+            &RestoreRequest {
+                target: Some("copy-act".into()),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+    assert_ne!(copy.store().dataset_id(), ds.store().dataset_id());
+    copy.jobs().recover().unwrap();
+    assert_eq!(state(&copy, queued), State::Paused);
+    copy.jobs().resume(&[queued], &admin()).unwrap();
+    assert_eq!(state(&copy, queued), State::Queued);
+    assert_eq!(
+        copy.store()
+            .evidence_view(&sparkles::history::At::Head, &prep)
+            .unwrap()
+            .configuration()
+            .dataset_id(),
+        copy.store().dataset_id()
+    );
+}

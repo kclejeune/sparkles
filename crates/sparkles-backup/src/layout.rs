@@ -168,6 +168,9 @@ pub fn valid_backup_path(p: &str) -> bool {
 /// Primary configuration history has a closed path grammar. In particular, a
 /// required feature never grants access to arbitrary nested dataset files.
 pub fn configuration_history_path(path: &str) -> bool {
+    if imported_configuration_history_path(path) {
+        return true;
+    }
     let canonical_uuid = |value: &str| {
         Uuid::parse_str(value).is_ok_and(|id| !id.is_nil() && id.to_string() == value)
     };
@@ -191,6 +194,76 @@ pub fn configuration_history_path(path: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Closed path grammar for imported provenance closures carried by backups of
+/// cloned or new-identity-restored activated stores (`evidence-configuration-history/2`).
+pub fn imported_configuration_history_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("evidence-history/imports/") else {
+        return false;
+    };
+    let Some((digest, member)) = rest.split_once('/') else {
+        return false;
+    };
+    if !valid_blob_id(digest) {
+        return false;
+    }
+    if member == "origin.json" {
+        return true;
+    }
+    let Some(source_rel) = member.strip_prefix("source/") else {
+        return false;
+    };
+    imported_source_member_path(source_rel)
+}
+
+fn imported_source_member_path(path: &str) -> bool {
+    let canonical_uuid = |value: &str| {
+        Uuid::parse_str(value).is_ok_and(|id| !id.is_nil() && id.to_string() == value)
+    };
+    let primary_meta = |p: &str| {
+        p.split_once('/').is_some_and(|(dir, file)| {
+            valid_generation(dir) && matches!(file, "commit.json" | "meta.json")
+        })
+    };
+    if let Some(rest) = path.strip_prefix("branches/") {
+        let Some((id, member)) = rest.split_once('/') else {
+            return false;
+        };
+        return canonical_uuid(id)
+            && (matches!(
+                member,
+                "CURRENT" | "dataset.json" | "branch.json" | "history.json" | "origin.json"
+            ) || primary_meta(member));
+    }
+    if let Some(rest) = path.strip_prefix("evidence-history/") {
+        if rest == "origin.json" {
+            return true;
+        }
+        let Some((lineage, member)) = rest.split_once('/') else {
+            return false;
+        };
+        return canonical_uuid(lineage)
+            && (member == "coverage.json"
+                || member
+                    .strip_prefix("generations/")
+                    .and_then(|file| file.strip_suffix(".json"))
+                    .is_some_and(valid_blob_id));
+    }
+    matches!(
+        path,
+        "CURRENT"
+            | "dataset.json"
+            | "family-dataset.json"
+            | "managed.json"
+            | "branches.json"
+            | "branch.json"
+            | "history.json"
+            | "origin.json"
+            | "prefixes.json"
+            | "evidence.json"
+            | "jobs.json"
+    ) || primary_meta(path)
 }
 
 /// A generation directory name: `gen-` and 4 to 8 digits.
