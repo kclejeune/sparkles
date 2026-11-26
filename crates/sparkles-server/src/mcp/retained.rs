@@ -279,15 +279,28 @@ pub(super) fn is_small_bounded_error(error: &ToolError) -> bool {
         && error.hint.as_deref().map_or(0, str::len) <= 512
 }
 
-fn truncate_str_bytes(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
+const MAX_WHY_EMPTY_SUMMARY_BYTES: usize = 2048;
+
+fn json_char_escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\x08' | '\x0c' | '\n' | '\r' | '\t' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
     }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
+}
+
+/// Truncate `s` on a UTF-8 boundary so its JSON-encoded string contents (excluding
+/// surrounding quotes) occupy at most `max_json_bytes`.
+fn truncate_json_str_bytes(s: &str, max_json_bytes: usize) -> &str {
+    let mut used = 0usize;
+    for (idx, ch) in s.char_indices() {
+        let len = json_char_escaped_len(ch);
+        if used + len > max_json_bytes {
+            return &s[..idx];
+        }
+        used += len;
     }
-    &s[..end]
+    s
 }
 
 /// Build a strictly bounded (<= 2 KiB serialized) incomplete diagnostic summary for
@@ -301,7 +314,7 @@ pub(super) fn bounded_why_empty_summary(value: &Value) -> Option<Value> {
     let dataset = obj
         .get("dataset")
         .and_then(Value::as_str)
-        .map(|s| truncate_str_bytes(s, 128))
+        .map(|s| truncate_json_str_bytes(s, 128))
         .unwrap_or("");
     let commit = obj.get("commit").and_then(Value::as_u64).unwrap_or(0);
     let empty = match obj.get("empty") {
@@ -311,8 +324,18 @@ pub(super) fn bounded_why_empty_summary(value: &Value) -> Option<Value> {
     let message = obj
         .get("message")
         .and_then(Value::as_str)
-        .map(|s| truncate_str_bytes(s, 256))
+        .map(|s| truncate_json_str_bytes(s, 256))
         .unwrap_or("query diagnosis exceeded the memory budget; steps are incomplete");
+    let mut summary = serde_json::json!({
+        "dataset": dataset,
+        "commit": commit,
+        "empty": empty,
+        "steps": [],
+        "complete": false,
+        "message": message,
+        "prefixes": {},
+    });
+    let mut serialized_len = serde_json::to_vec(&summary).ok()?.len();
     let mut steps = Vec::new();
     if let Some(arr) = obj.get("steps").and_then(Value::as_array) {
         for step in arr.iter().take(8) {
@@ -322,34 +345,42 @@ pub(super) fn bounded_why_empty_summary(value: &Value) -> Option<Value> {
             let kind = so
                 .get("kind")
                 .and_then(Value::as_str)
-                .map(|s| truncate_str_bytes(s, 32))
+                .map(|s| truncate_json_str_bytes(s, 32))
                 .unwrap_or("pattern");
             let text = so
                 .get("text")
                 .and_then(Value::as_str)
-                .map(|s| truncate_str_bytes(s, 128))
+                .map(|s| truncate_json_str_bytes(s, 128))
                 .unwrap_or("");
             let solutions = match so.get("solutions") {
                 Some(Value::Bool(b)) => Value::Bool(*b),
                 _ => Value::Null,
             };
-            steps.push(serde_json::json!({
+            let candidate = serde_json::json!({
                 "kind": kind,
                 "text": text,
                 "solutions": solutions,
-            }));
+            });
+            let step_len = serde_json::to_vec(&candidate).ok()?.len();
+            let extra = step_len + usize::from(!steps.is_empty());
+            if serialized_len.saturating_add(extra) > MAX_WHY_EMPTY_SUMMARY_BYTES {
+                break;
+            }
+            serialized_len += extra;
+            steps.push(candidate);
         }
     }
-    let summary = serde_json::json!({
-        "dataset": dataset,
-        "commit": commit,
-        "empty": empty,
-        "steps": steps,
-        "complete": false,
-        "message": message,
-        "prefixes": {},
-    });
-    debug_assert!(serde_json::to_vec(&summary).is_ok_and(|b| b.len() <= 2048));
+    summary["steps"] = Value::Array(steps);
+    if !serde_json::to_vec(&summary).is_ok_and(|b| b.len() <= MAX_WHY_EMPTY_SUMMARY_BYTES) {
+        summary["steps"] = Value::Array(Vec::new());
+        summary["dataset"] = Value::String(truncate_json_str_bytes(dataset, 64).to_string());
+        summary["message"] = Value::String(
+            "query diagnosis exceeded the memory budget; steps are incomplete".to_string(),
+        );
+    }
+    debug_assert!(
+        serde_json::to_vec(&summary).is_ok_and(|b| b.len() <= MAX_WHY_EMPTY_SUMMARY_BYTES)
+    );
     Some(summary)
 }
 
@@ -483,13 +514,22 @@ impl RetainedCallResult {
         self.inner.preparation.trim_grant();
     }
 
-    /// Create a fresh-control `NativeBudget` sharing this retained result's remaining
+    /// Create a fresh-control [`TaskFrameBudget`] sharing this retained result's remaining
     /// `query_memory_bytes` allowance and `PoolGrant`, so a later `tasks/get` poll can
     /// render a wire frame after the original query's deadline without exceeding the
     /// configured memory ceiling or deadlocking on a second `INITIAL_GRANT` admission.
-    pub(super) fn fresh_frame_budget(&self, control: Control) -> Result<NativeBudget> {
+    ///
+    /// Carries a trailing [`TrimOnDrop`] guard from admission through every exit path
+    /// (including early cancellation, closed slots, and cancelled stdio jobs) so an
+    /// abandoned poll never leaves a trimmed task holding a 4 MiB granule.
+    pub(super) fn fresh_frame_budget(&self, control: Control) -> Result<TaskFrameBudget> {
+        let trim_on_drop = TrimOnDrop(self.inner.preparation.clone());
         let child = self.inner.preparation.child_with_control(control)?;
-        NativeBudget::from_preparation(&child)
+        let budget = NativeBudget::from_preparation(&child)?;
+        Ok(TaskFrameBudget {
+            budget,
+            _trim_on_drop: trim_on_drop,
+        })
     }
 
     /// Fallback conversion to an ordinary `CallToolResult` when no qualified transport
@@ -733,6 +773,16 @@ struct JsonRpcErrorEnvelope<'a> {
     error: rmcp::ErrorData,
 }
 
+/// Fresh-control frame budget for rendering a completed background task on `tasks/get`.
+///
+/// Field drop order is load-bearing: `budget` (and its child `Preparation` /
+/// `ParentHandle` reservations) drops first, then `_trim_on_drop` trims the backing
+/// `PoolGrant` back to the retained task's actual usage on every exit path.
+pub(super) struct TaskFrameBudget {
+    budget: NativeBudget,
+    _trim_on_drop: TrimOnDrop,
+}
+
 /// A retained response staged by `Adapter` for a qualified transport (`CreditedStdioTransport`,
 /// stateless HTTP `Endpoint`, or `CreditedSessionManager`).
 pub(super) enum StagedResponse {
@@ -742,9 +792,9 @@ pub(super) enum StagedResponse {
     },
     TaskCompleted {
         id: RequestId,
-        task: Task,
+        task: Box<Task>,
         result: RetainedCallResult,
-        frame_budget: NativeBudget,
+        frame_budget: TaskFrameBudget,
         cancel: Arc<AtomicBool>,
     },
     Resource {
@@ -809,11 +859,11 @@ impl StagedResponse {
                     id,
                     result: CompletedTaskWire {
                         result_type: ResultType::COMPLETE,
-                        task,
+                        task: task.as_ref(),
                         result,
                     },
                 },
-                frame_budget,
+                &frame_budget.budget,
                 framing,
                 Some(result.inner.preparation.clone()),
             ),
@@ -911,13 +961,17 @@ pub(super) fn placeholder_task_result(task: Task) -> GetTaskResult {
 }
 
 enum SlotState {
-    Open(Option<Box<StagedResponse>>),
+    Open {
+        staged: Option<Box<StagedResponse>>,
+        on_cancel: Option<Box<dyn FnOnce() + Send>>,
+    },
     Closed,
 }
 
 /// One-shot handoff slot carried in request extensions between `Adapter` and a qualified
-/// transport. Closing the slot drops any parked payload immediately and rejects any late
-/// park, guaranteeing zero credit leaks on cancellation, error, or disconnect.
+/// transport. Closing the slot drops any parked payload immediately, invokes any armed
+/// cancellation hook, and rejects any late park, guaranteeing zero credit leaks or
+/// unreachable detached tasks on cancellation, error, or disconnect.
 #[derive(Clone)]
 pub(super) struct ResponseSlot {
     inner: Arc<Mutex<SlotState>>,
@@ -926,33 +980,68 @@ pub(super) struct ResponseSlot {
 impl ResponseSlot {
     pub(super) fn open() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(SlotState::Open(None))),
+            inner: Arc::new(Mutex::new(SlotState::Open {
+                staged: None,
+                on_cancel: None,
+            })),
         }
     }
 
-    pub(super) fn park(&self, staged: StagedResponse) {
+    pub(super) fn park(&self, new_staged: StagedResponse) {
         let mut guard = self.inner.lock();
-        if let SlotState::Open(slot) = &mut *guard {
-            *slot = Some(Box::new(staged));
+        if let SlotState::Open { staged, .. } = &mut *guard {
+            *staged = Some(Box::new(new_staged));
         } else {
             drop(guard);
-            staged.cancel_on_close();
-            drop(staged);
+            new_staged.cancel_on_close();
+            drop(new_staged);
+        }
+    }
+
+    /// Arm a hook to run if this slot is closed before [`Self::take`] consumes it.
+    /// Returns `false` (and runs `hook` immediately) if the slot is already closed.
+    pub(super) fn arm_cancel_hook(&self, hook: impl FnOnce() + Send + 'static) -> bool {
+        let mut guard = self.inner.lock();
+        if let SlotState::Open { on_cancel, .. } = &mut *guard {
+            *on_cancel = Some(Box::new(hook));
+            true
+        } else {
+            drop(guard);
+            hook();
+            false
+        }
+    }
+
+    /// Disarm any pending cancel hook without closing or consuming staged payloads
+    /// (used when a non-JSON 2xx response succeeds on stateless HTTP).
+    pub(super) fn disarm_cancel_hook(&self) {
+        let mut guard = self.inner.lock();
+        if let SlotState::Open { on_cancel, .. } = &mut *guard {
+            *on_cancel = None;
         }
     }
 
     pub(super) fn take(&self) -> Option<StagedResponse> {
         let mut guard = self.inner.lock();
         match std::mem::replace(&mut *guard, SlotState::Closed) {
-            SlotState::Open(staged) => staged.map(|b| *b),
+            SlotState::Open { staged, .. } => staged.map(|b| *b),
             SlotState::Closed => None,
         }
     }
 
     pub(super) fn close(&self) {
-        if let Some(dropped) = self.take() {
-            dropped.cancel_on_close();
-            drop(dropped);
+        let state = {
+            let mut guard = self.inner.lock();
+            std::mem::replace(&mut *guard, SlotState::Closed)
+        };
+        if let SlotState::Open { staged, on_cancel } = state {
+            if let Some(hook) = on_cancel {
+                hook();
+            }
+            if let Some(dropped) = staged {
+                dropped.cancel_on_close();
+                drop(dropped);
+            }
         }
     }
 }
@@ -1179,7 +1268,7 @@ mod tests {
             .unwrap();
         let staged = StagedResponse::TaskCompleted {
             id: RequestId::Number(3),
-            task: task.clone(),
+            task: Box::new(task.clone()),
             result: retained.clone(),
             frame_budget,
             cancel,
@@ -1210,7 +1299,7 @@ mod tests {
             .unwrap();
         let staged = StagedResponse::TaskCompleted {
             id: RequestId::Number(4),
-            task,
+            task: Box::new(task),
             result: retained,
             frame_budget,
             cancel,
@@ -1272,5 +1361,171 @@ mod tests {
             !s.contains("id:"),
             "invalid event_id must not be emitted: {s:?}"
         );
+    }
+
+    #[test]
+    fn bounded_why_empty_summary_enforces_2kib_cap_on_max_and_escape_heavy_inputs() {
+        // 1. Plain ASCII at max individual field caps previously serialized to 2096 B > 2048 B.
+        let ascii_steps: Vec<Value> = (0..8)
+            .map(|i| {
+                serde_json::json!({
+                    "kind": "k".repeat(64),
+                    "text": format!("step-{i}-{}", "a".repeat(256)),
+                    "solutions": false,
+                })
+            })
+            .collect();
+        let ascii_input = serde_json::json!({
+            "dataset": "d".repeat(256),
+            "commit": u64::MAX,
+            "empty": true,
+            "complete": false,
+            "message": "m".repeat(512),
+            "steps": ascii_steps,
+            "prefixes": { "ex": "http://example.org/" },
+        });
+        let ascii_summary = bounded_why_empty_summary(&ascii_input).expect("incomplete summary");
+        let ascii_wire = serde_json::to_vec(&ascii_summary).unwrap();
+        assert!(
+            ascii_wire.len() <= MAX_WHY_EMPTY_SUMMARY_BYTES,
+            "ASCII summary exceeded 2 KiB cap: {} bytes",
+            ascii_wire.len()
+        );
+        assert_eq!(ascii_summary["complete"], false);
+
+        // 2. Escape-heavy SPARQL literals (quotes, backslashes, control chars, UTF-8).
+        let escaped_text = "\"\\\n\r\t\u{0000}\u{001f}é🚀".repeat(40);
+        let escaped_steps: Vec<Value> = (0..8)
+            .map(|_| {
+                serde_json::json!({
+                    "kind": "\"\\\u{0001}pattern".repeat(8),
+                    "text": escaped_text,
+                    "solutions": Value::Null,
+                })
+            })
+            .collect();
+        let escaped_input = serde_json::json!({
+            "dataset": "\"\\\u{0000}ds".repeat(40),
+            "commit": 42,
+            "empty": Value::Null,
+            "complete": false,
+            "message": "\"\\\n\u{0000}msg".repeat(60),
+            "steps": escaped_steps,
+        });
+        let escaped_summary =
+            bounded_why_empty_summary(&escaped_input).expect("escape-heavy summary");
+        let escaped_wire = serde_json::to_vec(&escaped_summary).unwrap();
+        assert!(
+            escaped_wire.len() <= MAX_WHY_EMPTY_SUMMARY_BYTES,
+            "escape-heavy summary exceeded 2 KiB cap: {} bytes",
+            escaped_wire.len()
+        );
+        assert_eq!(escaped_summary["complete"], false);
+    }
+
+    #[test]
+    fn abandoned_task_poll_re_trims_grant_and_keeps_task_readable() {
+        let (prep, grant, pool, _) = fixture(4 << 20);
+        let retained = RetainedCallResult::from_outcome(
+            Ok(Outcome::Text("small completed payload".to_string())),
+            &prep,
+            true,
+            &err_ctx(),
+        )
+        .unwrap();
+        drop(prep);
+        retained.trim_grant();
+        let pre_poll_granted = grant.granted();
+        assert!(
+            pre_poll_granted < (64 << 10),
+            "expected trimmed task grant, got {pre_poll_granted}"
+        );
+
+        // 1. Early drop of `fresh_frame_budget` (e.g. cancelled before parking) re-trims grant.
+        let budget = retained.fresh_frame_budget(Control::none()).unwrap();
+        assert!(
+            grant.granted() > pre_poll_granted,
+            "fresh_frame_budget should grow grant to a granule during poll"
+        );
+        drop(budget);
+        assert_eq!(
+            grant.granted(),
+            pre_poll_granted,
+            "dropping abandoned TaskFrameBudget must restore pre-poll grant"
+        );
+
+        // 2. Closing a parked `StagedResponse::TaskCompleted` before `into_frame_or_error`
+        //    also restores the pre-poll grant, and the retained task remains readable.
+        let task = Task::new(
+            "t-trim".to_string(),
+            rmcp::model::TaskStatus::Completed,
+            "2026-01-01T00:00:00Z".to_string(),
+            "2026-01-01T00:00:00Z".to_string(),
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let budget2 = retained
+            .fresh_frame_budget(Control::with_cancel(cancel.clone()))
+            .unwrap();
+        assert!(grant.granted() > pre_poll_granted);
+        let slot = ResponseSlot::open();
+        slot.park(StagedResponse::TaskCompleted {
+            id: RequestId::Number(11),
+            task: Box::new(task.clone()),
+            result: retained.clone(),
+            frame_budget: budget2,
+            cancel: cancel.clone(),
+        });
+        slot.close();
+        assert!(cancel.load(Ordering::Relaxed));
+        assert_eq!(
+            grant.granted(),
+            pre_poll_granted,
+            "closing parked TaskCompleted must restore pre-poll grant"
+        );
+
+        // Task remains readable via a subsequent poll and trims back after frame drop.
+        let budget3 = retained.fresh_frame_budget(Control::none()).unwrap();
+        let staged3 = StagedResponse::TaskCompleted {
+            id: RequestId::Number(12),
+            task: Box::new(task),
+            result: retained.clone(),
+            frame_budget: budget3,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let frame = staged3.into_frame_or_error(Framing::Json, 30.0);
+        let v: Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(
+            v["result"]["result"]["content"][0]["text"],
+            "small completed payload"
+        );
+        drop(frame);
+        assert_eq!(grant.granted(), pre_poll_granted);
+
+        drop((retained, grant));
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn response_slot_cancel_hook_fires_only_on_close_or_already_closed() {
+        let fired = Arc::new(AtomicBool::new(false));
+        let slot = ResponseSlot::open();
+        let f = fired.clone();
+        assert!(slot.arm_cancel_hook(move || f.store(true, Ordering::SeqCst)));
+        // Normal take() disarms the hook without running it.
+        assert!(slot.take().is_none());
+        assert!(!fired.load(Ordering::SeqCst));
+
+        // Arming on an already-closed slot runs the hook immediately and returns false.
+        let f2 = fired.clone();
+        assert!(!slot.arm_cancel_hook(move || f2.store(true, Ordering::SeqCst)));
+        assert!(fired.load(Ordering::SeqCst));
+
+        // close() runs an armed hook on an open slot.
+        let fired2 = Arc::new(AtomicBool::new(false));
+        let slot2 = ResponseSlot::open();
+        let f3 = fired2.clone();
+        assert!(slot2.arm_cancel_hook(move || f3.store(true, Ordering::SeqCst)));
+        slot2.close();
+        assert!(fired2.load(Ordering::SeqCst));
     }
 }

@@ -674,6 +674,9 @@ impl Endpoint {
             }
             return Response::from_parts(parts, Body::from(bytes));
         }
+        if resp.status().is_success() {
+            slot.disarm_cancel_hook();
+        }
         resp.map(Body::new)
     }
 }

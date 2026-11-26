@@ -352,37 +352,22 @@ impl Tasks {
     }
 
     /// Atomically admit the running call `work` as a background task of `owner` if the
-    /// server has not shut down and fewer than [`MAX_RUNNING`] tasks are active. Returns
-    /// `Err(work)` when full or shut down so the caller can keep running `work` inline.
+    /// server has not shut down, `request_ct` has not been cancelled, and fewer than
+    /// [`MAX_RUNNING`] tasks are active. Returns `Err(work)` without cancelling `cancel`
+    /// when full, shut down, or cancelled so the caller can keep running `work` inline
+    /// or handle cancellation cleanly.
     /// `cancel` is the call's cancel flag, which `tasks/cancel` sets.
     pub(super) fn try_start_retained(
         &self,
         owner: String,
         mut work: JoinHandle<TaskOutcome>,
         cancel: Arc<AtomicBool>,
+        request_ct: Option<&CancellationToken>,
     ) -> Result<Task, JoinHandle<TaskOutcome>> {
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let now = current_timestamp();
         let ttl = self.ttl;
-        let task = Task::new(task_id.clone(), TaskStatus::Working, now.clone(), now)
-            .with_ttl_ms(ttl.as_millis() as u64)
-            .with_poll_interval_ms(POLL_MS)
-            .with_status_message("running");
-        let (cancel_tx, mut cancel_rx) = watch::channel(false);
-        let entry = TaskEntry {
-            owner,
-            task: task.clone(),
-            state: TaskState::Working {
-                cancel: cancel.clone(),
-                cancel_tx,
-                join_handle: None,
-            },
-            created: Instant::now(),
-            ttl,
-        };
-        {
+        let (task_id, task, mut cancel_rx) = {
             let mut inner = self.inner.lock();
-            if inner.shut_down {
+            if inner.shut_down || request_ct.is_some_and(CancellationToken::is_cancelled) {
                 return Err(work);
             }
             Self::sweep_expired(&self.inner, &mut inner);
@@ -394,8 +379,27 @@ impl Tasks {
             if running >= MAX_RUNNING {
                 return Err(work);
             }
+            let task_id = uuid::Uuid::new_v4().to_string();
+            let now = current_timestamp();
+            let task = Task::new(task_id.clone(), TaskStatus::Working, now.clone(), now)
+                .with_ttl_ms(ttl.as_millis() as u64)
+                .with_poll_interval_ms(POLL_MS)
+                .with_status_message("running");
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            let entry = TaskEntry {
+                owner,
+                task: task.clone(),
+                state: TaskState::Working {
+                    cancel: cancel.clone(),
+                    cancel_tx,
+                    join_handle: None,
+                },
+                created: Instant::now(),
+                ttl,
+            };
             inner.tasks.insert(task_id.clone(), entry);
-        }
+            (task_id, task, cancel_rx)
+        };
 
         let inner_arc = self.inner.clone();
         let id_for_task = task_id.clone();
@@ -499,6 +503,18 @@ impl Tasks {
         Ok(task)
     }
 
+    /// Remove and drop a task immediately without waiting for TTL.
+    ///
+    /// Used when request cancellation races task detachment before the caller can
+    /// receive the task ID, ensuring no unreachable task or retained credit lingers.
+    pub(super) fn retire(&self, id: &str) {
+        let removed = {
+            let mut inner = self.inner.lock();
+            inner.tasks.remove(id)
+        };
+        drop(removed);
+    }
+
     /// Convenience wrapper for tests that spawn a plain `CallToolResult`.
     #[cfg(test)]
     pub fn start(
@@ -513,7 +529,7 @@ impl Tasks {
                 Err(_) => TaskOutcome::Fallback(CallToolResult::error(Vec::new())),
             }
         });
-        self.try_start_retained(owner, wrapped, cancel)
+        self.try_start_retained(owner, wrapped, cancel, None)
             .ok()
             .expect("task capacity available")
     }
@@ -600,16 +616,63 @@ mod tests {
             });
             assert!(
                 tasks
-                    .try_start_retained("alice".into(), work, Arc::new(AtomicBool::new(false)))
+                    .try_start_retained(
+                        "alice".into(),
+                        work,
+                        Arc::new(AtomicBool::new(false)),
+                        None
+                    )
                     .is_ok()
             );
         }
-        // MAX_RUNNING + 1 must be refused atomically and return `work` intact.
-        let extra = tokio::spawn(async { TaskOutcome::Fallback(CallToolResult::default()) });
+        // MAX_RUNNING + 1 must be refused atomically and return `work` WITHOUT tripping `cancel`.
+        let extra_cancel = Arc::new(AtomicBool::new(false));
+        let check_cancel = extra_cancel.clone();
+        let (extra_tx, extra_rx) = tokio::sync::oneshot::channel::<()>();
+        let extra = tokio::spawn(async move {
+            let _ = extra_rx.await;
+            if check_cancel.load(Ordering::SeqCst) {
+                TaskOutcome::Fallback(CallToolResult::error(Vec::new()))
+            } else {
+                TaskOutcome::Fallback(CallToolResult::success(Vec::new()))
+            }
+        });
         let returned = tasks
-            .try_start_retained("alice".into(), extra, Arc::new(AtomicBool::new(false)))
+            .try_start_retained("alice".into(), extra, extra_cancel.clone(), None)
             .expect_err("must reject beyond MAX_RUNNING");
-        let _ = returned.await;
+        assert!(
+            !extra_cancel.load(Ordering::SeqCst),
+            "refusal beyond MAX_RUNNING must not cancel inline fallback work"
+        );
+        let _ = extra_tx.send(());
+        match returned.await.unwrap() {
+            TaskOutcome::Fallback(r) => assert_eq!(r.is_error, Some(false)),
+            TaskOutcome::Retained(_) => panic!("unexpected retained"),
+        }
+
+        // Cancelled request token refuses detachment without setting cancel on `work`.
+        let ct = CancellationToken::new();
+        ct.cancel();
+        let tasks2 = Tasks::with_ttl(Duration::from_secs(60));
+        let ct_cancel = Arc::new(AtomicBool::new(false));
+        let ct_work = tokio::spawn(async { TaskOutcome::Fallback(CallToolResult::default()) });
+        let ct_ret = tasks2
+            .try_start_retained("alice".into(), ct_work, ct_cancel.clone(), Some(&ct))
+            .expect_err("cancelled token must refuse detachment");
+        assert!(!ct_cancel.load(Ordering::SeqCst));
+        assert!(tasks2.inner.lock().tasks.is_empty());
+        let _ = ct_ret.await;
+
+        // Shut-down store also refuses without tripping `cancel`.
+        tasks2.shutdown();
+        let sd_cancel = Arc::new(AtomicBool::new(false));
+        let sd_work = tokio::spawn(async { TaskOutcome::Fallback(CallToolResult::default()) });
+        let sd_ret = tasks2
+            .try_start_retained("alice".into(), sd_work, sd_cancel.clone(), None)
+            .expect_err("shut down store must refuse detachment");
+        assert!(!sd_cancel.load(Ordering::SeqCst));
+        let _ = sd_ret.await;
+
         tasks.shutdown();
     }
 
@@ -621,7 +684,7 @@ mod tests {
             TaskOutcome::Fallback(CallToolResult::default())
         });
         let task = tasks
-            .try_start_retained("alice".into(), work, Arc::new(AtomicBool::new(false)))
+            .try_start_retained("alice".into(), work, Arc::new(AtomicBool::new(false)), None)
             .ok()
             .unwrap();
         // Wait past initial TTL so Phase 1 transitions Working -> Failed with an eviction timer.
@@ -629,6 +692,23 @@ mod tests {
         let _ = tasks.can_start();
         // Wait past the second TTL window without any further RPCs: eviction timer removes it.
         tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(!tasks.inner.lock().tasks.contains_key(&task.task_id));
+    }
+
+    #[tokio::test]
+    async fn retire_immediately_cancels_and_removes_detached_task() {
+        let tasks = Tasks::with_ttl(Duration::from_secs(60));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let work = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            TaskOutcome::Fallback(CallToolResult::default())
+        });
+        let task = tasks
+            .try_start_retained("alice".into(), work, cancel.clone(), None)
+            .ok()
+            .unwrap();
+        tasks.retire(&task.task_id);
+        assert!(cancel.load(Ordering::SeqCst));
         assert!(!tasks.inner.lock().tasks.contains_key(&task.task_id));
     }
 }

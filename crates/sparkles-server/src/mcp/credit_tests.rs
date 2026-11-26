@@ -927,9 +927,17 @@ async fn stdio_cancel_under_open_backpressure_dup_id_and_short_write_framing() {
         // Send req 1 so its ~180 KiB response blocks on the 4 KiB duplex pipe.
         cw.write_all(make_call(101).as_bytes()).await.unwrap();
         cw.flush().await.unwrap();
-        assert!(wait_for(Duration::from_secs(5), || pool.granted() > 0).await);
-        // Wait for req 1 to finish executing and trim down to its blocked frame size.
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        // Wait for req 1 to finish executing, enter `StdioQueue`, trim its INITIAL_GRANT
+        // down to the ~180 KiB blocked frame, and stall mid-write on the 4 KiB pipe.
+        assert!(
+            wait_for(Duration::from_secs(10), || {
+                let g = pool.granted();
+                g > 0 && g < (4 << 20)
+            })
+            .await,
+            "expected req 101 to trim and block inside StdioQueue: granted={}",
+            pool.granted()
+        );
         let held_by_one = pool.granted();
         assert!(held_by_one > 0);
 
@@ -958,8 +966,23 @@ async fn stdio_cancel_under_open_backpressure_dup_id_and_short_write_framing() {
             pool.granted()
         );
 
-        // Now drain req 1 (pipe still open) and verify a subsequent ping works cleanly with
-        // no stray response for cancelled req 2 and pool.granted() == 0!
+        // Send a duplicate request with id 101 WHILE original 101's response is already
+        // queued/writing inside `StdioQueue` under open backpressure: must still be rejected
+        // with -32600 rather than admitted as a second concurrent request!
+        let dup_101 = json!({
+            "jsonrpc": "2.0",
+            "id": 101,
+            "method": "tools/list",
+            "params": { "_meta": modern_meta(false) }
+        });
+        cw.write_all(format!("{}\n", serde_json::to_string(&dup_101).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        cw.flush().await.unwrap();
+
+        // Now drain req 1 (pipe still open) and verify the duplicate-ID -32600 rejection and
+        // a subsequent tools/list work cleanly with no stray response for cancelled req 2 and
+        // pool.granted() == 0!
         let mut lines = BufReader::new(cr).lines();
         let line1 = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
             .await
@@ -969,6 +992,18 @@ async fn stdio_cancel_under_open_backpressure_dup_id_and_short_write_framing() {
         let reply1: Value = serde_json::from_str(&line1).unwrap();
         assert_eq!(reply1["id"], 101);
         assert_eq!(reply1["result"]["isError"], false);
+
+        let line_dup = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let reply_dup: Value = serde_json::from_str(&line_dup).unwrap();
+        assert_eq!(reply_dup["id"], 101);
+        assert_eq!(
+            reply_dup["error"]["code"], -32600,
+            "duplicate ID while response is in StdioQueue must return -32600: {reply_dup}"
+        );
 
         let list = json!({
             "jsonrpc": "2.0",
@@ -1070,7 +1105,11 @@ async fn stdio_cancel_under_open_backpressure_dup_id_and_short_write_framing() {
             chunk: 7,
             yield_next: false,
         };
-        let serve_handle = tokio::spawn(super::adapter::serve(Adapter::new(server), sr, short_sw));
+        let serve_handle = tokio::spawn(super::adapter::serve(
+            Adapter::new(server.clone()),
+            sr,
+            short_sw,
+        ));
         let (cr, mut cw) = tokio::io::split(client);
 
         let mut batch = String::new();
@@ -1111,6 +1150,49 @@ async fn stdio_cancel_under_open_backpressure_dup_id_and_short_write_framing() {
         assert_eq!(err_count, 6);
         drop((cw, lines));
         let _ = serve_handle.await;
+    }
+
+    // Subcase 4 (R2-8): stdin half-closes immediately after protocol errors over a
+    // short-writing 7-byte sink while stdout stays open — every accepted -32600 error line
+    // must drain intact before EOF.
+    {
+        let (client, srv) = tokio::io::duplex(256 << 10);
+        let (sr, sw) = tokio::io::split(srv);
+        let short_sw = ShortWriter {
+            inner: sw,
+            chunk: 7,
+            yield_next: false,
+        };
+        let serve_handle = tokio::spawn(super::adapter::serve(Adapter::new(server), sr, short_sw));
+        let (cr, mut cw) = tokio::io::split(client);
+
+        let mut batch = String::new();
+        for _ in 0..4 {
+            batch.push_str("{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":123}\n");
+        }
+        cw.write_all(batch.as_bytes()).await.unwrap();
+        cw.flush().await.unwrap();
+        // Half-close stdin immediately while keeping stdout (`cr`) open to read.
+        cw.shutdown().await.unwrap();
+        drop(cw);
+
+        let mut lines = BufReader::new(cr).lines();
+        let mut err_count = 0usize;
+        while let Some(line) = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            let v: Value = serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("truncated NDJSON error frame on EOF: {e}: {line:?}"));
+            assert_eq!(v["error"]["code"], -32600);
+            err_count += 1;
+        }
+        assert_eq!(
+            err_count, 4,
+            "all accepted protocol errors must drain before EOF"
+        );
+        serve_handle.await.unwrap().unwrap();
     }
 }
 
@@ -1312,11 +1394,106 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
     );
     drop(unread_resp);
 
-    // 3. (F7) Create BOTH an unread/disconnected replay entry AND a retained completed task
-    //    (with 60 s TTLs), then cancel `HttpConf.shutdown` WITHOUT dropping `app` -> credit
-    //    MUST drop to 0 immediately!
+    // 2b. (F8 / R2-11) Duplicate in-flight RequestId on a legacy HTTP session returns
+    //     -32600 on the duplicate SSE stream without breaking the original request.
+    {
+        let slow_body = json!({
+            "jsonrpc": "2.0",
+            "id": 305,
+            "method": "tools/call",
+            "params": {
+                "name": "sparql_query",
+                "arguments": {
+                    "dataset": "t",
+                    "query": "PREFIX ex: <http://ex.org/> SELECT (COUNT(*) AS ?n) WHERE { ?a ex:v ?v1 . ?b ex:v ?v2 . FILTER(STRLEN(CONCAT(?v1, ?v2)) > 0) }",
+                    "format": "json"
+                }
+            }
+        });
+        let dup_body = json!({
+            "jsonrpc": "2.0",
+            "id": 305,
+            "method": "tools/list",
+            "params": {}
+        });
+        let headers = [
+            ACCEPT,
+            JSON_CT,
+            ("mcp-protocol-version", "2025-11-25"),
+            ("mcp-session-id", sid.as_str()),
+        ];
+        // First POST returns the SSE response as soon as the session worker registers id 305.
+        let orig_resp = app
+            .clone()
+            .oneshot(http_req("POST", &headers, &slow_body.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(orig_resp.status(), StatusCode::OK);
+        let dup_resp = app
+            .clone()
+            .oneshot(http_req("POST", &headers, &dup_body.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(dup_resp.status(), StatusCode::OK);
+
+        let dup_bytes = axum::body::to_bytes(dup_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dup_text = String::from_utf8_lossy(&dup_bytes);
+        let dup_payload = dup_text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .find(|d| d.starts_with('{'))
+            .expect("duplicate request must emit JSON-RPC error event");
+        let dup_v: Value = serde_json::from_str(dup_payload).unwrap();
+        assert_eq!(dup_v["id"], 305);
+        assert_eq!(
+            dup_v["error"]["code"], -32600,
+            "expected -32600 duplicate ID rejection on legacy HTTP: {dup_v}"
+        );
+
+        let orig_bytes = axum::body::to_bytes(orig_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let orig_text = String::from_utf8_lossy(&orig_bytes);
+        let orig_payload = orig_text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .find(|d| d.starts_with('{'))
+            .expect("original request must still emit its terminal response");
+        let orig_v: Value = serde_json::from_str(orig_payload).unwrap();
+        assert_eq!(orig_v["id"], 305);
+        assert_eq!(orig_v["result"]["isError"], false, "{orig_v}");
+        // Evict 305's replay cache via cancellation so subcase 3 starts from 0 credit.
+        let cancel_305 = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": 305 }
+        });
+        let _ = app
+            .clone()
+            .oneshot(http_req("POST", &headers, &cancel_305.to_string()))
+            .await
+            .unwrap();
+        assert!(wait_for(Duration::from_secs(5), || pool.granted() == 0).await);
+    }
+
+    // 3. (F7 / R2-10) Create BOTH an unread/disconnected replay entry AND a retained
+    //    completed task (with 60 s TTLs), verify both hold credit, then cancel
+    //    `HttpConf.shutdown` WITHOUT dropping `app` -> credit MUST drop to 0 immediately!
     let held_sse = app.clone().oneshot(post_query(303)).await.unwrap();
     assert_eq!(held_sse.status(), StatusCode::OK);
+    assert!(
+        wait_for(Duration::from_secs(5), || {
+            let g = pool.granted();
+            g > 0 && g < (4 << 20)
+        })
+        .await,
+        "legacy SSE response did not finish caching and trimming: granted={}",
+        pool.granted()
+    );
+    let granted_with_sse = pool.granted();
+    assert!(granted_with_sse > 0);
     let task_start = app
         .clone()
         .oneshot(http_req(
@@ -1349,7 +1526,8 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
     let start_v: Value = serde_json::from_slice(&start_raw).unwrap();
     let task_id = start_v["result"]["taskId"].as_str().unwrap().to_string();
     // Wait until the task finishes and is retained.
-    for poll in 0..50 {
+    let mut task_completed = false;
+    for poll in 0..100 {
         let poll_resp = app
             .clone()
             .oneshot(http_req(
@@ -1359,6 +1537,7 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
                     JSON_CT,
                     ("mcp-protocol-version", "2026-07-28"),
                     ("mcp-method", "tasks/get"),
+                    ("mcp-name", task_id.as_str()),
                 ],
                 &json!({
                     "jsonrpc": "2.0",
@@ -1370,17 +1549,27 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
             ))
             .await
             .unwrap();
+        assert_eq!(poll_resp.status(), StatusCode::OK);
         let raw = axum::body::to_bytes(poll_resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&raw).unwrap();
         if v["result"]["status"] == "completed" {
             assert_eq!(v["result"]["resultType"], "complete", "{v}");
+            task_completed = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(pool.granted() > 0);
+    assert!(
+        task_completed,
+        "background task {task_id} did not reach completed state before shutdown check"
+    );
+    assert!(
+        pool.granted() > granted_with_sse,
+        "expected both legacy SSE replay and retained completed task to hold credit: granted={}, sse_only={granted_with_sse}",
+        pool.granted()
+    );
 
     // Fire HTTP shutdown while `app` and `held_sse` are still alive!
     state.mcp.as_ref().unwrap().shutdown.cancel();
@@ -1433,7 +1622,7 @@ async fn many_small_completed_tasks_trim_grants_and_never_starve_pool() {
         drop(grant);
         let work = tokio::spawn(async move { TaskOutcome::Retained(retained) });
         let task = tasks
-            .try_start_retained("alice".into(), work, Arc::new(AtomicBool::new(false)))
+            .try_start_retained("alice".into(), work, Arc::new(AtomicBool::new(false)), None)
             .ok()
             .expect("task admitted");
         // Wait for this task to complete and trim its grant before admitting the next one.

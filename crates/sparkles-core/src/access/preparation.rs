@@ -2751,19 +2751,32 @@ mod tests {
     fn child_with_control_enforces_parent_limit_after_expiry_and_bounds_concurrent_children() {
         let pool = crate::sparql::pool::QueryPool::new(16 << 20);
         let grant = Arc::new(pool.empty_grant());
-        let mut expired = Control::none();
-        expired.deadline = Some(std::time::Instant::now() + Duration::from_secs(60));
+        let root_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut expired = Control::with_cancel(root_cancel.clone());
+        expired.deadline = Some(std::time::Instant::now() + Duration::from_millis(25));
         let root = Preparation::with_grant(expired, 8192, grant.clone()).unwrap();
         // Simulate 5000 bytes retained on the root preparation.
         let retained = root.reserve(5000).unwrap();
         let baseline_used = root.inner.used.load(Ordering::Relaxed);
         let baseline_grant = grant.used();
 
+        // Wait until the root deadline has genuinely expired before creating fresh children.
+        let wait_limit = std::time::Instant::now() + Duration::from_secs(2);
+        while root.check().is_ok() && std::time::Instant::now() < wait_limit {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            matches!(root.check(), Err(Error::Timeout)),
+            "root preparation deadline must be expired before child_with_control"
+        );
+        root_cancel.store(true, Ordering::SeqCst);
+
         // Construct a child with a fresh live deadline and cancel flag.
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut fresh = Control::with_cancel(cancel.clone());
         fresh.deadline = Some(std::time::Instant::now() + Duration::from_secs(60));
         let child1 = root.child_with_control(fresh).unwrap();
+        assert!(child1.check().is_ok());
         // Child1 cannot exceed the root's remaining headroom (8192 - used).
         let err = child1.reserve(4000).err().expect("expected budget error");
         assert!(matches!(

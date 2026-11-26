@@ -474,7 +474,7 @@ impl ServerHandler for Adapter {
                     }
                     slot.park(StagedResponse::TaskCompleted {
                         id: ctx.id.clone(),
-                        task: task.clone(),
+                        task: Box::new(task.clone()),
                         result,
                         frame_budget,
                         cancel,
@@ -926,11 +926,28 @@ impl ServerHandler for Adapter {
             }
             return Ok(CallToolResult::default().into());
         }
-        // Recheck `MAX_RUNNING` atomically at detachment; if capacity filled while waiting
-        // for `task_after`, keep running this call synchronously.
-        let mut work = match tasks.try_start_retained(owner, work, cancel.clone()) {
+        // Recheck `MAX_RUNNING` and request cancellation atomically at detachment; if
+        // capacity filled while waiting for `task_after`, keep running this call
+        // synchronously without cancelling `work`. If cancellation races detachment
+        // before the caller can receive the task ID, retire the task immediately so no
+        // unreachable task or retained credit lingers.
+        let mut work = match tasks.try_start_retained(owner, work, cancel.clone(), Some(&ctx.ct)) {
             Ok(task) => {
                 stop.0 = None;
+                let server_for_retire = self.server.clone();
+                let task_id = task.task_id.clone();
+                let slot_open = transport_slot.as_ref().is_none_or(|slot| {
+                    let server_hook = server_for_retire.clone();
+                    let id_hook = task_id.clone();
+                    slot.arm_cancel_hook(move || server_hook.shared.tasks.retire(&id_hook))
+                });
+                if !slot_open || ctx.ct.is_cancelled() {
+                    server_for_retire.shared.tasks.retire(&task_id);
+                    if let Some(slot) = &transport_slot {
+                        slot.close();
+                    }
+                    return Ok(CallToolResult::default().into());
+                }
                 return Ok(CallToolResponse::Task(CreateTaskResult::new(task)));
             }
             Err(work) => work,
@@ -1005,9 +1022,16 @@ fn should_ignore_stdio_notification(json_value: &Value) -> bool {
     )
 }
 
+/// Upper bound on queued/active non-blocking stdio protocol-error frames before stdin
+/// applies backpressure, preventing unbounded memory growth under a blocked stdout sink.
+const MAX_PENDING_RAW_ERRORS: usize = 64;
+const MAX_PENDING_RAW_ERROR_BYTES: usize = 64 << 10;
+/// Bounded grace period to flush already-accepted raw protocol-error frames on stdin EOF.
+const STDIO_EOF_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 enum StdioWritePayload {
     Staged {
-        staged: StagedResponse,
+        staged: Box<StagedResponse>,
         max_timeout_secs: f64,
     },
     Raw(axum::body::Bytes),
@@ -1016,6 +1040,8 @@ enum StdioWritePayload {
 struct StdioWriteJob {
     session_id: u64,
     request_id: Option<RequestId>,
+    is_raw_error: bool,
+    raw_len: usize,
     payload: StdioWritePayload,
     cancel: CancellationToken,
     done: Option<oneshot::Sender<std::io::Result<()>>>,
@@ -1031,19 +1057,30 @@ struct StdioActiveJob {
 struct StdioQueue {
     jobs: VecDeque<StdioWriteJob>,
     active: Option<StdioActiveJob>,
+    pending_raw_errors: usize,
+    pending_raw_error_bytes: usize,
+    draining: bool,
     closed: bool,
+}
+
+enum EnqueueRaw {
+    Queued,
+    Full(axum::body::Bytes),
+    Closed,
 }
 
 /// Shared, cancellation-safe writer task handle for `CreditedStdioTransport`.
 ///
 /// Owns stdout exclusively so `receive()` never awaits `write_all` inside a
 /// `tokio::select!`-cancellable future, keeps partial writes atomic across short-writing
-/// sinks, and lets `notifications/cancelled` drop queued or not-yet-started frames even
-/// while stdout is backpressured.
+/// sinks, bounds queued protocol-error traffic under backpressure, drains accepted
+/// protocol errors on clean stdin EOF, and lets `notifications/cancelled` drop queued or
+/// not-yet-started frames even while stdout is backpressured.
 #[derive(Clone)]
 struct StdioWriterHandle {
     queue: Arc<parking_lot::Mutex<StdioQueue>>,
     notify: Arc<Notify>,
+    raw_space_notify: Arc<Notify>,
     shutdown: CancellationToken,
 }
 
@@ -1055,13 +1092,18 @@ impl StdioWriterHandle {
         let queue = Arc::new(parking_lot::Mutex::new(StdioQueue {
             jobs: VecDeque::new(),
             active: None,
+            pending_raw_errors: 0,
+            pending_raw_error_bytes: 0,
+            draining: false,
             closed: false,
         }));
         let notify = Arc::new(Notify::new());
+        let raw_space_notify = Arc::new(Notify::new());
         let shutdown = CancellationToken::new();
         let handle = Self {
             queue: queue.clone(),
             notify: notify.clone(),
+            raw_space_notify: raw_space_notify.clone(),
             shutdown: shutdown.clone(),
         };
         let task = tokio::spawn(async move {
@@ -1069,14 +1111,26 @@ impl StdioWriterHandle {
                 let next_job = {
                     let mut q = queue.lock();
                     if q.closed {
+                        q.pending_raw_errors = 0;
+                        q.pending_raw_error_bytes = 0;
                         let dropped = std::mem::take(&mut q.jobs);
                         drop(q);
+                        raw_space_notify.notify_waiters();
                         drop(dropped);
                         return;
                     }
                     if let Some(job) = q.jobs.pop_front() {
                         if job.cancel.is_cancelled() {
+                            let wake_raw = job.is_raw_error;
+                            if job.is_raw_error {
+                                q.pending_raw_errors = q.pending_raw_errors.saturating_sub(1);
+                                q.pending_raw_error_bytes =
+                                    q.pending_raw_error_bytes.saturating_sub(job.raw_len);
+                            }
                             drop(q);
+                            if wake_raw {
+                                raw_space_notify.notify_waiters();
+                            }
                             if let Some(done) = job.done {
                                 let _ = done.send(Ok(()));
                             }
@@ -1090,6 +1144,8 @@ impl StdioWriterHandle {
                             cancel: job.cancel.clone(),
                         });
                         Some(job)
+                    } else if q.draining {
+                        return;
                     } else {
                         None
                     }
@@ -1100,8 +1156,11 @@ impl StdioWriterHandle {
                         () = shutdown.cancelled() => {
                             let mut q = queue.lock();
                             q.closed = true;
+                            q.pending_raw_errors = 0;
+                            q.pending_raw_error_bytes = 0;
                             let dropped = std::mem::take(&mut q.jobs);
                             drop(q);
+                            raw_space_notify.notify_waiters();
                             drop(dropped);
                             return;
                         }
@@ -1109,6 +1168,8 @@ impl StdioWriterHandle {
                     }
                 };
                 let StdioWriteJob {
+                    is_raw_error,
+                    raw_len,
                     payload,
                     cancel,
                     done,
@@ -1116,7 +1177,18 @@ impl StdioWriterHandle {
                 } = job;
                 if cancel.is_cancelled() || shutdown.is_cancelled() {
                     drop(payload);
-                    queue.lock().active = None;
+                    {
+                        let mut q = queue.lock();
+                        q.active = None;
+                        if is_raw_error {
+                            q.pending_raw_errors = q.pending_raw_errors.saturating_sub(1);
+                            q.pending_raw_error_bytes =
+                                q.pending_raw_error_bytes.saturating_sub(raw_len);
+                        }
+                    }
+                    if is_raw_error {
+                        raw_space_notify.notify_waiters();
+                    }
                     if let Some(done) = done {
                         let _ = done.send(Ok(()));
                     }
@@ -1129,10 +1201,15 @@ impl StdioWriterHandle {
                     } => staged.into_frame_or_error(Framing::NdJson, max_timeout_secs),
                     StdioWritePayload::Raw(bytes) => bytes,
                 };
+                let body_len = if frame.last() == Some(&b'\n') {
+                    frame.len().saturating_sub(1)
+                } else {
+                    frame.len()
+                };
                 let mut written = 0usize;
                 let mut cancelled_before_wire = false;
                 let mut write_res: std::io::Result<()> = Ok(());
-                while written < frame.len() {
+                while written < body_len {
                     if written == 0 {
                         // Before the first byte is written to stdout, cancelling the
                         // request can drop the frame cleanly without tearing NDJSON.
@@ -1149,7 +1226,7 @@ impl StdioWriterHandle {
                                 cancelled_before_wire = true;
                                 break;
                             }
-                            res = output.write(&frame[..]) => res,
+                            res = output.write(&frame[..body_len]) => res,
                         };
                         match step {
                             Ok(0) => {
@@ -1168,6 +1245,41 @@ impl StdioWriterHandle {
                     } else {
                         // Once a prefix of this NDJSON line is already on stdout, finish
                         // the line unless the transport itself shuts down or errors.
+                        let step = tokio::select! {
+                            biased;
+                            () = shutdown.cancelled() => {
+                                write_res = Err(std::io::Error::new(
+                                    std::io::ErrorKind::NotConnected,
+                                    "Transport is closed",
+                                ));
+                                break;
+                            }
+                            res = output.write(&frame[written..body_len]) => res,
+                        };
+                        match step {
+                            Ok(0) => {
+                                write_res = Err(std::io::Error::new(
+                                    std::io::ErrorKind::WriteZero,
+                                    "failed to write stdio frame",
+                                ));
+                                break;
+                            }
+                            Ok(n) => written += n,
+                            Err(e) => {
+                                write_res = Err(e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if write_res.is_ok() && !cancelled_before_wire {
+                    // Release the request-ID reservation BEFORE writing the trailing `\n`
+                    // so a sequential client that immediately reuses the same ID upon
+                    // reading the complete line never races `q.active`.
+                    if let Some(active) = queue.lock().active.as_mut() {
+                        active.request_id = None;
+                    }
+                    while written < frame.len() {
                         let step = tokio::select! {
                             biased;
                             () = shutdown.cancelled() => {
@@ -1208,15 +1320,27 @@ impl StdioWriterHandle {
                 // Release `Bytes` / `FrameOwner` credit before waking `send()`.
                 drop(frame);
                 let failed = write_res.is_err();
+                let mut wake_raw = is_raw_error;
+                let mut dropped_on_fail = None;
                 {
                     let mut q = queue.lock();
                     q.active = None;
+                    if is_raw_error {
+                        q.pending_raw_errors = q.pending_raw_errors.saturating_sub(1);
+                        q.pending_raw_error_bytes =
+                            q.pending_raw_error_bytes.saturating_sub(raw_len);
+                    }
                     if failed {
                         q.closed = true;
-                        let dropped = std::mem::take(&mut q.jobs);
-                        drop(q);
-                        drop(dropped);
+                        q.pending_raw_errors = 0;
+                        q.pending_raw_error_bytes = 0;
+                        wake_raw = true;
+                        dropped_on_fail = Some(std::mem::take(&mut q.jobs));
                     }
+                }
+                drop(dropped_on_fail);
+                if wake_raw {
+                    raw_space_notify.notify_waiters();
                 }
                 if let Some(done) = done {
                     let _ = done.send(write_res);
@@ -1229,6 +1353,18 @@ impl StdioWriterHandle {
         (handle, task)
     }
 
+    fn has_in_flight_request(&self, session_id: u64, request_id: &RequestId) -> bool {
+        let q = self.queue.lock();
+        if q.active.as_ref().is_some_and(|a| {
+            a.session_id == session_id && a.request_id.as_ref() == Some(request_id)
+        }) {
+            return true;
+        }
+        q.jobs
+            .iter()
+            .any(|j| j.session_id == session_id && j.request_id.as_ref() == Some(request_id))
+    }
+
     fn enqueue_with_ack(
         &self,
         session_id: u64,
@@ -1237,7 +1373,7 @@ impl StdioWriterHandle {
     ) -> oneshot::Receiver<std::io::Result<()>> {
         let (tx, rx) = oneshot::channel();
         let mut q = self.queue.lock();
-        if q.closed || self.shutdown.is_cancelled() {
+        if q.closed || q.draining || self.shutdown.is_cancelled() {
             drop(q);
             drop(payload);
             let _ = tx.send(Err(std::io::Error::new(
@@ -1249,6 +1385,8 @@ impl StdioWriterHandle {
         q.jobs.push_back(StdioWriteJob {
             session_id,
             request_id,
+            is_raw_error: false,
+            raw_len: 0,
             payload,
             cancel: CancellationToken::new(),
             done: Some(tx),
@@ -1258,21 +1396,67 @@ impl StdioWriterHandle {
         rx
     }
 
-    fn enqueue_raw_nonblocking(&self, session_id: u64, bytes: axum::body::Bytes) -> bool {
+    fn raw_error_has_room(q: &StdioQueue, needed_bytes: usize) -> bool {
+        q.pending_raw_errors == 0
+            || (q.pending_raw_errors < MAX_PENDING_RAW_ERRORS
+                && q.pending_raw_error_bytes.saturating_add(needed_bytes)
+                    <= MAX_PENDING_RAW_ERROR_BYTES)
+    }
+
+    fn try_enqueue_raw_error(&self, session_id: u64, bytes: axum::body::Bytes) -> EnqueueRaw {
         let mut q = self.queue.lock();
-        if q.closed || self.shutdown.is_cancelled() {
-            return false;
+        if q.closed || q.draining || self.shutdown.is_cancelled() {
+            return EnqueueRaw::Closed;
         }
+        let raw_len = bytes.len();
+        if !Self::raw_error_has_room(&q, raw_len) {
+            return EnqueueRaw::Full(bytes);
+        }
+        q.pending_raw_errors += 1;
+        q.pending_raw_error_bytes = q.pending_raw_error_bytes.saturating_add(raw_len);
         q.jobs.push_back(StdioWriteJob {
             session_id,
             request_id: None,
+            is_raw_error: true,
+            raw_len,
             payload: StdioWritePayload::Raw(bytes),
             cancel: CancellationToken::new(),
             done: None,
         });
         drop(q);
         self.notify.notify_one();
-        true
+        EnqueueRaw::Queued
+    }
+
+    async fn wait_for_raw_error_space(&self, needed_bytes: usize) -> bool {
+        loop {
+            let notified = self.raw_space_notify.notified();
+            tokio::pin!(notified);
+            {
+                let q = self.queue.lock();
+                if q.closed || q.draining || self.shutdown.is_cancelled() {
+                    return false;
+                }
+                if Self::raw_error_has_room(&q, needed_bytes) {
+                    return true;
+                }
+                notified.as_mut().enable();
+            }
+            tokio::select! {
+                biased;
+                () = self.shutdown.cancelled() => return false,
+                () = &mut notified => {}
+            }
+        }
+    }
+
+    fn begin_drain(&self) {
+        {
+            let mut q = self.queue.lock();
+            q.draining = true;
+        }
+        self.notify.notify_waiters();
+        self.raw_space_notify.notify_waiters();
     }
 
     fn cancel_request(&self, session_id: u64, request_id: &RequestId) {
@@ -1345,9 +1529,12 @@ impl StdioWriterHandle {
         let dropped = {
             let mut q = self.queue.lock();
             q.closed = true;
+            q.pending_raw_errors = 0;
+            q.pending_raw_error_bytes = 0;
             std::mem::take(&mut q.jobs)
         };
         self.notify.notify_waiters();
+        self.raw_space_notify.notify_waiters();
         for job in dropped {
             if let Some(done) = job.done {
                 let _ = done.send(Err(std::io::Error::new(
@@ -1365,6 +1552,20 @@ struct StdioWriterGuard {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
+impl StdioWriterGuard {
+    /// Let already-accepted frames (such as queued protocol errors and any started line)
+    /// finish writing and flushing on stdin EOF up to `timeout`; if stdout stays stalled
+    /// past `timeout` or this future is cancelled, `Drop` forces shutdown and aborts.
+    async fn drain(&mut self, timeout: std::time::Duration) {
+        self.handle.begin_drain();
+        if let Some(task) = self.task.as_mut()
+            && tokio::time::timeout(timeout, task).await.is_ok()
+        {
+            self.task = None;
+        }
+    }
+}
+
 impl Drop for StdioWriterGuard {
     fn drop(&mut self) {
         self.handle.shutdown();
@@ -1377,15 +1578,17 @@ impl Drop for StdioWriterGuard {
 /// Qualified newline-delimited JSON-RPC transport for `sparkles mcp` over stdio.
 ///
 /// Attaches a [`ResponseSlot`] to each incoming request, rejects duplicate in-flight
-/// request IDs without overwriting active ownership, drops slots and unwritten queued
-/// frames immediately on `notifications/cancelled` or transport close/drop, and encodes
-/// staged responses under their originating query credit into `Bytes::from_owner(FrameOwner)`,
-/// holding that credit across the dedicated writer task until the frame leaves the process.
+/// request IDs (including responses still queued or active in the writer) without
+/// overwriting active ownership, drops slots and unwritten queued frames immediately on
+/// `notifications/cancelled` or transport close/drop, and encodes staged responses under
+/// their originating query credit into `Bytes::from_owner(FrameOwner)`, holding that
+/// credit across the dedicated writer task until the frame leaves the process.
 struct CreditedStdioTransport<R> {
     session_id: u64,
     input: Arc<tokio::sync::Mutex<BufReader<R>>>,
     writer: StdioWriterHandle,
     line_buf: Vec<u8>,
+    pending_error: Option<axum::body::Bytes>,
     pending: HashMap<RequestId, ResponseSlot>,
     closed: Arc<AtomicBool>,
     max_timeout_secs: f64,
@@ -1416,6 +1619,7 @@ where
             input,
             writer,
             line_buf: Vec::new(),
+            pending_error: None,
             pending: HashMap::new(),
             closed: Arc::new(AtomicBool::new(false)),
             max_timeout_secs,
@@ -1451,7 +1655,7 @@ where
         }
         let payload = match staged {
             Some(staged) => StdioWritePayload::Staged {
-                staged,
+                staged: Box::new(staged),
                 max_timeout_secs: self.max_timeout_secs,
             },
             None => match serde_json::to_vec(&item) {
@@ -1481,6 +1685,23 @@ where
 
     async fn receive(&mut self) -> Option<ClientJsonRpcMessage> {
         loop {
+            if let Some(err_bytes) = self.pending_error.take() {
+                match self
+                    .writer
+                    .try_enqueue_raw_error(self.session_id, err_bytes)
+                {
+                    EnqueueRaw::Queued => {}
+                    EnqueueRaw::Closed => return None,
+                    EnqueueRaw::Full(err_bytes) => {
+                        let needed = err_bytes.len();
+                        self.pending_error = Some(err_bytes);
+                        if !self.writer.wait_for_raw_error_space(needed).await {
+                            return None;
+                        }
+                        continue;
+                    }
+                }
+            }
             {
                 let mut reader = self.input.lock().await;
                 match reader.read_until(b'\n', &mut self.line_buf).await {
@@ -1518,7 +1739,9 @@ where
                 Ok(Some(mut msg)) => {
                     match &mut msg {
                         ClientJsonRpcMessage::Request(req) => {
-                            if self.pending.contains_key(&req.id) {
+                            if self.pending.contains_key(&req.id)
+                                || self.writer.has_in_flight_request(self.session_id, &req.id)
+                            {
                                 let err_msg = ServerJsonRpcMessage::error(
                                     McpError::invalid_request(
                                         "duplicate in-flight request id",
@@ -1528,12 +1751,7 @@ where
                                 );
                                 if let Ok(mut buf) = serde_json::to_vec(&err_msg) {
                                     buf.push(b'\n');
-                                    if !self.writer.enqueue_raw_nonblocking(
-                                        self.session_id,
-                                        axum::body::Bytes::from(buf),
-                                    ) {
-                                        return None;
-                                    }
+                                    self.pending_error = Some(axum::body::Bytes::from(buf));
                                 }
                                 continue;
                             }
@@ -1568,12 +1786,7 @@ where
                         );
                         if let Ok(mut buf) = serde_json::to_vec(&err_msg) {
                             buf.push(b'\n');
-                            if !self.writer.enqueue_raw_nonblocking(
-                                self.session_id,
-                                axum::body::Bytes::from(buf),
-                            ) {
-                                return None;
-                            }
+                            self.pending_error = Some(axum::body::Bytes::from(buf));
                         }
                     }
                 },
@@ -1605,7 +1818,7 @@ where
 {
     let input = Arc::new(tokio::sync::Mutex::new(BufReader::new(input)));
     let (writer, writer_task) = StdioWriterHandle::spawn(output);
-    let _writer_guard = StdioWriterGuard {
+    let mut writer_guard = StdioWriterGuard {
         handle: writer.clone(),
         task: Some(writer_task),
     };
@@ -1623,9 +1836,13 @@ where
             Ok(running) => {
                 let reason = running.waiting().await?;
                 tracing::debug!("MCP session ended: {reason:?}");
+                writer_guard.drain(STDIO_EOF_DRAIN_TIMEOUT).await;
                 return Ok(());
             }
-            Err(ServerInitializeError::ConnectionClosed(_)) => return Ok(()),
+            Err(ServerInitializeError::ConnectionClosed(_)) => {
+                writer_guard.drain(STDIO_EOF_DRAIN_TIMEOUT).await;
+                return Ok(());
+            }
             Err(e) => tracing::warn!("MCP: {e}"),
         }
     }
@@ -1639,4 +1856,58 @@ pub async fn serve_stdio(server: McpServer) -> anyhow::Result<()> {
         tokio::io::stdout(),
     )
     .await
+}
+
+#[cfg(test)]
+mod stdio_writer_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn stdio_writer_bounds_pending_raw_errors_and_resumes_on_drain() {
+        let (mut reader, writer_half) = tokio::io::duplex(64);
+        let (handle, task) = StdioWriterHandle::spawn(writer_half);
+        let mut guard = StdioWriterGuard {
+            handle: handle.clone(),
+            task: Some(task),
+        };
+        // Fill the duplex buffer with a blocking request response so raw errors queue up.
+        let blocker_id = RequestId::Number(1);
+        let blocker = axum::body::Bytes::from(vec![b'x'; 256]);
+        let _ack =
+            handle.enqueue_with_ack(1, Some(blocker_id.clone()), StdioWritePayload::Raw(blocker));
+        assert!(handle.has_in_flight_request(1, &blocker_id));
+
+        let err_frame = axum::body::Bytes::from_static(
+            b"{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"Invalid request\"}}\n",
+        );
+        for _ in 0..MAX_PENDING_RAW_ERRORS {
+            assert!(matches!(
+                handle.try_enqueue_raw_error(1, err_frame.clone()),
+                EnqueueRaw::Queued
+            ));
+        }
+        // Next raw error must be refused with Full rather than growing StdioQueue unboundedly.
+        assert!(matches!(
+            handle.try_enqueue_raw_error(1, err_frame.clone()),
+            EnqueueRaw::Full(_)
+        ));
+
+        // Draining stdout frees room so wait_for_raw_error_space wakes and admits more errors.
+        let drain_task = tokio::spawn(async move {
+            let mut out = Vec::new();
+            let _ = reader.read_to_end(&mut out).await;
+            out
+        });
+        assert!(handle.wait_for_raw_error_space(err_frame.len()).await);
+        assert!(matches!(
+            handle.try_enqueue_raw_error(1, err_frame),
+            EnqueueRaw::Queued
+        ));
+        guard.drain(STDIO_EOF_DRAIN_TIMEOUT).await;
+        drop(guard);
+        let output = drain_task.await.unwrap();
+        let err_lines = String::from_utf8_lossy(&output).matches("-32600").count();
+        assert_eq!(err_lines, MAX_PENDING_RAW_ERRORS + 1);
+    }
 }

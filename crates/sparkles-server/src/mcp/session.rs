@@ -213,8 +213,33 @@ impl SharedSseQueue {
 /// Hand-off payload installed into [`HTTP_SSE_SLOT`] by [`CreditedSessionManager`] so
 /// `Endpoint::forward` replaces `rmcp`'s placeholder SSE body with a zero-copy
 /// [`CreditedSseBody`].
+///
+/// Acts as a drop guard for the receiver half of [`SharedSseQueue`]: if an HTTP request
+/// is cancelled during worker oneshot handoff or before [`CreditedSseBody::new`] takes
+/// ownership, dropping the receiver closes and discards the queue immediately so no
+/// abandoned primary or request queue stays open without a reader.
 pub(super) struct CreditedSseReceiver {
-    queue: SharedSseQueue,
+    queue: Option<SharedSseQueue>,
+}
+
+impl CreditedSseReceiver {
+    pub(super) fn new(queue: SharedSseQueue) -> Self {
+        Self { queue: Some(queue) }
+    }
+
+    fn into_queue(mut self) -> SharedSseQueue {
+        self.queue
+            .take()
+            .expect("CreditedSseReceiver queue already transferred")
+    }
+}
+
+impl Drop for CreditedSseReceiver {
+    fn drop(&mut self) {
+        if let Some(queue) = self.queue.take() {
+            queue.close_and_discard();
+        }
+    }
 }
 
 tokio::task_local! {
@@ -248,7 +273,7 @@ impl CreditedSseBody {
         let ping_sleep = keep_alive.map(|d| Box::pin(tokio::time::sleep(d)));
         let shutdown_fut = Box::pin(shutdown.clone().cancelled_owned());
         Self {
-            queue: receiver.queue,
+            queue: receiver.into_queue(),
             keep_alive,
             ping_sleep,
             shutdown,
@@ -385,9 +410,13 @@ struct CachedChannel {
 
 impl CachedChannel {
     fn new(tx: SharedSseQueue, http_request_id: Option<HttpRequestId>, capacity: usize) -> Self {
+        // Hold one more event than the live `SharedSseQueue` capacity so that when a
+        // stalled live queue overflows on the `(capacity + 1)`-th unread event and closes,
+        // the client's next unread index `n + 1` is still present for gap-free replay.
+        let cache_capacity = capacity.max(1).saturating_add(1);
         Self {
-            cache: VecDeque::with_capacity(capacity.min(16)),
-            capacity: capacity.max(1),
+            cache: VecDeque::with_capacity(cache_capacity.min(16)),
+            capacity: cache_capacity,
             tx,
             http_request_id,
             next_index: 0,
@@ -426,18 +455,43 @@ impl CachedChannel {
         self.tx.try_push(event)
     }
 
+    /// Validate `last_index` against the replay ring **before** mutating or replacing `tx`.
+    ///
+    /// Rejects future indexes (`last_index >= next_index`) and gaps where intermediate
+    /// events rolled off the ring, except when `allow_gap_for_terminal` is true and a
+    /// completed request channel retains its terminal JSON-RPC response in the ring so a
+    /// stalled client can still recover that terminal response after intermediate progress
+    /// notifications rolled off.
+    fn can_replay_after(
+        &self,
+        last_index: usize,
+        allow_gap_for_terminal: bool,
+    ) -> Result<(), CreditedSessionError> {
+        if last_index >= self.next_index {
+            return Err(CreditedSessionError::InvalidEventId);
+        }
+        let Some(front) = self.cache.front() else {
+            return Ok(());
+        };
+        if last_index.saturating_add(1) < front.index {
+            let has_terminal =
+                allow_gap_for_terminal && self.cache.back().is_some_and(|e| e.terminal);
+            if !has_terminal {
+                return Err(CreditedSessionError::InvalidEventId);
+            }
+        }
+        Ok(())
+    }
+
     /// Replay events strictly after `last_index` (matching SSE `Last-Event-ID` semantics)
     /// without blocking. Returns whether the client's `last_index` already acknowledged a
     /// cached terminal event.
-    fn replay_after(&mut self, last_index: usize) -> Result<ReplayOutcome, CreditedSessionError> {
-        let Some(front) = self.cache.front() else {
-            return Ok(ReplayOutcome {
-                client_acked_terminal: false,
-            });
-        };
-        if last_index.saturating_add(1) < front.index {
-            return Err(CreditedSessionError::InvalidEventId);
-        }
+    fn replay_after(
+        &mut self,
+        last_index: usize,
+        allow_gap_for_terminal: bool,
+    ) -> Result<ReplayOutcome, CreditedSessionError> {
+        self.can_replay_after(last_index, allow_gap_for_terminal)?;
         let client_acked_terminal = self
             .cache
             .iter()
@@ -471,8 +525,9 @@ struct RequestChannel {
     completed_at: Option<Instant>,
 }
 
-type RequestWiseChannelResult = Result<(HttpRequestId, SharedSseQueue), CreditedSessionError>;
-type ResumeChannelResult = Result<(Option<HttpRequestId>, SharedSseQueue), CreditedSessionError>;
+type RequestWiseChannelResult = Result<(HttpRequestId, CreditedSseReceiver), CreditedSessionError>;
+type ResumeChannelResult =
+    Result<(Option<HttpRequestId>, CreditedSseReceiver), CreditedSessionError>;
 
 enum SessionEvent {
     /// Atomically establish a request-wise channel and forward the initiating client
@@ -486,7 +541,7 @@ enum SessionEvent {
         http_request_id: Option<HttpRequestId>,
     },
     EstablishCommonChannel {
-        responder: oneshot::Sender<Result<SharedSseQueue, CreditedSessionError>>,
+        responder: oneshot::Sender<Result<CreditedSseReceiver, CreditedSessionError>>,
     },
     Resume {
         last_event_id: EventId,
@@ -530,7 +585,7 @@ impl CreditedSessionHandle {
     async fn create_request_stream(
         &self,
         message: ClientJsonRpcMessage,
-    ) -> Result<(HttpRequestId, SharedSseQueue), CreditedSessionError> {
+    ) -> Result<(HttpRequestId, CreditedSseReceiver), CreditedSessionError> {
         let (tx, rx) = oneshot::channel();
         self.event_tx
             .send(SessionEvent::CreateRequestStream {
@@ -543,7 +598,7 @@ impl CreditedSessionHandle {
             .map_err(|_| CreditedSessionError::SessionServiceTerminated)?
     }
 
-    async fn establish_common_channel(&self) -> Result<SharedSseQueue, CreditedSessionError> {
+    async fn establish_common_channel(&self) -> Result<CreditedSseReceiver, CreditedSessionError> {
         let (tx, rx) = oneshot::channel();
         self.event_tx
             .send(SessionEvent::EstablishCommonChannel { responder: tx })
@@ -556,7 +611,7 @@ impl CreditedSessionHandle {
     async fn resume(
         &self,
         last_event_id: EventId,
-    ) -> Result<(Option<HttpRequestId>, SharedSseQueue), CreditedSessionError> {
+    ) -> Result<(Option<HttpRequestId>, CreditedSseReceiver), CreditedSessionError> {
         let (tx, rx) = oneshot::channel();
         self.event_tx
             .send(SessionEvent::Resume {
@@ -779,7 +834,7 @@ impl CreditedSessionWorker {
         }
     }
 
-    fn alloc_request_wise_channel(&mut self) -> (HttpRequestId, SharedSseQueue) {
+    fn alloc_request_wise_channel(&mut self) -> (HttpRequestId, CreditedSseReceiver) {
         let http_request_id = self.next_http_request_id;
         self.next_http_request_id = self.next_http_request_id.wrapping_add(1);
         let queue = SharedSseQueue::new(self.config.channel_capacity);
@@ -800,14 +855,14 @@ impl CreditedSessionWorker {
                 completed_at: None,
             },
         );
-        (http_request_id, queue)
+        (http_request_id, CreditedSseReceiver::new(queue))
     }
 
     fn reject_duplicate_request_stream(
         &mut self,
         req_id: RequestId,
-    ) -> (HttpRequestId, SharedSseQueue) {
-        let (http_request_id, queue) = self.alloc_request_wise_channel();
+    ) -> (HttpRequestId, CreditedSseReceiver) {
+        let (http_request_id, receiver) = self.alloc_request_wise_channel();
         if let Some(channel) = self.tx_router.get_mut(&http_request_id) {
             let (index, event_id) = channel.channel.alloc_index();
             let err_msg = ServerJsonRpcMessage::error(
@@ -819,7 +874,7 @@ impl CreditedSessionWorker {
             channel.completed_at = Some(Instant::now());
             channel.channel.tx.close_eof();
         }
-        (http_request_id, queue)
+        (http_request_id, receiver)
     }
 
     fn resolve_outbound_channel(&self, message: &ServerJsonRpcMessage) -> OutboundChannel {
@@ -969,54 +1024,61 @@ impl CreditedSessionWorker {
     fn resume(
         &mut self,
         last_event_id: EventId,
-    ) -> Result<(Option<HttpRequestId>, SharedSseQueue), CreditedSessionError> {
+    ) -> Result<(Option<HttpRequestId>, CreditedSseReceiver), CreditedSessionError> {
         self.shadow_queues.retain(|q| !q.is_closed());
         let (index, req_id) = parse_event_id_parts(&last_event_id);
         match req_id {
             Some(http_request_id) => {
-                let (queue, acked_terminal) = {
+                let (receiver, acked_terminal) = {
                     let request_wise = self
                         .tx_router
                         .get_mut(&http_request_id)
                         .ok_or(CreditedSessionError::ChannelClosed(Some(http_request_id)))?;
                     let is_completed = request_wise.completed_at.is_some();
+                    // Validate cursor BEFORE closing or replacing the active live stream.
+                    request_wise.channel.can_replay_after(index, is_completed)?;
                     let cap = self
                         .config
                         .channel_capacity
                         .max(request_wise.channel.cache.len() + 2);
                     let queue = SharedSseQueue::new(cap);
+                    let receiver = CreditedSseReceiver::new(queue.clone());
                     request_wise.channel.tx.close_and_discard();
-                    request_wise.channel.tx = queue.clone();
-                    let outcome = request_wise.channel.replay_after(index)?;
+                    request_wise.channel.tx = queue;
+                    let outcome = request_wise.channel.replay_after(index, is_completed)?;
                     if is_completed {
                         request_wise.channel.tx.close_eof();
                     }
-                    (queue, is_completed && outcome.client_acked_terminal)
+                    (receiver, is_completed && outcome.client_acked_terminal)
                 };
                 if acked_terminal {
                     // Client explicitly sent a `Last-Event-ID` at or past the terminal
                     // event, proving delivery; evict the replay entry now.
                     self.remove_request_channel(http_request_id);
                 }
-                Ok((Some(http_request_id), queue))
+                Ok((Some(http_request_id), receiver))
             }
             None => {
-                let queue = self.resume_or_shadow_common(Some(index))?;
-                Ok((None, queue))
+                let receiver = self.resume_or_shadow_common(Some(index))?;
+                Ok((None, receiver))
             }
         }
     }
 
-    fn establish_common_channel(&mut self) -> Result<SharedSseQueue, CreditedSessionError> {
+    fn establish_common_channel(&mut self) -> Result<CreditedSseReceiver, CreditedSessionError> {
         self.resume_or_shadow_common(None)
     }
 
     fn resume_or_shadow_common(
         &mut self,
         last_event_index: Option<usize>,
-    ) -> Result<SharedSseQueue, CreditedSessionError> {
+    ) -> Result<CreditedSseReceiver, CreditedSessionError> {
         self.shadow_queues.retain(|q| !q.is_closed());
         let replacing = self.common.tx.is_closed();
+        if replacing && let Some(idx) = last_event_index {
+            // Validate cursor BEFORE creating or installing a replacement primary queue.
+            self.common.can_replay_after(idx, false)?;
+        }
         let cap = if replacing {
             self.config
                 .channel_capacity
@@ -1025,16 +1087,17 @@ impl CreditedSessionWorker {
             2
         };
         let queue = SharedSseQueue::new(cap);
+        let receiver = CreditedSseReceiver::new(queue.clone());
         if last_event_index.is_none()
             && let Some(retry) = self.config.sse_retry
         {
             let _ = queue.try_push(CreditedSseEvent::priming(0, "0", retry));
         }
         if replacing {
-            self.common.tx = queue.clone();
+            self.common.tx = queue;
             match last_event_index {
                 Some(idx) => {
-                    let _ = self.common.replay_after(idx)?;
+                    let _ = self.common.replay_after(idx, false)?;
                 }
                 None => {
                     // Fresh standalone `GET /$/mcp` without `Last-Event-ID`: replay any
@@ -1050,9 +1113,9 @@ impl CreditedSessionWorker {
                 let evicted = self.shadow_queues.remove(0);
                 evicted.close_and_discard();
             }
-            self.shadow_queues.push(queue.clone());
+            self.shadow_queues.push(queue);
         }
-        Ok(queue)
+        Ok(receiver)
     }
 }
 
@@ -1209,11 +1272,13 @@ impl Worker for CreditedSessionWorker {
                     {
                         let dup_id = req.id.clone();
                         close_message_slot(&message);
-                        let res = self.reject_duplicate_request_stream(dup_id);
-                        let _ = responder.send(Ok(res));
+                        let (dup_http_id, dup_rx) = self.reject_duplicate_request_stream(dup_id);
+                        if responder.send(Ok((dup_http_id, dup_rx))).is_err() {
+                            self.remove_request_channel(dup_http_id);
+                        }
                         continue;
                     }
-                    let (http_request_id, queue) = self.alloc_request_wise_channel();
+                    let (http_request_id, receiver) = self.alloc_request_wise_channel();
                     match &message {
                         ClientJsonRpcMessage::Request(req) => {
                             self.register_request(req, Some(http_request_id));
@@ -1223,7 +1288,7 @@ impl Worker for CreditedSessionWorker {
                         }
                         _ => {}
                     }
-                    if responder.send(Ok((http_request_id, queue))).is_err() {
+                    if responder.send(Ok((http_request_id, receiver))).is_err() {
                         // Caller cancelled before receiving the stream handle.
                         close_message_slot(&message);
                         if let ClientJsonRpcMessage::Request(req) = &message {
@@ -1266,6 +1331,9 @@ impl Worker for CreditedSessionWorker {
                     }
                 }
                 InnerEvent::FromHttpService(SessionEvent::EstablishCommonChannel { responder }) => {
+                    if responder.is_closed() {
+                        continue;
+                    }
                     let res = self.establish_common_channel();
                     let _ = responder.send(res);
                 }
@@ -1273,6 +1341,9 @@ impl Worker for CreditedSessionWorker {
                     last_event_id,
                     responder,
                 }) => {
+                    if responder.is_closed() {
+                        continue;
+                    }
                     let res = self.resume(last_event_id);
                     let _ = responder.send(res);
                 }
@@ -1404,8 +1475,8 @@ impl SessionManager for CreditedSessionManager {
                 .cloned()
                 .ok_or_else(|| CreditedSessionManagerError::SessionNotFound(id.clone()))?
         };
-        let (_http_request_id, queue) = handle.create_request_stream(message).await?;
-        Self::install_sse_receiver(CreditedSseReceiver { queue });
+        let (_http_request_id, receiver) = handle.create_request_stream(message).await?;
+        Self::install_sse_receiver(receiver);
         // `Endpoint::forward` replaces the placeholder SSE body with `CreditedSseBody`.
         Ok(futures_util::stream::empty::<ServerSseMessage>())
     }
@@ -1437,8 +1508,8 @@ impl SessionManager for CreditedSessionManager {
                 .cloned()
                 .ok_or_else(|| CreditedSessionManagerError::SessionNotFound(id.clone()))?
         };
-        let queue = handle.establish_common_channel().await?;
-        Self::install_sse_receiver(CreditedSseReceiver { queue });
+        let receiver = handle.establish_common_channel().await?;
+        Self::install_sse_receiver(receiver);
         Ok(futures_util::stream::empty::<ServerSseMessage>())
     }
 
@@ -1457,8 +1528,8 @@ impl SessionManager for CreditedSessionManager {
         let parsed: EventId = last_event_id
             .parse()
             .map_err(|e: EventIdParseError| CreditedSessionManagerError::InvalidEventId(e))?;
-        let (_http_request_id, queue) = handle.resume(parsed).await?;
-        Self::install_sse_receiver(CreditedSseReceiver { queue });
+        let (_http_request_id, receiver) = handle.resume(parsed).await?;
+        Self::install_sse_receiver(receiver);
         Ok(futures_util::stream::empty::<ServerSseMessage>())
     }
 
@@ -1500,7 +1571,7 @@ mod tests {
         );
         worker.handle_server_message(notif).unwrap();
 
-        let queue = worker.establish_common_channel().unwrap();
+        let queue = worker.establish_common_channel().unwrap().into_queue();
         let mut events = Vec::new();
         {
             let mut q = queue.inner.lock();
@@ -1541,5 +1612,250 @@ mod tests {
         queue2.close_and_discard();
         assert!(queue2.is_closed());
         assert!(queue2.inner.lock().items.is_empty());
+    }
+
+    fn drain_queue_strings(queue: &SharedSseQueue) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut q = queue.inner.lock();
+        while let Some(ev) = q.items.pop_front() {
+            out.push(String::from_utf8_lossy(&ev.bytes).into_owned());
+        }
+        out
+    }
+
+    #[test]
+    fn stale_last_event_id_does_not_poison_common_or_disrupt_inflight_request() {
+        let mut cfg = SessionConfig::default();
+        cfg.channel_capacity = 2; // replay ring capacity = 3
+        cfg.sse_retry = Some(Duration::from_secs(3));
+        let (_handle, mut worker) =
+            create_credited_session("s2".into(), cfg, 30.0, CancellationToken::new());
+
+        // Push 4 common notifications (indices 1..=4); ring keeps [2, 3, 4], so index 0 is stale.
+        for _ in 0..4 {
+            let notif = ServerJsonRpcMessage::notification(
+                ServerNotification::ToolListChangedNotification(Default::default()),
+            );
+            worker.handle_server_message(notif).unwrap();
+        }
+        assert!(worker.common.tx.is_closed());
+
+        // Stale Last-Event-ID "0" must fail with InvalidEventId and leave `common.tx` CLOSED.
+        let err = worker.resume("0".parse().unwrap()).err().unwrap();
+        assert!(matches!(err, CreditedSessionError::InvalidEventId));
+        assert!(
+            worker.common.tx.is_closed(),
+            "failed common resume must not install an open primary queue"
+        );
+
+        // Next standalone GET without Last-Event-ID must become primary (replaying [2, 3, 4]),
+        // NOT a silent shadow stream!
+        let primary = worker.establish_common_channel().unwrap();
+        assert!(!worker.common.tx.is_closed());
+        let replayed = drain_queue_strings(primary.queue.as_ref().unwrap());
+        assert_eq!(
+            replayed.len(),
+            4,
+            "expected priming + 3 retained notifications: {replayed:?}"
+        );
+        // Dropping `CreditedSseReceiver` without transferring to `CreditedSseBody` closes primary.
+        drop(primary);
+        assert!(
+            worker.common.tx.is_closed(),
+            "dropping abandoned CreditedSseReceiver must close primary queue"
+        );
+
+        // Now test an IN-FLIGHT request-wise stream: stale Last-Event-ID must NOT disrupt
+        // the live stream, which still receives the eventual terminal response.
+        let (http_id, live_rx) = worker.alloc_request_wise_channel();
+        let req_id = RequestId::Number(42);
+        let req = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: req_id.clone(),
+            request: ClientRequest::PingRequest(Default::default()),
+        };
+        worker.register_request(&req, Some(http_id));
+        // Drain priming (index 0) and push 4 intermediate progress/cancel notifications so
+        // index 0 rolls off the ring while the request is STILL in-flight.
+        let _ = drain_queue_strings(live_rx.queue.as_ref().unwrap());
+        for i in 1..=4usize {
+            let ch = worker.tx_router.get_mut(&http_id).unwrap();
+            let (idx, eid) = ch.channel.alloc_index();
+            assert_eq!(idx, i);
+            let ev = CreditedSseEvent {
+                index: idx,
+                bytes: Bytes::from(format!("data: {{\"n\":{i}}}\nid: {eid}\n\n")),
+                terminal: false,
+            };
+            assert!(ch.channel.send_event(ev));
+            // Drain live queue so it stays open and active.
+            let _ = drain_queue_strings(live_rx.queue.as_ref().unwrap());
+        }
+        assert!(
+            !worker
+                .tx_router
+                .get(&http_id)
+                .unwrap()
+                .channel
+                .tx
+                .is_closed()
+        );
+
+        // Stale resume at "0/<http_id>" must fail with InvalidEventId and leave `live_rx` open.
+        let err = worker
+            .resume(format!("0/{http_id}").parse().unwrap())
+            .err()
+            .unwrap();
+        assert!(matches!(err, CreditedSessionError::InvalidEventId));
+        assert!(
+            !live_rx.queue.as_ref().unwrap().is_closed(),
+            "failed request resume must not close active live stream"
+        );
+
+        // Delivering the terminal response still reaches `live_rx`.
+        let resp = ServerJsonRpcMessage::response(rmcp::model::ServerResult::empty(()), req_id);
+        worker.handle_server_message(resp).unwrap();
+        let delivered = drain_queue_strings(live_rx.queue.as_ref().unwrap());
+        assert_eq!(delivered.len(), 1, "{delivered:?}");
+        assert!(delivered[0].contains("\"id\":42"), "{delivered:?}");
+    }
+
+    #[test]
+    fn sse_overflow_preserves_replay_and_recovers_terminal_response() {
+        let mut cfg = SessionConfig::default();
+        cfg.channel_capacity = 2; // live queue capacity = 2, replay ring capacity = 3
+        cfg.sse_retry = Some(Duration::from_secs(3));
+        let (_handle, mut worker) =
+            create_credited_session("s3".into(), cfg, 30.0, CancellationToken::new());
+
+        // Case 1: Exact overflow on the `(C + 1)`-th unread event (index 3 = terminal).
+        let (http_id, live_rx) = worker.alloc_request_wise_channel();
+        let req_id = RequestId::Number(7);
+        let req = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: req_id.clone(),
+            request: ClientRequest::PingRequest(Default::default()),
+        };
+        worker.register_request(&req, Some(http_id));
+        // Client reads priming (index 0), then stalls.
+        let initial = drain_queue_strings(live_rx.queue.as_ref().unwrap());
+        assert_eq!(initial.len(), 1);
+        for i in 1..=2usize {
+            let ch = worker.tx_router.get_mut(&http_id).unwrap();
+            let (idx, eid) = ch.channel.alloc_index();
+            assert_eq!(idx, i);
+            assert!(ch.channel.send_event(CreditedSseEvent {
+                index: idx,
+                bytes: Bytes::from(format!("data: {{\"step\":{i}}}\nid: {eid}\n\n")),
+                terminal: false,
+            }));
+        }
+        // Terminal response (index 3) overflows the stalled 2-slot live queue and closes it.
+        worker
+            .handle_server_message(ServerJsonRpcMessage::response(
+                rmcp::model::ServerResult::empty(()),
+                req_id,
+            ))
+            .unwrap();
+        assert!(live_rx.queue.as_ref().unwrap().is_closed());
+        drop(live_rx);
+
+        // Reconnect from "0/<http_id>": replay ring kept [1, 2, 3], zero gap!
+        let (_, resumed) = worker
+            .resume(format!("0/{http_id}").parse().unwrap())
+            .expect("exact overflow must remain replayable from last read event");
+        let events = drain_queue_strings(resumed.queue.as_ref().unwrap());
+        assert_eq!(
+            events.len(),
+            3,
+            "expected events 1, 2, and terminal 3: {events:?}"
+        );
+        assert!(events[2].contains("\"id\":7"), "{events:?}");
+        drop(resumed);
+
+        // Case 2: Heavy overflow (> C + 1 intermediate events roll off before terminal).
+        let (http_id2, live_rx2) = worker.alloc_request_wise_channel();
+        let req_id2 = RequestId::Number(8);
+        let req2 = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: req_id2.clone(),
+            request: ClientRequest::PingRequest(Default::default()),
+        };
+        worker.register_request(&req2, Some(http_id2));
+        let _ = drain_queue_strings(live_rx2.queue.as_ref().unwrap());
+        for i in 1..=6usize {
+            let ch = worker.tx_router.get_mut(&http_id2).unwrap();
+            let (idx, eid) = ch.channel.alloc_index();
+            let _ = ch.channel.send_event(CreditedSseEvent {
+                index: idx,
+                bytes: Bytes::from(format!("data: {{\"step\":{i}}}\nid: {eid}\n\n")),
+                terminal: false,
+            });
+        }
+        worker
+            .handle_server_message(ServerJsonRpcMessage::response(
+                rmcp::model::ServerResult::empty(()),
+                req_id2,
+            ))
+            .unwrap();
+        drop(live_rx2);
+
+        // Even after intermediate notifications rolled off, resuming the completed request
+        // from "0/<http_id2>" still delivers the retained terminal response!
+        let (_, resumed2) = worker
+            .resume(format!("0/{http_id2}").parse().unwrap())
+            .expect("completed request terminal response must remain recoverable after gap");
+        let events2 = drain_queue_strings(resumed2.queue.as_ref().unwrap());
+        assert!(
+            events2.iter().any(|e| e.contains("\"id\":8")),
+            "expected terminal response for id 8 in {events2:?}"
+        );
+        // Bogus future index is still rejected with InvalidEventId.
+        let err = worker
+            .resume(format!("999/{http_id2}").parse().unwrap())
+            .err()
+            .unwrap();
+        assert!(matches!(err, CreditedSessionError::InvalidEventId));
+    }
+
+    #[test]
+    fn duplicate_inflight_request_stream_returns_32600_without_breaking_original() {
+        let mut cfg = SessionConfig::default();
+        cfg.sse_retry = Some(Duration::from_secs(3));
+        let (_handle, mut worker) =
+            create_credited_session("s4".into(), cfg, 30.0, CancellationToken::new());
+
+        let req_id = RequestId::Number(99);
+        let (orig_http_id, orig_rx) = worker.alloc_request_wise_channel();
+        let req = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: req_id.clone(),
+            request: ClientRequest::PingRequest(Default::default()),
+        };
+        worker.register_request(&req, Some(orig_http_id));
+        assert!(worker.is_in_flight(&req_id));
+
+        // Duplicate in-flight RequestId gets an immediate -32600 error stream.
+        let (_dup_http_id, dup_rx) = worker.reject_duplicate_request_stream(req_id.clone());
+        let dup_events = drain_queue_strings(dup_rx.queue.as_ref().unwrap());
+        assert!(
+            dup_events
+                .iter()
+                .any(|e| e.contains("-32600") && e.contains("duplicate in-flight request id")),
+            "expected -32600 duplicate rejection: {dup_events:?}"
+        );
+
+        // Original request channel stays intact and still receives its response.
+        worker
+            .handle_server_message(ServerJsonRpcMessage::response(
+                rmcp::model::ServerResult::empty(()),
+                req_id,
+            ))
+            .unwrap();
+        let orig_events = drain_queue_strings(orig_rx.queue.as_ref().unwrap());
+        assert!(
+            orig_events.iter().any(|e| e.contains("\"id\":99")),
+            "expected original response for id 99: {orig_events:?}"
+        );
     }
 }
