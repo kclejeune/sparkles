@@ -2331,9 +2331,8 @@ fn diagnostic_summary_resolves_rdf_type_and_decodes_outside_cache_lock() {
     use sparkles_budget::MemoryDomain;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    // In this compacted store, looking up `rdf:type` scans an FSST-coded
-    // 64 KiB sibling suffix. The small diagnostic budget must refuse that scratch
-    // allocation while the cache slot is unlocked.
+    // In this compacted store, looking up `rdf:type` passes an FSST-coded
+    // 64 KiB sibling without reconstructing it.
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(
         dir.path(),
@@ -2362,23 +2361,33 @@ fn diagnostic_summary_resolves_rdf_type_and_decodes_outside_cache_lock() {
     store.compact().unwrap();
     let snap = store.snapshot();
     assert!(snap.generation.vocab.is_fsst());
-    let mut lookup_scratch = 0;
-    let type_id = snap
-        .lookup_key_controlled::<sparkles_core::Error>(
-            &sparkles_core::id::iri_key(oxrdf::vocab::rdf::TYPE.as_str()),
-            |old, new| {
-                lookup_scratch = lookup_scratch.max(old + new);
-                Ok(())
-            },
-            |_| Ok(()),
+    let key = sparkles_core::id::iri_key(oxrdf::vocab::rdf::TYPE.as_str());
+    let (type_id, peak) = crate::alloc_probe::peak_of(|| {
+        snap.lookup_key_controlled::<sparkles_core::Error>(
+            &key,
+            |_, _| panic!("encoded FSST lookup requested scratch"),
+            |_| panic!("encoded FSST lookup retained scratch"),
             || Ok(()),
         )
-        .unwrap();
+        .unwrap()
+    });
     assert!(type_id.is_some());
-    assert!(
-        lookup_scratch > 4 * 1024,
-        "the lookup must reach the long suffix"
+    assert_eq!(peak, 0);
+    let mut polls = 0;
+    let stopped = snap.lookup_key_controlled(
+        &key,
+        |_, _| Ok(()),
+        |_| Ok(()),
+        || {
+            polls += 1;
+            if polls == 8 {
+                Err(sparkles_core::Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        },
     );
+    assert!(matches!(stopped, Err(sparkles_core::Error::Cancelled)));
 
     let profile = crate::Profile::Rules(
         "[type: (?x <urn:val> ?v) -> (?v <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2001/XMLSchema#integer>)]"
@@ -2425,17 +2434,21 @@ fn diagnostic_summary_resolves_rdf_type_and_decodes_outside_cache_lock() {
             give_owned.fetch_sub(n, Ordering::SeqCst);
         },
     );
-    let typings = crate::literal_typings_controlled_guarded(
-        &store,
-        commit,
-        Some(&cache),
-        &crate::diagnostics::DiagnosticControls {
-            memory_parent: Some(parent),
-            ..Default::default()
-        },
-    )
-    .unwrap()
-    .expect("compacted FSST summary");
+    let (typings, peak) = crate::alloc_probe::peak_of(|| {
+        crate::literal_typings_controlled_guarded(
+            &store,
+            commit,
+            Some(&cache),
+            &crate::diagnostics::DiagnosticControls {
+                max_memory: Some(4 * 1024),
+                memory_parent: Some(parent),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .expect("compacted FSST summary")
+    });
+    assert!(peak < 4 * 1024, "small FSST summary used {peak} bytes");
     assert_eq!(typings.facts.len(), 1);
     assert!(saw_take.load(Ordering::SeqCst));
     assert!(
@@ -2445,14 +2458,14 @@ fn diagnostic_summary_resolves_rdf_type_and_decodes_outside_cache_lock() {
     drop(typings);
     assert_eq!(owned.load(Ordering::SeqCst), 0);
 
-    // Refusing under a 4 KiB budget proves FSST suffix lookup scratch is admitted before decoding.
-    let tiny_pool = QueryPool::new(4 * 1024);
+    // A budget too small for even one retained candidate must still be enforced.
+    let tiny_pool = QueryPool::new(1);
     let err = crate::literal_typings_controlled_guarded(
         &store,
         commit,
         Some(&cache),
         &crate::diagnostics::DiagnosticControls {
-            max_memory: Some(4 * 1024),
+            max_memory: Some(1),
             memory_parent: Some(tiny_pool.work_parent()),
             ..Default::default()
         },
@@ -2463,7 +2476,7 @@ fn diagnostic_summary_resolves_rdf_type_and_decodes_outside_cache_lock() {
             BudgetFailure::from_anyhow(&err),
             Some(BudgetFailure::Local(_))
         ),
-        "expected FSST lookup scratch budget refusal, got: {err:#}"
+        "expected diagnostic workspace budget refusal, got: {err:#}"
     );
     assert_eq!(tiny_pool.granted(), 0);
 }

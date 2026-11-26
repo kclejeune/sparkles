@@ -164,6 +164,13 @@ impl Store {
                     ),
                 ));
             }
+            // The preceding fence released its reservations and may have grown
+            // files. Sample again at admission while holding the target writer.
+            if i > 0
+                && let (Some(root), Some(_)) = (&tgt.root, tgt.opts.min_free_disk_bytes)
+            {
+                crate::disk::invalidate_free_bytes(root);
+            }
             txn.force = true;
             txn.merge = Some(MergeRec {
                 seq: 0,
@@ -565,6 +572,15 @@ mod tests {
 
     #[test]
     fn replay_preview_reserve_counts_a_predecessors_new_tail() {
+        replay_reserve_after_tail_growth(false);
+    }
+
+    #[test]
+    fn replay_reserve_refreshes_a_warm_sample_after_tail_growth() {
+        replay_reserve_after_tail_growth(true);
+    }
+
+    fn replay_reserve_after_tail_growth(cached: bool) {
         const RESERVE: u64 = 1 << 20;
         const HEADROOM: u64 = 512 << 10;
         let dir = tempfile::tempdir().unwrap();
@@ -606,8 +622,16 @@ mod tests {
         let wal_alloc = main.writer.lock().tail.alloc();
         assert!(wal_alloc - main.wal_bytes() >= 65 * WAL_REC as u64);
         assert!(main.annotations.lock().pending_header() > 0);
-        let _disk =
-            crate::disk::fake::install(dir.path(), dir_size(dir.path()) + RESERVE + HEADROOM);
+        let capacity = dir_size(dir.path()) + RESERVE + HEADROOM;
+        let _disk = if cached {
+            crate::disk::fake::install_cached(dir.path(), capacity)
+        } else {
+            crate::disk::fake::install(dir.path(), capacity)
+        };
+        assert_eq!(
+            crate::disk::free_bytes_cached(dir.path(), std::time::Duration::from_secs(1)).unwrap(),
+            RESERVE + HEADROOM
+        );
 
         let head = main.snapshot().commit;
         let candidate = preview(&main);

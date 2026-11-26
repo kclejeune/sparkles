@@ -813,7 +813,7 @@ fn materialized_fast_miss_refuses_oversized_key_before_allocating() {
 
 #[cfg(feature = "reasoning")]
 #[test]
-fn materialized_fast_miss_admits_fsst_lookup_scratch() {
+fn materialized_fast_miss_bounds_fsst_probe_memory() {
     use sparkles::reasoning::{
         ReasonRequest,
         reasoner::{GraphRef, Inputs, Profile},
@@ -848,7 +848,7 @@ fn materialized_fast_miss_admits_fsst_lookup_scratch() {
     assert!(snap.generation.vocab.is_fsst());
     assert_eq!(
         snap.generation.vocab.find(&sparkles_core::id::term_key(
-            &oxrdf::Literal::new_simple_literal(long).into()
+            &oxrdf::Literal::new_simple_literal(&long).into()
         )),
         Ok(1)
     );
@@ -884,39 +884,44 @@ fn materialized_fast_miss_admits_fsst_lookup_scratch() {
         alloc.peak,
         alloc.largest
     );
-    let error = result.map(|_| ()).unwrap_err();
-    assert!(
-        matches!(&error, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
-        "{error:?}"
-    );
-    let peak = std::cell::Cell::new(0);
+    assert!(matches!(result.unwrap().explained, Explained::NotFound));
+    assert!(alloc.peak < 8192, "short probe used {} bytes", alloc.peak);
+
+    let mut admitted = Vec::new();
     let miss = snap
         .lookup_term_controlled(
             &req.triple[2],
             &mut |bytes| {
-                peak.set(peak.get().max(bytes));
+                admitted.push(bytes);
                 Ok(())
             },
             &mut || Ok(()),
         )
         .unwrap();
     assert!(miss.is_none());
-    // The 3-byte probe and previous 3-byte scratch coexist with the larger scratch.
-    assert_eq!(peak.get(), 3 + 3 + 65_536 + 2);
-    let stopped = snap.lookup_term_controlled(
-        &req.triple[2],
-        &mut |bytes| {
-            peak.set(bytes);
-            Ok(())
-        },
-        &mut || {
-            if peak.get() > 8192 {
-                Err(sparkles::Error::Cancelled)
-            } else {
-                Ok(())
-            }
-        },
+    assert_eq!(admitted, [3]);
+
+    req.triple[2] = oxrdf::Literal::new_simple_literal(long).into();
+    let (result, alloc) = caller_allocations::measure(|| ds.reasoning().explain(&req));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(&error, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+        "{error:?}"
     );
+    assert!(
+        alloc.largest < 8192,
+        "long probe allocated before admission"
+    );
+
+    let mut polls = 0;
+    let stopped = snap.lookup_term_controlled(&req.triple[2], &mut |_| Ok(()), &mut || {
+        polls += 1;
+        if polls == 8 {
+            Err(sparkles::Error::Cancelled)
+        } else {
+            Ok(())
+        }
+    });
     assert!(matches!(stopped, Err(sparkles::Error::Cancelled)));
 }
 
@@ -1077,7 +1082,7 @@ fn demand_and_why_not_admit_fsst_rule_constant_scratch() {
 
 #[cfg(feature = "reasoning")]
 #[test]
-fn explanation_graph_name_lookups_admit_fsst_scratch() {
+fn explanation_graph_name_lookups_bound_fsst_probe_memory() {
     use sparkles::reasoning::{
         ReasonRequest,
         explain::ExplainMode,
@@ -1097,6 +1102,7 @@ fn explanation_graph_name_lookups_admit_fsst_scratch() {
     //    literals so rank 0 is an IRI and the FSST IRI table trains directly), while
     //    rule constants and target triple IRIs live in <http://z.org/*> (block 2+).
     let named_hr = "http://x.org/hr";
+    let long_graph = format!("http://x.org/b{long}");
     let dir = tempfile::tempdir().unwrap();
     let ds = Dataset::open_with(
         dir.path().join("db"),
@@ -1124,7 +1130,7 @@ fn explanation_graph_name_lookups_admit_fsst_scratch() {
     for i in 0..(fc - 3) {
         data.push_str(&format!(", <http://x.org/z{i:02}>"));
     }
-    data.push_str(" . }\n");
+    data.push_str(&format!(" . }}\n<{long_graph}> {{ z:s z:p z:o . }}"));
     ds.load_str(&data, RdfFormat::TriG).unwrap();
     ds.store().compact().unwrap();
     ds.reasoning()
@@ -1146,7 +1152,11 @@ fn explanation_graph_name_lookups_admit_fsst_scratch() {
         (Some(ExplainSource::Demand), ExplainMode::Why),
         (Some(ExplainSource::Demand), ExplainMode::WhyNot),
     ] {
-        let mut req = ExplainRequest::new([z("s"), z("q"), z("o")]);
+        // A predicate with no applicable rules keeps demand's work to the graph lookup
+        // and the setup needed to identify a miss.
+        let demand = source == Some(ExplainSource::Demand);
+        let predicate = if demand { "absent" } else { "q" };
+        let mut req = ExplainRequest::new([z("s"), z(predicate), z("o")]);
         req.source = source;
         req.mode = mode;
         req.max_memory = Some(48 * 1024);
@@ -1162,11 +1172,13 @@ fn explanation_graph_name_lookups_admit_fsst_scratch() {
             alloc.peak,
             alloc.largest
         );
-        let error = result.map(|_| ()).unwrap_err();
-        assert!(
-            matches!(&error, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
-            "named graph {source:?}/{mode:?}: {error:?}"
-        );
+        let answer =
+            result.unwrap_or_else(|error| panic!("named graph {source:?}/{mode:?}: {error:?}"));
+        match (demand, mode) {
+            (false, _) => assert!(matches!(answer.explained, Explained::Found { .. })),
+            (true, ExplainMode::Why) => assert!(matches!(answer.explained, Explained::NotFound)),
+            (true, ExplainMode::WhyNot) => assert!(answer.why_not.is_some()),
+        }
     }
 
     for source in [ExplainSource::Materialized, ExplainSource::Demand] {
@@ -1190,6 +1202,49 @@ fn explanation_graph_name_lookups_admit_fsst_scratch() {
             "cancelled named graph {source:?}: {result:?}"
         );
     }
+
+    // The same FSST block has a graph whose own key needs more than the probe budget.
+    let snap = ds.store().snapshot();
+    let mut admitted = 0;
+    let mut polls = 0;
+    let stopped = snap.lookup_iri_controlled(
+        &long_graph,
+        &mut |bytes| {
+            admitted = bytes;
+            Ok(())
+        },
+        &mut || {
+            polls += 1;
+            if polls == 8 {
+                Err(sparkles::Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert_eq!(admitted, long_graph.len() + 1);
+    assert!(matches!(stopped, Err(sparkles::Error::Cancelled)));
+
+    ds.reasoning()
+        .run(&ReasonRequest {
+            profile: Profile::Rules(
+                "@prefix z: <http://z.org/> . [derive: (?x z:p ?y) -> (?x z:q ?y)]".into(),
+            ),
+            inputs: Inputs {
+                data_graphs: vec![GraphRef::Named(long_graph)],
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+    let mut req = ExplainRequest::new([z("s"), z("q"), z("o")]);
+    req.source = Some(ExplainSource::Materialized);
+    req.max_memory = Some(48 * 1024);
+    let error = ds.reasoning().explain(&req).unwrap_err();
+    assert!(
+        matches!(&error, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET && c.message.contains("looking up an explanation graph")),
+        "{error:?}"
+    );
 
     // 2. Inferred graph <urn:x-sparkles:inferred> sorts after a 64 KiB IRI in the same
     //    FSST block after compaction, covering explain() source selection and materialized_for.
@@ -1241,11 +1296,8 @@ fn explanation_graph_name_lookups_admit_fsst_scratch() {
             alloc.peak,
             alloc.largest
         );
-        let error = result.map(|_| ()).unwrap_err();
-        assert!(
-            matches!(&error, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
-            "inferred graph {source:?}: {error:?}"
-        );
+        let answer = result.unwrap_or_else(|error| panic!("inferred graph {source:?}: {error:?}"));
+        assert!(matches!(answer.explained, Explained::Found { .. }));
     }
 }
 
