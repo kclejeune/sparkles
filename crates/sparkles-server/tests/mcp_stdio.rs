@@ -462,23 +462,106 @@ fn stdio_rapid_sequential_id_reuse() {
 #[cfg(unix)]
 #[test]
 fn stdio_cli_exits_after_eof_with_stalled_stdout() {
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::time::Instant;
+
+    struct ChildGuard(Option<std::process::Child>);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn read_line_before(fd: libc::c_int, deadline: Instant, label: &str) -> String {
+        let mut buf = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for {label} from sparkles mcp"
+            );
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
+            let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("poll failed waiting for {label}: {err}");
+            }
+            assert!(rc > 0, "timed out waiting for {label} from sparkles mcp");
+            let mut byte = 0u8;
+            let n = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("read failed waiting for {label}: {err}");
+            }
+            assert!(n > 0, "unexpected EOF while waiting for {label}");
+            buf.push(byte);
+            if byte == b'\n' {
+                return String::from_utf8(buf).expect("valid UTF-8 JSON-RPC line");
+            }
+        }
+    }
+
+    fn pipe_is_writable(fd: libc::c_int) -> bool {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        loop {
+            let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+            if rc < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            assert!(
+                rc >= 0,
+                "poll(POLLOUT) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return rc > 0 && (pfd.revents & libc::POLLOUT) != 0;
+        }
+    }
+
+    // Create the stdout pipe directly so we retain a `FD_CLOEXEC` write-end probe (`probe_w`)
+    // to observe kernel `!POLLOUT` backpressure directly instead of guessing from a pause.
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let stdout_pipe = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let child_stdout_w = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    assert!(unsafe { libc::fcntl(stdout_pipe.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } >= 0);
+    let probe_fd = unsafe { libc::fcntl(child_stdout_w.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    assert!(probe_fd >= 0);
+    let probe_w = unsafe { OwnedFd::from_raw_fd(probe_fd) };
 
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("fixture.ttl");
     std::fs::write(&data, FIXTURE).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sparkles"))
-        .args(["mcp", "--data"])
-        .arg(&data)
-        .args(["--name", "t"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut child = ChildGuard(Some(
+        Command::new(env!("CARGO_BIN_EXE_sparkles"))
+            .args(["mcp", "--data"])
+            .arg(&data)
+            .args(["--name", "t"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(child_stdout_w))
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    ));
+    let mut stdin = child.0.as_mut().unwrap().stdin.take().unwrap();
+    let setup_deadline = Instant::now() + Duration::from_secs(15);
 
     // Confirm the CLI process is up and serving before stalling stdout.
     let init = json!({
@@ -493,8 +576,11 @@ fn stdio_cli_exits_after_eof_with_stalled_stdout() {
     });
     writeln!(stdin, "{init}").unwrap();
     stdin.flush().unwrap();
-    let mut first = String::new();
-    stdout.read_line(&mut first).unwrap();
+    let first = read_line_before(
+        stdout_pipe.as_raw_fd(),
+        setup_deadline,
+        "initialize response",
+    );
     let v: Value = serde_json::from_str(&first).unwrap();
     assert_eq!(v["id"], 1);
     assert!(v.get("result").is_some(), "{v}");
@@ -516,8 +602,11 @@ fn stdio_cli_exits_after_eof_with_stalled_stdout() {
     )
     .unwrap();
     stdin.flush().unwrap();
-    let mut sample = String::new();
-    stdout.read_line(&mut sample).unwrap();
+    let sample = read_line_before(
+        stdout_pipe.as_raw_fd(),
+        setup_deadline,
+        "sample tools/list response",
+    );
     let sample_v: Value = serde_json::from_str(&sample).unwrap();
     assert_eq!(sample_v["id"], 2);
     assert!(sample_v.get("result").is_some(), "{sample_v}");
@@ -525,7 +614,6 @@ fn stdio_cli_exits_after_eof_with_stalled_stdout() {
     assert!(single_response_len > 0);
 
     // Stop reading stdout while keeping the read end open so the pipe fills and stalls.
-    let stdout_pipe = stdout.into_inner();
     #[cfg(target_os = "linux")]
     {
         let _ = unsafe { libc::fcntl(stdout_pipe.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
@@ -546,12 +634,10 @@ fn stdio_cli_exits_after_eof_with_stalled_stdout() {
     }
     stdin.flush().unwrap();
 
-    // Wait until stdout carries at least 4096 buffered bytes, remains strictly below the
-    // full batch volume, and plateaus unchanged for 60 ms so we know the pipe is actively
-    // backpressured on both Linux and macOS before closing stdin.
+    // Wait until the kernel directly reports `!POLLOUT` on the write end of stdout AND
+    // `FIONREAD` confirms buffered output strictly below total batch volume, proving true
+    // pipe backpressure rather than a scheduling pause before closing stdin.
     let fill_deadline = Instant::now() + Duration::from_secs(10);
-    let mut last_readable: libc::c_int = 0;
-    let mut stable_since: Option<Instant> = None;
     loop {
         let mut readable: libc::c_int = 0;
         let rc = unsafe { libc::ioctl(stdout_pipe.as_raw_fd(), libc::FIONREAD, &mut readable) };
@@ -560,39 +646,51 @@ fn stdio_cli_exits_after_eof_with_stalled_stdout() {
                 (readable as usize) < total_expected_bytes,
                 "all {batch_count} tools/list responses ({total_expected_bytes} B) unexpectedly fit in stdout pipe without stalling (readable={readable})"
             );
-            if readable >= 4096 && readable == last_readable {
-                if stable_since.is_some_and(|t| t.elapsed() >= Duration::from_millis(60)) {
-                    break;
-                }
-            } else {
-                last_readable = readable;
-                stable_since = (readable >= 4096).then(Instant::now);
+            if readable >= 4096 && !pipe_is_writable(probe_w.as_raw_fd()) {
+                break;
             }
         }
         assert!(
             Instant::now() < fill_deadline,
-            "stdout pipe did not fill and plateau before EOF test (readable={readable})"
+            "stdout pipe did not reach kernel !POLLOUT backpressure before EOF test (readable={readable})"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
 
     // Close stdin while keeping `stdout_pipe` open and unread; `sparkles mcp` must hit its
-    // bounded EOF drain timeout and exit cleanly without hanging on runtime shutdown.
+    // 5 s bounded EOF drain timeout under active backpressure and exit cleanly without
+    // hanging on runtime shutdown.
+    let eof_at = Instant::now();
     drop(stdin);
     let exit_deadline = Instant::now() + Duration::from_secs(20);
     let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = child.0.as_mut().unwrap().try_wait().unwrap() {
+            child.0 = None;
             break status;
         }
-        if Instant::now() >= exit_deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("sparkles mcp failed to exit after stdin EOF while stdout stayed stalled");
-        }
+        assert!(
+            Instant::now() < exit_deadline,
+            "sparkles mcp failed to exit after stdin EOF while stdout stayed stalled"
+        );
         std::thread::sleep(Duration::from_millis(25));
     };
+    let eof_elapsed = eof_at.elapsed();
     assert!(status.success(), "{status}");
+    assert!(
+        eof_elapsed >= Duration::from_secs(4),
+        "sparkles mcp exited in {eof_elapsed:?} after EOF instead of exercising the 5 s bounded drain timeout under stdout backpressure"
+    );
+    let mut final_readable: libc::c_int = 0;
+    assert_eq!(
+        unsafe { libc::ioctl(stdout_pipe.as_raw_fd(), libc::FIONREAD, &mut final_readable) },
+        0
+    );
+    assert!(
+        (final_readable as usize) < total_expected_bytes && !pipe_is_writable(probe_w.as_raw_fd()),
+        "stdout pipe was not still stalled at process exit (readable={final_readable})"
+    );
 
-    // Release the stalled stdout read end only after verifying process exit.
+    // Release the stalled stdout pipe only after verifying process exit.
+    drop(probe_w);
     drop(stdout_pipe);
 }
