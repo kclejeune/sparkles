@@ -928,14 +928,39 @@ fn charged_exists_state_matches_eager_with_budget_decline_and_partial_keys() {
     }
 }
 
-/// Constant ARQ property function split leaf, refused by decision Q1 and used to test
-/// eager fallback visibility and laziness.
-fn split_leaf(n: usize) -> String {
-    let items: Vec<String> = (0..n).map(|i| i.to_string()).collect();
-    format!(
-        "?x <http://jena.apache.org/ARQ/property#strSplit> (\"{}\" \",\")",
-        items.join(",")
-    )
+/// Legacy eager-only `ViewSource` (`streams_views() == false`), refused by strict
+/// cursors and used to test eager fallback visibility, laziness, and input streaming.
+#[derive(Debug)]
+struct LegacyViews(usize);
+
+impl sparkles_core::sparql::viewsvc::ViewSource for LegacyViews {
+    fn read_view(
+        &self,
+        _: &sparkles_core::sparql::viewsvc::ViewRead<'_>,
+    ) -> sparkles_core::Result<sparkles_core::sparql::viewsvc::ViewRows> {
+        Ok(sparkles_core::sparql::viewsvc::ViewRows {
+            columns: vec!["x".into()],
+            rows: (0..self.0)
+                .map(|i| {
+                    (
+                        vec![Some(Term::Literal(oxrdf::Literal::from(i.to_string())))],
+                        1,
+                    )
+                })
+                .collect(),
+            commit: 0,
+            evaluated_under: None,
+        })
+    }
+}
+
+const LEGACY_VIEW_LEAF: &str = "SERVICE <urn:x-sparkles:view#read> { [] <urn:x-sparkles:view#name> \"v\" ; <urn:x-sparkles:view#bind> ?x }";
+
+fn legacy_view_opts(n: usize) -> QueryOptions {
+    QueryOptions {
+        views: Some(Arc::new(LegacyViews(n))),
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -950,8 +975,8 @@ fn eager_fallback_is_visible_lazy_and_budgeted() {
         None,
     )])
     .unwrap();
-    let q = &format!("SELECT ?x WHERE {{ {} }}", split_leaf(100));
-    let opts_q = QueryOptions::default();
+    let q = &format!("SELECT ?x WHERE {{ {LEGACY_VIEW_LEAF} }}");
+    let opts_q = legacy_view_opts(100);
     assert!(matches!(
         select_cursor(s.snapshot(), q, &opts_q, &options(2)),
         Err(Error::Unsupported(_))
@@ -2497,8 +2522,8 @@ fn strict_automatic_execution_never_hides_materialization_in_eager_mode() {
     assert!(matches!(
         query_execution(
             s.snapshot(),
-            &format!("SELECT ?x {{ {} }}", split_leaf(3)),
-            &Default::default(),
+            &format!("SELECT ?x {{ {LEGACY_VIEW_LEAF} }}"),
+            &legacy_view_opts(3),
             &strict,
             ExecutionMode::Auto,
         ),
@@ -4076,18 +4101,19 @@ fn a_fallback_materializes_only_its_operator_and_streams_its_inputs() {
             fallbacks(child, out);
         }
     }
-    let split = split_leaf(30);
-    let opts_q = QueryOptions::default();
+    let opts_q = legacy_view_opts(30);
     for q in [
         format!(
-            "SELECT ?s ?o WHERE {{ ?s <urn:p> ?o FILTER EXISTS {{ {split} FILTER(?x = STR(?o)) }} }}"
+            "SELECT ?s ?o WHERE {{ ?s <urn:p> ?o FILTER EXISTS {{ {LEGACY_VIEW_LEAF} FILTER(?x = STR(?o)) }} }}"
         ),
         format!(
-            "SELECT ?s WHERE {{ ?s <urn:q> ?t FILTER NOT EXISTS {{ {split} FILTER(?x = \"3\") }} }}"
+            "SELECT ?s WHERE {{ ?s <urn:q> ?t FILTER NOT EXISTS {{ {LEGACY_VIEW_LEAF} FILTER(?x = \"3\") }} }}"
         ),
         // a BIND over an EXISTS that does not stream reads its whole input, and that
         // input streams into it
-        "SELECT ?s ?e WHERE { ?s <urn:p> ?o FILTER(?o < 5) BIND(EXISTS { ?t <http://jena.apache.org/ARQ/property#strSplit> (\"a b\" \" \") } AS ?e) }".to_string(),
+        format!(
+            "SELECT ?s ?e WHERE {{ ?s <urn:p> ?o FILTER(?o < 5) BIND(EXISTS {{ {LEGACY_VIEW_LEAF} }} AS ?e) }}"
+        ),
     ] {
         let q = q.as_str();
         let expected = bag(query(s.snapshot(), q, &opts_q).unwrap().application_rows());
@@ -4100,10 +4126,16 @@ fn a_fallback_materializes_only_its_operator_and_streams_its_inputs() {
             let mut found = Vec::new();
             fallbacks(c.plan(), &mut found);
             assert!(!found.is_empty(), "{q}");
-            assert!(found.iter().all(|(_, nested)| !nested), "{q}: {:?}", c.plan());
-            if q.contains("strSplit") {
-                assert!(found.iter().any(|(inputs, _)| *inputs), "{q}: {:?}", c.plan());
-            }
+            assert!(
+                found.iter().all(|(_, nested)| !nested),
+                "{q}: {:?}",
+                c.plan()
+            );
+            assert!(
+                found.iter().any(|(inputs, _)| *inputs),
+                "{q}: {:?}",
+                c.plan()
+            );
             assert_eq!(bag(all(c)), expected, "{q}; {rows}");
         }
     }

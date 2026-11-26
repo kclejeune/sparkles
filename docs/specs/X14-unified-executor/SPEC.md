@@ -1379,10 +1379,11 @@ answer enters the cache only when it was read to its end, and the copy for the c
 dropped once it grows past the largest entry the cache keeps or past what the budget
 holds beside the answer. The outbound timeout counts from the start of the request, while
 the query's deadline leaves out the time a consumer keeps the cursor waiting, so a slow
-consumer can expire a transfer that an eager run would finish. The strict policy refuses
-a SILENT SERVICE, which needs its whole answer before its first row, and a JSON response
-whose results come before its head, which [item 1125](../../ROADMAP.md) decodes in either
-order. Under the permissive policy, a late-head JSON response is buffered under a memory
+consumer can expire a transfer that an eager run would finish. In part 2, the strict policy
+refused a SILENT SERVICE, which needed its whole answer before its first row, and a JSON
+response whose results come before its head, which [item 1125](../../ROADMAP.md) decodes in
+either order; part 3 below moves SILENT SERVICE onto a native budget-buffered cursor. Under
+the permissive policy, a late-head JSON response is buffered under a memory
 charge, and the runtime plan reports and retains `fullInputBeforeOutput` on that SERVICE
 node after the response is released. Its refusal inside an EXISTS fails the query, as it
 does outside one.
@@ -1449,8 +1450,24 @@ rebuilds use the maintained VALUES terms for template blank-node identity and ch
 distinct graph state as the graph streams. Strict policy also
 applies inside the child. A custom source that only implements eager view reads requires
 the permissive policy. The cursor inventory and heap audit cover the maintained readers.
-The inventory test `cursor_inventory.rs` lists every form as native or refused with
-its decision or row.
+The inventory test `cursor_inventory.rs` lists every built-in plan form as native.
+
+Leaf ARQ property functions (`Kind::PropertyFn` without plan inputs) and `SILENT SERVICE`
+now run natively under `FallbackPolicy::RejectMaterialization`, completing item 829.
+`cursor/propertyfn.rs` and `arqpf::LeafReader` stream store-backed collections, RDF
+containers, `rdfs:member` triples and `apf:strSplit` tokens a batch at a time under
+`OwnedCharge` with cooperative control polling, and emit constant scalar functions on
+first pull. `cursor/service.rs` runs `SILENT SERVICE` lazily by draining remote and
+in-process responses into a memory-charged buffer before the first row so open-time and
+mid-stream endpoint failures become one empty solution while cancellation, query
+deadlines, policy refusals, budget limits and strict callee refusals still propagate;
+cache hits stream directly and late-head JSON is accepted under byte metering because the
+operator already reports `fullInputBeforeOutput`. Every built-in form in
+`cursor_inventory.rs` runs natively, and the ARQ property-function and CDT streaming
+suites record zero eager fallbacks. Strict cursors still refuse only unprefixed
+user-registered property functions, legacy eager-only `ViewSource` implementations,
+late-head JSON responses on non-`SILENT` `SERVICE` (tracked in
+[item 1125](../../ROADMAP.md)) and operators whose `EXISTS` embeds one of those shapes.
 
 Tests compare each reader with eager answers at batch sizes down to one row, refuse the
 budget and row limits where eager execution refuses, measure each reader's heap against

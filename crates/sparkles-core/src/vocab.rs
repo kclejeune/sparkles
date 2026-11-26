@@ -3064,6 +3064,38 @@ fn compare_prepared_bytes<E>(
     Ok(left.len().cmp(&right.len()))
 }
 
+/// Conservative SIMD control-group width for `hashbrown::RawTable` (covers 16 B SSE2/NEON
+/// and 32 B AVX2 groups).
+const APPEND_VOCAB_HASH_GROUP_WIDTH: usize = 32;
+
+/// Conservative per-entry heap overhead for `Arc<[u8]>` (`ArcInner` strong/weak counters,
+/// alignment padding and allocator metadata).
+const APPEND_VOCAB_ARC_OVERHEAD: u64 = 32;
+
+fn append_vocab_hashtable_buckets(cap: usize) -> usize {
+    if cap == 0 {
+        0
+    } else {
+        cap.saturating_mul(8).div_ceil(7).max(4).next_power_of_two()
+    }
+}
+
+fn append_vocab_hashtable_bytes<T>(buckets: usize) -> Option<u64> {
+    if buckets == 0 {
+        return Some(0);
+    }
+    let size = u64::try_from(std::mem::size_of::<T>()).ok()?;
+    let ctrl_align =
+        u64::try_from(std::mem::align_of::<T>().max(APPEND_VOCAB_HASH_GROUP_WIDTH)).ok()?;
+    let buckets = u64::try_from(buckets).ok()?;
+    let data_bytes = buckets.checked_mul(size)?;
+    let mask = ctrl_align.checked_sub(1)?;
+    let ctrl_offset = data_bytes.checked_add(mask)? & !mask;
+    ctrl_offset
+        .checked_add(buckets)?
+        .checked_add(APPEND_VOCAB_HASH_GROUP_WIDTH as u64)
+}
+
 impl AppendVocab {
     pub fn len(&self) -> u64 {
         self.keys.len() as u64
@@ -3100,6 +3132,77 @@ impl AppendVocab {
     }
     pub fn get(&self, id: u64) -> Option<&[u8]> {
         self.keys.get(id as usize).map(|k| &**k)
+    }
+
+    /// Conservative physical heap storage currently held by this live dictionary:
+    /// the `keys` pointer vector capacity, `map` hash-table allocation (data slots plus
+    /// SIMD control bytes), and owned `Arc<[u8]>` headers and payloads.
+    pub(crate) fn physical_bytes(&self) -> u64 {
+        if self.cold.is_some() {
+            return self.cold_bytes();
+        }
+        let keys_bytes =
+            (self.keys.capacity() as u64).saturating_mul(std::mem::size_of::<Arc<[u8]>>() as u64);
+        let map_bytes = append_vocab_hashtable_bytes::<(Arc<[u8]>, u64)>(
+            append_vocab_hashtable_buckets(self.map.capacity()),
+        )
+        .unwrap_or(u64::MAX);
+        let entries_bytes = (self.key_bytes as u64)
+            .saturating_add((self.keys.len() as u64).saturating_mul(APPEND_VOCAB_ARC_OVERHEAD));
+        keys_bytes
+            .saturating_add(map_bytes)
+            .saturating_add(entries_bytes)
+    }
+
+    /// Peak physical heap storage during `insert(key)` for a new key of `key_len` bytes,
+    /// including simultaneous old and new `keys` buffers or `map` hash tables when either
+    /// grows, plus the newly allocated `Arc<[u8]>`.
+    pub(crate) fn insert_peak_bytes(&self, key_len: usize) -> Option<u64> {
+        if self.cold.is_some() {
+            return self
+                .cold_bytes()
+                .checked_add(u64::try_from(key_len).ok()?)?
+                .checked_add(APPEND_VOCAB_ARC_OVERHEAD);
+        }
+        let ptr_size = u64::try_from(std::mem::size_of::<Arc<[u8]>>()).ok()?;
+        let cur_keys_cap = self.keys.capacity();
+        let keys_peak = if self.keys.len() >= cur_keys_cap {
+            let next_cap = if cur_keys_cap == 0 {
+                4
+            } else {
+                cur_keys_cap.checked_mul(2)?
+            };
+            u64::try_from(cur_keys_cap.checked_add(next_cap)?)
+                .ok()?
+                .checked_mul(ptr_size)?
+        } else {
+            u64::try_from(cur_keys_cap).ok()?.checked_mul(ptr_size)?
+        };
+        let cur_map_buckets = append_vocab_hashtable_buckets(self.map.capacity());
+        let cur_map_bytes = append_vocab_hashtable_bytes::<(Arc<[u8]>, u64)>(cur_map_buckets)?;
+        let map_peak = if self.map.len() >= self.map.capacity() {
+            let next_buckets = if cur_map_buckets == 0 {
+                8
+            } else {
+                cur_map_buckets.checked_mul(2)?
+            };
+            let next_map_bytes = append_vocab_hashtable_bytes::<(Arc<[u8]>, u64)>(next_buckets)?;
+            cur_map_bytes.checked_add(next_map_bytes)?
+        } else {
+            cur_map_bytes
+        };
+        let new_entry = u64::try_from(key_len)
+            .ok()?
+            .checked_add(APPEND_VOCAB_ARC_OVERHEAD)?;
+        let existing_entries = u64::try_from(self.key_bytes).ok()?.checked_add(
+            u64::try_from(self.keys.len())
+                .ok()?
+                .checked_mul(APPEND_VOCAB_ARC_OVERHEAD)?,
+        )?;
+        keys_peak
+            .checked_add(map_peak)?
+            .checked_add(existing_entries)?
+            .checked_add(new_entry)
     }
     pub fn find(&self, key: &[u8]) -> Option<u64> {
         if let Some(index) = &self.cold {

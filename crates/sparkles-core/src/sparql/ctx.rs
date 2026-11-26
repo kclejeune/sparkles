@@ -1205,6 +1205,23 @@ impl LocalVocab {
             Self::Circuit(t) => t.bytes(),
         }
     }
+
+    fn physical_bytes(&self) -> u64 {
+        match self {
+            Self::Owned(v) => v.physical_bytes(),
+            Self::Circuit(t) => t.bytes(),
+        }
+    }
+
+    fn insert_peak_bytes(&self, key_len: usize) -> Option<u64> {
+        match self {
+            Self::Owned(v) => v.insert_peak_bytes(key_len),
+            Self::Circuit(t) => t
+                .bytes()
+                .checked_add(u64::try_from(key_len).ok()?)?
+                .checked_add(96),
+        }
+    }
 }
 
 pub struct Ctx {
@@ -1219,6 +1236,9 @@ pub struct Ctx {
     pub(super) reasoning_memory: Vec<QueryMemoryLease>,
     pub snap: Arc<Snapshot>,
     local: RwLock<LocalVocab>,
+    /// Bytes of `local` currently covered by retained context credit (mutated under
+    /// `local.write()`).
+    local_retained: AtomicU64,
     values: ValueCache,
     floors: FloorCache,
     next_bnode: AtomicU64,
@@ -1861,6 +1881,7 @@ impl Ctx {
             #[cfg(test)]
             chunk_hook: parking_lot::Mutex::new(None),
             local: RwLock::new(LocalVocab::default()),
+            local_retained: AtomicU64::new(0),
             values: Default::default(),
             floors: Default::default(),
             next_bnode: AtomicU64::new(0),
@@ -2577,12 +2598,14 @@ impl Ctx {
             let name_bytes = names.iter().fold(0u64, |bytes, name| {
                 bytes.saturating_add(name.len() as u64 + std::mem::size_of::<String>() as u64)
             });
+            let local_bytes = local.append_only_clone_bytes();
             let bytes = fixed_bytes
                 .saturating_add(name_bytes)
-                .saturating_add(local.append_only_clone_bytes());
+                .saturating_add(local_bytes);
             if bytes <= admitted {
                 *trial.var_names.get_mut() = names.clone();
                 *trial.local.get_mut() = LocalVocab::Owned(local.clone_owned());
+                trial.local_retained.store(local_bytes, Ordering::Release);
                 break;
             }
             // Admission may wake a pool entrant. Keep both vocabulary and
@@ -2649,6 +2672,50 @@ impl Ctx {
             Err(error) => {
                 retained.used.fetch_sub(bytes, Ordering::AcqRel);
                 Err(error)
+            }
+        }
+    }
+
+    /// Retain `bytes` of query-local state by consuming spare `self.retained` headroom
+    /// first and keeping any remainder permanently charged directly out of `source`
+    /// without releasing it back to the pool. Never advances `self.retained.charge.reserved`,
+    /// preserving the `StepReservation` invariant (`reserved >= used`) against concurrent
+    /// `retain_bytes` callers. Any excess above `bytes` stays on `source` to be released
+    /// once temporary growth buffers have freed.
+    fn retain_from_charge(&self, bytes: u64, source: &Charge<'_>) {
+        if bytes == 0 {
+            return;
+        }
+        debug_assert!(source.belongs_to(self));
+        debug_assert!(source.bytes() >= bytes);
+        let from_spare = {
+            let _grow = self.retained.charge.grow.lock();
+            let reserved = self.retained.charge.reserved.load(Ordering::Acquire);
+            let mut claimed = 0u64;
+            if self
+                .retained
+                .used
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                    let take = bytes.min(reserved.saturating_sub(cur));
+                    if take == 0 {
+                        None
+                    } else {
+                        claimed = take;
+                        Some(cur + take)
+                    }
+                })
+                .is_err()
+            {
+                claimed = 0;
+            }
+            claimed
+        };
+        let direct = bytes - from_spare;
+        if direct > 0 {
+            let remaining = source.bytes.get() - direct;
+            source.bytes.set(remaining);
+            if remaining == 0 {
+                source.disarm();
             }
         }
     }
@@ -3409,8 +3476,13 @@ impl Ctx {
         if let Some(i) = local.find(key) {
             return Ok(Id::local(i));
         }
-        self.try_retain_bytes(key.len() as u64 + 96)?;
-        Ok(Id::local(local.insert(key).0))
+        let add = key.len() as u64 + 96;
+        self.try_retain_bytes(add)?;
+        let id = Id::local(local.insert(key).0);
+        let covered = self.local_retained.load(Ordering::Acquire);
+        self.local_retained
+            .store(covered.saturating_add(add), Ordering::Release);
+        Ok(id)
     }
 
     pub fn intern_key(&self, key: &[u8]) -> Id {
@@ -3421,6 +3493,118 @@ impl Ctx {
                 Id::UNDEF
             }
         }
+    }
+
+    /// Look up or intern an already-encoded vocabulary key, pre-admitting decompression
+    /// scratch and local-vocabulary growth peaks (simultaneous old and new hash tables or
+    /// key-pointer buffers during resize) and reconciling against retained physical
+    /// capacities afterward.
+    pub(crate) fn intern_key_checked(&self, key: &[u8]) -> Result<Id> {
+        self.check()?;
+        let vocab_scratch = self.charge(0)?;
+        if let Ok(i) = self.snap.generation.vocab.find_with_checked(key, |need| {
+            let bytes = u64::try_from(need)
+                .ok()
+                .and_then(|n| n.checked_mul(2))
+                .ok_or_else(|| self.memory_exceeded(u64::MAX))?;
+            vocab_scratch.resize(bytes)
+        })? {
+            return Ok(Id::vocab(i));
+        }
+        drop(vocab_scratch);
+        if let Some(i) = self
+            .snap
+            .generation
+            .dvocab
+            .find(key)
+            .filter(|&i| i < self.snap.dvocab_len)
+        {
+            return Ok(Id::delta(i));
+        }
+        if let Some(i) = self.local.read().find(key) {
+            return Ok(Id::local(i));
+        }
+        let mut local = self.local.write();
+        if let Some(i) = local.find(key) {
+            return Ok(Id::local(i));
+        }
+        let covered = self.local_retained.load(Ordering::Acquire);
+        let peak = local
+            .insert_peak_bytes(key.len())
+            .ok_or_else(|| self.memory_exceeded(u64::MAX))?;
+        let transient = peak.saturating_sub(covered);
+        let growth_charge = if transient > 0 {
+            Some(self.charge(transient)?)
+        } else {
+            None
+        };
+        let (id, _) = local.insert(key);
+        let after = local.physical_bytes();
+        let retain_delta = after.saturating_sub(covered);
+        if retain_delta > 0 {
+            let from_source = growth_charge
+                .as_ref()
+                .map_or(0, |charge| charge.bytes().min(retain_delta));
+            if from_source > 0 {
+                self.retain_from_charge(
+                    from_source,
+                    growth_charge
+                        .as_ref()
+                        .expect("pre-admitted growth charge for retained transfer"),
+                );
+            }
+            let rem = retain_delta - from_source;
+            debug_assert_eq!(
+                rem, 0,
+                "insert_peak_bytes must cover post-insert physical_bytes"
+            );
+            if rem > 0 {
+                drop(growth_charge);
+                if !self.retain_bytes(rem) {
+                    self.local_retained
+                        .store(covered.saturating_add(from_source), Ordering::Release);
+                    return Err(self.check_memory_failure().err().unwrap_or_else(|| {
+                        self.memory_exceeded(self.live_bytes().saturating_add(rem))
+                    }));
+                }
+                self.local_retained
+                    .store(covered.saturating_add(retain_delta), Ordering::Release);
+                return Ok(Id::local(id));
+            }
+            self.local_retained
+                .store(covered.saturating_add(retain_delta), Ordering::Release);
+        }
+        drop(growth_charge);
+        Ok(Id::local(id))
+    }
+
+    /// Intern a simple `xsd:string` literal directly from a borrowed lexical value,
+    /// pre-admitting the temporary key buffer before encoding so no intermediate
+    /// `Arc<str>` or `oxrdf::Literal` is allocated outside the query budget.
+    pub(crate) fn intern_simple_str_checked(&self, s: &str) -> Result<Id> {
+        let key_len = s
+            .len()
+            .checked_add(2)
+            .ok_or_else(|| self.memory_exceeded(u64::MAX))?;
+        let _scratch = self.charge(key_len as u64)?;
+        let mut key = Vec::with_capacity(key_len);
+        id::write_literal_ref_key(oxrdf::LiteralRef::new_simple_literal(s), &mut key);
+        debug_assert_eq!(key.len(), key_len);
+        self.intern_key_checked(&key)
+    }
+
+    /// Intern an IRI directly from a borrowed string, pre-admitting the temporary key
+    /// buffer before encoding.
+    pub(crate) fn intern_iri_checked(&self, iri: &str) -> Result<Id> {
+        let key_len = iri
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| self.memory_exceeded(u64::MAX))?;
+        let _scratch = self.charge(key_len as u64)?;
+        let mut key = Vec::with_capacity(key_len);
+        key.push(b'<');
+        key.extend_from_slice(iri.as_bytes());
+        self.intern_key_checked(&key)
     }
 
     /// SERVICE-created encoded terms retain the existing key-byte estimate in eager
@@ -3464,6 +3648,9 @@ impl Ctx {
         }
         let id = Id::local(local.insert(key).0);
         std::mem::forget(charge);
+        let covered = self.local_retained.load(Ordering::Acquire);
+        self.local_retained
+            .store(covered.saturating_add(estimate), Ordering::Release);
         Ok(id)
     }
 
@@ -3502,8 +3689,11 @@ impl Ctx {
         let local = other.local.read().clone_owned();
         // The copy is this context's own, so it is charged here, and a refusal fails the
         // next check.
-        self.retain_bytes(local.bytes() as u64);
-        *self.local.write() = LocalVocab::Owned(local);
+        let bytes = local.bytes() as u64;
+        self.retain_bytes(bytes);
+        let mut dst = self.local.write();
+        *dst = LocalVocab::Owned(local);
+        self.local_retained.store(bytes, Ordering::Release);
         self.next_bnode
             .store(other.next_bnode.load(Ordering::Relaxed), Ordering::Relaxed);
     }
@@ -5210,20 +5400,25 @@ impl Ctx {
         terms: crate::incr::terms::Terms,
     ) -> crate::incr::terms::Terms {
         let mut guard = self.local.write();
-        match std::mem::replace(&mut *guard, LocalVocab::Circuit(terms)) {
+        let bytes = terms.bytes();
+        let prev = match std::mem::replace(&mut *guard, LocalVocab::Circuit(terms)) {
             LocalVocab::Circuit(prev) => prev,
             LocalVocab::Owned(_) => crate::incr::terms::Terms::default(),
-        }
+        };
+        self.local_retained.store(bytes, Ordering::Release);
+        prev
     }
 
     /// Take back the [`Terms`](crate::incr::terms::Terms) previously attached with
     /// [`Ctx::swap_circuit_terms`], restoring an empty owned vocabulary.
     pub(crate) fn take_circuit_terms(&self) -> crate::incr::terms::Terms {
         let mut guard = self.local.write();
-        match std::mem::take(&mut *guard) {
+        let prev = match std::mem::take(&mut *guard) {
             LocalVocab::Circuit(terms) => terms,
             LocalVocab::Owned(_) => crate::incr::terms::Terms::default(),
-        }
+        };
+        self.local_retained.store(0, Ordering::Release);
+        prev
     }
 
     #[cfg(test)]
@@ -5923,6 +6118,9 @@ impl OwnedCharge {
             self.resize(bytes)?;
         }
         Ok(())
+    }
+    pub(crate) fn check(&self) -> Result<()> {
+        self.ctx.check()
     }
     /// Adopt the actual predecoded payload guard; the existing cursor ledger is
     /// required and checked before the source is consumed.
@@ -7614,6 +7812,195 @@ mod charge_tests {
             assert!(ctx.check().is_ok());
             ctx.release_work();
             assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
+
+    /// Checked local-vocabulary insertion transfers the retained portion of its
+    /// pre-admitted growth charge directly into `self.retained` before releasing the
+    /// transient excess, so a contending waiter on the shared `QueryPool` cannot steal
+    /// the retained granules during handoff and leave an inserted entry unaccounted.
+    #[test]
+    fn intern_key_checked_transfers_retained_credit_without_pool_release() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(48 * MIB);
+        let grant = Arc::new(pool.try_grant(16 * MIB).unwrap());
+        let other = pool.try_grant(24 * MIB).unwrap();
+        let mut ctx = pooled(&store, &grant);
+        ctx.mem_limit = 64 * MIB;
+        ctx.enable_cursor_accounting().unwrap();
+
+        let ticket_slot: Arc<parking_lot::Mutex<Option<super::super::pool::Ticket>>> =
+            Default::default();
+        let stolen: Arc<parking_lot::Mutex<Option<super::super::pool::PoolGrant>>> =
+            Default::default();
+        let ticket_for_wake = ticket_slot.clone();
+        let stolen_for_wake = stolen.clone();
+        let ticket = pool.enter(
+            8 * MIB,
+            Some(Arc::new(move || {
+                if let Some(ticket) = ticket_for_wake.lock().as_mut()
+                    && let Some(g) = ticket.poll()
+                {
+                    *stolen_for_wake.lock() = Some(g);
+                }
+            })),
+        );
+        *ticket_slot.lock() = Some(ticket);
+
+        // `growth_charge` grows `grant` from 16 MiB to 24 MiB (consuming the last 8 MiB
+        // of the 48 MiB pool while staying within the 24 MiB waiting-pool half share).
+        // If `growth_charge` were dropped before retaining the 22 MiB entry, `grant`
+        // would trim back to 16 MiB, wake the 8 MiB waiter synchronously, and fail the
+        // subsequent `retain_bytes` call with `ServerMemory`.
+        let key = vec![b'k'; (22 * MIB) as usize];
+        let id = ctx
+            .intern_key_checked(&key)
+            .expect("retained credit must stay pinned across handoff under pool contention");
+        assert_eq!(id.tag(), Tag::Local);
+        assert!(
+            stolen.lock().is_none(),
+            "retained granules must not be released to a contending pool waiter"
+        );
+        let physical = ctx.local.read().physical_bytes();
+        assert_eq!(ctx.local_retained.load(Ordering::Acquire), physical);
+        assert!(
+            ctx.live_bytes() >= physical,
+            "live bytes ({}) must cover retained local vocabulary ({physical})",
+            ctx.live_bytes()
+        );
+
+        drop(ticket_slot.lock().take());
+        drop(stolen.lock().take());
+        drop(other);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    /// `retain_from_charge` never advances `self.retained.charge.reserved`, so concurrent
+    /// `retain_bytes` calls cannot mistake directly-retained bytes for `StepReservation`
+    /// headroom and skip charging past `mem_limit`.
+    #[test]
+    fn retain_from_charge_preserves_step_reservation_invariant_under_concurrency() {
+        let store = Store::in_memory(StoreOptions::default());
+
+        // 1. Deterministic A < B interleaving (16 KiB retain_bytes pauses before
+        // `grow_reservation`, 60 KiB `retain_from_charge` completes under a 64 KiB cap):
+        // `grow_reservation` must refuse rather than observing `used_a <= reserved`.
+        {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = 64 << 10;
+            let used_a = ctx.retained.used.fetch_add(16 << 10, Ordering::AcqRel) + (16 << 10);
+            assert!(!ctx.retained.charge.covers(used_a));
+
+            let src = ctx.charge(60 << 10).unwrap();
+            ctx.retain_from_charge(60 << 10, &src);
+            drop(src);
+
+            let res = ctx.grow_reservation(&ctx.retained.charge, used_a, u64::MAX, true);
+            assert!(
+                res.is_err(),
+                "16 KiB retain_bytes must refuse when 60 KiB is already retained under 64 KiB cap"
+            );
+            ctx.retained.used.fetch_sub(16 << 10, Ordering::AcqRel);
+            assert!(
+                ctx.retained.charge.reserved() >= ctx.retained.used.load(Ordering::Acquire),
+                "reserved ({}) must stay >= used ({})",
+                ctx.retained.charge.reserved(),
+                ctx.retained.used.load(Ordering::Acquire)
+            );
+            assert_eq!(ctx.live_bytes(), 60 << 10);
+        }
+
+        // 2. Deterministic A > B interleaving (60 KiB retain_bytes pauses before
+        // `grow_reservation`, 16 KiB `retain_from_charge` completes): under 64 KiB cap it
+        // must refuse; under 128 KiB cap it must charge all 60 KiB on top of the 16 KiB.
+        for (limit, expect_ok) in [(64 << 10, false), (128 << 10, true)] {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = limit;
+            let used_a = ctx.retained.used.fetch_add(60 << 10, Ordering::AcqRel) + (60 << 10);
+
+            let src = ctx.charge(16 << 10).unwrap();
+            ctx.retain_from_charge(16 << 10, &src);
+            drop(src);
+
+            let res = ctx.grow_reservation(&ctx.retained.charge, used_a, u64::MAX, true);
+            assert_eq!(res.is_ok(), expect_ok);
+            if res.is_err() {
+                ctx.retained.used.fetch_sub(60 << 10, Ordering::AcqRel);
+            } else {
+                assert!(
+                    ctx.live_bytes() >= (76 << 10),
+                    "live bytes ({}) must cover both 60 KiB and 16 KiB",
+                    ctx.live_bytes()
+                );
+            }
+            assert!(ctx.retained.charge.reserved() >= ctx.retained.used.load(Ordering::Acquire));
+            assert!(ctx.live_bytes() <= limit);
+        }
+
+        // 3. Existing spare headroom in `self.retained` is reused without changing
+        // `reserved`, while only the overflow stays permanently charged out of `source`.
+        {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = 16 << 20;
+            assert!(ctx.retain_bytes(16 << 10));
+            let reserved_before = ctx.retained.charge.reserved();
+            assert!(reserved_before > (16 << 10));
+            let spare = reserved_before - (16 << 10);
+            let want = spare + (12 << 10);
+            let src = ctx.charge(want + (4 << 10)).unwrap();
+            ctx.retain_from_charge(want, &src);
+            drop(src);
+            assert_eq!(ctx.retained.charge.reserved(), reserved_before);
+            assert_eq!(ctx.retained.used.load(Ordering::Acquire), reserved_before);
+            assert_eq!(ctx.live_bytes(), reserved_before + (12 << 10));
+        }
+
+        // 4. Multi-threaded stress test: concurrent `retain_bytes` and
+        // `intern_key_checked` under a tight budget preserve `reserved >= used` and
+        // `live_bytes <= mem_limit`.
+        for trial in 0..8usize {
+            let mut raw = Ctx::new(store.snapshot());
+            raw.mem_limit = 96 << 10;
+            let ctx = Arc::new(raw);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            std::thread::scope(|s| {
+                let c1 = ctx.clone();
+                let b1 = barrier.clone();
+                s.spawn(move || {
+                    b1.wait();
+                    for _ in 0..32 {
+                        if !c1.retain_bytes(4 << 10) {
+                            break;
+                        }
+                    }
+                });
+                let c2 = ctx.clone();
+                let b2 = barrier.clone();
+                s.spawn(move || {
+                    b2.wait();
+                    for i in 0..32usize {
+                        let key = format!("<urn:t{trial}:{i}:{}>", "x".repeat(2048));
+                        if c2.intern_key_checked(key.as_bytes()).is_err() {
+                            break;
+                        }
+                    }
+                });
+            });
+            assert!(
+                ctx.retained.charge.reserved() >= ctx.retained.used.load(Ordering::Acquire),
+                "trial {trial}: reserved ({}) < used ({})",
+                ctx.retained.charge.reserved(),
+                ctx.retained.used.load(Ordering::Acquire)
+            );
+            assert!(
+                ctx.live_bytes() <= ctx.mem_limit,
+                "trial {trial}: live bytes ({}) exceeded mem_limit ({})",
+                ctx.live_bytes(),
+                ctx.mem_limit
+            );
         }
     }
 }

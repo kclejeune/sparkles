@@ -338,12 +338,13 @@ fn a_blank_node_label_is_one_node_across_batches() {
     }
 }
 
-/// A response that breaks off after some rows fails the cursor after it has handed
-/// those rows out, and fails the eager run. A failed request fails both, and a SILENT
-/// SERVICE stays an eager leaf: refused by the strict policy, and one empty solution
-/// under the permissive one, as in an eager run.
+/// A response that breaks off after some rows fails a non-SILENT cursor after it has
+/// handed those rows out, and fails the eager run. A SILENT SERVICE runs natively under
+/// the strict policy, buffering its answer under the memory budget so both open-time and
+/// mid-stream endpoint failures become one empty solution while policy refusals,
+/// cancellation, timeouts, and budget failures still propagate.
 #[test]
-fn failures_end_the_stream_and_silent_stays_eager() {
+fn failures_end_the_stream_and_silent_runs_natively() {
     let s = store();
     let snap = s.snapshot();
     let cut = format!("{HEAD}{},{{\"s\":", rows(3));
@@ -364,6 +365,69 @@ fn failures_end_the_stream_and_silent_stays_eager() {
     assert_eq!(emitted, 3);
     assert!(matches!(failure, Some(Error::Service(_))), "{failure:?}");
 
+    // Mid-stream truncation under SILENT SERVICE emits ONLY one empty solution (never the
+    // 3 partial rows) and runs natively under the strict policy.
+    let silent_broken = q.replace("SERVICE <", "SERVICE SILENT <");
+    let unit = vec![vec![None, None]];
+    assert_eq!(eager(&snap, &silent_broken, &opts()).unwrap(), unit);
+    for batch_rows in [1, 2, 4096] {
+        let (got_broken, plan) =
+            streamed(&snap, &silent_broken, &opts(), &strict(batch_rows)).unwrap();
+        assert_eq!(
+            got_broken, unit,
+            "mid-stream SILENT batch_rows={batch_rows}"
+        );
+        assert!(!materializes(&plan));
+        let svc = service_node(&plan);
+        assert!(svc.full_input_before_output && svc.growing_state && svc.reason.is_some());
+    }
+
+    // A clean 0-row SILENT SERVICE emits 0 rows (not an empty solution).
+    let empty_ep = Endpoint::start(answer(0));
+    let silent_empty = format!(
+        "SELECT ?s ?o {{ SERVICE SILENT <{}> {{ ?s ?p ?o }} }}",
+        empty_ep.url
+    );
+    assert!(eager(&snap, &silent_empty, &opts()).unwrap().is_empty());
+    let (got_empty, plan) = streamed(&snap, &silent_empty, &opts(), &strict(1)).unwrap();
+    assert!(got_empty.is_empty());
+    assert!(!materializes(&plan));
+
+    // A succeeding SILENT SERVICE (including late-head JSON) matches eager at all batch sizes.
+    let ok_ep = Endpoint::start(answer(15));
+    let silent_ok = format!(
+        "SELECT ?s ?o {{ SERVICE SILENT <{}> {{ ?s ?p ?o }} }}",
+        ok_ep.url
+    );
+    let expected_ok = eager(&snap, &silent_ok, &opts()).unwrap();
+    assert_eq!(expected_ok.len(), 15);
+    for batch_rows in [1, 2, 3, 4096] {
+        let (got, plan) = streamed(&snap, &silent_ok, &opts(), &strict(batch_rows)).unwrap();
+        assert_eq!(got, expected_ok, "batch_rows={batch_rows}");
+        assert!(!materializes(&plan));
+    }
+    let late_ep = Endpoint::start(Arc::new(|| {
+        (
+            200,
+            vec![Part::Bytes(
+                format!(
+                    r#"{{"results":{{"bindings":[{}]}},"head":{{"vars":["s","o"]}}}}"#,
+                    rows(7)
+                )
+                .into_bytes(),
+            )],
+        )
+    }));
+    let silent_late = format!(
+        "SELECT ?s ?o {{ SERVICE SILENT <{}> {{ ?s ?p ?o }} }}",
+        late_ep.url
+    );
+    let expected_late = eager(&snap, &silent_late, &opts()).unwrap();
+    let (got_late, plan_late) = streamed(&snap, &silent_late, &opts(), &strict(2)).unwrap();
+    assert_eq!(got_late, expected_late);
+    assert!(!materializes(&plan_late));
+
+    // HTTP 500 under SILENT SERVICE suppresses to one empty binding, also below a join.
     let failing = Endpoint::start(Arc::new(|| (500, vec![Part::Bytes(b"no".to_vec())])));
     let q = format!(
         "SELECT ?s ?o {{ SERVICE <{}> {{ ?s ?p ?o }} }}",
@@ -374,13 +438,10 @@ fn failures_end_the_stream_and_silent_stays_eager() {
     assert!(matches!(r, Err(Error::Service(_))), "{:?}", r.map(|r| r.0));
 
     let silent = q.replace("SERVICE <", "SERVICE SILENT <");
-    let unit = vec![vec![None, None]];
     assert_eq!(eager(&snap, &silent, &opts()).unwrap(), unit);
-    let allow = CursorOptions {
-        fallback: FallbackPolicy::AllowMaterialization,
-        ..strict(1)
-    };
-    assert_eq!(streamed(&snap, &silent, &opts(), &allow).unwrap().0, unit);
+    let (got, plan) = streamed(&snap, &silent, &opts(), &strict(1)).unwrap();
+    assert_eq!(got, unit);
+    assert!(!materializes(&plan));
     // the empty solution has the SERVICE's variables, unbound, also below a join
     let joined = format!(
         "SELECT ?a ?s ?o {{ ?a <urn:b> ?v SERVICE SILENT <{}> {{ ?s ?p ?o }} }}",
@@ -388,16 +449,9 @@ fn failures_end_the_stream_and_silent_stays_eager() {
     );
     let expected = eager(&snap, &joined, &opts()).unwrap();
     assert_eq!(expected.len(), 1);
-    assert_eq!(
-        streamed(&snap, &joined, &opts(), &allow).unwrap().0,
-        expected
-    );
-    let r = streamed(&snap, &silent, &opts(), &strict(1));
-    assert!(
-        matches!(&r, Err(Error::Unsupported(m)) if m.contains("materialization at Service")),
-        "{:?}",
-        r.map(|r| r.0)
-    );
+    let (got_joined, plan_joined) = streamed(&snap, &joined, &opts(), &strict(1)).unwrap();
+    assert_eq!(got_joined, expected);
+    assert!(!materializes(&plan_joined));
 
     // the policy's refusals come at the first pull, as in an eager run, and SILENT does
     // not hide them
@@ -412,13 +466,62 @@ fn failures_end_the_stream_and_silent_stays_eager() {
             eager(&snap, &q, &denied),
             Err(Error::NotPermitted(_))
         ));
-        let allow = CursorOptions {
-            fallback: FallbackPolicy::AllowMaterialization,
-            ..strict(1)
-        };
-        let r = streamed(&snap, &q, &denied, &allow);
+        let r = streamed(&snap, &q, &denied, &strict(1));
         assert!(
             matches!(r, Err(Error::NotPermitted(_))),
+            "{:?}",
+            r.map(|r| r.0)
+        );
+    }
+    // Cancellation, expired deadline, row budget, and memory budget are never suppressed
+    // by SILENT SERVICE.
+    let silent_q = q.replace("SERVICE <", "SERVICE SILENT <");
+    {
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let o = QueryOptions {
+            cancel: Some(cancel),
+            ..opts()
+        };
+        let r = streamed(&snap, &silent_q, &o, &strict(1));
+        assert!(matches!(r, Err(Error::Cancelled)), "{:?}", r.map(|r| r.0));
+    }
+    {
+        let o = QueryOptions {
+            deadline: Some(Instant::now() - Duration::from_secs(1)),
+            ..opts()
+        };
+        let r = streamed(&snap, &silent_q, &o, &strict(1));
+        assert!(matches!(r, Err(Error::Timeout)), "{:?}", r.map(|r| r.0));
+    }
+    {
+        let o = QueryOptions {
+            max_rows: Some(1),
+            ..opts()
+        };
+        let r = streamed(&snap, &silent_ok, &o, &strict(1));
+        assert!(
+            matches!(r, Err(Error::BudgetExceeded(ref b)) if b.kind == BudgetKind::Rows),
+            "{:?}",
+            r.map(|r| r.0)
+        );
+    }
+    {
+        let big_row = r#"{"s":{"type":"uri","value":"urn:s"},"o":{"type":"uri","value":"urn:o"}}"#;
+        let big_body = format!("{HEAD}{}{TAIL}", vec![big_row; 50_000].join(","));
+        let big_ep = Endpoint::start(Arc::new(move || {
+            (200, vec![Part::Bytes(big_body.clone().into_bytes())])
+        }));
+        let big_silent = format!(
+            "SELECT ?s ?o {{ SERVICE SILENT <{}> {{ ?s ?p ?o }} }}",
+            big_ep.url
+        );
+        let tight = QueryOptions {
+            max_memory_bytes: Some(256 << 10),
+            ..opts()
+        };
+        let r = streamed(&snap, &big_silent, &tight, &strict(64));
+        assert!(
+            matches!(r, Err(Error::BudgetExceeded(ref b)) if b.kind == BudgetKind::Memory),
             "{:?}",
             r.map(|r| r.0)
         );
@@ -688,8 +791,26 @@ fn an_exists_over_a_streamed_service_sends_eagers_requests() {
     }
 }
 
+/// A legacy `ViewSource` implementing only eager `read_view` (refused by strict cursors).
+#[derive(Debug)]
+struct LegacyViews;
+
+impl sparkles_core::sparql::viewsvc::ViewSource for LegacyViews {
+    fn read_view(
+        &self,
+        _: &sparkles_core::sparql::viewsvc::ViewRead<'_>,
+    ) -> Result<sparkles_core::sparql::viewsvc::ViewRows> {
+        Ok(sparkles_core::sparql::viewsvc::ViewRows {
+            columns: vec!["x".into()],
+            rows: vec![(vec![Some(Term::Literal(oxrdf::Literal::from(1)))], 1)],
+            commit: 0,
+            evaluated_under: None,
+        })
+    }
+}
+
 /// The in-process endpoint `http://local/sparql`, which reads `snap` and may call
-/// services itself.
+/// services itself, plus `http://legacy-view/sparql`, which carries a legacy `ViewSource`.
 struct Local(Arc<Snapshot>, Arc<()>);
 
 impl std::fmt::Debug for Local {
@@ -700,8 +821,8 @@ impl std::fmt::Debug for Local {
 
 impl LocalEndpoints for Local {
     fn resolve(&self, iri: &str) -> Option<Result<LocalTarget>> {
-        (iri == "http://local/sparql").then(|| {
-            Ok(LocalTarget {
+        match iri {
+            "http://local/sparql" => Some(Ok(LocalTarget {
                 snap: self.0.clone(),
                 options: QueryOptions {
                     allow_service: true,
@@ -713,8 +834,18 @@ impl LocalEndpoints for Local {
                     ..Default::default()
                 },
                 hold: Some(Box::new(self.1.clone())),
-            })
-        })
+            })),
+            "http://legacy-view/sparql" => Some(Ok(LocalTarget {
+                snap: self.0.clone(),
+                options: QueryOptions {
+                    no_cache: true,
+                    views: Some(Arc::new(LegacyViews)),
+                    ..Default::default()
+                },
+                hold: Some(Box::new(self.1.clone())),
+            })),
+            _ => None,
+        }
     }
 }
 
@@ -762,26 +893,46 @@ fn an_in_process_call_runs_under_the_callers_policy_and_deadline() {
         assert_eq!(n, 100);
         assert_service_streaming(cursor.plan(), "local after none");
     }
-    // the callee holds a SILENT SERVICE, which the strict policy refuses
+    // a nested SILENT SERVICE inside an in-process call now runs natively under strict policy
     let failing = Endpoint::start(Arc::new(|| (500, vec![Part::Bytes(b"no".to_vec())])));
-    let nested = format!(
+    let nested_silent = format!(
         "SELECT ?s ?o {{ SERVICE <http://local/sparql> {{ ?s <urn:p> ?o SERVICE SILENT <{}> {{ ?s ?q ?r }} }} }}",
         failing.url
     );
-    let expected = eager(&snap, &nested, &o).unwrap();
+    let expected = eager(&snap, &nested_silent, &o).unwrap();
     assert_eq!(expected.len(), 100);
-    let mut cursor = select_cursor(snap.clone(), &nested, &o, &strict(4)).unwrap();
-    let r = cursor.next_batch();
-    assert!(
-        matches!(&r, Err(Error::Unsupported(m)) if m.contains("materialization at Service")),
-        "{:?}",
-        r.map(|b| b.map(|b| b.len()))
-    );
+    let (got, plan) = streamed(&snap, &nested_silent, &o, &strict(4)).unwrap();
+    assert_eq!(got, expected);
+    assert!(!materializes(&plan));
+
+    // a callee holding a strict-refused form (legacy eager-only ViewSource) is refused at
+    // first pull under strict policy (even when wrapped in SILENT) and answered under permissive.
+    let nested_refused = "SELECT ?x { SERVICE <http://legacy-view/sparql> { SERVICE <urn:x-sparkles:view#read> { [] <urn:x-sparkles:view#name> \"v\" ; <urn:x-sparkles:view#bind> ?x } } }";
+    let expected_refused = eager(&snap, nested_refused, &o).unwrap();
+    assert_eq!(expected_refused.len(), 1);
+    for q in [
+        nested_refused.to_string(),
+        nested_refused.replace(
+            "SERVICE <http://legacy-view/sparql>",
+            "SERVICE SILENT <http://legacy-view/sparql>",
+        ),
+    ] {
+        let mut cursor = select_cursor(snap.clone(), &q, &o, &strict(4)).unwrap();
+        let r = cursor.next_batch();
+        assert!(
+            matches!(&r, Err(Error::Unsupported(m)) if m.contains("materialization at ViewRead")),
+            "{q}: {:?}",
+            r.map(|b| b.map(|b| b.len()))
+        );
+    }
     let allow = CursorOptions {
         fallback: FallbackPolicy::AllowMaterialization,
         ..strict(4)
     };
-    assert_eq!(streamed(&snap, &nested, &o, &allow).unwrap().0, expected);
+    assert_eq!(
+        streamed(&snap, nested_refused, &o, &allow).unwrap().0,
+        expected_refused
+    );
     // a pause of the caller's consumer past the deadline, after the call opened and
     // before it opened
     let timed = QueryOptions {
@@ -894,14 +1045,26 @@ fn an_exists_over_an_in_process_call_keeps_the_strict_policy() {
     };
     let failing = Endpoint::start(Arc::new(|| (500, vec![Part::Bytes(b"no".to_vec())])));
     for filter in ["EXISTS", "NOT EXISTS"] {
-        let q = format!(
+        // Nested SILENT SERVICE runs natively under strict policy inside EXISTS too.
+        let q_silent = format!(
             "SELECT ?a {{ ?a <urn:b> ?v FILTER {filter} {{ SERVICE <http://local/sparql> {{ ?x <urn:p> ?o SERVICE SILENT <{}> {{ ?x ?q ?r }} }} }} }}",
             failing.url
         );
-        let expected = eager(&snap, &q, &o).unwrap();
-        let r = streamed(&snap, &q, &o, &strict(4));
+        let expected_silent = eager(&snap, &q_silent, &o).unwrap();
+        let (got_silent, plan_silent) = streamed(&snap, &q_silent, &o, &strict(4)).unwrap();
+        assert_eq!(got_silent, expected_silent, "{filter}");
+        assert!(!materializes(&plan_silent));
+        assert_eq!(auto(&snap, &q_silent, &o), expected_silent, "{filter}");
+
+        // A strict-refused callee form (legacy ViewSource) still fails under strict policy
+        // inside EXISTS, and succeeds under AllowMaterialization / auto.
+        let q_refused = format!(
+            "SELECT ?a {{ ?a <urn:b> ?v FILTER {filter} {{ SERVICE <http://legacy-view/sparql> {{ SERVICE <urn:x-sparkles:view#read> {{ [] <urn:x-sparkles:view#name> \"v\" ; <urn:x-sparkles:view#bind> ?x }} }} }} }}"
+        );
+        let expected = eager(&snap, &q_refused, &o).unwrap();
+        let r = streamed(&snap, &q_refused, &o, &strict(4));
         assert!(
-            matches!(&r, Err(Error::Unsupported(m)) if m.contains("materialization at Service")),
+            matches!(&r, Err(Error::Unsupported(m)) if m.contains("materialization at ViewRead")),
             "{filter}: {:?}",
             r.map(|(rows, _)| rows)
         );
@@ -910,11 +1073,11 @@ fn an_exists_over_an_in_process_call_keeps_the_strict_policy() {
             ..strict(4)
         };
         assert_eq!(
-            streamed(&snap, &q, &o, &allow).unwrap().0,
+            streamed(&snap, &q_refused, &o, &allow).unwrap().0,
             expected,
             "{filter}"
         );
-        assert_eq!(auto(&snap, &q, &o), expected, "{filter}");
+        assert_eq!(auto(&snap, &q_refused, &o), expected, "{filter}");
     }
     // automatic admission under the default policy answers the nested form too
     let nested = format!(
@@ -980,6 +1143,197 @@ fn a_late_head_refusal_inside_exists_fails_the_query() {
             );
         }
     }
+
+    // An enclosing `SERVICE SILENT` around an in-process callee that calls a non-SILENT
+    // late-head endpoint propagates the strict refusal under `RejectMaterialization` and
+    // yields the bindings under `AllowMaterialization`.
+    let silent_nested = format!(
+        "SELECT ?x ?s ?o {{ SERVICE SILENT <http://local/sparql> {{ ?x <urn:p> ?v SERVICE <{}> {{ ?s ?p ?o }} }} }}",
+        late.url
+    );
+    let r = streamed(&snap, &silent_nested, &o, &strict(4));
+    assert!(
+        matches!(&r, Err(Error::Service(m)) if m.contains("before the variables of its head")),
+        "enclosing SILENT must propagate strict callee LATE_HEAD: {:?}",
+        r.map(|(rows, _)| rows)
+    );
+    let allow = CursorOptions {
+        fallback: FallbackPolicy::AllowMaterialization,
+        ..strict(4)
+    };
+    assert_eq!(
+        streamed(&snap, &silent_nested, &o, &allow).unwrap().0,
+        eager(&snap, &silent_nested, &o).unwrap()
+    );
+}
+
+/// Truncated or trailing-malformed late-head JSON responses never emit partial rows and
+/// never populate the service cache, under both `SILENT SERVICE` and permissive
+/// non-`SILENT SERVICE`.
+#[test]
+fn malformed_late_head_responses_never_emit_partial_rows_or_cache() {
+    let s = store();
+    let snap = s.snapshot();
+    let cached = QueryOptions {
+        no_cache: false,
+        ..opts()
+    };
+    let allow = CursorOptions {
+        fallback: FallbackPolicy::AllowMaterialization,
+        ..strict(2)
+    };
+    let cases: [(&str, &[u8]); 2] = [
+        (
+            "truncated after vars",
+            br#"{"results":{"bindings":[{"s":{"type":"uri","value":"urn:s"}}]},"head":{"vars":["s"]"#,
+        ),
+        (
+            "trailing garbage",
+            br#"{"results":{"bindings":[{"s":{"type":"uri","value":"urn:s"}}]},"head":{"vars":["s"]}} trailing"#,
+        ),
+    ];
+    for (label, body) in cases {
+        let payload = body.to_vec();
+        let ep = Endpoint::start(Arc::new(move || (200, vec![Part::Bytes(payload.clone())])));
+        s.result_cache().service.clear();
+
+        let silent_q = format!(
+            "SELECT ?s {{ SERVICE SILENT <cache:{}> {{ ?s ?p ?o }} }}",
+            ep.url
+        );
+        let unit = vec![vec![None]];
+        assert_eq!(eager(&snap, &silent_q, &opts()).unwrap(), unit, "{label}");
+        assert_eq!(
+            streamed(&snap, &silent_q, &cached, &strict(1)).unwrap().0,
+            unit,
+            "{label}: first silent streamed"
+        );
+        assert_eq!(
+            s.result_cache().service.entries(),
+            0,
+            "{label}: malformed late-head must not populate cache"
+        );
+        let calls_after_first = ep.calls();
+        assert_eq!(
+            streamed(&snap, &silent_q, &cached, &strict(1)).unwrap().0,
+            unit,
+            "{label}: second silent streamed"
+        );
+        assert_eq!(
+            ep.calls(),
+            calls_after_first + 1,
+            "{label}: second cache-enabled call must contact endpoint again"
+        );
+
+        let non_silent_q = format!("SELECT ?s {{ SERVICE <cache:{}> {{ ?s ?p ?o }} }}", ep.url);
+        let r = streamed(&snap, &non_silent_q, &cached, &allow);
+        assert!(
+            matches!(&r, Err(Error::Service(_))),
+            "{label}: permissive non-silent must fail: {:?}",
+            r.map(|(rows, _)| rows)
+        );
+        assert_eq!(
+            s.result_cache().service.entries(),
+            0,
+            "{label}: failed permissive late-head must not populate cache"
+        );
+    }
+}
+
+/// `SILENT SERVICE` enforces `max_rows` and `max_rows_produced` per accepted row before
+/// reading malformed trailing content, never caches a failed stream, and serves a
+/// succeeding cache hit directly without hitting the endpoint again.
+#[test]
+fn silent_service_enforces_row_budgets_per_row_and_cache_semantics() {
+    let s = store();
+    let snap = s.snapshot();
+
+    // 2 valid rows followed by malformed JSON.
+    let cut = format!("{HEAD}{},{{\"s\":", rows(2));
+    let broken = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(cut.clone().into_bytes())])
+    }));
+    let q_broken = format!(
+        "SELECT ?s ?o {{ SERVICE SILENT <cache:{}> {{ ?s ?p ?o }} }}",
+        broken.url
+    );
+    let cached = QueryOptions {
+        no_cache: false,
+        ..opts()
+    };
+
+    // max_rows = 1 crosses the limit on row 2 before the malformed JSON arrives.
+    let over_rows = QueryOptions {
+        max_rows: Some(1),
+        ..opts()
+    };
+    let r = streamed(&snap, &q_broken, &over_rows, &strict(1));
+    assert!(
+        matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Rows),
+        "expected BudgetKind::Rows, got {:?}",
+        r.map(|(rows, _)| rows)
+    );
+
+    // max_rows = 2 stays within the limit, hits malformed JSON, and suppresses to 1 empty row.
+    let within_rows = QueryOptions {
+        max_rows: Some(2),
+        ..opts()
+    };
+    let unit = vec![vec![None, None]];
+    assert_eq!(
+        streamed(&snap, &q_broken, &within_rows, &strict(1))
+            .unwrap()
+            .0,
+        unit
+    );
+
+    // max_rows_produced = 1 crosses the produced-row limit before malformed JSON arrives.
+    let over_produced = QueryOptions {
+        max_rows_produced: Some(1),
+        ..opts()
+    };
+    let r = streamed(&snap, &q_broken, &over_produced, &strict(1));
+    assert!(
+        matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced),
+        "expected BudgetKind::RowsProduced, got {:?}",
+        r.map(|(rows, _)| rows)
+    );
+
+    // Mid-stream failure never populates the service cache.
+    s.result_cache().service.clear();
+    let before = broken.calls();
+    assert_eq!(
+        streamed(&snap, &q_broken, &cached, &strict(1)).unwrap().0,
+        unit
+    );
+    assert_eq!(s.result_cache().service.entries(), 0);
+    assert_eq!(
+        streamed(&snap, &q_broken, &cached, &strict(1)).unwrap().0,
+        unit
+    );
+    assert_eq!(broken.calls(), before + 2);
+
+    // A succeeding SILENT SERVICE populates the cache once and serves later runs from cache.
+    let ok = Endpoint::start(answer(9));
+    let q_ok = format!(
+        "SELECT ?s ?o {{ SERVICE SILENT <cache:{}> {{ ?s ?p ?o }} }}",
+        ok.url
+    );
+    s.result_cache().service.clear();
+    let (first_rows, _) = streamed(&snap, &q_ok, &cached, &strict(2)).unwrap();
+    assert_eq!(first_rows.len(), 9);
+    assert_eq!(ok.calls(), 1);
+    assert_eq!(s.result_cache().service.entries(), 1);
+    for batch_rows in [1, 4096] {
+        let (hit_rows, plan) = streamed(&snap, &q_ok, &cached, &strict(batch_rows)).unwrap();
+        assert_eq!(hit_rows, first_rows, "batch_rows={batch_rows}");
+        assert!(!materializes(&plan));
+    }
+    assert_eq!(
+        ok.calls(),
+        1,
+        "SILENT cache hit must not call endpoint again"
+    );
 }
 
 /// An ordinary failure inside EXISTS stays a false filter under the strict policy even
@@ -1502,4 +1856,338 @@ fn unpooled_caller_can_call_local_target_with_pool_configured() {
         "dropping the cursor must return its owned contribution to pool A"
     );
     assert_eq!(pool_b.granted(), 0);
+}
+
+/// Eager SERVICE compacts a long leading whitespace prefix in bounded memory and charges
+/// non-whitespace JSON head and late-head staging buffers against the query memory grant.
+#[test]
+fn eager_service_charges_json_staging_and_streams_long_whitespace_prefix() {
+    let s = store();
+    let snap = s.snapshot();
+    let tight = QueryOptions {
+        max_memory_bytes: Some(128 << 10),
+        ..opts()
+    };
+
+    // 1. Long leading whitespace prefix before a small head-first response succeeds under
+    // a tight eager budget.
+    let mut ws_payload = vec![b' '; 256 << 10];
+    ws_payload.extend_from_slice(
+        br#"{"head":{"vars":["s"]},"results":{"bindings":[{"s":{"type":"uri","value":"urn:ok"}}]}}"#,
+    );
+    let ep_ws = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(ws_payload.clone())])
+    }));
+    let q_ws = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_ws.url);
+    let rows = eager(&snap, &q_ws, &tight).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][0],
+        Some(Term::NamedNode(oxrdf::NamedNode::new("urn:ok").unwrap()))
+    );
+
+    // 2. Large non-whitespace head exceeds the tight eager memory budget.
+    let big_head = format!(
+        r#"{{"head":{{"links":["{}"],"vars":["s"]}},"results":{{"bindings":[]}}}}"#,
+        "h".repeat(256 << 10)
+    )
+    .into_bytes();
+    let ep_head = Endpoint::start(Arc::new(move || (200, vec![Part::Bytes(big_head.clone())])));
+    let q_head = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_head.url);
+    let err = eager(&snap, &q_head, &tight).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+        "expected Memory BudgetExceeded for large eager head, got {err:?}"
+    );
+
+    // 3. Large late-head body exceeds the tight eager memory budget.
+    let big_late = format!(
+        r#"{{"results":{{"bindings":[{{"s":{{"type":"literal","value":"{}"}}}}]}},"head":{{"vars":["s"]}}}}"#,
+        "v".repeat(256 << 10)
+    )
+    .into_bytes();
+    let ep_late = Endpoint::start(Arc::new(move || (200, vec![Part::Bytes(big_late.clone())])));
+    let q_late = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_late.url);
+    let err = eager(&snap, &q_late, &tight).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+        "expected Memory BudgetExceeded for large eager late-head body, got {err:?}"
+    );
+}
+
+/// Eager SERVICE refuses responses whose raw JSON bytes fit in the memory grant when
+/// either escaped-token parser scratch or late-head buffered bindings exceed the grant.
+#[test]
+fn eager_service_refuses_escaped_token_scratch_and_late_buffered_bindings() {
+    let s = store();
+    let snap = s.snapshot();
+
+    // 1. ~27 KiB escaped string in `head.links` fits in a 32 KiB staging Vec<u8> (48 KiB
+    // growth peak), while the staging Vec + parser's decoded String exceed 56 KiB.
+    let escaped_head = format!(
+        r#"{{"head":{{"links":["\"{}"],"vars":["s"]}},"results":{{"bindings":[]}}}}"#,
+        "e".repeat(27 << 10)
+    )
+    .into_bytes();
+    let ep_esc = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(escaped_head.clone())])
+    }));
+    let q_esc = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_esc.url);
+    let tight_esc = QueryOptions {
+        max_memory_bytes: Some(56 << 10),
+        ..opts()
+    };
+    let err = eager(&snap, &q_esc, &tight_esc).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+        "expected Memory BudgetExceeded for eager escaped-token scratch, got {err:?}"
+    );
+
+    // 2. 10,000 empty bindings occupy ~30 KiB on the wire (raw staging fits easily in
+    // 256 KiB, and a single 4 KiB read's allowance is ~172 KiB), while `sparesults`
+    // buffers ~1 MiB of `(Vec<String>, Vec<Term>)` pairs alongside the replay cursor.
+    let bindings = vec!["{}"; 10_000].join(",");
+    let late_empty =
+        format!(r#"{{"results":{{"bindings":[{bindings}]}},"head":{{"vars":["s"]}}}}"#)
+            .into_bytes();
+    assert!(late_empty.len() < (32 << 10));
+    let ep_late = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(late_empty.clone())])
+    }));
+    let q_late = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_late.url);
+    let tight_late = QueryOptions {
+        max_memory_bytes: Some(256 << 10),
+        ..opts()
+    };
+    let err = eager(&snap, &q_late, &tight_late).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+        "expected Memory BudgetExceeded for eager late-head buffered bindings, got {err:?}"
+    );
+
+    // 3. A tiny (< 100 B) complete late-head response succeeds under a 128 KiB eager
+    // budget instead of failing before its EOF check read.
+    let tiny_late =
+        br#"{"results":{"bindings":[{"s":{"type":"uri","value":"urn:tiny"}}]},"head":{"vars":["s"]}}"#
+            .to_vec();
+    let ep_tiny = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(tiny_late.clone())])
+    }));
+    let q_tiny = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_tiny.url);
+    let tight_tiny = QueryOptions {
+        max_memory_bytes: Some(128 << 10),
+        ..opts()
+    };
+    assert_eq!(
+        eager(&snap, &q_tiny, &tight_tiny).unwrap(),
+        vec![vec![Some(Term::NamedNode(
+            oxrdf::NamedNode::new("urn:tiny").unwrap()
+        ))]]
+    );
+
+    // 4. An escape after an 18,000-byte literal prefix in a comma-preceded second link
+    // refuses under an 84 KiB eager budget (covering separator skipping and
+    // non-power-of-two initial String growth).
+    let prefix_escaped = format!(
+        r#"{{"head":{{"links":["ok","{}\""],"vars":["s"]}},"results":{{"bindings":[]}}}}"#,
+        "p".repeat(18_000)
+    )
+    .into_bytes();
+    let ep_prefix = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(prefix_escaped.clone())])
+    }));
+    let q_prefix = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_prefix.url);
+    let tight_prefix = QueryOptions {
+        max_memory_bytes: Some(84 << 10),
+        ..opts()
+    };
+    let err = eager(&snap, &q_prefix, &tight_prefix).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+        "expected Memory BudgetExceeded for comma-preceded long-prefix escaped link, got {err:?}"
+    );
+
+    // 5. Missing-colon malformed plain-ASCII value (3,000 B) in the first 4 KiB read
+    // refuses under a 6 KiB eager budget before `LowLevelJsonParser` clones it into
+    // `buffered_event`.
+    let missing_colon = format!(r#"{{"head":{{"x" "{}"}}}}"#, "m".repeat(3_000)).into_bytes();
+    let ep_colon = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(missing_colon.clone())])
+    }));
+    let q_colon = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_colon.url);
+    let tight_colon = QueryOptions {
+        max_memory_bytes: Some(6 << 10),
+        ..opts()
+    };
+    let err = eager(&snap, &q_colon, &tight_colon).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+        "expected Memory BudgetExceeded for missing-colon plain-ASCII error copy, got {err:?}"
+    );
+
+    // 6. Valid 1,000-level nested array head extension fits in one 4 KiB read and stays
+    // within `nesting::MAX_ELEMENTS`, but refuses under a 4,608-byte eager budget once
+    // parser `state_stack` growth pushes live memory past the budget.
+    let nested_head = format!(
+        r#"{{"head":{{"ext":{}0{},"vars":["s"]}},"results":{{"bindings":[]}}}}"#,
+        "[".repeat(1_000),
+        "]".repeat(1_000),
+    )
+    .into_bytes();
+    let ep_nested = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(nested_head.clone())])
+    }));
+    let q_nested = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_nested.url);
+    let tight_nested = QueryOptions {
+        max_memory_bytes: Some(4_608),
+        ..opts()
+    };
+    let err = eager(&snap, &q_nested, &tight_nested).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+        "expected Memory BudgetExceeded for deeply nested head extension, got {err:?}"
+    );
+}
+
+/// Whitespace compaction never turns a misplaced UTF-8 BOM after leading spaces into a
+/// valid response in either eager or strict cursor SERVICE, while a valid UTF-8 BOM at
+/// byte zero succeeds in both.
+#[test]
+fn service_rejects_misplaced_bom_after_whitespace_and_accepts_leading_bom() {
+    let s = store();
+    let snap = s.snapshot();
+
+    let mut misplaced = vec![b' '; 8192];
+    misplaced.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    misplaced.extend_from_slice(
+        br#"{"results":{"bindings":[{"s":{"type":"uri","value":"urn:bad"}}]},"head":{"vars":["s"]}}"#,
+    );
+    let ep_bad = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(misplaced.clone())])
+    }));
+    let q_bad = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_bad.url);
+    assert!(
+        matches!(eager(&snap, &q_bad, &opts()), Err(Error::Service(_))),
+        "eager SERVICE must reject misplaced BOM after discarded whitespace"
+    );
+    assert!(
+        matches!(
+            streamed(&snap, &q_bad, &opts(), &strict(1)),
+            Err(Error::Service(_))
+        ),
+        "strict cursor SERVICE must reject misplaced BOM after discarded whitespace"
+    );
+
+    let mut leading_bom = vec![0xEF, 0xBB, 0xBF];
+    leading_bom.extend(std::iter::repeat_n(b' ', 8192));
+    leading_bom.extend_from_slice(
+        br#"{"head":{"vars":["s"]},"results":{"bindings":[{"s":{"type":"uri","value":"urn:ok"}}]}}"#,
+    );
+    let ep_ok = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(leading_bom.clone())])
+    }));
+    let q_ok = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_ok.url);
+    let want = vec![vec![Some(Term::NamedNode(
+        oxrdf::NamedNode::new("urn:ok").unwrap(),
+    ))]];
+    assert_eq!(eager(&snap, &q_ok, &opts()).unwrap(), want);
+    assert_eq!(streamed(&snap, &q_ok, &opts(), &strict(1)).unwrap().0, want);
+}
+
+/// A head-first response with an incomplete > 4 KiB head token delivered across chunks
+/// streams its first solution immediately once the token closes and `"results"` + row 1
+/// arrive, without blocking on the rest of the open HTTP body.
+#[test]
+fn strict_service_streams_first_row_after_chunked_large_head_with_open_body() {
+    let s = store();
+    let snap = s.snapshot();
+    let gate = Arc::new(Gate::default());
+    let g = gate.clone();
+
+    let mut chunk1 = br#"{"head":{"links":[""#.to_vec();
+    chunk1.extend(std::iter::repeat_n(b'a', 5_000));
+    let chunk2 =
+        br#"","b"],"vars":["s"]},"results":{"bindings":[{"s":{"type":"uri","value":"urn:first"}}"#
+            .to_vec();
+    let chunk3 = br#"]}}"#.to_vec();
+
+    let ep = Endpoint::start(Arc::new(move || {
+        (
+            200,
+            vec![
+                Part::Bytes(chunk1.clone()),
+                Part::Bytes(chunk2.clone()),
+                Part::Wait(g.clone()),
+                Part::Bytes(chunk3.clone()),
+            ],
+        )
+    }));
+    let q = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep.url);
+    let qopts = QueryOptions {
+        timeout: Some(Duration::from_secs(3)),
+        ..opts()
+    };
+    let mut cursor = select_cursor(snap, &q, &qopts, &strict(1)).unwrap();
+    let batch = cursor
+        .next_batch()
+        .expect("first row must arrive before the endpoint closes or sends more body")
+        .expect("first row present");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch.row(0).unwrap().values(),
+        &[Some(Term::NamedNode(
+            oxrdf::NamedNode::new("urn:first").unwrap()
+        ))]
+    );
+    gate.open();
+    assert!(cursor.next_batch().unwrap().is_none());
+}
+
+/// A head-first response with an incomplete > 4 KiB number in a `head` extension member
+/// streams its first solution immediately once the number ends and `"results"` + row 1
+/// arrive, without blocking on the rest of the open HTTP body.
+#[test]
+fn strict_service_streams_first_row_after_chunked_large_head_number_with_open_body() {
+    let s = store();
+    let snap = s.snapshot();
+    let gate = Arc::new(Gate::default());
+    let g = gate.clone();
+
+    let mut chunk1 = br#"{"head":{"ext":1"#.to_vec();
+    chunk1.extend(std::iter::repeat_n(b'9', 5_000));
+    let chunk2 =
+        br#","vars":["s"]},"results":{"bindings":[{"s":{"type":"uri","value":"urn:first-num"}}"#
+            .to_vec();
+    let chunk3 = br#"]}}"#.to_vec();
+
+    let ep = Endpoint::start(Arc::new(move || {
+        (
+            200,
+            vec![
+                Part::Bytes(chunk1.clone()),
+                Part::Bytes(chunk2.clone()),
+                Part::Wait(g.clone()),
+                Part::Bytes(chunk3.clone()),
+            ],
+        )
+    }));
+    let q = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep.url);
+    let qopts = QueryOptions {
+        timeout: Some(Duration::from_secs(3)),
+        ..opts()
+    };
+    let mut cursor = select_cursor(snap, &q, &qopts, &strict(1)).unwrap();
+    let batch = cursor
+        .next_batch()
+        .expect("first row must arrive before the endpoint closes or sends more body")
+        .expect("first row present");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch.row(0).unwrap().values(),
+        &[Some(Term::NamedNode(
+            oxrdf::NamedNode::new("urn:first-num").unwrap()
+        ))]
+    );
+    gate.open();
+    assert!(cursor.next_batch().unwrap().is_none());
 }

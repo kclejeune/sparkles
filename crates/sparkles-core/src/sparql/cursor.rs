@@ -35,6 +35,7 @@ pub use graph::{GraphBatch, GraphCursor, graph_cursor};
 pub(super) use joinspill::row_hash;
 mod merge;
 mod pathsearch;
+mod propertyfn;
 mod ripple;
 mod service;
 mod spatial;
@@ -3479,8 +3480,11 @@ enum State {
     IndexTopK(Box<topk::IndexTopK>),
     /// A vector search below ORDER BY DESC(...) LIMIT k, with a generic scan fallback.
     VectorOrder(Box<topk::VectorOrder>),
-    /// A SERVICE without SILENT, read from its endpoint a batch at a time.
+    /// A SERVICE leaf (both streaming non-SILENT and budget-buffered SILENT).
     Service(Box<service::Service>),
+    /// A leaf ARQ property function (`Kind::PropertyFn` without plan inputs), streamed
+    /// under the memory budget.
+    PropertyFn(Box<propertyfn::PropertyFn>),
     /// A text search without a limit, which holds its hits and decodes rows from them.
     Text(Box<text::Text>),
     /// A history query without a limit or input, read a page of whole commits at a time.
@@ -4120,8 +4124,10 @@ impl Operator {
         let index_topk = matches!(node.kind, Kind::OrderedTopK(_));
         // A vector ORDER BY search serves top-k from the vector index or falls back to its scan child.
         let vector_order = topk::vector_order_eligible(&node);
-        // A SERVICE without SILENT reads its endpoint's answer as it arrives.
+        // A SERVICE leaf (streaming when non-SILENT, budget-buffered when SILENT).
         let service_reader = service::eligible(&node);
+        // A leaf ARQ property function streams its rows under the memory budget.
+        let propertyfn_reader = propertyfn::eligible(&node);
         // A text search without a limit holds its hits and decodes rows as they are read.
         let text_reader = text::eligible(&node);
         // A history query without a limit holds a page of its changes at a time.
@@ -4146,6 +4152,7 @@ impl Operator {
             && !index_topk
             && !vector_order
             && !service_reader
+            && !propertyfn_reader
             && !text_reader
             && !history_reader
             && !path_reader
@@ -4345,6 +4352,7 @@ impl Operator {
             || whole_input
             || exists
             || service_reader
+            || propertyfn_reader
             || text_reader
             || history_reader
             || path_reader
@@ -4411,6 +4419,8 @@ impl Operator {
             }
         }
         let heap = native_blocking && !materializes && topk::eligible(ctx, &node);
+        let silent_service =
+            service_reader && matches!(node.kind, Kind::Service { silent: true, .. });
         let reason = (materializes
             || native_blocking
             || exists
@@ -4418,6 +4428,8 @@ impl Operator {
             || vector_order
             || run_group
             || whole_input
+            || silent_service
+            || propertyfn_reader
             || text_reader
             || history_reader
             || path_reader
@@ -4429,6 +4441,13 @@ impl Operator {
                 if view_reader {
                     format!(
                         "{} reads the view's immutable shared version a batch at a time under the memory budget",
+                        node.operator()
+                    )
+                } else if silent_service {
+                    service::SILENT_REASON.to_string()
+                } else if propertyfn_reader {
+                    format!(
+                        "{} streams solutions from its arguments or the index under the memory budget",
                         node.operator()
                     )
                 } else if history_reader {
@@ -4551,6 +4570,8 @@ impl Operator {
             State::Filter(Box::new(filter::Filter::new(node)))
         } else if service_reader {
             State::Service(Box::new(service::Service::new(ctx, &node, fallback)))
+        } else if propertyfn_reader {
+            State::PropertyFn(Box::new(propertyfn::PropertyFn::new(node)))
         } else if text_reader {
             State::Text(Box::new(text::Text::new(node)))
         } else if history_reader {
@@ -4766,6 +4787,7 @@ impl Operator {
             State::Binary(binary) => binary.release_working_sets(),
             State::Ripple(ripple) => ripple.release_working_sets(),
             State::Service(service) => service.release(),
+            State::PropertyFn(pf) => pf.release(),
             State::Text(text) => text.release(),
             State::History(history) => history.release(),
             State::IndexTopK(topk) => topk.release(),
@@ -5480,6 +5502,11 @@ impl Operator {
                 State::Service(service) => {
                     let b = service.next(ctx, options, cap)?;
                     self.done = service.done();
+                    b
+                }
+                State::PropertyFn(pf) => {
+                    let b = pf.next(ctx, cap)?;
+                    self.done = pf.done();
                     b
                 }
                 State::Text(text) => {
@@ -6562,14 +6589,42 @@ mod tests {
 
     #[test]
     fn callback_guard_cursor_still_checks_other_exists_patterns_for_materialization() {
-        let (cursor, opens) = unconfigured_cursor(
-            "SELECT ?b WHERE {
-                BIND(COALESCE(
-                    EXISTS { <urn:s> <urn:callback> ?x },
-                    EXISTS { SERVICE SILENT <urn:remote> { ?s <urn:p> ?o } }
-                ) AS ?b)
-            }",
-            None,
+        use super::super::callback_guard_tests::{prepare_unconfigured, unconfigured};
+        #[derive(Debug)]
+        struct LegacyViews;
+        impl super::super::viewsvc::ViewSource for LegacyViews {
+            fn read_view(
+                &self,
+                _: &super::super::viewsvc::ViewRead<'_>,
+            ) -> Result<super::super::viewsvc::ViewRows> {
+                unreachable!("the strict cursor refuses the legacy view before reading it")
+            }
+        }
+        let query = "SELECT ?b WHERE {
+            BIND(COALESCE(
+                EXISTS { <urn:s> <urn:callback> ?x },
+                EXISTS { SERVICE <urn:x-sparkles:view#read> { [] <urn:x-sparkles:view#name> \"v\" ; <urn:x-sparkles:view#bind> ?y } }
+            ) AS ?b)
+        }";
+        let parsed = super::super::parse_query(query, None, &[]).unwrap();
+        let (mut ctx, opens) = unconfigured();
+        ctx.views = Some(Arc::new(LegacyViews));
+        let prepared = prepare_unconfigured(&parsed, ctx, true);
+        let levels = prepared.plan_depth;
+        let cursor = from_prepared(
+            prepared,
+            &parsed,
+            query,
+            &QueryOptions::default(),
+            &CursorOptions {
+                fallback: FallbackPolicy::RejectMaterialization,
+                ..Default::default()
+            },
+            Instant::now(),
+            0.0,
+            0.0,
+            levels,
+            QueryKind::Select,
         );
         assert!(
             matches!(cursor, Err(Error::Unsupported(message)) if message.starts_with("cursor requires materialization at Bind"))
@@ -10698,6 +10753,17 @@ mod retained_variable_tests {
         use crate::io::Source;
         use crate::store::{Store, StoreOptions};
 
+        #[derive(Debug)]
+        struct LegacyViews;
+        impl super::super::viewsvc::ViewSource for LegacyViews {
+            fn read_view(
+                &self,
+                _: &super::super::viewsvc::ViewRead<'_>,
+            ) -> Result<super::super::viewsvc::ViewRows> {
+                unreachable!("the untaken legacy view EXISTS is never evaluated")
+            }
+        }
+
         let store = Store::in_memory(StoreOptions::default());
         store
             .load(&[Source::from_bytes(
@@ -10708,15 +10774,19 @@ mod retained_variable_tests {
             .unwrap();
         let query = "ASK { ?s <urn:p> ?o
             FILTER(IF(true, true,
-                EXISTS { SERVICE SILENT <urn:unused> { ?s <urn:p> ?o } }
+                EXISTS { SERVICE <urn:x-sparkles:view#read> { [] <urn:x-sparkles:view#name> \"v\" ; <urn:x-sparkles:view#bind> ?v } }
                 || EXISTS { { ?s <urn:p> ?y FILTER(isIRI(?y)) } UNION { ?s <urn:q> ?y } }
             )) }";
+        let opts = QueryOptions {
+            views: Some(Arc::new(LegacyViews)),
+            ..Default::default()
+        };
         for mode in [ExecutionMode::Streaming, ExecutionMode::Auto] {
             EXISTS_PLANS_BUILT.with(|n| n.set(0));
             let execution = query_execution_with_plan(
                 store.snapshot(),
                 query,
-                &QueryOptions::default(),
+                &opts,
                 &CursorOptions::default(),
                 mode,
             )

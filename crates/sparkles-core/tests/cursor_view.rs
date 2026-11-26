@@ -834,12 +834,17 @@ fn reduced_rebuild_preserves_multiplicity_and_commit() {
 }
 
 #[test]
-fn rebuilt_view_inherits_strict_fallback_and_reports_permissive_child() {
+fn rebuilt_view_streams_leaf_property_function_natively_and_reports_child_plan() {
     let s = Store::in_memory(StoreOptions::default());
     let rt = runtime(&s);
-    rt.put(&s, "split", ViewDef::table(
-        "PREFIX apf: <http://jena.apache.org/ARQ/property#> SELECT ?x { ?x apf:strSplit ('one,two' ',') }",
-    )).unwrap();
+    rt.put(
+        &s,
+        "split",
+        ViewDef::table(
+            "PREFIX apf: <http://jena.apache.org/ARQ/property#> SELECT ?x { ?x apf:strSplit ('one,two' ',') }",
+        ),
+    )
+    .unwrap();
     rt.round(&s);
     let q =
         format!("{P}SELECT ?x {{ SERVICE view:read {{ [] view:name \"split\" ; view:bind ?x }} }}");
@@ -849,15 +854,21 @@ fn rebuilt_view_inherits_strict_fallback_and_reports_permissive_child() {
         ..Default::default()
     };
     let snap = s.snapshot();
-    let mut c = select_cursor(snap.clone(), &q, &opts, &strict(1)).unwrap();
-    assert!(matches!(c.next_batch(), Err(Error::Unsupported(s)) if s.contains("materialization")));
-    let permissive = CursorOptions {
-        fallback: FallbackPolicy::AllowMaterialization,
-        ..strict(1)
-    };
-    let mut c = select_cursor(snap, &q, &opts, &permissive).unwrap();
-    assert_eq!(c.next_batch().unwrap().unwrap().len(), 1);
-    assert!(c.plan().has_materialization());
+    let expected = eager_rows(&snap, &q, &opts);
+    let mut c = select_cursor(snap, &q, &opts, &strict(1)).unwrap();
+    let mut got = Vec::new();
+    while let Some(b) = c.next_batch().unwrap() {
+        for i in 0..b.len() {
+            got.push(b.row(i).unwrap().values().to_vec());
+        }
+    }
+    assert_eq!(bag(got), bag(expected));
+    assert!(!c.plan().has_materialization());
+    assert!(
+        !c.plan().children.is_empty(),
+        "rebuilt view must attach its child plan: {:#?}",
+        c.plan()
+    );
 }
 
 #[test]

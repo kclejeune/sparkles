@@ -306,12 +306,11 @@ fn path_and_vector_cursors_enforce_memory_cancellation_and_timeout() {
     }
 }
 
-/// Decision Q-SVC1: `SERVICE SILENT` must buffer the entire remote answer before emitting
-/// its first row (to replace any mid-stream error with a single empty solution), so
-/// `RejectMaterialization` refuses it while `AllowMaterialization` matches eager error
-/// suppression identically.
+/// Native `SERVICE SILENT` buffers its answer under the memory budget so any remote or
+/// local endpoint error (including mid-stream failures) is suppressed into a single empty
+/// binding, matching eager execution with zero materialization under `RejectMaterialization`.
 #[test]
-fn silent_service_respects_decision_q_svc1_and_error_suppression_parity() {
+fn silent_service_runs_natively_and_preserves_error_suppression_parity() {
     #[derive(Debug)]
     struct FailingLocal;
     impl LocalEndpoints for FailingLocal {
@@ -330,20 +329,6 @@ fn silent_service_respects_decision_q_svc1_and_error_suppression_parity() {
     };
     let q = "SELECT ?s ?o { SERVICE SILENT <http://broken/sparql> { ?s <urn:p> ?o } }";
 
-    // Strict policy refuses SILENT SERVICE by decision Q-SVC1.
-    let strict = CursorOptions {
-        fallback: FallbackPolicy::RejectMaterialization,
-        ..Default::default()
-    };
-    let err = select_cursor(snap.clone(), q, &opts, &strict)
-        .err()
-        .expect("SILENT SERVICE must be refused under RejectMaterialization");
-    assert!(
-        matches!(err, Error::Unsupported(ref m) if m.contains("materialization at Service")),
-        "unexpected error: {err:?}"
-    );
-
-    // Permissive policy matches eager error suppression (one empty binding).
     let eager = query(snap.clone(), q, &opts).unwrap();
     let expected = bag(eager
         .rows()
@@ -353,14 +338,25 @@ fn silent_service_respects_decision_q_svc1_and_error_suppression_parity() {
         .collect());
     assert_eq!(expected.len(), 1);
 
-    let mut c = select_cursor(snap, q, &opts, &CursorOptions::default()).unwrap();
-    let mut rows = Vec::new();
-    while let Some(batch) = c.next_batch().unwrap() {
-        for i in 0..batch.len() {
-            rows.push(batch.row(i).unwrap().values().to_vec());
+    // Strict policy runs SILENT SERVICE natively without eager fallback.
+    for batch_rows in [1, 2, 4096] {
+        let strict = CursorOptions {
+            batch_rows,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let mut c = select_cursor(snap.clone(), q, &opts, &strict)
+            .expect("SILENT SERVICE must run natively under RejectMaterialization");
+        assert!(!c.plan().has_materialization());
+        let mut rows = Vec::new();
+        while let Some(batch) = c.next_batch().unwrap() {
+            for i in 0..batch.len() {
+                rows.push(batch.row(i).unwrap().values().to_vec());
+            }
         }
+        assert!(!c.plan().has_materialization());
+        assert_eq!(bag(rows), expected, "batch_rows={batch_rows}");
     }
-    assert_eq!(bag(rows), expected);
 }
 
 /// Regression for S4 & S5:
