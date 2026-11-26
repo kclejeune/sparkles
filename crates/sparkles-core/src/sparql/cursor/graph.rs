@@ -417,6 +417,10 @@ impl GraphCursor {
     pub fn reasoning(&self) -> Option<Arc<crate::sparql::reasoning::Applied>> {
         self.where_cursor.reasoning()
     }
+    /// Whether this cursor's query calls a graph algorithm.
+    pub fn uses_algorithms(&self) -> bool {
+        self.where_cursor.uses_algorithms()
+    }
     pub fn deadline(&self) -> Option<Instant> {
         self.where_cursor.deadline()
     }
