@@ -2148,6 +2148,40 @@ impl Ctx {
         }
     }
 
+    /// Retain `bytes` of query-local state by transferring already-admitted credit out of
+    /// `source` without releasing it back to the pool first. Any excess above `bytes`
+    /// stays on `source` to be released once temporary growth buffers have freed.
+    fn retain_from_charge(&self, bytes: u64, source: &Charge<'_>) {
+        if bytes == 0 {
+            return;
+        }
+        debug_assert!(source.belongs_to(self));
+        debug_assert!(source.bytes() >= bytes);
+        let mut owner = self.retained.charge.grow.lock();
+        let used = self.retained.used.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        let reserved = self.retained.charge.reserved.load(Ordering::Acquire);
+        let transfer = used.saturating_sub(reserved).min(bytes);
+        if transfer > 0 {
+            let id = source.owner.get();
+            debug_assert!(
+                owner.is_none() || id.is_none() || *owner == id,
+                "one owner of a reservation"
+            );
+            if owner.is_none() {
+                *owner = id;
+            }
+            let remaining = source.bytes.get() - transfer;
+            source.bytes.set(remaining);
+            if remaining == 0 {
+                source.disarm();
+            }
+            self.retained
+                .charge
+                .reserved
+                .store(reserved + transfer, Ordering::Release);
+        }
+    }
+
     /// Charge `bytes` more of query-local terms and memos, which stay until the context
     /// drops, in both accounting modes. Infallible expression interning must not turn a
     /// resource failure into an ordinary unbound BIND, so a refusal is recorded and fails
@@ -2820,17 +2854,41 @@ impl Ctx {
         };
         let (id, _) = local.insert(key);
         let after = local.physical_bytes();
-        drop(growth_charge);
         let retain_delta = after.saturating_sub(covered);
         if retain_delta > 0 {
-            if !self.retain_bytes(retain_delta) {
-                return Err(self.check_memory_failure().err().unwrap_or_else(|| {
-                    self.memory_exceeded(self.live_bytes().saturating_add(retain_delta))
-                }));
+            let from_source = growth_charge
+                .as_ref()
+                .map_or(0, |charge| charge.bytes().min(retain_delta));
+            if from_source > 0 {
+                self.retain_from_charge(
+                    from_source,
+                    growth_charge
+                        .as_ref()
+                        .expect("pre-admitted growth charge for retained transfer"),
+                );
+            }
+            let rem = retain_delta - from_source;
+            debug_assert_eq!(
+                rem, 0,
+                "insert_peak_bytes must cover post-insert physical_bytes"
+            );
+            if rem > 0 {
+                drop(growth_charge);
+                if !self.retain_bytes(rem) {
+                    self.local_retained
+                        .store(covered.saturating_add(from_source), Ordering::Release);
+                    return Err(self.check_memory_failure().err().unwrap_or_else(|| {
+                        self.memory_exceeded(self.live_bytes().saturating_add(rem))
+                    }));
+                }
+                self.local_retained
+                    .store(covered.saturating_add(retain_delta), Ordering::Release);
+                return Ok(Id::local(id));
             }
             self.local_retained
                 .store(covered.saturating_add(retain_delta), Ordering::Release);
         }
+        drop(growth_charge);
         Ok(Id::local(id))
     }
 
@@ -5796,6 +5854,69 @@ mod charge_tests {
         drop((ctx1, ctx2));
         assert_eq!(accepted.load(Ordering::SeqCst), 0);
         drop((g1, g2));
+        assert_eq!(pool.granted(), 0);
+    }
+
+    /// Checked local-vocabulary insertion transfers the retained portion of its
+    /// pre-admitted growth charge directly into `self.retained` before releasing the
+    /// transient excess, so a contending waiter on the shared `QueryPool` cannot steal
+    /// the retained granules during handoff and leave an inserted entry unaccounted.
+    #[test]
+    fn intern_key_checked_transfers_retained_credit_without_pool_release() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(48 * MIB);
+        let grant = Arc::new(pool.try_grant(16 * MIB).unwrap());
+        let other = pool.try_grant(24 * MIB).unwrap();
+        let mut ctx = pooled(&store, &grant);
+        ctx.mem_limit = 64 * MIB;
+        ctx.enable_cursor_accounting().unwrap();
+
+        let ticket_slot: Arc<parking_lot::Mutex<Option<super::super::pool::Ticket>>> =
+            Default::default();
+        let stolen: Arc<parking_lot::Mutex<Option<super::super::pool::PoolGrant>>> =
+            Default::default();
+        let ticket_for_wake = ticket_slot.clone();
+        let stolen_for_wake = stolen.clone();
+        let ticket = pool.enter(
+            8 * MIB,
+            Some(Arc::new(move || {
+                if let Some(ticket) = ticket_for_wake.lock().as_mut()
+                    && let Some(g) = ticket.poll()
+                {
+                    *stolen_for_wake.lock() = Some(g);
+                }
+            })),
+        );
+        *ticket_slot.lock() = Some(ticket);
+
+        // `growth_charge` grows `grant` from 16 MiB to 24 MiB (consuming the last 8 MiB
+        // of the 48 MiB pool while staying within the 24 MiB waiting-pool half share).
+        // If `growth_charge` were dropped before retaining the 22 MiB entry, `grant`
+        // would trim back to 16 MiB, wake the 8 MiB waiter synchronously, and fail the
+        // subsequent `retain_bytes` call with `ServerMemory`.
+        let key = vec![b'k'; (22 * MIB) as usize];
+        let id = ctx
+            .intern_key_checked(&key)
+            .expect("retained credit must stay pinned across handoff under pool contention");
+        assert_eq!(id.tag(), Tag::Local);
+        assert!(
+            stolen.lock().is_none(),
+            "retained granules must not be released to a contending pool waiter"
+        );
+        let physical = ctx.local.read().physical_bytes();
+        assert_eq!(ctx.local_retained.load(Ordering::Acquire), physical);
+        assert!(
+            ctx.live_bytes() >= physical,
+            "live bytes ({}) must cover retained local vocabulary ({physical})",
+            ctx.live_bytes()
+        );
+
+        drop(ticket_slot.lock().take());
+        drop(stolen.lock().take());
+        drop(other);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+        drop(grant);
         assert_eq!(pool.granted(), 0);
     }
 }

@@ -1944,8 +1944,8 @@ fn eager_service_refuses_escaped_token_scratch_and_late_buffered_bindings() {
     );
 
     // 2. 10,000 empty bindings occupy ~30 KiB on the wire (raw staging fits easily in
-    // 128 KiB), while `sparesults` buffers ~469+ KiB of `(Vec<String>, Vec<Term>)` pairs
-    // alongside the replay cursor.
+    // 256 KiB, and a single 4 KiB read's allowance is ~172 KiB), while `sparesults`
+    // buffers ~1 MiB of `(Vec<String>, Vec<Term>)` pairs alongside the replay cursor.
     let bindings = vec!["{}"; 10_000].join(",");
     let late_empty =
         format!(r#"{{"results":{{"bindings":[{bindings}]}},"head":{{"vars":["s"]}}}}"#)
@@ -1956,13 +1956,55 @@ fn eager_service_refuses_escaped_token_scratch_and_late_buffered_bindings() {
     }));
     let q_late = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_late.url);
     let tight_late = QueryOptions {
-        max_memory_bytes: Some(128 << 10),
+        max_memory_bytes: Some(256 << 10),
         ..opts()
     };
     let err = eager(&snap, &q_late, &tight_late).unwrap_err();
     assert!(
         matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
         "expected Memory BudgetExceeded for eager late-head buffered bindings, got {err:?}"
+    );
+
+    // 3. A tiny (< 100 B) complete late-head response succeeds under a 128 KiB eager
+    // budget instead of failing before its EOF check read.
+    let tiny_late =
+        br#"{"results":{"bindings":[{"s":{"type":"uri","value":"urn:tiny"}}]},"head":{"vars":["s"]}}"#
+            .to_vec();
+    let ep_tiny = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(tiny_late.clone())])
+    }));
+    let q_tiny = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_tiny.url);
+    let tight_tiny = QueryOptions {
+        max_memory_bytes: Some(128 << 10),
+        ..opts()
+    };
+    assert_eq!(
+        eager(&snap, &q_tiny, &tight_tiny).unwrap(),
+        vec![vec![Some(Term::NamedNode(
+            oxrdf::NamedNode::new("urn:tiny").unwrap()
+        ))]]
+    );
+
+    // 4. An escape after an 18,000-byte literal prefix in a comma-preceded second link
+    // refuses under an 84 KiB eager budget (covering separator skipping and
+    // non-power-of-two initial String growth).
+    let prefix_escaped = format!(
+        r#"{{"head":{{"links":["ok","{}\""],"vars":["s"]}},"results":{{"bindings":[]}}}}"#,
+        "p".repeat(18_000)
+    )
+    .into_bytes();
+    let ep_prefix = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(prefix_escaped.clone())])
+    }));
+    let q_prefix = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_prefix.url);
+    let tight_prefix = QueryOptions {
+        max_memory_bytes: Some(84 << 10),
+        ..opts()
+    };
+    let err = eager(&snap, &q_prefix, &tight_prefix).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+        "expected Memory BudgetExceeded for comma-preceded long-prefix escaped link, got {err:?}"
     );
 }
 
@@ -2054,6 +2096,55 @@ fn strict_service_streams_first_row_after_chunked_large_head_with_open_body() {
         batch.row(0).unwrap().values(),
         &[Some(Term::NamedNode(
             oxrdf::NamedNode::new("urn:first").unwrap()
+        ))]
+    );
+    gate.open();
+    assert!(cursor.next_batch().unwrap().is_none());
+}
+
+/// A head-first response with an incomplete > 4 KiB number in a `head` extension member
+/// streams its first solution immediately once the number ends and `"results"` + row 1
+/// arrive, without blocking on the rest of the open HTTP body.
+#[test]
+fn strict_service_streams_first_row_after_chunked_large_head_number_with_open_body() {
+    let s = store();
+    let snap = s.snapshot();
+    let gate = Arc::new(Gate::default());
+    let g = gate.clone();
+
+    let mut chunk1 = br#"{"head":{"ext":1"#.to_vec();
+    chunk1.extend(std::iter::repeat_n(b'9', 5_000));
+    let chunk2 =
+        br#","vars":["s"]},"results":{"bindings":[{"s":{"type":"uri","value":"urn:first-num"}}"#
+            .to_vec();
+    let chunk3 = br#"]}}"#.to_vec();
+
+    let ep = Endpoint::start(Arc::new(move || {
+        (
+            200,
+            vec![
+                Part::Bytes(chunk1.clone()),
+                Part::Bytes(chunk2.clone()),
+                Part::Wait(g.clone()),
+                Part::Bytes(chunk3.clone()),
+            ],
+        )
+    }));
+    let q = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep.url);
+    let qopts = QueryOptions {
+        timeout: Some(Duration::from_secs(3)),
+        ..opts()
+    };
+    let mut cursor = select_cursor(snap, &q, &qopts, &strict(1)).unwrap();
+    let batch = cursor
+        .next_batch()
+        .expect("first row must arrive before the endpoint closes or sends more body")
+        .expect("first row present");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch.row(0).unwrap().values(),
+        &[Some(Term::NamedNode(
+            oxrdf::NamedNode::new("urn:first-num").unwrap()
         ))]
     );
     gate.open();

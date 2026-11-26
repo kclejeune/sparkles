@@ -147,6 +147,31 @@ fn vec_growth_peak(cur_cap: usize, next_len: usize) -> u64 {
     }
 }
 
+fn skip_json_ws(mut slice: &[u8]) -> &[u8] {
+    while let Some((&b, rest)) = slice.split_first() {
+        if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
+            slice = rest;
+        } else {
+            break;
+        }
+    }
+    slice
+}
+
+fn parse_hex4(bytes: &[u8]) -> Option<u32> {
+    let mut val = 0u32;
+    for &b in bytes {
+        let digit = match b {
+            b'0'..=b'9' => (b - b'0') as u32,
+            b'a'..=b'f' => (b - b'a' + 10) as u32,
+            b'A'..=b'F' => (b - b'A' + 10) as u32,
+            _ => return None,
+        };
+        val = (val << 4) | digit;
+    }
+    Some(val)
+}
+
 /// Conservative peak heap scratch `LowLevelJsonParser::parse_next` may allocate while
 /// decoding the next token in `slice` (an owned `String` when a JSON string contains an
 /// escape sequence or invalid UTF-8 bytes).
@@ -154,81 +179,210 @@ fn lexer_token_scratch(mut slice: &[u8], allow_bom: bool) -> u64 {
     if allow_bom && slice.starts_with(&[0xEF, 0xBB, 0xBF]) {
         slice = &slice[3..];
     }
-    while let Some((&b, rest)) = slice.split_first() {
-        if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
-            slice = rest;
-        } else {
-            break;
-        }
+    slice = skip_json_ws(slice);
+    // `LowLevelJsonParser::parse_next` loops past a single `:` or `,` separator and
+    // decodes the following value or key in the same call.
+    if matches!(slice.first(), Some(b':' | b',')) {
+        slice = skip_json_ws(&slice[1..]);
     }
     if slice.first() != Some(&b'"') {
         return 0;
     }
-    let mut escaped = false;
     let mut has_escape = false;
     let mut has_non_ascii = false;
-    let mut token_len = 0usize;
-    for (idx, &b) in slice[1..].iter().enumerate() {
-        token_len = idx + 1;
-        if escaped {
-            escaped = false;
-            continue;
-        }
+    let mut decoded = 0usize;
+    let mut i = 1usize;
+    while i < slice.len() {
+        let b = slice[i];
         if b == b'\\' {
-            escaped = true;
             has_escape = true;
+            i += 1;
+            if i >= slice.len() {
+                break;
+            }
+            match slice[i] {
+                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                    decoded = decoded.saturating_add(1);
+                    i += 1;
+                }
+                b'u' => {
+                    i += 1;
+                    if i + 4 > slice.len() {
+                        break;
+                    }
+                    let cp = parse_hex4(&slice[i..i + 4]);
+                    i += 4;
+                    if let Some(cp) = cp
+                        && char::from_u32(cp).is_none()
+                    {
+                        // Surrogate code unit: `read_string` consumes 6 more bytes and
+                        // pushes at most one 4-byte UTF-8 character.
+                        if i + 6 > slice.len() {
+                            break;
+                        }
+                        i += 6;
+                        decoded = decoded.saturating_add(4);
+                    } else {
+                        // Single BMP scalar or invalid hex -> `U+FFFD` (at most 3 bytes).
+                        decoded = decoded.saturating_add(3);
+                    }
+                }
+                _ => {
+                    // Unrecognized 2-byte escape pushes `U+FFFD` (3 UTF-8 bytes).
+                    decoded = decoded.saturating_add(3);
+                    i += 1;
+                }
+            }
         } else if b == b'"' {
             break;
         } else if !b.is_ascii() {
             has_non_ascii = true;
+            decoded = decoded.saturating_add(3);
+            i += 1;
+        } else {
+            decoded = decoded.saturating_add(1);
+            i += 1;
         }
     }
     if !has_escape && !has_non_ascii {
         return 0;
     }
-    let decoded = if has_non_ascii {
-        token_len.saturating_mul(3)
+    // `String::new(); string.push_str(prefix)` allocates `prefix.len()` without rounding
+    // to a power of two; a subsequent push can double `old_cap` to `2 * old_cap`, giving
+    // an old + new reallocation peak bounded by `3 * decoded + 16`. When `has_escape`
+    // and `has_non_ascii` both hold, an owned `from_utf8_lossy` chunk buffer can coexist
+    // with `string` during `push_str`, bounded by `4 * decoded + 24`.
+    let decoded = decoded as u64;
+    if has_escape && has_non_ascii {
+        decoded.saturating_mul(4).saturating_add(24)
     } else {
-        token_len
-    };
-    let cap = decoded.checked_next_power_of_two().unwrap_or(decoded);
-    let string_peak = (cap as u64).saturating_add((cap / 2) as u64);
-    if has_non_ascii {
-        string_peak.saturating_add(cap as u64)
-    } else {
-        string_peak
+        decoded.saturating_mul(3).saturating_add(16)
     }
 }
 
-/// When `parse_next` returned `None` on an incomplete JSON string token with no unescaped
-/// closing quote yet, returns `Some(in_escape)` so `json_start` can keep reading chunks
-/// until an unescaped `"` arrives without either quadratic rescanning or extra blocking
-/// reads after the token closes.
-fn incomplete_string_escape_state(mut slice: &[u8], allow_bom: bool) -> Option<bool> {
-    if allow_bom && slice.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        slice = &slice[3..];
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NumberPhase {
+    AfterSign,
+    AfterZero,
+    IntDigits,
+    FracStart,
+    FracDigits,
+    ExpStart,
+    ExpSign,
+    ExpDigits,
+}
+
+impl NumberPhase {
+    /// Advance by one byte of `JsonLexer::read_number`. Returns `true` once this byte
+    /// terminates the number (either validly as a delimiter or as a syntax error).
+    fn advance(&mut self, b: u8) -> bool {
+        match (*self, b) {
+            (Self::AfterSign, b'0') => *self = Self::AfterZero,
+            (Self::AfterSign, b'1'..=b'9') => *self = Self::IntDigits,
+            (Self::AfterZero, b'.') => *self = Self::FracStart,
+            (Self::AfterZero, b'e' | b'E') => *self = Self::ExpStart,
+            (Self::IntDigits, b'0'..=b'9') => {}
+            (Self::IntDigits, b'.') => *self = Self::FracStart,
+            (Self::IntDigits, b'e' | b'E') => *self = Self::ExpStart,
+            (Self::FracStart, b'0'..=b'9') => *self = Self::FracDigits,
+            (Self::FracDigits, b'0'..=b'9') => {}
+            (Self::FracDigits, b'e' | b'E') => *self = Self::ExpStart,
+            (Self::ExpStart, b'+' | b'-') => *self = Self::ExpSign,
+            (Self::ExpStart, b'0'..=b'9') => *self = Self::ExpDigits,
+            (Self::ExpSign, b'0'..=b'9') => *self = Self::ExpDigits,
+            (Self::ExpDigits, b'0'..=b'9') => {}
+            _ => return true,
+        }
+        false
     }
-    while let Some((&b, rest)) = slice.split_first() {
-        if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
-            slice = rest;
-        } else {
-            break;
+}
+
+/// State of an incomplete JSON token in `json_start` after `parse_next` returned `None`.
+/// Advancing it on each newly read chunk avoids quadratic rescanning of long strings,
+/// numbers, or alphabetic runs while retrying `parse_next` immediately when the token
+/// closes.
+enum IncompleteToken {
+    String { escaped: bool, skip: u8 },
+    Number(NumberPhase),
+    AlphaRun,
+}
+
+impl IncompleteToken {
+    fn from_slice(mut slice: &[u8], allow_bom: bool) -> Option<Self> {
+        if allow_bom && slice.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            slice = &slice[3..];
+        }
+        slice = skip_json_ws(slice);
+        let (&first, rest) = slice.split_first()?;
+        match first {
+            b'"' => {
+                let mut token = Self::String {
+                    escaped: false,
+                    skip: 0,
+                };
+                if token.advance_slice(rest) {
+                    None
+                } else {
+                    Some(token)
+                }
+            }
+            b'-' | b'0'..=b'9' => {
+                let phase = match first {
+                    b'-' => NumberPhase::AfterSign,
+                    b'0' => NumberPhase::AfterZero,
+                    _ => NumberPhase::IntDigits,
+                };
+                let mut token = Self::Number(phase);
+                if token.advance_slice(rest) {
+                    None
+                } else {
+                    Some(token)
+                }
+            }
+            b't' | b'f' | b'n' => {
+                let expected_len = if first == b'f' { 5 } else { 4 };
+                if slice.len() >= expected_len && slice.iter().all(|b| b.is_ascii_alphabetic()) {
+                    Some(Self::AlphaRun)
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
-    if slice.first() != Some(&b'"') {
-        return None;
-    }
-    let mut escaped = false;
-    for &b in &slice[1..] {
-        if escaped {
-            escaped = false;
-        } else if b == b'\\' {
-            escaped = true;
-        } else if b == b'"' {
-            return None;
+
+    /// Advance over newly read bytes. Returns `true` as soon as the incomplete token
+    /// closes or hits a terminating/invalid byte so `parse_next` can retry immediately.
+    fn advance_slice(&mut self, bytes: &[u8]) -> bool {
+        match self {
+            Self::String { escaped, skip } => {
+                for &b in bytes {
+                    if *skip > 0 {
+                        *skip -= 1;
+                    } else if *escaped {
+                        *escaped = false;
+                        if b == b'u' {
+                            *skip = 4;
+                        }
+                    } else if b == b'\\' {
+                        *escaped = true;
+                    } else if b == b'"' {
+                        return true;
+                    }
+                }
+                false
+            }
+            Self::Number(phase) => {
+                for &b in bytes {
+                    if phase.advance(b) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Self::AlphaRun => bytes.iter().any(|b| !b.is_ascii_alphabetic()),
         }
     }
-    Some(escaped)
 }
 
 /// How much a JSON head keeps for each byte of it. The shortest variable, `"a",`, is
@@ -278,10 +432,19 @@ pub(super) fn json_start(
     charge: &mut StagingCharge,
     ctx: &Ctx,
 ) -> io::Result<Start> {
+    json_start_inner(body, charge, ctx).map(|(start, _)| start)
+}
+
+fn json_start_inner(
+    body: &mut dyn Read,
+    charge: &mut StagingCharge,
+    ctx: &Ctx,
+) -> io::Result<(Start, usize)> {
     let mut parser = LowLevelJsonParser::new();
     let mut bytes = Vec::new();
     let (mut at, mut ending) = (0usize, false);
     let (mut depth, mut in_head, mut vars, mut seen_token) = (0usize, false, false, false);
+    let mut incomplete_retries = 0usize;
     loop {
         let prev_at = at;
         if at < bytes.len() {
@@ -335,15 +498,18 @@ pub(super) fn json_start(
             },
         };
         if let Some(late) = decided {
-            return Ok(Start {
-                bytes,
-                decided: at,
-                late,
-                parser,
-                ending,
-                depth,
-                in_head,
-            });
+            return Ok((
+                Start {
+                    bytes,
+                    decided: at,
+                    late,
+                    parser,
+                    ending,
+                    depth,
+                    in_head,
+                },
+                incomplete_retries,
+            ));
         }
         // Compact consumed pure whitespace so a long whitespace prefix before the root
         // object or between tokens does not grow the lookahead buffer. Before the first
@@ -368,7 +534,10 @@ pub(super) fn json_start(
                 at = drop_from;
             }
         }
-        let mut string_escape = incomplete_string_escape_state(&bytes[at..], !seen_token);
+        if at < bytes.len() {
+            incomplete_retries += 1;
+        }
+        let mut incomplete = IncompleteToken::from_slice(&bytes[at..], !seen_token);
         loop {
             ctx.check().map_err(io::Error::other)?;
             let start = bytes.len();
@@ -394,21 +563,10 @@ pub(super) fn json_start(
             if ending {
                 break;
             }
-            let Some(escaped) = string_escape.as_mut() else {
+            let Some(token) = incomplete.as_mut() else {
                 break;
             };
-            let mut closed = false;
-            for &b in &bytes[start..] {
-                if *escaped {
-                    *escaped = false;
-                } else if b == b'\\' {
-                    *escaped = true;
-                } else if b == b'"' {
-                    closed = true;
-                    break;
-                }
-            }
-            if closed {
+            if token.advance_slice(&bytes[start..]) {
                 break;
             }
         }
@@ -554,20 +712,34 @@ fn read_late_json_inner(
         loop {
             ctx.check().map_err(io::Error::other)?;
             let cur = bytes.len();
-            let next_len = cur.checked_add(READ_STEP).ok_or_else(|| {
+            let cap = bytes.capacity();
+            let step = if cap > cur && cap - cur >= READ_STEP / 2 {
+                (cap - cur).min(READ_STEP)
+            } else {
+                READ_STEP
+            };
+            let next_len = cur.checked_add(step).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::OutOfMemory, "JSON response too large")
             })?;
-            let vec_peak = vec_growth_peak(bytes.capacity(), next_len);
-            let target = vec_peak
-                .saturating_add((next_len as u64).saturating_mul(buffered_factor()))
-                .saturating_add(SLACK);
-            if target > charge.bytes() {
-                charge.resize(target).map_err(io::Error::other)?;
+            // Pre-admit raw staging growth before `body.read`; size the buffered replay
+            // reserve against bytes actually received so a tiny complete response is not
+            // rejected before the read can observe EOF.
+            let vec_peak = vec_growth_peak(cap, next_len);
+            if vec_peak > charge.bytes() {
+                charge.resize(vec_peak).map_err(io::Error::other)?;
             }
             bytes.resize(next_len, 0);
             let n = body.read(&mut bytes[cur..])?;
             bytes.truncate(cur + n);
             ending = n == 0;
+            if n > 0 {
+                let replay_target = (bytes.capacity() as u64)
+                    .saturating_add((bytes.len() as u64).saturating_mul(buffered_factor()))
+                    .saturating_add(SLACK);
+                if replay_target > charge.bytes() {
+                    charge.resize(replay_target).map_err(io::Error::other)?;
+                }
+            }
             if ending || target_unparsed == 0 || bytes.len() - at >= target_unparsed {
                 break;
             }
@@ -852,13 +1024,13 @@ mod tests {
     }
 
     /// Eager late-head validation charges `sparesults`'s buffered bindings through replay,
-    /// refusing 10,000 empty bindings (~30 KiB wire, ~469 KiB buffered) under a 128 KiB
-    /// budget even though the raw vector fits.
+    /// refusing 10,000 empty bindings (~30 KiB wire, ~1 MiB buffered) under a 256 KiB
+    /// budget (above a single 4 KiB read's allowance) even though the raw vector fits.
     #[test]
     fn eager_late_json_reserves_buffered_bindings_through_replay() {
         let store = Store::in_memory(StoreOptions::default());
         let mut raw = Ctx::new(store.snapshot());
-        raw.mem_limit = 128 << 10;
+        raw.mem_limit = 256 << 10;
         let ctx = Arc::new(raw);
         ctx.attach_owner();
 
@@ -879,6 +1051,186 @@ mod tests {
             ),
             "late-head buffered bindings must refuse on eager memory budget"
         );
+    }
+
+    /// `lexer_token_scratch` pre-admits strings immediately following `,` or `:`,
+    /// non-power-of-two initial string growth when an escape follows a long ASCII prefix,
+    /// and 2 -> 3 byte `U+FFFD` expansion on invalid ASCII escapes.
+    #[test]
+    fn eager_json_probe_pre_admits_separator_prefix_and_invalid_escape_scratch() {
+        let store = Store::in_memory(StoreOptions::default());
+
+        // 1. Comma-preceded second link in the first 4 KiB chunk (~3 KiB escaped string
+        // plus 4 KiB staging vector exceeds a 6 KiB budget).
+        {
+            let mut raw = Ctx::new(store.snapshot());
+            raw.mem_limit = 6 << 10;
+            let ctx = Arc::new(raw);
+            ctx.attach_owner();
+
+            let escaped = format!(r#"\"{}"#, "a".repeat(3_000));
+            let payload = format!(
+                r#"{{"head":{{"links":["ok","{escaped}"],"vars":["s"]}},"results":{{"bindings":[]}}}}"#
+            );
+            assert!(payload.len() < READ_STEP);
+            let mut cur = io::Cursor::new(payload.as_bytes());
+            let mut staging = eager_charge(&ctx).unwrap();
+            let err = json_start(&mut cur, &mut staging, &ctx).err().unwrap();
+            assert!(
+                matches!(
+                    crate::codec::io_error(err),
+                    Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
+                ),
+                "comma-preceded escaped string in first chunk must refuse on memory budget"
+            );
+        }
+
+        // 2. Colon-preceded invalid UTF-8 object value in a single-chunk late-head body.
+        {
+            let mut raw = Ctx::new(store.snapshot());
+            raw.mem_limit = 16 << 10;
+            let ctx = Arc::new(raw);
+            ctx.attach_owner();
+
+            let mut payload =
+                br#"{"results":{"bindings":[{"s":{"type":"literal","value":""#.to_vec();
+            payload.extend(std::iter::repeat_n(0xFFu8, 3_500));
+            payload.extend_from_slice(br#""}}]},"head":{"vars":["s"]}}"#);
+            assert!(payload.len() < READ_STEP);
+            let mut cur = io::Cursor::new(payload.as_slice());
+            let mut staging = eager_charge(&ctx).unwrap();
+            let start = json_start(&mut cur, &mut staging, &ctx).unwrap();
+            assert!(start.late);
+            let err = read_late_json(start, &mut cur, &mut staging, &ctx).unwrap_err();
+            assert!(
+                matches!(
+                    crate::codec::io_error(err),
+                    Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
+                ),
+                "colon-preceded invalid UTF-8 string must refuse on memory budget"
+            );
+        }
+
+        // 3. 18,000-byte ASCII prefix before an escaped quote allocates 18,000 B then
+        // doubles to 36,000 B (54,000 B growth peak + 32,768 B staging = 86,768 B > 84 KiB).
+        {
+            let mut raw = Ctx::new(store.snapshot());
+            raw.mem_limit = 84 << 10;
+            let ctx = Arc::new(raw);
+            ctx.attach_owner();
+
+            let escaped = format!(r#"{}\""#, "a".repeat(18_000));
+            let payload = format!(
+                r#"{{"head":{{"links":["{escaped}"],"vars":["s"]}},"results":{{"bindings":[]}}}}"#
+            );
+            assert!(payload.len() < (32 << 10));
+            let mut cur = io::Cursor::new(payload.as_bytes());
+            let mut staging = eager_charge(&ctx).unwrap();
+            let err = json_start(&mut cur, &mut staging, &ctx).err().unwrap();
+            assert!(
+                matches!(
+                    crate::codec::io_error(err),
+                    Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
+                ),
+                "escape after long literal prefix must cover non-power-of-two doubling peak"
+            );
+        }
+
+        // 4. 22,000 bytes of invalid `\a` escapes expand 2 -> 3 bytes (33,000 B decoded,
+        // 96 KiB String growth peak + 32 KiB staging = 128 KiB > 120 KiB).
+        {
+            let mut raw = Ctx::new(store.snapshot());
+            raw.mem_limit = 120 << 10;
+            let ctx = Arc::new(raw);
+            ctx.attach_owner();
+
+            let invalid_escapes = r#"\a"#.repeat(11_000);
+            let payload = format!(
+                r#"{{"head":{{"links":["{invalid_escapes}"],"vars":["s"]}},"results":{{"bindings":[]}}}}"#
+            );
+            assert!(payload.len() < (32 << 10));
+            let mut cur = io::Cursor::new(payload.as_bytes());
+            let mut staging = eager_charge(&ctx).unwrap();
+            let err = json_start(&mut cur, &mut staging, &ctx).err().unwrap();
+            assert!(
+                matches!(
+                    crate::codec::io_error(err),
+                    Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
+                ),
+                "invalid ASCII escapes expanding to U+FFFD must refuse on memory budget"
+            );
+        }
+    }
+
+    /// A tiny complete late-head response succeeds under a 128 KiB eager grant instead of
+    /// failing before its EOF read, and replay keeps `parser_reserve` live while
+    /// `sparesults` owns the buffered solutions iterator.
+    #[test]
+    fn eager_late_json_accepts_tiny_response_under_128kib_and_holds_replay_credit() {
+        let store = Store::in_memory(StoreOptions::default());
+        let payload = br#"{"results":{"bindings":[{"s":{"type":"uri","value":"urn:tiny"}}]},"head":{"vars":["s"]}}"#;
+        assert!(payload.len() < 100);
+
+        // 1. Succeeds under a 128 KiB eager budget.
+        {
+            let mut raw = Ctx::new(store.snapshot());
+            raw.mem_limit = 128 << 10;
+            let ctx = Arc::new(raw);
+            ctx.attach_owner();
+
+            let mut cur = io::Cursor::new(payload.as_slice());
+            let mut staging = eager_charge(&ctx).unwrap();
+            let start = json_start(&mut cur, &mut staging, &ctx).unwrap();
+            assert!(start.late);
+            let bytes = read_late_json(start, &mut cur, &mut staging, &ctx).unwrap();
+            assert_eq!(bytes, payload);
+        }
+
+        // 2. Under ample grant, `ChargedCursor` releases raw capacity on EOF while
+        // keeping `parser_reserve` live until `sparesults`'s buffered iterator drops.
+        {
+            let mut raw = Ctx::new(store.snapshot());
+            raw.mem_limit = 4 << 20;
+            let ctx = Arc::new(raw);
+            ctx.attach_owner();
+            let base = ctx.live_bytes();
+
+            let mut cur = io::Cursor::new(payload.as_slice());
+            let mut staging = eager_charge(&ctx).unwrap();
+            let start = json_start(&mut cur, &mut staging, &ctx).unwrap();
+            let bytes = read_late_json(start, &mut cur, &mut staging, &ctx).unwrap();
+            let raw_cap = bytes.capacity() as u64;
+            let parser_reserve = (bytes.len() as u64)
+                .saturating_mul(buffered_factor())
+                .saturating_add(SLACK);
+            let cursor =
+                ChargedCursor::with_parser_reserve(bytes, staging, parser_reserve).unwrap();
+            assert_eq!(ctx.live_bytes(), base + raw_cap + parser_reserve);
+
+            let parser =
+                sparesults::QueryResultsParser::from_format(sparesults::QueryResultsFormat::Json);
+            let sparesults::ReaderQueryResultsParserOutput::Solutions(mut sols) =
+                parser.for_reader(cursor).unwrap()
+            else {
+                panic!("expected solutions");
+            };
+            // `sparesults` read the late-head JSON through `"vars"` and buffered the
+            // solution; raw staging buffer is released once EOF is observed, while
+            // `parser_reserve` remains live as long as `sols` owns the buffered answers.
+            assert!(
+                ctx.live_bytes() >= base + parser_reserve,
+                "parser_reserve must remain charged while sparesults owns buffered solutions"
+            );
+            let row = sols.next().unwrap().unwrap();
+            assert_eq!(
+                row.get("s"),
+                Some(&Term::NamedNode(oxrdf::NamedNode::new("urn:tiny").unwrap()))
+            );
+            assert!(sols.next().is_none());
+            assert!(ctx.live_bytes() >= base + parser_reserve);
+            drop(sols);
+            assert_eq!(ctx.live_bytes(), base);
+        }
     }
 
     /// Leading whitespace compaction preserves a single space before replaying so a
@@ -1125,5 +1477,95 @@ mod tests {
             incomplete_retries <= 20,
             "expected logarithmic retries for 2 MiB token, got {incomplete_retries}"
         );
+    }
+
+    /// Head probing avoids quadratic rescanning of long incomplete JSON numbers (integer,
+    /// fractional, and exponent digit runs) and malformed alphabetic runs, while still
+    /// retrying immediately on the chunk that closes the token.
+    #[test]
+    fn json_start_avoids_quadratic_rescan_on_long_incomplete_numbers() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut raw = Ctx::new(store.snapshot());
+        raw.mem_limit = 256 << 20;
+        raw.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(raw);
+        ctx.attach_owner();
+
+        // 1. 2 MiB integer in a root extension member (> 512 reads of 4 KiB).
+        let big_int = "1".repeat(2 << 20);
+        let payload =
+            format!(r#"{{"ext":{big_int},"head":{{"vars":["s"]}},"results":{{"bindings":[]}}}}"#);
+        let mut cur = io::Cursor::new(payload.as_bytes());
+        let mut ch = StagingCharge::from_cursor(charge(&ctx).unwrap());
+        let (start, retries) = json_start_inner(&mut cur, &mut ch, &ctx).unwrap();
+        assert!(!start.late);
+        assert!(
+            retries <= 2,
+            "expected O(1) retries for 2 MiB head number, got {retries}"
+        );
+
+        // 2. Long fractional and exponent digit runs in `head` extension members.
+        let frac = format!("0.{}", "2".repeat(128 << 10));
+        let exp = format!("-1.5e+{}", "3".repeat(128 << 10));
+        let payload = format!(
+            r#"{{"head":{{"a":{frac},"b":{exp},"vars":["s"]}},"results":{{"bindings":[]}}}}"#
+        );
+        let mut cur = io::Cursor::new(payload.as_bytes());
+        let mut ch = StagingCharge::from_cursor(charge(&ctx).unwrap());
+        let (start, retries) = json_start_inner(&mut cur, &mut ch, &ctx).unwrap();
+        assert!(!start.late);
+        assert!(
+            retries <= 4,
+            "expected O(1) retries for fractional/exponent numbers, got {retries}"
+        );
+
+        // 3. Long malformed alphabetic run starting with `t` avoids quadratic rescan.
+        let bad_alpha = "t".repeat(128 << 10);
+        let payload = format!(r#"{{"ext":{bad_alpha}}}"#);
+        let mut cur = io::Cursor::new(payload.as_bytes());
+        let mut ch = StagingCharge::from_cursor(charge(&ctx).unwrap());
+        let (_start, retries) = json_start_inner(&mut cur, &mut ch, &ctx).unwrap();
+        assert!(
+            retries <= 2,
+            "expected O(1) retries for malformed alpha run, got {retries}"
+        );
+
+        // 4. Chunked > 4 KiB number in `head` retries immediately when its delimiter
+        // arrives and does not issue an extra blocking read.
+        struct Scripted {
+            chunks: VecDeque<Vec<u8>>,
+            reads: usize,
+        }
+        impl Read for Scripted {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                let Some(chunk) = self.chunks.pop_front() else {
+                    panic!(
+                        "json_start issued unexpected blocking read #{} after number closed",
+                        self.reads
+                    );
+                };
+                let n = chunk.len().min(buf.len());
+                buf[..n].copy_from_slice(&chunk[..n]);
+                if n < chunk.len() {
+                    self.chunks.push_front(chunk[n..].to_vec());
+                }
+                Ok(n)
+            }
+        }
+        let mut chunk1 = br#"{"head":{"ext":1"#.to_vec();
+        chunk1.extend(std::iter::repeat_n(b'9', 5_000));
+        let chunk2 =
+            br#","vars":["s"]},"results":{"bindings":[{"s":{"type":"uri","value":"urn:num"}}"#
+                .to_vec();
+        let mut body = Scripted {
+            chunks: VecDeque::from([chunk1, chunk2]),
+            reads: 0,
+        };
+        let mut ch = StagingCharge::from_cursor(charge(&ctx).unwrap());
+        let (start, retries) = json_start_inner(&mut body, &mut ch, &ctx).unwrap();
+        assert!(!start.late);
+        assert_eq!(body.reads, 3);
+        assert_eq!(retries, 1);
     }
 }
