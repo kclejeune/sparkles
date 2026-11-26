@@ -1142,6 +1142,9 @@ impl CreditedSessionWorker {
             let _ = queue.push_replay(CreditedSseEvent::priming(0, "0", retry));
         }
         if replacing {
+            // Discard any unread replay prefix still sitting in the superseded primary
+            // queue so it cannot leak outside session bounds or emit after teardown.
+            self.common.tx.close_and_discard();
             self.common.tx = queue;
             match last_event_index {
                 Some(idx) => {
@@ -2227,5 +2230,90 @@ mod tests {
         );
         assert!(final_events[2].contains("\"id\":88"), "{final_events:?}");
         drop(req_final);
+    }
+
+    #[tokio::test]
+    async fn superseded_common_sse_discards_unread_replay_before_and_after_session_delete() {
+        use http_body_util::BodyExt;
+
+        let mut cfg = SessionConfig::default();
+        cfg.channel_capacity = 2; // live queue capacity = 2, replay ring capacity = 3
+        cfg.sse_retry = Some(Duration::from_secs(3));
+        let shutdown = CancellationToken::new();
+        let (_handle, mut worker) =
+            create_credited_session("s7".into(), cfg.clone(), 30.0, shutdown.clone());
+
+        let notif = || {
+            ServerJsonRpcMessage::notification(ServerNotification::ToolListChangedNotification(
+                Default::default(),
+            ))
+        };
+
+        // Populate replay ring with [4, 5, 6] while initial primary is closed.
+        for _ in 0..6 {
+            worker.handle_server_message(notif()).unwrap();
+        }
+        // Open common stream #1 from 3 -> preloads replay prefix [4, 5, 6].
+        let (_, rx1) = worker
+            .resume("3".parse().unwrap())
+            .expect("resume from 3 must preload [4, 5, 6]");
+        let mut body1 = CreditedSseBody::new(rx1, None, shutdown.clone());
+
+        // Trigger live overflow (7, 8 admitted; 9 overflows) while body1 stays unread:
+        // body1's queue closes with its replay prefix [4, 5, 6] still buffered.
+        for _ in 0..3 {
+            worker.handle_server_message(notif()).unwrap();
+        }
+        assert!(worker.common.tx.is_closed());
+
+        // An invalid `Last-Event-ID` replacement attempt must be rejected without
+        // discarding body1's still-draining replay prefix.
+        assert!(matches!(
+            worker.resume("99".parse().unwrap()),
+            Err(CreditedSessionError::InvalidEventId)
+        ));
+
+        // Now supersede the closed primary with a new standalone GET while body1 is still
+        // alive and unread. The superseded queue must be discarded immediately so body1
+        // yields EOF with zero frames.
+        let rx2 = worker
+            .establish_common_channel()
+            .expect("replacement standalone GET must succeed");
+        let mut body2 = CreditedSseBody::new(rx2, None, shutdown.clone());
+        assert!(
+            body1.frame().await.is_none(),
+            "superseded common SSE body must discard unread replay prefix and return EOF"
+        );
+
+        // Delete/expire the session while body2 is still alive and unread (with priming +
+        // [7, 8, 9] buffered). Both body1 and body2 must emit nothing after teardown.
+        drop(worker);
+        assert!(
+            body1.frame().await.is_none(),
+            "superseded body must stay closed after session deletion"
+        );
+        assert!(
+            body2.frame().await.is_none(),
+            "active replacement body must discard unread replay on session deletion"
+        );
+
+        // Also verify direct session deletion while an unreplaced overflowed common stream
+        // is still holding its unread replay prefix discards that prefix immediately.
+        let (_handle2, mut worker2) =
+            create_credited_session("s8".into(), cfg, 30.0, shutdown.clone());
+        for _ in 0..6 {
+            worker2.handle_server_message(notif()).unwrap();
+        }
+        let (_, rx3) = worker2.resume("3".parse().unwrap()).unwrap();
+        let mut body3 = CreditedSseBody::new(rx3, None, shutdown);
+        for _ in 0..3 {
+            worker2.handle_server_message(notif()).unwrap();
+        }
+        assert!(worker2.common.tx.is_closed());
+        drop(worker2);
+        assert!(
+            body3.frame().await.is_none(),
+            "overflowed common SSE body must not emit unread replay after session deletion"
+        );
     }
 }
