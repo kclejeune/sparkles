@@ -1,0 +1,75 @@
+{
+  "description": "Shared test cases for C19 §8.1 enable-ingest field selection (verified by both Rust memory_cmd::ops and UI Vitest settings.test.ts).",
+  "cases": [
+    {
+      "name": "all-default",
+      "assistant": {
+        "effective": { "enabled": false, "ingest": false, "send": "schema" },
+        "sources": { "enabled": "default", "ingest": "default", "send": "default" },
+        "locked": []
+      },
+      "expectedPatch": { "enabled": true, "ingest": true, "send": "documents" },
+      "wouldEnable": true
+    },
+    {
+      "name": "send-locked-rows",
+      "assistant": {
+        "effective": { "enabled": false, "ingest": false, "send": "rows" },
+        "sources": { "enabled": "default", "ingest": "default", "send": "locked" },
+        "locked": ["send"]
+      },
+      "expectedPatch": { "enabled": true, "ingest": true },
+      "wouldEnable": false
+    },
+    {
+      "name": "ingest-declared-false",
+      "assistant": {
+        "effective": { "enabled": false, "ingest": false, "send": "schema" },
+        "sources": { "enabled": "default", "ingest": "declared", "send": "default" },
+        "locked": []
+      },
+      "expectedPatch": { "enabled": true, "send": "documents" },
+      "wouldEnable": false
+    },
+    {
+      "name": "enabled-and-send-declared-ingest-default",
+      "assistant": {
+        "effective": { "enabled": true, "ingest": false, "send": "documents" },
+        "sources": { "enabled": "declared", "ingest": "default", "send": "declared" },
+        "locked": []
+      },
+      "expectedPatch": { "ingest": true },
+      "wouldEnable": true
+    },
+    {
+      "name": "ingest-runtime-false",
+      "assistant": {
+        "effective": { "enabled": true, "ingest": false, "send": "documents" },
+        "sources": { "enabled": "runtime", "ingest": "runtime", "send": "runtime" },
+        "locked": []
+      },
+      "expectedPatch": {},
+      "wouldEnable": false
+    },
+    {
+      "name": "already-enabled",
+      "assistant": {
+        "effective": { "enabled": true, "ingest": true, "send": "documents" },
+        "sources": { "enabled": "runtime", "ingest": "runtime", "send": "runtime" },
+        "locked": []
+      },
+      "expectedPatch": {},
+      "wouldEnable": true
+    },
+    {
+      "name": "enabled-locked-false",
+      "assistant": {
+        "effective": { "enabled": false, "ingest": false, "send": "schema" },
+        "sources": { "enabled": "locked", "ingest": "default", "send": "default" },
+        "locked": ["enabled"]
+      },
+      "expectedPatch": { "ingest": true, "send": "documents" },
+      "wouldEnable": false
+    }
+  ]
+}

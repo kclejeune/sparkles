@@ -294,12 +294,15 @@ fn draft_table(r: &mut Run, req: &Request, ds: &Dataset, table: Table) -> Result
     }
     let mut notes: Vec<String> = Vec::new();
     let mut pair_used = None;
+    let mut redactions = std::collections::BTreeMap::new();
     let (mut metadata, specs) = if use_model && columns.len() <= MAX_COLUMNS {
         let profile = req.profile.clone().unwrap_or_else(|| "default".into());
         let vocab = Vocabulary::read(r, &profile)?;
         let models = ctx.models.expect("pairs need models");
         let sample = sample_lines(bytes, SAMPLE_ROWS + 1);
-        let user = prompt(&vocab, &sample, tsv);
+        let redacted = super::pipeline::apply_redaction(&ctx.server.state, ds, &sample, None, &[])?;
+        redactions = redacted.counts;
+        let user = prompt(&vocab, &redacted.text, tsv);
         let out_schema = OutputSchema {
             name: "TableMapping",
             schema: schema(&vocab),
@@ -458,6 +461,9 @@ fn draft_table(r: &mut Run, req: &Request, ds: &Dataset, table: Table) -> Result
     }
     if !notes.is_empty() {
         out["notes"] = notes.into();
+    }
+    if !redactions.is_empty() {
+        out["redactions"] = json!(redactions);
     }
     Ok(out)
 }

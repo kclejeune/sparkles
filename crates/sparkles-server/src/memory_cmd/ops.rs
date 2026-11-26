@@ -53,6 +53,8 @@ struct Config {
     transcripts: Vec<String>,
     /// extra redaction patterns
     redact: Vec<ConfigPattern>,
+    /// file of extra known secret values (one per line, 8+ characters)
+    known_values: Option<PathBuf>,
     /// harness roots
     claude_dir: Option<PathBuf>,
     codex_dir: Option<PathBuf>,
@@ -495,6 +497,19 @@ fn ingest_fields() -> [(&'static str, Value); 3] {
     ]
 }
 
+/// The PATCH body to turn on server-side ingestion for an assistant settings document
+/// (`GET /$/settings/{ds}/assistant`), setting only the fields of [`ingest_fields`] whose
+/// source is `default` (spec C19 §8.1).
+pub(crate) fn plan_enable_ingest(cur: &Value) -> Value {
+    let mut patch = json!({});
+    for (f, wanted) in ingest_fields() {
+        if cur["sources"][f] == "default" && cur["effective"][f] != wanted {
+            patch[f] = wanted;
+        }
+    }
+    patch
+}
+
 /// Turn on server-side ingestion: set each field of [`ingest_fields`] whose source is
 /// `default`, and leave declared, runtime and locked fields as they are. The answer
 /// lists what changed, what stayed with its source, and the providers of the effective
@@ -518,12 +533,7 @@ fn enable_ingest(conn: &Conn) -> Value {
             Ok(v) => v,
             Err(e) => return failed(e),
         };
-        let mut patch = json!({});
-        for (f, wanted) in ingest_fields() {
-            if cur["sources"][f] == "default" && cur["effective"][f] != wanted {
-                patch[f] = wanted;
-            }
-        }
+        let patch = plan_enable_ingest(&cur);
         if patch.as_object().is_some_and(|m| m.is_empty()) {
             break (cur, patch);
         }
@@ -796,9 +806,17 @@ fn adapters_of(names: &[String]) -> Result<Vec<Adapter>, CmdError> {
         .collect()
 }
 
-fn patterns(env: &Env, settings: &Value, flags: &ImportFlags) -> Result<Vec<Pattern>, CmdError> {
+fn redaction_policy(
+    env: &Env,
+    settings: &Value,
+    flags: &ImportFlags,
+) -> Result<redact::Policy, CmdError> {
     let mut ps = redact::builtin();
+    let mut seen: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
     let mut add = |name: &str, regex: &str, from: &str| -> Result<(), CmdError> {
+        if !seen.insert((name.to_string(), regex.to_string())) {
+            return Ok(());
+        }
         ps.push(Pattern::new(name, regex).map_err(|e| CmdError::usage(format!("{from}: {e}")))?);
         Ok(())
     };
@@ -809,6 +827,12 @@ fn patterns(env: &Env, settings: &Value, flags: &ImportFlags) -> Result<Vec<Patt
     {
         if let (Some(n), Some(r)) = (p["name"].as_str(), p["regex"].as_str()) {
             add(n, r, "secretPatterns")?;
+        }
+    }
+    let red = &settings["redaction"];
+    for p in red["patterns"].as_array().into_iter().flatten() {
+        if let (Some(n), Some(r)) = (p["name"].as_str(), p["regex"].as_str()) {
+            add(n, r, "redaction.patterns")?;
         }
     }
     for p in &env.cfg.redact {
@@ -822,7 +846,54 @@ fn patterns(env: &Env, settings: &Value, flags: &ImportFlags) -> Result<Vec<Patt
                 .map_err(|e| CmdError::usage(format!("{}: {e}", f.display())))?,
         );
     }
-    Ok(ps)
+    let mut policy = redact::Policy::from_patterns(ps);
+    if let Some(ent) = red["entropy"].as_object() {
+        let d = redact::EntropyConfig::default();
+        policy.entropy = Some(redact::EntropyConfig {
+            min_length: ent
+                .get("minLength")
+                .and_then(Value::as_u64)
+                .map_or(d.min_length, |n| n as usize),
+            min_bits_per_char: ent
+                .get("minBitsPerChar")
+                .and_then(Value::as_f64)
+                .unwrap_or(d.min_bits_per_char),
+        });
+    }
+    for cat in red["personal"].as_array().into_iter().flatten() {
+        if let Some(c) = cat.as_str().and_then(redact::PersonalCategory::parse)
+            && !policy.personal.contains(&c)
+        {
+            policy.personal.push(c);
+        }
+    }
+    for expr in red["allow"].as_array().into_iter().flatten() {
+        if let Some(s) = expr.as_str() {
+            let re = regex::Regex::new(s)
+                .map_err(|e| CmdError::usage(format!("redaction.allow: {e}")))?;
+            policy.allow.push(re);
+        }
+    }
+    let use_known = red["knownValues"].as_bool().unwrap_or(true);
+    let mut known: Vec<String> = if use_known {
+        redact::env_known_values()
+    } else {
+        Vec::new()
+    };
+    for f in env
+        .cfg
+        .known_values
+        .iter()
+        .chain(flags.redact_known_values.iter())
+    {
+        let t = std::fs::read_to_string(f)
+            .map_err(|e| CmdError::usage(format!("{}: {e}", f.display())))?;
+        known.extend(redact::parse_known_values_file(&t));
+    }
+    if !known.is_empty() {
+        policy = policy.with_known_values(known, "known-value");
+    }
+    Ok(policy)
 }
 
 fn project_of(dir: Option<&Path>) -> Result<Project, CmdError> {
@@ -854,7 +925,7 @@ fn import(
     let project = project_of(flags.project.as_deref())?;
     let conn = env.connect()?;
     let (ctx, settings) = context(&conn)?;
-    let ps = patterns(env, &settings, &flags)?;
+    let policy = redaction_policy(env, &settings, &flags)?;
     let roots = env.roots();
     let mut notes: Vec<String> = Vec::new();
     // §8.10.7: the dataset allows transcripts, and the person opts the project in
@@ -887,7 +958,7 @@ fn import(
         user_scope: flags.user_scope,
         paths: flags.paths.clone(),
         instructions_only: flags.instructions_only,
-        patterns: &ps,
+        patterns: &policy.patterns,
     };
     let prefix = format!(
         "{}{}/",
@@ -926,7 +997,7 @@ fn import(
     let mut file_graphs: std::collections::HashMap<PathBuf, String>;
     loop {
         runs += 1;
-        let scan = sparkles_memory_import::scan(&req);
+        let scan = sparkles_memory_import::scan_with_policy(&req, &policy);
         file_graphs = scan
             .files
             .iter()
@@ -972,7 +1043,7 @@ fn import(
             roots: &roots,
             project: &project,
             harnesses,
-            patterns: &ps,
+            policy: &policy,
             file_graphs,
             opts: transcripts::Opts {
                 tools: flags.transcript_content == "tools",
@@ -1585,18 +1656,21 @@ fn status(env: &Env, project: Option<PathBuf>, harness: Option<String>) -> Resul
     let project = project_of(project.as_deref())?;
     let conn = env.connect()?;
     let (ctx, settings) = context(&conn)?;
-    let ps = patterns(env, &settings, &ImportFlags::default())?;
+    let policy = redaction_policy(env, &settings, &ImportFlags::default())?;
     let roots = env.roots();
-    let scan = sparkles_memory_import::scan(&sparkles_memory_import::Request {
-        ctx: &ctx,
-        roots: &roots,
-        adapters: Adapter::ALL.to_vec(),
-        project: Some(project.clone()),
-        user_scope: false,
-        paths: Vec::new(),
-        instructions_only: false,
-        patterns: &ps,
-    });
+    let scan = sparkles_memory_import::scan_with_policy(
+        &sparkles_memory_import::Request {
+            ctx: &ctx,
+            roots: &roots,
+            adapters: Adapter::ALL.to_vec(),
+            project: Some(project.clone()),
+            user_scope: false,
+            paths: Vec::new(),
+            instructions_only: false,
+            patterns: &policy.patterns,
+        },
+        &policy,
+    );
     let files: Vec<_> = scan
         .files
         .iter()
@@ -3296,5 +3370,34 @@ mod tests {
         assert!(is_instruction_file(Path::new("/p/.claude/rules/x.md")));
         assert!(!is_instruction_file(Path::new("/p/src/main.rs")));
         assert!(!is_instruction_file(Path::new("/p/README.md")));
+    }
+
+    #[test]
+    fn enable_ingest_matches_shared_fixture() {
+        let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testsuite/settings/enable-ingest.json");
+        let text = std::fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", fixture_path.display()));
+        let fixture: Value = serde_json::from_str(&text).unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let got = plan_enable_ingest(&case["assistant"]);
+            assert_eq!(got, case["expectedPatch"], "case {name}: patch mismatch");
+            let mut eff = case["assistant"]["effective"].clone();
+            if let Some(m) = got.as_object() {
+                for (k, v) in m {
+                    eff[k] = v.clone();
+                }
+            }
+            let enabled =
+                eff["enabled"] == true && eff["ingest"] == true && eff["send"] == "documents";
+            assert_eq!(
+                enabled,
+                case["wouldEnable"].as_bool().unwrap(),
+                "case {name}: wouldEnable mismatch"
+            );
+        }
     }
 }

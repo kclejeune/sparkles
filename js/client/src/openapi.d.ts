@@ -5883,7 +5883,14 @@ export interface components {
                     model: string;
                     provider: string;
                 }[];
+                /** @description The effective `extract` role list for this dataset (dataset override or server list). */
+                extract?: {
+                    model: string;
+                    provider: string;
+                }[];
                 historyDays: number;
+                /** @description Whether server-side document ingestion can extract facts with an `extract` provider. */
+                ingest?: boolean;
                 models: boolean;
                 reason?: string;
                 /** @description Whether an answer can carry a summary. */
@@ -9127,7 +9134,7 @@ export interface components {
             message?: string;
             /** @description From 0 to 1. */
             progress: number;
-            /** @description The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `already-proposed`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, a table's mapping draft and preview, or a workbook's drafts for each sheet. A `claims` ingestion reports the evidence operation, commit, first availability, revision, records and their counts by kind, the claims, failed facts, flagged entities and `factGuard` `not-run`. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted. */
+            /** @description The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `already-proposed`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, `redactions` counts by detector when text was redacted, a table's mapping draft and preview, or a workbook's drafts for each sheet. A `claims` ingestion reports the evidence operation, commit, first availability, revision, records and their counts by kind, the claims, failed facts, flagged entities and `factGuard` `not-run`. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted. */
             result?: {
                 [key: string]: unknown;
             };
@@ -9864,6 +9871,34 @@ export interface components {
                 }[];
                 /** @description Whether transcripts may be imported (Phase 3m-b). */
                 transcripts?: boolean;
+            };
+            /** @description Redaction policy for agent memory imports, `register_source` and server-side document ingestion. Written as `format` 4 of `memory.json`. */
+            redaction?: {
+                /** @description Regular expressions whose matched spans are never redacted. */
+                allow?: string[];
+                /** @description High-entropy token detector for assignments, headers, query parameters and quoted values. Off when omitted. */
+                entropy?: {
+                    /** @description Minimum Shannon entropy in bits per character, 1.0 to 8.0, 4.0 by default. */
+                    minBitsPerChar?: number;
+                    /** @description Minimum token length in characters, 8 to 256, 20 by default. */
+                    minLength?: number;
+                };
+                /** @description Apply the `secret-detected` check of `register_source` to every graph of the dataset, not only `imports.base`. `false` by default. */
+                everywhere?: boolean;
+                /** @description Whether exact known secret values (server secrets on the server, sensitive environment variables in the CLI) are redacted. `true` by default. */
+                knownValues?: boolean;
+                /** @description Extra regular-expression redaction patterns, merged with `imports.secretPatterns`. */
+                patterns?: {
+                    name: string;
+                    regex: string;
+                }[];
+                /** @description Opt-in personal data detectors. */
+                personal?: ("email" | "phone" | "payment-card" | "iban" | "ip")[];
+                /**
+                 * @description How server-side document ingestion handles detected secrets: `redact` replaces them before storage and model calls (default), `refuse` fails the task with `secret-detected`, and `off` leaves text untouched.
+                 * @enum {string}
+                 */
+                serverIngest?: "redact" | "refuse" | "off";
             };
             /** @description The retention of session graphs, off without it. */
             retention?: {

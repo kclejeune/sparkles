@@ -944,7 +944,7 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     // 1. conversion
     ctx.progress.status(Status::Converting, 0.05, None);
     r.check()?;
-    let converted = convert::convert(
+    let mut converted = convert::convert(
         &req.bytes,
         format,
         &convert::Options {
@@ -958,12 +958,23 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     )?;
     r.check()?;
     // the text exactly as the registration normalizes it, so spans agree with it
-    let text = crate::mcp::memory::ingest::normalize(&converted.text);
-    let title = req
+    let raw_text = crate::mcp::memory::ingest::normalize(&converted.text);
+    let raw_title = req
         .title
         .clone()
         .or_else(|| converted.title.clone())
         .or_else(|| name.clone());
+    let redacted = super::pipeline::apply_redaction(
+        &ctx.server.state,
+        &t.main,
+        &raw_text,
+        raw_title.as_deref(),
+        &converted.page_starts,
+    )?;
+    let text = redacted.text;
+    converted.page_starts = redacted.page_starts;
+    let title = redacted.title;
+    let redactions = redacted.counts;
     let iri = req.iri.clone().or_else(|| {
         req.url
             .clone()
@@ -1022,6 +1033,9 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         "profile": profile,
         "factGuard": "not-run",
     });
+    if !redactions.is_empty() {
+        out["redactions"] = json!(redactions);
+    }
     if t.branch != sparkles::branch::MAIN {
         out["branch"] = t.branch.clone().into();
     }
@@ -1155,6 +1169,15 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
     let principal = crate::evidence::principal_iri(ctx.principal);
     let on = (t.branch != sparkles::branch::MAIN).then_some(t.branch.as_str());
     let read = super::pipeline::read_source(r, source, on)?;
+    let redacted =
+        super::pipeline::apply_redaction(&ctx.server.state, &t.main, &read.text, None, &[])?;
+    let redactions = redacted.counts;
+    let (extract_text, extract_chunks) = if redactions.is_empty() {
+        (read.text.clone(), read.chunks.clone())
+    } else {
+        let chunks = crate::mcp::memory::ingest::chunk_bounds(&redacted.text, false);
+        (redacted.text, chunks)
+    };
     let profile = req.profile.clone().unwrap_or_else(|| "default".into());
     let rendition_digest = sha(read.text.as_bytes())?;
     let revision_digest = recorded_digest(&read.found["digest"], &rendition_digest);
@@ -1177,6 +1200,9 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
         "profile": profile,
         "factGuard": "not-run",
     });
+    if !redactions.is_empty() {
+        out["redactions"] = json!(redactions);
+    }
     if t.branch != sparkles::branch::MAIN {
         out["branch"] = t.branch.clone().into();
     }
@@ -1187,12 +1213,21 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
     }
     let branch = (t.branch != sparkles::branch::MAIN).then_some(t.branch.as_str());
     let vocab = Vocabulary::read_on(r, &profile, branch)?;
-    estimate(r, req, models, &pairs, &vocab, &read.text, &read.chunks, &t)?;
+    estimate(
+        r,
+        req,
+        models,
+        &pairs,
+        &vocab,
+        &extract_text,
+        &extract_chunks,
+        &t,
+    )?;
     let (ex, linked) = extract_and_link(
         r,
         (models, &pairs),
         &vocab,
-        (&read.text, &read.chunks),
+        (&extract_text, &extract_chunks),
         branch,
         &revision_digest,
     )?;

@@ -21,7 +21,7 @@
 use super::conn::{CmdError, Conn, val};
 use super::sync::{self, Cache, CacheEntry, FileReport, RegisterText, SyncOpts, count, normalize};
 use serde_json::Value;
-use sparkles_memory_import::redact::{self, Pattern};
+use sparkles_memory_import::redact;
 use sparkles_memory_import::transcripts::{self, Format, Session, render, split};
 use sparkles_memory_import::vocab::{self, XSD_DATETIME, XSD_INTEGER, mem};
 use sparkles_memory_import::{Ctx, Fact, FileImport, FileKind, Harness, Obj, Project, Roots};
@@ -234,7 +234,7 @@ pub struct Run<'a> {
     pub roots: &'a Roots,
     pub project: &'a Project,
     pub harnesses: Vec<Harness>,
-    pub patterns: &'a [Pattern],
+    pub policy: &'a redact::Policy,
     /// the graph of each scanned memory or instruction file, by path
     pub file_graphs: HashMap<PathBuf, String>,
     pub opts: Opts,
@@ -390,7 +390,7 @@ pub fn sync(run: &Run, cache: &mut Cache) -> Result<Vec<FileReport>, CmdError> {
         let turns: Vec<String> = turns
             .into_iter()
             .map(|t| {
-                let r = redact::redact(&t, run.patterns);
+                let r = run.policy.redact(&t);
                 names.extend(r.names);
                 normalize(&r.text)
             })

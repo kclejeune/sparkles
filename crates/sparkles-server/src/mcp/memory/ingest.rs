@@ -1118,13 +1118,17 @@ impl Tools<'_> {
             "urn:uuid:{}",
             uuid_v5(&dataset_id, &format!("rendition\0{dig}")).hyphenated()
         ));
-        // §8.10.7: no text the server recognizes as a secret enters an import graph
+        // §8.10.7 / item 77: no text the server recognizes as a secret enters an import
+        // graph, or any graph when `redaction.everywhere` is true
         let main_ds = ds.main();
         let main_ds: &Dataset = main_ds.as_deref().unwrap_or(&ds);
         let memory = crate::assist::memory_settings(&self.server.state, main_ds);
-        if let Some(im) = memory.imports.as_ref()
-            && graph.as_str().starts_with(&im.base)
-        {
+        let check_secrets = memory.redaction_everywhere()
+            || memory
+                .imports
+                .as_ref()
+                .is_some_and(|im| graph.as_str().starts_with(&im.base));
+        if check_secrets {
             let mut texts: Vec<&str> = vec![&text];
             if let Some(s) = original
                 .as_deref()
@@ -1132,7 +1136,7 @@ impl Tools<'_> {
             {
                 texts.push(s);
             }
-            secret_check(im, &texts)?;
+            secret_check(&self.server.state, &memory, &texts)?;
         }
         let transcript =
             format.starts_with("text/markdown") && format.contains("profile=transcript");
@@ -1762,20 +1766,23 @@ impl Tools<'_> {
     }
 }
 
-/// The `secret-detected` check of §8.10.7: the built-in patterns and the dataset's own
-/// over each text. The error names the pattern and the offset in characters, never the
-/// value.
-fn secret_check(im: &crate::assist::Imports, texts: &[&str]) -> Result<(), ToolError> {
-    use sparkles_memory_import::redact;
-    let mut patterns = redact::builtin();
-    for p in &im.secret_patterns {
-        // the settings route validates them; one that no longer compiles is skipped
-        if let Ok(x) = redact::Pattern::new(&p.name, &p.regex) {
-            patterns.push(x);
-        }
-    }
+/// The `secret-detected` check of §8.10.7 and item 77: the dataset's full redaction
+/// policy (built-in and configured patterns, entropy, personal detectors, server secrets
+/// and allow-list) over each text. The error names the detector and the offset in
+/// characters, never the value.
+fn secret_check(
+    st: &crate::state::AppState,
+    memory: &crate::assist::MemorySettings,
+    texts: &[&str],
+) -> Result<(), ToolError> {
+    let known = if memory.redaction_known_values() {
+        crate::settings::secrets::known_values(st)
+    } else {
+        Vec::new()
+    };
+    let policy = memory.redaction_policy(known, "server-secret");
     for t in texts {
-        if let Some((name, at)) = redact::first_match(t, &patterns) {
+        if let Some((name, at)) = policy.first_match(t) {
             let offset = t[..at].chars().count();
             return Err(ToolError::new(
                 "secret-detected",
@@ -1785,7 +1792,7 @@ fn secret_check(im: &crate::assist::Imports, texts: &[&str]) -> Result<(), ToolE
                 ),
             )
             .hint("redact the text before registering it (sparkles memory import does), or remove the secret from the file")
-            .data(json!({"pattern": name, "offset": offset})));
+            .data(json!({"pattern": name, "detector": name, "offset": offset})));
         }
     }
     Ok(())

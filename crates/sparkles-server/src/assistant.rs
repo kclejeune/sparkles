@@ -1472,13 +1472,31 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/$/models/usage", get(usage))
 }
 
-/// The settings, with a `status` that says whether asking works and why not.
+/// The settings, with a `status` that says whether asking and ingestion work and which
+/// pairs they use.
 fn settings_json(st: &AppState, s: &AssistantSettings) -> Value {
     let mut v = serde_json::to_value(s).unwrap_or_default();
     let mut status = json!({
         "models": st.models().is_some(),
         "historyDays": s.history_days(st),
     });
+    if let Some(m) = st.models() {
+        let extract = s
+            .roles
+            .get(&Role::Extract)
+            .cloned()
+            .unwrap_or_else(|| m.pairs(Role::Extract));
+        status["extract"] = serde_json::to_value(&extract).unwrap_or_default();
+        let ingest_on = s.enabled
+            && s.ingest
+            && s.send >= Send::Documents
+            && extract.iter().any(|p| {
+                m.provider(&p.provider).is_some() && s.send_to(&p.provider) >= Send::Documents
+            });
+        status["ingest"] = ingest_on.into();
+    } else {
+        status["ingest"] = false.into();
+    }
     match ask_status(st, s) {
         Ok(()) => {
             status["ask"] = true.into();

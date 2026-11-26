@@ -2414,3 +2414,401 @@ async fn declared_drift_refuses_claims_ingestion_before_model_calls() {
     assert!(m.requests().is_empty());
     assert_eq!(head(&st), before);
 }
+
+/// Build an app with a model provider key backed by a secret file so server-side
+/// exact-value redaction (`server-secret`) can be verified end to end.
+fn app_with_secret(url: &str, secret_value: &str) -> (tempfile::TempDir, Arc<AppState>, Router) {
+    let dir = tempfile::tempdir().unwrap();
+    let key_file = dir.path().join("provider.key");
+    std::fs::write(&key_file, format!("{secret_value}\n")).unwrap();
+    let mut secrets = std::collections::BTreeMap::new();
+    secrets.insert(
+        "provider-key".to_string(),
+        sparkles::vector::embed::SecretSource::File(key_file),
+    );
+    let mut st = AppState::standalone(Default::default(), Duration::from_secs(30));
+    let cfg = json!({
+        "providers": {
+            "cheap": {
+                "kind": "openai",
+                "endpoint": url,
+                "apiKey": { "secret": "provider-key" },
+                "requestTimeoutSecs": 5,
+                "allowedModels": ["m"],
+                "structuredOutput": "json-schema",
+                "pricing": { "inputPerMTok": 1.0, "outputPerMTok": 2.0 }
+            }
+        },
+        "roles": {
+            "extract": [{ "provider": "cheap", "model": "m" }]
+        }
+    });
+    st.models = arc_swap::ArcSwapOption::from_pointee(Models::new(
+        ModelsConfig::parse(&cfg.to_string()).unwrap(),
+        secrets,
+        sparkles::outbound::OutboundPolicy {
+            allow_private: true,
+            ..Default::default()
+        },
+    ));
+    let st = Arc::new(st);
+    let ds = st.attach("org", DbType::Mem, None).unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            ORG.as_bytes().to_vec(),
+            RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let router = crate::http::router(st.clone());
+    (dir, st, router)
+}
+
+#[tokio::test]
+async fn server_ingest_redacts_server_secret_and_reports_counts() {
+    let m = proposals_mock();
+    let server_key = "spkl-internal-provider-credential-987654321";
+    let gh_token = format!("ghp_{}", "a".repeat(36));
+    let (_dir, _st, app) = app_with_secret(&m.url(), server_key);
+    enable(&app).await;
+    let doc = format!(
+        "# Notes\n\nAna Lima moved to the payments team this week.\n\nProvider key: {server_key}\nToken: {gh_token}\n"
+    );
+    let v = ingest(
+        &app,
+        multipart(
+            "/$/ingest/org",
+            &[(
+                "file",
+                Some("notes.md"),
+                Some("text/markdown"),
+                doc.as_bytes(),
+            )],
+        ),
+    )
+    .await;
+    assert_eq!(v["status"], "done", "{v}");
+    let r = &v["result"];
+    assert_eq!(r["outcome"], "proposed", "{v}");
+    assert_eq!(r["redactions"]["server-secret"], 1, "{r}");
+    assert_eq!(r["redactions"]["github-token"], 1, "{r}");
+    // The mock provider must receive redacted text, never the raw key or token.
+    let reqs = m.requests();
+    assert!(!reqs.is_empty());
+    for req in &reqs {
+        let serialized = req.body.to_string();
+        assert!(
+            !serialized.contains(server_key),
+            "leaked server key: {serialized}"
+        );
+        assert!(
+            !serialized.contains(&gh_token),
+            "leaked github token: {serialized}"
+        );
+        assert!(
+            serialized.contains("[redacted:server-secret]"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("[redacted:github-token]"),
+            "{serialized}"
+        );
+    }
+    // The stored source text on the review branch must also hold only the redacted markers.
+    let branch = r["branch"].as_str().unwrap();
+    let rev = review(&app, branch).await;
+    let stored = rev["sources"][0]["text"].as_str().unwrap();
+    assert!(!stored.contains(server_key), "stored raw key: {stored}");
+    assert!(!stored.contains(&gh_token), "stored raw token: {stored}");
+    assert!(stored.contains("[redacted:server-secret]"), "{stored}");
+    assert!(stored.contains("[redacted:github-token]"), "{stored}");
+}
+
+#[tokio::test]
+async fn server_ingest_refuse_off_allow_personal_and_legacy_patterns() {
+    let m = proposals_mock();
+    let server_key = "spkl-refuse-check-provider-key-123456";
+    let (_dir, _st, app) = app_with_secret(&m.url(), server_key);
+    enable(&app).await;
+
+    // 1. serverIngest: "refuse" fails with secret-detected before calling any model or writing.
+    let (s, v) = send(
+        &app,
+        req(
+            "PUT",
+            "/$/memory/org",
+            json!({ "redaction": { "serverIngest": "refuse" } }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let doc = format!("Ana Lima moved to the payments team this week.\n{server_key}\n");
+    let res = ingest(
+        &app,
+        multipart(
+            "/$/ingest/org",
+            &[(
+                "file",
+                Some("secret.md"),
+                Some("text/markdown"),
+                doc.as_bytes(),
+            )],
+        ),
+    )
+    .await;
+    assert_eq!(res["status"], "failed", "{res}");
+    assert_eq!(res["error"]["code"], "secret-detected", "{res}");
+    assert_eq!(res["error"]["status"], 422, "{res}");
+    assert_eq!(res["error"]["detector"], "server-secret", "{res}");
+    assert!(
+        !res.to_string().contains(server_key),
+        "error must never leak the secret value: {res}"
+    );
+    assert!(m.requests().is_empty(), "refuse must not call the model");
+
+    // 2. allow-list, personal email, high-entropy and legacy imports.secretPatterns.
+    let (s, v) = send(
+        &app,
+        req(
+            "PUT",
+            "/$/memory/org",
+            json!({
+                "agentGraphs": ["urn:x-sparkles:import/*"],
+                "imports": {
+                    "base": "urn:x-sparkles:import/",
+                    "secretPatterns": [{ "name": "corp-id", "regex": "CORP-[0-9]{6}" }]
+                },
+                "redaction": {
+                    "personal": ["email"],
+                    "entropy": { "minLength": 20, "minBitsPerChar": 4.0 },
+                    "allow": ["CORP-000000"],
+                    "serverIngest": "redact"
+                }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let doc2 = "Ana Lima moved to the payments team this week.\nContact ana@example.org.\nAllow CORP-000000 but hide CORP-999999.\napi_sig=\"aB3dE6fG9hI2jK5lM8nO1pQ4rS7t\"\n";
+    let res2 = ingest(
+        &app,
+        multipart(
+            "/$/ingest/org",
+            &[(
+                "file",
+                Some("mixed.md"),
+                Some("text/markdown"),
+                doc2.as_bytes(),
+            )],
+        ),
+    )
+    .await;
+    assert_eq!(res2["status"], "done", "{res2}");
+    let r2 = &res2["result"];
+    assert_eq!(r2["redactions"]["email"], 1, "{r2}");
+    assert_eq!(r2["redactions"]["corp-id"], 1, "{r2}");
+    assert_eq!(r2["redactions"]["high-entropy"], 1, "{r2}");
+    let branch = r2["branch"].as_str().unwrap();
+    let rev = review(&app, branch).await;
+    let stored = rev["sources"][0]["text"].as_str().unwrap();
+    assert!(
+        stored.contains("CORP-000000"),
+        "allow-listed value must stay: {stored}"
+    );
+    assert!(!stored.contains("CORP-999999"), "{stored}");
+    assert!(!stored.contains("ana@example.org"), "{stored}");
+    assert!(!stored.contains("aB3dE6fG9hI2jK5lM8nO1pQ4rS7t"), "{stored}");
+
+    // 3. serverIngest: "off" leaves text untouched.
+    let (s, v) = send(
+        &app,
+        req(
+            "PUT",
+            "/$/memory/org",
+            json!({ "redaction": { "serverIngest": "off" } }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let res3 = ingest(
+        &app,
+        multipart(
+            "/$/ingest/org",
+            &[(
+                "file",
+                Some("off.md"),
+                Some("text/markdown"),
+                doc.as_bytes(),
+            )],
+        ),
+    )
+    .await;
+    assert_eq!(res3["status"], "done", "{res3}");
+    assert!(res3["result"].get("redactions").is_none(), "{res3}");
+    let branch3 = res3["result"]["branch"].as_str().unwrap();
+    let rev3 = review(&app, branch3).await;
+    assert!(
+        rev3["sources"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(server_key)
+    );
+}
+
+#[tokio::test]
+async fn register_source_redaction_everywhere_enforces_outside_import_base() {
+    let m = proposals_mock();
+    let server_key = "spkl-everywhere-secret-value-555555";
+    let (_dir, _st, app) = app_with_secret(&m.url(), server_key);
+
+    // By default, graphs outside imports.base are not checked by register_source.
+    let (s, v) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({
+                "graph": "https://example.org/docs/d1",
+                "text": format!("Note with {server_key}")
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    // With redaction.everywhere = true, any graph refuses secrets and opted-in personal data.
+    let (s, v) = send(
+        &app,
+        req(
+            "PUT",
+            "/$/memory/org",
+            json!({ "redaction": { "everywhere": true, "personal": ["email"] } }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    let (s, v) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({
+                "graph": "https://example.org/docs/d2",
+                "text": format!("Leaked {server_key}")
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert_eq!(v["code"], "secret-detected", "{v}");
+    assert_eq!(v["detector"], "server-secret", "{v}");
+    assert!(!v.to_string().contains(server_key), "{v}");
+
+    let (s, v) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({
+                "graph": "https://example.org/docs/d3",
+                "text": "Reach bob@example.org for details"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert_eq!(v["code"], "secret-detected", "{v}");
+    assert_eq!(v["detector"], "email", "{v}");
+}
+
+#[tokio::test]
+async fn csv_draft_redacts_sample_before_model_call() {
+    let server_key = "spkl-csv-secret-token-value-777777";
+    let m = MockModel::start(|r, _| {
+        let s = &r.body["response_format"]["json_schema"]["schema"]["properties"];
+        let pick = |e: &Value, needle: &str| {
+            e["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|v| v.contains(needle))
+                .unwrap()
+                .to_string()
+        };
+        let a = json!({
+            "subjectColumn": "id",
+            "class": pick(&s["class"], "Person"),
+            "columns": [
+                { "column": "id", "predicate": "", "kind": "literal", "datatype": "", "lang": "", "linkClass": "" },
+                { "column": "note", "predicate": "", "kind": "literal", "datatype": "", "lang": "", "linkClass": "" }
+            ]
+        });
+        (200, mock::openai(&a.to_string()))
+    });
+    let (_dir, _st, app) = app_with_secret(&m.url(), server_key);
+    enable(&app).await;
+    let csv = format!("id,note\n1,uses {server_key}\n");
+    let v = ingest(
+        &app,
+        multipart(
+            "/$/ingest/org",
+            &[("file", Some("notes.csv"), Some("text/csv"), csv.as_bytes())],
+        ),
+    )
+    .await;
+    assert_eq!(v["status"], "done", "{v}");
+    assert_eq!(v["result"]["redactions"]["server-secret"], 1, "{v}");
+    for req in m.requests() {
+        let body = req.body.to_string();
+        assert!(
+            !body.contains(server_key),
+            "leaked secret in csv sample: {body}"
+        );
+        assert!(body.contains("[redacted:server-secret]"), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn assistant_status_reports_ingest_and_extract_pairs() {
+    let m = proposals_mock();
+    let (_st, router) = app(Some([&m.url(), &m.url()]));
+    // Initially assistant is disabled, so ingest is off, while status.extract still lists
+    // the server's extract pairs so dataset admins know what turning it on will use.
+    let (s, v) = send(&router, req("GET", "/$/assistant/org", Value::Null)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["status"]["ingest"], false, "{v}");
+    assert_eq!(
+        v["status"]["extract"],
+        json!([{ "provider": "cheap", "model": "m" }, { "provider": "top", "model": "m" }]),
+        "{v}"
+    );
+    // Once enabled with ingest + documents, status.ingest becomes true.
+    enable(&router).await;
+    let (s, v) = send(&router, req("GET", "/$/assistant/org", Value::Null)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["status"]["ingest"], true, "{v}");
+    // Lowering sendByProvider below documents for all extract providers turns ingest off.
+    let (s, v) = send(
+        &router,
+        req(
+            "PUT",
+            "/$/assistant/org",
+            json!({
+                "enabled": true,
+                "ingest": true,
+                "send": "documents",
+                "sendByProvider": { "cheap": "rows", "top": "rows" }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["status"]["ingest"], false, "{v}");
+    // Without model providers configured, status.ingest is false.
+    let (_st2, router2) = app(None);
+    let (s, v) = send(&router2, req("GET", "/$/assistant/org", Value::Null)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["status"]["ingest"], false, "{v}");
+}

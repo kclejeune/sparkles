@@ -589,6 +589,19 @@ impl Models {
         Ok(k)
     }
 
+    /// The values of all readable secrets configured on these models, for exact-value
+    /// redaction before text leaves the server (C18 item 77). Values are never logged
+    /// or returned in responses.
+    pub fn known_secret_values(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for name in self.secrets.keys() {
+            if let Ok(v) = self.read_secret(name) {
+                out.push(v);
+            }
+        }
+        out
+    }
+
     /// The key of provider `name`, read now: `Ok(None)` when it names none.
     fn key(&self, p: &ProviderConfig) -> Result<Option<String>, String> {
         match &p.api_key {

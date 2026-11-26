@@ -166,8 +166,19 @@ pub struct Scan {
 
 /// Run the adapters of `req`.
 pub fn scan(req: &Request) -> Scan {
+    scan_inner(req, None)
+}
+
+/// Run the adapters of `req` with a full redaction [`redact::Policy`] instead of
+/// `req.patterns`.
+pub fn scan_with_policy(req: &Request, policy: &redact::Policy) -> Scan {
+    scan_inner(req, Some(policy))
+}
+
+fn scan_inner(req: &Request, policy: Option<&redact::Policy>) -> Scan {
     let mut s = Scanner {
         req,
+        policy,
         out: Scan::default(),
         seen: HashSet::new(),
     };
@@ -197,6 +208,7 @@ struct Read {
 
 struct Scanner<'a> {
     req: &'a Request<'a>,
+    policy: Option<&'a redact::Policy>,
     out: Scan,
     /// graphs already produced
     seen: HashSet<String>,
@@ -374,7 +386,10 @@ impl Scanner<'_> {
         if crate::is_generated(text) {
             return skip(self, "generated");
         }
-        let r = redact::redact(text, self.req.patterns);
+        let r = match self.policy {
+            Some(p) => p.redact(text),
+            None => redact::redact(text, self.req.patterns),
+        };
         Some(Read {
             modified: mtime(&meta),
             text: r.text,

@@ -339,6 +339,87 @@ pub fn run(ctx: &Ctx, req: &Request) -> (Result<Value, Value>, Value) {
     (out, usage)
 }
 
+/// The result of applying the dataset's `memory.redaction` policy to document text before
+/// server-side ingestion writes it or sends it to a model (C18 item 77).
+pub(super) struct RedactionOutcome {
+    pub text: String,
+    pub title: Option<String>,
+    pub page_starts: Vec<usize>,
+    pub counts: std::collections::BTreeMap<String, usize>,
+}
+
+/// Apply the dataset's `memory.redaction` policy according to `redaction.serverIngest`
+/// (`redact` by default, `refuse` to fail with `secret-detected`, `off` to leave text
+/// unchanged). Never logs or returns secret values.
+pub(super) fn apply_redaction(
+    st: &crate::state::AppState,
+    ds: &crate::state::Dataset,
+    text: &str,
+    title: Option<&str>,
+    page_starts: &[usize],
+) -> Result<RedactionOutcome, Failed> {
+    let memory = crate::assist::memory_settings(st, ds);
+    let mode = memory.server_ingest_redaction();
+    if mode == crate::assist::ServerIngestRedaction::Off {
+        return Ok(RedactionOutcome {
+            text: text.to_string(),
+            title: title.map(str::to_string),
+            page_starts: page_starts.to_vec(),
+            counts: std::collections::BTreeMap::new(),
+        });
+    }
+    let known = if memory.redaction_known_values() {
+        crate::settings::secrets::known_values(st)
+    } else {
+        Vec::new()
+    };
+    let policy = memory.redaction_policy(known, "server-secret");
+    if mode == crate::assist::ServerIngestRedaction::Refuse {
+        for candidate in title.into_iter().chain(std::iter::once(text)) {
+            if let Some((name, at)) = policy.first_match(candidate) {
+                let offset = candidate[..at].chars().count();
+                return Err(Failed(json!({
+                    "code": "secret-detected",
+                    "status": 422,
+                    "message": format!(
+                        "the text matches the secret pattern {name} at character {offset}; nothing was written"
+                    ),
+                    "detector": name,
+                    "pattern": name,
+                    "offset": offset,
+                })));
+            }
+        }
+        return Ok(RedactionOutcome {
+            text: text.to_string(),
+            title: title.map(str::to_string),
+            page_starts: page_starts.to_vec(),
+            counts: std::collections::BTreeMap::new(),
+        });
+    }
+    let (redacted, edits) = policy.redact_with_edits(text);
+    let remapped = sparkles_memory_import::redact::remap_char_offsets(
+        text,
+        &redacted.text,
+        &edits,
+        page_starts,
+    );
+    let mut counts = redacted.counts();
+    let new_title = title.map(|t| {
+        let r = policy.redact(t);
+        for (k, v) in r.counts() {
+            *counts.entry(k).or_default() += v;
+        }
+        r.text
+    });
+    Ok(RedactionOutcome {
+        text: redacted.text,
+        title: new_title,
+        page_starts: remapped,
+        counts,
+    })
+}
+
 /// The dataset's `ingest.json` members of Phase 4.
 pub(crate) struct Limits {
     pub confirm_tokens: u64,
@@ -412,7 +493,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     // 1. conversion
     ctx.progress.status(Status::Converting, 0.05, None);
     r.check()?;
-    let converted = convert::convert(
+    let mut converted = convert::convert(
         &req.bytes,
         format,
         &convert::Options {
@@ -425,11 +506,22 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         },
     )?;
     r.check()?;
-    let title = req
+    let raw_title = req
         .title
         .clone()
         .or_else(|| converted.title.clone())
         .or_else(|| name.clone());
+    let redacted = apply_redaction(
+        st,
+        &ds,
+        &converted.text,
+        raw_title.as_deref(),
+        &converted.page_starts,
+    )?;
+    converted.text = redacted.text;
+    converted.page_starts = redacted.page_starts;
+    let title = redacted.title;
+    let redactions = redacted.counts;
     let iri = req.iri.clone().or_else(|| {
         req.url
             .clone()
@@ -508,7 +600,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     };
     if registered["alreadyRegistered"] == true {
         discard_branch(r, req, branch.as_deref());
-        return Ok(json!({
+        let mut out = json!({
             "outcome": "already-registered",
             "format": format.name(),
             "source": registered["source"],
@@ -518,7 +610,11 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
             "length": registered["length"],
             "message": "the same text is already registered in this graph; nothing was written",
             "prefixes": registered["prefixes"],
-        }));
+        });
+        if !redactions.is_empty() {
+            out["redactions"] = json!(redactions);
+        }
+        return Ok(out);
     }
     let rendition = registered["rendition"].as_str().unwrap_or("").to_string();
     let mut out = json!({
@@ -533,6 +629,9 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         "chunks": chunks.len(),
         "profile": profile,
     });
+    if !redactions.is_empty() {
+        out["redactions"] = json!(redactions);
+    }
     if let Some(b) = &branch {
         out["branch"] = b.clone().into();
         out["review"] = review_link(&ds.name, b).into();
@@ -752,10 +851,19 @@ fn run_existing(r: &mut Run, req: &Request, source: &str) -> Result<Value, Faile
         chunks,
         ..
     } = read_source(r, source, None)?;
-    let title = req
+    let raw_title = req
         .title
         .clone()
         .or_else(|| found["title"].as_str().map(str::to_string));
+    let redacted = apply_redaction(st, &ds, &text, raw_title.as_deref(), &[])?;
+    let redactions = redacted.counts;
+    let (text, chunks) = if redactions.is_empty() {
+        (text, chunks)
+    } else {
+        let new_chunks = crate::mcp::memory::ingest::chunk_bounds(&redacted.text, false);
+        (redacted.text, new_chunks)
+    };
+    let title = redacted.title;
     if req.mode == Mode::Memory && !crate::assist::memory_settings(st, &ds).is_agent_graph(&graph) {
         return Err(Failed::new(
             "not-agent-memory",
@@ -798,6 +906,9 @@ fn run_existing(r: &mut Run, req: &Request, source: &str) -> Result<Value, Faile
         "chunks": chunks.len(),
         "profile": profile,
     });
+    if !redactions.is_empty() {
+        out["redactions"] = json!(redactions);
+    }
     if let Some(b) = &branch {
         out["branch"] = b.clone().into();
         out["review"] = review_link(&ds.name, b).into();
