@@ -618,8 +618,9 @@ fn spin_dual_form_fallback_anon_subquery_scope_and_named_shapes_value_type() {
         "SHACL-SPARQL must still reject MINUS in fallback sp:text"
     );
 
-    // 2. Mixed RDF + sp:SubQuery sp:text projecting ?_spin_v1 does not capture outer WHERE
-    //    bare blank node, and CONSTRUCT template blank nodes stay distinct per solution.
+    // 2. Mixed RDF + sp:SubQuery sp:text projecting ?_spin_v1 (including after a CR-terminated
+    //    comment) does not capture outer WHERE bare blank node, and CONSTRUCT template blank
+    //    nodes stay distinct per solution.
     let s_mixed = store_of(
         r#"
         ex:A spin:rule [
@@ -633,7 +634,7 @@ fn spin_dual_form_fallback_anon_subquery_scope_and_named_shapes_value_type() {
             [ a sp:SubQuery ;
               sp:query [
                 a sp:Select ;
-                sp:text "SELECT ?_spin_v1 ?v WHERE { ?_spin_v1 <http://example.org/other> ?v }"
+                sp:text "SELECT # cr comment\r ?_spin_v1 ?v WHERE { ?_spin_v1 <http://example.org/other> ?v } # end"
               ] ]
           )
         ] .
@@ -718,6 +719,138 @@ fn spin_dual_form_fallback_anon_subquery_scope_and_named_shapes_value_type() {
     .unwrap_err();
     assert!(
         format!("{err:#}").contains("expects an instance of"),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn spin_round2_nested_select_bound_fallback_focus_and_triple_terms() {
+    // 1. FILTER BOUND(?arg) + nested SELECT ?arg in both text and RDF templates, plus
+    //    dual-form sp:Select -> CONSTRUCT sp:text fallback and spin:_this sp:varName "this"
+    //    on a class with multiple focus nodes.
+    let s = store_of(
+        r#"
+        spin:_this a sp:Variable ; sp:varName "this" .
+        ex:TextTmpl a spin:ConstructTemplate ;
+          spin:constraint [ a spl:Argument ; spl:predicate ex:tag ] ;
+          spin:body [
+            a sp:Construct ;
+            sp:text """
+              CONSTRUCT { ?this <http://example.org/textTag> ?tag }
+              WHERE {
+                { SELECT ?tag WHERE { { SELECT ?tag WHERE { ?this <http://example.org/seed> ?tag } } } }
+                FILTER BOUND(?tag)
+              }
+            """
+          ] .
+        ex:RdfTmpl a spin:ConstructTemplate ;
+          spin:constraint [ a spl:Argument ; spl:predicate ex:tag ] ;
+          spin:body [
+            a sp:Construct ;
+            sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:rdfTag ; sp:object [ sp:varName "tag" ] ] ) ;
+            sp:where (
+              [ a sp:SubQuery ;
+                sp:query [
+                  a sp:Select ;
+                  sp:resultVariables ( [ sp:varName "tag" ] ) ;
+                  sp:where (
+                    [ a sp:SubQuery ;
+                      sp:query [
+                        a sp:Select ;
+                        sp:resultVariables ( [ sp:varName "tag" ] ) ;
+                        sp:where ( [ sp:subject spin:_this ; sp:predicate ex:seed ; sp:object [ sp:varName "tag" ] ] )
+                      ] ]
+                  )
+                ] ]
+            )
+          ] .
+        ex:Item spin:rule [ a ex:TextTmpl ; ex:tag ex:Gold ] ;
+                spin:rule [ a ex:RdfTmpl ; ex:tag ex:Gold ] ;
+                spin:rule [
+                  a sp:Select ;
+                  sp:where () ;
+                  sp:text "CONSTRUCT { ?this <http://example.org/fallback> true } WHERE { ?this <http://example.org/seed> <http://example.org/Gold> }"
+                ] .
+        ex:i1 a ex:Item ; ex:seed ex:Gold .
+        ex:i2 a ex:Item ; ex:seed ex:Gold .
+        "#,
+    );
+    run(&s, ShaclAf::default()).unwrap();
+    let got = inferred(&s);
+    assert!(got.contains("i1 textTag Gold"), "{got:?}");
+    assert!(got.contains("i2 textTag Gold"), "{got:?}");
+    assert!(got.contains("i1 rdfTag Gold"), "{got:?}");
+    assert!(got.contains("i2 rdfTag Gold"), "{got:?}");
+    assert!(got.iter().any(|t| t.starts_with("i1 fallback")), "{got:?}");
+    assert!(got.iter().any(|t| t.starts_with("i2 fallback")), "{got:?}");
+
+    // 2. Conflicting spin:_this sp:varName "other" is refused even when ex:other is supplied
+    let s_rename = store_of(
+        r#"
+        spin:_this sp:varName "other" .
+        ex:T a spin:ConstructTemplate ;
+          spin:constraint [ a spl:Argument ; spl:predicate ex:other ] ;
+          spin:body [
+            a sp:Construct ;
+            sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:hit ; sp:object true ] ) ;
+            sp:where ( [ sp:subject spin:_this ; sp:predicate ex:ready ; sp:object true ] )
+          ] .
+        ex:Item spin:rule [ a ex:T ; ex:other ex:Fake ] .
+        ex:i1 a ex:Item ; ex:ready true .
+        ex:i2 a ex:Item ; ex:ready true .
+        "#,
+    );
+    assert!(run(&s_rename, ShaclAf::default()).is_err());
+
+    // 3. Embedded RDF 1.2 triple term in an RDF WHERE pattern matches the ground triple term
+    //    directly (`<<( s p o )>>`, not a reified blank node), while a triple term in a
+    //    CONSTRUCT template is parsed as TermPattern::Triple and cleanly refused by SHACL-AF.
+    let s_tt_where = Store::in_memory(StoreOptions::default());
+    s_tt_where
+        .load(&[Source::from_bytes(
+            format!(
+                r#"{PREFIXES}
+                ex:Item spin:rule [
+                  a sp:Construct ;
+                  sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:matched ; sp:object true ] ) ;
+                  sp:where ( [ sp:subject spin:_this ; sp:predicate ex:claim ; sp:object <<( ex:s ex:p ex:o )>> ] )
+                ] .
+                ex:i1 a ex:Item ; ex:claim <<( ex:s ex:p ex:o )>> .
+                "#
+            )
+            .into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    run(&s_tt_where, ShaclAf::default()).unwrap();
+    let got_tt = inferred(&s_tt_where);
+    assert!(
+        got_tt.iter().any(|t| t.starts_with("i1 matched")),
+        "ground triple term in WHERE must match directly without rdf:reifies expansion: {got_tt:?}"
+    );
+
+    let s_tt_head = Store::in_memory(StoreOptions::default());
+    s_tt_head
+        .load(&[Source::from_bytes(
+            format!(
+                r#"{PREFIXES}
+                ex:Item spin:rule [
+                  a sp:Construct ;
+                  sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:claim ; sp:object <<( ex:s ex:p ex:o )>> ] ) ;
+                  sp:where ( [ sp:subject spin:_this ; sp:predicate ex:ready ; sp:object true ] )
+                ] .
+                ex:i1 a ex:Item ; ex:ready true .
+                "#
+            )
+            .into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let err = run(&s_tt_head, ShaclAf::default()).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("triple terms in a rule's template"),
         "{err:#}"
     );
 }

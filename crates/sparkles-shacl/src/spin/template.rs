@@ -2,18 +2,18 @@
 //! `spl:Argument`, `spl:predicate`, `spl:defaultValue`, `spl:optional`, `spl:valueType`)
 //! with `rdfs:subClassOf` inheritance, work bounds, and cycle detection.
 
-use super::ExtraTypes;
 use super::rdf::{
-    MAX_DEPTH, MAX_OUTPUT_BYTES, WorkBudget, has_rdf_query_structure, is_instance_bounded,
-    is_limit_or_cycle_error, limit_err, parse_spin_bool, push_str_bounded,
-    serialize_query_with_bindings, single_object, spin_var_name, validate_var_name,
-    write_term_value,
+    MAX_DEPTH, MAX_OUTPUT_BYTES, WorkBudget, check_and_own_iri, check_and_own_term,
+    has_rdf_query_structure, is_instance_bounded, is_limit_or_cycle_error, limit_err,
+    parse_spin_bool_ref, push_str_bounded, serialize_query_with_bindings, single_object,
+    single_object_ref, spin_var_name, validate_var_name, write_term_value,
 };
 use super::vocab::{sp, spin, spl};
+use super::{CandidateCheck, ExtraTypes};
 use crate::shapes::{G, as_subject};
 use crate::vocab::{rdf, rdfs};
 use anyhow::{Context as _, Result, anyhow, bail};
-use oxrdf::{NamedNode, Term};
+use oxrdf::{NamedNode, Term, TermRef};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeMap, VecDeque};
 
@@ -89,8 +89,8 @@ fn direct_superclasses(
         g.g.objects_for_subject_predicate(cls.as_ref(), rdfs::SUB_CLASS_OF)
     {
         budget.step()?;
-        if let oxrdf::TermRef::NamedNode(n) = t {
-            supers.push(n.into_owned());
+        if let TermRef::NamedNode(n) = t {
+            supers.push(check_and_own_iri(n, budget)?);
         }
     }
     supers.sort_by(|a, b| a.as_str().cmp(b.as_str()));
@@ -222,7 +222,7 @@ pub(crate) fn template_of_call(
     let mut types: Vec<NamedNode> = Vec::new();
     for t in g.g.objects_for_subject_predicate(sub, rdf::TYPE) {
         budget.step()?;
-        if let oxrdf::TermRef::NamedNode(n) = t
+        if let TermRef::NamedNode(n) = t
             && !is_direct_sp_query_class(n.as_str())
             && !matches!(
                 n.as_str(),
@@ -230,7 +230,7 @@ pub(crate) fn template_of_call(
                     | "http://www.w3.org/2002/07/owl#Thing"
             )
         {
-            types.push(n.into_owned());
+            types.push(check_and_own_iri(n, budget)?);
         }
     }
     types.sort_by(|a, b| a.as_str().cmp(b.as_str()));
@@ -314,15 +314,15 @@ fn resolve_template(
                 g.g.objects_for_subject_predicate(cls.as_ref(), spin::CONSTRAINT)
             {
                 budget.step()?;
-                constraints.push(c.into_owned());
+                constraints.push(check_and_own_term(c, budget)?);
             }
             constraints.sort_by_cached_key(ToString::to_string);
             for c in constraints {
                 if !is_instance_bounded(g, &c, spl::ARGUMENT, budget)? {
                     continue;
                 }
-                let pred = match single_object(g, &c, spl::PREDICATE, budget)? {
-                    Some(Term::NamedNode(p)) => p,
+                let pred = match single_object_ref(g, &c, spl::PREDICATE, budget)? {
+                    Some(TermRef::NamedNode(p)) => check_and_own_iri(p, budget)?,
                     Some(other) => {
                         bail!(
                             "spl:predicate of argument {c} in {cls} must be an IRI, found {other}"
@@ -343,17 +343,17 @@ fn resolve_template(
                         "spl:predicate {pred} of SPIN template {cls} cannot use the reserved variable name ?this"
                     );
                 }
-                let optional = match single_object(g, &c, spl::OPTIONAL, budget)? {
+                let optional = match single_object_ref(g, &c, spl::OPTIONAL, budget)? {
                     None => None,
-                    Some(ref t) => Some(parse_spin_bool(
+                    Some(t) => Some(parse_spin_bool_ref(
                         t,
                         &format!("spl:optional of argument {c} in {cls}"),
                     )?),
                 };
                 let default_value = single_object(g, &c, spl::DEFAULT_VALUE, budget)?;
-                let value_type = match single_object(g, &c, spl::VALUE_TYPE, budget)? {
+                let value_type = match single_object_ref(g, &c, spl::VALUE_TYPE, budget)? {
                     None => None,
-                    Some(Term::NamedNode(vt)) => Some(vt),
+                    Some(TermRef::NamedNode(vt)) => Some(check_and_own_iri(vt, budget)?),
                     Some(other) => {
                         bail!(
                             "spl:valueType of argument {c} in {cls} must be an IRI, found {other}"
@@ -496,7 +496,9 @@ fn is_class_member(
             if obj == target.as_ref() {
                 return Ok(true);
             }
-            stack.push(obj.into_owned());
+            if matches!(obj, TermRef::NamedNode(_) | TermRef::BlankNode(_)) {
+                stack.push(check_and_own_term(obj, budget)?);
+            }
         }
     }
     if let Some(ex) = extra {
@@ -537,7 +539,9 @@ fn is_class_member(
                 if sup == target.as_ref() {
                     return Ok(true);
                 }
-                stack.push(sup.into_owned());
+                if matches!(sup, TermRef::NamedNode(_) | TermRef::BlankNode(_)) {
+                    stack.push(check_and_own_term(sup, budget)?);
+                }
             }
         }
         if let Some(ex) = extra {
@@ -614,6 +618,7 @@ pub(crate) fn expand_template_call(
     extra: Option<&ExtraTypes<'_>>,
     call: &Term,
     template: &NamedNode,
+    check: Option<&CandidateCheck<'_>>,
     budget: &mut WorkBudget,
     cache: &mut HierarchyCache,
 ) -> Result<String> {
@@ -624,6 +629,7 @@ pub(crate) fn expand_template_call(
         extra,
         call,
         template,
+        check,
         &outer,
         &mut active,
         0,
@@ -638,6 +644,7 @@ fn expand_inner(
     extra: Option<&ExtraTypes<'_>>,
     call: &Term,
     template: &NamedNode,
+    check: Option<&CandidateCheck<'_>>,
     outer_bindings: &FxHashMap<String, Option<Term>>,
     active_templates: &mut FxHashSet<NamedNode>,
     depth: usize,
@@ -732,6 +739,7 @@ fn expand_inner(
                 extra,
                 &def.body,
                 &inner_template,
+                check,
                 &bindings,
                 active_templates,
                 depth + 1,
@@ -740,21 +748,28 @@ fn expand_inner(
             );
         }
         if has_rdf_query_structure(g, &def.body) {
-            match serialize_query_with_bindings(g, &def.body, &bindings, budget) {
+            let rdf_res =
+                serialize_query_with_bindings(g, &def.body, &bindings, budget).and_then(|q| {
+                    if let Some(c) = check {
+                        c.validate(&q)?;
+                    }
+                    Ok(q)
+                });
+            match rdf_res {
                 Ok(q) => return Ok(q),
                 Err(rdf_err) => {
                     if !is_limit_or_cycle_error(&rdf_err)
-                        && let Some(Term::Literal(lit)) =
-                            single_object(g, &def.body, sp::TEXT, budget)?
+                        && let Some(TermRef::Literal(lit)) =
+                            single_object_ref(g, &def.body, sp::TEXT, budget)?
                     {
-                        return substitute_sparql_text(lit.value(), &bindings);
+                        return substitute_sparql_text(lit.value(), &bindings, budget);
                     }
                     return Err(rdf_err);
                 }
             }
         }
-        match single_object(g, &def.body, sp::TEXT, budget)? {
-            Some(Term::Literal(lit)) => substitute_sparql_text(lit.value(), &bindings),
+        match single_object_ref(g, &def.body, sp::TEXT, budget)? {
+            Some(TermRef::Literal(lit)) => substitute_sparql_text(lit.value(), &bindings, budget),
             Some(other) => bail!(
                 "the sp:text of spin:body {} in SPIN template {template} is {other}, not a string",
                 def.body
@@ -897,18 +912,23 @@ fn scan_pn_local(text: &str, start: usize) -> usize {
 }
 
 /// Try to scan a SPARQL 1.1 `PNAME_NS` / `PNAME_LN` starting at `start` (where `text[start..]`
-/// begins with `PN_CHARS_BASE`). Returns `Some(end)` if a `:` follows a valid `PN_PREFIX`.
-fn try_scan_prefixed_name(text: &str, start: usize) -> Option<usize> {
+/// begins with `PN_CHARS_BASE`). Returns `Ok(end)` if a `:` follows a valid `PN_PREFIX`, or
+/// `Err(failed_at)` with the end of the scanned prefix run so the caller never rescans it.
+fn try_scan_prefixed_name(text: &str, start: usize) -> std::result::Result<usize, usize> {
     let b = text.as_bytes();
     let mut j = start;
-    let first = text[j..].chars().next()?;
+    let Some(first) = text[j..].chars().next() else {
+        return Err(j);
+    };
     if !pn_chars_base(first) {
-        return None;
+        return Err(j);
     }
     j += first.len_utf8();
     let mut last_non_dot = j;
     while j < b.len() {
-        let c = text[j..].chars().next()?;
+        let Some(c) = text[j..].chars().next() else {
+            break;
+        };
         if pn_chars(c) {
             j += c.len_utf8();
             last_non_dot = j;
@@ -919,9 +939,9 @@ fn try_scan_prefixed_name(text: &str, start: usize) -> Option<usize> {
         }
     }
     if last_non_dot == j && b.get(j) == Some(&b':') {
-        Some(scan_pn_local(text, j + 1))
+        Ok(scan_pn_local(text, j + 1))
     } else {
-        None
+        Err(j)
     }
 }
 
@@ -966,24 +986,31 @@ impl Tok {
     }
 }
 
-/// Tokenize a SPARQL 1.1 query string into non-whitespace, non-comment tokens while
-/// preserving exact byte offsets.
-fn tokenize_sparql(text: &str) -> Vec<Tok> {
+/// Tokenize a SPARQL 1.1/1.2 query string into non-whitespace, non-comment tokens in a
+/// single forward-only O(n) pass while preserving exact byte offsets and charging `budget`.
+fn tokenize_sparql(text: &str, budget: &mut WorkBudget) -> Result<Vec<Tok>> {
     let mut tokens = Vec::new();
     let b = text.as_bytes();
     let mut i = 0usize;
+    let mut no_pname_before = 0usize;
+    let mut next_byte_charge = 256usize;
 
     while i < b.len() {
+        while i >= next_byte_charge {
+            budget.step()?;
+            next_byte_charge = next_byte_charge.saturating_add(256);
+        }
         if b[i].is_ascii_whitespace() {
             i += 1;
             continue;
         }
         if b[i] == b'#' {
-            while i < b.len() && b[i] != b'\n' {
+            while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
                 i += 1;
             }
             continue;
         }
+        budget.step()?;
         match b[i] {
             q @ (b'"' | b'\'') => {
                 let start = i;
@@ -997,18 +1024,12 @@ fn tokenize_sparql(text: &str) -> Vec<Tok> {
                                 .and_then(|s| s.chars().next())
                                 .map_or(0, char::len_utf8);
                             j = (j + 1 + next_len).min(b.len());
-                        } else if b[j] == q {
-                            let mut run = 0usize;
-                            while j + run < b.len() && b[j + run] == q {
-                                run += 1;
-                            }
-                            if run >= 3 {
-                                // SPARQL 1.1 STRING_LITERAL_LONG1/2 permits up to 2 content
-                                // quotes immediately before the 3 closing quotes (3..=5 total).
-                                j += run.min(5);
-                                break;
-                            }
-                            j += run;
+                        } else if b[j..].starts_with(&[q, q, q]) {
+                            // SPARQL STRING_LITERAL_LONG1/2 closes at the first unescaped
+                            // triple-quote delimiter (any quote inside before closing must
+                            // be followed by a non-quote char or escaped as `\"` / `\'`).
+                            j += 3;
+                            break;
                         } else {
                             let ch_len = text[j..].chars().next().map_or(1, char::len_utf8);
                             j += ch_len;
@@ -1046,9 +1067,26 @@ fn tokenize_sparql(text: &str) -> Vec<Tok> {
                 let start = i;
                 let mut j = i + 1;
                 while let Some(&c) = b.get(j) {
+                    if c == b'\\' {
+                        if b.get(j + 1) == Some(&b'u')
+                            && b.get(j + 2..j + 6)
+                                .is_some_and(|s| s.iter().all(u8::is_ascii_hexdigit))
+                        {
+                            j += 6;
+                            continue;
+                        }
+                        if b.get(j + 1) == Some(&b'U')
+                            && b.get(j + 2..j + 10)
+                                .is_some_and(|s| s.iter().all(u8::is_ascii_hexdigit))
+                        {
+                            j += 10;
+                            continue;
+                        }
+                        break;
+                    }
                     if c == b'>'
                         || c <= b' '
-                        || matches!(c, b'<' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`' | b'\\')
+                        || matches!(c, b'<' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`')
                     {
                         break;
                     }
@@ -1198,14 +1236,21 @@ fn tokenize_sparql(text: &str) -> Vec<Tok> {
                 let start = i;
                 let c = text[i..].chars().next().unwrap();
                 if pn_chars_base(c) {
-                    if let Some(end) = try_scan_prefixed_name(text, i) {
-                        i = end;
-                        tokens.push(Tok {
-                            kind: TokKind::PrefixedName,
-                            start,
-                            end: i,
-                        });
-                        continue;
+                    if i >= no_pname_before {
+                        match try_scan_prefixed_name(text, i) {
+                            Ok(end) => {
+                                i = end;
+                                tokens.push(Tok {
+                                    kind: TokKind::PrefixedName,
+                                    start,
+                                    end: i,
+                                });
+                                continue;
+                            }
+                            Err(failed_at) => {
+                                no_pname_before = failed_at;
+                            }
+                        }
                     }
                     let mut j = i + c.len_utf8();
                     while j < b.len() {
@@ -1235,165 +1280,596 @@ fn tokenize_sparql(text: &str) -> Vec<Tok> {
             }
         }
     }
-    tokens
+    while i >= next_byte_charge {
+        budget.step()?;
+        next_byte_charge = next_byte_charge.saturating_add(256);
+    }
+    Ok(tokens)
 }
 
 /// Collect every SPARQL variable name (`?name` / `$name`) referenced outside comments,
-/// string literals, IRIs, and prefixed names in `text`.
-pub(crate) fn collect_sparql_text_vars(text: &str, out: &mut FxHashSet<String>) {
-    for tok in tokenize_sparql(text) {
+/// string literals, IRIs, and prefixed names in `text`, charging `budget`.
+pub(crate) fn collect_sparql_text_vars(
+    text: &str,
+    out: &mut FxHashSet<String>,
+    budget: &mut WorkBudget,
+) -> Result<()> {
+    for tok in tokenize_sparql(text, budget)? {
         if let Some(name) = tok.var_name(text) {
             out.insert(name.to_string());
         }
     }
+    Ok(())
 }
 
-fn skip_balanced_parens(tokens: &[Tok], start: usize) -> usize {
-    let mut depth = 0usize;
-    let mut k = start;
-    while k < tokens.len() {
-        match tokens[k].kind {
-            TokKind::LParen => depth += 1,
-            TokKind::RParen => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return k + 1;
+/// Validate that `text` represents a single valid SPARQL `SubSelect` (starting with `SELECT`,
+/// balanced `{}` braces that cannot escape the subquery block, and no dataset clauses or
+/// prologue), charging `budget`.
+pub(crate) fn validate_subquery_text(text: &str, budget: &mut WorkBudget) -> Result<()> {
+    if text.len() > MAX_OUTPUT_BYTES {
+        return Err(limit_err(format!(
+            "SPIN sp:text exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
+        )));
+    }
+    let tokens = tokenize_sparql(text, budget)?;
+    let Some(first) = tokens.first() else {
+        bail!("sp:SubQuery sp:text is empty");
+    };
+    if !first.is_word(text, "SELECT") {
+        bail!("sp:SubQuery sp:text must be a SELECT query");
+    }
+    let mut brace_depth: isize = 0;
+    let mut prefixes: FxHashSet<&str> = FxHashSet::default();
+    for tok in &tokens {
+        match tok.kind {
+            TokKind::LBrace => brace_depth += 1,
+            TokKind::RBrace => {
+                brace_depth -= 1;
+                if brace_depth < 0 {
+                    bail!("sp:SubQuery sp:text has unmatched closing brace");
+                }
+            }
+            TokKind::PrefixedName => {
+                if let Some((prefix, _)) = tok.as_str(text).split_once(':') {
+                    prefixes.insert(prefix);
                 }
             }
             _ => {}
         }
-        k += 1;
     }
-    k
+    if brace_depth != 0 {
+        bail!("sp:SubQuery sp:text has unbalanced braces");
+    }
+    let mut wrapped = String::with_capacity(text.len().saturating_add(64));
+    for p in prefixes {
+        wrapped.push_str("PREFIX ");
+        wrapped.push_str(p);
+        wrapped.push_str(": <urn:sparkles:spin-subquery-check:ns/>\n");
+    }
+    wrapped.push_str("SELECT * WHERE { {\n");
+    wrapped.push_str(text);
+    wrapped.push_str("\n} }");
+    sparkles_core::sparql::parse_query(&wrapped, None, &[])
+        .map_err(|e| anyhow!("invalid sp:SubQuery sp:text: {e}"))?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VarPosRewrite {
     Plain,
+    /// Keep the bare variable `?arg` unchanged because an inner query already exports it.
+    KeepVar,
     /// Bare bound variable in `SELECT ?arg` -> `(<term> AS ?arg)`.
     SelectBind,
     /// Bare bound variable in `GROUP BY ?arg` or `ORDER BY ?arg` -> `(<term>)`.
     ParenTerm,
 }
 
-/// Token-aware substitution of template argument bindings into a SPARQL `sp:text` query.
-///
-/// - Tokenizes string literals (`'...'`, `"..."`, `'''...'''`, `"""..."""` including 4–5
-///   closing quotes), IRI references (`<...>`), prefixed names (`PNAME_NS`/`PNAME_LN` with
-///   `-`/`.`/`PLX`), blank node labels, language tags, and `#` comments atomically.
-/// - Rewrites `BOUND(?arg)` / `BOUND($arg)` to `true` when `?arg` is bound.
-/// - Refuses `AS ?arg` and `VALUES ... ?arg` headers when `?arg` is bound.
-/// - Preserves valid SPARQL syntax in `SELECT ?arg` (`(<val> AS ?arg)`), `GROUP BY ?arg`
-///   (`(<val>)`), and `ORDER BY ?arg` (`(<val>)`).
-/// - Avoids merging `<` with a substituted `<iri>` into RDF-star `<<` (or `>` with `>`).
-/// - Never substitutes the reserved focus variable `?this`.
-pub(crate) fn substitute_sparql_text(
-    text: &str,
-    bindings: &FxHashMap<String, Option<Term>>,
-) -> Result<String> {
-    if text.len() > MAX_OUTPUT_BYTES {
-        return Err(limit_err(format!(
-            "SPIN sp:text exceeds maximum size ({MAX_OUTPUT_BYTES} bytes)"
-        )));
-    }
-    let tokens = tokenize_sparql(text);
-    let mut var_rewrites = vec![VarPosRewrite::Plain; tokens.len()];
+fn is_aggregate_keyword(tok: Tok, text: &str) -> bool {
+    tok.kind == TokKind::Word
+        && (tok.is_word(text, "COUNT")
+            || tok.is_word(text, "SUM")
+            || tok.is_word(text, "AVG")
+            || tok.is_word(text, "MIN")
+            || tok.is_word(text, "MAX")
+            || tok.is_word(text, "SAMPLE")
+            || tok.is_word(text, "GROUP_CONCAT"))
+}
 
-    // Pre-mark bare variables in SELECT, GROUP BY, and ORDER BY clauses, and validate
-    // VALUES variable headers.
-    let mut idx = 0usize;
-    while idx < tokens.len() {
-        let tok = tokens[idx];
-        if tok.is_word(text, "SELECT") {
-            let mut k = idx + 1;
-            if k < tokens.len()
-                && (tokens[k].is_word(text, "DISTINCT") || tokens[k].is_word(text, "REDUCED"))
-            {
+fn compute_delimiters(tokens: &[Tok]) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
+    let mut matching_rparen = vec![None; tokens.len()];
+    let mut matching_rbrace = vec![None; tokens.len()];
+    let mut paren_stack = Vec::new();
+    let mut brace_stack = Vec::new();
+    for (idx, tok) in tokens.iter().enumerate() {
+        match tok.kind {
+            TokKind::LParen => paren_stack.push(idx),
+            TokKind::RParen => {
+                if let Some(open) = paren_stack.pop() {
+                    matching_rparen[open] = Some(idx);
+                }
+            }
+            TokKind::LBrace => brace_stack.push(idx),
+            TokKind::RBrace => {
+                if let Some(open) = brace_stack.pop() {
+                    matching_rbrace[open] = Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    (matching_rparen, matching_rbrace)
+}
+
+struct TextAnalyzer<'a, 'b> {
+    text: &'a str,
+    tokens: &'a [Tok],
+    matching_rparen: Vec<Option<usize>>,
+    matching_rbrace: Vec<Option<usize>>,
+    bindings: &'a FxHashMap<String, Option<Term>>,
+    var_rewrites: &'b mut [VarPosRewrite],
+    budget: &'b mut WorkBudget,
+}
+
+impl TextAnalyzer<'_, '_> {
+    fn is_bound(&self, var: &str) -> bool {
+        var != "this" && self.bindings.get(var).is_some_and(Option::is_some)
+    }
+
+    fn skip_paren(&self, idx: usize, end: usize) -> usize {
+        self.matching_rparen[idx].map_or(end, |close| (close + 1).min(end))
+    }
+
+    fn check_values_header(&mut self, values_idx: usize, end: usize) -> Result<usize> {
+        let mut k = values_idx + 1;
+        if k >= end {
+            return Ok(k);
+        }
+        let next = self.tokens[k];
+        if let Some(var) = next.var_name(self.text) {
+            if self.is_bound(var) {
+                bail!("SPIN template body uses bound argument ?{var} in VALUES");
+            }
+            return Ok(k + 1);
+        }
+        if next.kind == TokKind::LParen {
+            k += 1;
+            while k < end {
+                let t = self.tokens[k];
+                if t.kind == TokKind::RParen {
+                    return Ok(k + 1);
+                }
+                if matches!(t.kind, TokKind::LBrace | TokKind::RBrace)
+                    || t.is_word(self.text, "VALUES")
+                {
+                    break;
+                }
+                if let Some(var) = t.var_name(self.text)
+                    && self.is_bound(var)
+                {
+                    bail!("SPIN template body uses bound argument ?{var} in VALUES");
+                }
                 k += 1;
             }
-            while k < tokens.len() {
-                match tokens[k].kind {
+        }
+        Ok(k)
+    }
+
+    /// Analyze an expression range for nested `{ ... }` patterns (e.g. `EXISTS { ... }`) and
+    /// return whether an aggregate keyword appears at this expression level.
+    fn analyze_expr_range(&mut self, start: usize, end: usize, depth: usize) -> Result<bool> {
+        if depth > MAX_DEPTH * 2 {
+            return Err(limit_err(format!(
+                "SPARQL text exceeds maximum nesting depth ({})",
+                MAX_DEPTH * 2
+            )));
+        }
+        let mut has_agg = false;
+        let mut k = start;
+        while k < end {
+            let tok = self.tokens[k];
+            if tok.kind == TokKind::LBrace {
+                let rb = self.matching_rbrace[k].unwrap_or(end).min(end);
+                if k + 1 < rb && self.tokens[k + 1].is_word(self.text, "SELECT") {
+                    self.analyze_select(k + 1, rb, depth + 1)?;
+                } else {
+                    self.analyze_group_pattern(k + 1, rb, depth + 1)?;
+                }
+                k = (rb + 1).min(end);
+                continue;
+            }
+            if is_aggregate_keyword(tok, self.text) {
+                has_agg = true;
+            }
+            k += 1;
+        }
+        Ok(has_agg)
+    }
+
+    fn scan_group_by(
+        &mut self,
+        start: usize,
+        end: usize,
+        body_exported: &FxHashSet<String>,
+        depth: usize,
+    ) -> Result<(usize, FxHashSet<String>)> {
+        let mut k = start;
+        let mut group_exported = FxHashSet::default();
+        while k < end {
+            let tok = self.tokens[k];
+            match tok.kind {
+                TokKind::LParen => {
+                    let next_k = self.skip_paren(k, end);
+                    self.analyze_expr_range(k + 1, next_k.saturating_sub(1), depth + 1)?;
+                    k = next_k;
+                }
+                TokKind::Var => {
+                    if let Some(var) = tok.var_name(self.text)
+                        && self.is_bound(var)
+                        && body_exported.contains(var)
+                    {
+                        self.var_rewrites[k] = VarPosRewrite::KeepVar;
+                        group_exported.insert(var.to_string());
+                    } else {
+                        self.var_rewrites[k] = VarPosRewrite::ParenTerm;
+                    }
+                    k += 1;
+                }
+                TokKind::LBrace | TokKind::RBrace => break,
+                TokKind::Word
+                    if tok.is_word(self.text, "GROUP")
+                        || tok.is_word(self.text, "HAVING")
+                        || tok.is_word(self.text, "ORDER")
+                        || tok.is_word(self.text, "LIMIT")
+                        || tok.is_word(self.text, "OFFSET")
+                        || tok.is_word(self.text, "VALUES")
+                        || tok.is_word(self.text, "SELECT")
+                        || tok.is_word(self.text, "WHERE") =>
+                {
+                    break;
+                }
+                _ => k += 1,
+            }
+        }
+        Ok((k, group_exported))
+    }
+
+    fn scan_order_by(&mut self, start: usize, end: usize, depth: usize) -> Result<usize> {
+        let mut k = start;
+        while k < end {
+            let tok = self.tokens[k];
+            match tok.kind {
+                TokKind::LParen => {
+                    let next_k = self.skip_paren(k, end);
+                    self.analyze_expr_range(k + 1, next_k.saturating_sub(1), depth + 1)?;
+                    k = next_k;
+                }
+                TokKind::Var => {
+                    self.var_rewrites[k] = VarPosRewrite::ParenTerm;
+                    k += 1;
+                }
+                TokKind::LBrace | TokKind::RBrace => break,
+                TokKind::Word
+                    if tok.is_word(self.text, "ORDER")
+                        || tok.is_word(self.text, "GROUP")
+                        || tok.is_word(self.text, "HAVING")
+                        || tok.is_word(self.text, "LIMIT")
+                        || tok.is_word(self.text, "OFFSET")
+                        || tok.is_word(self.text, "VALUES")
+                        || tok.is_word(self.text, "SELECT")
+                        || tok.is_word(self.text, "WHERE") =>
+                {
+                    break;
+                }
+                _ => k += 1,
+            }
+        }
+        Ok(k)
+    }
+
+    fn analyze_select(
+        &mut self,
+        sel_idx: usize,
+        end: usize,
+        depth: usize,
+    ) -> Result<FxHashSet<String>> {
+        if depth > MAX_DEPTH * 2 {
+            return Err(limit_err(format!(
+                "SPARQL text exceeds maximum nesting depth ({})",
+                MAX_DEPTH * 2
+            )));
+        }
+        self.budget.step()?;
+        let mut k = sel_idx + 1;
+        if k < end
+            && (self.tokens[k].is_word(self.text, "DISTINCT")
+                || self.tokens[k].is_word(self.text, "REDUCED"))
+        {
+            k += 1;
+        }
+        let mut is_star = false;
+        let mut proj_vars: Vec<(usize, &str)> = Vec::new();
+        let mut has_agg = false;
+        if k < end
+            && self.tokens[k].kind == TokKind::Other
+            && self.tokens[k].as_str(self.text) == "*"
+        {
+            is_star = true;
+            k += 1;
+        } else {
+            while k < end {
+                match self.tokens[k].kind {
                     TokKind::LParen => {
-                        k = skip_balanced_parens(&tokens, k);
+                        let next_k = self.skip_paren(k, end);
+                        if self.analyze_expr_range(k + 1, next_k.saturating_sub(1), depth + 1)? {
+                            has_agg = true;
+                        }
+                        k = next_k;
                     }
                     TokKind::Var => {
-                        var_rewrites[k] = VarPosRewrite::SelectBind;
+                        if let Some(var) = self.tokens[k].var_name(self.text) {
+                            proj_vars.push((k, var));
+                        }
                         k += 1;
                     }
                     _ => break,
                 }
             }
-        } else if tok.is_word(text, "GROUP")
-            && tokens.get(idx + 1).is_some_and(|t| t.is_word(text, "BY"))
-        {
-            let mut k = idx + 2;
-            while k < tokens.len() {
-                match tokens[k].kind {
-                    TokKind::LParen => {
-                        k = skip_balanced_parens(&tokens, k);
-                    }
-                    TokKind::Var => {
-                        var_rewrites[k] = VarPosRewrite::ParenTerm;
-                        k += 1;
-                    }
-                    TokKind::RBrace | TokKind::LBrace => break,
-                    TokKind::Word
-                        if tokens[k].is_word(text, "HAVING")
-                            || tokens[k].is_word(text, "ORDER")
-                            || tokens[k].is_word(text, "LIMIT")
-                            || tokens[k].is_word(text, "OFFSET")
-                            || tokens[k].is_word(text, "VALUES") =>
-                    {
-                        break;
-                    }
-                    _ => k += 1,
-                }
+        }
+
+        // Skip optional FROM / FROM NAMED dataset clauses and optional WHERE keyword
+        while k < end {
+            let tok = self.tokens[k];
+            if tok.kind == TokKind::LBrace {
+                break;
             }
-        } else if tok.is_word(text, "ORDER")
-            && tokens.get(idx + 1).is_some_and(|t| t.is_word(text, "BY"))
-        {
-            let mut k = idx + 2;
-            while k < tokens.len() {
-                match tokens[k].kind {
-                    TokKind::LParen => {
-                        k = skip_balanced_parens(&tokens, k);
-                    }
-                    TokKind::Var => {
-                        var_rewrites[k] = VarPosRewrite::ParenTerm;
-                        k += 1;
-                    }
-                    TokKind::RBrace | TokKind::LBrace => break,
-                    TokKind::Word
-                        if tokens[k].is_word(text, "LIMIT")
-                            || tokens[k].is_word(text, "OFFSET")
-                            || tokens[k].is_word(text, "VALUES") =>
-                    {
-                        break;
-                    }
-                    _ => k += 1,
-                }
-            }
-        } else if tok.is_word(text, "VALUES")
-            && let Some(next) = tokens.get(idx + 1)
-        {
-            if let Some(var) = next.var_name(text) {
-                if var != "this" && bindings.get(var).is_some_and(Option::is_some) {
-                    bail!("SPIN template body uses bound argument ?{var} in VALUES");
-                }
-            } else if next.kind == TokKind::LParen {
-                let mut k = idx + 2;
-                while k < tokens.len() && tokens[k].kind != TokKind::RParen {
-                    if let Some(var) = tokens[k].var_name(text)
-                        && var != "this"
-                        && bindings.get(var).is_some_and(Option::is_some)
-                    {
-                        bail!("SPIN template body uses bound argument ?{var} in VALUES");
-                    }
-                    k += 1;
-                }
+            if tok.is_word(self.text, "WHERE")
+                || tok.is_word(self.text, "FROM")
+                || tok.is_word(self.text, "NAMED")
+                || matches!(tok.kind, TokKind::IriRef | TokKind::PrefixedName)
+            {
+                k += 1;
+            } else {
+                break;
             }
         }
-        idx += 1;
+
+        let mut body_exported = FxHashSet::default();
+        if k < end && self.tokens[k].kind == TokKind::LBrace {
+            let rb = self.matching_rbrace[k].unwrap_or(end).min(end);
+            body_exported = self.analyze_group_pattern(k + 1, rb, depth + 1)?;
+            k = (rb + 1).min(end);
+        }
+
+        // Solution modifiers trailing this SELECT
+        let mut has_group_by = false;
+        let mut group_exported = FxHashSet::default();
+        while k < end {
+            let tok = self.tokens[k];
+            if tok.is_word(self.text, "GROUP")
+                && k + 1 < end
+                && self.tokens[k + 1].is_word(self.text, "BY")
+            {
+                has_group_by = true;
+                let (next_k, grp) = self.scan_group_by(k + 2, end, &body_exported, depth)?;
+                group_exported.extend(grp);
+                k = next_k;
+                continue;
+            }
+            if tok.is_word(self.text, "HAVING") {
+                let mut h = k + 1;
+                while h < end {
+                    let ht = self.tokens[h];
+                    if ht.kind == TokKind::LParen {
+                        let next_h = self.skip_paren(h, end);
+                        if self.analyze_expr_range(h + 1, next_h.saturating_sub(1), depth + 1)? {
+                            has_agg = true;
+                        }
+                        h = next_h;
+                        continue;
+                    }
+                    if matches!(ht.kind, TokKind::LBrace | TokKind::RBrace)
+                        || ht.is_word(self.text, "ORDER")
+                        || ht.is_word(self.text, "LIMIT")
+                        || ht.is_word(self.text, "OFFSET")
+                        || ht.is_word(self.text, "VALUES")
+                        || ht.is_word(self.text, "GROUP")
+                        || ht.is_word(self.text, "HAVING")
+                        || ht.is_word(self.text, "SELECT")
+                    {
+                        break;
+                    }
+                    if is_aggregate_keyword(ht, self.text) {
+                        has_agg = true;
+                    }
+                    h += 1;
+                }
+                k = h;
+                continue;
+            }
+            if tok.is_word(self.text, "ORDER")
+                && k + 1 < end
+                && self.tokens[k + 1].is_word(self.text, "BY")
+            {
+                k = self.scan_order_by(k + 2, end, depth)?;
+                continue;
+            }
+            if tok.is_word(self.text, "VALUES") {
+                k = self.check_values_header(k, end)?;
+                continue;
+            }
+            if tok.kind == TokKind::LBrace {
+                let rb = self.matching_rbrace[k].unwrap_or(end).min(end);
+                if k + 1 < rb && self.tokens[k + 1].is_word(self.text, "SELECT") {
+                    self.analyze_select(k + 1, rb, depth + 1)?;
+                } else {
+                    self.analyze_group_pattern(k + 1, rb, depth + 1)?;
+                }
+                k = (rb + 1).min(end);
+                continue;
+            }
+            k += 1;
+        }
+
+        let visible_at_select = if has_group_by {
+            group_exported
+        } else if has_agg {
+            FxHashSet::default()
+        } else {
+            body_exported
+        };
+
+        if is_star {
+            return Ok(visible_at_select);
+        }
+        let mut select_exported = FxHashSet::default();
+        for (tok_idx, var) in proj_vars {
+            if self.is_bound(var) {
+                if visible_at_select.contains(var) {
+                    self.var_rewrites[tok_idx] = VarPosRewrite::KeepVar;
+                } else {
+                    self.var_rewrites[tok_idx] = VarPosRewrite::SelectBind;
+                }
+                select_exported.insert(var.to_string());
+            }
+        }
+        Ok(select_exported)
+    }
+
+    fn analyze_group_pattern(
+        &mut self,
+        start: usize,
+        end: usize,
+        depth: usize,
+    ) -> Result<FxHashSet<String>> {
+        if depth > MAX_DEPTH * 2 {
+            return Err(limit_err(format!(
+                "SPARQL text exceeds maximum nesting depth ({})",
+                MAX_DEPTH * 2
+            )));
+        }
+        let mut exported = FxHashSet::default();
+        let mut i = start;
+        while i < end {
+            let tok = self.tokens[i];
+            if (tok.is_word(self.text, "MINUS") || tok.is_word(self.text, "EXISTS"))
+                && i + 1 < end
+                && self.tokens[i + 1].kind == TokKind::LBrace
+            {
+                let lb = i + 1;
+                let rb = self.matching_rbrace[lb].unwrap_or(end).min(end);
+                self.analyze_group_pattern(lb + 1, rb, depth + 1)?;
+                i = (rb + 1).min(end);
+                continue;
+            }
+            if tok.kind == TokKind::LBrace {
+                let rb = self.matching_rbrace[i].unwrap_or(end).min(end);
+                if i + 1 < rb && self.tokens[i + 1].is_word(self.text, "SELECT") {
+                    let sub_vars = self.analyze_select(i + 1, rb, depth + 1)?;
+                    exported.extend(sub_vars);
+                } else {
+                    let sub_vars = self.analyze_group_pattern(i + 1, rb, depth + 1)?;
+                    exported.extend(sub_vars);
+                }
+                i = (rb + 1).min(end);
+                continue;
+            }
+            if tok.is_word(self.text, "SELECT") {
+                let sub_vars = self.analyze_select(i, end, depth + 1)?;
+                exported.extend(sub_vars);
+                break;
+            }
+            if tok.is_word(self.text, "GROUP")
+                && i + 1 < end
+                && self.tokens[i + 1].is_word(self.text, "BY")
+            {
+                let (next_i, _) = self.scan_group_by(i + 2, end, &exported, depth)?;
+                i = next_i;
+                continue;
+            }
+            if tok.is_word(self.text, "ORDER")
+                && i + 1 < end
+                && self.tokens[i + 1].is_word(self.text, "BY")
+            {
+                i = self.scan_order_by(i + 2, end, depth)?;
+                continue;
+            }
+            if tok.is_word(self.text, "VALUES") {
+                i = self.check_values_header(i, end)?;
+                continue;
+            }
+            i += 1;
+        }
+        Ok(exported)
+    }
+}
+
+/// Return the set of bound template variables exported by a textual `SubSelect` fragment.
+pub(crate) fn exported_select_bound_vars(
+    text: &str,
+    bindings: &FxHashMap<String, Option<Term>>,
+    budget: &mut WorkBudget,
+) -> Result<FxHashSet<String>> {
+    if bindings.is_empty() {
+        return Ok(FxHashSet::default());
+    }
+    if text.len() > MAX_OUTPUT_BYTES {
+        return Err(limit_err(format!(
+            "SPIN sp:text exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
+        )));
+    }
+    let tokens = tokenize_sparql(text, budget)?;
+    let (matching_rparen, matching_rbrace) = compute_delimiters(&tokens);
+    let mut var_rewrites = vec![VarPosRewrite::Plain; tokens.len()];
+    let mut analyzer = TextAnalyzer {
+        text,
+        tokens: &tokens,
+        matching_rparen,
+        matching_rbrace,
+        bindings,
+        var_rewrites: &mut var_rewrites,
+        budget,
+    };
+    analyzer.analyze_group_pattern(0, tokens.len(), 0)
+}
+
+/// Token-aware substitution of template argument bindings into a SPARQL `sp:text` query.
+///
+/// - Tokenizes string literals (`'...'`, `"..."`, `'''...'''`, `"""..."""`), IRI references
+///   (`<...>` with `\uXXXX`/`\UXXXXXXXX` escapes), prefixed names (`PNAME_NS`/`PNAME_LN` with
+///   `-`/`.`/`PLX`), blank node labels, language tags, and `#` comments (CR/LF terminated)
+///   in a single forward-only O(n) pass under `budget`.
+/// - Rewrites `BOUND(?arg)` / `BOUND($arg)` to `(true)` when `?arg` is bound, valid in both
+///   expression and constraint positions (`FILTER`, `HAVING`, `GROUP BY`, `ORDER BY`).
+/// - Refuses `AS ?arg` and `VALUES ... ?arg` headers when `?arg` is bound.
+/// - Preserves valid SPARQL syntax and scope in `SELECT ?arg` (keeping `?arg` when an inner
+///   query already exports it, otherwise `(<val> AS ?arg)`), `GROUP BY ?arg`, and `ORDER BY ?arg`.
+/// - Avoids merging `<` with a substituted `<iri>` into RDF-star `<<` (or `>` with `>`).
+/// - Never substitutes the reserved focus variable `?this`.
+pub(crate) fn substitute_sparql_text(
+    text: &str,
+    bindings: &FxHashMap<String, Option<Term>>,
+    budget: &mut WorkBudget,
+) -> Result<String> {
+    if text.len() > MAX_OUTPUT_BYTES {
+        return Err(limit_err(format!(
+            "SPIN sp:text exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
+        )));
+    }
+    let tokens = tokenize_sparql(text, budget)?;
+    let (matching_rparen, matching_rbrace) = compute_delimiters(&tokens);
+    let mut var_rewrites = vec![VarPosRewrite::Plain; tokens.len()];
+    {
+        let mut analyzer = TextAnalyzer {
+            text,
+            tokens: &tokens,
+            matching_rparen,
+            matching_rbrace,
+            bindings,
+            var_rewrites: &mut var_rewrites,
+            budget,
+        };
+        analyzer.analyze_group_pattern(0, tokens.len(), 0)?;
     }
 
     let mut out = String::with_capacity(text.len().min(65_536));
@@ -1410,7 +1886,7 @@ pub(crate) fn substitute_sparql_text(
             && bindings.get(var).is_some_and(Option::is_some)
         {
             push_str_bounded(&mut out, &text[copied..tok.start])?;
-            push_str_bounded(&mut out, "true")?;
+            push_str_bounded(&mut out, "(true)")?;
             copied = tokens[i + 3].end;
             i += 4;
             continue;
@@ -1426,21 +1902,26 @@ pub(crate) fn substitute_sparql_text(
             && var != "this"
             && let Some(Some(term)) = bindings.get(var)
         {
-            push_str_bounded(&mut out, &text[copied..tok.start])?;
             match var_rewrites[i] {
+                VarPosRewrite::KeepVar => {}
                 VarPosRewrite::SelectBind => {
+                    push_str_bounded(&mut out, &text[copied..tok.start])?;
                     push_str_bounded(&mut out, "(")?;
                     write_term_value(&mut out, term, 0)?;
                     push_str_bounded(&mut out, " AS ?")?;
                     push_str_bounded(&mut out, var)?;
                     push_str_bounded(&mut out, ")")?;
+                    copied = tok.end;
                 }
                 VarPosRewrite::ParenTerm => {
+                    push_str_bounded(&mut out, &text[copied..tok.start])?;
                     push_str_bounded(&mut out, "(")?;
                     write_term_value(&mut out, term, 0)?;
                     push_str_bounded(&mut out, ")")?;
+                    copied = tok.end;
                 }
                 VarPosRewrite::Plain => {
+                    push_str_bounded(&mut out, &text[copied..tok.start])?;
                     let starts_with_lt = matches!(term, Term::NamedNode(_) | Term::Triple(_));
                     if starts_with_lt && out.ends_with('<') {
                         push_str_bounded(&mut out, " ")?;
@@ -1456,9 +1937,9 @@ pub(crate) fn substitute_sparql_text(
                     if needs_trailing_space {
                         push_str_bounded(&mut out, " ")?;
                     }
+                    copied = tok.end;
                 }
             }
-            copied = tok.end;
         }
         i += 1;
     }

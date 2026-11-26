@@ -21,7 +21,7 @@ mod vocab;
 use crate::shapes::G;
 use crate::vocab::{rdf as rdf_vocab, rdfs as rdfs_vocab, sh};
 use anyhow::{Context as _, Result, bail};
-use oxrdf::{BlankNode, Graph, Literal, NamedNode, NamedOrBlankNode, Term, Triple};
+use oxrdf::{BlankNode, Graph, Literal, NamedNode, Term, Triple};
 use rustc_hash::{FxHashMap, FxHashSet};
 use spargebra::Query;
 use sparkles_core::id::Id;
@@ -42,9 +42,10 @@ pub(crate) struct ExtraTypes<'a> {
 impl<'a> ExtraTypes<'a> {
     pub(crate) fn new(snap: &'a Snapshot, graphs: &[String]) -> Self {
         let mut graph_ids = Vec::new();
+        let mut seen = FxHashSet::default();
         for iri in graphs {
             if let Some(id) = sparkles_core::validation::graph_id(snap, iri)
-                && !graph_ids.contains(&id)
+                && seen.insert(id)
             {
                 graph_ids.push(id);
             }
@@ -81,6 +82,7 @@ impl<'a> ExtraTypes<'a> {
         pred: Option<Id>,
         budget: &mut rdf::WorkBudget,
     ) -> Result<Vec<Term>> {
+        budget.step()?;
         let Some(pred_id) = pred else {
             return Ok(Vec::new());
         };
@@ -90,6 +92,7 @@ impl<'a> ExtraTypes<'a> {
         let mut out = Vec::new();
         let mut budget_err: Option<anyhow::Error> = None;
         for &gid in &self.graph_ids {
+            budget.step()?;
             let res = self.snap.scan_checked(
                 Perm::Gspo,
                 &[gid.0, sub_id.0, pred_id.0],
@@ -101,8 +104,18 @@ impl<'a> ExtraTypes<'a> {
                             return Err(sparkles_core::Error::Cancelled);
                         }
                         let q = Perm::Gspo.to_quad(&k);
-                        if let Some(term) = self.snap.term(q[2]) {
-                            out.push(term);
+                        if let Some(term) = self.snap.term(q[2])
+                            && matches!(term, Term::NamedNode(_) | Term::BlankNode(_))
+                        {
+                            match rdf::term_ref_size_and_depth(term.as_ref(), 0, budget)
+                                .and_then(|bytes| budget.charge_bytes(bytes))
+                            {
+                                Ok(()) => out.push(term),
+                                Err(e) => {
+                                    budget_err = Some(e);
+                                    return Err(sparkles_core::Error::Cancelled);
+                                }
+                            }
                         }
                         Ok(())
                     };
@@ -123,6 +136,29 @@ impl<'a> ExtraTypes<'a> {
             res.map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         Ok(out)
+    }
+}
+
+/// Optional validation gate applied to a dual-form RDF candidate before accepting it over
+/// `sp:text` fallback (used by rule translation to verify parseability and `CONSTRUCT` form).
+pub(crate) struct CandidateCheck<'a> {
+    pub(crate) prefix_head: &'a str,
+    pub(crate) require_construct: bool,
+}
+
+impl CandidateCheck<'_> {
+    pub(crate) fn validate(&self, sparql: &str) -> Result<Query> {
+        let full = if self.prefix_head.is_empty() {
+            std::borrow::Cow::Borrowed(sparql)
+        } else {
+            std::borrow::Cow::Owned(format!("{}{sparql}", self.prefix_head))
+        };
+        let parsed = sparkles_core::sparql::parse_query(&full, None, &[])
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if self.require_construct && !matches!(parsed, Query::Construct { .. }) {
+            bail!("SPIN rule query must be a CONSTRUCT query");
+        }
+        Ok(parsed)
     }
 }
 
@@ -157,10 +193,11 @@ fn rule_properties(graph: &Graph, budget: &mut rdf::WorkBudget) -> Result<Vec<Na
         let p = Term::NamedNode(out[i].clone());
         for t in graph.subjects_for_predicate_object(oxrdf::vocab::rdfs::SUB_PROPERTY_OF, &p) {
             budget.step()?;
-            if let NamedOrBlankNode::NamedNode(n) = t.into_owned()
-                && seen.insert(n.clone())
-            {
-                out.push(n);
+            if let oxrdf::NamedOrBlankNodeRef::NamedNode(n) = t {
+                let n = rdf::check_and_own_iri(n, budget)?;
+                if seen.insert(n.clone()) {
+                    out.push(n);
+                }
             }
         }
         i += 1;
@@ -174,8 +211,9 @@ fn rule_properties(graph: &Graph, budget: &mut rdf::WorkBudget) -> Result<Vec<Na
 pub fn serialize_query(graph: &Graph, query: &Term) -> Result<String> {
     let g = G { g: graph };
     let mut budget = rdf::WorkBudget::new(rdf::MAX_NODES);
+    rdf::term_ref_size_and_depth(query.as_ref(), 0, &mut budget)?;
     let mut cache = template::HierarchyCache::default();
-    query_to_sparql(&g, None, query, &mut budget, &mut cache)
+    query_to_sparql(&g, None, query, None, &mut budget, &mut cache)
 }
 
 fn read_direct_sp_text(
@@ -183,16 +221,18 @@ fn read_direct_sp_text(
     node: &Term,
     budget: &mut rdf::WorkBudget,
 ) -> Result<Option<String>> {
-    match rdf::single_object(g, node, vocab::sp::TEXT, budget)? {
+    match rdf::single_object_ref(g, node, vocab::sp::TEXT, budget)? {
         None => Ok(None),
-        Some(Term::Literal(l)) => {
-            if l.value().len() > rdf::MAX_OUTPUT_BYTES {
+        Some(oxrdf::TermRef::Literal(l)) => {
+            let val = l.value();
+            if val.len() > rdf::MAX_OUTPUT_BYTES {
                 return Err(rdf::limit_err(format!(
-                    "SPIN sp:text exceeds maximum size ({} bytes)",
+                    "SPIN sp:text exceeds maximum output size ({} bytes)",
                     rdf::MAX_OUTPUT_BYTES
                 )));
             }
-            Ok(Some(l.value().to_string()))
+            budget.charge_bytes(val.len())?;
+            Ok(Some(val.to_string()))
         }
         Some(other) => bail!("the sp:text of the SPIN rule {node} is {other}, not a string"),
     }
@@ -202,19 +242,27 @@ fn query_to_sparql(
     g: &G<'_>,
     extra: Option<&ExtraTypes<'_>>,
     node: &Term,
+    check: Option<&CandidateCheck<'_>>,
     budget: &mut rdf::WorkBudget,
     cache: &mut template::HierarchyCache,
 ) -> Result<String> {
     // 1. Template call (an instance of a spin:Template / spin:ConstructTemplate or subclass)
     if let Some(template) = template::template_of_call(g, node, budget, cache)? {
-        return template::expand_template_call(g, extra, node, &template, budget, cache);
+        return template::expand_template_call(g, extra, node, &template, check, budget, cache);
     }
     // 2. SPIN RDF syntax (prefer structural RDF over sp:text so TopBraid files with full
     //    IRIs run even when Turtle prefix declarations are absent; fall back to sp:text on
-    //    unsupported structural constructs to preserve compatibility for dual-form files)
+    //    unsupported or non-runnable structural constructs to preserve compatibility for
+    //    dual-form files)
     if rdf::has_rdf_query_structure(g, node) {
         let empty = FxHashMap::default();
-        match rdf::serialize_query_with_bindings(g, node, &empty, budget) {
+        let rdf_res = rdf::serialize_query_with_bindings(g, node, &empty, budget).and_then(|q| {
+            if let Some(c) = check {
+                c.validate(&q)?;
+            }
+            Ok(q)
+        });
+        match rdf_res {
             Ok(sparql) => return Ok(sparql),
             Err(rdf_err) => {
                 if !rdf::is_limit_or_cycle_error(&rdf_err)
@@ -230,9 +278,16 @@ fn query_to_sparql(
     if let Some(text) = read_direct_sp_text(g, node, budget)? {
         return Ok(text);
     }
-    let kind = g
-        .object(node, rdf_vocab::TYPE)
-        .map_or_else(|| "no type".to_string(), |t| t.to_string());
+    let kind = crate::shapes::as_subject(node)
+        .and_then(|sub| g.g.object_for_subject_predicate(sub, rdf_vocab::TYPE))
+        .map_or_else(
+            || "no type".to_string(),
+            |t| match t {
+                oxrdf::TermRef::NamedNode(n) if n.as_str().len() <= 256 => n.to_string(),
+                oxrdf::TermRef::BlankNode(b) if b.as_str().len() <= 256 => b.to_string(),
+                _ => "<non-IRI or oversized type>".to_string(),
+            },
+        );
     bail!(
         "the SPIN rule {node} ({kind}) has neither SPIN RDF syntax, a SPIN template \
          definition, nor sp:text"
@@ -267,7 +322,10 @@ pub(crate) fn translate_with_extra_types(
     let mut pairs: Vec<(Term, Term)> = Vec::new();
     for p in rule_properties(graph, &mut discovery_budget)? {
         for t in graph.triples_for_predicate(&p) {
-            pairs.push((Term::from(t.subject.into_owned()), t.object.into_owned()));
+            discovery_budget.step()?;
+            let s = rdf::check_and_own_subject(t.subject, &mut discovery_budget)?;
+            let o = rdf::check_and_own_term(t.object, &mut discovery_budget)?;
+            pairs.push((Term::from(s), o));
         }
     }
     pairs.sort_by_cached_key(|(c, r)| (c.to_string(), r.to_string()));
@@ -279,12 +337,16 @@ pub(crate) fn translate_with_extra_types(
         n += 1;
         BlankNode::new_unchecked(format!("spinr{n}"))
     };
+    let check = CandidateCheck {
+        prefix_head: &head,
+        require_construct: true,
+    };
     for (class, rule) in pairs {
         let Term::NamedNode(class) = class else {
             bail!("the SPIN rule {rule} belongs to {class}, which is not an IRI");
         };
         let mut rule_budget = rdf::WorkBudget::new(rdf::MAX_NODES);
-        let text = query_to_sparql(&g, extra, &rule, &mut rule_budget, &mut cache)
+        let text = query_to_sparql(&g, extra, &rule, Some(&check), &mut rule_budget, &mut cache)
             .with_context(|| format!("translating SPIN rule {rule} of {class}"))?;
         let shape = fresh();
         let r = fresh();
@@ -611,7 +673,7 @@ mod tests {
             q1.contains("\"50\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
             "{q1}"
         );
-        assert!(q1.contains("IF(true, \"gold\", \"none\")"), "{q1}");
+        assert!(q1.contains("IF((true), \"gold\", \"none\")"), "{q1}");
         assert!(q1.contains("\"?minVal\""), "string literal untouched: {q1}");
 
         let q2 = serialize_query(&g, &ex("call2")).unwrap();
@@ -1005,32 +1067,43 @@ mod tests {
             q.contains("ex:upper-bound(<http://example.org/MaxVal>)"),
             "{q}"
         );
-        assert!(q.contains("IF(true,"), "{q}");
+        assert!(q.contains("IF((true),"), "{q}");
         assert!(
             q.contains("<http://example.org/Alice> != <http://example.org/none>"),
             "{q}"
         );
 
-        // Long string literals ending in 4 or 5 quotes do not swallow subsequent ?arg tokens
+        // Parser-valid long string literals (escaped trailing content quote, and adjacent
+        // quoted tokens) parse cleanly and never swallow or mis-substitute `?arg`.
         let mut bindings = super::FxHashMap::default();
         bindings.insert("arg".to_string(), Some(ex("Bob")));
-        let out4 = super::template::substitute_sparql_text(
-            r#"SELECT * WHERE { ?s <http://example.org/p> """say "hi"""" . ?s <http://example.org/q> ?arg }"#,
+        let mut b1 = super::rdf::WorkBudget::new(super::rdf::MAX_NODES);
+        let out_esc = super::template::substitute_sparql_text(
+            r#"SELECT * WHERE { ?s <http://example.org/p> """say "hi\"""" . ?s <http://example.org/q> ?arg }"#,
             &bindings,
+            &mut b1,
         )
         .unwrap();
+        assert!(parse_query(&out_esc, None, &[]).is_ok(), "{out_esc}");
         assert!(
-            out4.contains("<http://example.org/q> <http://example.org/Bob>"),
-            "{out4}"
+            out_esc.contains("<http://example.org/q> <http://example.org/Bob>"),
+            "{out_esc}"
         );
-        let out5 = super::template::substitute_sparql_text(
-            r#"SELECT * WHERE { ?s <http://example.org/p> """say ""hi""""" . ?s <http://example.org/q> ?arg }"#,
+        let mut b2 = super::rdf::WorkBudget::new(super::rdf::MAX_NODES);
+        let out_adj = super::template::substitute_sparql_text(
+            r#"SELECT * WHERE { ?s <http://example.org/p> ("""hello""""?arg") . ?s <http://example.org/q> ?arg }"#,
             &bindings,
+            &mut b2,
         )
         .unwrap();
+        assert!(parse_query(&out_adj, None, &[]).is_ok(), "{out_adj}");
         assert!(
-            out5.contains("<http://example.org/q> <http://example.org/Bob>"),
-            "{out5}"
+            out_adj.contains(r#""""hello""""?arg""#),
+            "adjacent quoted string must stay untouched: {out_adj}"
+        );
+        assert!(
+            out_adj.contains("<http://example.org/q> <http://example.org/Bob>"),
+            "{out_adj}"
         );
 
         // VALUES with bound argument is refused
@@ -1438,6 +1511,634 @@ mod tests {
         assert!(
             q_spec.contains("(<http://example.org/a> AS ?who)"),
             "{q_spec}"
+        );
+    }
+
+    #[test]
+    fn round2_pre_clone_bounds_linear_text_and_extra_types_budget() {
+        // 1. Oversized sp:text rejected through serialize_query and translate before cloning
+        let mut g = Graph::new();
+        let cls = NamedNode::new_unchecked("http://example.org/A");
+        let rule = NamedNode::new_unchecked("http://example.org/hugeTextRule");
+        let huge = "x".repeat(super::rdf::MAX_OUTPUT_BYTES + 32);
+        g.insert(&Triple::new(
+            cls.clone(),
+            super::vocab::spin::RULE,
+            rule.clone(),
+        ));
+        g.insert(&Triple::new(
+            rule.clone(),
+            super::vocab::sp::TEXT,
+            Literal::new_simple_literal(huge),
+        ));
+        let err = serialize_query(&g, &Term::NamedNode(rule)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("maximum output size"),
+            "{err:#}"
+        );
+        let err = translate(&g, &[]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("maximum output size"),
+            "{err:#}"
+        );
+
+        // 2. Deeply nested Term::Triple in graph rejected through serialize_query (not just write_term_value)
+        let mut nested = Term::NamedNode(NamedNode::new_unchecked("http://example.org/leaf"));
+        let s = NamedNode::new_unchecked("http://example.org/s");
+        let p = NamedNode::new_unchecked("http://example.org/p");
+        for _ in 0..70 {
+            nested = Term::Triple(Box::new(Triple::new(s.clone(), p.clone(), nested)));
+        }
+        let mut g_deep = Graph::new();
+        let q = NamedNode::new_unchecked("http://example.org/deepQ");
+        let cell = BlankNode::new_unchecked("c1");
+        let tp = BlankNode::new_unchecked("tp1");
+        g_deep.insert(&Triple::new(
+            q.clone(),
+            crate::vocab::rdf::TYPE,
+            super::vocab::sp::ASK,
+        ));
+        g_deep.insert(&Triple::new(
+            q.clone(),
+            super::vocab::sp::WHERE,
+            cell.clone(),
+        ));
+        g_deep.insert(&Triple::new(
+            cell.clone(),
+            crate::vocab::rdf::FIRST,
+            tp.clone(),
+        ));
+        g_deep.insert(&Triple::new(
+            cell,
+            crate::vocab::rdf::REST,
+            crate::vocab::rdf::NIL,
+        ));
+        g_deep.insert(&Triple::new(
+            tp.clone(),
+            super::vocab::sp::SUBJECT,
+            s.clone(),
+        ));
+        g_deep.insert(&Triple::new(
+            tp.clone(),
+            super::vocab::sp::PREDICATE,
+            p.clone(),
+        ));
+        g_deep.insert(&Triple::new(tp, super::vocab::sp::OBJECT, nested));
+        let err = serialize_query(&g_deep, &Term::NamedNode(q)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("maximum nesting depth"),
+            "{err:#}"
+        );
+
+        // 3. Bounded-length list of moderately large literals exceeds cumulative retained byte cap
+        let mut g_list = Graph::new();
+        let q_list = NamedNode::new_unchecked("http://example.org/bigListQ");
+        let row_head = BlankNode::new_unchecked("row_head");
+        let vals = BlankNode::new_unchecked("vals");
+        let var_cell = BlankNode::new_unchecked("vcell");
+        g_list.insert(&Triple::new(
+            q_list.clone(),
+            crate::vocab::rdf::TYPE,
+            super::vocab::sp::ASK,
+        ));
+        g_list.insert(&Triple::new(
+            q_list.clone(),
+            super::vocab::sp::WHERE,
+            crate::vocab::rdf::NIL,
+        ));
+        g_list.insert(&Triple::new(
+            q_list.clone(),
+            super::vocab::sp::VALUES,
+            vals.clone(),
+        ));
+        g_list.insert(&Triple::new(
+            vals.clone(),
+            super::vocab::sp::VAR_NAMES,
+            var_cell.clone(),
+        ));
+        g_list.insert(&Triple::new(
+            var_cell.clone(),
+            crate::vocab::rdf::FIRST,
+            Literal::new_simple_literal("v"),
+        ));
+        g_list.insert(&Triple::new(
+            var_cell,
+            crate::vocab::rdf::REST,
+            crate::vocab::rdf::NIL,
+        ));
+        // 40 literals x 64 KiB = 2.5 MiB > MAX_RETAINED_BYTES (2 MiB)
+        let chunk = "z".repeat(65_536);
+        let mut list_head = Term::NamedNode(crate::vocab::rdf::NIL.into_owned());
+        for i in 0..40 {
+            let c = BlankNode::new_unchecked(format!("big_item_{i}"));
+            g_list.insert(&Triple::new(
+                c.clone(),
+                crate::vocab::rdf::FIRST,
+                Literal::new_simple_literal(format!("{chunk}{i}")),
+            ));
+            g_list.insert(&Triple::new(c.clone(), crate::vocab::rdf::REST, list_head));
+            list_head = Term::BlankNode(c);
+        }
+        g_list.insert(&Triple::new(
+            row_head.clone(),
+            crate::vocab::rdf::FIRST,
+            list_head,
+        ));
+        g_list.insert(&Triple::new(
+            row_head.clone(),
+            crate::vocab::rdf::REST,
+            crate::vocab::rdf::NIL,
+        ));
+        g_list.insert(&Triple::new(vals, super::vocab::sp::BINDINGS, row_head));
+        let err = serialize_query(&g_list, &Term::NamedNode(q_list)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("maximum retained term size"),
+            "{err:#}"
+        );
+
+        // 4. Quadratic-trap dotted words and repeated ORDER BY stay bounded in both template and subquery paths
+        let dotted = "a.".repeat(10_000);
+        let order_spam = "ORDER BY ".repeat(10_000);
+        for malformed in [&dotted, &order_spam] {
+            // Template expansion entry point
+            let mut g_t = parse_ttl(
+                r#"
+                ex:T a spin:ConstructTemplate ;
+                  spin:constraint [ a spl:Argument ; spl:predicate ex:x ] ;
+                  spin:body ex:body .
+                ex:c a ex:T ; ex:x 1 .
+                "#,
+            );
+            g_t.insert(&Triple::new(
+                NamedNode::new_unchecked("http://example.org/body"),
+                super::vocab::sp::TEXT,
+                Literal::new_simple_literal(malformed.clone()),
+            ));
+            let err = serialize_query(&g_t, &ex("c")).unwrap_err();
+            assert!(format!("{err:#}").contains("node budget"), "{err:#}");
+
+            // Mixed RDF + textual subquery entry point
+            let mut g_sq = parse_ttl(
+                r#"
+                ex:q a sp:Select ;
+                  sp:where ( [ a sp:SubQuery ; sp:query ex:inner ] ) .
+                "#,
+            );
+            g_sq.insert(&Triple::new(
+                NamedNode::new_unchecked("http://example.org/inner"),
+                super::vocab::sp::TEXT,
+                Literal::new_simple_literal(format!("SELECT ?x WHERE {{ {malformed} }}")),
+            ));
+            let err = serialize_query(&g_sq, &ex("q")).unwrap_err();
+            assert!(format!("{err:#}").contains("node budget"), "{err:#}");
+        }
+
+        // 5. ExtraTypes charges empty per-graph probes and deduplicates graph IDs
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        let mut sources = Vec::new();
+        let mut graph_iris = Vec::new();
+        for i in 0..30 {
+            let iri = format!("urn:x:g{i}");
+            graph_iris.push(iri.clone());
+            graph_iris.push(iri.clone()); // duplicate to exercise set deduplication
+            sources.push(sparkles_core::io::Source::from_bytes(
+                format!(
+                    "<http://example.org/other{i}> <http://example.org/p> <http://example.org/v> .\n"
+                )
+                .into_bytes(),
+                sparkles_core::io::RdfFormat::NTriples,
+                Some(NamedNode::new_unchecked(iri)),
+            ));
+        }
+        // Seed rdf:type and subject IRI in one graph so lookup_term & pred_id resolve, while
+        // the subject has no rdf:type in any of the 30 graphs (all probes miss).
+        sources.push(sparkles_core::io::Source::from_bytes(
+            b"<http://example.org/missingSub> <http://example.org/unrelated> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> .\n"
+                .to_vec(),
+            sparkles_core::io::RdfFormat::NTriples,
+            Some(NamedNode::new_unchecked("urn:x:seed")),
+        ));
+        store.load(&sources).unwrap();
+        let snap = store.snapshot();
+        let extra = super::ExtraTypes::new(&snap, &graph_iris);
+        assert_eq!(extra.graph_ids.len(), 30);
+        let mut tight = super::rdf::WorkBudget::new(10);
+        let err = extra.rdf_types(&ex("missingSub"), &mut tight).unwrap_err();
+        assert!(format!("{err:#}").contains("node budget"), "{err:#}");
+    }
+
+    #[test]
+    fn round2_bound_clauses_nested_select_scope_comments_iris_and_ask_modifiers() {
+        // 1. BOUND(?arg) in FILTER, HAVING, GROUP BY, ORDER BY emits valid (true)
+        let g_bound = parse_ttl(
+            r#"
+            ex:T a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:arg ] ;
+              spin:body [
+                a sp:Construct ;
+                sp:text """
+                  CONSTRUCT { ?this <http://example.org/ok> ?arg }
+                  WHERE {
+                    {
+                      SELECT ?s (COUNT(?v) AS ?c) WHERE {
+                        ?s <http://example.org/v> ?v .
+                        FILTER BOUND(?arg)
+                      }
+                      GROUP BY ?s BOUND(?arg)
+                      HAVING BOUND(?arg)
+                      ORDER BY BOUND(?arg)
+                    }
+                    ?this <http://example.org/ref> ?s .
+                  }
+                """
+              ] .
+            ex:call a ex:T ; ex:arg 42 .
+            "#,
+        );
+        let q_bound = serialize_query(&g_bound, &ex("call")).unwrap();
+        assert!(parse_query(&q_bound, None, &[]).is_ok(), "{q_bound}");
+        assert!(q_bound.contains("FILTER (true)"), "{q_bound}");
+        assert!(q_bound.contains("GROUP BY ?s (true)"), "{q_bound}");
+        assert!(q_bound.contains("HAVING (true)"), "{q_bound}");
+        assert!(q_bound.contains("ORDER BY (true)"), "{q_bound}");
+
+        // 2. Nested SELECT projections of the same bound argument in text and RDF bodies
+        let g_nested_text = parse_ttl(
+            r#"
+            ex:T a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:arg ] ;
+              spin:body [
+                a sp:Construct ;
+                sp:text """
+                  CONSTRUCT { ?this <http://example.org/out> ?arg }
+                  WHERE {
+                    {
+                      SELECT ?arg WHERE {
+                        {
+                          SELECT * WHERE {
+                            { SELECT ?arg WHERE { ?this <http://example.org/p> ?arg } }
+                          }
+                        }
+                      }
+                    }
+                  }
+                """
+              ] .
+            ex:call a ex:T ; ex:arg ex:Val .
+            "#,
+        );
+        let q_nt = serialize_query(&g_nested_text, &ex("call")).unwrap();
+        assert!(parse_query(&q_nt, None, &[]).is_ok(), "{q_nt}");
+        assert!(
+            q_nt.contains("SELECT ?arg WHERE"),
+            "outer SELECT must keep bare ?arg: {q_nt}"
+        );
+        assert!(
+            q_nt.contains("SELECT (<http://example.org/Val> AS ?arg) WHERE"),
+            "innermost SELECT must bind ?arg: {q_nt}"
+        );
+
+        let g_nested_rdf = parse_ttl(
+            r#"
+            ex:T a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:arg ] ;
+              spin:body [
+                a sp:Construct ;
+                sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:out ; sp:object [ sp:varName "arg" ] ] ) ;
+                sp:where (
+                  [ a sp:SubQuery ;
+                    sp:query [
+                      a sp:Select ;
+                      sp:resultVariables ( [ sp:varName "arg" ] ) ;
+                      sp:where (
+                        [ a sp:SubQuery ;
+                          sp:query [
+                            a sp:Select ;
+                            sp:resultVariables ( [ sp:varName "arg" ] ) ;
+                            sp:where ( [ sp:subject spin:_this ; sp:predicate ex:p ; sp:object [ sp:varName "arg" ] ] )
+                          ] ]
+                      ) ;
+                      sp:groupBy ( [ sp:varName "arg" ] )
+                    ] ]
+                )
+              ] .
+            ex:call a ex:T ; ex:arg ex:Val .
+            "#,
+        );
+        let q_nr = serialize_query(&g_nested_rdf, &ex("call")).unwrap();
+        assert!(parse_query(&q_nr, None, &[]).is_ok(), "{q_nr}");
+        assert!(
+            q_nr.contains("SELECT ?arg WHERE { { SELECT (<http://example.org/Val> AS ?arg) WHERE"),
+            "{q_nr}"
+        );
+        assert!(q_nr.contains("GROUP BY ?arg"), "{q_nr}");
+
+        // 3. CR-terminated comment and IRI Unicode escapes (\uXXXX / \UXXXXXXXX)
+        let mut g_cr = parse_ttl(
+            r#"
+            ex:T a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:arg ] ;
+              spin:body ex:body .
+            ex:call a ex:T ; ex:arg ex:Bob .
+            "#,
+        );
+        g_cr.insert(&Triple::new(
+            NamedNode::new_unchecked("http://example.org/body"),
+            super::vocab::sp::TEXT,
+            Literal::new_simple_literal(
+                "CONSTRUCT { ?this <https://example.org/\\u0061?arg> ?arg ; <https://example.org/\\U00000062?arg> ?v } WHERE { # cr comment\r ?this <http://example.org/p> ?arg . ?this <http://example.org/q> ?v }",
+            ),
+        ));
+        let q_cr = serialize_query(&g_cr, &ex("call")).unwrap();
+        assert!(parse_query(&q_cr, None, &[]).is_ok(), "{q_cr}");
+        assert!(
+            q_cr.contains("<https://example.org/\\u0061?arg> <http://example.org/Bob>"),
+            "{q_cr}"
+        );
+        assert!(
+            q_cr.contains("<https://example.org/\\U00000062?arg> ?v"),
+            "{q_cr}"
+        );
+        assert!(
+            q_cr.contains("# cr comment\r ?this <http://example.org/p> <http://example.org/Bob>"),
+            "{q_cr}"
+        );
+
+        // CR-terminated comment inside sp:SubQuery sp:text still inventories ?_spin_v1
+        let mut g_sq_cr = parse_ttl(
+            r#"
+            ex:q a sp:Select ;
+              sp:where (
+                [ sp:subject [ sp:varName "s" ] ; sp:predicate ex:p ; sp:object [] ]
+                [ a sp:SubQuery ; sp:query ex:inner ]
+              ) .
+            "#,
+        );
+        g_sq_cr.insert(&Triple::new(
+            NamedNode::new_unchecked("http://example.org/inner"),
+            super::vocab::sp::TEXT,
+            Literal::new_simple_literal(
+                "SELECT # comment\r ?_spin_v1 WHERE { ?_spin_v1 <http://example.org/q> 1 }",
+            ),
+        ));
+        let q_sq_cr = serialize_query(&g_sq_cr, &ex("q")).unwrap();
+        assert!(parse_query(&q_sq_cr, None, &[]).is_ok(), "{q_sq_cr}");
+        assert!(
+            q_sq_cr.contains("?s <http://example.org/p> ?_spin_v2 ."),
+            "{q_sq_cr}"
+        );
+
+        // 4. ASK preserves solution modifiers (ORDER BY, LIMIT, OFFSET, VALUES, and GROUP BY)
+        let g_ask = parse_ttl(
+            r#"
+            ex:askMod a sp:Ask ;
+              sp:where ( [ sp:subject [ sp:varName "x" ] ; sp:predicate ex:p ; sp:object [ sp:varName "v" ] ] ) ;
+              sp:orderBy ( [ a sp:Asc ; sp:expression [ sp:varName "x" ] ] ) ;
+              sp:limit 0 ;
+              sp:offset 1 ;
+              sp:values [ a sp:Values ; sp:varNames ( "v" ) ; sp:bindings ( ( 1 ) ) ] .
+            ex:askGroup a sp:Ask ;
+              sp:where ( [ sp:subject [ sp:varName "x" ] ; sp:predicate ex:p ; sp:object [ sp:varName "v" ] ] ) ;
+              sp:groupBy ( [ sp:varName "x" ] ) ;
+              sp:having ( [ a sp:ne ; sp:arg1 [ sp:varName "x" ] ; sp:arg2 ex:bad ] ) .
+            "#,
+        );
+        let q_ask = serialize_query(&g_ask, &ex("askMod")).unwrap();
+        assert!(
+            matches!(
+                parse_query(&q_ask, None, &[]).expect(&q_ask),
+                spargebra::Query::Ask { .. }
+            ),
+            "{q_ask}"
+        );
+        assert!(q_ask.contains("ORDER BY ASC(?x)"), "{q_ask}");
+        assert!(q_ask.contains("LIMIT 0 OFFSET 1"), "{q_ask}");
+        assert!(q_ask.contains("VALUES (?v)"), "{q_ask}");
+        let q_ask_grp = serialize_query(&g_ask, &ex("askGroup")).unwrap();
+        assert!(q_ask_grp.contains("GROUP BY ?x HAVING"), "{q_ask_grp}");
+    }
+
+    #[test]
+    fn round2_dual_form_fallback_subquery_validation_this_immutability_and_triple_terms() {
+        // 1. Dual-form rule & template body with non-CONSTRUCT RDF (sp:Select) fall back to CONSTRUCT sp:text
+        let g_fb_rule = parse_ttl(
+            r#"
+            ex:Person spin:rule [
+              a sp:Select ;
+              sp:where () ;
+              sp:text "CONSTRUCT { ?this <http://example.org/out> 1 } WHERE { ?this <http://example.org/in> ?x }"
+            ] .
+            "#,
+        );
+        let tr = translate(&g_fb_rule, &[]).unwrap();
+        assert!(!tr.is_empty());
+
+        let g_fb_tmpl = parse_ttl(
+            r#"
+            ex:T a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:v ] ;
+              spin:body [
+                a sp:Select ;
+                sp:where () ;
+                sp:text "CONSTRUCT { ?this <http://example.org/out> ?v } WHERE { ?this <http://example.org/in> ?x }"
+              ] .
+            ex:Person spin:rule [ a ex:T ; ex:v 7 ] .
+            "#,
+        );
+        let tr_t = translate(&g_fb_tmpl, &[]).unwrap();
+        assert!(!tr_t.is_empty());
+
+        // 2. Textual subquery ending in `# note` (text-only and fallback) parses cleanly
+        let g_sq_comment = parse_ttl(
+            r#"
+            ex:qText a sp:Construct ;
+              sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:out ; sp:object [ sp:varName "x" ] ] ) ;
+              sp:where (
+                [ a sp:SubQuery ;
+                  sp:query [ sp:text "SELECT ?x WHERE { ?s <http://example.org/p> ?x } # trailing note" ] ]
+              ) .
+            ex:qFb a sp:Construct ;
+              sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:out ; sp:object [ sp:varName "x" ] ] ) ;
+              sp:where (
+                [ a sp:SubQuery ;
+                  sp:query [
+                    a sp:Ask ;
+                    sp:where () ;
+                    sp:text "SELECT ?x WHERE { ?s <http://example.org/p> ?x } # fallback note"
+                  ] ]
+              ) .
+            "#,
+        );
+        for name in ["qText", "qFb"] {
+            let s = serialize_query(&g_sq_comment, &ex(name)).unwrap();
+            assert!(
+                matches!(
+                    parse_query(&s, None, &[]).expect(&s),
+                    spargebra::Query::Construct { .. }
+                ),
+                "{name}: {s}"
+            );
+        }
+
+        // 3. Invalid textual subqueries (ASK, FROM, brace escape) refused in both text-only and fallback
+        for bad_text in [
+            "ASK {}",
+            "SELECT ?x FROM <http://example.org/g> WHERE { ?s <http://example.org/p> ?x }",
+            "SELECT ?x WHERE { ?s <http://example.org/p> ?x } } UNION { ?a <http://example.org/q> ?b",
+        ] {
+            let mut g_only = parse_ttl(
+                r#"
+                ex:q a sp:Select ; sp:where ( [ a sp:SubQuery ; sp:query ex:inner ] ) .
+                "#,
+            );
+            g_only.insert(&Triple::new(
+                NamedNode::new_unchecked("http://example.org/inner"),
+                super::vocab::sp::TEXT,
+                Literal::new_simple_literal(bad_text),
+            ));
+            assert!(
+                serialize_query(&g_only, &ex("q")).is_err(),
+                "text-only subquery should fail: {bad_text}"
+            );
+
+            let mut g_fb = parse_ttl(
+                r#"
+                ex:q a sp:Select ; sp:where ( [ a sp:SubQuery ; sp:query ex:inner ] ) .
+                ex:inner a sp:Ask ; sp:where () .
+                "#,
+            );
+            g_fb.insert(&Triple::new(
+                NamedNode::new_unchecked("http://example.org/inner"),
+                super::vocab::sp::TEXT,
+                Literal::new_simple_literal(bad_text),
+            ));
+            assert!(
+                serialize_query(&g_fb, &ex("q")).is_err(),
+                "fallback subquery should fail: {bad_text}"
+            );
+        }
+
+        // 4. Intrinsic spin:_this cannot be renamed via sp:varName; matching "this" is allowed
+        let g_rename = parse_ttl(
+            r#"
+            spin:_this sp:varName "other" .
+            ex:T a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:other ] ;
+              spin:body [
+                a sp:Construct ;
+                sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:out ; sp:object 1 ] ) ;
+                sp:where ( [ sp:subject spin:_this ; sp:predicate ex:in ; sp:object [ sp:varName "v" ] ] )
+              ] .
+            ex:Person spin:rule [ a ex:T ; ex:other ex:Const ] .
+            "#,
+        );
+        let err = translate(&g_rename, &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("cannot be renamed"), "{err:#}");
+
+        let g_same = parse_ttl(
+            r#"
+            spin:_this a sp:Variable ; sp:varName "this" .
+            ex:Person spin:rule [
+              a sp:Construct ;
+              sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:out ; sp:object 1 ] ) ;
+              sp:where ( [ sp:subject spin:_this ; sp:predicate ex:in ; sp:object [ sp:varName "v" ] ] )
+            ] .
+            "#,
+        );
+        assert!(translate(&g_same, &[]).is_ok());
+
+        // 5. Shallow embedded triple term serializes as ground `<<( s p o )>>` (not reifier `<< s p o >>`)
+        let embedded = Term::Triple(Box::new(Triple::new(
+            NamedNode::new_unchecked("http://example.org/s"),
+            NamedNode::new_unchecked("http://example.org/p"),
+            NamedNode::new_unchecked("http://example.org/o"),
+        )));
+        let mut g_tt = Graph::new();
+        let q_tt = NamedNode::new_unchecked("http://example.org/ttQ");
+        let t_cell = BlankNode::new_unchecked("tc1");
+        let t_pat = BlankNode::new_unchecked("tp1");
+        let w_cell = BlankNode::new_unchecked("wc1");
+        let w_pat = BlankNode::new_unchecked("wp1");
+        g_tt.insert(&Triple::new(
+            q_tt.clone(),
+            crate::vocab::rdf::TYPE,
+            super::vocab::sp::CONSTRUCT,
+        ));
+        g_tt.insert(&Triple::new(
+            q_tt.clone(),
+            super::vocab::sp::TEMPLATES,
+            t_cell.clone(),
+        ));
+        g_tt.insert(&Triple::new(
+            t_cell.clone(),
+            crate::vocab::rdf::FIRST,
+            t_pat.clone(),
+        ));
+        g_tt.insert(&Triple::new(
+            t_cell,
+            crate::vocab::rdf::REST,
+            crate::vocab::rdf::NIL,
+        ));
+        g_tt.insert(&Triple::new(
+            t_pat.clone(),
+            super::vocab::sp::SUBJECT,
+            super::vocab::spin::THIS,
+        ));
+        g_tt.insert(&Triple::new(
+            t_pat.clone(),
+            super::vocab::sp::PREDICATE,
+            NamedNode::new_unchecked("http://example.org/claim"),
+        ));
+        g_tt.insert(&Triple::new(t_pat, super::vocab::sp::OBJECT, embedded));
+        g_tt.insert(&Triple::new(
+            q_tt.clone(),
+            super::vocab::sp::WHERE,
+            w_cell.clone(),
+        ));
+        g_tt.insert(&Triple::new(
+            w_cell.clone(),
+            crate::vocab::rdf::FIRST,
+            w_pat.clone(),
+        ));
+        g_tt.insert(&Triple::new(
+            w_cell,
+            crate::vocab::rdf::REST,
+            crate::vocab::rdf::NIL,
+        ));
+        g_tt.insert(&Triple::new(
+            w_pat.clone(),
+            super::vocab::sp::SUBJECT,
+            super::vocab::spin::THIS,
+        ));
+        g_tt.insert(&Triple::new(
+            w_pat.clone(),
+            super::vocab::sp::PREDICATE,
+            NamedNode::new_unchecked("http://example.org/ready"),
+        ));
+        g_tt.insert(&Triple::new(
+            w_pat,
+            super::vocab::sp::OBJECT,
+            Literal::from(true),
+        ));
+        let sparql_tt = serialize_query(&g_tt, &Term::NamedNode(q_tt)).unwrap();
+        assert!(
+            sparql_tt.contains(
+                "<<( <http://example.org/s> <http://example.org/p> <http://example.org/o> )>>"
+            ),
+            "{sparql_tt}"
+        );
+        let parsed_tt = parse_query(&sparql_tt, None, &[]).expect(&sparql_tt);
+        let spargebra::Query::Construct { template, .. } = parsed_tt else {
+            panic!("expected CONSTRUCT: {sparql_tt}");
+        };
+        assert_eq!(
+            template.len(),
+            1,
+            "ground triple term must not expand into a reifier + rdf:reifies triple: {template:?}"
+        );
+        assert!(
+            matches!(template[0].object, spargebra::term::TermPattern::Triple(_)),
+            "{template:?}"
         );
     }
 }
