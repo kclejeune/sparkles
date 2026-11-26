@@ -914,6 +914,11 @@ impl Deadline {
         }
     }
 
+    #[cfg(test)]
+    fn expire_now(&mut self) {
+        self.at = Some(Instant::now());
+    }
+
     fn left(&self) -> sparkles::Result<Option<Duration>> {
         let Some(at) = self.at else {
             return Ok(None);
@@ -924,6 +929,16 @@ impl Deadline {
         }
         Ok(Some(at.saturating_duration_since(now)))
     }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TestHooks {
+    /// Expire the request deadline immediately before querying dataset index `idx`.
+    pub(crate) expire_deadline_before_dataset: Option<usize>,
+    /// Charge any remaining query memory budget onto `snap_charge` right after
+    /// `settle_replay` so the defensive `charge.engine_budget()` error arm runs.
+    pub(crate) exhaust_budget_after_settle: bool,
 }
 
 /// Readable hosted namespace or version IRI entry used by the HTML renderer to apply the
@@ -1150,6 +1165,7 @@ fn probe_one_dataset(
     grant: &Option<Arc<PoolGrant>>,
     charge: &mut MemoryCharge,
     deadline: &Deadline,
+    #[cfg(test)] hooks: TestHooks,
 ) -> ApiResult<ProbeResult> {
     let mut opts = CallerContext::for_caller(st, &plan.ds, principal).read_options();
     opts.grant = grant.clone();
@@ -1202,6 +1218,17 @@ fn probe_one_dataset(
                 }
                 return Ok(ProbeResult::ReplayFailed(e));
             }
+        };
+        #[cfg(test)]
+        let held = if hooks.exhaust_budget_after_settle {
+            if let Ok(Some(rem)) = charge.engine_budget() {
+                let _ = charge.charge(rem);
+                held.saturating_add(rem)
+            } else {
+                held
+            }
+        } else {
+            held
         };
         (snap, held)
     } else {
@@ -1257,7 +1284,18 @@ fn live_is_readable(
     deadline: &Deadline,
 ) -> bool {
     matches!(
-        probe_one_dataset(st, principal, plan, sparql, None, grant, charge, deadline),
+        probe_one_dataset(
+            st,
+            principal,
+            plan,
+            sparql,
+            None,
+            grant,
+            charge,
+            deadline,
+            #[cfg(test)]
+            TestHooks::default(),
+        ),
         Ok(ProbeResult::Readable)
     )
 }
@@ -1273,10 +1311,22 @@ fn probe_any_readable(
     charge: &mut MemoryCharge,
     deadline: &Deadline,
     hide_replay_errors: bool,
+    #[cfg(test)] hooks: TestHooks,
 ) -> ApiResult<ProbeResult> {
     let mut saw_gone = false;
     for plan in plans {
-        match probe_one_dataset(st, principal, plan, sparql, at, grant, charge, deadline)? {
+        match probe_one_dataset(
+            st,
+            principal,
+            plan,
+            sparql,
+            at,
+            grant,
+            charge,
+            deadline,
+            #[cfg(test)]
+            hooks,
+        )? {
             ProbeResult::Readable => return Ok(ProbeResult::Readable),
             ProbeResult::Empty => {}
             ProbeResult::HistoryGone => {
@@ -1322,6 +1372,62 @@ pub fn resolve_and_describe(
     describe_params: &Params,
     grant: Option<Arc<PoolGrant>>,
     redirect_slash: bool,
+) -> ApiResult<LookupOutcome> {
+    resolve_and_describe_inner(
+        st,
+        principal,
+        catalog,
+        target,
+        requested_version,
+        at_override,
+        describe_params,
+        grant,
+        redirect_slash,
+        #[cfg(test)]
+        TestHooks::default(),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_and_describe_with_hooks(
+    st: &AppState,
+    principal: &Principal,
+    catalog: &CatalogFile,
+    target: LookupTarget,
+    requested_version: Option<&str>,
+    at_override: Option<At>,
+    describe_params: &Params,
+    grant: Option<Arc<PoolGrant>>,
+    redirect_slash: bool,
+    hooks: TestHooks,
+) -> ApiResult<LookupOutcome> {
+    resolve_and_describe_inner(
+        st,
+        principal,
+        catalog,
+        target,
+        requested_version,
+        at_override,
+        describe_params,
+        grant,
+        redirect_slash,
+        hooks,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_and_describe_inner(
+    st: &AppState,
+    principal: &Principal,
+    catalog: &CatalogFile,
+    target: LookupTarget,
+    requested_version: Option<&str>,
+    at_override: Option<At>,
+    describe_params: &Params,
+    grant: Option<Arc<PoolGrant>>,
+    redirect_slash: bool,
+    #[cfg(test)] hooks: TestHooks,
 ) -> ApiResult<LookupOutcome> {
     let iri = match target {
         LookupTarget::Iri(iri) => {
@@ -1381,7 +1487,8 @@ pub fn resolve_and_describe(
         });
     }
 
-    let deadline = Deadline::new(st.default_timeout);
+    #[allow(unused_mut)]
+    let mut deadline = Deadline::new(st.default_timeout);
     let mut charge = MemoryCharge::new(grant.clone(), st.limits.query_memory_bytes);
     let sparql = describe_sparql(&iri, &resolved_target);
 
@@ -1399,6 +1506,8 @@ pub fn resolve_and_describe(
             &mut charge,
             &deadline,
             true,
+            #[cfg(test)]
+            hooks,
         )? {
             ProbeResult::Readable => {
                 return Err(err_code(
@@ -1433,6 +1542,8 @@ pub fn resolve_and_describe(
                     &mut charge,
                     &deadline,
                     true,
+                    #[cfg(test)]
+                    hooks,
                 )? {
                     ProbeResult::Readable => {
                         return Err(err_code(
@@ -1471,6 +1582,8 @@ pub fn resolve_and_describe(
             &mut charge,
             &deadline,
             false,
+            #[cfg(test)]
+            hooks,
         )? {
             ProbeResult::Readable => Ok(LookupOutcome::Redirect { iri }),
             ProbeResult::HistoryGone => Err(history_gone()),
@@ -1507,22 +1620,23 @@ pub fn resolve_and_describe(
     }
 
     for (idx, plan) in plans.iter().enumerate() {
+        #[cfg(test)]
+        if hooks.expire_deadline_before_dataset == Some(idx) {
+            deadline.expire_now();
+        }
+        let readability_established = contributing_datasets > 0;
         let mut opts = CallerContext::for_caller(st, &plan.ds, principal).read_options();
         opts.grant = grant.clone();
         opts.timeout = match deadline.left() {
             Ok(t) => t,
             Err(e) => {
+                // Once an earlier dataset has contributed readable triples, propagate
+                // timeout rather than returning an incomplete description as an unmarked
+                // 200. Before any readable triple is established, keep the generic 404
+                // because `live_is_readable` cannot run under the expired deadline.
                 if effective_at.is_some()
                     && !matches!(e, sparkles::Error::Cancelled)
-                    && !live_is_readable(
-                        st,
-                        principal,
-                        plan,
-                        &sparql,
-                        &grant,
-                        &mut charge,
-                        &deadline,
-                    )
+                    && !readability_established
                 {
                     continue;
                 }
@@ -1546,15 +1660,17 @@ pub fn resolve_and_describe(
                     return Err(ApiError::from(sparkles::Error::Cancelled));
                 }
                 Err(e) => {
-                    if live_is_readable(
-                        st,
-                        principal,
-                        plan,
-                        &sparql,
-                        &grant,
-                        &mut charge,
-                        &deadline,
-                    ) {
+                    if readability_established
+                        || live_is_readable(
+                            st,
+                            principal,
+                            plan,
+                            &sparql,
+                            &grant,
+                            &mut charge,
+                            &deadline,
+                        )
+                    {
                         return Err(ApiError::from(e));
                     }
                     continue;
@@ -1589,15 +1705,17 @@ pub fn resolve_and_describe(
                         }
                         sparkles::Error::Cancelled => return Err(ApiError::from(e)),
                         other => {
-                            if live_is_readable(
-                                st,
-                                principal,
-                                plan,
-                                &sparql,
-                                &grant,
-                                &mut charge,
-                                &deadline,
-                            ) {
+                            if readability_established
+                                || live_is_readable(
+                                    st,
+                                    principal,
+                                    plan,
+                                    &sparql,
+                                    &grant,
+                                    &mut charge,
+                                    &deadline,
+                                )
+                            {
                                 return Err(ApiError::from(other));
                             }
                             continue;
@@ -1612,19 +1730,32 @@ pub fn resolve_and_describe(
                     if let Some(r) = reserved {
                         charge.release(r);
                     }
-                    if live_is_readable(
-                        st,
-                        principal,
-                        plan,
-                        &sparql,
-                        &grant,
-                        &mut charge,
-                        &deadline,
-                    ) {
+                    if readability_established
+                        || live_is_readable(
+                            st,
+                            principal,
+                            plan,
+                            &sparql,
+                            &grant,
+                            &mut charge,
+                            &deadline,
+                        )
+                    {
                         return Err(ApiError::from(e));
                     }
                     continue;
                 }
+            };
+            #[cfg(test)]
+            let held = if hooks.exhaust_budget_after_settle {
+                if let Ok(Some(rem)) = charge.engine_budget() {
+                    let _ = charge.charge(rem);
+                    held.saturating_add(rem)
+                } else {
+                    held
+                }
+            } else {
+                held
             };
             (snap, resolved, held)
         } else {
@@ -1638,6 +1769,7 @@ pub fn resolve_and_describe(
                 charge.release(snap_charge);
                 if effective_at.is_some()
                     && !matches!(e, sparkles::Error::Cancelled)
+                    && !readability_established
                     && !live_is_readable(
                         st,
                         principal,
@@ -1660,6 +1792,7 @@ pub fn resolve_and_describe(
                 charge.release(snap_charge);
                 if effective_at.is_some()
                     && !matches!(e, sparkles::Error::Cancelled)
+                    && !readability_established
                     && !live_is_readable(
                         st,
                         principal,

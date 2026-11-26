@@ -448,25 +448,36 @@ fn render_htaccess(
     );
     let _ = writeln!(out, "Options +FollowSymLinks");
     let _ = writeln!(out, "RewriteEngine on");
+    let _ = writeln!(out, "RewriteOptions AllowNoSlash");
     let _ = writeln!(out);
 
     let subst_base = escape_rewrite_subst(base);
 
-    // Version IRI rules come before general namespace rules, ordered longest-first so
-    // more specific prefixes (including repeated-slash prefixes) match before parents.
+    // Version IRI rules come before general namespace rules, ordered longest-first by
+    // wire request path so more specific prefixes (including repeated-slash prefixes)
+    // match before parents.
     if !versions.is_empty() {
         let _ = writeln!(out, "# Versioned IRI rules");
+        let ver_paths: Vec<String> = versions
+            .iter()
+            .map(|v| wire_request_path(&v.version_iri, mount))
+            .collect();
         let mut ver_order: Vec<usize> = (0..versions.len()).collect();
         ver_order.sort_by(|&a, &b| {
-            versions[b]
-                .version_iri
+            ver_paths[b]
                 .len()
-                .cmp(&versions[a].version_iri.len())
+                .cmp(&ver_paths[a].len())
+                .then_with(|| {
+                    versions[b]
+                        .version_iri
+                        .len()
+                        .cmp(&versions[a].version_iri.len())
+                })
                 .then_with(|| a.cmp(&b))
         });
         for i in ver_order {
             let v = &versions[i];
-            let wire_path = wire_request_path(&v.version_iri, mount);
+            let wire_path = &ver_paths[i];
             let subst_vi = escape_rewrite_subst(&percent_encode(&v.version_iri));
             let _ = writeln!(
                 out,
@@ -478,7 +489,7 @@ fn render_htaccess(
                     .map(|s| format!(" -> {s}"))
                     .unwrap_or_default()
             );
-            let exact_pat = exact_request_pattern(&wire_path);
+            let exact_pat = exact_request_pattern(wire_path);
             let _ = writeln!(out, "RewriteCond %{{ENV:SPARKLES_LD}} ^$");
             let _ = writeln!(out, "RewriteCond %{{THE_REQUEST}} {exact_pat}");
             let _ = writeln!(
@@ -489,7 +500,7 @@ fn render_htaccess(
                 write_dynamic_slash_rule(
                     &mut out,
                     &format!("v{i}"),
-                    &wire_path,
+                    wire_path,
                     &subst_base,
                     &subst_vi,
                 );
@@ -498,17 +509,21 @@ fn render_htaccess(
         }
     }
 
+    let ns_paths: Vec<String> = namespaces
+        .iter()
+        .map(|ns| wire_request_path(&ns.iri, mount))
+        .collect();
     let mut ns_order: Vec<usize> = (0..namespaces.len()).collect();
     ns_order.sort_by(|&a, &b| {
-        namespaces[b]
-            .iri
+        ns_paths[b]
             .len()
-            .cmp(&namespaces[a].iri.len())
+            .cmp(&ns_paths[a].len())
+            .then_with(|| namespaces[b].iri.len().cmp(&namespaces[a].iri.len()))
             .then_with(|| a.cmp(&b))
     });
     for i in ns_order {
         let ns = &namespaces[i];
-        let wire_path = wire_request_path(&ns.iri, mount);
+        let wire_path = &ns_paths[i];
         let subst_prefix = escape_rewrite_subst(&percent_encode(&ns.prefix));
         let subst_ns = escape_rewrite_subst(&percent_encode(&ns.iri));
         let _ = writeln!(
@@ -516,7 +531,7 @@ fn render_htaccess(
             "# Namespace '{}' ({}, {} IRI)",
             ns.prefix, ns.iri, ns.style
         );
-        let root_pat = exact_request_pattern(&wire_path);
+        let root_pat = exact_request_pattern(wire_path);
         if ns.style == "hash" {
             let _ = writeln!(out, "RewriteCond %{{ENV:SPARKLES_LD}} ^$");
             let _ = writeln!(out, "RewriteCond %{{THE_REQUEST}} {root_pat}");
@@ -529,7 +544,7 @@ fn render_htaccess(
                 write_dynamic_slash_rule(
                     &mut out,
                     &format!("n{i}"),
-                    &wire_path,
+                    wire_path,
                     &subst_base,
                     &subst_ns,
                 );

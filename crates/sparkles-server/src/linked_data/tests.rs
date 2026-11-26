@@ -968,7 +968,7 @@ datasets = {{ other_ds = "read" }}
         outsider = h("out-pw"),
     );
     let auth_path = dir.path().join("auth.toml");
-    std::fs::write(&auth_path, auth_toml).unwrap();
+    std::fs::write(&auth_path, &auth_toml).unwrap();
     let auth = crate::auth::load(Some(&auth_path), dir.path(), "127.0.0.1", false).unwrap();
 
     let mut st =
@@ -1405,7 +1405,7 @@ graphs = ["http://example.org/cold/g"]
         pub_reader = h("pub-pw"),
     );
     let auth_path = dir.path().join("auth.toml");
-    std::fs::write(&auth_path, auth_toml).unwrap();
+    std::fs::write(&auth_path, &auth_toml).unwrap();
     let auth = crate::auth::load(Some(&auth_path), dir.path(), "127.0.0.1", false).unwrap();
 
     let basic = |u: &str, pw: &str| {
@@ -1427,11 +1427,14 @@ graphs = ["http://example.org/cold/g"]
         st.create("cold_ds", DbType::Persistent).unwrap();
         let app = crate::http::router(st.clone());
 
-        let mut ttl = String::from(
+        let big_pub = "p".repeat(8 * 1024);
+        let big_secret = "s".repeat(8 * 1024);
+        let mut ttl = format!(
             "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
              @prefix cold: <http://example.org/cold/> .\n\
-             cold:PublicTerm rdfs:label \"Public Term\" .\n\
-             cold:v1 cold:secretNote \"HIDDEN COLD VERSION\" .\n",
+             cold:PublicTerm rdfs:label \"Public Term\" ;\n\
+               rdfs:comment \"{big_pub}\" .\n\
+             cold:v1 cold:secretNote \"{big_secret}\" .\n"
         );
         for i in 0..400 {
             ttl.push_str(&format!(
@@ -1460,21 +1463,22 @@ graphs = ["http://example.org/cold/g"]
         .await;
         assert_eq!(snap.status, StatusCode::CREATED, "{}", snap.text());
 
-        // Commit 2 keeps both PublicTerm and the hidden v1 triple at head so live probes
-        // see PublicTerm (for pub_reader) and v1 (for admin only), while snapshot:cold
-        // requires WAL replay of commit 1.
-        let post2 = send(
+        // Commit 2 keeps a small live PublicTerm (for pub_reader) and a hidden v1 triple
+        // (for admin only) at head, while snapshot:cold holds the larger historical state
+        // and requires WAL replay when cold.
+        let put2 = send(
             &app,
-            Request::post("/cold_ds/data?graph=http%3A%2F%2Fexample.org%2Fcold%2Fg")
+            Request::put("/cold_ds/data?graph=http%3A%2F%2Fexample.org%2Fcold%2Fg")
                 .header(header::CONTENT_TYPE, "text/turtle")
                 .header(header::AUTHORIZATION, &admin_auth)
                 .body(Body::from(
-                    "<http://example.org/cold/PublicTerm> <http://www.w3.org/2000/01/rdf-schema#comment> \"head\" .",
+                    "<http://example.org/cold/PublicTerm> <http://www.w3.org/2000/01/rdf-schema#label> \"Public Term\" .\n\
+                     <http://example.org/cold/v1> <http://example.org/cold/secretNote> \"HIDDEN LIVE\" .\n",
                 ))
                 .unwrap(),
         )
         .await;
-        assert!(post2.status.is_success(), "{}", post2.text());
+        assert!(put2.status.is_success(), "{}", put2.text());
 
         let reg = send(
             &app,
@@ -1499,70 +1503,59 @@ graphs = ["http://example.org/cold/g"]
         assert_eq!(reg.status, StatusCode::CREATED, "{}", reg.text());
     }
 
-    // Reopen with a cold history cache and test three tight memory ceilings:
-    //  1. 24 KiB: cold replay itself exceeds the cap inside `snapshot_for_limited`.
-    //  2. `retained`: replay + `settle_replay` succeed, then `charge.engine_budget()` fails.
-    //  3. `retained + 64`: replay + `engine_budget()` succeed, then `sparql::query()` fails.
-    let probe_st =
-        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
-    let probe_ds = crate::http::dataset(&probe_st, "cold_ds")
-        .ok()
-        .expect("cold_ds dataset");
-    let (_, _, retained) = probe_ds
-        .store
-        .snapshot_at_limited_bytes(
-            &sparkles::history::At::Snapshot("cold".to_string()),
-            &sparkles::history::HistoryOptions::default(),
-            64 * 1024 * 1024,
-        )
-        .unwrap();
-    assert!(
-        retained > 24 * 1024,
-        "expected retained > 24 KiB, got {retained}"
-    );
-    drop(probe_ds);
-    drop(probe_st);
+    let hidden_uris = [
+        format!("/$/ld?iri={}", enc("http://example.org/cold/v1")),
+        format!("/$/ld/doc?iri={}", enc("http://example.org/cold/v1")),
+        format!(
+            "/$/ld/doc?iri={}&version=2.0",
+            enc("http://example.org/cold/v1")
+        ),
+        format!(
+            "/$/ld/doc?iri={}&at=commit:999",
+            enc("http://example.org/cold/v1")
+        ),
+    ];
 
-    for (label, cap) in [
-        ("cold-replay-exceeds-cap", 24 * 1024),
-        ("post-replay-engine-budget-zero", retained),
-        ("post-replay-query-budget-exhausted", retained + 64),
-    ] {
+    // 1. Cold replay exceeds the 24 KiB cap inside `snapshot_for_limited`.
+    {
         let mut st =
             AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
         st.auth = auth.clone();
-        st.limits.query_memory_bytes = Some(cap);
+        st.limits.query_memory_bytes = Some(24 * 1024);
         let st = Arc::new(st);
+        let cold_ds = crate::http::dataset(&st, "cold_ds")
+            .ok()
+            .expect("cold_ds dataset");
+        assert!(
+            matches!(
+                cold_ds.store.snapshot_at_limited_bytes(
+                    &sparkles::history::At::Snapshot("cold".to_string()),
+                    &sparkles::history::HistoryOptions::default(),
+                    24 * 1024,
+                ),
+                Err(sparkles::Error::BudgetExceeded(b))
+                    if b.kind == sparkles::BudgetKind::Memory
+            ),
+            "cold replay must exceed 24 KiB"
+        );
         let app = crate::http::router(st.clone());
 
-        // pub_reader cannot read cold/v1 (hidden by triple protection): direct lookup,
-        // redirect probe and conflict probes must all return the generic 404 — identical to
-        // an absent IRI — and must NEVER return 507 or leak replay/engine byte counts.
-        for uri in [
-            format!("/$/ld?iri={}", enc("http://example.org/cold/v1")),
-            format!("/$/ld/doc?iri={}", enc("http://example.org/cold/v1")),
-            format!(
-                "/$/ld/doc?iri={}&version=2.0",
-                enc("http://example.org/cold/v1")
-            ),
-            format!(
-                "/$/ld/doc?iri={}&at=commit:999",
-                enc("http://example.org/cold/v1")
-            ),
-        ] {
-            let r = send(&app, get_req(&uri, Some("text/turtle"), Some(&pub_auth))).await;
+        for uri in &hidden_uris {
+            let r = send(&app, get_req(uri, Some("text/turtle"), Some(&pub_auth))).await;
             assert_eq!(
                 r.status,
                 StatusCode::NOT_FOUND,
-                "{label} disclosed hidden catalog entry on {uri}: {}",
+                "cold-replay-exceeds-cap disclosed hidden catalog entry on {uri}: {}",
                 r.text()
             );
             assert_eq!(r.json()["code"], "linked-data-not-found");
-            assert!(!r.text().contains("requested"), "{label}: {}", r.text());
+            assert!(
+                !r.text().contains("requested"),
+                "cold-replay-exceeds-cap: {}",
+                r.text()
+            );
         }
 
-        // Authorized caller on a live-readable target (pub_reader on PublicTerm?at=snapshot:cold)
-        // still receives 507 when replay or post-replay query execution exceeds the budget.
         let auth_cold = send(
             &app,
             get_req(
@@ -1578,29 +1571,330 @@ graphs = ["http://example.org/cold/g"]
         assert_eq!(
             auth_cold.status,
             StatusCode::INSUFFICIENT_STORAGE,
-            "{label}: {}",
+            "cold-replay-exceeds-cap: {}",
             auth_cold.text()
         );
     }
 
-    // Expired deadline on historical lookup must also stay 404 (never 408) for a hidden target.
+    // 2. Use an in-memory retained snapshot whose retained delta (~60+ KiB) exceeds the
+    //    live 1-triple probe's memory footprint so `snapshot_for_limited` succeeds under
+    //    `mem_cap = mem_retained + 1024`, the post-replay ACL-filtered `sparql::query()`
+    //    fails under the 1 KiB remainder, and `live_is_readable` still succeeds under the
+    //    full `mem_cap` after `snap_charge` is released.
+    {
+        let mem_dir = tempfile::tempdir().unwrap();
+        let mem_auth_path = mem_dir.path().join("auth.toml");
+        std::fs::write(&mem_auth_path, &auth_toml).unwrap();
+        let mem_auth =
+            crate::auth::load(Some(&mem_auth_path), mem_dir.path(), "127.0.0.1", false).unwrap();
+
+        let mut st = AppState::new(
+            mem_dir.path(),
+            StoreOptions::default(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        st.auth = mem_auth.clone();
+        let st = Arc::new(st);
+        st.create("cold_ds", DbType::Mem).unwrap();
+        let setup_app = crate::http::router(st.clone());
+
+        let big_pub = "p".repeat(8 * 1024);
+        let big_secret = "s".repeat(8 * 1024);
+        let mut ttl = format!(
+            "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+             @prefix cold: <http://example.org/cold/> .\n\
+             cold:PublicTerm rdfs:label \"Public Term\" ;\n\
+               rdfs:comment \"{big_pub}\" .\n\
+             cold:v1 cold:secretNote \"{big_secret}\" .\n"
+        );
+        for i in 0..400 {
+            ttl.push_str(&format!(
+                "cold:Pad{i} rdfs:comment \"padding-entry-{i:04}-payload-for-wal-replay\" .\n"
+            ));
+        }
+        let put1 = send(
+            &setup_app,
+            Request::put("/cold_ds/data?graph=http%3A%2F%2Fexample.org%2Fcold%2Fg")
+                .header(header::CONTENT_TYPE, "text/turtle")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .body(Body::from(ttl))
+                .unwrap(),
+        )
+        .await;
+        assert!(put1.status.is_success(), "{}", put1.text());
+
+        let snap = send(
+            &setup_app,
+            post_json(
+                "/$/snapshots/cold_ds",
+                json!({"name": "cold"}),
+                Some(&admin_auth),
+            ),
+        )
+        .await;
+        assert_eq!(snap.status, StatusCode::CREATED, "{}", snap.text());
+
+        let put2 = send(
+            &setup_app,
+            Request::put("/cold_ds/data?graph=http%3A%2F%2Fexample.org%2Fcold%2Fg")
+                .header(header::CONTENT_TYPE, "text/turtle")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .body(Body::from(
+                    "<http://example.org/cold/PublicTerm> <http://www.w3.org/2000/01/rdf-schema#label> \"Public Term\" .\n\
+                     <http://example.org/cold/v1> <http://example.org/cold/secretNote> \"HIDDEN LIVE\" .\n",
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert!(put2.status.is_success(), "{}", put2.text());
+
+        let reg = send(
+            &setup_app,
+            post_json(
+                "/$/resources",
+                json!({
+                    "id": "coldv",
+                    "kind": "vocabulary",
+                    "title": "Cold Vocab",
+                    "namespaces": [{"prefix": "cold", "iri": "http://example.org/cold/"}],
+                    "graphs": [{"dataset": "cold_ds", "graph": "http://example.org/cold/g"}],
+                    "versions": [{
+                        "version": "1.0",
+                        "versionIri": "http://example.org/cold/v1",
+                        "snapshot": "snapshot:cold"
+                    }]
+                }),
+                Some(&admin_auth),
+            ),
+        )
+        .await;
+        assert_eq!(reg.status, StatusCode::CREATED, "{}", reg.text());
+
+        let mem_ds = crate::http::dataset(&st, "cold_ds")
+            .ok()
+            .expect("cold_ds dataset");
+        let (_, _, mem_retained) = mem_ds
+            .store
+            .snapshot_at_limited_bytes(
+                &sparkles::history::At::Snapshot("cold".to_string()),
+                &sparkles::history::HistoryOptions::default(),
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+        assert!(
+            mem_retained > 24 * 1024,
+            "expected in-memory retained snapshot > 24 KiB, got {mem_retained}"
+        );
+        // Bounded lookup needs 1 KiB (`READ_METADATA_BYTES`) headroom above `mem_retained`,
+        // leaving 1 KiB for `sparql::query()` while full `mem_cap` (> 25 KiB) easily runs
+        // the live 1-triple readability probe.
+        let mem_cap = mem_retained + 1024;
+
+        let (mem_snap, _, check_retained) = mem_ds
+            .store
+            .snapshot_at_limited_bytes(
+                &sparkles::history::At::Snapshot("cold".to_string()),
+                &sparkles::history::HistoryOptions::default(),
+                mem_cap,
+            )
+            .expect("in-memory retained snapshot lookup must succeed under mem_cap");
+        assert_eq!(check_retained, mem_retained);
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert(header::AUTHORIZATION, pub_auth.parse().unwrap());
+        let pub_principal = st
+            .auth
+            .as_ref()
+            .unwrap()
+            .authenticate(&hdrs, None, None, None, None, None)
+            .await
+            .unwrap()
+            .principal;
+        let mut pub_opts = CallerContext::for_caller(&st, &mem_ds, &pub_principal).read_options();
+        pub_opts.default_graph_uris = vec!["http://example.org/cold/g".to_string()];
+        pub_opts.default_graph_extra.clear();
+        pub_opts.max_memory_bytes = Some(mem_cap - mem_retained);
+        assert!(
+            matches!(
+                sparkles::sparql::query(
+                    mem_snap.clone(),
+                    "DESCRIBE <http://example.org/cold/PublicTerm>",
+                    &pub_opts,
+                ),
+                Err(sparkles::Error::BudgetExceeded(b))
+                    if b.kind == sparkles::BudgetKind::Memory
+            ),
+            "post-replay query for PublicTerm must fail under remaining budget {}",
+            mem_cap - mem_retained
+        );
+        assert!(
+            matches!(
+                sparkles::sparql::query(
+                    mem_snap,
+                    "DESCRIBE <http://example.org/cold/v1>",
+                    &pub_opts,
+                ),
+                Err(sparkles::Error::BudgetExceeded(b))
+                    if b.kind == sparkles::BudgetKind::Memory
+            ),
+            "post-replay ACL-filtered query for hidden v1 must fail under remaining budget {}",
+            mem_cap - mem_retained
+        );
+        let mut live_opts = pub_opts.clone();
+        live_opts.max_memory_bytes = Some(mem_cap);
+        live_opts.describe.max_triples = Some(1);
+        let live_res = sparkles::sparql::query(
+            mem_ds.store.snapshot(),
+            "DESCRIBE <http://example.org/cold/PublicTerm>",
+            &live_opts,
+        )
+        .expect("live 1-triple probe for PublicTerm must succeed under full mem_cap");
+        assert!(!live_res.triples().is_empty());
+
+        // Drop the temporary router and apply `mem_cap` directly on this exact `AppState`.
+        drop(setup_app);
+        drop(mem_ds);
+        let mut st = Arc::try_unwrap(st).ok().expect("unique AppState");
+        st.limits.query_memory_bytes = Some(mem_cap);
+        let app = crate::http::router(Arc::new(st));
+
+        for uri in &hidden_uris {
+            let r = send(&app, get_req(uri, Some("text/turtle"), Some(&pub_auth))).await;
+            assert_eq!(
+                r.status,
+                StatusCode::NOT_FOUND,
+                "post-replay-query-budget-exhausted disclosed hidden catalog entry on {uri}: {}",
+                r.text()
+            );
+            assert_eq!(r.json()["code"], "linked-data-not-found");
+            assert!(
+                !r.text().contains("requested"),
+                "post-replay-query-budget-exhausted: {}",
+                r.text()
+            );
+        }
+
+        let auth_mem = send(
+            &app,
+            get_req(
+                &format!(
+                    "/$/ld/doc?iri={}&at=snapshot:cold",
+                    enc("http://example.org/cold/PublicTerm")
+                ),
+                Some("text/turtle"),
+                Some(&pub_auth),
+            ),
+        )
+        .await;
+        assert_eq!(
+            auth_mem.status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "post-replay-query-budget-exhausted: {}",
+            auth_mem.text()
+        );
+    }
+
+    // 3. Cover the defensive zero-remaining-budget (`charge.engine_budget()`) arm
+    //    separately in both `probe_one_dataset` (`redirect_slash: true`) and
+    //    `resolve_and_describe` (`redirect_slash: false`), verifying charge release
+    //    before `live_is_readable` and clean pool accounting.
+    {
+        let mut st = AppState::with_memory(
+            dir.path(),
+            StoreOptions::default(),
+            Duration::from_secs(30),
+            Some(256 * 1024),
+        )
+        .unwrap();
+        st.auth = auth.clone();
+        st.limits.query_memory_bytes = Some(128 * 1024);
+        let st = Arc::new(st);
+        let warm_ds = crate::http::dataset(&st, "cold_ds")
+            .ok()
+            .expect("cold_ds dataset");
+        warm_ds
+            .store
+            .snapshot_at_limited_bytes(
+                &sparkles::history::At::Snapshot("cold".to_string()),
+                &sparkles::history::HistoryOptions::default(),
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert(header::AUTHORIZATION, pub_auth.parse().unwrap());
+        let pub_principal = st
+            .auth
+            .as_ref()
+            .unwrap()
+            .authenticate(&hdrs, None, None, None, None, None)
+            .await
+            .unwrap()
+            .principal;
+        let catalog = st.resources.read().unwrap();
+        let pool = st.catalog.pool().expect("query pool");
+        let hooks = super::TestHooks {
+            expire_deadline_before_dataset: None,
+            exhaust_budget_after_settle: true,
+        };
+
+        for redirect_slash in [true, false] {
+            let grant = Arc::new(pool.empty_grant());
+            let err = super::resolve_and_describe_with_hooks(
+                &st,
+                &pub_principal,
+                &catalog,
+                LookupTarget::Iri("http://example.org/cold/v1".to_string()),
+                None,
+                None,
+                &crate::http::Params::default(),
+                Some(grant),
+                redirect_slash,
+                hooks,
+            )
+            .err()
+            .expect("hidden v1 must fail");
+            let resp = axum::response::IntoResponse::into_response(err);
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "defensive zero-budget arm disclosed hidden v1 (redirect_slash={redirect_slash})"
+            );
+            assert_eq!(pool.granted(), 0, "hidden v1 leaked pool charge");
+
+            let grant = Arc::new(pool.empty_grant());
+            let err = super::resolve_and_describe_with_hooks(
+                &st,
+                &pub_principal,
+                &catalog,
+                LookupTarget::Iri("http://example.org/cold/PublicTerm".to_string()),
+                None,
+                Some(sparkles::history::At::Snapshot("cold".to_string())),
+                &crate::http::Params::default(),
+                Some(grant),
+                redirect_slash,
+                hooks,
+            )
+            .err()
+            .expect("PublicTerm must fail with 507");
+            let resp = axum::response::IntoResponse::into_response(err);
+            assert_eq!(
+                resp.status(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                "defensive zero-budget arm must release snap_charge before live_is_readable (redirect_slash={redirect_slash})"
+            );
+            assert_eq!(pool.granted(), 0, "PublicTerm leaked pool charge");
+        }
+    }
+
+    // 4. Expired deadline on historical lookup must also stay 404 (never 408) for a hidden target.
     let mut st_to =
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_nanos(1)).unwrap();
     st_to.auth = auth;
     let app_to = crate::http::router(Arc::new(st_to));
-    for uri in [
-        format!("/$/ld?iri={}", enc("http://example.org/cold/v1")),
-        format!("/$/ld/doc?iri={}", enc("http://example.org/cold/v1")),
-        format!(
-            "/$/ld/doc?iri={}&version=2.0",
-            enc("http://example.org/cold/v1")
-        ),
-        format!(
-            "/$/ld/doc?iri={}&at=commit:999",
-            enc("http://example.org/cold/v1")
-        ),
-    ] {
-        let r = send(&app_to, get_req(&uri, Some("text/turtle"), Some(&pub_auth))).await;
+    for uri in &hidden_uris {
+        let r = send(&app_to, get_req(uri, Some("text/turtle"), Some(&pub_auth))).await;
         assert_eq!(
             r.status,
             StatusCode::NOT_FOUND,
@@ -1609,6 +1903,182 @@ graphs = ["http://example.org/cold/g"]
         );
         assert_eq!(r.json()["code"], "linked-data-not-found");
     }
+}
+
+#[tokio::test]
+async fn multi_dataset_historical_deadline_expiry_propagates_timeout_only_after_readability() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    st.create("mto_ds1", DbType::Persistent).unwrap();
+    st.create("mto_ds2", DbType::Persistent).unwrap();
+    let app = crate::http::router(st.clone());
+
+    let put1 = send(
+        &app,
+        Request::put("/mto_ds1/data?graph=http%3A%2F%2Fexample.org%2Fmto%2Fg1")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(
+                "<http://example.org/mto/Shared> <http://www.w3.org/2000/01/rdf-schema#label> \"From DS1\" .\n",
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert!(put1.status.is_success(), "{}", put1.text());
+    let put2 = send(
+        &app,
+        Request::put("/mto_ds2/data?graph=http%3A%2F%2Fexample.org%2Fmto%2Fg2")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(
+                "<http://example.org/mto/Shared> <http://www.w3.org/2000/01/rdf-schema#comment> \"From DS2\" .\n\
+                 <http://example.org/mto/OnlyInDs2> <http://www.w3.org/2000/01/rdf-schema#label> \"Only DS2\" .\n",
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert!(put2.status.is_success(), "{}", put2.text());
+
+    for ds_name in ["mto_ds1", "mto_ds2"] {
+        let snap = send(
+            &app,
+            post_json(
+                &format!("/$/snapshots/{ds_name}"),
+                json!({"name": "v1"}),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(snap.status, StatusCode::CREATED, "{}", snap.text());
+        // Advance head so snapshot:v1 is a historical state on both datasets.
+        let post = send(
+            &app,
+            Request::post(format!(
+                "/{ds_name}/data?graph=http%3A%2F%2Fexample.org%2Fmto%2F{}",
+                if ds_name == "mto_ds1" { "g1" } else { "g2" }
+            ))
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(
+                "<http://example.org/mto/Extra> <http://www.w3.org/2000/01/rdf-schema#label> \"head\" .\n",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert!(post.status.is_success(), "{}", post.text());
+    }
+
+    let reg = send(
+        &app,
+        post_json(
+            "/$/resources",
+            json!({
+                "id": "mto",
+                "kind": "vocabulary",
+                "title": "Multi-dataset timeout vocab",
+                "namespaces": [{"prefix": "mto", "iri": "http://example.org/mto/"}],
+                "graphs": [
+                    {"dataset": "mto_ds1", "graph": "http://example.org/mto/g1"},
+                    {"dataset": "mto_ds2", "graph": "http://example.org/mto/g2"}
+                ]
+            }),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(reg.status, StatusCode::CREATED, "{}", reg.text());
+
+    let catalog = st.resources.read().unwrap();
+    let principal = crate::auth::Principal::local();
+    let snap_at = sparkles::history::At::Snapshot("v1".to_string());
+
+    // Sanity check: without expiry, `Shared` merges triples from both datasets.
+    let merged = match super::resolve_and_describe_with_hooks(
+        &st,
+        &principal,
+        &catalog,
+        LookupTarget::Iri("http://example.org/mto/Shared".to_string()),
+        None,
+        Some(snap_at.clone()),
+        &crate::http::Params::default(),
+        None,
+        false,
+        super::TestHooks::default(),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let resp = axum::response::IntoResponse::into_response(e);
+            panic!(
+                "unexpired multi-dataset lookup should succeed, got {}",
+                resp.status()
+            );
+        }
+    };
+    let LookupOutcome::Document(desc) = merged else {
+        panic!("expected Document outcome");
+    };
+    assert_eq!(desc.triples.as_slice().len(), 2);
+
+    let expire_before_second = super::TestHooks {
+        expire_deadline_before_dataset: Some(1),
+        exhaust_budget_after_settle: false,
+    };
+
+    // With an earlier readable triple from dataset 0, expiry before dataset 1 MUST
+    // propagate 408 Request Timeout rather than returning an incomplete 200 OK.
+    let err_after_read = super::resolve_and_describe_with_hooks(
+        &st,
+        &principal,
+        &catalog,
+        LookupTarget::Iri("http://example.org/mto/Shared".to_string()),
+        None,
+        Some(snap_at.clone()),
+        &crate::http::Params::default(),
+        None,
+        false,
+        expire_before_second,
+    )
+    .err()
+    .expect("expired deadline after earlier readable dataset must not return incomplete 200");
+    let resp_after = axum::response::IntoResponse::into_response(err_after_read);
+    assert_eq!(resp_after.status(), StatusCode::REQUEST_TIMEOUT);
+
+    // Without an earlier readable triple from dataset 0, historical expiry before dataset 1
+    // MUST preserve the generic 404 response.
+    let err_before_read = super::resolve_and_describe_with_hooks(
+        &st,
+        &principal,
+        &catalog,
+        LookupTarget::Iri("http://example.org/mto/OnlyInDs2".to_string()),
+        None,
+        Some(snap_at),
+        &crate::http::Params::default(),
+        None,
+        false,
+        expire_before_second,
+    )
+    .err()
+    .expect("expired historical deadline without readability must fail");
+    let resp_before = axum::response::IntoResponse::into_response(err_before_read);
+    assert_eq!(resp_before.status(), StatusCode::NOT_FOUND);
+
+    // Non-historical (live) lookup still propagates 408 Request Timeout when expiring
+    // before dataset 1 even when dataset 0 had no triples.
+    let err_live = super::resolve_and_describe_with_hooks(
+        &st,
+        &principal,
+        &catalog,
+        LookupTarget::Iri("http://example.org/mto/OnlyInDs2".to_string()),
+        None,
+        None,
+        &crate::http::Params::default(),
+        None,
+        false,
+        expire_before_second,
+    )
+    .err()
+    .expect("expired live deadline must return 408");
+    let resp_live = axum::response::IntoResponse::into_response(err_live);
+    assert_eq!(resp_live.status(), StatusCode::REQUEST_TIMEOUT);
 }
 
 #[tokio::test]
@@ -2898,6 +3368,8 @@ async fn apache_recipe_round_trips_encoded_version_iri_and_dynamic_encoded_terms
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 <http://example.org/ap/g> {
+  <https://w3id.org/myorg> a owl:Ontology ;
+    rdfs:label "Mount Root Version" .
   <https://w3id.org/myorg/mv/> a owl:Ontology ;
     owl:versionIRI <https://w3id.org/myorg/mv/rev%3B1> ;
     rdfs:label "Encoded Version rev%3B1" .
@@ -2958,11 +3430,18 @@ async fn apache_recipe_round_trips_encoded_version_iri_and_dynamic_encoded_terms
                     {"prefix": "dbl", "iri": "https://w3id.org/myorg/vocab//"}
                 ],
                 "graphs": [{"dataset": "apds", "graph": "http://example.org/ap/g"}],
-                "versions": [{
-                    "version": "1.0",
-                    "versionIri": "https://w3id.org/myorg/mv/rev%3B1",
-                    "snapshot": "snapshot:v1"
-                }]
+                "versions": [
+                    {
+                        "version": "1.0",
+                        "versionIri": "https://w3id.org/myorg/mv/rev%3B1",
+                        "snapshot": "snapshot:v1"
+                    },
+                    {
+                        "version": "0.9",
+                        "versionIri": "https://w3id.org/myorg",
+                        "snapshot": "snapshot:v1"
+                    }
+                ]
             }),
             None,
         ),
@@ -2980,8 +3459,13 @@ async fn apache_recipe_round_trips_encoded_version_iri_and_dynamic_encoded_terms
     .await;
     assert_eq!(recipe.status, StatusCode::OK, "{}", recipe.text());
     let text = recipe.text();
+    assert!(
+        text.contains("RewriteOptions AllowNoSlash"),
+        "expected RewriteOptions AllowNoSlash in generated .htaccess:\n{text}"
+    );
 
     let cases = [
+        ("/myorg", "Mount Root Version", Some("snapshot:v1")),
         (
             "/myorg/mv/rev%3B1",
             "Encoded Version rev%3B1",
@@ -3034,6 +3518,12 @@ async fn apache_recipe_round_trips_encoded_version_iri_and_dynamic_encoded_terms
         assert_eq!(resp.header("sparkles-at"), want_at, "{raw_path}");
     }
 
+    // Trailing-slash `/myorg/` must NOT match the slashless mount-root IRI `/myorg`.
+    assert_eq!(
+        eval_htaccess_request(&text, "/myorg/"),
+        None,
+        "slashed mount root must not match slashless version IRI"
+    );
     // Single-slash `/myorg/vocab/Term` must NOT redirect into `/myorg/vocab//Term`.
     assert_eq!(
         eval_htaccess_request(&text, "/myorg/vocab/Term"),
@@ -3171,8 +3661,14 @@ async fn apache_recipe_round_trips_encoded_version_iri_and_dynamic_encoded_terms
             assert_eq!(resp.header("sparkles-at"), want_at, "apache2 {raw_path}");
         }
 
-        // Verify real Apache refuses single-slash `/myorg/vocab/Term` (404, no redirect)
-        // and explicitly rejects multi-`?` queries (400).
+        // Verify real Apache refuses trailing-slash `/myorg/` (distinct from slashless
+        // `/myorg`), refuses single-slash `/myorg/vocab/Term` (404, no redirect), and
+        // explicitly rejects multi-`?` queries (400).
+        let mount_slash = raw_http("/myorg/");
+        assert!(
+            mount_slash.starts_with("HTTP/1.1 404"),
+            "apache2 /myorg/ should be 404 (distinct from /myorg), got: {mount_slash}"
+        );
         let miss = raw_http("/myorg/vocab/Term");
         assert!(
             miss.starts_with("HTTP/1.1 404"),
@@ -3277,7 +3773,7 @@ graphs = ["http://example.org/ds/public"]
         pub_reader = h("pub-pw"),
     );
     let auth_path = dir.path().join("auth.toml");
-    std::fs::write(&auth_path, auth_toml).unwrap();
+    std::fs::write(&auth_path, &auth_toml).unwrap();
     let auth = crate::auth::load(Some(&auth_path), dir.path(), "127.0.0.1", false).unwrap();
 
     let mut st =
