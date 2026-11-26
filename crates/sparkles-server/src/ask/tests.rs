@@ -634,7 +634,10 @@ fn demo_set_gold_queries() {
         a.insert("format".into(), "json".into());
         a.insert("maxRows".into(), 1000.into());
         let doc = match s.run_now("sparql_query", a, &mut call) {
-            Ok(Outcome::Text(t)) => serde_json::from_str::<Value>(&t).unwrap(),
+            Ok(crate::mcp::Outcome::Text(t)) => serde_json::from_str::<Value>(&t).unwrap(),
+            Ok(crate::mcp::Outcome::Retained(p)) => {
+                serde_json::from_str::<Value>(p.as_str()).unwrap()
+            }
             Ok(_) => panic!("{id}"),
             Err(e) => panic!("{id}: {}", e.message),
         };

@@ -103,6 +103,11 @@ async fn run(
         Ok(Outcome::Text(t)) => {
             Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], t).into_response())
         }
+        Ok(Outcome::Retained(p)) => Ok((
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            p.as_str().to_string(),
+        )
+            .into_response()),
     }
 }
 

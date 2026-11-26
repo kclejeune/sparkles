@@ -1396,17 +1396,19 @@ impl Tools<'_> {
             })
             .transpose()?;
         let derived = r.reasoning().and_then(|a| a.header());
-        let text = match r.kind {
-            QueryKind::Ask => match format {
-                Format::Table => render::ask_table(snap.commit, r.boolean, derived.as_deref()),
-                Format::Json => render::ask_json(
-                    &ds.name,
-                    snap.commit,
-                    r.boolean,
-                    elapsed_ms,
-                    derived.as_deref(),
-                ),
-            },
+        let budget = sparkles::sparql::output::NativeBudget::from_preparation(&controlled)
+            .map_err(|e| ctx.engine(e))?;
+        let rendered = match r.kind {
+            QueryKind::Ask => render::owned_ask(
+                &ds.name,
+                snap.commit,
+                r.boolean,
+                elapsed_ms,
+                derived.as_deref(),
+                format == Format::Json,
+                &budget,
+            )
+            .map_err(|e| ctx.engine(e))?,
             kind => {
                 let len = r.len();
                 let start = offset.min(len);
@@ -1433,13 +1435,12 @@ impl Tools<'_> {
                     elapsed_ms,
                     reasoning: derived.as_deref(),
                 };
-                match format {
-                    Format::Table => render::table(&page, &prefixes),
-                    Format::Json => render::json(&page, &prefixes),
-                }
+                render::owned_page(&page, &prefixes, format == Format::Json, &budget)
+                    .map_err(|e| ctx.engine(e))?
             }
         };
-        Ok((Outcome::Text(text), whole))
+        drop(r);
+        Ok((Outcome::Retained(rendered), whole))
     }
 
     // ------------------------------------------------------------- explain_query ------

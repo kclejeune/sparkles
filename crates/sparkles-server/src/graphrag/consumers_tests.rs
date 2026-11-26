@@ -145,6 +145,7 @@ fn tool(f: &Fixture, name: &str, args: Value) -> Value {
     match server(f).run_now(name, m, &mut call).unwrap() {
         Outcome::Structured(v) => v,
         Outcome::Text(t) => Value::String(t),
+        Outcome::Retained(p) => Value::String(p.as_str().to_string()),
     }
 }
 

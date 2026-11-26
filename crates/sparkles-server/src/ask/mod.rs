@@ -40,7 +40,7 @@ pub use cli::{AskArgs, run_cli};
 
 use crate::auth::Principal;
 use crate::mcp::errors::ToolError;
-use crate::mcp::{Call, McpServer, Outcome};
+use crate::mcp::{Call, McpServer};
 use crate::models::{Level, Models, Pair, Part, Prompt, Role, StepError, StepRecord};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -809,10 +809,7 @@ impl Asking<'_, '_> {
 
     fn tool_unprofiled(&self, name: &str, args: Value, timed: bool) -> Result<Value, ToolError> {
         let (m, mut call) = self.tool_call(name, args, timed)?;
-        Ok(match self.server.run_now(name, m, &mut call)? {
-            Outcome::Structured(v) => v,
-            Outcome::Text(t) => serde_json::from_str(&t).unwrap_or(Value::String(t)),
-        })
+        Ok(self.server.run_now(name, m, &mut call)?.into_json_value())
     }
 
     /// Run a query with `sparql_query`: its compact result, and with `full_results` the
@@ -828,17 +825,15 @@ impl Asking<'_, '_> {
             "maxRows": self.o.max_rows.min(self.server.cfg().max_rows),
             "maxBytes": self.server.cfg().max_bytes,
         });
-        let text = |o: Outcome| match o {
-            Outcome::Structured(v) => v,
-            Outcome::Text(t) => serde_json::from_str(&t).unwrap_or(Value::String(t)),
-        };
         let (m, mut call) = self.tool_call("sparql_query", args, true)?;
         if self.o.full_results {
             let (o, full) = crate::mcp::tools::sparql_query_full(self.server, m, &mut call)?;
-            Ok((text(o), Some(full)))
+            Ok((o.into_json_value(), Some(full)))
         } else {
             Ok((
-                text(self.server.run_now("sparql_query", m, &mut call)?),
+                self.server
+                    .run_now("sparql_query", m, &mut call)?
+                    .into_json_value(),
                 None,
             ))
         }
@@ -2432,13 +2427,9 @@ impl Asking<'_, '_> {
         let mut v = if seeds.is_empty() {
             // no entity yet: the policies and the map are checked, and no claim is read
             let (m, mut call) = self.tool_call("recall", args, true)?;
-            match self
-                .server
+            self.server
                 .run_now(crate::mcp::RECALL_PREFLIGHT, m, &mut call)?
-            {
-                Outcome::Structured(v) => v,
-                Outcome::Text(t) => serde_json::from_str(&t).unwrap_or(Value::String(t)),
-            }
+                .into_json_value()
         } else {
             self.tool("recall", args, true)?
         };

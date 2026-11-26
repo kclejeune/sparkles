@@ -549,6 +549,86 @@ impl Preparation {
         self.inner.grant.as_ref()
     }
 
+    /// Trim this preparation's backing pool grant down to currently charged bytes,
+    /// releasing unused `INITIAL_GRANT` slack when a query transitions to idle retention.
+    pub fn trim_grant(&self) {
+        if let Some(grant) = &self.inner.grant {
+            grant.trim_to_used();
+        }
+    }
+
+    /// Create a fresh-control child preparation sharing this preparation's remaining
+    /// memory allowance and backing pool grant, evaluated against `control` instead of
+    /// this preparation's original deadline or cancel flag (for example, rendering a
+    /// retained MCP task result on a later `tasks/get` poll).
+    pub fn child_with_control(&self, control: Control) -> Result<Self> {
+        control.check()?;
+        let root = self.without_selection_scope();
+        root.reserve_bytes(PARENT_BYTES)
+            .map_err(|error| match error {
+                sparkles_budget::ParentRefused::Limit {
+                    scope: sparkles_budget::Scope::Local,
+                    limit,
+                    ..
+                } if root.inner.upstream.is_none() => memory(limit),
+                sparkles_budget::ParentRefused::Overflow => memory(root.active_budget().1),
+                error => parent_error(error),
+            })?;
+        let header = Reservation {
+            preparation: root.clone(),
+            bytes: PARENT_BYTES,
+        };
+        let take = root.clone();
+        let give = root.clone();
+        let domain = root
+            .inner
+            .grant
+            .as_ref()
+            .map_or(sparkles_budget::MemoryDomain::unpooled(), |grant| {
+                grant.memory_domain()
+            });
+        let admitted = header.bytes();
+        let parent = domain
+            .parent_with_header(
+                move |bytes| take.reserve_bytes(bytes),
+                move |_: &sparkles_budget::ParentHandle, bytes| give.release_bytes(bytes),
+                header,
+                admitted,
+            )
+            .map_err(parent_error)?;
+        let bytes =
+            (std::mem::size_of::<Inner>() + 16 + std::mem::size_of::<Upstream>() + 32) as u64;
+        let limit = root.inner.limit;
+        if bytes > limit {
+            return Err(memory(limit));
+        }
+        let held = parent.reserve(bytes).map_err(parent_error)?;
+        let child = Self {
+            inner: Shared::new(Inner {
+                control,
+                limit,
+                used: AtomicU64::new(bytes),
+                peak: AtomicU64::new(bytes),
+                selection: None,
+                grant: root.inner.grant.clone(),
+                context_bytes: bytes,
+                cancellation: None,
+                original_controls: None,
+                inherited_controls: None,
+                upstream: Some(Box::new(Upstream {
+                    parent,
+                    held: Mutex::new(held),
+                    pause: Arc::new(AtomicU64::new(0)),
+                })),
+            }),
+            no_wait: false,
+            query: None,
+            in_selection: false,
+        };
+        child.check()?;
+        Ok(child)
+    }
+
     /// One checked descendant shares the actual preparation root. The callbacks
     /// retain genuine ownership and original admission, not a domain label.
     pub fn memory_parent(&self) -> Result<sparkles_budget::ParentHandle> {
@@ -2670,5 +2750,81 @@ mod tests {
         expected.sort_unstable();
         sort_by(&mut values, &preparation, |a, b| Ok(a.cmp(b))).unwrap();
         assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn child_with_control_enforces_parent_limit_after_expiry_and_bounds_concurrent_children() {
+        let pool = crate::sparql::pool::QueryPool::new(16 << 20);
+        let grant = Arc::new(pool.empty_grant());
+        let root_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Build and charge the root BEFORE expiring its deadline so a slow runner
+        // cannot hit `Error::Timeout` during setup.
+        let mut root = Preparation::with_grant(
+            Control::with_cancel(root_cancel.clone()),
+            8192,
+            grant.clone(),
+        )
+        .unwrap();
+        // Simulate 5000 bytes retained on the root preparation.
+        root.reserve_bytes(5000).unwrap();
+        let past_deadline = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now);
+        root.inner
+            .get_mut()
+            .expect("unique root before creating Reservation")
+            .control
+            .deadline = Some(past_deadline);
+        let retained = Reservation {
+            preparation: root.clone(),
+            bytes: 5000,
+        };
+        let baseline_used = root.inner.used.load(Ordering::Relaxed);
+        let baseline_grant = grant.used();
+
+        assert!(
+            matches!(root.check(), Err(Error::Timeout)),
+            "root preparation deadline must be expired before child_with_control"
+        );
+        root_cancel.store(true, Ordering::SeqCst);
+
+        // Construct a child with a fresh live deadline and cancel flag.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut fresh = Control::with_cancel(cancel.clone());
+        fresh.deadline = Some(std::time::Instant::now() + Duration::from_secs(60));
+        let child1 = root.child_with_control(fresh).unwrap();
+        assert!(child1.check().is_ok());
+        // Child1 cannot exceed the root's remaining headroom (8192 - used).
+        let err = child1.reserve(4000).err().expect("expected budget error");
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(Budget {
+                kind: BudgetKind::Memory,
+                ..
+            })
+        ));
+        // Reserve 1000 bytes in child1; a second concurrent child shares the same remaining cap.
+        let r1 = child1.reserve(1000).unwrap();
+        let child2 = root.child_with_control(Control::none()).unwrap();
+        let err2 = child2.reserve(2000).err().expect("expected budget error");
+        assert!(matches!(
+            err2,
+            Error::BudgetExceeded(Budget {
+                kind: BudgetKind::Memory,
+                ..
+            })
+        ));
+        // Cancelling child1's control stops child1 without affecting child2.
+        cancel.store(true, Ordering::SeqCst);
+        assert!(matches!(child1.check(), Err(Error::Cancelled)));
+        assert!(child2.check().is_ok());
+
+        drop((r1, child1, child2));
+        assert_eq!(root.inner.used.load(Ordering::Relaxed), baseline_used);
+        assert_eq!(grant.used(), baseline_grant);
+        drop((retained, root));
+        assert_eq!(grant.used(), 0);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
     }
 }

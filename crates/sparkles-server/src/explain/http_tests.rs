@@ -385,6 +385,7 @@ fn tool(
     match server.run_now("explain_query", m, &mut call(p))? {
         Outcome::Structured(v) => Ok(v),
         Outcome::Text(t) => panic!("{t}"),
+        Outcome::Retained(p) => panic!("{}", p.as_str()),
     }
 }
 

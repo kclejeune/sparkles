@@ -401,6 +401,7 @@ async fn brief_names_expiring_scratch_branches() {
     let v = match out {
         Ok(Outcome::Structured(v)) => v,
         Ok(Outcome::Text(t)) => panic!("{t}"),
+        Ok(Outcome::Retained(p)) => panic!("{}", p.as_str()),
         Err(e) => panic!("{}", e.message),
     };
     assert!(

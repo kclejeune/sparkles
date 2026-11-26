@@ -1349,7 +1349,7 @@ fn link_evidence_counts_and_details_remain_in_the_query_view() {
             .unwrap()
         {
             Outcome::Structured(value) => value,
-            Outcome::Text(_) => panic!("expected structured link result"),
+            Outcome::Text(_) | Outcome::Retained(_) => panic!("expected structured link result"),
         }
     };
     let full = read(Principal::local());
@@ -1597,7 +1597,7 @@ fn link_evidence_escaped_terms_keep_identity_and_exact_byte_acceptance() {
             )
             .map(|outcome| match outcome {
                 Outcome::Structured(value) => value,
-                Outcome::Text(_) => panic!("expected structured evidence"),
+                Outcome::Text(_) | Outcome::Retained(_) => panic!("expected structured evidence"),
             })
     };
     let plain = read(&server, false).unwrap();

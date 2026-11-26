@@ -99,7 +99,7 @@ impl Tools<'_> {
         }
         let checked = match self.check_query(check)? {
             Outcome::Structured(v) => v,
-            Outcome::Text(_) => json!({}),
+            Outcome::Text(_) | Outcome::Retained(_) => json!({}),
         };
         let mut payload = json!({ "dataset": ds.name, "query": a.query });
         if let Some(q) = &a.question {
