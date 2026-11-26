@@ -11,13 +11,17 @@ use peg::parser;
 use peg::str::LineCol;
 use rand::random;
 use std::borrow::Cow;
+#[cfg(test)]
+use std::cell::Cell;
 use std::char;
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::hash::BuildHasher;
 use std::mem::take;
 #[cfg(feature = "standard-unicode-escaping")]
 use std::str::Chars;
 use std::str::FromStr;
+use std::sync::Arc;
 
 /// The IRI of the ARQ aggregate `local` (`median`, `stdev`, …).
 fn arq_aggregate(local: &str) -> NamedNode {
@@ -745,6 +749,7 @@ enum SelectionVariables {
 
 #[derive(Default)]
 struct Selection {
+    pub start: usize,
     pub option: SelectionOption,
     pub variables: SelectionVariables,
 }
@@ -779,199 +784,222 @@ fn build_select(
     values: Option<GraphPattern>,
     state: &mut ParserState,
 ) -> Result<GraphPattern, &'static str> {
-    let mut p = r#where;
-    let mut with_aggregate = false;
-
     // GROUP BY
     let aggregates = state.aggregates.pop().unwrap_or_default();
     let placeholder_calls = state.placeholder_calls.pop().unwrap_or_default();
     let _ = state.aggregate_arg_depth.pop();
-    let agg_vars: HashSet<Variable> = if !placeholder_calls.is_empty() && !aggregates.is_empty() {
-        aggregates.iter().map(|(v, _)| v.clone()).collect()
-    } else {
-        HashSet::new()
-    };
-    if group.is_none() && !aggregates.is_empty() {
-        group = Some((vec![], vec![]));
-    }
+    let select_start = select.start;
+    let record_forest = !placeholder_calls.is_empty()
+        && !state.synthetic_calls.has_recorded_select(select_start);
+    let checkpoint = record_forest.then(|| state.synthetic_calls.checkpoint());
 
-    if let Some((clauses, binds)) = group {
-        for (expression, variable) in binds {
-            p = GraphPattern::Extend {
-                inner: Box::new(p),
-                variable,
-                expression,
-            };
-        }
-        p = GraphPattern::Group {
-            inner: Box::new(p),
-            variables: clauses,
-            aggregates,
-        };
-        with_aggregate = true;
-    }
-
-    // HAVING
-    if let Some(expr) = having {
-        if !placeholder_calls.is_empty() {
-            state.synthetic_calls.record_placeholder_forest(
-                &expr,
-                &placeholder_calls,
-                &agg_vars,
-                None,
-            )?;
-        }
-        let expr = if placeholder_calls.is_empty() {
-            expr
+    let result: Result<GraphPattern, &'static str> = (|| {
+        let mut p = r#where;
+        let mut with_aggregate = false;
+        let agg_vars: HashSet<Variable> = if record_forest && !aggregates.is_empty() {
+            aggregates.iter().map(|(v, _)| v.clone()).collect()
         } else {
-            restore_placeholder_calls(expr, &placeholder_calls)
+            HashSet::new()
         };
-        p = GraphPattern::Filter {
-            expr,
-            inner: Box::new(p),
-        };
-    }
+        if group.is_none() && !aggregates.is_empty() {
+            group = Some((vec![], vec![]));
+        }
 
-    // VALUES
-    if let Some(data) = values {
-        p = new_join(p, data);
-    }
-
-    // SELECT
-    let mut pv = Vec::new();
-    let mut in_pv = None;
-    let with_project = match select.variables {
-        SelectionVariables::Explicit(sel_items) => {
-            let mut visible = HashSet::new();
-            p.on_in_scope_variable(|v| {
-                visible.insert(v.clone());
-            });
-            for sel_item in sel_items {
-                let v = match sel_item {
-                    SelectionMember::Variable(v) => {
-                        if with_aggregate && !visible.contains(&v) {
-                            // We validate projection variables if there is an aggregate
-                            return Err("The SELECT contains a variable that is unbound");
-                        }
-                        v
-                    }
-                    SelectionMember::Expression(expression, variable) => {
-                        if visible.contains(&variable) {
-                            // We disallow to override an existing variable with an expression
-                            return Err(
-                                "The SELECT overrides an existing variable using an expression",
-                            );
-                        }
-                        if with_aggregate
-                            && !are_variables_bound(&expression, &visible, &placeholder_calls)
-                        {
-                            // We validate projection variables if there is an aggregate
-                            return Err(
-                                "The SELECT contains an expression with a variable that is unbound",
-                            );
-                        }
-                        if !placeholder_calls.is_empty() {
-                            state.synthetic_calls.record_placeholder_forest(
-                                &expression,
-                                &placeholder_calls,
-                                &agg_vars,
-                                None,
-                            )?;
-                        }
-                        let expression = if placeholder_calls.is_empty() {
-                            expression
-                        } else {
-                            restore_placeholder_calls(expression, &placeholder_calls)
-                        };
-                        p = GraphPattern::Extend {
-                            inner: Box::new(p),
-                            variable: variable.clone(),
-                            expression,
-                        };
-                        // SPARQL 1.2 §16.1.2: "The scoping for (expr AS v) applies
-                        // immediately": later SELECT expressions may use v (and it may
-                        // not be assigned again), as the Extend chain of §18.3.4.4 implies.
-                        visible.insert(variable.clone());
-                        variable
-                    }
+        if let Some((clauses, binds)) = group {
+            for (expression, variable) in binds {
+                p = GraphPattern::Extend {
+                    inner: Box::new(p),
+                    variable,
+                    expression,
                 };
-                if !add_var(&mut pv, &mut in_pv, &v) {
-                    return Err("Duplicated variable name in SELECT");
-                }
             }
-            true
-        }
-        SelectionVariables::Star => {
-            if with_aggregate {
-                return Err("SELECT * is not authorized with GROUP BY");
-            }
-            // TODO: is it really useful to do a projection?
-            p.on_in_scope_variable(|v| {
-                add_var(&mut pv, &mut in_pv, v);
-            });
-            pv.sort();
-            true
-        }
-    };
-
-    let mut m = p;
-
-    // ORDER BY
-    if let Some(order_exprs) = order_by {
-        let mut expression = Vec::with_capacity(order_exprs.len());
-        for order_expr in order_exprs {
-            let e = match &order_expr {
-                OrderExpression::Asc(e) | OrderExpression::Desc(e) => e,
+            p = GraphPattern::Group {
+                inner: Box::new(p),
+                variables: clauses,
+                aggregates,
             };
-            if !placeholder_calls.is_empty() {
+            with_aggregate = true;
+        }
+
+        // HAVING
+        if let Some(expr) = having {
+            if record_forest {
                 state.synthetic_calls.record_placeholder_forest(
-                    e,
+                    &expr,
                     &placeholder_calls,
                     &agg_vars,
                     None,
                 )?;
             }
-            expression.push(if placeholder_calls.is_empty() {
-                order_expr
+            let expr = if placeholder_calls.is_empty() {
+                expr
             } else {
-                match order_expr {
-                    OrderExpression::Asc(e) => {
-                        OrderExpression::Asc(restore_placeholder_calls(e, &placeholder_calls))
-                    }
-                    OrderExpression::Desc(e) => {
-                        OrderExpression::Desc(restore_placeholder_calls(e, &placeholder_calls))
+                restore_placeholder_calls(expr, &placeholder_calls)
+            };
+            p = GraphPattern::Filter {
+                expr,
+                inner: Box::new(p),
+            };
+        }
+
+        // VALUES
+        if let Some(data) = values {
+            p = new_join(p, data);
+        }
+
+        // SELECT
+        let mut pv = Vec::new();
+        let mut in_pv = None;
+        let with_project = match select.variables {
+            SelectionVariables::Explicit(sel_items) => {
+                let mut visible = HashSet::new();
+                p.on_in_scope_variable(|v| {
+                    visible.insert(v.clone());
+                });
+                for sel_item in sel_items {
+                    let v = match sel_item {
+                        SelectionMember::Variable(v) => {
+                            if with_aggregate && !visible.contains(&v) {
+                                // We validate projection variables if there is an aggregate
+                                return Err("The SELECT contains a variable that is unbound");
+                            }
+                            v
+                        }
+                        SelectionMember::Expression(expression, variable) => {
+                            if visible.contains(&variable) {
+                                // We disallow to override an existing variable with an expression
+                                return Err(
+                                    "The SELECT overrides an existing variable using an expression",
+                                );
+                            }
+                            if with_aggregate
+                                && !are_variables_bound(&expression, &visible, &placeholder_calls)
+                            {
+                                // We validate projection variables if there is an aggregate
+                                return Err(
+                                    "The SELECT contains an expression with a variable that is unbound",
+                                );
+                            }
+                            if record_forest {
+                                state.synthetic_calls.record_placeholder_forest(
+                                    &expression,
+                                    &placeholder_calls,
+                                    &agg_vars,
+                                    None,
+                                )?;
+                            }
+                            let expression = if placeholder_calls.is_empty() {
+                                expression
+                            } else {
+                                restore_placeholder_calls(expression, &placeholder_calls)
+                            };
+                            p = GraphPattern::Extend {
+                                inner: Box::new(p),
+                                variable: variable.clone(),
+                                expression,
+                            };
+                            // SPARQL 1.2 §16.1.2: "The scoping for (expr AS v) applies
+                            // immediately": later SELECT expressions may use v (and it may
+                            // not be assigned again), as the Extend chain of §18.3.4.4 implies.
+                            visible.insert(variable.clone());
+                            variable
+                        }
+                    };
+                    if !add_var(&mut pv, &mut in_pv, &v) {
+                        return Err("Duplicated variable name in SELECT");
                     }
                 }
-            });
-        }
-        m = GraphPattern::OrderBy {
-            inner: Box::new(m),
-            expression,
+                true
+            }
+            SelectionVariables::Star => {
+                if with_aggregate {
+                    return Err("SELECT * is not authorized with GROUP BY");
+                }
+                // TODO: is it really useful to do a projection?
+                p.on_in_scope_variable(|v| {
+                    add_var(&mut pv, &mut in_pv, v);
+                });
+                pv.sort();
+                true
+            }
         };
-    }
 
-    // PROJECT
-    if with_project {
-        m = GraphPattern::Project {
-            inner: Box::new(m),
-            variables: pv,
-        };
-    }
-    match select.option {
-        SelectionOption::Distinct => m = GraphPattern::Distinct { inner: Box::new(m) },
-        SelectionOption::Reduced => m = GraphPattern::Reduced { inner: Box::new(m) },
-        SelectionOption::Default => (),
-    }
+        let mut m = p;
 
-    // OFFSET LIMIT
-    if let Some((start, length)) = offset_limit {
-        m = GraphPattern::Slice {
-            inner: Box::new(m),
-            start,
-            length,
+        // ORDER BY
+        if let Some(order_exprs) = order_by {
+            let mut expression = Vec::with_capacity(order_exprs.len());
+            for order_expr in order_exprs {
+                let e = match &order_expr {
+                    OrderExpression::Asc(e) | OrderExpression::Desc(e) => e,
+                };
+                if record_forest {
+                    state.synthetic_calls.record_placeholder_forest(
+                        e,
+                        &placeholder_calls,
+                        &agg_vars,
+                        None,
+                    )?;
+                }
+                expression.push(if placeholder_calls.is_empty() {
+                    order_expr
+                } else {
+                    match order_expr {
+                        OrderExpression::Asc(e) => {
+                            OrderExpression::Asc(restore_placeholder_calls(e, &placeholder_calls))
+                        }
+                        OrderExpression::Desc(e) => {
+                            OrderExpression::Desc(restore_placeholder_calls(e, &placeholder_calls))
+                        }
+                    }
+                });
+            }
+            m = GraphPattern::OrderBy {
+                inner: Box::new(m),
+                expression,
+            };
+        }
+
+        // PROJECT
+        if with_project {
+            m = GraphPattern::Project {
+                inner: Box::new(m),
+                variables: pv,
+            };
+        }
+        match select.option {
+            SelectionOption::Distinct => m = GraphPattern::Distinct { inner: Box::new(m) },
+            SelectionOption::Reduced => m = GraphPattern::Reduced { inner: Box::new(m) },
+            SelectionOption::Default => (),
+        }
+
+        // OFFSET LIMIT
+        if let Some((start, length)) = offset_limit {
+            m = GraphPattern::Slice {
+                inner: Box::new(m),
+                start,
+                length,
+            }
+        }
+        Ok(m)
+    })();
+
+    match result {
+        Ok(pattern) => {
+            if let Some(checkpoint) = checkpoint {
+                state
+                    .synthetic_calls
+                    .commit_select(select_start, checkpoint);
+            }
+            Ok(pattern)
+        }
+        Err(err) => {
+            if let Some(checkpoint) = checkpoint {
+                state.synthetic_calls.rollback(checkpoint);
+            }
+            Err(err)
         }
     }
-    Ok(m)
 }
 
 fn are_variables_bound(
@@ -1032,6 +1060,123 @@ fn are_variables_bound(
 
 const NO_SYNTHETIC_CALL_NODE: u32 = u32::MAX;
 
+struct InternedIri {
+    iri: NamedNode,
+    hash: u64,
+    next_in_bucket: u32,
+}
+
+/// Interns distinct synthetic call IRIs once and caches each key's 64-bit hash so table
+/// growth never rehashes previously interned IRI strings.
+struct IriInterner {
+    hasher: RandomState,
+    entries: Vec<InternedIri>,
+    buckets: Vec<u32>,
+    #[cfg(test)]
+    hashed_bytes: Cell<usize>,
+}
+
+impl IriInterner {
+    fn new() -> Self {
+        Self {
+            hasher: RandomState::new(),
+            entries: Vec::new(),
+            buckets: Vec::new(),
+            #[cfg(test)]
+            hashed_bytes: Cell::new(0),
+        }
+    }
+
+    fn hash_iri(&self, iri: &NamedNode) -> u64 {
+        let s = iri.as_str();
+        #[cfg(test)]
+        self.hashed_bytes.set(self.hashed_bytes.get() + s.len());
+        self.hasher.hash_one(s)
+    }
+
+    fn bucket_index(hash: u64, bucket_len: usize) -> usize {
+        debug_assert!(bucket_len.is_power_of_two());
+        let mask = u64::try_from(bucket_len - 1).unwrap_or(u64::MAX);
+        usize::try_from(hash & mask).unwrap_or(0)
+    }
+
+    fn get(&self, iri: &NamedNode) -> Option<u32> {
+        if self.buckets.is_empty() {
+            return None;
+        }
+        let hash = self.hash_iri(iri);
+        let mut idx = self.buckets[Self::bucket_index(hash, self.buckets.len())];
+        while idx != NO_SYNTHETIC_CALL_NODE {
+            let entry = &self.entries[idx as usize];
+            if entry.hash == hash && entry.iri == *iri {
+                return Some(idx);
+            }
+            idx = entry.next_in_bucket;
+        }
+        None
+    }
+
+    fn intern(&mut self, iri: &NamedNode) -> Result<(u32, bool), &'static str> {
+        let hash = self.hash_iri(iri);
+        if !self.buckets.is_empty() {
+            let mut idx = self.buckets[Self::bucket_index(hash, self.buckets.len())];
+            while idx != NO_SYNTHETIC_CALL_NODE {
+                let entry = &self.entries[idx as usize];
+                if entry.hash == hash && entry.iri == *iri {
+                    return Ok((idx, false));
+                }
+                idx = entry.next_in_bucket;
+            }
+        }
+        let id = u32::try_from(self.entries.len())
+            .ok()
+            .filter(|&id| id != NO_SYNTHETIC_CALL_NODE)
+            .ok_or("Too many distinct synthetic function calls")?;
+        if self.buckets.is_empty()
+            || self.entries.len().saturating_add(1).saturating_mul(4)
+                > self.buckets.len().saturating_mul(3)
+        {
+            let new_cap = if self.buckets.is_empty() {
+                8
+            } else {
+                self.buckets
+                    .len()
+                    .checked_mul(2)
+                    .ok_or("Too many distinct synthetic function calls")?
+            };
+            let mut new_buckets = vec![NO_SYNTHETIC_CALL_NODE; new_cap];
+            let mut entry_id: u32 = 0;
+            for entry in &mut self.entries {
+                let bucket = Self::bucket_index(entry.hash, new_cap);
+                entry.next_in_bucket = new_buckets[bucket];
+                new_buckets[bucket] = entry_id;
+                entry_id += 1;
+            }
+            self.buckets = new_buckets;
+        }
+        let bucket = Self::bucket_index(hash, self.buckets.len());
+        let next_in_bucket = self.buckets[bucket];
+        self.entries.push(InternedIri {
+            iri: iri.clone(),
+            hash,
+            next_in_bucket,
+        });
+        self.buckets[bucket] = id;
+        Ok((id, true))
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ForestCheckpoint {
+    nodes_len: usize,
+    roots_head: u32,
+}
+
 #[derive(Clone, Copy)]
 struct SyntheticCallNode {
     iri: u32,
@@ -1043,24 +1188,48 @@ struct SyntheticCallNode {
 /// Tracks synthetic placeholder call nesting in O(occurrences) memory and validates
 /// against inferred `DISTINCT` synthetic aggregates once all inferences are known.
 struct SyntheticCallTracker {
-    iris: HashMap<NamedNode, u32>,
+    iris: IriInterner,
     inferred_aggregates: Vec<bool>,
     in_aggregates: Vec<bool>,
     has_inferred_aggregates: bool,
     nodes: Vec<SyntheticCallNode>,
     roots_head: u32,
+    recorded_selects: HashSet<usize>,
 }
 
 impl SyntheticCallTracker {
     fn new() -> Self {
         Self {
-            iris: HashMap::new(),
+            iris: IriInterner::new(),
             inferred_aggregates: Vec::new(),
             in_aggregates: Vec::new(),
             has_inferred_aggregates: false,
             nodes: Vec::new(),
             roots_head: NO_SYNTHETIC_CALL_NODE,
+            recorded_selects: HashSet::new(),
         }
+    }
+
+    fn has_recorded_select(&self, select_start: usize) -> bool {
+        self.recorded_selects.contains(&select_start)
+    }
+
+    fn checkpoint(&self) -> ForestCheckpoint {
+        ForestCheckpoint {
+            nodes_len: self.nodes.len(),
+            roots_head: self.roots_head,
+        }
+    }
+
+    fn commit_select(&mut self, select_start: usize, checkpoint: ForestCheckpoint) {
+        if self.nodes.len() > checkpoint.nodes_len {
+            self.recorded_selects.insert(select_start);
+        }
+    }
+
+    fn rollback(&mut self, checkpoint: ForestCheckpoint) {
+        self.nodes.truncate(checkpoint.nodes_len);
+        self.roots_head = checkpoint.roots_head;
     }
 
     fn is_inferred_aggregate(&self, iri: &NamedNode) -> bool {
@@ -1068,20 +1237,15 @@ impl SyntheticCallTracker {
             && self
                 .iris
                 .get(iri)
-                .is_some_and(|&id| self.inferred_aggregates[id as usize])
+                .is_some_and(|id| self.inferred_aggregates[id as usize])
     }
 
     fn intern_iri(&mut self, iri: &NamedNode) -> Result<u32, &'static str> {
-        if let Some(&id) = self.iris.get(iri) {
-            return Ok(id);
+        let (id, inserted) = self.iris.intern(iri)?;
+        if inserted {
+            self.inferred_aggregates.push(false);
+            self.in_aggregates.push(false);
         }
-        let id = u32::try_from(self.inferred_aggregates.len())
-            .ok()
-            .filter(|&id| id != NO_SYNTHETIC_CALL_NODE)
-            .ok_or("Too many distinct synthetic function calls")?;
-        self.iris.insert(iri.clone(), id);
-        self.inferred_aggregates.push(false);
-        self.in_aggregates.push(false);
         Ok(id)
     }
 
@@ -2163,10 +2327,10 @@ parser! {
                 (w, g, h, o, l, v)
             }
 
-        rule SelectClause() -> Selection = i("SELECT") _ Selection_init() res:SelectClause_body()? {?
+        rule SelectClause() -> Selection = start:position!() i("SELECT") _ Selection_init() res:SelectClause_body()? {?
             state.placeholder_scope.pop();
             if let Some((option, variables)) = res {
-                Ok(Selection { option, variables })
+                Ok(Selection { start, option, variables })
             } else {
                 state.aggregates.pop();
                 state.placeholder_calls.pop();
@@ -2240,6 +2404,7 @@ parser! {
                 Ok(Query::Describe {
                     dataset: d,
                     pattern: build_select(Selection {
+                        start: 0,
                         option: SelectionOption::Default,
                         variables: SelectionVariables::Explicit(p.into_iter().map(|var_or_iri| match var_or_iri {
                             NamedNodePattern::NamedNode(n) => SelectionMember::Expression(n.into(), variable()),
@@ -3576,18 +3741,30 @@ parser! {
             }
 
         rule RegexExpression() -> Expression =
-            i("REGEX") _ "(" _ a:Expression() _ "," _ b:Expression() _ "," _ c:Expression() _ ")" { Expression::FunctionCall(Function::Regex, vec![a, b, c]) } /
-            i("REGEX") _ "(" _ a:Expression() _ "," _ b:Expression() _ ")" { Expression::FunctionCall(Function::Regex, vec![a, b]) }
+            i("REGEX") _ "(" _ a:Expression() _ "," _ b:Expression() _ c:("," _ e:Expression() _ { e })? ")" {
+                match c {
+                    Some(c) => Expression::FunctionCall(Function::Regex, vec![a, b, c]),
+                    None => Expression::FunctionCall(Function::Regex, vec![a, b]),
+                }
+            }
 
 
         rule SubstringExpression() -> Expression =
-            i("SUBSTR") _ "(" _ a:Expression() _ "," _ b:Expression() _ "," _ c:Expression() _ ")" { Expression::FunctionCall(Function::SubStr, vec![a, b, c]) } /
-            i("SUBSTR") _ "(" _ a:Expression() _ "," _ b:Expression() _ ")" { Expression::FunctionCall(Function::SubStr, vec![a, b]) }
+            i("SUBSTR") _ "(" _ a:Expression() _ "," _ b:Expression() _ c:("," _ e:Expression() _ { e })? ")" {
+                match c {
+                    Some(c) => Expression::FunctionCall(Function::SubStr, vec![a, b, c]),
+                    None => Expression::FunctionCall(Function::SubStr, vec![a, b]),
+                }
+            }
 
 
         rule StrReplaceExpression() -> Expression =
-            i("REPLACE") _ "(" _ a:Expression() _ "," _ b:Expression() _ "," _ c:Expression() _ "," _ d:Expression() _ ")" { Expression::FunctionCall(Function::Replace, vec![a, b, c, d]) } /
-            i("REPLACE") _ "(" _ a:Expression() _ "," _ b:Expression() _ "," _ c:Expression() _ ")" { Expression::FunctionCall(Function::Replace, vec![a, b, c]) }
+            i("REPLACE") _ "(" _ a:Expression() _ "," _ b:Expression() _ "," _ c:Expression() _ d:("," _ e:Expression() _ { e })? ")" {
+                match d {
+                    Some(d) => Expression::FunctionCall(Function::Replace, vec![a, b, c, d]),
+                    None => Expression::FunctionCall(Function::Replace, vec![a, b, c]),
+                }
+            }
 
         rule Exists_enter() = {
             state.placeholder_scope.push(PlaceholderScope::None);
@@ -3684,10 +3861,8 @@ parser! {
             i("AVG") _ "(" _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Avg, expr, distinct: false } } /
             i("SAMPLE") _ "(" _ i("DISTINCT") _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Sample, expr, distinct: true } } /
             i("SAMPLE") _ "(" _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Sample, expr, distinct: false } } /
-            i("GROUP_CONCAT") _ "(" _ i("DISTINCT") _ expr:AggExpr() _ ";" _ i("SEPARATOR") _ "=" _ s:String() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: Some(s) }, expr, distinct: true } } /
-            i("GROUP_CONCAT") _ "(" _ i("DISTINCT") _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: None }, expr, distinct: true } } /
-            i("GROUP_CONCAT") _ "(" _ expr:AggExpr() _ ";" _ i("SEPARATOR") _ "=" _ s:String() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: Some(s) }, expr, distinct: false } } /
-            i("GROUP_CONCAT") _ "(" _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: None }, expr, distinct: false } } /
+            i("GROUP_CONCAT") _ "(" _ i("DISTINCT") _ expr:AggExpr() _ s:(";" _ i("SEPARATOR") _ "=" _ s:String() _ { s })? ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: s }, expr, distinct: true } } /
+            i("GROUP_CONCAT") _ "(" _ expr:AggExpr() _ s:(";" _ i("SEPARATOR") _ "=" _ s:String() _ { s })? ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: s }, expr, distinct: false } } /
             arq() i("FOLD") _ "(" _ f:AggFoldBody() ")" { f } /
             arq() name:ArqAggregateKeyword() _ "(" _ i("DISTINCT") _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true } } /
             arq() name:ArqAggregateKeyword() _ "(" _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: false } } /
@@ -4383,6 +4558,10 @@ mod tests {
         assert!(parser::QueryUnit(&wide_query, &mut wide_state).is_ok());
         assert_eq!(wide_state.synthetic_calls.iris.len(), width + 1);
         assert_eq!(wide_state.synthetic_calls.nodes.len(), width + 1);
+        assert_eq!(
+            wide_state.synthetic_calls.iris.hashed_bytes.get(),
+            ns.len() + outer_local.len() + inner_iri_bytes
+        );
 
         // Inferring only the long outer synthetic call as an aggregate is allowed.
         let wide_outer_only = format!(
@@ -4490,5 +4669,113 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "must reject nested aggregate: {bad}");
         }
+    }
+
+    #[test]
+    fn round10_backtracking_deduplicates_subselect_forest() {
+        let ns = "urn:sparkles:test:p0/";
+        let parse_with_state = |q: &str| {
+            let mut state = ParserState::new(
+                None,
+                HashMap::from([("p".to_string(), ns.to_string())]),
+                Arc::new(HashSet::new()),
+            );
+            state.placeholder_prefixes.insert("p".to_string());
+            let res = parser::QueryUnit(q, &mut state);
+            (res, state)
+        };
+        let parse = |q: &str| {
+            SparqlParser::new()
+                .with_placeholder_prefix("p", ns)
+                .unwrap()
+                .parse_query(q)
+        };
+
+        // R10-1: Single-layer two-argument REGEX around EXISTS { SELECT ... } retains
+        // exactly two arena nodes for the two source call sites.
+        let single_regex = "SELECT (REGEX(STR(EXISTS { \
+            SELECT (p:f(p:g(?v)) AS ?n) WHERE { ?s <urn:p> ?v } \
+        }), \"true\") AS ?x) WHERE {}";
+        let (res, state) = parse_with_state(single_regex);
+        assert!(res.is_ok(), "single REGEX wrapper must parse");
+        assert_eq!(state.synthetic_calls.iris.len(), 2);
+        assert_eq!(state.synthetic_calls.nodes.len(), 2);
+
+        // Deeply nested two-argument REGEX wrappers parse in O(depth) time, charge each
+        // resolved IRI once, and retain exactly two nodes.
+        let mut nested_regex =
+            "EXISTS { SELECT (p:f(p:g(?v)) AS ?n) WHERE { ?s <urn:p> ?v } }".to_string();
+        for _ in 0..20 {
+            nested_regex = format!("REGEX(STR({nested_regex}), \"true\")");
+        }
+        let nested_regex_query = format!("SELECT ({nested_regex} AS ?x) WHERE {{}}");
+        let exact_bytes = (ns.len() + 1) * 2 + "urn:p".len();
+        assert!(
+            SparqlParser::new()
+                .with_placeholder_prefix("p", ns)
+                .unwrap()
+                .with_max_resolved_iri_bytes(exact_bytes)
+                .parse_query(&nested_regex_query)
+                .is_ok()
+        );
+        let (res, state) = parse_with_state(&nested_regex_query);
+        assert!(res.is_ok(), "nested REGEX wrappers must parse");
+        assert_eq!(state.synthetic_calls.iris.len(), 2);
+        assert_eq!(state.synthetic_calls.nodes.len(), 2);
+
+        // Nested inferred aggregates inside wrapped REGEX subselects are still rejected.
+        let nested_regex_bad = format!(
+            "SELECT ({nested_regex} AS ?x) WHERE {{ \
+                {{ SELECT (p:f(DISTINCT ?w) AS ?a) WHERE {{ ?s <urn:q> ?w }} }} \
+                {{ SELECT (p:g(DISTINCT ?z) AS ?b) WHERE {{ ?s <urn:r> ?z }} }} \
+            }}"
+        );
+        assert!(parse(&nested_regex_bad).is_err());
+
+        // Left-factored SUBSTR and REPLACE wrappers also retain exactly two nodes.
+        let mut nested_substr =
+            "EXISTS { SELECT (p:f(p:g(?v)) AS ?n) WHERE { ?s <urn:p> ?v } }".to_string();
+        let mut nested_replace = nested_substr.clone();
+        for _ in 0..16 {
+            nested_substr = format!("SUBSTR(STR({nested_substr}), 1)");
+            nested_replace = format!("REPLACE(STR({nested_replace}), \"a\", \"b\")");
+        }
+        for q in [
+            format!("SELECT ({nested_substr} AS ?x) WHERE {{}}"),
+            format!("SELECT ({nested_replace} AS ?x) WHERE {{}}"),
+        ] {
+            let (res, state) = parse_with_state(&q);
+            assert!(res.is_ok(), "wrapped query must parse: {q}");
+            assert_eq!(state.synthetic_calls.iris.len(), 2);
+            assert_eq!(state.synthetic_calls.nodes.len(), 2);
+        }
+
+        // Genuine PEG backtracking through PrimaryExpression (iriOrFunction -> BuiltInCall
+        // for an already-inferred aggregate wrapping nested EXISTS subselects) still
+        // deduplicates committed subselect forests to O(AST) nodes.
+        let mut bt_expr =
+            "EXISTS { SELECT (p:f(p:g(?v)) AS ?n) WHERE { ?s <urn:p> ?v } }".to_string();
+        for i in 0..5 {
+            bt_expr = format!("EXISTS {{ SELECT (p:h({bt_expr}) AS ?x{i}) WHERE {{}} }}");
+        }
+        let bt_query = format!(
+            "SELECT (p:h(DISTINCT ?a) AS ?d) (p:h({bt_expr}) AS ?x) WHERE {{ ?s <urn:q> ?a }}"
+        );
+        let (res, state) = parse_with_state(&bt_query);
+        assert!(res.is_ok(), "backtracked aggregate query must parse");
+        assert_eq!(state.synthetic_calls.iris.len(), 3);
+        assert_eq!(state.synthetic_calls.nodes.len(), 2);
+
+        let bt_bad = format!(
+            "SELECT (p:h(DISTINCT ?a) AS ?d) (p:h({bt_expr}) AS ?x) \
+                (p:f(DISTINCT ?a) AS ?af) (p:g(DISTINCT ?a) AS ?ag) WHERE {{ ?s <urn:q> ?a }}"
+        );
+        assert!(parse(&bt_bad).is_err());
+
+        // Failed build_select rolls back any nodes appended before the error.
+        let dup_select_err = "SELECT (p:f(?v) AS ?a) (1 AS ?a) WHERE { ?s <urn:p> ?v }";
+        let (res, state) = parse_with_state(dup_select_err);
+        assert!(res.is_err());
+        assert_eq!(state.synthetic_calls.nodes.len(), 0);
     }
 }
