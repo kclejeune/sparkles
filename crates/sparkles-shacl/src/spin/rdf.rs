@@ -1,8 +1,7 @@
 //! Bounded SPARQL 1.1 serializer for SPIN RDF syntax (`http://spinrdf.org/sp#`).
 
 use super::template::{
-    collect_sparql_text_vars, exported_select_bound_vars, substitute_sparql_text,
-    validate_subquery_text,
+    collect_sparql_text_vars, substitute_sparql_text_with_exported, validate_subquery_text,
 };
 use super::vocab::{
     SP_NS, aggregate_fn, binary_op, builtin_fn, is_sp_expression_type, is_structural_sp_class, sp,
@@ -54,6 +53,25 @@ pub(crate) fn is_limit_or_cycle_error(err: &anyhow::Error) -> bool {
     err.chain().any(|e| e.is::<SpinLimitError>())
 }
 
+/// Map a `sparkles_core::Error` returned by query parsing/validation, preserving typed
+/// resource-limit and nesting/depth refusals as [`SpinLimitError`] so dual-form `sp:text`
+/// fallback cannot hide them.
+pub(crate) fn map_core_parse_error(err: sparkles_core::Error, context: &str) -> anyhow::Error {
+    let is_limit = match &err {
+        sparkles_core::Error::SparqlSyntax(e) => e.is_too_deep(),
+        sparkles_core::Error::BudgetExceeded(_)
+        | sparkles_core::Error::Timeout
+        | sparkles_core::Error::Cancelled => true,
+        sparkles_core::Error::Invalid(msg) => msg.contains("nested deeper than"),
+        _ => false,
+    };
+    if is_limit {
+        limit_err(format!("{context}: {err}"))
+    } else {
+        anyhow!("{context}: {err}")
+    }
+}
+
 /// Shared step and retained-byte budget bounding graph reads, hierarchy walks, template
 /// resolution, text scanning, and AST serialization for one SPIN query.
 #[derive(Clone, Debug)]
@@ -94,6 +112,10 @@ impl WorkBudget {
             )));
         }
         Ok(())
+    }
+
+    pub(crate) fn remaining_bytes(&self) -> usize {
+        self.byte_limit.saturating_sub(self.bytes)
     }
 }
 
@@ -291,13 +313,16 @@ pub(crate) fn serialize_query_with_bindings(
     g: &G<'_>,
     query: &Term,
     bindings: &FxHashMap<String, Option<Term>>,
+    known_prefixes: Option<&FxHashMap<&str, &str>>,
     budget: &mut WorkBudget,
 ) -> Result<String> {
     let mut ser = Serializer {
         g: *g,
         bindings,
+        known_prefixes,
         budget,
         out: String::new(),
+        reserved_out_bytes: 0,
         ancestors: FxHashSet::default(),
         anon_vars: FxHashMap::default(),
         anon_var_spans: Vec::new(),
@@ -308,20 +333,25 @@ pub(crate) fn serialize_query_with_bindings(
     ser.resolve_anon_var_collisions()
 }
 
-/// Append `s` to `out`, refusing output larger than [`MAX_OUTPUT_BYTES`].
-pub(crate) fn push_str_bounded(out: &mut String, s: &str) -> Result<()> {
+/// Append `s` to `out`, refusing output larger than `limit`.
+fn push_str_bounded_max(out: &mut String, s: &str, limit: usize) -> Result<()> {
     let Some(next) = out.len().checked_add(s.len()) else {
         return Err(limit_err(format!(
             "serialized SPIN query exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
         )));
     };
-    if next > MAX_OUTPUT_BYTES {
+    if next > limit {
         return Err(limit_err(format!(
             "serialized SPIN query exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
         )));
     }
     out.push_str(s);
     Ok(())
+}
+
+/// Append `s` to `out`, refusing output larger than [`MAX_OUTPUT_BYTES`].
+pub(crate) fn push_str_bounded(out: &mut String, s: &str) -> Result<()> {
+    push_str_bounded_max(out, s, MAX_OUTPUT_BYTES)
 }
 
 /// Validate a SPARQL 1.1 `VARNAME` (without leading `?` or `$`).
@@ -342,8 +372,8 @@ pub(crate) fn validate_var_name(name: &str) -> Result<()> {
 }
 
 /// Serialize an IRI reference `<...>` after checking for forbidden SPARQL `IRIREF` characters.
-pub(crate) fn write_iri(out: &mut String, iri: &str) -> Result<()> {
-    if out.len().saturating_add(iri.len()).saturating_add(2) > MAX_OUTPUT_BYTES {
+fn write_iri_max(out: &mut String, iri: &str, limit: usize) -> Result<()> {
+    if out.len().saturating_add(iri.len()).saturating_add(2) > limit {
         return Err(limit_err(format!(
             "serialized SPIN query exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
         )));
@@ -354,9 +384,9 @@ pub(crate) fn write_iri(out: &mut String, iri: &str) -> Result<()> {
     {
         bail!("IRI {iri:?} contains characters illegal in a SPARQL IRIREF");
     }
-    push_str_bounded(out, "<")?;
-    push_str_bounded(out, iri)?;
-    push_str_bounded(out, ">")
+    push_str_bounded_max(out, "<", limit)?;
+    push_str_bounded_max(out, iri, limit)?;
+    push_str_bounded_max(out, ">", limit)
 }
 
 fn validate_lang_tag(lang: &str) -> Result<()> {
@@ -375,16 +405,15 @@ fn validate_lang_tag(lang: &str) -> Result<()> {
     Ok(())
 }
 
-/// Serialize an RDF literal in SPARQL 1.1 syntax, enforcing [`MAX_OUTPUT_BYTES`] before
-/// scanning or allocating.
-pub(crate) fn write_literal_ref(out: &mut String, lit: LiteralRef<'_>) -> Result<()> {
+/// Serialize an RDF literal in SPARQL 1.1 syntax, enforcing `limit` before scanning or allocating.
+fn write_literal_ref_max(out: &mut String, lit: LiteralRef<'_>, limit: usize) -> Result<()> {
     let val = lit.value();
-    if out.len().saturating_add(val.len()).saturating_add(2) > MAX_OUTPUT_BYTES {
+    if out.len().saturating_add(val.len()).saturating_add(2) > limit {
         return Err(limit_err(format!(
             "serialized SPIN query exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
         )));
     }
-    push_str_bounded(out, "\"")?;
+    push_str_bounded_max(out, "\"", limit)?;
     let mut last = 0usize;
     for (idx, c) in val.char_indices() {
         let esc = match c {
@@ -398,32 +427,33 @@ pub(crate) fn write_literal_ref(out: &mut String, lit: LiteralRef<'_>) -> Result
             _ => continue,
         };
         if idx > last {
-            push_str_bounded(out, &val[last..idx])?;
+            push_str_bounded_max(out, &val[last..idx], limit)?;
         }
-        push_str_bounded(out, esc)?;
+        push_str_bounded_max(out, esc, limit)?;
         last = idx + c.len_utf8();
     }
     if last < val.len() {
-        push_str_bounded(out, &val[last..])?;
+        push_str_bounded_max(out, &val[last..], limit)?;
     }
-    push_str_bounded(out, "\"")?;
+    push_str_bounded_max(out, "\"", limit)?;
     if let Some(lang) = lit.language() {
         validate_lang_tag(lang)?;
-        push_str_bounded(out, "@")?;
-        push_str_bounded(out, lang)?;
+        push_str_bounded_max(out, "@", limit)?;
+        push_str_bounded_max(out, lang, limit)?;
     } else if lit.datatype() != xsd::STRING {
-        push_str_bounded(out, "^^")?;
-        write_iri(out, lit.datatype().as_str())?;
+        push_str_bounded_max(out, "^^", limit)?;
+        write_iri_max(out, lit.datatype().as_str(), limit)?;
     }
     Ok(())
 }
 
 /// Serialize a borrowed ground RDF term (IRI, literal, or RDF 1.2 triple term `<<( ... )>>`)
-/// into SPARQL syntax under [`MAX_DEPTH`].
-pub(crate) fn write_term_ref_value(
+/// into SPARQL syntax under [`MAX_DEPTH`] and `limit`.
+fn write_term_ref_value_max(
     out: &mut String,
     term: TermRef<'_>,
     depth: usize,
+    limit: usize,
 ) -> Result<()> {
     if depth > MAX_DEPTH {
         return Err(limit_err(format!(
@@ -431,19 +461,19 @@ pub(crate) fn write_term_ref_value(
         )));
     }
     match term {
-        TermRef::NamedNode(n) => write_iri(out, n.as_str()),
-        TermRef::Literal(l) => write_literal_ref(out, l),
+        TermRef::NamedNode(n) => write_iri_max(out, n.as_str(), limit),
+        TermRef::Literal(l) => write_literal_ref_max(out, l, limit),
         TermRef::BlankNode(_) => {
             bail!("cannot serialize blank node {term} as a constant SPARQL term")
         }
         TermRef::Triple(t) => {
-            push_str_bounded(out, "<<( ")?;
-            write_term_ref_value(out, TermRef::from(t.subject.as_ref()), depth + 1)?;
-            push_str_bounded(out, " ")?;
-            write_iri(out, t.predicate.as_str())?;
-            push_str_bounded(out, " ")?;
-            write_term_ref_value(out, t.object.as_ref(), depth + 1)?;
-            push_str_bounded(out, " )>>")
+            push_str_bounded_max(out, "<<( ", limit)?;
+            write_term_ref_value_max(out, TermRef::from(t.subject.as_ref()), depth + 1, limit)?;
+            push_str_bounded_max(out, " ", limit)?;
+            write_iri_max(out, t.predicate.as_str(), limit)?;
+            push_str_bounded_max(out, " ", limit)?;
+            write_term_ref_value_max(out, t.object.as_ref(), depth + 1, limit)?;
+            push_str_bounded_max(out, " )>>", limit)
         }
     }
 }
@@ -451,7 +481,7 @@ pub(crate) fn write_term_ref_value(
 /// Serialize a ground RDF term (IRI, literal, or RDF 1.2 triple term) into SPARQL syntax
 /// under [`MAX_DEPTH`].
 pub(crate) fn write_term_value(out: &mut String, term: &Term, depth: usize) -> Result<()> {
-    write_term_ref_value(out, term.as_ref(), depth)
+    write_term_ref_value_max(out, term.as_ref(), depth, MAX_OUTPUT_BYTES)
 }
 
 /// Return the SPARQL variable name if `node` denotes a named SPIN variable (`spin:_this`,
@@ -464,12 +494,23 @@ pub(crate) fn spin_var_name(
 ) -> Result<Option<String>> {
     if let Term::NamedNode(n) = node {
         let intrinsic = if n.as_ref() == spin::THIS {
+            budget.charge_bytes(4)?;
             Some("this".to_string())
         } else if let Some(rest) = n.as_str().strip_prefix("http://spinrdf.org/spin#_arg")
             && !rest.is_empty()
-            && rest.chars().all(|c| c.is_ascii_digit())
         {
-            Some(format!("arg{rest}"))
+            let expected_len = 3usize.saturating_add(rest.len());
+            if expected_len > MAX_OUTPUT_BYTES {
+                return Err(limit_err(format!(
+                    "SPIN variable name exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
+                )));
+            }
+            budget.charge_bytes(expected_len)?;
+            if rest.bytes().all(|b| b.is_ascii_digit()) {
+                Some(format!("arg{rest}"))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -489,6 +530,7 @@ pub(crate) fn spin_var_name(
         None => Ok(None),
         Some(TermRef::Literal(lit)) => {
             let name = lit.value();
+            budget.charge_bytes(name.len())?;
             validate_var_name(name)
                 .with_context(|| format!("invalid sp:varName on SPIN variable {node}"))?;
             Ok(Some(name.to_string()))
@@ -512,11 +554,13 @@ enum NodePos {
     Object,
 }
 
-struct Serializer<'g, 'b, 'w> {
+struct Serializer<'g, 'b, 'p, 'w> {
     g: G<'g>,
     bindings: &'b FxHashMap<String, Option<Term>>,
+    known_prefixes: Option<&'p FxHashMap<&'p str, &'p str>>,
     budget: &'w mut WorkBudget,
     out: String,
+    reserved_out_bytes: usize,
     ancestors: FxHashSet<Term>,
     /// Anonymous blank-node variable -> sequential id `0..anon_vars.len()`.
     anon_vars: FxHashMap<BlankNode, usize>,
@@ -528,19 +572,41 @@ struct Serializer<'g, 'b, 'w> {
     used_var_names: FxHashSet<String>,
 }
 
-impl Serializer<'_, '_, '_> {
+impl Serializer<'_, '_, '_, '_> {
+    fn output_limit(&self) -> usize {
+        MAX_OUTPUT_BYTES.saturating_sub(self.reserved_out_bytes)
+    }
+
     fn push(&mut self, s: &str) -> Result<()> {
-        push_str_bounded(&mut self.out, s)
+        let limit = self.output_limit();
+        push_str_bounded_max(&mut self.out, s, limit)
+    }
+
+    fn push_iri(&mut self, iri: &str) -> Result<()> {
+        let limit = self.output_limit();
+        write_iri_max(&mut self.out, iri, limit)
+    }
+
+    fn push_literal_ref(&mut self, lit: LiteralRef<'_>) -> Result<()> {
+        let limit = self.output_limit();
+        write_literal_ref_max(&mut self.out, lit, limit)
+    }
+
+    fn push_term_value(&mut self, term: &Term, depth: usize) -> Result<()> {
+        let limit = self.output_limit();
+        write_term_ref_value_max(&mut self.out, term.as_ref(), depth, limit)
     }
 
     fn count_node(&mut self) -> Result<()> {
         self.budget.step()
     }
 
-    fn record_var(&mut self, name: &str) {
+    fn record_var(&mut self, name: &str) -> Result<()> {
         if !self.used_var_names.contains(name) {
+            self.budget.charge_bytes(name.len())?;
             self.used_var_names.insert(name.to_string());
         }
+        Ok(())
     }
 
     fn bound_term(&self, name: &str) -> Option<&Term> {
@@ -557,7 +623,7 @@ impl Serializer<'_, '_, '_> {
     fn var_name(&mut self, node: &Term) -> Result<Option<String>> {
         let name = spin_var_name(&self.g, node, self.budget)?;
         if let Some(ref n) = name {
-            self.record_var(n);
+            self.record_var(n)?;
         }
         Ok(name)
     }
@@ -786,115 +852,6 @@ impl Serializer<'_, '_, '_> {
         })
     }
 
-    fn select_exported_bound_vars(
-        &mut self,
-        query: &Term,
-        depth: usize,
-    ) -> Result<FxHashSet<String>> {
-        self.with_node(query, depth, "query", |this| {
-            let kind = this.query_kind(query)?;
-            if kind != QueryKind::Select {
-                return Ok(FxHashSet::default());
-            }
-            if let Some(head) = this.single_object(query, sp::RESULT_VARIABLES)? {
-                let vars = this.read_list(&head, "sp:resultVariables")?;
-                if !vars.is_empty() {
-                    let mut out = FxHashSet::default();
-                    for v in &vars {
-                        if this.g.has(v, sp::AS) || this.g.has(v, sp::EXPRESSION) {
-                            continue;
-                        }
-                        if let Some(name) = spin_var_name(&this.g, v, this.budget)?
-                            && this.is_bound(&name)
-                        {
-                            out.insert(name);
-                        }
-                    }
-                    return Ok(out);
-                }
-            }
-            let Some(where_head) = this.single_object(query, sp::WHERE)? else {
-                return Ok(FxHashSet::default());
-            };
-            let body_exported = this.where_exported_bound_vars(&where_head, depth + 1)?;
-            this.select_visible_bound_vars(query, &body_exported, &[], depth + 1)
-        })
-    }
-
-    fn where_exported_bound_vars(
-        &mut self,
-        node: &Term,
-        depth: usize,
-    ) -> Result<FxHashSet<String>> {
-        if self.bindings.is_empty() {
-            return Ok(FxHashSet::default());
-        }
-        self.with_node(node, depth, "graph pattern", |this| {
-            let mut out = FxHashSet::default();
-            if matches!(node, Term::NamedNode(n) if n.as_ref() == rdf::NIL) {
-                return Ok(out);
-            }
-            if this.g.has(node, rdf::FIRST) {
-                let elems = this.read_list(node, "sp:where / sp:elements")?;
-                for elem in &elems {
-                    out.extend(this.where_exported_bound_vars(elem, depth + 1)?);
-                }
-                return Ok(out);
-            }
-            if this.is_instance(node, sp::SUB_QUERY)? {
-                let Some(inner) = this.single_object(node, sp::QUERY_PROP)? else {
-                    return Ok(out);
-                };
-                if has_rdf_query_structure(&this.g, &inner) {
-                    match this.select_exported_bound_vars(&inner, depth + 1) {
-                        Ok(vars) => return Ok(vars),
-                        Err(err) => {
-                            if is_limit_or_cycle_error(&err) {
-                                return Err(err);
-                            }
-                            if let Some(TermRef::Literal(lit)) =
-                                single_object_ref(&this.g, &inner, sp::TEXT, this.budget)?
-                            {
-                                return exported_select_bound_vars(
-                                    lit.value(),
-                                    this.bindings,
-                                    this.budget,
-                                );
-                            }
-                            return Ok(out);
-                        }
-                    }
-                }
-                if let Some(TermRef::Literal(lit)) =
-                    single_object_ref(&this.g, &inner, sp::TEXT, this.budget)?
-                {
-                    return exported_select_bound_vars(lit.value(), this.bindings, this.budget);
-                }
-                return Ok(out);
-            }
-            if this.is_instance(node, sp::OPTIONAL)?
-                || this.is_instance(node, sp::NAMED_GRAPH)?
-                || this.is_instance(node, sp::SERVICE)?
-                || this.is_instance(node, sp::ELEMENT_GROUP)?
-            {
-                if let Some(elems) = this.single_object(node, sp::ELEMENTS)? {
-                    out.extend(this.where_exported_bound_vars(&elems, depth + 1)?);
-                }
-                return Ok(out);
-            }
-            if this.is_instance(node, sp::UNION)? {
-                if let Some(elems) = this.single_object(node, sp::ELEMENTS)? {
-                    let branches = this.read_list(&elems, "sp:Union")?;
-                    for branch in &branches {
-                        out.extend(this.where_exported_bound_vars(branch, depth + 1)?);
-                    }
-                }
-                return Ok(out);
-            }
-            Ok(out)
-        })
-    }
-
     fn select_visible_bound_vars(
         &mut self,
         query: &Term,
@@ -910,9 +867,17 @@ impl Serializer<'_, '_, '_> {
             if !items.is_empty() {
                 let mut grouped = FxHashSet::default();
                 for item in &items {
-                    if !self.g.has(item, sp::AS)
-                        && !self.g.has(item, sp::EXPRESSION)
-                        && let Some(name) = spin_var_name(&self.g, item, self.budget)?
+                    if self.g.has(item, sp::AS) {
+                        continue;
+                    }
+                    if let Some(expr) = self.single_object(item, sp::EXPRESSION)? {
+                        if self.var_name(item)?.is_none()
+                            && let Some(name) = spin_var_name(&self.g, &expr, self.budget)?
+                            && body_exported.contains(&name)
+                        {
+                            grouped.insert(name);
+                        }
+                    } else if let Some(name) = spin_var_name(&self.g, item, self.budget)?
                         && body_exported.contains(&name)
                     {
                         grouped.insert(name);
@@ -943,7 +908,12 @@ impl Serializer<'_, '_, '_> {
         Ok(body_exported.clone())
     }
 
-    fn write_query(&mut self, query: &Term, depth: usize, is_subquery: bool) -> Result<()> {
+    fn write_query(
+        &mut self,
+        query: &Term,
+        depth: usize,
+        is_subquery: bool,
+    ) -> Result<FxHashSet<String>> {
         self.with_node(query, depth, "query", |this| {
             let kind = this.query_kind(query)?;
             if is_subquery {
@@ -960,12 +930,6 @@ impl Serializer<'_, '_, '_> {
                         this.required_object(query, sp::TEMPLATES, "sp:Construct")?;
                     let templates = this.read_list(&templates_head, "sp:templates")?;
                     let where_head = this.required_object(query, sp::WHERE, "sp:Construct")?;
-                    let body_exported =
-                        if !this.bindings.is_empty() && this.g.has(query, sp::GROUP_BY) {
-                            this.where_exported_bound_vars(&where_head, depth + 1)?
-                        } else {
-                            FxHashSet::default()
-                        };
                     this.push("CONSTRUCT { ")?;
                     for t in &templates {
                         this.write_triple_pattern(t, true, depth + 1)?;
@@ -974,9 +938,10 @@ impl Serializer<'_, '_, '_> {
                     this.push("}")?;
                     this.write_dataset_clauses(query)?;
                     this.push(" WHERE { ")?;
-                    this.write_element_list(&where_head, depth + 1)?;
+                    let body_exported = this.write_element_list(&where_head, depth + 1)?;
                     this.push(" }")?;
                     this.write_solution_modifiers(query, depth + 1, &body_exported)?;
+                    Ok(FxHashSet::default())
                 }
                 QueryKind::Select => {
                     let distinct = this.optional_bool(query, sp::DISTINCT)?;
@@ -991,55 +956,106 @@ impl Serializer<'_, '_, '_> {
                         None => Vec::new(),
                         Some(head) => this.read_list(&head, "sp:resultVariables")?,
                     };
-                    let body_exported = if this.bindings.is_empty() {
-                        FxHashSet::default()
-                    } else {
-                        this.where_exported_bound_vars(&where_head, depth + 1)?
-                    };
-                    let visible_bound = this.select_visible_bound_vars(
-                        query,
-                        &body_exported,
-                        &proj_vars,
-                        depth + 1,
-                    )?;
-                    this.push("SELECT ")?;
-                    if distinct {
-                        this.push("DISTINCT ")?;
-                    } else if reduced {
-                        this.push("REDUCED ")?;
-                    }
-                    if proj_vars.is_empty() {
-                        this.push("*")?;
-                    } else {
-                        for (i, v) in proj_vars.iter().enumerate() {
-                            if i > 0 {
-                                this.push(" ")?;
-                            }
-                            this.write_projection_item(v, depth + 1, &visible_bound)?;
+                    if this.bindings.is_empty() {
+                        let empty = FxHashSet::default();
+                        this.push("SELECT ")?;
+                        if distinct {
+                            this.push("DISTINCT ")?;
+                        } else if reduced {
+                            this.push("REDUCED ")?;
                         }
+                        if proj_vars.is_empty() {
+                            this.push("*")?;
+                        } else {
+                            for (i, v) in proj_vars.iter().enumerate() {
+                                if i > 0 {
+                                    this.push(" ")?;
+                                }
+                                this.write_projection_item(v, depth + 1, &empty)?;
+                            }
+                        }
+                        if !is_subquery {
+                            this.write_dataset_clauses(query)?;
+                        }
+                        this.push(" WHERE { ")?;
+                        this.write_element_list(&where_head, depth + 1)?;
+                        this.push(" }")?;
+                        this.write_solution_modifiers(query, depth + 1, &empty)?;
+                        Ok(FxHashSet::default())
+                    } else {
+                        // Serialize WHERE into a bounded sub-buffer first so `body_exported`
+                        // reflects the exact subquery candidates emitted (including any
+                        // dual-form `sp:text` fallbacks).
+                        let saved_out = std::mem::take(&mut this.out);
+                        let saved_spans = std::mem::take(&mut this.anon_var_spans);
+                        let saved_len = saved_out.len();
+                        this.reserved_out_bytes = this.reserved_out_bytes.saturating_add(saved_len);
+                        let where_res = this.write_element_list(&where_head, depth + 1);
+                        let where_buf = std::mem::replace(&mut this.out, saved_out);
+                        let where_spans = std::mem::replace(&mut this.anon_var_spans, saved_spans);
+                        this.reserved_out_bytes = this.reserved_out_bytes.saturating_sub(saved_len);
+                        let body_exported = where_res?;
+
+                        let visible_bound = this.select_visible_bound_vars(
+                            query,
+                            &body_exported,
+                            &proj_vars,
+                            depth + 1,
+                        )?;
+
+                        let where_len = where_buf.len();
+                        this.reserved_out_bytes = this.reserved_out_bytes.saturating_add(where_len);
+                        let header_res = (|| -> Result<FxHashSet<String>> {
+                            this.push("SELECT ")?;
+                            if distinct {
+                                this.push("DISTINCT ")?;
+                            } else if reduced {
+                                this.push("REDUCED ")?;
+                            }
+                            let mut select_exported = FxHashSet::default();
+                            if proj_vars.is_empty() {
+                                this.push("*")?;
+                                select_exported = visible_bound.clone();
+                            } else {
+                                for (i, v) in proj_vars.iter().enumerate() {
+                                    if i > 0 {
+                                        this.push(" ")?;
+                                    }
+                                    if let Some(bound_name) =
+                                        this.write_projection_item(v, depth + 1, &visible_bound)?
+                                    {
+                                        select_exported.insert(bound_name);
+                                    }
+                                }
+                            }
+                            if !is_subquery {
+                                this.write_dataset_clauses(query)?;
+                            }
+                            this.push(" WHERE { ")?;
+                            Ok(select_exported)
+                        })();
+                        this.reserved_out_bytes = this.reserved_out_bytes.saturating_sub(where_len);
+                        let select_exported = header_res?;
+
+                        let base = this.out.len();
+                        this.push(&where_buf)?;
+                        for (s, e, id) in where_spans {
+                            this.anon_var_spans.push((base + s, base + e, id));
+                        }
+                        this.push(" }")?;
+                        this.write_solution_modifiers(query, depth + 1, &body_exported)?;
+                        Ok(select_exported)
                     }
-                    if !is_subquery {
-                        this.write_dataset_clauses(query)?;
-                    }
-                    this.push(" WHERE { ")?;
-                    this.write_element_list(&where_head, depth + 1)?;
-                    this.push(" }")?;
-                    this.write_solution_modifiers(query, depth + 1, &body_exported)?;
                 }
                 QueryKind::Ask => {
                     this.push("ASK")?;
                     this.write_dataset_clauses(query)?;
                     let where_head = this.required_object(query, sp::WHERE, "sp:Ask")?;
-                    let body_exported =
-                        if !this.bindings.is_empty() && this.g.has(query, sp::GROUP_BY) {
-                            this.where_exported_bound_vars(&where_head, depth + 1)?
-                        } else {
-                            FxHashSet::default()
-                        };
                     this.push(" WHERE { ")?;
-                    this.write_element_list(&where_head, depth + 1)?;
+                    let body_exported = this.write_element_list(&where_head, depth + 1)?;
                     this.push(" }")?;
                     this.write_solution_modifiers(query, depth + 1, &body_exported)?;
+                    Ok(FxHashSet::default())
                 }
                 QueryKind::Describe => {
                     this.push("DESCRIBE ")?;
@@ -1061,23 +1077,18 @@ impl Serializer<'_, '_, '_> {
                     }
                     this.write_dataset_clauses(query)?;
                     let where_head = this.single_object(query, sp::WHERE)?;
-                    let body_exported = if !this.bindings.is_empty()
-                        && this.g.has(query, sp::GROUP_BY)
-                        && let Some(ref wh) = where_head
-                    {
-                        this.where_exported_bound_vars(wh, depth + 1)?
+                    let body_exported = if let Some(wh) = where_head {
+                        this.push(" WHERE { ")?;
+                        let exported = this.write_element_list(&wh, depth + 1)?;
+                        this.push(" }")?;
+                        exported
                     } else {
                         FxHashSet::default()
                     };
-                    if let Some(wh) = where_head {
-                        this.push(" WHERE { ")?;
-                        this.write_element_list(&wh, depth + 1)?;
-                        this.push(" }")?;
-                    }
                     this.write_solution_modifiers(query, depth + 1, &body_exported)?;
+                    Ok(FxHashSet::default())
                 }
             }
-            Ok(())
         })
     }
 
@@ -1096,7 +1107,7 @@ impl Serializer<'_, '_, '_> {
         from.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         for iri in from {
             self.push(" FROM ")?;
-            write_iri(&mut self.out, iri.as_str())?;
+            self.push_iri(iri.as_str())?;
         }
         let mut from_named = Vec::new();
         for g in self.g.g.objects_for_subject_predicate(sub, sp::FROM_NAMED) {
@@ -1109,7 +1120,7 @@ impl Serializer<'_, '_, '_> {
         from_named.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         for iri in from_named {
             self.push(" FROM NAMED ")?;
-            write_iri(&mut self.out, iri.as_str())?;
+            self.push_iri(iri.as_str())?;
         }
         Ok(())
     }
@@ -1119,7 +1130,7 @@ impl Serializer<'_, '_, '_> {
         item: &Term,
         depth: usize,
         visible_bound: &FxHashSet<String>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         // Direct aggregate or expression projection with `sp:as` (W3C SPIN SPARQL Syntax §2.3),
         // e.g. `[ a sp:Count ; sp:as [ sp:varName "n" ] ; sp:expression [ sp:varName "o" ] ]`.
         if let Some(as_var) = self.single_object(item, sp::AS)? {
@@ -1139,7 +1150,7 @@ impl Serializer<'_, '_, '_> {
             self.push(" AS ?")?;
             self.push(&name)?;
             self.push(")")?;
-            return Ok(());
+            return Ok(None);
         }
         if let Some(expr) = self.single_object(item, sp::EXPRESSION)? {
             let Some(name) = self.var_name(item)? else {
@@ -1153,22 +1164,25 @@ impl Serializer<'_, '_, '_> {
             self.push(" AS ?")?;
             self.push(&name)?;
             self.push(")")?;
-            return Ok(());
+            return Ok(None);
         }
         if let Some(name) = self.var_name(item)? {
-            if let Some(bound) = self.bound_term(&name).cloned()
-                && !visible_bound.contains(&name)
-            {
-                self.push("(")?;
-                write_term_value(&mut self.out, &bound, depth + 1)?;
-                self.push(" AS ?")?;
-                self.push(&name)?;
-                self.push(")")?;
-            } else {
-                self.push("?")?;
-                self.push(&name)?;
+            if let Some(bound) = self.bound_term(&name).cloned() {
+                if !visible_bound.contains(&name) {
+                    self.push("(")?;
+                    self.push_term_value(&bound, depth + 1)?;
+                    self.push(" AS ?")?;
+                    self.push(&name)?;
+                    self.push(")")?;
+                } else {
+                    self.push("?")?;
+                    self.push(&name)?;
+                }
+                return Ok(Some(name));
             }
-            return Ok(());
+            self.push("?")?;
+            self.push(&name)?;
+            return Ok(None);
         }
         bail!("invalid sp:resultVariables entry {item}: expected variable or projected expression")
     }
@@ -1201,16 +1215,26 @@ impl Serializer<'_, '_, '_> {
                         self.push(&name)?;
                         self.push(")")?;
                     } else if let Some(expr) = self.single_object(item, sp::EXPRESSION)? {
-                        self.push("(")?;
-                        self.write_expr(&expr, depth + 1)?;
-                        if let Some(name) = self.var_name(item)? {
-                            if self.is_bound(&name) {
-                                bail!("GROUP BY assigns to bound template argument ?{name}");
-                            }
-                            self.push(" AS ?")?;
+                        let item_var = self.var_name(item)?;
+                        if item_var.is_none()
+                            && let Some(name) = self.var_name(&expr)?
+                            && (!self.is_bound(&name) || body_exported.contains(&name))
+                        {
+                            self.push("(?")?;
                             self.push(&name)?;
+                            self.push(")")?;
+                        } else {
+                            self.push("(")?;
+                            self.write_expr(&expr, depth + 1)?;
+                            if let Some(name) = item_var {
+                                if self.is_bound(&name) {
+                                    bail!("GROUP BY assigns to bound template argument ?{name}");
+                                }
+                                self.push(" AS ?")?;
+                                self.push(&name)?;
+                            }
+                            self.push(")")?;
                         }
-                        self.push(")")?;
                     } else if let Some(name) = self.var_name(item)?
                         && (!self.is_bound(&name) || body_exported.contains(&name))
                     {
@@ -1277,18 +1301,19 @@ impl Serializer<'_, '_, '_> {
         Ok(())
     }
 
-    fn write_element_list(&mut self, head: &Term, depth: usize) -> Result<()> {
+    fn write_element_list(&mut self, head: &Term, depth: usize) -> Result<FxHashSet<String>> {
         let elements = self.read_list(head, "sp:where / sp:elements")?;
+        let mut exported = FxHashSet::default();
         for (i, elem) in elements.iter().enumerate() {
             if i > 0 {
                 self.push(" ")?;
             }
-            self.write_element(elem, depth + 1)?;
+            exported.extend(self.write_element(elem, depth + 1)?);
         }
-        Ok(())
+        Ok(exported)
     }
 
-    fn write_element_block(&mut self, node: &Term, depth: usize) -> Result<()> {
+    fn write_element_block(&mut self, node: &Term, depth: usize) -> Result<FxHashSet<String>> {
         if matches!(node, Term::NamedNode(n) if n.as_ref() == rdf::NIL)
             || self.g.has(node, rdf::FIRST)
         {
@@ -1302,7 +1327,11 @@ impl Serializer<'_, '_, '_> {
         self.write_element(node, depth)
     }
 
-    fn write_subquery_text(&mut self, inner: &Term, text_term: TermRef<'_>) -> Result<()> {
+    fn write_subquery_text(
+        &mut self,
+        inner: &Term,
+        text_term: TermRef<'_>,
+    ) -> Result<FxHashSet<String>> {
         let TermRef::Literal(lit) = text_term else {
             bail!("sp:text of subquery {inner} must be a string literal");
         };
@@ -1313,36 +1342,39 @@ impl Serializer<'_, '_, '_> {
             )));
         }
         if self.bindings.is_empty() {
-            validate_subquery_text(raw, self.budget)?;
+            validate_subquery_text(raw, self.known_prefixes, self.budget)?;
             collect_sparql_text_vars(raw, &mut self.used_var_names, self.budget)?;
             self.push(raw)?;
-            self.push("\n")
+            self.push("\n")?;
+            Ok(FxHashSet::default())
         } else {
-            let substituted = substitute_sparql_text(raw, self.bindings, self.budget)?;
-            validate_subquery_text(&substituted, self.budget)?;
+            let (substituted, exported) =
+                substitute_sparql_text_with_exported(raw, self.bindings, self.budget)?;
+            validate_subquery_text(&substituted, self.known_prefixes, self.budget)?;
             collect_sparql_text_vars(&substituted, &mut self.used_var_names, self.budget)?;
             self.push(&substituted)?;
-            self.push("\n")
+            self.push("\n")?;
+            Ok(exported)
         }
     }
 
-    fn write_element(&mut self, node: &Term, depth: usize) -> Result<()> {
+    fn write_element(&mut self, node: &Term, depth: usize) -> Result<FxHashSet<String>> {
         self.with_node(node, depth, "graph pattern", |this| {
             // Nested RDF list of elements represents a `{ ... }` group
             if matches!(node, Term::NamedNode(n) if n.as_ref() == rdf::NIL)
                 || this.g.has(node, rdf::FIRST)
             {
                 this.push("{ ")?;
-                this.write_element_list(node, depth + 1)?;
+                let exported = this.write_element_list(node, depth + 1)?;
                 this.push(" }")?;
-                return Ok(());
+                return Ok(exported);
             }
             if this.is_instance(node, sp::FILTER)? {
                 let expr = this.required_object(node, sp::EXPRESSION, "sp:Filter")?;
                 this.push("FILTER (")?;
                 this.write_expr(&expr, depth + 1)?;
                 this.push(")")?;
-                return Ok(());
+                return Ok(FxHashSet::default());
             }
             if this.is_instance(node, sp::BIND)? || this.is_instance(node, sp::LET)? {
                 let expr = this.required_object(node, sp::EXPRESSION, "sp:Bind")?;
@@ -1358,14 +1390,14 @@ impl Serializer<'_, '_, '_> {
                 this.push(" AS ?")?;
                 this.push(&name)?;
                 this.push(")")?;
-                return Ok(());
+                return Ok(FxHashSet::default());
             }
             if this.is_instance(node, sp::OPTIONAL)? {
                 let elems = this.required_object(node, sp::ELEMENTS, "sp:Optional")?;
                 this.push("OPTIONAL { ")?;
-                this.write_element_list(&elems, depth + 1)?;
+                let exported = this.write_element_list(&elems, depth + 1)?;
                 this.push(" }")?;
-                return Ok(());
+                return Ok(exported);
             }
             if this.is_instance(node, sp::UNION)? {
                 let elems = this.required_object(node, sp::ELEMENTS, "sp:Union")?;
@@ -1373,24 +1405,25 @@ impl Serializer<'_, '_, '_> {
                 if branches.is_empty() {
                     bail!("sp:Union {node} has no branches");
                 }
+                let mut exported = FxHashSet::default();
                 for (i, branch) in branches.iter().enumerate() {
                     if i > 0 {
                         this.push(" UNION ")?;
                     }
                     this.push("{ ")?;
-                    this.write_element_block(branch, depth + 1)?;
+                    exported.extend(this.write_element_block(branch, depth + 1)?);
                     this.push(" }")?;
                 }
-                return Ok(());
+                return Ok(exported);
             }
             if this.is_instance(node, sp::SUB_QUERY)? {
                 let inner = this.required_object(node, sp::QUERY_PROP, "sp:SubQuery")?;
                 this.push("{ ")?;
-                if has_rdf_query_structure(&this.g, &inner) {
+                let exported = if has_rdf_query_structure(&this.g, &inner) {
                     let saved_len = this.out.len();
                     let saved_spans = this.anon_var_spans.len();
                     match this.write_query(&inner, depth + 1, true) {
-                        Ok(()) => {}
+                        Ok(sub_exported) => sub_exported,
                         Err(rdf_err) => {
                             if !is_limit_or_cycle_error(&rdf_err)
                                 && let Some(text_term) =
@@ -1398,7 +1431,7 @@ impl Serializer<'_, '_, '_> {
                             {
                                 this.out.truncate(saved_len);
                                 this.anon_var_spans.truncate(saved_spans);
-                                this.write_subquery_text(&inner, text_term)?;
+                                this.write_subquery_text(&inner, text_term)?
                             } else {
                                 return Err(rdf_err);
                             }
@@ -1407,21 +1440,21 @@ impl Serializer<'_, '_, '_> {
                 } else if let Some(text_term) =
                     single_object_ref(&this.g, &inner, sp::TEXT, this.budget)?
                 {
-                    this.write_subquery_text(&inner, text_term)?;
+                    this.write_subquery_text(&inner, text_term)?
                 } else {
                     bail!(
                         "sp:SubQuery {node} points to {inner} which has neither SPIN RDF syntax nor sp:text"
                     );
-                }
+                };
                 this.push(" }")?;
-                return Ok(());
+                return Ok(exported);
             }
             if this.is_instance(node, sp::MINUS)? {
                 let elems = this.required_object(node, sp::ELEMENTS, "sp:Minus")?;
                 this.push("MINUS { ")?;
                 this.write_element_list(&elems, depth + 1)?;
                 this.push(" }")?;
-                return Ok(());
+                return Ok(FxHashSet::default());
             }
             if this.is_instance(node, sp::NAMED_GRAPH)? {
                 let graph_node =
@@ -1430,9 +1463,9 @@ impl Serializer<'_, '_, '_> {
                 this.push("GRAPH ")?;
                 this.write_var_or_iri(&graph_node, "sp:graphNameNode")?;
                 this.push(" { ")?;
-                this.write_element_list(&elems, depth + 1)?;
+                let exported = this.write_element_list(&elems, depth + 1)?;
                 this.push(" }")?;
-                return Ok(());
+                return Ok(exported);
             }
             if this.is_instance(node, sp::SERVICE)? {
                 let uri = this.required_object(node, sp::SERVICE_URI, "sp:Service")?;
@@ -1444,34 +1477,34 @@ impl Serializer<'_, '_, '_> {
                 }
                 this.write_var_or_iri(&uri, "sp:serviceURI")?;
                 this.push(" { ")?;
-                this.write_element_list(&elems, depth + 1)?;
+                let exported = this.write_element_list(&elems, depth + 1)?;
                 this.push(" }")?;
-                return Ok(());
+                return Ok(exported);
             }
             if this.is_instance(node, sp::VALUES_CLS)? {
                 this.write_values(node, depth + 1)?;
-                return Ok(());
+                return Ok(FxHashSet::default());
             }
             if this.is_instance(node, sp::NOT_EXISTS)? {
                 let elems = this.required_object(node, sp::ELEMENTS, "sp:NotExists")?;
                 this.push("FILTER NOT EXISTS { ")?;
                 this.write_element_list(&elems, depth + 1)?;
                 this.push(" }")?;
-                return Ok(());
+                return Ok(FxHashSet::default());
             }
             if this.is_instance(node, sp::EXISTS)? {
                 let elems = this.required_object(node, sp::ELEMENTS, "sp:Exists")?;
                 this.push("FILTER EXISTS { ")?;
                 this.write_element_list(&elems, depth + 1)?;
                 this.push(" }")?;
-                return Ok(());
+                return Ok(FxHashSet::default());
             }
             if this.is_instance(node, sp::ELEMENT_GROUP)? {
                 let elems = this.required_object(node, sp::ELEMENTS, "sp:ElementGroup")?;
                 this.push("{ ")?;
-                this.write_element_list(&elems, depth + 1)?;
+                let exported = this.write_element_list(&elems, depth + 1)?;
                 this.push(" }")?;
-                return Ok(());
+                return Ok(exported);
             }
             if this.is_instance(node, sp::TRIPLE_PATH)? || this.g.has(node, sp::PATH) {
                 let s = this.required_object(node, sp::SUBJECT, "sp:TriplePath")?;
@@ -1483,7 +1516,7 @@ impl Serializer<'_, '_, '_> {
                 this.push(" ")?;
                 this.write_node_or_var(&o, false, NodePos::Object, depth + 1)?;
                 this.push(" .")?;
-                return Ok(());
+                return Ok(FxHashSet::default());
             }
             if this.is_instance(node, sp::TRIPLE_PATTERN)?
                 || this.is_instance(node, sp::TRIPLE_TEMPLATE)?
@@ -1491,7 +1524,8 @@ impl Serializer<'_, '_, '_> {
                     && this.g.has(node, sp::PREDICATE)
                     && this.g.has(node, sp::OBJECT))
             {
-                return this.write_triple_pattern(node, false, depth + 1);
+                this.write_triple_pattern(node, false, depth + 1)?;
+                return Ok(FxHashSet::default());
             }
             bail!("unsupported or malformed SPIN graph pattern element {node}")
         })
@@ -1521,13 +1555,13 @@ impl Serializer<'_, '_, '_> {
                 let Term::NamedNode(iri) = bound else {
                     bail!("template argument ?{name} bound to {bound} is not an IRI for {what}");
                 };
-                return write_iri(&mut self.out, iri.as_str());
+                return self.push_iri(iri.as_str());
             }
             self.push("?")?;
             return self.push(&name);
         }
         match node {
-            Term::NamedNode(n) => write_iri(&mut self.out, n.as_str()),
+            Term::NamedNode(n) => self.push_iri(n.as_str()),
             _ => bail!("{what} expects an IRI or SPIN variable, found {node}"),
         }
     }
@@ -1546,18 +1580,18 @@ impl Serializer<'_, '_, '_> {
                         "template argument ?{name} bound to {bound} cannot be used as a predicate"
                     );
                 }
-                return write_term_value(&mut self.out, &bound, depth);
+                return self.push_term_value(&bound, depth);
             }
             self.push("?")?;
             return self.push(&name);
         }
         match node {
-            Term::NamedNode(n) => write_iri(&mut self.out, n.as_str()),
+            Term::NamedNode(n) => self.push_iri(n.as_str()),
             Term::Literal(l) => {
                 if pos == NodePos::Predicate {
                     bail!("literal {l} cannot be used as a predicate in SPIN triple pattern");
                 }
-                write_literal_ref(&mut self.out, l.as_ref())
+                self.push_literal_ref(l.as_ref())
             }
             Term::BlankNode(b) => {
                 let is_var = self.is_instance(node, sp::VARIABLE_CLS)?;
@@ -1576,7 +1610,7 @@ impl Serializer<'_, '_, '_> {
                 if pos == NodePos::Predicate {
                     bail!("triple term {node} cannot be used as a predicate");
                 }
-                write_term_value(&mut self.out, node, depth)
+                self.push_term_value(node, depth)
             }
         }
     }
@@ -1596,7 +1630,7 @@ impl Serializer<'_, '_, '_> {
                 };
                 let name = lit.value();
                 validate_var_name(name)?;
-                self.record_var(name);
+                self.record_var(name)?;
                 if self.is_bound(name) {
                     bail!("sp:Values {node} mentions bound template argument ?{name}");
                 }
@@ -1649,13 +1683,13 @@ impl Serializer<'_, '_, '_> {
                     self.push("UNDEF")?;
                 } else if let Some(name) = self.var_name(val)? {
                     match self.bound_term(&name).cloned() {
-                        Some(bound) => write_term_value(&mut self.out, &bound, depth + 1)?,
+                        Some(bound) => self.push_term_value(&bound, depth + 1)?,
                         None => bail!(
                             "sp:Values {node} contains unbound variable ?{name} in bindings row"
                         ),
                     }
                 } else {
-                    write_term_value(&mut self.out, val, depth + 1)?;
+                    self.push_term_value(val, depth + 1)?;
                 }
             }
             self.push(")")?;
@@ -1669,7 +1703,7 @@ impl Serializer<'_, '_, '_> {
             if let Some(name) = this.var_name(node)? {
                 match this.bound_term(&name).cloned() {
                     Some(Term::NamedNode(iri)) => {
-                        return write_iri(&mut this.out, iri.as_str());
+                        return this.push_iri(iri.as_str());
                     }
                     Some(other) => bail!(
                         "template argument ?{name} bound to {other} cannot be used as a property path"
@@ -1813,7 +1847,7 @@ impl Serializer<'_, '_, '_> {
                 return this.push(")");
             }
             if let Term::NamedNode(iri) = node {
-                return write_iri(&mut this.out, iri.as_str());
+                return this.push_iri(iri.as_str());
             }
             bail!("unsupported or malformed SPIN property path {node}")
         })
@@ -1913,18 +1947,18 @@ impl Serializer<'_, '_, '_> {
             // 1. Named variable
             if let Some(name) = this.var_name(node)? {
                 if let Some(bound) = this.bound_term(&name).cloned() {
-                    return write_term_value(&mut this.out, &bound, depth + 1);
+                    return this.push_term_value(&bound, depth + 1);
                 }
                 this.push("?")?;
                 return this.push(&name);
             }
             // 2. Literal constant
             if let Term::Literal(l) = node {
-                return write_literal_ref(&mut this.out, l.as_ref());
+                return this.push_literal_ref(l.as_ref());
             }
             // 3. RDF-star triple term
             if matches!(node, Term::Triple(_)) {
-                return write_term_value(&mut this.out, node, depth + 1);
+                return this.push_term_value(node, depth + 1);
             }
             // 4. Anonymous sp:Variable blank node
             if let Term::BlankNode(b) = node
@@ -1936,7 +1970,7 @@ impl Serializer<'_, '_, '_> {
             let args = this.collect_args(node)?;
             let Some(ty) = this.expr_call_type(node, &args)? else {
                 if let Term::NamedNode(n) = node {
-                    return write_iri(&mut this.out, n.as_str());
+                    return this.push_iri(n.as_str());
                 }
                 bail!("malformed SPIN expression node {node}");
             };
@@ -1991,7 +2025,7 @@ impl Serializer<'_, '_, '_> {
                         );
                     }
                     this.push(" ; SEPARATOR = ")?;
-                    write_literal_ref(&mut this.out, lit.as_ref())?;
+                    this.push_literal_ref(lit.as_ref())?;
                 }
                 return this.push(")");
             }
@@ -2095,7 +2129,7 @@ impl Serializer<'_, '_, '_> {
                 bail!("unsupported SPIN operator or built-in {ty} at {node}");
             }
             // Custom IRI function or XSD cast: <iri>(arg1, arg2, ...)
-            write_iri(&mut this.out, iri)?;
+            this.push_iri(iri)?;
             this.push("(")?;
             for (i, arg) in args.iter().enumerate() {
                 if i > 0 {

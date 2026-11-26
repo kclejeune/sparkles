@@ -218,6 +218,11 @@ impl SparqlSyntaxError {
     pub(crate) fn from_bad_base_iri(e: IriParseError) -> Self {
         SparqlSyntaxErrorKind::InvalidBaseIri(e).into()
     }
+
+    /// Whether this error refused the query or update for exceeding the nesting or depth limit.
+    pub fn is_too_deep(&self) -> bool {
+        matches!(self.kind, SparqlSyntaxErrorKind::TooDeep { .. })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -5,8 +5,9 @@
 use super::rdf::{
     MAX_DEPTH, MAX_OUTPUT_BYTES, WorkBudget, check_and_own_iri, check_and_own_term,
     has_rdf_query_structure, is_instance_bounded, is_limit_or_cycle_error, limit_err,
-    parse_spin_bool_ref, push_str_bounded, serialize_query_with_bindings, single_object,
-    single_object_ref, spin_var_name, validate_var_name, write_term_value,
+    map_core_parse_error, parse_spin_bool_ref, push_str_bounded, serialize_query_with_bindings,
+    single_object, single_object_ref, spin_var_name, term_ref_size_and_depth, validate_var_name,
+    write_term_value,
 };
 use super::vocab::{sp, spin, spl};
 use super::{CandidateCheck, ExtraTypes};
@@ -663,9 +664,9 @@ fn expand_inner(
         )));
     }
     let result = (|| {
-        let def = resolve_template(g, template, budget, cache)?;
+        let TemplateDef { body, args } = resolve_template(g, template, budget, cache)?;
         let mut bindings: FxHashMap<String, Option<Term>> = FxHashMap::default();
-        for arg in &def.args {
+        for arg in args {
             let supplied = match single_object(g, call, arg.predicate.as_ref(), budget)? {
                 None => None,
                 Some(v) => {
@@ -673,7 +674,13 @@ fn expand_inner(
                         if let Some(outer_val) = outer_bindings.get(&var_name) {
                             // Omitted outer optional argument (`None`) falls through to the
                             // inner argument's default / optional / required checks.
-                            outer_val.clone()
+                            if let Some(t) = outer_val {
+                                let bytes = term_ref_size_and_depth(t.as_ref(), 0, budget)?;
+                                budget.charge_bytes(bytes)?;
+                                Some(t.clone())
+                            } else {
+                                None
+                            }
                         } else {
                             bail!(
                                 "SPIN template call {call} of {template} passes unbound SPIN variable ?{var_name} ({v}) to argument {}",
@@ -693,8 +700,8 @@ fn expand_inner(
             let raw = match supplied {
                 Some(v) => Some(v),
                 None => {
-                    if let Some(default) = &arg.default_value {
-                        Some(default.clone())
+                    if let Some(default) = arg.default_value {
+                        Some(default)
                     } else if arg.optional == Some(true) {
                         None
                     } else {
@@ -729,15 +736,15 @@ fn expand_inner(
                     check_value_type(g, extra, val, vt, &arg.predicate, budget)?;
                 }
             }
-            bindings.insert(arg.var.clone(), raw);
+            bindings.insert(arg.var, raw);
         }
 
         // The body may itself be another template call, SPIN RDF syntax, or sp:text
-        if let Some(inner_template) = template_of_call(g, &def.body, budget, cache)? {
+        if let Some(inner_template) = template_of_call(g, &body, budget, cache)? {
             return expand_inner(
                 g,
                 extra,
-                &def.body,
+                &body,
                 &inner_template,
                 check,
                 &bindings,
@@ -747,20 +754,22 @@ fn expand_inner(
                 cache,
             );
         }
-        if has_rdf_query_structure(g, &def.body) {
+        if has_rdf_query_structure(g, &body) {
+            let known_prefixes = check.map(|c| &c.prefixes);
             let rdf_res =
-                serialize_query_with_bindings(g, &def.body, &bindings, budget).and_then(|q| {
-                    if let Some(c) = check {
-                        c.validate(&q)?;
-                    }
-                    Ok(q)
-                });
+                serialize_query_with_bindings(g, &body, &bindings, known_prefixes, budget)
+                    .and_then(|q| {
+                        if let Some(c) = check {
+                            c.validate(&q)?;
+                        }
+                        Ok(q)
+                    });
             match rdf_res {
                 Ok(q) => return Ok(q),
                 Err(rdf_err) => {
                     if !is_limit_or_cycle_error(&rdf_err)
                         && let Some(TermRef::Literal(lit)) =
-                            single_object_ref(g, &def.body, sp::TEXT, budget)?
+                            single_object_ref(g, &body, sp::TEXT, budget)?
                     {
                         return substitute_sparql_text(lit.value(), &bindings, budget);
                     }
@@ -768,15 +777,13 @@ fn expand_inner(
                 }
             }
         }
-        match single_object_ref(g, &def.body, sp::TEXT, budget)? {
+        match single_object_ref(g, &body, sp::TEXT, budget)? {
             Some(TermRef::Literal(lit)) => substitute_sparql_text(lit.value(), &bindings, budget),
             Some(other) => bail!(
-                "the sp:text of spin:body {} in SPIN template {template} is {other}, not a string",
-                def.body
+                "the sp:text of spin:body {body} in SPIN template {template} is {other}, not a string",
             ),
             None => bail!(
-                "the spin:body {} of SPIN template {template} has neither SPIN RDF syntax nor sp:text",
-                def.body
+                "the spin:body {body} of SPIN template {template} has neither SPIN RDF syntax nor sp:text",
             ),
         }
     })();
@@ -1295,17 +1302,54 @@ pub(crate) fn collect_sparql_text_vars(
     budget: &mut WorkBudget,
 ) -> Result<()> {
     for tok in tokenize_sparql(text, budget)? {
-        if let Some(name) = tok.var_name(text) {
+        if let Some(name) = tok.var_name(text)
+            && !out.contains(name)
+        {
+            budget.charge_bytes(name.len())?;
             out.insert(name.to_string());
         }
     }
     Ok(())
 }
 
+fn placeholder_prefix_ns(prefix: &str) -> String {
+    if prefix.is_empty() {
+        "urn:sparkles:spin-subquery-check:default/".to_string()
+    } else {
+        format!("urn:sparkles:spin-subquery-check:ns/{prefix}/")
+    }
+}
+
+fn unescape_pn_local(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(next) = chars.next()
+        {
+            out.push(next);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Validate that `text` represents a single valid SPARQL `SubSelect` (starting with `SELECT`,
 /// balanced `{}` braces that cannot escape the subquery block, and no dataset clauses or
 /// prologue), charging `budget`.
-pub(crate) fn validate_subquery_text(text: &str, budget: &mut WorkBudget) -> Result<()> {
+///
+/// When `known_prefixes` is `Some`, prefixes are resolved against the real translation
+/// prefix environment so registered custom aggregates (such as `afn:variance(DISTINCT ?v)`)
+/// retain their true IRIs. When `None` (standalone serialization without a prefix table),
+/// placeholder namespaces are generated per prefix and placeholder-prefixed calls using
+/// `DISTINCT` are admitted as custom aggregates so placeholder resolution does not decide
+/// aggregate identity.
+pub(crate) fn validate_subquery_text(
+    text: &str,
+    known_prefixes: Option<&FxHashMap<&str, &str>>,
+    budget: &mut WorkBudget,
+) -> Result<()> {
     if text.len() > MAX_OUTPUT_BYTES {
         return Err(limit_err(format!(
             "SPIN sp:text exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
@@ -1320,7 +1364,8 @@ pub(crate) fn validate_subquery_text(text: &str, budget: &mut WorkBudget) -> Res
     }
     let mut brace_depth: isize = 0;
     let mut prefixes: FxHashSet<&str> = FxHashSet::default();
-    for tok in &tokens {
+    let mut standalone_distinct_aggs: Vec<NamedNode> = Vec::new();
+    for (idx, tok) in tokens.iter().enumerate() {
         match tok.kind {
             TokKind::LBrace => brace_depth += 1,
             TokKind::RBrace => {
@@ -1330,8 +1375,25 @@ pub(crate) fn validate_subquery_text(text: &str, budget: &mut WorkBudget) -> Res
                 }
             }
             TokKind::PrefixedName => {
-                if let Some((prefix, _)) = tok.as_str(text).split_once(':') {
+                if let Some((prefix, local)) = tok.as_str(text).split_once(':') {
                     prefixes.insert(prefix);
+                    if known_prefixes.is_none()
+                        && tokens
+                            .get(idx + 1)
+                            .is_some_and(|t| t.kind == TokKind::LParen)
+                        && tokens
+                            .get(idx + 2)
+                            .is_some_and(|t| t.is_word(text, "DISTINCT"))
+                    {
+                        let iri_str = format!(
+                            "{}{}",
+                            placeholder_prefix_ns(prefix),
+                            unescape_pn_local(local)
+                        );
+                        if let Ok(iri) = NamedNode::new(iri_str) {
+                            standalone_distinct_aggs.push(iri);
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1341,16 +1403,55 @@ pub(crate) fn validate_subquery_text(text: &str, budget: &mut WorkBudget) -> Res
         bail!("sp:SubQuery sp:text has unbalanced braces");
     }
     let mut wrapped = String::with_capacity(text.len().saturating_add(64));
-    for p in prefixes {
-        wrapped.push_str("PREFIX ");
-        wrapped.push_str(p);
-        wrapped.push_str(": <urn:sparkles:spin-subquery-check:ns/>\n");
+    match known_prefixes {
+        Some(prefix_map) => {
+            for p in prefixes {
+                if let Some(&ns) = prefix_map.get(p) {
+                    wrapped.push_str("PREFIX ");
+                    wrapped.push_str(p);
+                    wrapped.push_str(": <");
+                    wrapped.push_str(ns);
+                    wrapped.push_str(">\n");
+                }
+            }
+        }
+        None => {
+            for p in prefixes {
+                wrapped.push_str("PREFIX ");
+                wrapped.push_str(p);
+                wrapped.push_str(": <");
+                wrapped.push_str(&placeholder_prefix_ns(p));
+                wrapped.push_str(">\n");
+            }
+        }
     }
     wrapped.push_str("SELECT * WHERE { {\n");
     wrapped.push_str(text);
     wrapped.push_str("\n} }");
-    sparkles_core::sparql::parse_query(&wrapped, None, &[])
-        .map_err(|e| anyhow!("invalid sp:SubQuery sp:text: {e}"))?;
+
+    let mut parser = sparkles_core::sparql::aggext::register(spargebra::SparqlParser::new());
+    for iri in standalone_distinct_aggs {
+        parser = parser.with_custom_aggregate_function(iri);
+    }
+    let parsed = parser.parse_query(&wrapped).map_err(|e| {
+        if e.is_too_deep() {
+            limit_err(format!("invalid sp:SubQuery sp:text: {e}"))
+        } else {
+            anyhow!("invalid sp:SubQuery sp:text: {e}")
+        }
+    })?;
+    let (query, depth) = sparkles_core::sparql::depth::checked_query(parsed)
+        .map_err(|e| map_core_parse_error(e, "invalid sp:SubQuery sp:text"))?;
+    let pattern = match &query {
+        spargebra::Query::Select { pattern, .. }
+        | spargebra::Query::Construct { pattern, .. }
+        | spargebra::Query::Ask { pattern, .. }
+        | spargebra::Query::Describe { pattern, .. } => pattern,
+    };
+    sparkles_core::sparql::depth::with_stack(depth, || {
+        sparkles_core::sparql::validate_scoping(pattern)
+    })
+    .map_err(|e| map_core_parse_error(e, "invalid sp:SubQuery sp:text"))?;
     Ok(())
 }
 
@@ -1500,7 +1601,30 @@ impl TextAnalyzer<'_, '_> {
             match tok.kind {
                 TokKind::LParen => {
                     let next_k = self.skip_paren(k, end);
-                    self.analyze_expr_range(k + 1, next_k.saturating_sub(1), depth + 1)?;
+                    let close = next_k.saturating_sub(1);
+                    if close > k && self.matching_rparen[k] == Some(close) {
+                        let mut inner_l = k + 1;
+                        let mut inner_r = close;
+                        while inner_l < inner_r
+                            && self.tokens[inner_l].kind == TokKind::LParen
+                            && self.matching_rparen[inner_l] == Some(inner_r - 1)
+                        {
+                            inner_l += 1;
+                            inner_r -= 1;
+                        }
+                        if inner_l + 1 == inner_r
+                            && self.tokens[inner_l].kind == TokKind::Var
+                            && let Some(var) = self.tokens[inner_l].var_name(self.text)
+                            && self.is_bound(var)
+                            && body_exported.contains(var)
+                        {
+                            self.var_rewrites[inner_l] = VarPosRewrite::KeepVar;
+                            group_exported.insert(var.to_string());
+                            k = next_k;
+                            continue;
+                        }
+                    }
+                    self.analyze_expr_range(k + 1, close, depth + 1)?;
                     k = next_k;
                 }
                 TokKind::Var => {
@@ -1626,7 +1750,10 @@ impl TextAnalyzer<'_, '_> {
             if tok.is_word(self.text, "WHERE")
                 || tok.is_word(self.text, "FROM")
                 || tok.is_word(self.text, "NAMED")
-                || matches!(tok.kind, TokKind::IriRef | TokKind::PrefixedName)
+                || matches!(
+                    tok.kind,
+                    TokKind::IriRef | TokKind::PrefixedName | TokKind::Var
+                )
             {
                 k += 1;
             } else {
@@ -1804,15 +1931,14 @@ impl TextAnalyzer<'_, '_> {
     }
 }
 
-/// Return the set of bound template variables exported by a textual `SubSelect` fragment.
-pub(crate) fn exported_select_bound_vars(
+/// Token-aware substitution of template argument bindings into a SPARQL `sp:text` query,
+/// returning both the rewritten SPARQL text and the set of bound template variables exported
+/// by its top-level `SELECT` (used when embedding a textual `sp:SubQuery` inside an RDF query).
+pub(crate) fn substitute_sparql_text_with_exported(
     text: &str,
     bindings: &FxHashMap<String, Option<Term>>,
     budget: &mut WorkBudget,
-) -> Result<FxHashSet<String>> {
-    if bindings.is_empty() {
-        return Ok(FxHashSet::default());
-    }
+) -> Result<(String, FxHashSet<String>)> {
     if text.len() > MAX_OUTPUT_BYTES {
         return Err(limit_err(format!(
             "SPIN sp:text exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
@@ -1821,45 +1947,7 @@ pub(crate) fn exported_select_bound_vars(
     let tokens = tokenize_sparql(text, budget)?;
     let (matching_rparen, matching_rbrace) = compute_delimiters(&tokens);
     let mut var_rewrites = vec![VarPosRewrite::Plain; tokens.len()];
-    let mut analyzer = TextAnalyzer {
-        text,
-        tokens: &tokens,
-        matching_rparen,
-        matching_rbrace,
-        bindings,
-        var_rewrites: &mut var_rewrites,
-        budget,
-    };
-    analyzer.analyze_group_pattern(0, tokens.len(), 0)
-}
-
-/// Token-aware substitution of template argument bindings into a SPARQL `sp:text` query.
-///
-/// - Tokenizes string literals (`'...'`, `"..."`, `'''...'''`, `"""..."""`), IRI references
-///   (`<...>` with `\uXXXX`/`\UXXXXXXXX` escapes), prefixed names (`PNAME_NS`/`PNAME_LN` with
-///   `-`/`.`/`PLX`), blank node labels, language tags, and `#` comments (CR/LF terminated)
-///   in a single forward-only O(n) pass under `budget`.
-/// - Rewrites `BOUND(?arg)` / `BOUND($arg)` to `(true)` when `?arg` is bound, valid in both
-///   expression and constraint positions (`FILTER`, `HAVING`, `GROUP BY`, `ORDER BY`).
-/// - Refuses `AS ?arg` and `VALUES ... ?arg` headers when `?arg` is bound.
-/// - Preserves valid SPARQL syntax and scope in `SELECT ?arg` (keeping `?arg` when an inner
-///   query already exports it, otherwise `(<val> AS ?arg)`), `GROUP BY ?arg`, and `ORDER BY ?arg`.
-/// - Avoids merging `<` with a substituted `<iri>` into RDF-star `<<` (or `>` with `>`).
-/// - Never substitutes the reserved focus variable `?this`.
-pub(crate) fn substitute_sparql_text(
-    text: &str,
-    bindings: &FxHashMap<String, Option<Term>>,
-    budget: &mut WorkBudget,
-) -> Result<String> {
-    if text.len() > MAX_OUTPUT_BYTES {
-        return Err(limit_err(format!(
-            "SPIN sp:text exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
-        )));
-    }
-    let tokens = tokenize_sparql(text, budget)?;
-    let (matching_rparen, matching_rbrace) = compute_delimiters(&tokens);
-    let mut var_rewrites = vec![VarPosRewrite::Plain; tokens.len()];
-    {
+    let exported = {
         let mut analyzer = TextAnalyzer {
             text,
             tokens: &tokens,
@@ -1869,8 +1957,8 @@ pub(crate) fn substitute_sparql_text(
             var_rewrites: &mut var_rewrites,
             budget,
         };
-        analyzer.analyze_group_pattern(0, tokens.len(), 0)?;
-    }
+        analyzer.analyze_group_pattern(0, tokens.len(), 0)?
+    };
 
     let mut out = String::with_capacity(text.len().min(65_536));
     let mut copied = 0usize;
@@ -1944,5 +2032,27 @@ pub(crate) fn substitute_sparql_text(
         i += 1;
     }
     push_str_bounded(&mut out, &text[copied..])?;
-    Ok(out)
+    Ok((out, exported))
+}
+
+/// Token-aware substitution of template argument bindings into a SPARQL `sp:text` query.
+///
+/// - Tokenizes string literals (`'...'`, `"..."`, `'''...'''`, `"""..."""`), IRI references
+///   (`<...>` with `\uXXXX`/`\UXXXXXXXX` escapes), prefixed names (`PNAME_NS`/`PNAME_LN` with
+///   `-`/`.`/`PLX`), blank node labels, language tags, and `#` comments (CR/LF terminated)
+///   in a single forward-only O(n) pass under `budget`.
+/// - Rewrites `BOUND(?arg)` / `BOUND($arg)` to `(true)` when `?arg` is bound, valid in both
+///   expression and constraint positions (`FILTER`, `HAVING`, `GROUP BY`, `ORDER BY`).
+/// - Refuses `AS ?arg` and `VALUES ... ?arg` headers when `?arg` is bound.
+/// - Preserves valid SPARQL syntax and scope in `SELECT ?arg` (keeping `?arg` when an inner
+///   query already exports it, otherwise `(<val> AS ?arg)`), `GROUP BY ?arg` / `(?arg)`, and
+///   `ORDER BY ?arg`.
+/// - Avoids merging `<` with a substituted `<iri>` into RDF-star `<<` (or `>` with `>`).
+/// - Never substitutes the reserved focus variable `?this`.
+pub(crate) fn substitute_sparql_text(
+    text: &str,
+    bindings: &FxHashMap<String, Option<Term>>,
+    budget: &mut WorkBudget,
+) -> Result<String> {
+    substitute_sparql_text_with_exported(text, bindings, budget).map(|(out, _)| out)
 }
