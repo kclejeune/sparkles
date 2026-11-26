@@ -14,7 +14,7 @@ use spargebra::algebra::{
 use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 
 pub(super) struct Layout<'a> {
-    preparation: &'a Preparation,
+    preparation: Option<&'a Preparation>,
     bytes: u64,
     retained: bool,
 }
@@ -22,7 +22,7 @@ pub(super) struct Layout<'a> {
 impl<'a> Layout<'a> {
     pub(super) fn new(preparation: &'a Preparation) -> Self {
         Self {
-            preparation,
+            preparation: Some(preparation),
             bytes: 0,
             retained: false,
         }
@@ -35,25 +35,48 @@ impl<'a> Layout<'a> {
         }
     }
 
+    pub(super) fn unchecked(retained: bool) -> Layout<'static> {
+        Layout {
+            preparation: None,
+            bytes: 0,
+            retained,
+        }
+    }
+
+    pub(super) fn is_checked(&self) -> bool {
+        self.preparation.is_some()
+    }
+
     pub(super) fn bytes(&self) -> u64 {
         self.bytes
     }
 
     pub(super) fn add(&mut self, bytes: usize) -> Result<()> {
-        self.preparation.check()?;
-        self.bytes = self
-            .bytes
-            .checked_add(bytes as u64)
-            .ok_or_else(|| self.preparation.exhausted())?;
+        if let Some(preparation) = self.preparation {
+            preparation.check()?;
+            self.bytes = self
+                .bytes
+                .checked_add(bytes as u64)
+                .ok_or_else(|| preparation.exhausted())?;
+        } else {
+            self.bytes = self.bytes.saturating_add(bytes as u64);
+        }
         Ok(())
     }
 
     pub(super) fn slots<T>(&mut self, count: usize) -> Result<()> {
-        self.add(
-            count
-                .checked_mul(size_of::<T>())
-                .ok_or_else(|| self.preparation.exhausted())?,
-        )
+        if let Some(preparation) = self.preparation {
+            self.add(
+                count
+                    .checked_mul(size_of::<T>())
+                    .ok_or_else(|| preparation.exhausted())?,
+            )
+        } else {
+            self.bytes = self
+                .bytes
+                .saturating_add((count as u64).saturating_mul(size_of::<T>() as u64));
+            Ok(())
+        }
     }
 
     pub(super) fn slice<T>(&mut self, values: &[T]) -> Result<()> {
@@ -107,10 +130,17 @@ impl<'a> Layout<'a> {
         if capacity == 0 {
             return Ok(());
         }
-        let buckets = capacity
-            .checked_next_power_of_two()
-            .and_then(|count| count.max(2).checked_mul(2))
-            .ok_or_else(|| self.preparation.exhausted())?;
+        let buckets = if let Some(preparation) = self.preparation {
+            capacity
+                .checked_next_power_of_two()
+                .and_then(|count| count.max(2).checked_mul(2))
+                .ok_or_else(|| preparation.exhausted())?
+        } else {
+            capacity
+                .checked_next_power_of_two()
+                .and_then(|count| count.max(2).checked_mul(2))
+                .unwrap_or(usize::MAX)
+        };
         self.slots::<(K, V)>(buckets)?;
         self.add(buckets)?;
         self.add(align_of::<(K, V)>().max(64))
@@ -236,7 +266,8 @@ impl<'a> Layout<'a> {
     }
 
     pub(super) fn syntax(&mut self, root: Algebra<'_>) -> Result<()> {
-        visit_algebra(root, self.preparation, |item| match item {
+        let preparation = self.preparation;
+        let visit = |item| match item {
             Algebra::Pattern(pattern) => self.pattern_item(pattern),
             Algebra::Expr(expression) => self.expression_item(expression),
             Algebra::Aggregate(aggregate) => match aggregate {
@@ -244,7 +275,11 @@ impl<'a> Layout<'a> {
                 AggregateExpression::FunctionCall { name, .. } => self.aggregate_name(name),
                 AggregateExpression::Fold { order, .. } => self.slice(order),
             },
-        })
+        };
+        match preparation {
+            Some(preparation) => visit_algebra(root, preparation, visit),
+            None => visit_algebra_ordinary(root, visit),
+        }
     }
 
     fn pattern_item(&mut self, pattern: &GraphPattern) -> Result<()> {
@@ -396,7 +431,9 @@ impl<'a> Layout<'a> {
     }
 
     fn expr(&mut self, expression: &Expr) -> Result<()> {
-        self.preparation.check()?;
+        if let Some(preparation) = self.preparation {
+            preparation.check()?;
+        }
         match expression {
             // Value's heap variants and ExistsSpec are Arc-backed.
             Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) | Expr::Exists(_) => {
@@ -734,6 +771,114 @@ impl<'a> Layout<'a> {
             Kind::PatternScan(_) => self.slots::<super::patternplan::PatternScanSpec>(1),
         }
     }
+}
+
+/// Owned heap bytes of a cloned [`Node`] (including its root slot, metadata, children,
+/// expressions, `VALUES` tables, and `OrderedTopK` fallback), excluding `Arc`-shared
+/// `ExistsSpec`, `PreparedGraphNames`, `PreparedGraphBranches`, and `Value` backing.
+pub(super) fn node_copy_bytes(node: &Node) -> u64 {
+    let mut layout = Layout::unchecked(false);
+    let _ = layout.slots::<Node>(1);
+    let _ = layout.node(node);
+    layout.bytes()
+}
+
+/// Owned retained heap bytes of [`Node`] using vector/string capacities (mirrors
+/// [`Layout::retained`] without requiring a checked [`Preparation`]).
+pub(super) fn node_retained_bytes(node: &Node) -> u64 {
+    let mut layout = Layout::unchecked(true);
+    let _ = layout.slots::<Node>(1);
+    let _ = layout.node(node);
+    layout.bytes()
+}
+
+/// Owned heap bytes of a cloned `Vec<Expr>` (its slot array plus every boxed child,
+/// argument vector, and custom function IRI), excluding `Arc`-shared `ExistsSpec` and
+/// `Value` backing.
+pub(super) fn expressions_copy_bytes(exprs: &[Expr]) -> u64 {
+    let mut layout = Layout::unchecked(false);
+    let _ = layout.slice(exprs);
+    for expr in exprs {
+        let _ = layout.expr(expr);
+    }
+    layout.bytes()
+}
+
+/// Owned expression backing beyond the list that holds the expressions.
+pub(super) fn expressions_owned_bytes<'a>(exprs: impl Iterator<Item = &'a Expr>) -> u64 {
+    let mut layout = Layout::unchecked(true);
+    for expr in exprs {
+        let _ = layout.expression(expr);
+    }
+    layout.bytes()
+}
+
+/// Heap bytes owned by `Arc`-backed [`super::value::Value`] variants inside `Expr::Lit`.
+pub(super) fn value_heap_bytes(value: &super::value::Value) -> u64 {
+    use super::value::Value;
+    let arc = (2 * size_of::<usize>()) as u64;
+    match value {
+        Value::Iri(s) | Value::BNode(s) | Value::Str(s) => arc.saturating_add(s.len() as u64),
+        Value::Lang(s, l) | Value::LangDir(s, l, _) => arc
+            .saturating_mul(2)
+            .saturating_add(s.len() as u64)
+            .saturating_add(l.len() as u64),
+        Value::Other { lex, dt } => arc
+            .saturating_mul(2)
+            .saturating_add(lex.len() as u64)
+            .saturating_add(dt.len() as u64),
+        Value::Triple(_) => arc.saturating_add(size_of::<oxrdf::Triple>() as u64),
+        _ => 0,
+    }
+}
+
+/// Immediate heap bytes that `compile_expression` will allocate for `expr` (its boxed
+/// children, pre-sized argument vector, literal `Value` strings, custom function IRI,
+/// and description rendering slack). Does not recurse into sub-expressions or nested
+/// `EXISTS` patterns.
+pub(super) fn expression_compile_bytes(expr: &Expression) -> u64 {
+    use Expression as E;
+    let boxed: u64 = match expr {
+        E::Or(..)
+        | E::And(..)
+        | E::Equal(..)
+        | E::SameTerm(..)
+        | E::Greater(..)
+        | E::GreaterOrEqual(..)
+        | E::Less(..)
+        | E::LessOrEqual(..)
+        | E::Add(..)
+        | E::Subtract(..)
+        | E::Multiply(..)
+        | E::Divide(..) => 2,
+        E::UnaryPlus(_) | E::UnaryMinus(_) | E::Not(_) | E::In(..) => 1,
+        E::If(..) => 3,
+        E::NamedNode(_)
+        | E::Literal(_)
+        | E::Variable(_)
+        | E::Exists(_)
+        | E::Bound(_)
+        | E::Coalesce(_)
+        | E::FunctionCall(..) => 0,
+    };
+    let args: u64 = match expr {
+        E::In(_, args) | E::Coalesce(args) | E::FunctionCall(_, args) => args.len() as u64,
+        _ => 0,
+    };
+    let slots = boxed
+        .saturating_add(args)
+        .saturating_mul(size_of::<Expr>() as u64);
+    let extra: u64 = match expr {
+        E::NamedNode(node) => node.as_str().len() as u64,
+        E::Variable(var) | E::Bound(var) => (var.as_str().len() as u64).saturating_add(4),
+        E::Literal(literal) => (literal.value().len() as u64)
+            .saturating_add(literal.datatype().as_str().len() as u64)
+            .saturating_add(literal.language().map_or(0, |l| l.len() as u64))
+            .saturating_add((4 * size_of::<usize>()) as u64),
+        E::FunctionCall(Function::Custom(iri), _) => iri.as_str().len() as u64,
+        _ => 0,
+    };
+    slots.saturating_add(extra)
 }
 
 /// Owned heap bytes of a cloned [`GraphPattern`] beyond its root slot (mirrors

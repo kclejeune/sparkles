@@ -1658,7 +1658,7 @@ fn prepare_query(
     parsed: &Query,
     opts: &QueryOptions,
     cursor_started: Option<Instant>,
-    automatic: Option<&CursorOptions>,
+    automatic: Option<(&CursorOptions, &str)>,
 ) -> Result<PreparedQuery> {
     prepare_query_input(snap, parsed, opts, cursor_started, automatic, None)
 }
@@ -1668,7 +1668,7 @@ fn prepare_query_input(
     parsed: &Query,
     opts: &QueryOptions,
     cursor_started: Option<Instant>,
-    automatic: Option<&CursorOptions>,
+    automatic: Option<(&CursorOptions, &str)>,
     source: Option<crate::store::BoundReadSource>,
 ) -> Result<PreparedQuery> {
     prepare_query_input_policy(
@@ -1697,7 +1697,7 @@ fn prepare_query_input_policy(
     parsed: &Query,
     opts: &QueryOptions,
     cursor_started: Option<Instant>,
-    automatic: Option<&CursorOptions>,
+    automatic: Option<(&CursorOptions, &str)>,
     source: Option<crate::store::BoundReadSource>,
     prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
     parent: Option<sparkles_budget::ParentHandle>,
@@ -1721,8 +1721,10 @@ fn prepare_query_input_policy(
         selector_graphs,
         inherited,
     )?;
-    if let Some(started) = cursor_started.filter(|_| automatic.is_none()) {
-        ctx.enable_cursor_accounting()?;
+    if let Some(started) = cursor_started {
+        if automatic.is_none() {
+            ctx.enable_cursor_accounting()?;
+        }
         ctx.deadline = opts.effective_deadline(started)?;
     }
     // a provider that rewrites the query (OWL 2 QL, spec F17 §7) plans the rewritten one
@@ -1812,20 +1814,21 @@ fn prepare_query_input_policy(
     let plan_depth = depth::check_plan(node.depth())?;
     ioacct::mark("planned");
     exec::prefetch_scans(&ctx, &node);
-    if let Some(automatic) = automatic
+    let (streamed, admission_lease) = if let Some((automatic, query)) = automatic
         && bound.is_empty()
-        && cursor::auto_streaming(&ctx, &node, kind, automatic)
     {
-        let started = cursor_started.expect("automatic preparation start");
-        let mutable = Arc::get_mut(&mut ctx)
-            .ok_or_else(|| Error::invalid("automatic cursor context is shared"))?;
-        mutable.enable_cursor_accounting()?;
-        mutable.deadline = opts.effective_deadline(started)?;
+        cursor::auto_streaming_lease(&ctx, &node, Some(&pattern), query, kind, automatic)?
+    } else {
+        (false, None)
+    };
+    if streamed {
+        finalize_auto_streaming(&mut ctx, &node, admission_lease)?;
+    } else {
+        // Retained charges release through the shared context in both accounting modes.
+        // An eager context is attached once the automatic choice no longer needs it alone,
+        // so its planning keeps what it retains uncharged, as before.
+        ctx.attach_owner();
     }
-    // Retained charges release through the shared context in both accounting modes.
-    // An eager context is attached once the automatic choice no longer needs it alone,
-    // so its planning keeps what it retains uncharged, as before.
-    ctx.attach_owner();
     ctx.check()?;
     let rewrite_guard = rewritten.and_then(|r| r.memory_guard);
     Ok(PreparedQuery {
@@ -1837,6 +1840,41 @@ fn prepare_query_input_policy(
         plan_depth,
         _rewrite_guard: rewrite_guard,
     })
+}
+
+/// Complete the automatic-streaming transition after `auto_streaming_lease`: switch
+/// `ctx` into cursor accounting, attach its owner, and transfer `admission_lease` into
+/// `RetainedCharge`s on cached `EXISTS` plans and metadata.
+///
+/// Clears speculative caches before `admission_lease` drops on any error or unwind so a
+/// concurrent query cannot claim the released pool bytes while cached plans are still live.
+pub(super) fn finalize_auto_streaming(
+    ctx: &mut Arc<Ctx>,
+    node: &plan::Node,
+    mut admission_lease: Option<query_memory::QueryMemoryLease>,
+) -> Result<()> {
+    struct ClearOnDrop<'a> {
+        node: &'a plan::Node,
+        keep: bool,
+    }
+    impl Drop for ClearOnDrop<'_> {
+        fn drop(&mut self) {
+            if !self.keep {
+                exists::clear_cached_plans(self.node);
+            }
+        }
+    }
+    // Declared after `admission_lease` so on error or unwind, speculative caches drop
+    // before `admission_lease` releases its pool bytes.
+    let mut clear_guard = ClearOnDrop { node, keep: false };
+    let mutable =
+        Arc::get_mut(ctx).ok_or_else(|| Error::invalid("automatic cursor context is shared"))?;
+    mutable.enable_cursor_accounting()?;
+    ctx.attach_owner();
+    exists::charge_cached_plans(ctx, node, admission_lease.as_mut())?;
+    clear_guard.keep = true;
+    drop(admission_lease);
+    Ok(())
 }
 
 fn execute_parsed(

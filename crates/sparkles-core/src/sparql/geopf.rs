@@ -216,6 +216,28 @@ pub(super) fn spatial_leaf(p: &Planner<'_>, c: SpatialCall, g: &ActiveGraph) -> 
     on::spatial_leaf(p, c, g)
 }
 
+/// Whether spatial pushdown may copy these conjuncts while it builds its candidate.
+pub(super) fn copies_filters<'a>(
+    n: &Node,
+    mut exprs: impl Iterator<Item = &'a Expr>,
+    ctx: &Ctx,
+) -> bool {
+    #[cfg(feature = "geo")]
+    {
+        let super::plan::Kind::Scan(spec) = &n.kind else {
+            return false;
+        };
+        ctx.opt.spatial_pushdown
+            && ScanShape::of(spec)
+                .is_some_and(|shape| exprs.any(|e| on::spatial_conjunct(e, shape.obj)))
+    }
+    #[cfg(not(feature = "geo"))]
+    {
+        let _ = (n, &mut exprs, ctx);
+        false
+    }
+}
+
 /// Move spatial conjuncts over the object of an indexed predicate's scan into a
 /// `SpatialScan`; returns the plan and the conjuncts left for an ordinary filter.
 pub fn push_spatial(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
@@ -809,7 +831,7 @@ mod on {
 
     /// Whether a (conjunction of) filter expressions has a `geof:` test of `w` at its
     /// top level (a quick check before the conjuncts are taken apart).
-    fn spatial_conjunct(e: &Expr, w: VarId) -> bool {
+    pub(super) fn spatial_conjunct(e: &Expr, w: VarId) -> bool {
         match e {
             Expr::And(a, b) => spatial_conjunct(a, w) || spatial_conjunct(b, w),
             Expr::Cmp(a, b, _) => {
@@ -820,7 +842,21 @@ mod on {
     }
 
     fn mentions(e: &Expr, v: VarId) -> bool {
-        e.var_set().contains(&v)
+        e.visit_vars(&mut |found| if found == v { Err(()) } else { Ok(()) })
+            .is_err()
+    }
+
+    #[test]
+    fn spatial_conjunct_borrows_filter_variables() {
+        let expr = Expr::Call(
+            Func::Ext(format!("{}sfIntersects", vocab::GEOF)),
+            vec![Expr::Coalesce((0..4096).map(Expr::Var).collect())],
+        );
+        let largest = crate::test_alloc::record_largest(|| {
+            assert!(spatial_conjunct(&expr, 0));
+            assert!(!spatial_conjunct(&expr, 4096));
+        });
+        assert_eq!(largest, 0);
     }
 
     /// The constant geometry of an argument (a literal or a constant expression).

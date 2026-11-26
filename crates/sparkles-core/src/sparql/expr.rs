@@ -43,6 +43,9 @@ pub struct ExistsSpec {
     memo_charge: Mutex<Option<super::ctx::RetainedCharge>>,
     /// the key set answering the EXISTS for every outer row (see [`super::exists`])
     pub decor: super::exists::Decor,
+    /// Cached unsubstituted plan and streaming verdicts, separate from `decor` so
+    /// admission never mutates EXPLAIN notes or runtime decorrelation state.
+    pub(super) plan_cache: super::exists::PlanCache,
     /// Native REDUCED / VALUES occurrences projected onto this spec's heap-pinned pattern.
     view_patterns: Option<Arc<RetainedViewPatterns>>,
     _held: BackingCredit,
@@ -135,6 +138,7 @@ impl ExistsSpec {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn new_ordinary_charged(
         ctx: &Ctx,
         pattern: &GraphPattern,
@@ -143,26 +147,206 @@ impl ExistsSpec {
         vars: Vec<VarId>,
         bound: Vec<(VarId, Id)>,
     ) -> Result<ExistsSpec> {
+        Self::new_ordinary_charged_with_admission(
+            ctx,
+            pattern,
+            view_patterns,
+            graph,
+            vars,
+            bound,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_ordinary_charged_with_admission(
+        ctx: &Ctx,
+        pattern: &GraphPattern,
+        view_patterns: Option<&super::viewsvc::ViewPatterns>,
+        graph: super::plan::ActiveGraph,
+        vars: Vec<VarId>,
+        bound: Vec<(VarId, Id)>,
+        admission: Option<&super::ctx::Charge<'_>>,
+    ) -> Result<ExistsSpec> {
         ctx.check()?;
         let pattern_bytes = Self::ordinary_pattern_bytes(pattern);
         let pattern_charge = ctx.retained_charge(pattern_bytes)?;
+        if pattern_charge.is_none()
+            && let Some(held) = admission
+        {
+            held.add(pattern_bytes)?;
+        }
         let owned = Arc::new(OrdinaryPattern {
             syntax: pattern.clone(),
             bytes: pattern_bytes,
             _charge: pattern_charge,
         });
         let projected = match view_patterns {
-            Some(vp) => vp.project_retained(pattern, &owned.syntax, ctx)?.map(
-                |(projected, bytes, charge)| {
+            Some(vp) => vp
+                .project_retained(pattern, &owned.syntax, ctx, admission)?
+                .map(|(projected, bytes, charge)| {
                     Arc::new(RetainedViewPatterns::from_retained(
                         projected, bytes, charge,
                     ))
-                },
-            ),
+                }),
             None => None,
         };
-        let spec_charge =
-            ctx.retained_charge(Self::spec_bytes(vars.capacity(), bound.capacity()))?;
+        let spec_bytes = Self::spec_bytes(vars.capacity(), bound.capacity());
+        let spec_charge = ctx.retained_charge(spec_bytes)?;
+        if spec_charge.is_none()
+            && let Some(held) = admission
+        {
+            held.add(spec_bytes)?;
+        }
+        let calls_service = super::cursor::calls_service(&owned.syntax);
+        Ok(Self::from_pattern(
+            ExistsPattern::Ordinary(owned),
+            calls_service,
+            graph,
+            vars,
+            bound,
+            projected,
+            spec_charge.map_or(BackingCredit::None, BackingCredit::Retained),
+        ))
+    }
+
+    /// Compile an ordinary `EXISTS` spec from `pattern` and `subst`, reserving the
+    /// syntax clone, deduplicated variable scratch, and spec vectors before allocating.
+    pub(super) fn compile_ordinary_with_admission(
+        ctx: &Ctx,
+        pattern: &GraphPattern,
+        view_patterns: Option<&super::viewsvc::ViewPatterns>,
+        graph: super::plan::ActiveGraph,
+        subst: &FxHashMap<VarId, Id>,
+        admission: Option<&super::ctx::Charge<'_>>,
+    ) -> Result<ExistsSpec> {
+        ctx.check()?;
+        let pattern_bytes = Self::ordinary_pattern_bytes(pattern);
+        let pattern_charge = ctx.retained_charge(pattern_bytes)?;
+        let pattern_admission = if pattern_charge.is_none()
+            && let Some(held) = admission
+        {
+            let part = held.part();
+            part.add(pattern_bytes)?;
+            Some(part)
+        } else {
+            None
+        };
+        let scratch = match admission {
+            Some(held) => Some(held.part()),
+            None if ctx.shared().is_some() => Some(ctx.charge(0)?),
+            None => None,
+        };
+        let mut seen = super::exists::VarSet::new(scratch.as_ref());
+        let mut steps = 0usize;
+        super::plan::try_visit_pattern_vars(pattern, &mut |name| -> Result<()> {
+            steps += 1;
+            if steps.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            seen.insert(ctx.var(name))
+        })?;
+        let vars_len = seen.ids.len();
+        let bound_len = seen.ids.iter().filter(|v| subst.contains_key(v)).count();
+        let spec_bytes = Self::spec_bytes(vars_len, bound_len);
+        let spec_charge = ctx.retained_charge(spec_bytes)?;
+        let spec_admission = if spec_charge.is_none()
+            && let Some(held) = admission
+        {
+            let part = held.part();
+            part.add(spec_bytes)?;
+            Some(part)
+        } else {
+            None
+        };
+        let mut vars = Vec::with_capacity(vars_len);
+        vars.extend(seen.ids.iter().copied());
+        drop(seen);
+        vars.sort_unstable();
+        let mut bound = Vec::with_capacity(bound_len);
+        for &v in &vars {
+            if let Some(&id) = subst.get(&v) {
+                bound.push((v, id));
+            }
+        }
+        drop(scratch);
+        let actual_spec_bytes = Self::spec_bytes(vars.capacity(), bound.capacity());
+        if actual_spec_bytes > spec_bytes {
+            if let Some(mut charge) = spec_charge {
+                charge.resize(actual_spec_bytes)?;
+                // Re-bind below after moving out of the Option.
+                return Self::finish_ordinary_compiled(
+                    ctx,
+                    pattern,
+                    view_patterns,
+                    graph,
+                    vars,
+                    bound,
+                    admission,
+                    pattern_bytes,
+                    pattern_charge,
+                    pattern_admission,
+                    Some(charge),
+                    spec_admission,
+                );
+            } else if let Some(part) = spec_admission.as_ref() {
+                part.resize(actual_spec_bytes)?;
+            }
+        }
+        Self::finish_ordinary_compiled(
+            ctx,
+            pattern,
+            view_patterns,
+            graph,
+            vars,
+            bound,
+            admission,
+            pattern_bytes,
+            pattern_charge,
+            pattern_admission,
+            spec_charge,
+            spec_admission,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_ordinary_compiled(
+        ctx: &Ctx,
+        pattern: &GraphPattern,
+        view_patterns: Option<&super::viewsvc::ViewPatterns>,
+        graph: super::plan::ActiveGraph,
+        vars: Vec<VarId>,
+        bound: Vec<(VarId, Id)>,
+        admission: Option<&super::ctx::Charge<'_>>,
+        pattern_bytes: u64,
+        pattern_charge: Option<super::ctx::RetainedCharge>,
+        mut pattern_admission: Option<super::ctx::Charge<'_>>,
+        spec_charge: Option<super::ctx::RetainedCharge>,
+        mut spec_admission: Option<super::ctx::Charge<'_>>,
+    ) -> Result<ExistsSpec> {
+        let owned = Arc::new(OrdinaryPattern {
+            syntax: pattern.clone(),
+            bytes: pattern_bytes,
+            _charge: pattern_charge,
+        });
+        let projected = match view_patterns {
+            Some(vp) => vp
+                .project_retained(pattern, &owned.syntax, ctx, admission)?
+                .map(|(projected, bytes, charge)| {
+                    Arc::new(RetainedViewPatterns::from_retained(
+                        projected, bytes, charge,
+                    ))
+                }),
+            None => None,
+        };
+        if let Some(held) = admission {
+            if pattern_admission.is_some() {
+                held.adopt_charge(&mut pattern_admission)?;
+            }
+            if spec_admission.is_some() {
+                held.adopt_charge(&mut spec_admission)?;
+            }
+        }
         let calls_service = super::cursor::calls_service(&owned.syntax);
         Ok(Self::from_pattern(
             ExistsPattern::Ordinary(owned),
@@ -194,6 +378,7 @@ impl ExistsSpec {
             unbound: Default::default(),
             memo_charge: Mutex::new(None),
             decor: Default::default(),
+            plan_cache: Default::default(),
             view_patterns,
             _held: held,
         }
@@ -272,7 +457,7 @@ impl ExistsSpec {
                 self.bound.capacity(),
             ));
         }
-        bytes
+        bytes.saturating_add(self.plan_cache.uncharged_admit_bytes())
     }
 
     /// Memoize the answer for `key`, charging the entry first, in both accounting modes.
@@ -683,11 +868,60 @@ impl Expr {
         text
     }
 
-    /// The same rendering for ordinary strings and admitted diagnostic buffers.
-    pub(super) fn write_description(
+    /// Count the rendered bytes without allocating the description. Dictionary
+    /// reconstruction and each temporary term must fit before they are decoded.
+    pub(super) fn description_bytes(&self, ctx: &Ctx) -> Result<usize> {
+        use std::fmt::Write;
+
+        struct Count(usize);
+        impl Write for Count {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                self.0 = self.0.saturating_add(s.len());
+                Ok(())
+            }
+        }
+        let mut text = Count(0);
+        let mut error = None;
+        let written = self.write_description_with(ctx, &mut text, &mut |id, text| {
+            let rendered = (|| {
+                let scratch = ctx.charge(0)?;
+                let term = ctx.covered_batch_term(id, |bytes| scratch.add(bytes))?;
+                Ok(match term {
+                    Some(term) => write!(text, "{term}"),
+                    None => text.write_str("UNDEF"),
+                })
+            })();
+            match rendered {
+                Ok(written) => written,
+                Err(e) => {
+                    error = Some(e);
+                    Err(std::fmt::Error)
+                }
+            }
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+        written.expect("counting filter description bytes");
+        Ok(text.0)
+    }
+
+    pub(super) fn write_description<W: std::fmt::Write + ?Sized>(
         &self,
         ctx: &Ctx,
-        text: &mut (impl std::fmt::Write + ?Sized),
+        text: &mut W,
+    ) -> std::fmt::Result {
+        self.write_description_with(ctx, text, &mut |id, text| match ctx.plan_term(id) {
+            Some(term) => write!(text, "{term}"),
+            None => text.write_str("UNDEF"),
+        })
+    }
+
+    fn write_description_with<W: std::fmt::Write + ?Sized>(
+        &self,
+        ctx: &Ctx,
+        text: &mut W,
+        term: &mut impl FnMut(Id, &mut W) -> std::fmt::Result,
     ) -> std::fmt::Result {
         fn binary<W: std::fmt::Write + ?Sized>(
             ctx: &Ctx,
@@ -695,24 +929,26 @@ impl Expr {
             a: &Expr,
             op: &str,
             b: &Expr,
+            term: &mut impl FnMut(Id, &mut W) -> std::fmt::Result,
         ) -> std::fmt::Result {
             text.write_char('(')?;
-            a.write_description(ctx, text)?;
+            a.write_description_with(ctx, text, term)?;
             write!(text, " {op} ")?;
-            b.write_description(ctx, text)?;
+            b.write_description_with(ctx, text, term)?;
             text.write_char(')')
         }
         fn arguments<W: std::fmt::Write + ?Sized>(
             ctx: &Ctx,
             text: &mut W,
             args: &[Expr],
+            term: &mut impl FnMut(Id, &mut W) -> std::fmt::Result,
         ) -> std::fmt::Result {
             text.write_char('(')?;
             for (index, arg) in args.iter().enumerate() {
                 if index > 0 {
                     text.write_str(", ")?;
                 }
-                arg.write_description(ctx, text)?;
+                arg.write_description_with(ctx, text, term)?;
             }
             text.write_char(')')
         }
@@ -727,14 +963,11 @@ impl Expr {
         }
 
         match self {
-            Expr::Const(id) | Expr::Lit(id, _) => match ctx.plan_term(*id) {
-                Some(term) => write!(text, "{term}"),
-                None => text.write_str("UNDEF"),
-            },
+            Expr::Const(id) | Expr::Lit(id, _) => term(*id, text),
             Expr::Var(var) => write!(text, "?{}", ctx.var_names.read()[*var as usize]),
-            Expr::Or(a, b) => binary(ctx, text, a, "||", b),
-            Expr::And(a, b) => binary(ctx, text, a, "&&", b),
-            Expr::Eq(a, b) => binary(ctx, text, a, "=", b),
+            Expr::Or(a, b) => binary(ctx, text, a, "||", b, term),
+            Expr::And(a, b) => binary(ctx, text, a, "&&", b, term),
+            Expr::Eq(a, b) => binary(ctx, text, a, "=", b, term),
             Expr::Cmp(a, b, op) => binary(
                 ctx,
                 text,
@@ -746,6 +979,7 @@ impl Expr {
                     CmpOp::Ge => ">=",
                 },
                 b,
+                term,
             ),
             Expr::Arith(a, b, op) => binary(
                 ctx,
@@ -758,39 +992,40 @@ impl Expr {
                     ArithOp::Div => "/",
                 },
                 b,
+                term,
             ),
             Expr::Not(a) => {
                 text.write_char('!')?;
-                a.write_description(ctx, text)
+                a.write_description_with(ctx, text, term)
             }
             Expr::Neg(a) => {
                 text.write_char('-')?;
-                a.write_description(ctx, text)
+                a.write_description_with(ctx, text, term)
             }
-            Expr::Pos(a) => a.write_description(ctx, text),
+            Expr::Pos(a) => a.write_description_with(ctx, text, term),
             Expr::Bound(var) => write!(text, "BOUND(?{})", ctx.var_names.read()[*var as usize]),
             Expr::Exists(_) => text.write_str("EXISTS{…}"),
             Expr::SameTerm(a, b) => {
                 text.write_str("sameTerm")?;
-                binary(ctx, text, a, ",", b)
+                binary(ctx, text, a, ",", b, term)
             }
             Expr::In(a, list) => {
-                a.write_description(ctx, text)?;
+                a.write_description_with(ctx, text, term)?;
                 text.write_str(" IN ")?;
-                arguments(ctx, text, list)
+                arguments(ctx, text, list, term)
             }
             Expr::If(a, b, c) => {
                 text.write_str("IF(")?;
-                a.write_description(ctx, text)?;
+                a.write_description_with(ctx, text, term)?;
                 text.write_str(", ")?;
-                b.write_description(ctx, text)?;
+                b.write_description_with(ctx, text, term)?;
                 text.write_str(", ")?;
-                c.write_description(ctx, text)?;
+                c.write_description_with(ctx, text, term)?;
                 text.write_char(')')
             }
             Expr::Coalesce(args) => {
                 text.write_str("COALESCE")?;
-                arguments(ctx, text, args)
+                arguments(ctx, text, args, term)
             }
             Expr::Call(function, args) => {
                 match function {
@@ -804,7 +1039,7 @@ impl Expr {
                     )?,
                     Func::Ext(iri) => write!(text, "<{iri}>")?,
                 }
-                arguments(ctx, text, args)
+                arguments(ctx, text, args, term)
             }
         }
     }
@@ -2701,6 +2936,13 @@ pub(super) fn compile_expression<T>(
     admit(e)?;
     let compile = |e: &Expression| compile_expression(ctx, subst, exists, admit, variable, e);
     let bx = |e: &Expression| compile(e).map(Box::new);
+    let compile_list = |items: &[Expression]| -> std::result::Result<Vec<Expr>, T> {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            out.push(compile(item)?);
+        }
+        Ok(out)
+    };
     Ok(match e {
         E::NamedNode(n) => Expr::Const(ctx.intern_term(&Term::NamedNode(n.clone()))),
         E::Literal(l) => {
@@ -2727,12 +2969,7 @@ pub(super) fn compile_expression<T>(
         E::GreaterOrEqual(a, c) => Expr::Cmp(bx(a)?, bx(c)?, CmpOp::Ge),
         E::Less(a, c) => Expr::Cmp(bx(a)?, bx(c)?, CmpOp::Lt),
         E::LessOrEqual(a, c) => Expr::Cmp(bx(a)?, bx(c)?, CmpOp::Le),
-        E::In(a, l) => Expr::In(
-            bx(a)?,
-            l.iter()
-                .map(&compile)
-                .collect::<std::result::Result<_, T>>()?,
-        ),
+        E::In(a, l) => Expr::In(bx(a)?, compile_list(l)?),
         E::Add(a, c) => Expr::Arith(bx(a)?, bx(c)?, ArithOp::Add),
         E::Subtract(a, c) => Expr::Arith(bx(a)?, bx(c)?, ArithOp::Sub),
         E::Multiply(a, c) => Expr::Arith(bx(a)?, bx(c)?, ArithOp::Mul),
@@ -2750,16 +2987,9 @@ pub(super) fn compile_expression<T>(
             }
         }
         E::If(a, c, d) => Expr::If(bx(a)?, bx(c)?, bx(d)?),
-        E::Coalesce(l) => Expr::Coalesce(
-            l.iter()
-                .map(&compile)
-                .collect::<std::result::Result<_, T>>()?,
-        ),
+        E::Coalesce(l) => Expr::Coalesce(compile_list(l)?),
         E::FunctionCall(f, args) => {
-            let args: Vec<Expr> = args
-                .iter()
-                .map(&compile)
-                .collect::<std::result::Result<_, T>>()?;
+            let args = compile_list(args)?;
             let f = match f {
                 Function::Custom(n) if is_cast(n.as_str()) => Func::Cast(n.clone()),
                 Function::Custom(n) => {
@@ -2773,4 +3003,45 @@ pub(super) fn compile_expression<T>(
             Expr::Call(f, args)
         }
     })
+}
+
+#[cfg(test)]
+mod exists_admission_tests {
+    use super::*;
+
+    #[test]
+    fn deep_exists_nested_variable_rehash_refuses_before_allocating_the_new_table() {
+        use sparkles_budget::sizes::{table_bytes, table_capacity};
+        let variables: Vec<_> = (0..3_600)
+            .map(|i| oxrdf::Variable::new_unchecked(format!("v{i}")))
+            .collect();
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        for var in &variables {
+            ctx.var(var.as_str());
+        }
+        let pattern = GraphPattern::Values {
+            variables,
+            bindings: Vec::new(),
+        };
+        let old = table_bytes(table_capacity(3_584), size_of::<VarId>());
+        let new = table_bytes(table_capacity(3_585), size_of::<VarId>());
+        let scratch_room = 56 << 10;
+        assert!(old < scratch_room && old + new > scratch_room);
+        ctx.mem_limit = ExistsSpec::ordinary_pattern_bytes(&pattern) + scratch_room as u64;
+        let admission = ctx.charge(0).unwrap();
+        let largest = crate::test_alloc::record_largest(|| {
+            let spec = ExistsSpec::compile_ordinary_with_admission(
+                &ctx,
+                &pattern,
+                None,
+                super::super::plan::ActiveGraph::Default,
+                &FxHashMap::default(),
+                Some(&admission),
+            );
+            assert!(matches!(spec, Err(crate::error::Error::BudgetExceeded(_))));
+        });
+        assert!(largest < new, "rehash allocated {largest} bytes");
+        assert_eq!(ctx.live_bytes(), 0);
+    }
 }

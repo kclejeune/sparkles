@@ -245,7 +245,10 @@ impl KeyFilter {
 
     /// [`KeyFilter::key_prefixes`] of the filter [`KeyFilter::new_for`] would compile,
     /// without compiling its regular expressions, for the planner's estimates.
-    pub(super) fn plan_prefixes(exprs: &[Expr], v: VarId) -> Option<Vec<Vec<u8>>> {
+    pub(super) fn plan_prefixes<'a>(
+        exprs: impl IntoIterator<Item = &'a Expr>,
+        v: VarId,
+    ) -> Option<Vec<Vec<u8>>> {
         Self::compile(Programs::None, exprs, v)?.key_prefixes()
     }
 
@@ -362,7 +365,11 @@ impl KeyFilter {
         Self::compile(Programs::Own, exprs, v)
     }
 
-    fn compile(ctx: Programs<'_>, exprs: &[Expr], v: VarId) -> Option<KeyFilter> {
+    fn compile<'a>(
+        ctx: Programs<'_>,
+        exprs: impl IntoIterator<Item = &'a Expr>,
+        v: VarId,
+    ) -> Option<KeyFilter> {
         fn add(ctx: Programs<'_>, e: &Expr, v: VarId, out: &mut Vec<Test>) -> Option<()> {
             if let Some(test) = length_test(e, v) {
                 out.push(test);

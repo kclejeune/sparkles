@@ -288,6 +288,7 @@ impl ViewPatterns {
         source: &GraphPattern,
         cloned: &GraphPattern,
         ctx: &super::ctx::Ctx,
+        admission: Option<&super::ctx::Charge<'_>>,
     ) -> Result<Option<(Self, u64, Option<super::ctx::RetainedCharge>)>> {
         if self.native.is_empty() {
             return Ok(None);
@@ -305,6 +306,11 @@ impl ViewPatterns {
         }
         let bytes = Self::allocation_bytes(count);
         let charge = ctx.retained_charge(bytes)?;
+        if charge.is_none()
+            && let Some(held) = admission
+        {
+            held.add(bytes)?;
+        }
         let mut native = rustc_hash::FxHashSet::default();
         native
             .try_reserve(count)

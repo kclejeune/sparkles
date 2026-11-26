@@ -8,7 +8,7 @@
 //! placement through OPTIONAL / UNION / MINUS / BIND, filter-equality substitution,
 //! top-k for ORDER BY + LIMIT).
 
-use super::ctx::Ctx;
+use super::ctx::{Charge, Ctx};
 use super::exec::PlanPattern;
 use super::expr::{ExistsSpec, Expr};
 use super::table::{Table, VarId};
@@ -996,6 +996,10 @@ pub struct Planner<'a> {
     seen: std::cell::RefCell<FxHashMap<SeenPattern, u32>>,
     /// how many times each pattern occurs in the source
     source_counts: std::cell::OnceCell<FxHashMap<SeenPattern, u32>>,
+    /// Live planning charge for speculative EXISTS planning so ordinary VALUES tables and
+    /// unattached nested EXISTS syntax reserve memory before allocating.
+    plan_charge: Option<&'a super::ctx::Charge<'a>>,
+    pub(super) sample_filters: bool,
 }
 
 #[cfg(test)]
@@ -1063,12 +1067,23 @@ impl<'a> Planner<'a> {
             source_sse: Default::default(),
             seen: Default::default(),
             source_counts: Default::default(),
+            plan_charge: None,
+            sample_filters: ctx.opt.sampled_filters,
         }
     }
 
     pub(super) fn for_exists(ctx: &'a Ctx, spec: &'a ExistsSpec) -> Self {
+        Self::for_exists_with_charge(ctx, spec, None)
+    }
+
+    pub(super) fn for_exists_with_charge(
+        ctx: &'a Ctx,
+        spec: &'a ExistsSpec,
+        plan_charge: Option<&'a super::ctx::Charge<'a>>,
+    ) -> Self {
         let mut planner = Self::new(ctx);
         planner.view_patterns = spec.view_patterns();
+        planner.plan_charge = plan_charge;
         planner
     }
 
@@ -1112,37 +1127,23 @@ impl<'a> Planner<'a> {
         let ctx = self.ctx;
         let subst = &self.subst;
         let exists = |p: &GraphPattern| -> Result<Arc<ExistsSpec>> {
-            let mut names = Vec::new();
-            collect_pattern_vars(p, &mut names);
-            let mut deduped: Vec<VarId> = names.iter().map(|n| ctx.var(n)).collect();
-            deduped.sort_unstable();
-            deduped.dedup();
-            let mut vars = Vec::with_capacity(deduped.len());
-            vars.extend_from_slice(&deduped);
-            let bound_len = vars.iter().filter(|v| subst.contains_key(v)).count();
-            let mut bound = Vec::with_capacity(bound_len);
-            for &v in &vars {
-                if let Some(&id) = subst.get(&v) {
-                    bound.push((v, id));
-                }
-            }
-            Ok(Arc::new(ExistsSpec::new_ordinary_charged(
+            Ok(Arc::new(ExistsSpec::compile_ordinary_with_admission(
                 ctx,
                 p,
                 self.view_patterns,
                 graph.clone(),
-                vars,
-                bound,
+                subst,
+                self.plan_charge,
             )?))
         };
-        super::expr::compile_expression(
-            ctx,
-            subst,
-            &exists,
-            &|_| Ok(()),
-            &|name| Ok(ctx.var(name)),
-            e,
-        )
+        let admit = |expr: &Expression| -> Result<()> {
+            if let Some(held) = self.plan_charge {
+                ctx.check()?;
+                held.add(super::checked_layout::expression_compile_bytes(expr))?;
+            }
+            Ok(())
+        };
+        super::expr::compile_expression(ctx, subst, &exists, &admit, &|name| Ok(ctx.var(name)), e)
     }
 
     fn compile_in_branch(&self, e: &Expression, graph: &ActiveGraph) -> Result<Expr> {
@@ -1286,6 +1287,43 @@ impl<'a> Planner<'a> {
             credit.grow_by(bytes)?;
         }
         Ok(())
+    }
+
+    pub(super) fn plan_scratch(
+        &self,
+        measure: impl FnOnce(&mut super::checked_layout::Layout<'_>) -> Result<()>,
+    ) -> Result<Option<Charge<'a>>> {
+        let Some(held) = self.plan_charge else {
+            return Ok(None);
+        };
+        self.ctx.check()?;
+        let mut layout = super::checked_layout::Layout::unchecked(false);
+        measure(&mut layout)?;
+        let part = held.part();
+        part.add(layout.bytes())?;
+        Ok(Some(part))
+    }
+
+    pub(super) fn retain_plan_scratch(&self, mut scratch: Option<Charge<'_>>) -> Result<()> {
+        if let Some(held) = self.plan_charge
+            && scratch.is_some()
+        {
+            held.adopt_charge(&mut scratch)?;
+        }
+        Ok(())
+    }
+
+    fn plan_filter_copy(&self, filters: &[Expr]) -> Result<Option<Charge<'a>>> {
+        if filters.is_empty() {
+            return Ok(None);
+        }
+        self.plan_scratch(|layout| {
+            layout.slice(filters)?;
+            for filter in filters {
+                layout.expression(filter)?;
+            }
+            Ok(())
+        })
     }
 
     fn admit_expression(&self, expr: &Expression) -> Result<()> {
@@ -1688,11 +1726,23 @@ impl<'a> Planner<'a> {
                 let mut branches = self.planning_vec()?;
                 flatten_union(gp, &mut branches)?;
                 let mut children = self.planning_vec()?;
-                for branch in branches {
-                    self.admit_payload(|layout| layout.expressions(&filters))?;
-                    let child = self.plan(branch, g, filters.clone())?;
+                let mut filters = filters;
+                let checked = self.branch_payload.borrow().is_some();
+                let mut iter = branches.into_iter().peekable();
+                while let Some(branch) = iter.next() {
+                    let copy;
+                    let branch_filters = if !checked && iter.peek().is_none() {
+                        copy = None;
+                        std::mem::take(&mut filters)
+                    } else {
+                        self.admit_payload(|layout| layout.expressions(&filters))?;
+                        copy = self.plan_filter_copy(&filters)?;
+                        filters.clone()
+                    };
+                    let child = self.plan(branch, g, branch_filters)?;
                     if !child.is_empty() {
                         children.push(child)?;
+                        self.retain_plan_scratch(copy)?;
                     }
                 }
                 self.union_for_branch(children)
@@ -1863,27 +1913,97 @@ impl<'a> Planner<'a> {
                     return self.apply_filters(values, filters);
                 }
                 let vars: Vec<VarId> = variables.iter().map(|v| self.ctx.var(v.as_str())).collect();
+                let width = vars.len();
+                let rows = bindings.len();
+                let table_bytes = (rows as u64)
+                    .saturating_mul((width as u64).saturating_mul(std::mem::size_of::<Id>() as u64))
+                    .saturating_add(
+                        (width as u64).saturating_mul(std::mem::size_of::<Vec<Id>>() as u64),
+                    )
+                    .saturating_add(
+                        (width as u64).saturating_mul(std::mem::size_of::<VarId>() as u64),
+                    );
+                if let Some(held) = self.plan_charge {
+                    held.add(table_bytes)?;
+                }
                 let mut t = Table::new(vars.clone());
+                if self.plan_charge.is_some() {
+                    for col in &mut t.cols {
+                        col.try_reserve_exact(rows)
+                            .map_err(|_| self.ctx.memory_exceeded(table_bytes))?;
+                    }
+                }
                 // a term repeated in the table is looked up once
                 let mut seen: FxHashMap<&GroundTerm, Id> = FxHashMap::default();
-                for row in bindings {
-                    let ids: Vec<Id> = row
-                        .iter()
-                        .map(|t| match t {
+                let seen_charge = self.plan_charge.map(|_| self.ctx.charge(0)).transpose()?;
+                let mut seen_full = false;
+                let mut row_ids = Vec::with_capacity(width);
+                for (row_idx, row) in bindings.iter().enumerate() {
+                    if row_idx % 1024 == 0 {
+                        self.ctx.check()?;
+                    }
+                    row_ids.clear();
+                    for term in row {
+                        let id = match term {
                             None => Id::UNDEF,
-                            Some(t) => *seen.entry(t).or_insert_with(|| match t {
-                                GroundTerm::NamedNode(n) => {
-                                    self.ctx.intern_term(&Term::NamedNode(n.clone()))
+                            Some(term) => {
+                                if let Some(&id) = seen.get(term) {
+                                    id
+                                } else {
+                                    let id = match term {
+                                        GroundTerm::NamedNode(n) => {
+                                            self.ctx.intern_term(&Term::NamedNode(n.clone()))
+                                        }
+                                        GroundTerm::Literal(l) if !native => {
+                                            self.ctx.intern_query_literal(l)
+                                        }
+                                        _ => self.ctx.intern_term(&ground_term(term)),
+                                    };
+                                    if !seen_full {
+                                        if let Some(charge) = &seen_charge {
+                                            let cap = seen.capacity();
+                                            let grown = sparkles_budget::sizes::table_grown(
+                                                cap,
+                                                seen.len(),
+                                                1,
+                                            );
+                                            if grown > cap {
+                                                let slot = std::mem::size_of::<(&GroundTerm, Id)>();
+                                                let old_bytes = if cap == 0 {
+                                                    0
+                                                } else {
+                                                    sparkles_budget::sizes::table_bytes(cap, slot)
+                                                        as u64
+                                                };
+                                                let new_bytes = sparkles_budget::sizes::table_bytes(
+                                                    grown, slot,
+                                                )
+                                                    as u64;
+                                                let peak = old_bytes.saturating_add(new_bytes);
+                                                if charge.resize(peak).is_ok() {
+                                                    seen.insert(term, id);
+                                                    let _ = charge.resize(new_bytes);
+                                                } else {
+                                                    seen_full = true;
+                                                }
+                                            } else {
+                                                seen.insert(term, id);
+                                            }
+                                        } else {
+                                            seen.insert(term, id);
+                                        }
+                                    }
+                                    id
                                 }
-                                GroundTerm::Literal(l) if !native => {
-                                    self.ctx.intern_query_literal(l)
-                                }
-                                _ => self.ctx.intern_term(&ground_term(t)),
-                            }),
-                        })
-                        .collect();
-                    t.push_row(&ids);
+                            }
+                        };
+                        row_ids.push(id);
+                    }
+                    t.push_row(&row_ids);
                 }
+                drop(seen);
+                drop(seen_charge);
+                self.ctx.check()?;
                 // substituted variables (initial bindings, filter equalities): keep only
                 // compatible rows and fill their UNDEF cells with the bound value, so the
                 // table agrees with the substitution the rest of the plan assumes
@@ -2210,7 +2330,7 @@ impl<'a> Planner<'a> {
         if self.branch_payload.borrow().is_none() || filters.is_empty() {
             let (push, top) = filters
                 .into_iter()
-                .partition(|f| !f.has_exists() && f.var_set().iter().all(&ok));
+                .partition(|f| filter_binds(f, true, |v| ok(&v)));
             return Ok((push, top, list_credit(None)));
         }
         let mut top = filters;
@@ -4449,8 +4569,8 @@ impl<'a> Planner<'a> {
             }
             leaves.push(options);
         }
-        if self.ctx.opt.sampled_filters && !filters.is_empty() {
-            super::sample::prepare(self.ctx, &leaves, &filters)?;
+        if self.sample_filters && !filters.is_empty() {
+            super::sample::prepare(self.ctx, &leaves, &filters, self.plan_charge)?;
         }
         if self.ctx.opt.characteristic_sets {
             use super::charsets::Term;
@@ -4509,9 +4629,10 @@ impl<'a> Planner<'a> {
         let late;
         (settled, late, _late_list) =
             if self.branch_payload.borrow().is_none() || deferred.is_empty() {
-                let (settled, late): (Vec<Expr>, Vec<Expr>) = deferred
-                    .into_iter()
-                    .partition(|f| !f.var_set().into_iter().any(binds_late));
+                let (settled, late): (Vec<Expr>, Vec<Expr>) = deferred.into_iter().partition(|f| {
+                    f.visit_vars(&mut |v| if binds_late(v) { Err(()) } else { Ok(()) })
+                        .is_ok()
+                });
                 (settled, late, list_credit(None))
             } else {
                 // The late filters move out of the deferred list, the settled ones stay.
@@ -4638,7 +4759,10 @@ impl<'a> Planner<'a> {
             .iter()
             .enumerate()
             .any(|(j, o)| j != i && o.t.contains(&PT::V(v)))
-            || filters.iter().any(|f| f.var_set().contains(&v));
+            || filters.iter().any(|f| {
+                f.visit_vars(&mut |var| if var == v { Err(()) } else { Ok(()) })
+                    .is_err()
+            });
         if !used
             || filters
                 .iter()
@@ -4792,22 +4916,50 @@ impl<'a> Planner<'a> {
                 let opts = items.into_iter().next().unwrap();
                 if preparation.is_some() {
                     self.choose_checked_scan(opts, filters)?
+                } else if opts.len() == 1 {
+                    let o = opts.into_iter().next().unwrap();
+                    self.place_filters(o, filters)?
                 } else {
+                    struct Candidate<'a> {
+                        node: Node,
+                        rest: Vec<Expr>,
+                        copy: Option<Charge<'a>>,
+                        kept: Option<Charge<'a>>,
+                    }
                     // the first of the cheapest, as `min_by` takes it
-                    let mut best: Option<(Node, Vec<Expr>)> = None;
-                    for o in opts {
-                        let mut f = filters.clone();
-                        let n = self.place_filters(o, &mut f)?;
+                    let mut best: Option<Candidate<'_>> = None;
+                    let mut iter = opts.into_iter().peekable();
+                    while let Some(o) = iter.next() {
+                        self.ctx.check()?;
+                        let (copy, mut f) = if iter.peek().is_none() {
+                            (None, std::mem::take(filters))
+                        } else {
+                            (self.plan_filter_copy(filters)?, filters.clone())
+                        };
+                        let (n, kept) = self.place_plan_where(o, &mut f, false)?;
+                        let candidate = Candidate {
+                            node: n,
+                            rest: f,
+                            copy,
+                            kept,
+                        };
                         if best
                             .as_ref()
-                            .is_none_or(|(b, _)| n.cost.total_cmp(&b.cost).is_lt())
+                            .is_none_or(|b| candidate.node.cost.total_cmp(&b.node.cost).is_lt())
                         {
-                            best = Some((n, f));
+                            best = Some(candidate);
                         }
                     }
-                    let (best, rest) = best.unwrap();
+                    let Candidate {
+                        node,
+                        rest,
+                        copy,
+                        kept,
+                    } = best.unwrap();
                     *filters = rest;
-                    best
+                    drop(copy);
+                    self.retain_plan_scratch(kept)?;
+                    node
                 }
             } else {
                 #[cfg(test)]
@@ -4887,12 +5039,8 @@ impl<'a> Planner<'a> {
         {
             return self.place_filters(super::joinorder::join_admitted(a, b, self)?, filters);
         }
-        let bound = |f: &Expr| {
-            !f.has_exists() && {
-                let vs = f.var_set();
-                !vs.is_empty() && vs.iter().all(|v| a.vars.contains(v) || b.vars.contains(v))
-            }
-        };
+        let bound =
+            |f: &Expr| filter_binds(f, false, |v| a.vars.contains(&v) || b.vars.contains(&v));
         let Some((x, y)) = filters
             .iter()
             .filter(|f| bound(f))
@@ -4913,21 +5061,7 @@ impl<'a> Planner<'a> {
             // The credit is declared before the list, which is freed first on a refusal.
             let _now_list;
             let now = {
-                let (now, now_list) = self.extract_filters(filters, |f| {
-                    !f.has_exists() && {
-                        let mut any = false;
-                        f.visit_vars(&mut |v| {
-                            any = true;
-                            if a.vars.contains(&v) || b.vars.contains(&v) {
-                                Ok(())
-                            } else {
-                                Err(())
-                            }
-                        })
-                        .is_ok()
-                            && any
-                    }
-                })?;
+                let (now, now_list) = self.extract_filters(filters, bound)?;
                 #[cfg(test)]
                 if let Some(credit) = &now_list {
                     watch_list(5, &now, credit);
@@ -5000,68 +5134,32 @@ impl<'a> Planner<'a> {
     ) -> Result<(Node, Option<Reservation>)> {
         #[cfg(test)]
         let _stage = crate::test_alloc::Stage::within(6);
-        let applies = |f: &Expr| {
-            !f.has_exists() && {
-                let vs = f.var_set();
-                (constant || !vs.is_empty()) && vs.iter().all(|v| n.vars.contains(v))
-            }
-        };
-        // The same test without allocating: every occurrence of a variable is bound by
-        // `n`, and there is one unless `constant`.
-        let bound = |f: &Expr| {
-            !f.has_exists() && {
-                let mut any = false;
-                f.visit_vars(&mut |v| {
-                    any = true;
-                    if n.vars.contains(&v) { Ok(()) } else { Err(()) }
-                })
-                .is_ok()
-                    && (constant || any)
-            }
-        };
-        // The reservation is declared before the list it covers, which is freed first on
-        // a refusal.
-        let mut partition;
-        let (held, now) = if self.branch_payload.borrow().is_some() && !filters.is_empty() {
-            self.planning_stage(FILTER_PHASE)?;
-            let placed = filters.iter().filter(|f| bound(f)).count();
-            #[cfg(test)]
-            BOUND_TERMS.with(|terms| {
-                let mut t = terms.get();
-                t[2] = t[2].max(filters.len() as u64);
-                terms.set(t);
-            });
-            // The filters placed here move into a list of their own, made to its size,
-            // and the rest stay in the caller's list, which allocates nothing here.
-            let partition = self
-                .planning_scratch(|layout| layout.slots::<Expr>(placed))?
-                .expect("checked filter partition");
-            let mut now = Vec::new();
-            now.try_reserve_exact(placed)
-                .map_err(|_| partition.preparation().exhausted())?;
-            now.extend(filters.extract_if(.., |f| bound(f)));
-            debug_assert_eq!(now.len(), placed);
-            #[cfg(test)]
-            watch_list(PARTITION_WATCH, &now, &partition);
-            (Some(partition), now)
-        } else {
-            let (now, later) = std::mem::take(filters).into_iter().partition(applies);
-            *filters = later;
-            (None, now)
-        };
-        partition = match held {
-            Some(held) => held,
-            None => {
-                return Ok((
-                    if now.is_empty() {
-                        n
-                    } else {
-                        filter_checked(n, now, self.ctx)?
-                    },
-                    None,
-                ));
-            }
-        };
+        if self.branch_payload.borrow().is_none() || filters.is_empty() {
+            let (n, kept) = self.place_plan_where(n, filters, constant)?;
+            self.retain_plan_scratch(kept)?;
+            return Ok((n, None));
+        }
+        let bound = |f: &Expr| filter_binds(f, constant, |v| n.vars.contains(&v));
+        self.planning_stage(FILTER_PHASE)?;
+        let placed = filters.iter().filter(|f| bound(f)).count();
+        #[cfg(test)]
+        BOUND_TERMS.with(|terms| {
+            let mut t = terms.get();
+            t[2] = t[2].max(filters.len() as u64);
+            terms.set(t);
+        });
+        // Placed filters move into a list sized before allocation. The rest stay in
+        // the caller's list.
+        let mut partition = self
+            .planning_scratch(|layout| layout.slots::<Expr>(placed))?
+            .expect("checked filter partition");
+        let mut now = Vec::new();
+        now.try_reserve_exact(placed)
+            .map_err(|_| partition.preparation().exhausted())?;
+        now.extend(filters.extract_if(.., |f| bound(f)));
+        debug_assert_eq!(now.len(), placed);
+        #[cfg(test)]
+        watch_list(PARTITION_WATCH, &now, &partition);
         let (n, kept) = if now.is_empty() {
             (n, None)
         } else {
@@ -5077,6 +5175,75 @@ impl<'a> Planner<'a> {
             partition.merge(kept);
         }
         Ok((n, Some(partition)))
+    }
+
+    fn place_plan_where(
+        &self,
+        n: Node,
+        filters: &mut Vec<Expr>,
+        constant: bool,
+    ) -> Result<(Node, Option<Charge<'a>>)> {
+        let applies = |f: &Expr| filter_binds(f, constant, |v| n.vars.contains(&v));
+        if self.plan_charge.is_none() {
+            let (now, later): (Vec<_>, _) = std::mem::take(filters).into_iter().partition(applies);
+            *filters = later;
+            return Ok((
+                if now.is_empty() {
+                    n
+                } else {
+                    filter_checked(n, now, self.ctx)?
+                },
+                None,
+            ));
+        }
+        let placed = filters.iter().filter(|f| applies(f)).count();
+        if placed == 0 {
+            return Ok((n, None));
+        }
+        let mut scratch =
+            self.plan_filter_scratch(&n, filters.iter().filter(|f| applies(f)), false)?;
+        if let Some(held) = &scratch {
+            held.add((placed as u64).saturating_mul(size_of::<Expr>() as u64))?;
+        }
+        let mut now = Vec::with_capacity(placed);
+        now.extend(filters.extract_if(.., |f| applies(f)));
+        let owned = super::checked_layout::expressions_owned_bytes(now.iter());
+        let n = self.filter_plan_held(&mut scratch, n, now, owned)?;
+        Ok((n, scratch))
+    }
+
+    pub(super) fn plan_filter_scratch<'e>(
+        &self,
+        n: &Node,
+        exprs: impl Iterator<Item = &'e Expr> + Clone,
+        copies: bool,
+    ) -> Result<Option<Charge<'a>>> {
+        self.plan_scratch(|layout| filter_bound(layout, n, exprs, copies, self.ctx))
+    }
+
+    pub(super) fn filter_plan_held(
+        &self,
+        scratch: &mut Option<Charge<'_>>,
+        n: Node,
+        exprs: Vec<Expr>,
+        owned: u64,
+    ) -> Result<Node> {
+        let Some(held) = scratch else {
+            return filter_checked(n, exprs, self.ctx);
+        };
+        let shallow = |node: &Node| {
+            let mut layout = super::checked_layout::Layout::unchecked(true);
+            let _ = layout.shallow(node);
+            layout.bytes()
+        };
+        let before = shallow(&n);
+        let f = filter_checked(n, exprs, self.ctx)?;
+        let after = shallow(&f).saturating_add(match f.kind {
+            Kind::Filter(_) => shallow(&f.children[0]),
+            _ => 0,
+        });
+        held.resize(after.saturating_sub(before).saturating_sub(owned))?;
+        Ok(f)
     }
 
     /// The credit for [`filter`] of `n` under the filters `exprs` lists, taken before the
@@ -5164,6 +5331,14 @@ impl<'a> Planner<'a> {
     fn filter_admitted(&self, n: Node, exprs: Vec<Expr>) -> Result<Node> {
         #[cfg(test)]
         let _stage = crate::test_alloc::Stage::within(6);
+        if self.plan_charge.is_some() {
+            let mut scratch = self.plan_filter_scratch(&n, exprs.iter(), false)?;
+            let owned = super::checked_layout::expressions_owned_bytes(exprs.iter())
+                .saturating_add((exprs.capacity() as u64).saturating_mul(size_of::<Expr>() as u64));
+            let n = self.filter_plan_held(&mut scratch, n, exprs, owned)?;
+            self.retain_plan_scratch(scratch)?;
+            return Ok(n);
+        }
         let mut scratch = self.filter_scratch(&n, exprs.iter(), false)?;
         // A list that filters were moved out of in place keeps its capacity, which the
         // FILTER keeps with it. That storage was made before this stage, so its credit
@@ -6382,7 +6557,7 @@ fn keyed_left_join(l: Node, r: Node, expr: Expr, (a, b): (VarId, VarId), ctx: &C
 /// estimated as a join on one variable whose result the rest of the condition filters.
 fn keyed_inner_join(l: Node, r: Node, expr: Expr, (a, b): (VarId, VarId), ctx: &Ctx) -> Node {
     let joined = join_est_from(l.est, r.est, l.d(a).max(r.d(b)));
-    let conjuncts = expr.clone().conjuncts().len().max(1);
+    let conjuncts = expr.conjunct_count().max(1);
     let est = (joined * FILTER_SELECTIVITY.powi(conjuncts as i32 - 1)).max(1.0);
     let mut vars = l.vars.clone();
     vars.extend(r.vars.iter().filter(|v| !l.vars.contains(v)));
@@ -6603,6 +6778,19 @@ fn list_credit(held: Option<Reservation>) -> ListCredit {
     held
 }
 
+fn filter_binds(f: &Expr, constant: bool, contains: impl Fn(VarId) -> bool) -> bool {
+    if f.has_exists() {
+        return false;
+    }
+    let mut any = false;
+    f.visit_vars(&mut |v| {
+        any = true;
+        if contains(v) { Ok(()) } else { Err(()) }
+    })
+    .is_ok()
+        && (constant || any)
+}
+
 /// The most that [`filter`] of `n` under `exprs` allocates at once, counting what the
 /// FILTER keeps but not what it keeps of `n`, and the copies of `exprs` when `copies`.
 /// Moving range conjuncts into a scan of `n` splits the filters into their conjuncts,
@@ -6617,19 +6805,13 @@ pub(super) fn filter_bound<'e>(
     copies: bool,
     ctx: &Ctx,
 ) -> Result<()> {
-    struct Count(usize);
-    impl std::fmt::Write for Count {
-        fn write_str(&mut self, s: &str) -> std::fmt::Result {
-            self.0 = self.0.saturating_add(s.len());
-            Ok(())
-        }
-    }
-    let (mut count, mut conjuncts, mut text, mut most) = (0usize, 0usize, Count(0), 0usize);
+    let (mut count, mut conjuncts, mut text, mut most) = (0usize, 0usize, 0usize, 0usize);
     for e in exprs.clone() {
         count += 1;
         conjuncts = conjuncts.saturating_add(e.conjunct_count());
-        text.0 = text.0.saturating_add(8);
-        let _ = e.write_description(ctx, &mut text);
+        text = text
+            .saturating_add(8)
+            .saturating_add(e.description_bytes(ctx)?);
         let mut occurrences = 0usize;
         let _ = e.visit_vars(&mut |_| {
             occurrences += 1;
@@ -6648,29 +6830,56 @@ pub(super) fn filter_bound<'e>(
         copy(layout)?;
     }
     let slots = conjuncts.max(4);
-    // every rendered conjunct, separator and note, as a list, joined and formatted
-    let texts = text
-        .0
+    let checked = layout.is_checked();
+    // The individual strings can each hold nearly twice their text. Their joined
+    // copy costs one more, and a selectivity note can cause a further reformat.
+    let text = text
         .saturating_add(conjuncts.saturating_mul(4))
-        .saturating_add(n.desc.len())
-        .saturating_add(64)
-        .saturating_mul(6);
+        .saturating_add(64);
+    let texts = if checked {
+        text.saturating_add(n.desc.len()).saturating_mul(6)
+    } else if ctx.has_sampled() {
+        text.saturating_mul(3)
+            .saturating_add(conjuncts.saturating_mul(512))
+    } else {
+        text.saturating_mul(3)
+    };
     if let Kind::Scan(spec) = &n.kind {
-        // range pushdown splits the filters into their conjuncts and partitions them
+        // Range pushdown splits the filters into their conjuncts and partitions them.
         layout.slots::<Expr>(slots.saturating_mul(8))?;
+        if !checked && super::geopf::copies_filters(n, exprs.clone(), ctx) {
+            copy(layout)?;
+        }
+        fn compares(e: &Expr) -> bool {
+            match e {
+                Expr::And(a, b) => compares(a) || compares(b),
+                Expr::Cmp(..) | Expr::Eq(..) => true,
+                _ => false,
+            }
+        }
+        let range = checked
+            || (ctx.opt.range_pushdown
+                && spec
+                    .cols
+                    .first()
+                    .is_some_and(|&(c, _)| c == spec.prefix.len() && c != spec.graph_col)
+                && exprs.clone().any(compares));
         #[cfg(test)]
         let sizes = std::cell::Cell::new((0u64, 0u64, 0usize));
-        // Then either range conjuncts move into a range scan, which the key ranges of
-        // the start do not read, or none do and the scan may read key ranges.
+        // Range conjuncts can move into a range scan. Otherwise the scan can read
+        // key ranges using the same expressions by reference.
         layout.larger(
             |layout| {
+                if !range {
+                    return Ok(());
+                }
                 #[cfg(test)]
                 let start = layout.bytes();
                 // the atoms, the id ranges, the rendered conjuncts and the scan's copy
                 layout.slots::<(RangeOp, super::value::Value)>(slots.saturating_mul(2))?;
                 layout.slots::<IdRange>(64)?;
                 layout.slots::<String>(conjuncts)?;
-                layout.add(texts)?;
+                layout.add(texts.saturating_add(n.desc.len().saturating_mul(2)))?;
                 layout.scan(spec)?;
                 #[cfg(test)]
                 sizes.set((layout.bytes() - start, sizes.get().1, sizes.get().2));
@@ -6679,11 +6888,12 @@ pub(super) fn filter_bound<'e>(
             |layout| {
                 #[cfg(test)]
                 let start = layout.bytes();
-                // copies of the conjuncts on the sorted column, their key tests with the
-                // prefixes they give, and the id ranges of those prefixes
-                layout.slots::<Expr>(slots.saturating_mul(2))?;
-                for e in exprs.clone() {
-                    layout.expression(e)?;
+                // The key tests, their prefixes, and the resulting ID ranges.
+                if checked {
+                    layout.slots::<Expr>(slots.saturating_mul(2))?;
+                    for e in exprs.clone() {
+                        layout.expression(e)?;
+                    }
                 }
                 if let Some(&(_, v)) = spec.cols.first() {
                     let mut tests = 0usize;
@@ -6702,7 +6912,7 @@ pub(super) fn filter_bound<'e>(
             },
         )?;
         #[cfg(test)]
-        {
+        if checked {
             // the terms of the branch that sets the bound
             let (range, keys, tests) = sizes.get();
             BOUND_TERMS.with(|terms| {
@@ -6757,10 +6967,24 @@ pub(super) fn filter_checked(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Result<Nod
     let sampled: Vec<Option<super::sample::Sampled>> =
         texts.iter().map(|t| ctx.sampled(t)).collect();
     let sel = super::sample::combine(sampled.iter().map(|s| s.map(|s| s.sel)));
-    let mut desc = texts.join(" && ");
-    if let Some(note) = super::sample::note(&sampled) {
-        desc = format!("{desc} {note}");
-    }
+    let desc = if let Some(note) = super::sample::note(&sampled) {
+        let size = texts.iter().map(String::len).sum::<usize>()
+            + 4 * texts.len().saturating_sub(1)
+            + 1
+            + note.len();
+        let mut desc = String::with_capacity(size);
+        for (i, text) in texts.iter().enumerate() {
+            if i > 0 {
+                desc.push_str(" && ");
+            }
+            desc.push_str(text);
+        }
+        desc.push(' ');
+        desc.push_str(&note);
+        desc
+    } else {
+        texts.join(" && ")
+    };
     // a conjunct evaluated once per distinct value sorts its input column, unless the
     // input is sorted on it already (an index scan can be read in that order instead).
     // Costed whether or not the expression cache is on, so that switching it off does
@@ -6803,14 +7027,16 @@ fn prefix_rows(n: &Node, exprs: &[Expr], ctx: &Ctx) -> Option<(f64, usize)> {
         return None;
     }
     // the conjuncts over the column alone, as the executor tests them
-    let on_key: Vec<Expr> = exprs
+    let on_key = exprs
         .iter()
-        .filter(|e| super::exprcache::input(&[e]) == Ok(Some(v)))
-        .cloned()
-        .collect();
-    let prefixes = super::keyfilter::KeyFilter::plan_prefixes(&on_key, v)?;
+        .filter(|e| super::exprcache::input(&[e]) == Ok(Some(v)));
     #[cfg(test)]
-    REACHED.with(|r| r.set((r.get().0, r.get().1.max(on_key.len()))));
+    let mut key_filters = 0;
+    #[cfg(test)]
+    let on_key = on_key.inspect(|_| key_filters += 1);
+    let prefixes = super::keyfilter::KeyFilter::plan_prefixes(on_key, v)?;
+    #[cfg(test)]
+    REACHED.with(|r| r.set((r.get().0, r.get().1.max(key_filters))));
     let vocab = &ctx.snap.generation.vocab;
     let mut ids = vec![(0, Id::vocab(0).0 - 1)];
     for p in prefixes {
@@ -8220,9 +8446,11 @@ fn defer_open_filters(
         return Vec::new();
     }
     let open = |v: VarId| open_filter_var(v, triples, paths, nodes, unpacks);
-    let (deferred, kept): (Vec<Expr>, Vec<Expr>) = std::mem::take(filters)
-        .into_iter()
-        .partition(|f| f.var_set().into_iter().any(open));
+    let (deferred, kept): (Vec<Expr>, Vec<Expr>) =
+        std::mem::take(filters).into_iter().partition(|f| {
+            f.visit_vars(&mut |v| if open(v) { Err(()) } else { Ok(()) })
+                .is_err()
+        });
     *filters = kept;
     deferred
 }
@@ -8550,14 +8778,33 @@ pub fn collect_pattern_vars(gp: &GraphPattern, out: &mut Vec<String>) {
 }
 
 fn visit_pattern_vars(gp: &GraphPattern, out: &mut impl FnMut(&str)) {
-    gp.on_in_scope_variable(|v| out(v.as_str()));
+    let _ = try_visit_pattern_vars(gp, &mut |name| {
+        out(name);
+        Ok::<(), std::convert::Infallible>(())
+    });
+}
+
+pub(super) fn try_visit_pattern_vars<E>(
+    gp: &GraphPattern,
+    out: &mut impl FnMut(&str) -> std::result::Result<(), E>,
+) -> std::result::Result<(), E> {
+    let mut status = Ok(());
+    gp.on_in_scope_variable(|v| {
+        if status.is_ok() {
+            status = out(v.as_str());
+        }
+    });
+    status?;
     // variables used only in filters also matter for substitution
-    fn walk(gp: &GraphPattern, out: &mut impl FnMut(&str)) {
+    fn walk<E>(
+        gp: &GraphPattern,
+        out: &mut impl FnMut(&str) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
         use GraphPattern as GP;
         match gp {
             GP::Filter { expr, inner } => {
-                visit_expr_vars(expr, out);
-                walk(inner, out);
+                try_visit_expr_vars(expr, out)?;
+                walk(inner, out)
             }
             GP::LeftJoin {
                 left,
@@ -8565,10 +8812,10 @@ fn visit_pattern_vars(gp: &GraphPattern, out: &mut impl FnMut(&str)) {
                 expression,
             } => {
                 if let Some(e) = expression {
-                    visit_expr_vars(e, out);
+                    try_visit_expr_vars(e, out)?;
                 }
-                walk(left, out);
-                walk(right, out);
+                walk(left, out)?;
+                walk(right, out)
             }
             GP::Join { left, right }
             | GP::Lateral { left, right }
@@ -8576,8 +8823,8 @@ fn visit_pattern_vars(gp: &GraphPattern, out: &mut impl FnMut(&str)) {
             | GP::Minus { left, right }
             | GP::SemiJoin { left, right }
             | GP::AntiJoin { left, right } => {
-                walk(left, out);
-                walk(right, out);
+                walk(left, out)?;
+                walk(right, out)
             }
             GP::Extend {
                 inner, expression, ..
@@ -8588,25 +8835,24 @@ fn visit_pattern_vars(gp: &GraphPattern, out: &mut impl FnMut(&str)) {
             | GP::Unfold {
                 inner, expression, ..
             } => {
-                visit_expr_vars(expression, out);
-                walk(inner, out);
+                try_visit_expr_vars(expression, out)?;
+                walk(inner, out)
             }
             GP::Graph { inner, .. }
             | GP::Distinct { inner }
             | GP::Reduced { inner }
             | GP::Slice { inner, .. }
             | GP::OrderBy { inner, .. } => walk(inner, out),
-            _ => {}
+            _ => Ok(()),
         }
     }
-    walk(gp, out);
+    walk(gp, out)
 }
 
-pub(super) fn expr_vars(e: &Expression, out: &mut Vec<String>) {
-    visit_expr_vars(e, &mut |name| out.push(name.to_string()));
-}
-
-fn visit_expr_vars(e: &Expression, out: &mut impl FnMut(&str)) {
+pub(super) fn try_visit_expr_vars<E>(
+    e: &Expression,
+    out: &mut impl FnMut(&str) -> std::result::Result<(), E>,
+) -> std::result::Result<(), E> {
     use Expression as E;
     match e {
         E::Variable(v) | E::Bound(v) => out(v.as_str()),
@@ -8622,22 +8868,30 @@ fn visit_expr_vars(e: &Expression, out: &mut impl FnMut(&str)) {
         | E::Subtract(a, b)
         | E::Multiply(a, b)
         | E::Divide(a, b) => {
-            visit_expr_vars(a, out);
-            visit_expr_vars(b, out);
+            try_visit_expr_vars(a, out)?;
+            try_visit_expr_vars(b, out)
         }
-        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => visit_expr_vars(a, out),
+        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => try_visit_expr_vars(a, out),
         E::In(a, l) => {
-            visit_expr_vars(a, out);
-            l.iter().for_each(|x| visit_expr_vars(x, out));
+            try_visit_expr_vars(a, out)?;
+            for x in l {
+                try_visit_expr_vars(x, out)?;
+            }
+            Ok(())
         }
         E::If(a, b, c) => {
-            visit_expr_vars(a, out);
-            visit_expr_vars(b, out);
-            visit_expr_vars(c, out);
+            try_visit_expr_vars(a, out)?;
+            try_visit_expr_vars(b, out)?;
+            try_visit_expr_vars(c, out)
         }
-        E::Coalesce(l) | E::FunctionCall(_, l) => l.iter().for_each(|x| visit_expr_vars(x, out)),
-        E::Exists(p) => visit_pattern_vars(p, out),
-        _ => {}
+        E::Coalesce(l) | E::FunctionCall(_, l) => {
+            for x in l {
+                try_visit_expr_vars(x, out)?;
+            }
+            Ok(())
+        }
+        E::Exists(p) => try_visit_pattern_vars(p, out),
+        _ => Ok(()),
     }
 }
 
@@ -8715,36 +8969,38 @@ pub fn short(t: &Term) -> String {
 
 /// Evaluate `EXISTS { pattern }` for one outer binding (substitution semantics).
 pub fn eval_exists(ctx: &Ctx, spec: &ExistsSpec, key: &[Id], schema: &[VarId]) -> Result<bool> {
-    let mut p = Planner::for_exists(ctx, spec);
-    if ctx.calls_extensions {
-        p.property_inputs.extend(schema.iter().copied());
-    }
-    for (v, id) in spec.vars.iter().zip(key) {
-        if !id.is_undef() {
-            p.subst.insert(*v, *id);
+    super::depth::guard_exists(|| {
+        let mut p = Planner::for_exists(ctx, spec);
+        if ctx.calls_extensions {
+            p.property_inputs.extend(schema.iter().copied());
         }
-    }
-    let graph = match &spec.graph {
-        ActiveGraph::Var(v) => match p.subst.get(v) {
-            Some(id) => ActiveGraph::Named(*id),
-            None => spec.graph.clone(),
-        },
-        g => g.clone(),
-    };
-    let node = p.plan(spec.pattern(), &graph, Vec::new())?;
-    // A substituted pattern of one triple or a table of values reads its first row
-    // directly, as the per-row evaluation of EXISTS stays eager until item 829. A larger
-    // pattern pulls its first solution through cursor operators, as a LIMIT does, or
-    // runs whole when it is small enough that a LIMIT would.
-    if let Some((rows, _, _)) = super::exec::leaf_rows(ctx, &node, 1)? {
-        return Ok(!rows.table.is_empty());
-    }
-    if super::demand::runs_whole(ctx, &node, 1)
-        && let Some((rows, _)) = super::exec::whole_or_refused(ctx, &node)?
-    {
-        return Ok(!rows.table.is_empty());
-    }
-    super::cursor::has_solution(ctx, &node)
+        for (v, id) in spec.vars.iter().zip(key) {
+            if !id.is_undef() {
+                p.subst.insert(*v, *id);
+            }
+        }
+        let graph = match &spec.graph {
+            ActiveGraph::Var(v) => match p.subst.get(v) {
+                Some(id) => ActiveGraph::Named(*id),
+                None => spec.graph.clone(),
+            },
+            g => g.clone(),
+        };
+        let node = p.plan(spec.pattern(), &graph, Vec::new())?;
+        // A substituted pattern of one triple or a table of values reads its first row
+        // directly, as the per-row evaluation of EXISTS stays eager until item 829. A larger
+        // pattern pulls its first solution through cursor operators, as a LIMIT does, or
+        // runs whole when it is small enough that a LIMIT would.
+        if let Some((rows, _, _)) = super::exec::leaf_rows(ctx, &node, 1)? {
+            return Ok(!rows.table.is_empty());
+        }
+        if super::demand::runs_whole(ctx, &node, 1)
+            && let Some((rows, _)) = super::exec::whole_or_refused(ctx, &node)?
+        {
+            return Ok(!rows.table.is_empty());
+        }
+        super::cursor::has_solution(ctx, &node)
+    })
 }
 
 /// Literal helper for tests.
@@ -8889,7 +9145,7 @@ impl Planner<'_> {
             let mut v = Vec::new();
             for o in opts {
                 let (o, fm, kept) =
-                    super::joinorder::place_masked(self, o, 0, filters, &filter_vars)?;
+                    super::joinorder::place_masked(self, o, 0, filters, &filter_vars, None)?;
                 if let Some(kept) = kept {
                     self.retain_planning(kept);
                 }
@@ -8923,6 +9179,7 @@ impl Planner<'_> {
                                         fa | fb,
                                         filters,
                                         &filter_vars,
+                                        None,
                                     )?;
                                     if let Some(kept) = kept {
                                         self.retain_planning(kept);

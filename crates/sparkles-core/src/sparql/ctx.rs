@@ -1151,6 +1151,12 @@ pub struct Ctx {
 #[cfg(test)]
 pub(super) type ChunkHook = Arc<dyn Fn(&'static str, usize) + Send + Sync>;
 
+// Deterministic test trigger to expire any query deadline at a chosen checkpoint.
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_DEADLINE_EXPIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Set in [`FastMemory::live`] once the ledger has taken the account over.
 const PROMOTED: u64 = 1 << 63;
 
@@ -1917,8 +1923,45 @@ impl Ctx {
 
     /// Keep the selectivity measured for the conjunct shown as `text` (the first one
     /// measured stays, so that every plan compared sees the same).
-    pub(super) fn set_sampled(&self, text: String, s: super::sample::Sampled) {
-        self.sampled.lock().entry(text).or_insert(s);
+    pub(super) fn set_sampled(
+        &self,
+        scratch: Option<Charge<'_>>,
+        text: String,
+        s: super::sample::Sampled,
+    ) {
+        use sparkles_budget::sizes::{table_bytes, table_grown};
+        let mut samples = self.sampled.lock();
+        if samples.contains_key(&text) {
+            return;
+        }
+        if let Some(held) = &scratch {
+            let cap = samples.capacity();
+            let grown = table_grown(cap, samples.len(), 1);
+            let elem = size_of::<(String, super::sample::Sampled)>();
+            let new_table = if grown == cap {
+                0
+            } else {
+                table_bytes(grown, elem)
+            };
+            let text_bytes = text.capacity();
+            if held
+                .resize(text_bytes.saturating_add(new_table) as u64)
+                .is_err()
+            {
+                return;
+            }
+            samples.insert(text, s);
+            let retired = if grown == cap {
+                0
+            } else {
+                table_bytes(cap, elem)
+            };
+            let _ = held.resize(text_bytes.saturating_add(new_table - retired) as u64);
+            // The query owns the sample text and its table until the context drops.
+            held.disarm();
+        } else {
+            samples.insert(text, s);
+        }
     }
 
     #[inline]
@@ -1964,6 +2007,10 @@ impl Ctx {
         let Some(d) = self.deadline else {
             return false;
         };
+        #[cfg(test)]
+        if TEST_DEADLINE_EXPIRED.with(std::cell::Cell::get) {
+            return true;
+        }
         let now = Instant::now();
         if now < d {
             return false;
@@ -2060,12 +2107,9 @@ impl Ctx {
         self.owner.lock().upgrade()
     }
 
-    /// Charge `bytes` of state that outlives the call that builds it, such as a cache
-    /// that belongs to the plan, in both accounting modes. The charge holds a weak owner,
-    /// which avoids a plan and context reference cycle. A context that was never shared
-    /// has no owner to release through, so an eager one keeps such state uncharged, as
-    /// `None` says, while a cursor always has one.
-    pub(crate) fn retained_charge(&self, bytes: u64) -> Result<Option<RetainedCharge>> {
+    /// Weak owner for retained state, or `Ok(None)` when an unattached eager context
+    /// keeps retained state uncharged.
+    fn retained_owner(&self) -> Result<Option<Weak<Ctx>>> {
         let owner = self.owner.lock().clone();
         if owner.strong_count() == 0 {
             if !self.streams {
@@ -2073,9 +2117,60 @@ impl Ctx {
             }
             return Err(Error::invalid("cursor context owner has not been attached"));
         }
+        Ok(Some(owner))
+    }
+
+    /// Charge `bytes` of state that outlives the call that builds it, such as a cache
+    /// that belongs to the plan, in both accounting modes. The charge holds a weak owner,
+    /// which avoids a plan and context reference cycle. A context that was never shared
+    /// has no owner to release through, so an eager one keeps such state uncharged, as
+    /// `None` says, while a cursor always has one.
+    pub(crate) fn retained_charge(&self, bytes: u64) -> Result<Option<RetainedCharge>> {
+        let Some(owner) = self.retained_owner()? else {
+            return Ok(None);
+        };
         let charge = self.charge(bytes)?;
         let id = charge.into_disarmed();
         Ok(Some(RetainedCharge { owner, id, bytes }))
+    }
+
+    /// Split `bytes` out of a live [`QueryMemoryLease`] belonging to this attached context
+    /// into a [`RetainedCharge`] without releasing or re-acquiring from the pool. If the
+    /// lease holds fewer than `bytes`, only the shortfall is reserved.
+    pub(super) fn retained_charge_from_lease(
+        &self,
+        lease: &mut QueryMemoryLease,
+        bytes: u64,
+    ) -> Result<Option<RetainedCharge>> {
+        if lease.service.is_some() || !self.owns_ledger(&lease.ledger) {
+            return Err(Error::invalid(
+                "admission lease belongs to another query account",
+            ));
+        }
+        let Some(owner) = self.retained_owner()? else {
+            return Ok(None);
+        };
+        if bytes == 0 {
+            return Ok(Some(RetainedCharge {
+                owner,
+                id: None,
+                bytes: 0,
+            }));
+        }
+        if bytes <= lease.bytes {
+            lease.bytes -= bytes;
+        } else {
+            let extra = bytes - lease.bytes;
+            lease
+                .ledger
+                .reserve(&lease.owner, self.mem_limit, extra, false)?;
+            lease.bytes = 0;
+        }
+        Ok(Some(RetainedCharge {
+            owner,
+            id: Some(lease.owner.id),
+            bytes,
+        }))
     }
 
     /// The query's program of a regular expression, compiled and charged on first use.
@@ -3838,8 +3933,8 @@ impl Ctx {
         mut cover: impl FnMut(u64) -> Result<()>,
     ) -> Result<Option<Term>> {
         let mut decode = |key: &[u8]| -> Result<Option<Term>> {
-            cover((key.len() as u64).saturating_mul(8).saturating_add(128))?;
-            Ok(Some(id::key_to_term(key)))
+            cover(self.batch_key_decode_bytes(key)?)?;
+            Ok(Some(copied_output_key(key)))
         };
         match id.tag() {
             Tag::Local => self.local.read().get(id.payload()).map_or(Ok(None), decode),
@@ -3859,26 +3954,37 @@ impl Ctx {
         }
     }
 
+    fn batch_key_decode_bytes(&self, key: &[u8]) -> Result<u64> {
+        let envelope = (key.len() as u64).saturating_mul(8).saturating_add(128);
+        if id::is_key_triple(key) {
+            // Compact triple keys can hide a component vector and boxed triple
+            // at each level, even when there is very little lexical text, while
+            // wide triple terms still need the legacy eightfold envelope floor.
+            Ok(output_key_bytes(self, key, 0)?.max(envelope))
+        } else {
+            Ok(envelope)
+        }
+    }
+
     pub(super) fn decoded_bytes(&self, id: Id) -> Result<u64> {
         self.check()?;
-        let size = match id.tag() {
-            Tag::Local => self.local.read().get(id.payload()).map_or(0, <[u8]>::len),
-            Tag::Vocab => self
-                .with_controlled_vocab_key(id.payload(), |key| Ok(key.len()))?
-                .unwrap_or(0),
+        let size = |key: &[u8]| self.batch_key_decode_bytes(key);
+        let bytes = match id.tag() {
+            Tag::Local => self.local.read().get(id.payload()).map(size),
+            Tag::Vocab => self.with_controlled_vocab_key(id.payload(), |key| Ok(size(key)))?,
             Tag::Delta => {
                 if id.payload() >= self.snap.dvocab_len {
-                    0
+                    None
                 } else {
                     self.snap
                         .generation
                         .dvocab
-                        .with(|v| v.get(id.payload()).map_or(0, <[u8]>::len))
+                        .with(|v| v.get(id.payload()).map(size))
                 }
             }
-            _ => 0,
+            _ => None,
         };
-        Ok((size as u64).saturating_mul(8).saturating_add(128))
+        bytes.unwrap_or(Ok(128))
     }
 
     /// The value of a base vocabulary id from the numeric column, when it holds one.
@@ -4546,6 +4652,40 @@ impl Ctx {
 impl Charge<'_> {
     pub(super) fn bytes(&self) -> u64 {
         self.bytes.get()
+    }
+
+    /// An empty child charge sharing this charge's owner on the same context, suitable
+    /// for later adoption via [`Charge::adopt_charge`] without an owner mismatch.
+    pub(super) fn part(&self) -> Charge<'_> {
+        Charge {
+            ctx: self.ctx,
+            bytes: std::cell::Cell::new(0),
+            owner: std::cell::Cell::new(self.owner.get()),
+        }
+    }
+
+    /// Resize this live charge to `bytes` and transfer ownership into a [`RetainedCharge`]
+    /// without releasing or double-charging.
+    pub(super) fn into_retained(self, bytes: u64) -> Result<Option<RetainedCharge>> {
+        Self::transfer_retained(&mut Some(self), bytes)
+    }
+
+    /// Transfer a charge without consuming it if admission fails.
+    pub(super) fn transfer_retained(
+        source: &mut Option<Self>,
+        bytes: u64,
+    ) -> Result<Option<RetainedCharge>> {
+        let held = source.as_ref().expect("live charge to transfer");
+        let Some(owner) = held.ctx.retained_owner()? else {
+            return Ok(None);
+        };
+        held.resize(bytes)?;
+        let id = source.take().expect("admitted live charge").disarm();
+        Ok(Some(RetainedCharge {
+            owner,
+            id: (bytes > 0).then_some(id).flatten(),
+            bytes,
+        }))
     }
 
     pub(super) fn belongs_to(&self, ctx: &Ctx) -> bool {

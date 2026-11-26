@@ -1274,3 +1274,91 @@ fn plan_refused<T>(r: sparkles::Result<T>) {
         Ok(_) => panic!("not refused"),
     }
 }
+
+#[test]
+fn deep_exists_streams_safely_on_small_stack() {
+    on_small_stack(|| {
+        let ds = Dataset::memory();
+        let mut ttl = String::new();
+        for i in 0..32 {
+            ttl.push_str(&format!("<urn:n{i}> <urn:p> <urn:n{}> .\n", i + 1));
+        }
+        ds.load_str(&ttl, RdfFormat::Turtle).unwrap();
+        let build_chain = |depth: usize, alternating: bool| -> String {
+            let mut q = String::from("SELECT (COUNT(*) AS ?n) { ?v0 <urn:p> ?v1");
+            for level in 1..=depth {
+                let kw = if alternating && level % 2 == 0 {
+                    "FILTER NOT EXISTS"
+                } else {
+                    "FILTER EXISTS"
+                };
+                q.push_str(&format!(" {kw} {{ ?v{level} <urn:p> ?v{}", level + 1));
+            }
+            for _ in 0..depth {
+                q.push_str(" }");
+            }
+            q.push_str(" }");
+            q
+        };
+        let opts = sparkles::sparql::QueryOptions::default();
+        let strict = sparkles::sparql::CursorOptions {
+            fallback: sparkles::sparql::FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        for depth in [16usize, 32] {
+            for alternating in [false, true] {
+                let q = build_chain(depth, alternating);
+                let eager = ds.query(&q).unwrap().rows().unwrap();
+                let auto = sparkles::sparql::query_execution(
+                    ds.snapshot(),
+                    &q,
+                    &opts,
+                    &sparkles::sparql::CursorOptions::default(),
+                    sparkles::sparql::ExecutionMode::Auto,
+                )
+                .unwrap();
+                let auto_rows = match auto {
+                    sparkles::sparql::QueryExecution::Select(mut c) => {
+                        let mut out = Vec::new();
+                        while let Some(b) = c.next_batch().unwrap() {
+                            for i in 0..b.len() {
+                                out.push(b.row(i).unwrap().values().to_vec());
+                            }
+                        }
+                        out
+                    }
+                    sparkles::sparql::QueryExecution::Eager(r) => r
+                        .into_result()
+                        .rows()
+                        .unwrap()
+                        .iter()
+                        .map(|r| r.values().to_vec())
+                        .collect(),
+                    _ => panic!("expected SELECT"),
+                };
+                let eager_rows: Vec<_> = eager.iter().map(|r| r.values().to_vec()).collect();
+                assert_eq!(
+                    auto_rows, eager_rows,
+                    "depth {depth} alt {alternating}: auto"
+                );
+
+                let mut c =
+                    sparkles::sparql::select_cursor(ds.snapshot(), &q, &opts, &strict).unwrap();
+                assert!(
+                    !c.plan().has_materialization(),
+                    "depth {depth} alt {alternating}: strict cursor materialized"
+                );
+                let mut stream_rows = Vec::new();
+                while let Some(b) = c.next_batch().unwrap() {
+                    for i in 0..b.len() {
+                        stream_rows.push(b.row(i).unwrap().values().to_vec());
+                    }
+                }
+                assert_eq!(
+                    stream_rows, eager_rows,
+                    "depth {depth} alt {alternating}: strict streaming"
+                );
+            }
+        }
+    });
+}
