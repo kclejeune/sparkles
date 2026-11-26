@@ -149,14 +149,41 @@ fn polled_find_support_index<E>(
     Ok(None)
 }
 
+/// Allocation request emitted by [`universal_facts_with_supports_polled`] so mandatory
+/// fact-vector growth and optional support storage share one live memory ledger.
+pub enum UniversalAlloc<'a> {
+    /// Mandatory growth of the returned `facts` vector by `grow` slots while
+    /// `supports_bytes` of optional support storage is live. Implementations must admit
+    /// `(old_cap + new_cap) * size_of::<Ex>() + supports_bytes`, run
+    /// `facts.try_reserve_exact(grow)`, and return `Ok(true)` on success, `Ok(false)`
+    /// only when `can_drop_supports` is true and admission failed, or `Err` on fatal
+    /// refusal / allocation failure.
+    Facts {
+        facts: &'a mut Vec<Ex>,
+        grow: usize,
+        supports_bytes: usize,
+        can_drop_supports: bool,
+    },
+    /// Optional admission of `peak_add` bytes for `supports_out` while `facts_bytes` and
+    /// `supports_bytes` are already live. Returns `Ok(true)` when admitted or `Ok(false)`
+    /// on refusal so optional tracking can be dropped cleanly.
+    Supports {
+        facts_bytes: usize,
+        supports_bytes: usize,
+        peak_add: usize,
+    },
+}
+
 /// The facts of universal roles that `known` lacks and some real context now gives: a
 /// negative `∃u.F` on a universal role u holds everywhere once F has an instance,
-/// polling `poll` cooperatively across contexts, rules, and membership checks.
+/// polling `poll` cooperatively across contexts, rules, and membership checks and
+/// pre-admitting every growth of the returned fact buffer via `reserve_facts`.
 pub fn universal_facts_polled<E>(
     ix: &Index,
     view: &dyn View,
     known: &[Ex],
     poll: &mut impl FnMut() -> Result<(), E>,
+    reserve_facts: &mut impl FnMut(&mut Vec<Ex>, usize) -> Result<(), E>,
 ) -> Result<Vec<Ex>, E> {
     let mut out: Vec<Ex> = Vec::new();
     if ix.universal.is_empty() {
@@ -198,7 +225,16 @@ pub fn universal_facts_polled<E>(
                 }
                 match polled_contains_ex(&out, x, &mut since_poll, poll) {
                     Ok(true) => continue,
-                    Ok(false) => out.push(x),
+                    Ok(false) => {
+                        if out.len() == out.capacity() {
+                            let grow = out.capacity().max(4);
+                            if let Err(err) = reserve_facts(&mut out, grow) {
+                                stop_err = Some(err);
+                                return;
+                            }
+                        }
+                        out.push(x);
+                    }
                     Err(err) => {
                         stop_err = Some(err);
                         return;
@@ -222,18 +258,19 @@ pub type UniversalFactsTracked = (Vec<Ex>, Option<(Vec<UniversalSupport>, usize)
 
 /// Like [`universal_facts_polled`], recording up to [`MAX_UNIVERSAL_SUPPORTS`]
 /// pre-broadcast `(filler, witness_ctx)` pairs per newly derived universal fact when
-/// `try_admit(peak_add, retained_add)` admits the optional support storage (including
-/// vector reallocation overlap) before each allocation.
+/// `admit` admits both mandatory fact-buffer growth and optional support storage
+/// (including vector reallocation overlap) before each allocation.
 ///
-/// If `try_admit` refuses an allocation, optional support tracking is dropped cleanly
-/// (`None` in the second tuple element) while the mandatory universal facts are still
-/// returned in full.
+/// If optional support admission is refused, or if mandatory fact-buffer growth needs
+/// the headroom held by optional supports, optional support tracking is dropped cleanly
+/// (`None` in the second tuple element) while mandatory universal facts are still
+/// admitted and returned in full.
 pub fn universal_facts_with_supports_polled<E>(
     ix: &Index,
     view: &dyn View,
     known: &[Ex],
     poll: &mut impl FnMut() -> Result<(), E>,
-    try_admit: &mut impl FnMut(usize, usize) -> bool,
+    admit: &mut impl FnMut(UniversalAlloc<'_>) -> Result<bool, E>,
 ) -> Result<UniversalFactsTracked, E> {
     let mut facts: Vec<Ex> = Vec::new();
     let mut supports_out: Vec<UniversalSupport> = Vec::new();
@@ -278,7 +315,43 @@ pub fn universal_facts_with_supports_polled<E>(
                 }
                 match polled_contains_ex(&facts, x, &mut since_poll, poll) {
                     Ok(true) => {}
-                    Ok(false) => facts.push(x),
+                    Ok(false) => {
+                        if facts.len() == facts.capacity() {
+                            let grow = facts.capacity().max(4);
+                            let can_drop_supports = tracking && admitted_bytes > 0;
+                            match admit(UniversalAlloc::Facts {
+                                facts: &mut facts,
+                                grow,
+                                supports_bytes: if tracking { admitted_bytes } else { 0 },
+                                can_drop_supports,
+                            }) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    supports_out = Vec::new();
+                                    tracking = false;
+                                    admitted_bytes = 0;
+                                    match admit(UniversalAlloc::Facts {
+                                        facts: &mut facts,
+                                        grow,
+                                        supports_bytes: 0,
+                                        can_drop_supports: false,
+                                    }) {
+                                        Ok(true) => {}
+                                        Ok(false) => return,
+                                        Err(err) => {
+                                            stop_err = Some(err);
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    stop_err = Some(err);
+                                    return;
+                                }
+                            }
+                        }
+                        facts.push(x);
+                    }
                     Err(err) => {
                         stop_err = Some(err);
                         return;
@@ -322,20 +395,35 @@ pub fn universal_facts_with_supports_polled<E>(
                     } else {
                         sup_buf
                     };
-                    if !try_admit(peak_add, retained_add) {
-                        supports_out = Vec::new();
-                        tracking = false;
-                        continue;
+                    let facts_bytes = facts.capacity().saturating_mul(std::mem::size_of::<Ex>());
+                    match admit(UniversalAlloc::Supports {
+                        facts_bytes,
+                        supports_bytes: admitted_bytes,
+                        peak_add,
+                    }) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            supports_out = Vec::new();
+                            tracking = false;
+                            admitted_bytes = 0;
+                            continue;
+                        }
+                        Err(err) => {
+                            stop_err = Some(err);
+                            return;
+                        }
                     }
                     if vec_grow > 0 && supports_out.try_reserve_exact(vec_grow).is_err() {
                         supports_out = Vec::new();
                         tracking = false;
+                        admitted_bytes = 0;
                         continue;
                     }
                     let mut supports = Vec::new();
                     if supports.try_reserve_exact(MAX_UNIVERSAL_SUPPORTS).is_err() {
                         supports_out = Vec::new();
                         tracking = false;
+                        admitted_bytes = 0;
                         continue;
                     }
                     supports.push((f, e));
@@ -422,9 +510,13 @@ pub struct KeyMerges<'a> {
     pairs: KeyStorage<'a, (Ex, Ex)>,
 }
 impl KeyMerges<'_> {
-    /// Take ownership of the already-admitted pair storage without copying.
-    pub fn into_vec(mut self) -> Vec<(Ex, Ex)> {
-        std::mem::take(&mut self.pairs.rows)
+    /// Take ownership of the already-admitted pair storage together with its exact
+    /// admitted byte capacity without copying. The caller must transfer that debit into
+    /// its own live ledger before `self` drops and retires the `KeyStorage` debit.
+    pub fn into_vec(mut self) -> (Vec<(Ex, Ex)>, usize) {
+        let bytes = self.pairs._scratch.bytes;
+        let rows = std::mem::take(&mut self.pairs.rows);
+        (rows, bytes)
     }
 }
 impl std::ops::Deref for KeyMerges<'_> {
@@ -2618,13 +2710,44 @@ impl<'a> World<'a> {
                 .copied()
                 .collect();
             let reporter = self.debit.reporter;
-            let facts = universal_facts_polled(self.ix, &self, &known, &mut || {
-                if reporter.tell(0) {
+            // Declare `facts_scratch` BEFORE `facts` so `facts` drops before its ledger
+            // debit is retired, and its buffer remains charged across `key_merges_reported`.
+            let mut facts_scratch = Scratch { reporter, bytes: 0 };
+            let facts = universal_facts_polled(
+                self.ix,
+                &self,
+                &known,
+                &mut || {
+                    if reporter.tell(0) {
+                        Ok(())
+                    } else {
+                        Err(Halt::Stopped)
+                    }
+                },
+                &mut |out, grow| {
+                    let elem = std::mem::size_of::<Ex>();
+                    let old_cap = out.capacity();
+                    let old_bytes = old_cap.saturating_mul(elem);
+                    let new_cap = old_cap.checked_add(grow).ok_or(Halt::Memory(usize::MAX))?;
+                    let new_bytes = new_cap
+                        .checked_mul(elem)
+                        .filter(|&b| b <= isize::MAX as usize)
+                        .ok_or(Halt::Memory(usize::MAX))?;
+                    let accepted = reporter.tell_owned(new_bytes as isize, || {
+                        facts_scratch.bytes = facts_scratch.bytes.saturating_add(new_bytes);
+                    });
+                    if !accepted {
+                        return Err(Halt::Stopped);
+                    }
+                    out.try_reserve_exact(grow)
+                        .map_err(|_| Halt::Memory(usize::MAX))?;
+                    if old_bytes > 0 {
+                        facts_scratch.bytes = facts_scratch.bytes.saturating_sub(old_bytes);
+                        reporter.retire(old_bytes as isize);
+                    }
                     Ok(())
-                } else {
-                    Err(Halt::Stopped)
-                }
-            })?;
+                },
+            )?;
             let merges = key_merges_reported(self.ix, &self, self.debit.reporter)?;
             if facts.is_empty() && merges.is_empty() {
                 break;
