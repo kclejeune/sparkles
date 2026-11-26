@@ -1,6 +1,6 @@
 # C32: Linked-data publishing
 
-> **Status:** specified.
+> **Status:** implemented in part (Phase 1).
 >
 > **Roadmap:** [item 461](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered
@@ -71,4 +71,22 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 ## Outcome
 
-Nothing is built. [Item 461](../../ROADMAP.md) tracks the work.
+Phase 1 (the linked-data front end) has shipped. [Item 461](../../ROADMAP.md) keeps the
+remaining phases: term and ontology pages with a documentation generator, catalog-wide
+term search, the OLS4 API subset and the deferred public-hub phases.
+
+The implementation lives in `crates/sparkles-server/src/linked_data/` and extends
+`resources.json` to format 2 (keeping format 1 on disk when no version uses the new
+fields) with optional `versionIri` and `snapshot` fields on catalog versions. The server
+exposes `/$/ld`, `/$/ld/doc`, `/$/ld/ns/{prefix}` and `/$/ld/ns/{prefix}/{*local}` with
+RFC 9110 `Accept` content negotiation (`Vary: Accept`) across escaped HTML, Turtle,
+JSON-LD, RDF/XML and N-Triples, `303 See Other` redirects for slash IRIs, direct `200 OK`
+responses for hash IRIs, pinned snapshot resolution for version IRIs and administrator
+recipe export (`w3id`, `htaccess` and `purl`) at `/$/resources/{id}/recipes`.
+
+Every linked-data request enforces dataset, graph and triple read permissions through
+`CallerContext::read_options`, classifies as a query for rate limiting and query memory
+admission, bounds `DESCRIBE` output by default and answers `404 Not Found` before any
+redirect when the caller cannot read the backing data. The first acceptance gate and the
+page half of the second acceptance gate are met; catalog-wide search remains with its
+phase.

@@ -14,6 +14,7 @@ use oxrdfio::{RdfFormat, RdfSerializer};
 
 const DCAT: &str = "http://www.w3.org/ns/dcat#";
 const DCT: &str = "http://purl.org/dc/terms/";
+const OWL: &str = "http://www.w3.org/2002/07/owl#";
 const PROV: &str = "http://www.w3.org/ns/prov#";
 const SPDX: &str = "http://spdx.org/rdf/terms#";
 const VANN: &str = "http://purl.org/vocab/vann/";
@@ -96,6 +97,9 @@ fn version(out: &mut Out, r: &Resource, v: &Version, prev: Option<&Version>) {
     out.add(me.clone(), t(DCT, "isVersionOf"), res);
     out.add(me.clone(), t(RDF, "type"), t(DCAT, "Dataset"));
     out.lit(me.clone(), t(DCAT, "version"), &v.input.version);
+    if let Some(vi) = &v.input.version_iri {
+        out.iri_or_lit(me.clone(), t(OWL, "versionIRI"), vi);
+    }
     if let Some(p) = prev {
         out.add(
             me.clone(),
@@ -245,6 +249,7 @@ pub fn describe(c: &CatalogFile, only: Option<&str>, format: RdfFormat) -> Strin
     let prefixes = [
         ("dcat", DCAT),
         ("dcterms", DCT),
+        ("owl", OWL),
         ("prov", PROV),
         ("spdx", SPDX),
         ("vann", VANN),

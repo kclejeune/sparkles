@@ -147,6 +147,10 @@ pub struct GraphRecord {
 pub struct VersionInput {
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_iri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issued: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
@@ -514,6 +518,14 @@ pub fn check_version(kind: Kind, v: &VersionInput) -> Result<()> {
             v.version
         )));
     }
+    if let Some(vi) = &v.version_iri {
+        iri("versionIri", vi)?;
+    }
+    if let Some(snap) = &v.snapshot {
+        text("snapshot", snap, 256, true)?;
+        snap.parse::<sparkles::history::At>()
+            .map_err(|e| invalid(format!("snapshot: {e}")))?;
+    }
     if let Some(d) = &v.issued
         && !date(d)
     {
@@ -605,6 +617,7 @@ pub fn check(c: &CatalogFile) -> Result<()> {
     let mut ids = BTreeSet::new();
     let mut prefixes = std::collections::BTreeMap::new();
     let mut iris = std::collections::BTreeMap::new();
+    let mut version_iris = std::collections::BTreeMap::new();
     for r in &c.resources {
         if !valid_id(&r.id) {
             return Err(invalid(format!(
@@ -633,6 +646,18 @@ pub fn check(c: &CatalogFile) -> Result<()> {
                 return Err(Error::Conflict(
                     "version-exists",
                     format!("{} has the version {} twice", r.id, v.input.version),
+                ));
+            }
+            if let Some(vi) = v.input.version_iri.as_deref()
+                && let Some((o_id, o_ver)) =
+                    version_iris.insert(vi, (r.id.as_str(), v.input.version.as_str()))
+            {
+                return Err(Error::Conflict(
+                    "version-iri-owned",
+                    format!(
+                        "{o_id} {o_ver} and {} {} both claim version IRI {vi}; a version IRI belongs to one resource version",
+                        r.id, v.input.version
+                    ),
                 ));
             }
         }
@@ -735,6 +760,16 @@ fn check_match(r: &Resource, if_match: Option<&str>) -> Result<()> {
 
 // --------------------------------------------------------------------- store ------
 
+/// Whether any record in `c` uses fields introduced in `resources.json` format 2
+/// (`versionIri` or `snapshot` on a version).
+fn uses_format_2(c: &CatalogFile) -> bool {
+    c.resources.iter().any(|r| {
+        r.versions
+            .iter()
+            .any(|v| v.input.version_iri.is_some() || v.input.snapshot.is_some())
+    })
+}
+
 /// The catalog of a server: its file, or memory for a server without a data directory.
 pub struct Resources {
     path: Option<PathBuf>,
@@ -776,8 +811,15 @@ impl Resources {
                 path.display()
             )));
         }
-        let c: CatalogFile = sparkles::formats::settings_from_slice(FILE, &bytes)
-            .map_err(|e| Error::Unreadable(format!("{}: {e}", path.display())))?;
+        let (c, found): (CatalogFile, u32) =
+            sparkles::formats::settings_from_slice_with_format(FILE, &bytes)
+                .map_err(|e| Error::Unreadable(format!("{}: {e}", path.display())))?;
+        if found == 1 && uses_format_2(&c) {
+            return Err(Error::Unreadable(format!(
+                "{}: versionIri and snapshot require format 2",
+                path.display()
+            )));
+        }
         check(&c).map_err(|e| Error::Unreadable(format!("{}: {}", path.display(), message(&e))))?;
         Ok(c)
     }
@@ -795,8 +837,9 @@ impl Resources {
         let out = f(&mut c)?;
         c.resources.sort_by(|a, b| a.id.cmp(&b.id));
         check(&c)?;
-        let bytes =
-            sparkles::formats::settings_to_vec(FILE, &c).map_err(|e| Error::Io(e.to_string()))?;
+        let format = if uses_format_2(&c) { 2 } else { 1 };
+        let bytes = sparkles::formats::settings_to_vec_at(FILE, &c, format)
+            .map_err(|e| Error::Io(e.to_string()))?;
         if bytes.len() > MAX_FILE_BYTES {
             return Err(Error::Limit(format!(
                 "the catalog would take {} bytes, more than the {MAX_FILE_BYTES} allowed",

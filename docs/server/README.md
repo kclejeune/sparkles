@@ -46,6 +46,14 @@ The server maintains a catalog of external sources, vocabularies, and datasets i
 * **Licence tracking and obligation propagation.** SPDX expressions classify into open, attribution, share-alike, and restricted tiers, with missing licences forbidding redistribution. Obligations propagate through imports and graph sources to each dataset graph, generating a `NOTICE` file. Restricted terms require recorded administrator acceptance. The licence gate warns by default and refuses only under `serve --license-policy enforce`. Export and publication routes do not consult the licence gate.
 * **Vocabulary namespaces.** Each vocabulary owns its namespaces and prefixes uniquely within the server. Vocabulary headers can be read from dataset graphs and compared against the catalog, and one request installs a vocabulary's prefixes and imported prefixes into a dataset.
 
+### Linked-data publishing
+
+The linked-data front end resolves IRIs under hosted vocabulary namespaces and configured version IRIs from the resource catalog ([API.md](../API.md#linked-data-publishing), [C32](../specs/C32-linked-data-publishing/README.md)).
+
+* **Content negotiation and redirects.** Requests to `/$/ld`, `/$/ld/doc`, `/$/ld/ns/{prefix}` and `/$/ld/ns/{prefix}/{*local}` negotiate `text/html`, `text/turtle`, `application/ld+json`, `application/rdf+xml` and `application/n-triples` with `Vary: Accept`. Slash IRIs answer `303 See Other` to `/$/ld/doc`, while hash IRIs and hash namespace documents answer `200 OK` directly.
+* **Versioned snapshots and recipes.** Catalog versions that set `versionIri` and `snapshot` resolve versioned IRIs to their pinned snapshots or commits with Memento headers. Administrators can export Apache `.htaccess`, w3id and PURL redirection recipes at `/$/resources/{id}/recipes`.
+* **Authorization and safety.** Every lookup, redirect target, HTML page and bounded `DESCRIBE` response runs through the caller's dataset, graph and triple read permissions and server query budgets. Unauthorized or missing IRIs answer `404 Not Found` without leaking private terms, and HTML pages escape all dynamic values under a script-free Content Security Policy.
+
 ## Access control and security
 
 Authentication is disabled by default. When enabled via `serve --auth-config`, access is denied unless explicitly granted ([API.md](../API.md#authentication-and-access-control), [C09](../specs/C09-dataset-access-control.md)).
@@ -98,6 +106,6 @@ Each limit below cites the [central roadmap](../ROADMAP.md) item tracking it.
 
 ## Roadmap
 
-Core design specifications for this area are [C09](../specs/C09-dataset-access-control.md), [C12](../specs/C12-graph-access-control.md), [C12b](../specs/C12b-triple-access-control.md), [C29](../specs/C29-bounded-view-preparation/README.md), [C30](../specs/C30-resource-catalog/README.md), [G08](../specs/G08-fuseki-configuration.md), and [X03](../specs/X03-openapi-and-completions.md).
+Core design specifications for this area are [C09](../specs/C09-dataset-access-control.md), [C12](../specs/C12-graph-access-control.md), [C12b](../specs/C12b-triple-access-control.md), [C29](../specs/C29-bounded-view-preparation/README.md), [C30](../specs/C30-resource-catalog/README.md), [C32](../specs/C32-linked-data-publishing/README.md), [G08](../specs/G08-fuseki-configuration.md), and [X03](../specs/X03-openapi-and-completions.md).
 
-The central [roadmap](../ROADMAP.md) owns priorities and dependencies, and its [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs) cover items 37, 39, 61, 65, 66, 69, 75, 76, 342, 395, 458, 525, 526, and 576.
+The central [roadmap](../ROADMAP.md) owns priorities and dependencies, and its [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs) cover items 37, 39, 61, 65, 66, 69, 75, 76, 342, 395, 458, 461, 525, 526, and 576.

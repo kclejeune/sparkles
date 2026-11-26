@@ -9,7 +9,7 @@ use super::*;
 use sparkles::sparql::describe::{DescribeMode, DescribeOptions};
 
 /// Response header: the DESCRIBE result stopped at its `maxTriples` limit.
-pub(super) const SPARKLES_DESCRIBE_TRUNCATED: &str = "sparkles-describe-truncated";
+pub(crate) const SPARKLES_DESCRIBE_TRUNCATED: &str = "sparkles-describe-truncated";
 
 /// The setting as `GET /$/describe/{ds}` reports it.
 pub(crate) fn status_json(ds: &Dataset) -> J {
@@ -73,7 +73,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 /// `describe` (a mode), `describe-labels`, `describe-reifiers`, `describe-max-triples`
 /// and `describe-max-depth` over it. The limits of a request can only lower the
 /// dataset's. A malformed value is a `400`.
-pub(super) fn request_options(ds: &Dataset, params: &Params) -> ApiResult<DescribeOptions> {
+pub(crate) fn request_options(ds: &Dataset, params: &Params) -> ApiResult<DescribeOptions> {
     let mut o = ds.dataset.settings().describe().get();
     let bad = |e: sparkles::Error| err(StatusCode::BAD_REQUEST, e.to_string());
     if let Some(m) = params.get("describe") {

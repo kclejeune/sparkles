@@ -150,6 +150,9 @@ pub fn classify(
             || admin == "commits/{ds}/timeline"
             // a vocabulary header reads graphs of the datasets that hold it
             || admin == "resources/{id}/header"
+            // linked-data publishing runs bounded DESCRIBE queries over readable graphs
+            || admin == "ld"
+            || admin.starts_with("ld/")
         {
             return Some(Class::Query);
         }

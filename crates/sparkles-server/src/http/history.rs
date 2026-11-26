@@ -51,7 +51,7 @@ pub(super) fn reject_at(params: &Params) -> ApiResult<()> {
 }
 
 /// The snapshot a read uses: the live one, or the state `at` selects.
-pub(super) fn snapshot_for(
+pub(crate) fn snapshot_for(
     ds: &Dataset,
     at: Option<&At>,
     opts: &QueryOptions,
@@ -76,7 +76,7 @@ pub(super) fn snapshot_for(
 
 /// `Sparkles-At`, `Sparkles-Head`, and for a past state the Memento headers:
 /// `Memento-Datetime` and `Link: <original>; rel="original"` (RFC 7089).
-pub(super) fn history_headers(mut resp: Response, r: Option<&Resolved>, uri: &Uri) -> Response {
+pub(crate) fn history_headers(mut resp: Response, r: Option<&Resolved>, uri: &Uri) -> Response {
     let Some(r) = r else { return resp };
     let h = resp.headers_mut();
     if let Ok(v) = header::HeaderValue::from_str(&r.at.to_string()) {

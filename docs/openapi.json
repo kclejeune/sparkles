@@ -273,6 +273,15 @@
           "type": "integer"
         }
       },
+      "local": {
+        "description": "The local path appended to the hosted namespace IRI.",
+        "in": "path",
+        "name": "local",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
       "maxDerived": {
         "description": "The most facts `reasoning=demand` may derive for the query, magic facts aside. It never exceeds the server's `--reason-max-derived`.",
         "in": "query",
@@ -350,6 +359,15 @@
         "description": "The backup policy.",
         "in": "path",
         "name": "policy",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "prefix": {
+        "description": "A hosted vocabulary namespace prefix.",
+        "in": "path",
+        "name": "prefix",
         "required": true,
         "schema": {
           "type": "string"
@@ -23220,6 +23238,96 @@
         ],
         "type": "object"
       },
+      "RecipeExport": {
+        "description": "Redirection recipes for a hosted vocabulary's namespaces and version IRIs.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "properties": {
+          "baseUrl": {
+            "type": "string"
+          },
+          "content": {
+            "description": "The generated `.htaccess` or PURL redirection rules.",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "w3id",
+              "htaccess",
+              "purl"
+            ],
+            "type": "string"
+          },
+          "namespaces": {
+            "items": {
+              "properties": {
+                "iri": {
+                  "type": "string"
+                },
+                "prefix": {
+                  "type": "string"
+                },
+                "style": {
+                  "enum": [
+                    "slash",
+                    "hash"
+                  ],
+                  "type": "string"
+                },
+                "targetUrl": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "prefix",
+                "iri",
+                "style",
+                "targetUrl"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "resource": {
+            "type": "string"
+          },
+          "versions": {
+            "items": {
+              "properties": {
+                "snapshot": {
+                  "type": "string"
+                },
+                "targetUrl": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
+                },
+                "versionIri": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "version",
+                "versionIri",
+                "targetUrl"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "resource",
+          "kind",
+          "baseUrl",
+          "namespaces",
+          "versions",
+          "content"
+        ],
+        "type": "object"
+      },
       "RegisterSourceRequest": {
         "additionalProperties": false,
         "description": "The arguments of `register_source` without `dataset`.",
@@ -24472,8 +24580,16 @@
           "notes": {
             "type": "string"
           },
+          "snapshot": {
+            "description": "Optional point-in-time selector (`snapshot:NAME`, `commit:N`, `N`, `time:<RFC 3339>` or `head`) pinning reads of this version.",
+            "type": "string"
+          },
           "version": {
             "description": "1 to 64 letters, digits, `.`, `_`, `+` and `-`.",
+            "type": "string"
+          },
+          "versionIri": {
+            "description": "Optional absolute IRI identifying this version, unique across the catalog.",
             "type": "string"
           }
         },
@@ -24594,8 +24710,16 @@
           "notes": {
             "type": "string"
           },
+          "snapshot": {
+            "description": "Optional point-in-time selector (`snapshot:NAME`, `commit:N`, `N`, `time:<RFC 3339>` or `head`) pinning reads of this version.",
+            "type": "string"
+          },
           "version": {
             "description": "1 to 64 letters, digits, `.`, `_`, `+` and `-`.",
+            "type": "string"
+          },
+          "versionIri": {
+            "description": "Optional absolute IRI identifying this version, unique across the catalog.",
             "type": "string"
           }
         },
@@ -40048,6 +40172,716 @@
         "x-sparkles-permission": "write"
       }
     },
+    "/$/ld": {
+      "get": {
+        "description": "Resolves an IRI under a hosted vocabulary namespace or configured version IRI. Slash IRIs answer `303 See Other` with `Vary: Accept` to `/$/ld/doc`; hash IRIs answer `200 OK` directly. Shows only data the caller is permitted to read.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "operationId": "resolveLinkedData",
+        "parameters": [
+          {
+            "description": "The absolute IRI to resolve.",
+            "in": "query",
+            "name": "iri",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Override `Accept` negotiation (`html`, `turtle`, `jsonld`, `rdfxml` or `ntriples`).",
+            "in": "query",
+            "name": "format",
+            "schema": {
+              "enum": [
+                "html",
+                "turtle",
+                "jsonld",
+                "rdfxml",
+                "ntriples"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Catalog version name to resolve against its pinned snapshot.",
+            "in": "query",
+            "name": "version",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "$ref": "#/components/parameters/describe"
+          },
+          {
+            "$ref": "#/components/parameters/describeLabels"
+          },
+          {
+            "$ref": "#/components/parameters/describeReifiers"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxTriples"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxDepth"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/ld+json": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/n-triples": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/rdf+xml": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/turtle": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The negotiated HTML or bounded DESCRIBE RDF representation.",
+            "headers": {
+              "Link": {
+                "description": "Alternate representation links.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Describe-Truncated": {
+                "description": "`true` when the bounded DESCRIBE reached its triple limit.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Vary": {
+                "description": "`Accept`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "303": {
+            "description": "Redirect from a slash IRI to its negotiated document representation.",
+            "headers": {
+              "Location": {
+                "description": "The document URL for the negotiated representation.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Vary": {
+                "description": "`Accept`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "406": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "No supported representation matches `Accept`."
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Resolve a hosted IRI with content negotiation",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "any caller"
+      }
+    },
+    "/$/ld/doc": {
+      "get": {
+        "description": "Returns the negotiated HTML or bounded `DESCRIBE` RDF representation of a hosted IRI directly with `200 OK` and `Vary: Accept`. Shows only data the caller is permitted to read.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "operationId": "getLinkedDataDocument",
+        "parameters": [
+          {
+            "description": "The absolute IRI to describe.",
+            "in": "query",
+            "name": "iri",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Override `Accept` negotiation (`html`, `turtle`, `jsonld`, `rdfxml` or `ntriples`).",
+            "in": "query",
+            "name": "format",
+            "schema": {
+              "enum": [
+                "html",
+                "turtle",
+                "jsonld",
+                "rdfxml",
+                "ntriples"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Catalog version name to resolve against its pinned snapshot.",
+            "in": "query",
+            "name": "version",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "$ref": "#/components/parameters/describe"
+          },
+          {
+            "$ref": "#/components/parameters/describeLabels"
+          },
+          {
+            "$ref": "#/components/parameters/describeReifiers"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxTriples"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxDepth"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/ld+json": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/n-triples": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/rdf+xml": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/turtle": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The negotiated HTML or bounded DESCRIBE RDF representation.",
+            "headers": {
+              "Link": {
+                "description": "Alternate representation links.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Describe-Truncated": {
+                "description": "`true` when the bounded DESCRIBE reached its triple limit.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Vary": {
+                "description": "`Accept`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "406": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "No supported representation matches `Accept`."
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Get the document representation of a hosted IRI",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "any caller"
+      }
+    },
+    "/$/ld/ns/{prefix}": {
+      "get": {
+        "description": "Resolves the namespace IRI owned by `prefix`. Hash namespaces answer `200 OK` directly; slash namespaces answer `303 See Other` with `Vary: Accept`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "operationId": "resolveHostedNamespace",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/prefix"
+          },
+          {
+            "description": "Override `Accept` negotiation (`html`, `turtle`, `jsonld`, `rdfxml` or `ntriples`).",
+            "in": "query",
+            "name": "format",
+            "schema": {
+              "enum": [
+                "html",
+                "turtle",
+                "jsonld",
+                "rdfxml",
+                "ntriples"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Catalog version name to resolve against its pinned snapshot.",
+            "in": "query",
+            "name": "version",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "$ref": "#/components/parameters/describe"
+          },
+          {
+            "$ref": "#/components/parameters/describeLabels"
+          },
+          {
+            "$ref": "#/components/parameters/describeReifiers"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxTriples"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxDepth"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/ld+json": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/n-triples": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/rdf+xml": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/turtle": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The negotiated HTML or bounded DESCRIBE RDF representation.",
+            "headers": {
+              "Link": {
+                "description": "Alternate representation links.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Describe-Truncated": {
+                "description": "`true` when the bounded DESCRIBE reached its triple limit.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Vary": {
+                "description": "`Accept`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "303": {
+            "description": "Redirect from a slash namespace IRI to its negotiated document representation.",
+            "headers": {
+              "Location": {
+                "description": "The document URL for the negotiated representation.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Vary": {
+                "description": "`Accept`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "406": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "No supported representation matches `Accept`."
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Resolve a hosted namespace root by prefix",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "any caller"
+      }
+    },
+    "/$/ld/ns/{prefix}/{local}": {
+      "get": {
+        "description": "Resolves `<namespace_iri><local>` for the hosted namespace owned by `prefix`. Slash IRIs answer `303 See Other` with `Vary: Accept`; hash IRIs answer `200 OK` directly.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "operationId": "resolveHostedTerm",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/prefix"
+          },
+          {
+            "$ref": "#/components/parameters/local"
+          },
+          {
+            "description": "Override `Accept` negotiation (`html`, `turtle`, `jsonld`, `rdfxml` or `ntriples`).",
+            "in": "query",
+            "name": "format",
+            "schema": {
+              "enum": [
+                "html",
+                "turtle",
+                "jsonld",
+                "rdfxml",
+                "ntriples"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Catalog version name to resolve against its pinned snapshot.",
+            "in": "query",
+            "name": "version",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "$ref": "#/components/parameters/describe"
+          },
+          {
+            "$ref": "#/components/parameters/describeLabels"
+          },
+          {
+            "$ref": "#/components/parameters/describeReifiers"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxTriples"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxDepth"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/ld+json": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/n-triples": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/rdf+xml": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/turtle": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The negotiated HTML or bounded DESCRIBE RDF representation.",
+            "headers": {
+              "Link": {
+                "description": "Alternate representation links.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Describe-Truncated": {
+                "description": "`true` when the bounded DESCRIBE reached its triple limit.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Vary": {
+                "description": "`Accept`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "303": {
+            "description": "Redirect from a slash IRI to its negotiated document representation.",
+            "headers": {
+              "Location": {
+                "description": "The document URL for the negotiated representation.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Vary": {
+                "description": "`Accept`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "406": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "No supported representation matches `Accept`."
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Resolve a term under a hosted namespace prefix",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "any caller"
+      }
+    },
     "/$/lint": {
       "post": {
         "description": "Lints a SPARQL query or update, or a Turtle, TriG, N-Triples, N-Quads, JSON-LD or SHACLC document, with the rules of `sparkles lint`. The SPARQL in `sh:select`, `sh:ask`, `sh:construct` and `sh:update` literals is linted too. A syntax error is one of the findings, so the answer is `200` either way. `--format-endpoint` may limit or turn off the route.",
@@ -50214,6 +51048,104 @@
           }
         },
         "summary": "Get a version's NOTICE",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/resources/{id}/recipes": {
+      "get": {
+        "description": "Generates Apache `.htaccess` rules (for `w3id.org` or a self-hosted domain) or PURL redirection recipes for a vocabulary resource's hosted namespaces and version IRIs. Returns `text/plain` by default or JSON on `Accept: application/json` or `format=json`. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "operationId": "getVocabularyRecipes",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "description": "Recipe target (`w3id` by default).",
+            "in": "query",
+            "name": "kind",
+            "schema": {
+              "enum": [
+                "w3id",
+                "htaccess",
+                "purl"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Public `http(s)` base URL of this Sparkles server.",
+            "in": "query",
+            "name": "base",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Response format (`text` by default).",
+            "in": "query",
+            "name": "format",
+            "schema": {
+              "enum": [
+                "text",
+                "json"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecipeExport"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The generated recipe.",
+            "headers": {
+              "Vary": {
+                "description": "`Accept`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Export PURL or w3id redirection recipes",
         "tags": [
           "Catalog"
         ],

@@ -32,7 +32,7 @@ mod changes;
 mod commit_graph;
 mod conditional;
 mod cursor;
-mod describe;
+pub(crate) mod describe;
 mod diff;
 mod dry_run;
 mod entailments;
@@ -438,6 +438,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let app = app.merge(crate::assist::routes());
     let app = app.merge(crate::settings::http::routes());
     let app = app.merge(crate::resources::http::routes());
+    let app = app.merge(crate::linked_data::http::routes());
     // outbound notifications: status and test sends (C21)
     let app = app.merge(crate::notify::http::routes());
     let app = app.merge(crate::watches::http::routes());
@@ -1147,8 +1148,8 @@ pub(crate) async fn blocking<T: Send + 'static>(
 
 // ------------------------------------------------------------------ params ------
 
-#[derive(Default, Debug)]
-pub(crate) struct Params(Vec<(String, String)>);
+#[derive(Clone, Default, Debug)]
+pub(crate) struct Params(pub(crate) Vec<(String, String)>);
 
 impl Params {
     /// No parameters, for a route whose options come from the server alone.
@@ -1166,7 +1167,7 @@ impl Params {
     fn extend_form(&mut self, body: &[u8]) {
         self.0.extend(form_urlencoded::parse(body).into_owned());
     }
-    fn get(&self, k: &str) -> Option<&str> {
+    pub(crate) fn get(&self, k: &str) -> Option<&str> {
         self.0.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str())
     }
     fn has(&self, k: &str) -> bool {
