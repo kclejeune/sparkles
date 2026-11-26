@@ -144,6 +144,34 @@ impl Reader {
         }
     }
 
+    /// Open a streaming SELECT cursor over this reader's snapshot or bound evidence view,
+    /// enforcing the caller's graph access, protections, budgets and remaining time.
+    pub(crate) fn select_cursor(
+        &self,
+        q: &str,
+        cursor_opts: &sparql::CursorOptions,
+    ) -> Result<sparql::QueryCursor, Error> {
+        let mut opts = self.timed()?;
+        opts.aggregate_errors = Some(sparkles::sparql::AggregateErrors::Sparkles);
+        match &self.source {
+            ReaderSource::Snapshot(snap) => {
+                sparql::select_cursor(snap.clone(), q, &opts, cursor_opts)
+            }
+            ReaderSource::Evidence { view, ds } => {
+                if opts.graphs.is_none() {
+                    opts.graphs = Some(Arc::new(sparkles::access::GraphAccess::all()));
+                }
+                sparql::select_source_cursor(
+                    view.read_source(),
+                    ds.dataset.store(),
+                    q,
+                    &opts,
+                    cursor_opts,
+                )
+            }
+        }
+    }
+
     /// Whether `graph` is readable under `opts` at this reader's state.
     pub(crate) fn readable_graph(&self, opts: &QueryOptions, graph: &str) -> Result<bool, Error> {
         match &self.source {

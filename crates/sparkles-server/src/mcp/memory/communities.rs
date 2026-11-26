@@ -10,7 +10,7 @@
 use super::Reader;
 use super::link::unavailable;
 use super::recall::{ResolutionDoc, ResolvedDoc, policy_error, rank_terms};
-use super::text::{terms, words};
+use super::text::plain_query;
 use crate::graphrag::read::{self, Filter, ReportRef};
 use crate::mcp::Outcome;
 use crate::mcp::errors::{ErrorContext, ToolError};
@@ -18,7 +18,8 @@ use crate::mcp::tools::{Tools, bounded, parse};
 use oxrdf::{Literal, NamedNode, Term};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 
 /// The most reports one call returns.
 pub(crate) const MAX_LIMIT: u64 = 100;
@@ -549,7 +550,7 @@ impl Tools<'_> {
                     .collect())
             };
         let mut lists: Vec<HashMap<String, usize>> = Vec::new();
-        if let Some(hits) = self.eligible_text_hits(ds, r, q, graph, &eligible_subjects, depth)?
+        if let Some(hits) = self.eligible_text_hits(ds, r, q, graph, &report_pat, depth)?
             && !hits.is_empty()
         {
             lists.push(rank_terms(hits.into_iter()));
@@ -576,18 +577,22 @@ impl Tools<'_> {
         ))
     }
 
-    /// Eligible-only BM25 text ranking over the report and finding literals matched by
-    /// `eligible_subjects` in `graph`, gated on the dataset's full-text index being
-    /// enabled, ready, and covering `graph`. Computing BM25 strictly over eligible
-    /// literals ensures excluded reports neither exhaust `maxHits` nor shift term
-    /// weights for eligible reports, and keeps broad queries bounded to `depth`.
+    /// Eligible-only streaming BM25 text ranking over the report and finding literals
+    /// matched by `report_pat` in `graph`, gated on the dataset's full-text index being
+    /// enabled, ready, and covering `graph`.
+    ///
+    /// Uses the index's configured `maxTextBytes` prefix and default accent-folding
+    /// analyzer (`StandardAnalyzer`), streams eligible reports in bounded batches over
+    /// the same authorized read view in two passes (corpus stats, then per-report best
+    /// score into a bounded top-`depth` heap), and never materializes all eligible
+    /// literals or all matching reports in memory.
     fn eligible_text_hits(
         &self,
         ds: &crate::state::Dataset,
         r: &Reader,
         q: &str,
         graph: &str,
-        eligible_subjects: &str,
+        report_pat: &str,
         depth: usize,
     ) -> Result<Option<Vec<(NamedNode, f64)>>, sparkles::error::Error> {
         if !ds.dataset.indexes().text().enabled() {
@@ -603,9 +608,15 @@ impl Tools<'_> {
         {
             return Ok(None);
         }
-        let q_terms = terms(q);
-        let use_terms = !q_terms.is_empty();
-        let mut q_tokens = if use_terms { q_terms } else { words(q) };
+        if depth == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let Some(plain) = plain_query(q) else {
+            return Ok(None);
+        };
+        let mut analyzer = sparkles::text::StandardAnalyzer::new();
+        let mut q_tokens: Vec<String> = Vec::new();
+        analyzer.for_each_token(&plain, |tok| q_tokens.push(tok.to_string()));
         q_tokens.sort();
         q_tokens.dedup();
         if q_tokens.is_empty() {
@@ -625,105 +636,334 @@ impl Tools<'_> {
         if preds.is_empty() {
             return Ok(None);
         }
-        let pred_values = super::values_iris("p", &preds);
-        let sparql = format!(
-            "SELECT ?r ?lit WHERE {{ GRAPH <{graph}> {{ {eligible_subjects} {pred_values} ?s ?p ?lit . FILTER(isLiteral(?lit) && (DATATYPE(?lit) = <http://www.w3.org/2001/XMLSchema#string> || DATATYPE(?lit) = <http://www.w3.org/1999/02/22-rdf-syntax-ns#langString>)) }} }}"
-        );
+        let pred_in = preds
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let max_text_bytes = status.config.max_text_bytes;
+        let finding = crate::graphrag::guard::gr("finding");
+        let reports_sparql =
+            format!("SELECT DISTINCT ?r WHERE {{ GRAPH <{graph}> {{ {report_pat} }} }}");
         let q_index: HashMap<&str, usize> = q_tokens
             .iter()
             .enumerate()
             .map(|(i, t)| (t.as_str(), i))
             .collect();
+
+        const REPORT_BATCH: usize = 16;
+        const FINDING_BATCH: usize = 32;
+        const LITERAL_BATCH_ROWS: usize = 64;
         const K1: f64 = 1.2;
         const B: f64 = 0.75;
-        let mut rep_nodes: Vec<NamedNode> = Vec::new();
-        let mut rep_idx: HashMap<String, usize> = HashMap::new();
+
+        fn balanced_union(branches: &[String]) -> String {
+            debug_assert!(!branches.is_empty());
+            if branches.len() == 1 {
+                return branches[0].clone();
+            }
+            let mid = branches.len() / 2;
+            format!(
+                "{{ {} }} UNION {{ {} }}",
+                balanced_union(&branches[..mid]),
+                balanced_union(&branches[mid..]),
+            )
+        }
+
+        let report_cursor_opts = sparkles::sparql::CursorOptions {
+            batch_rows: REPORT_BATCH,
+            batch_bytes: 256 << 10,
+            fallback: sparkles::sparql::FallbackPolicy::AllowMaterialization,
+        };
+        let lit_cursor_opts = sparkles::sparql::CursorOptions {
+            batch_rows: LITERAL_BATCH_ROWS,
+            batch_bytes: 256 << 10,
+            fallback: sparkles::sparql::FallbackPolicy::AllowMaterialization,
+        };
+
+        let lit_filter = format!(
+            "FILTER(?p IN ({pred_in}) && isLiteral(?lit) && (DATATYPE(?lit) = <http://www.w3.org/2001/XMLSchema#string> || DATATYPE(?lit) = <http://www.w3.org/1999/02/22-rdf-syntax-ns#langString>))"
+        );
+
+        type SubjectLitFn<'a> = &'a mut dyn FnMut(&str, &str) -> Result<(), sparkles::error::Error>;
+        type BatchLitFn<'a> = &'a mut dyn FnMut(usize, &str) -> Result<(), sparkles::error::Error>;
+        type ReportBatchFn<'a> =
+            &'a mut dyn FnMut(&[NamedNode]) -> Result<(), sparkles::error::Error>;
+
+        // Ground each subject directly in a balanced UNION (depth <= 5) so every read is
+        // a bounded GSPO point lookup for those subjects rather than a full predicate
+        // scan that could exceed `max_rows` on large graphs.
+        let stream_subject_literals = |subjects: &[NamedNode],
+                                       on_lit: SubjectLitFn<'_>|
+         -> Result<(), sparkles::error::Error> {
+            if subjects.is_empty() {
+                return Ok(());
+            }
+            let branches: Vec<String> = subjects
+                .iter()
+                .map(|s| format!("BIND({s} AS ?s) {s} ?p ?lit ."))
+                .collect();
+            let sparql = format!(
+                "SELECT ?s ?lit WHERE {{ GRAPH <{graph}> {{ {{ {} }} {lit_filter} }} }}",
+                balanced_union(&branches),
+            );
+            let mut cursor = r.select_cursor(&sparql, &lit_cursor_opts)?;
+            while let Some(batch) = cursor.next_batch()? {
+                for row in 0..batch.len() {
+                    let Some(owned_lit) = batch.term(row, 1)? else {
+                        continue;
+                    };
+                    let Term::Literal(lit) = owned_lit.as_term() else {
+                        continue;
+                    };
+                    let Some(owned_subj) = batch.term(row, 0)? else {
+                        continue;
+                    };
+                    let Term::NamedNode(subj) = owned_subj.as_term() else {
+                        continue;
+                    };
+                    on_lit(subj.as_str(), lit.value())?;
+                }
+            }
+            Ok(())
+        };
+
+        let for_each_batch_literals =
+            |reps: &[NamedNode], on_lit: BatchLitFn<'_>| -> Result<(), sparkles::error::Error> {
+                let rep_pos: HashMap<&str, usize> = reps
+                    .iter()
+                    .enumerate()
+                    .map(|(i, rep)| (rep.as_str(), i))
+                    .collect();
+
+                // 1) Report literals (title, summary, etc.)
+                stream_subject_literals(reps, &mut |subj, lit| {
+                    if let Some(&idx) = rep_pos.get(subj) {
+                        on_lit(idx, lit)?;
+                    }
+                    Ok(())
+                })?;
+
+                // 2) Finding literals, fetched in bounded finding chunks
+                let f_branches: Vec<String> = reps
+                    .iter()
+                    .map(|rep| format!("BIND({rep} AS ?r) {rep} <{finding}> ?f ."))
+                    .collect();
+                let f_sparql = format!(
+                    "SELECT ?r ?f WHERE {{ GRAPH <{graph}> {{ {} }} }}",
+                    balanced_union(&f_branches),
+                );
+                let mut f_cursor = r.select_cursor(&f_sparql, &lit_cursor_opts)?;
+                let mut f_chunk: Vec<(usize, NamedNode)> = Vec::with_capacity(FINDING_BATCH);
+                let flush_findings = |chunk: &mut Vec<(usize, NamedNode)>,
+                                      on_lit: BatchLitFn<'_>|
+                 -> Result<(), sparkles::error::Error> {
+                    if chunk.is_empty() {
+                        return Ok(());
+                    }
+                    let mut uniq: Vec<NamedNode> = Vec::with_capacity(chunk.len());
+                    let mut by_finding: HashMap<&str, Vec<usize>> = HashMap::new();
+                    for (idx, f) in chunk.iter() {
+                        let entry = by_finding.entry(f.as_str()).or_default();
+                        if entry.is_empty() {
+                            uniq.push(f.clone());
+                        }
+                        entry.push(*idx);
+                    }
+                    stream_subject_literals(&uniq, &mut |subj, lit| {
+                        if let Some(indices) = by_finding.get(subj) {
+                            for &idx in indices {
+                                on_lit(idx, lit)?;
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    chunk.clear();
+                    Ok(())
+                };
+                while let Some(batch) = f_cursor.next_batch()? {
+                    for row in 0..batch.len() {
+                        let Some(owned_r) = batch.term(row, 0)? else {
+                            continue;
+                        };
+                        let Term::NamedNode(rep) = owned_r.as_term() else {
+                            continue;
+                        };
+                        let Some(&idx) = rep_pos.get(rep.as_str()) else {
+                            continue;
+                        };
+                        let Some(owned_f) = batch.term(row, 1)? else {
+                            continue;
+                        };
+                        let Term::NamedNode(f) = owned_f.as_term() else {
+                            continue;
+                        };
+                        f_chunk.push((idx, f.clone()));
+                        if f_chunk.len() >= FINDING_BATCH {
+                            flush_findings(&mut f_chunk, on_lit)?;
+                        }
+                    }
+                }
+                drop(f_cursor);
+                flush_findings(&mut f_chunk, on_lit)?;
+                Ok(())
+            };
+
+        let for_each_report_batch =
+            |on_batch: ReportBatchFn<'_>| -> Result<(), sparkles::error::Error> {
+                let mut cursor = r.select_cursor(&reports_sparql, &report_cursor_opts)?;
+                let mut reps: Vec<NamedNode> = Vec::with_capacity(REPORT_BATCH);
+                while let Some(batch) = cursor.next_batch()? {
+                    reps.clear();
+                    for row in 0..batch.len() {
+                        if let Some(owned) = batch.term(row, 0)?
+                            && let Term::NamedNode(rep) = owned.as_term()
+                        {
+                            reps.push(rep.clone());
+                        }
+                    }
+                    drop(batch);
+                    if !reps.is_empty() {
+                        on_batch(&reps)?;
+                    }
+                }
+                Ok(())
+            };
+
+        // Pass 1: stream corpus statistics (N, total_len, df) over eligible literals.
         let mut total_docs: usize = 0;
         let mut total_len: usize = 0;
         let mut df: Vec<usize> = vec![0; q_tokens.len()];
-        let mut counts: Vec<usize> = vec![0; q_tokens.len()];
+        let mut seen: Vec<bool> = vec![false; q_tokens.len()];
         let mut touched: Vec<usize> = Vec::with_capacity(q_tokens.len());
-        struct MatchedDoc {
-            rep: usize,
-            len: usize,
-            tfs: Vec<(usize, usize)>,
-        }
-        let mut matched: Vec<MatchedDoc> = Vec::new();
-        for row in r.rows(&sparql, Vec::new())? {
-            let [Some(Term::NamedNode(rep)), Some(Term::Literal(lit))] = row.as_slice() else {
-                continue;
-            };
-            total_docs += 1;
-            let doc_tokens = if use_terms {
-                terms(lit.value())
-            } else {
-                words(lit.value())
-            };
-            let doc_len = doc_tokens.len();
-            total_len += doc_len;
-            touched.clear();
-            for tok in &doc_tokens {
-                if let Some(&qi) = q_index.get(tok.as_str()) {
-                    if counts[qi] == 0 {
+        let mut has_match = false;
+        for_each_report_batch(&mut |reps| {
+            for_each_batch_literals(reps, &mut |_idx, lit_val| {
+                total_docs += 1;
+                let prefix = sparkles::text::truncate_text(lit_val, max_text_bytes);
+                let mut doc_len = 0usize;
+                touched.clear();
+                analyzer.for_each_token(prefix, |tok| {
+                    doc_len += 1;
+                    if let Some(&qi) = q_index.get(tok)
+                        && !seen[qi]
+                    {
+                        seen[qi] = true;
                         touched.push(qi);
                     }
-                    counts[qi] += 1;
-                }
-            }
-            if !touched.is_empty() {
-                let idx = match rep_idx.get(rep.as_str()) {
-                    Some(&i) => i,
-                    None => {
-                        let i = rep_nodes.len();
-                        rep_nodes.push(rep.clone());
-                        rep_idx.insert(rep.as_str().to_string(), i);
-                        i
-                    }
-                };
-                let mut tfs = Vec::with_capacity(touched.len());
-                for &qi in &touched {
-                    df[qi] += 1;
-                    tfs.push((qi, counts[qi]));
-                    counts[qi] = 0;
-                }
-                matched.push(MatchedDoc {
-                    rep: idx,
-                    len: doc_len,
-                    tfs,
                 });
-            }
-        }
-        if matched.is_empty() {
+                total_len += doc_len;
+                if !touched.is_empty() {
+                    has_match = true;
+                    for &qi in &touched {
+                        df[qi] += 1;
+                        seen[qi] = false;
+                    }
+                }
+                Ok(())
+            })
+        })?;
+
+        if !has_match || total_docs == 0 {
             return Ok(Some(Vec::new()));
         }
+
+        // Pass 2: stream the same authorized view, reducing each report batch to its
+        // per-report MAX(score) and keeping only the top `depth` reports.
         let n = total_docs as f64;
         let avgdl = (total_len as f64 / n).max(1.0);
-        let mut best: HashMap<usize, f64> = HashMap::new();
-        for doc in matched {
-            let norm = 1.0 - B + B * (doc.len as f64) / avgdl;
-            let mut score = 0.0f64;
-            for (qi, tf) in doc.tfs {
-                let f = tf as f64;
-                let df_i = df[qi] as f64;
-                let idf = (1.0 + (n - df_i + 0.5) / (df_i + 0.5)).ln();
-                score += idf * f * (K1 + 1.0) / (f + K1 * norm);
-            }
-            if score.is_finite() && score > 0.0 {
-                let e = best.entry(doc.rep).or_insert(score);
-                if score > *e {
-                    *e = score;
-                }
+        let idf: Vec<f64> = df
+            .iter()
+            .map(|&d| {
+                let df_i = d as f64;
+                (1.0 + (n - df_i + 0.5) / (df_i + 0.5)).ln()
+            })
+            .collect();
+        let mut counts: Vec<usize> = vec![0; q_tokens.len()];
+
+        /// Heap entry ordered worst-first so `.peek()` / `.pop()` evicts the lowest
+        /// score (or lexicographically largest IRI on tie).
+        struct WorstFirst(f64, NamedNode);
+        impl PartialEq for WorstFirst {
+            fn eq(&self, other: &Self) -> bool {
+                self.0.total_cmp(&other.0) == Ordering::Equal && self.1 == other.1
             }
         }
-        let mut out: Vec<(NamedNode, f64)> = best
+        impl Eq for WorstFirst {}
+        impl PartialOrd for WorstFirst {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for WorstFirst {
+            fn cmp(&self, other: &Self) -> Ordering {
+                other
+                    .0
+                    .total_cmp(&self.0)
+                    .then_with(|| self.1.as_str().cmp(other.1.as_str()))
+            }
+        }
+
+        let mut top: BinaryHeap<WorstFirst> = BinaryHeap::with_capacity(depth);
+        for_each_report_batch(&mut |reps| {
+            let mut batch_best: Vec<f64> = vec![0.0; reps.len()];
+            for_each_batch_literals(reps, &mut |idx, lit_val| {
+                let prefix = sparkles::text::truncate_text(lit_val, max_text_bytes);
+                let mut doc_len = 0usize;
+                touched.clear();
+                analyzer.for_each_token(prefix, |tok| {
+                    doc_len += 1;
+                    if let Some(&qi) = q_index.get(tok) {
+                        if counts[qi] == 0 {
+                            touched.push(qi);
+                        }
+                        counts[qi] += 1;
+                    }
+                });
+                if touched.is_empty() {
+                    return Ok(());
+                }
+                let norm = 1.0 - B + B * (doc_len as f64) / avgdl;
+                let mut score = 0.0f64;
+                for &qi in &touched {
+                    let f = counts[qi] as f64;
+                    counts[qi] = 0;
+                    score += idf[qi] * f * (K1 + 1.0) / (f + K1 * norm);
+                }
+                if score.is_finite() && score > batch_best[idx] {
+                    batch_best[idx] = score;
+                }
+                Ok(())
+            })?;
+            for (rep, score) in reps.iter().zip(batch_best) {
+                if !(score.is_finite() && score > 0.0) {
+                    continue;
+                }
+                if top.len() < depth {
+                    top.push(WorstFirst(score, rep.clone()));
+                } else if let Some(worst) = top.peek() {
+                    let better = match score.total_cmp(&worst.0) {
+                        Ordering::Greater => true,
+                        Ordering::Equal => rep.as_str() < worst.1.as_str(),
+                        Ordering::Less => false,
+                    };
+                    if better {
+                        top.pop();
+                        top.push(WorstFirst(score, rep.clone()));
+                    }
+                }
+            }
+            Ok(())
+        })?;
+
+        let mut out: Vec<(NamedNode, f64)> = top
             .into_iter()
-            .map(|(i, s)| (rep_nodes[i].clone(), s))
+            .map(|WorstFirst(score, rep)| (rep, score))
             .collect();
         out.sort_by(|a, b| {
             b.1.total_cmp(&a.1)
                 .then_with(|| a.0.as_str().cmp(b.0.as_str()))
         });
-        out.truncate(depth);
         Ok(Some(out))
     }
 }

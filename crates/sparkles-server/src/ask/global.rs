@@ -204,6 +204,14 @@ struct PackedUnit {
     core_chars: usize,
     /// Chars used by minimum finding label/snippet + complete bare links + omission note.
     must_chars: usize,
+    /// Chars used by admitted complete bare links + omission note.
+    bare_chars: usize,
+    /// Number of complete bare links admitted.
+    admitted_count: usize,
+    /// Number of eligible bare links dropped for lack of space in this allowance.
+    fit_omitted: usize,
+    /// Whether an omission marker was needed but could not fit.
+    note_missing: bool,
     /// Whether the full finding text fit without truncation.
     finding_complete: bool,
 }
@@ -329,6 +337,7 @@ pub fn report_blocks(n: usize, r: &Value, budget: u64) -> Vec<(String, Vec<usize
             .min(first_cap);
         let mut admitted: Vec<(&Value, String)> = Vec::new();
         let mut bare_chars = 0usize;
+        let mut fit_omitted = 0usize;
         for (id, bare) in eligible {
             let bare_len = bare.chars().count() + 1;
             let cap = if admitted.is_empty() {
@@ -346,6 +355,7 @@ pub fn report_blocks(n: usize, r: &Value, budget: u64) -> Vec<(String, Vec<usize
                 admitted.push((id, bare));
             } else {
                 omitted += 1;
+                fit_omitted += 1;
             }
         }
 
@@ -365,8 +375,10 @@ pub fn report_blocks(n: usize, r: &Value, budget: u64) -> Vec<(String, Vec<usize
                 };
                 bare_chars = bare_chars.saturating_sub(popped.chars().count() + 1);
                 omitted += 1;
+                fit_omitted += 1;
             }
         }
+        let note_missing = omitted > 0 && note_line.is_none();
 
         // Pass 2: give the finding all remaining space after bare links and any marker.
         let finding_cap = avail.saturating_sub(bare_chars + 1).max(label_len);
@@ -375,6 +387,7 @@ pub fn report_blocks(n: usize, r: &Value, budget: u64) -> Vec<(String, Vec<usize
         let finding_complete = finding_line == full_finding;
         let core_chars = actual_finding_chars + bare_chars;
         let must_chars = min_finding_chars + bare_chars;
+        let admitted_count = admitted.len();
 
         // Pass 3: spend only remaining slack on inline cluster member lists so members
         // never steal space from the finding or a complete bare link.
@@ -408,6 +421,10 @@ pub fn report_blocks(n: usize, r: &Value, budget: u64) -> Vec<(String, Vec<usize
             emitted_ents,
             core_chars,
             must_chars,
+            bare_chars,
+            admitted_count,
+            fit_omitted,
+            note_missing,
             finding_complete,
         }
     };
@@ -416,26 +433,40 @@ pub fn report_blocks(n: usize, r: &Value, budget: u64) -> Vec<(String, Vec<usize
     let empty_ids: BTreeSet<String> = BTreeSet::new();
     let min_head0_len = format!("R{n}\n").chars().count();
     let min_cont_len = format!("R{n} (continued)\n").chars().count();
-    let extra0 = if last_idx == 0 { omitted_report } else { 0 };
-    let probe0 = build_unit(
-        0,
-        &findings[0],
-        &finding_ids[0],
-        &empty_ids,
-        max_chars.saturating_sub(min_head0_len),
-        extra0,
-    );
     let desired_title_cap = (max_chars / 4).max(32);
-    let reserve_for_f0 = if probe0.finding_complete {
-        probe0.core_chars
-    } else {
-        probe0.must_chars
+    let start_head = |idx: usize, f: &Value, continued: bool, extra: usize| -> String {
+        let min_len = if continued {
+            min_cont_len
+        } else {
+            min_head0_len
+        };
+        let probe = build_unit(
+            idx,
+            f,
+            &finding_ids[idx],
+            &empty_ids,
+            max_chars.saturating_sub(min_len),
+            extra,
+        );
+        let reserve = if probe.finding_complete {
+            probe.core_chars
+        } else if continued {
+            // Block 0 already carries the title; never let a repeated continuation title
+            // steal space from an already-truncated finding or its bare identity links.
+            max_chars.saturating_sub(min_len)
+        } else if probe.admitted_count >= 2 {
+            probe.must_chars.max(probe.bare_chars.saturating_mul(2))
+        } else {
+            probe.must_chars
+        };
+        let head_cap = desired_title_cap
+            .min(max_chars.saturating_sub(reserve))
+            .max(min_len);
+        make_head(n, title, continued, head_cap)
     };
-    let head0_cap = desired_title_cap
-        .min(max_chars.saturating_sub(reserve_for_f0))
-        .max(min_head0_len);
-    let head0 = make_head(n, title, false, head0_cap);
-    let cont_head = make_head(n, title, true, head0_cap.max(min_cont_len));
+
+    let extra0 = if last_idx == 0 { omitted_report } else { 0 };
+    let head0 = start_head(0, &findings[0], false, extra0);
 
     let mut out: Vec<(String, Vec<usize>)> = Vec::new();
     let mut cur = head0;
@@ -464,21 +495,23 @@ pub fn report_blocks(n: usize, r: &Value, budget: u64) -> Vec<(String, Vec<usize
         cur.push('\n');
     }
 
-    let fresh_avail = max_chars.saturating_sub(cont_head.chars().count());
     for (i, f) in findings.iter().enumerate() {
         let extra = if i == last_idx { omitted_report } else { 0 };
-        let avail_now = if shown.is_empty() {
-            max_chars.saturating_sub(cur.chars().count())
-        } else {
-            fresh_avail
-        };
+        let avail_now = max_chars.saturating_sub(cur.chars().count());
         let mut unit = build_unit(i, f, &finding_ids[i], &cur_ids, avail_now, extra);
-        if !shown.is_empty() && cur.chars().count() + unit.total_chars() > max_chars {
+        if !shown.is_empty()
+            && (cur.chars().count() + unit.total_chars() > max_chars
+                || !unit.finding_complete
+                || unit.fit_omitted > 0
+                || unit.note_missing)
+        {
+            let cont_head = start_head(i, f, true, extra);
             out.push((
-                std::mem::replace(&mut cur, cont_head.clone()),
+                std::mem::replace(&mut cur, cont_head),
                 std::mem::take(&mut shown),
             ));
             cur_ids.clear();
+            let fresh_avail = max_chars.saturating_sub(cur.chars().count());
             unit = build_unit(i, f, &finding_ids[i], &cur_ids, fresh_avail, extra);
         }
         cur.push_str(&unit.finding_line);
@@ -1639,6 +1672,93 @@ mod tests {
         assert!(
             text.contains("Identity: (+1 more identities)"),
             "expected explicit omission marker: {text}"
+        );
+    }
+
+    #[test]
+    fn report_blocks_shortens_continuation_title_for_long_second_finding() {
+        let budget = 256;
+        let max_chars = (budget * CHARS_PER_TOKEN) as usize;
+        let title = "T".repeat(200);
+        let second = format!("SECOND_START_{}_SECOND_END", "f".repeat(826));
+        assert_eq!(second.len(), 850);
+        let r = json!({
+            "title": title,
+            "summary": "Short summary.",
+            "findings": [
+                { "text": "Short first finding." },
+                { "text": second },
+            ],
+        });
+        let parts = report_blocks(1, &r, budget);
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert_eq!(parts[0].1, vec![0], "{parts:?}");
+        assert_eq!(parts[1].1, vec![1], "{parts:?}");
+        for (text, _) in &parts {
+            assert!(
+                text.chars().count() <= max_chars,
+                "exceeded budget: {}",
+                text.chars().count()
+            );
+        }
+        assert!(
+            parts[1].0.contains(&format!("F1.2 {second}")),
+            "second finding was truncated by repeated continuation title: {}",
+            parts[1].0
+        );
+    }
+
+    #[test]
+    fn report_blocks_shortens_continuation_title_to_keep_complete_identity_link() {
+        let budget = 256;
+        let max_chars = (budget * CHARS_PER_TOKEN) as usize;
+        let title = "T".repeat(200);
+        let ent = format!("http://example.org/entity/{}", "e".repeat(364));
+        let rep = format!("http://example.org/entity/{}", "r".repeat(364));
+        assert_eq!(ent.len(), 390);
+        assert_eq!(rep.len(), 390);
+        let bare = format!("Identity: <{ent}> resolvesTo <{rep}>");
+        assert!(bare.len() > 800, "bare len={}", bare.len());
+        let second_text = "Second finding near the continuation boundary.";
+        let r = json!({
+            "title": title,
+            "summary": "Short summary.",
+            "findings": [
+                { "text": "Short first finding." },
+                { "text": second_text, "about": [ent] },
+            ],
+            "identities": [{
+                "entity": ent,
+                "representative": rep,
+                "members": [rep, ent],
+                "membersComplete": true,
+            }],
+        });
+        let parts = report_blocks(1, &r, budget);
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert_eq!(parts[0].1, vec![0], "{parts:?}");
+        assert_eq!(parts[1].1, vec![1], "{parts:?}");
+        for (text, _) in &parts {
+            assert!(
+                text.chars().count() <= max_chars,
+                "exceeded budget: {}",
+                text.chars().count()
+            );
+        }
+        assert!(
+            parts[1].0.contains(&format!("F1.2 {second_text}")),
+            "second finding was truncated in continuation: {}",
+            parts[1].0
+        );
+        assert!(
+            parts[1].0.contains(&bare),
+            "complete bare link was displaced by repeated continuation title: {}",
+            parts[1].0
+        );
+        assert!(
+            !parts[1].0.contains("more identities)"),
+            "bare link should fit without omission: {}",
+            parts[1].0
         );
     }
 }

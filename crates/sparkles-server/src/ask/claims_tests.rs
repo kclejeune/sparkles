@@ -1120,6 +1120,15 @@ fn mcp_tool(
     name: &str,
     args: Value,
 ) -> Result<Value, crate::mcp::errors::ToolError> {
+    mcp_tool_with_cfg(st, crate::mcp::McpConfig::default(), name, args)
+}
+
+fn mcp_tool_with_cfg(
+    st: &Arc<AppState>,
+    cfg: crate::mcp::McpConfig,
+    name: &str,
+    args: Value,
+) -> Result<Value, crate::mcp::errors::ToolError> {
     let mut call = crate::mcp::Call {
         arrived: std::time::Instant::now(),
         cancel: Default::default(),
@@ -1134,7 +1143,7 @@ fn mcp_tool(
         panic!("arguments must be an object");
     };
     m.insert("dataset".into(), "org".into());
-    let server = crate::mcp::McpServer::new(st.clone(), crate::mcp::McpConfig::default());
+    let server = crate::mcp::McpServer::new(st.clone(), cfg);
     Ok(match server.run_now(name, m, &mut call)? {
         crate::mcp::Outcome::Structured(v) => v,
         crate::mcp::Outcome::Text(t) => serde_json::from_str(&t).unwrap_or(Value::String(t)),
@@ -2358,5 +2367,363 @@ async fn community_reports_bounds_shared_cluster_across_chunks_and_reports() {
     assert!(
         total_member_entries <= 8_192,
         "aggregate member entries {total_member_entries} exceeded 8,192 budget"
+    );
+}
+
+/// R3-1: Eligible text ranking streams in bounded report batches instead of materializing
+/// all eligible literals at once, so sparse and broad queries succeed under tight
+/// `max_rows` and `query_memory_bytes` budgets that reject a corpus-sized literal SELECT.
+#[cfg(feature = "text")]
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_scoped_text_search_streams_under_tight_row_and_memory_budgets() {
+    const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
+    const OTHER_DEC: &str = "urn:ev:other-decisions";
+    const OTHER_SUP: &str = "urn:ev:other-supports";
+    const OTHER_OUT: &str = "urn:ev:other-accepted";
+
+    let mut st = AppState::standalone(Default::default(), Duration::from_secs(30));
+    // Above the 550 total reports (so `level_counts` and report enumeration fit), but far
+    // below the 3,000+ eligible literal rows (6 literals per report) that an unbatched
+    // `SELECT ?r ?lit` materializes.
+    st.limits.max_rows = 1_000;
+    st.limits.max_result_bytes = None;
+    let st = Arc::new(st);
+    let state_ds = st.attach("org", DbType::Mem, None).unwrap();
+    let p = sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+    state_ds
+        .dataset
+        .store()
+        .activate_memory_configuration_history(&p)
+        .unwrap();
+    state_ds
+        .store
+        .load(&[Source::from_bytes(
+            ORG.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let ds = state_ds.dataset.clone();
+
+    let mut cfg = settings();
+    cfg.decisions.push(OTHER_DEC.into());
+    cfg.supports.push(OTHER_SUP.into());
+    cfg.projections.push(OTHER_OUT.into());
+    cfg.policies.insert(
+        "other".into(),
+        Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported],
+            required_scope: vec![],
+            conflicts: ConflictMode::AdmitLabelled,
+            boundary: vec!["urn:ev:sources".into(), "urn:ev:claims".into()],
+            decisions: OTHER_DEC.into(),
+            supports: OTHER_SUP.into(),
+            output: OTHER_OUT.into(),
+        },
+    );
+    evidence::configure(&ds, &cfg, &Control::none()).unwrap();
+    ds.indexes()
+        .text()
+        .enable(sparkles::text::TextConfig::default())
+        .unwrap();
+
+    let gr = crate::graphrag::guard::gr;
+    let main_iri = sparkles::evidence::review::policy_iri("main");
+    let other_iri = sparkles::evidence::review::policy_iri("other");
+    let (c_cls, lv, cnt, rep, r_cls, sum, stat, rat, rp, pv, fnd, ord, txt) = (
+        gr("Community"),
+        gr("level"),
+        gr("memberCount"),
+        gr("report"),
+        gr("Report"),
+        gr("summary"),
+        gr("status"),
+        gr("rating"),
+        gr("reviewPolicy"),
+        gr("policyVersion"),
+        gr("finding"),
+        gr("order"),
+        gr("text"),
+    );
+
+    // 500 eligible reports * (1 label + 1 summary + 4 findings) = 3,000 eligible literals,
+    // with ~900-byte summaries and findings (~2.25 MiB of literal payloads).
+    let pad = "detail ".repeat(120);
+    let mut trig = format!("<{REPORTS}> {{\n");
+    trig.push_str(&format!(
+        r#"  <urn:c:main-hit> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:main-hit> .
+  <urn:r:main-hit> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Quiet Main" ; <{sum}> "Mentions zephyr overview {pad}" ; <{stat}> "reviewed" ; <{rat}> 1 ; <{rp}> <{main}> ; <{pv}> 1 ; <{fnd}> <urn:r:main-hit#f1>, <urn:r:main-hit#f2>, <urn:r:main-hit#f3>, <urn:r:main-hit#f4> .
+  <urn:r:main-hit#f1> <{ord}> 1 ; <{txt}> "Single zephyr note {pad}" .
+  <urn:r:main-hit#f2> <{ord}> 2 ; <{txt}> "Background note two {pad}" .
+  <urn:r:main-hit#f3> <{ord}> 3 ; <{txt}> "Background note three {pad}" .
+  <urn:r:main-hit#f4> <{ord}> 4 ; <{txt}> "Background note four {pad}" .
+"#,
+        main = main_iri.as_str(),
+    ));
+    for i in 0..499 {
+        trig.push_str(&format!(
+            r#"  <urn:c:fill-{i}> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:fill-{i}> .
+  <urn:r:fill-{i}> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Fill {i}" ; <{sum}> "Unrelated overview {i} {pad}" ; <{stat}> "reviewed" ; <{rat}> 5 ; <{rp}> <{main}> ; <{pv}> 1 ; <{fnd}> <urn:r:fill-{i}#f1>, <urn:r:fill-{i}#f2>, <urn:r:fill-{i}#f3>, <urn:r:fill-{i}#f4> .
+  <urn:r:fill-{i}#f1> <{ord}> 1 ; <{txt}> "Background detail a {i} {pad}" .
+  <urn:r:fill-{i}#f2> <{ord}> 2 ; <{txt}> "Background detail b {i} {pad}" .
+  <urn:r:fill-{i}#f3> <{ord}> 3 ; <{txt}> "Background detail c {i} {pad}" .
+  <urn:r:fill-{i}#f4> <{ord}> 4 ; <{txt}> "Background detail d {i} {pad}" .
+"#,
+            main = main_iri.as_str(),
+        ));
+    }
+    for i in 0..50 {
+        trig.push_str(&format!(
+            r#"  <urn:c:off-{i}> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:off-{i}> .
+  <urn:r:off-{i}> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Off {i}" ; <{sum}> "zephyr zephyr excluded overview {i} {pad}" ; <{stat}> "reviewed" ; <{rat}> 10 ; <{rp}> <{other}> ; <{pv}> 1 .
+"#,
+            other = other_iri.as_str(),
+        ));
+    }
+    trig.push_str("}\n");
+    ds.store()
+        .load(&[Source::from_bytes(trig.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+
+    crate::settings::store_runtime(
+        &st,
+        &state_ds,
+        &crate::settings::GRAPHRAG,
+        &json!({ "enabled": true, "principal": "local", "projection": { "graphs": ["urn:g:org"] } }),
+    )
+    .unwrap();
+
+    // 1 MiB query memory budget: well below the ~2.25 MiB of eligible literal payloads
+    // that full-corpus decoding would materialize.
+    let tight_mcp = crate::mcp::McpConfig {
+        query_memory_bytes: Some(1 << 20),
+        ..crate::mcp::McpConfig::default()
+    };
+
+    let sparse_policied = mcp_tool_with_cfg(
+        &st,
+        tight_mcp.clone(),
+        "community_reports",
+        json!({ "query": "zephyr", "reviewPolicy": "main", "level": 0, "limit": 5 }),
+    )
+    .unwrap();
+    assert_eq!(sparse_policied["ranking"], "search", "{sparse_policied}");
+    assert_eq!(
+        sparse_policied["reports"][0]["iri"], "urn:r:main-hit",
+        "{sparse_policied}"
+    );
+
+    let broad_policied = mcp_tool_with_cfg(
+        &st,
+        tight_mcp.clone(),
+        "community_reports",
+        json!({ "query": "overview", "reviewPolicy": "main", "level": 0, "limit": 5 }),
+    )
+    .unwrap();
+    assert_eq!(broad_policied["ranking"], "search", "{broad_policied}");
+    assert_eq!(broad_policied["reports"].as_array().unwrap().len(), 5);
+
+    let broad_unpolicied = mcp_tool_with_cfg(
+        &st,
+        tight_mcp,
+        "community_reports",
+        json!({ "query": "overview", "level": 0, "limit": 5 }),
+    )
+    .unwrap();
+    assert_eq!(broad_unpolicied["ranking"], "search", "{broad_unpolicied}");
+    assert_eq!(broad_unpolicied["reports"].as_array().unwrap().len(), 5);
+}
+
+/// R3-2: Scoped text search preserves the full-text index's default accent-insensitive
+/// analyzer (`cafe` matches `café`, `naïve façade` matches `naive facade`) without a
+/// vector index, and respects the index's configured `maxTextBytes` literal prefix.
+#[cfg(feature = "text")]
+#[tokio::test(flavor = "multi_thread")]
+async fn text_search_preserves_accent_folding_and_max_text_bytes_truncation() {
+    const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
+    const OTHER_DEC: &str = "urn:ev:other-decisions";
+    const OTHER_SUP: &str = "urn:ev:other-supports";
+    const OTHER_OUT: &str = "urn:ev:other-accepted";
+
+    let m = mock(Arc::new(OnceLock::new()));
+    let (st, _app) = app(&m.url()).await;
+    let ds = dataset(&st);
+
+    let mut cfg = settings();
+    cfg.decisions.push(OTHER_DEC.into());
+    cfg.supports.push(OTHER_SUP.into());
+    cfg.projections.push(OTHER_OUT.into());
+    cfg.policies.insert(
+        "other".into(),
+        Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported],
+            required_scope: vec![],
+            conflicts: ConflictMode::AdmitLabelled,
+            boundary: vec!["urn:ev:sources".into(), "urn:ev:claims".into()],
+            decisions: OTHER_DEC.into(),
+            supports: OTHER_SUP.into(),
+            output: OTHER_OUT.into(),
+        },
+    );
+    evidence::configure(&ds, &cfg, &Control::none()).unwrap();
+    ds.indexes()
+        .text()
+        .enable(sparkles::text::TextConfig::default())
+        .unwrap();
+
+    let gr = crate::graphrag::guard::gr;
+    let main_iri = sparkles::evidence::review::policy_iri("main");
+    let other_iri = sparkles::evidence::review::policy_iri("other");
+    let (c_cls, lv, cnt, rep, r_cls, sum, stat, rat, rp, pv) = (
+        gr("Community"),
+        gr("level"),
+        gr("memberCount"),
+        gr("report"),
+        gr("Report"),
+        gr("summary"),
+        gr("status"),
+        gr("rating"),
+        gr("reviewPolicy"),
+        gr("policyVersion"),
+    );
+
+    let long_prefix = "x".repeat(80);
+    let trig = format!(
+        r#"<{REPORTS}> {{
+  <urn:c:main-cafe> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:main-cafe> .
+  <urn:r:main-cafe> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Hospitality" ; <{sum}> "Regional café expansion notes." ; <{stat}> "reviewed" ; <{rat}> 1 ; <{rp}> <{main}> ; <{pv}> 1 .
+
+  <urn:c:main-naive> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:main-naive> .
+  <urn:r:main-naive> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Architecture" ; <{sum}> "Naive facade review." ; <{stat}> "reviewed" ; <{rat}> 1 ; <{rp}> <{main}> ; <{pv}> 1 .
+
+  <urn:c:main-high> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:main-high> .
+  <urn:r:main-high> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Infrastructure" ; <{sum}> "Unrelated high-rated report." ; <{stat}> "reviewed" ; <{rat}> 10 ; <{rp}> <{main}> ; <{pv}> 1 .
+
+  <urn:c:other-cafe> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:other-cafe> .
+  <urn:r:other-cafe> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Excluded" ; <{sum}> "Excluded café café summary." ; <{stat}> "reviewed" ; <{rat}> 10 ; <{rp}> <{other}> ; <{pv}> 1 .
+}}"#,
+        main = main_iri.as_str(),
+        other = other_iri.as_str(),
+    );
+    ds.store()
+        .load(&[Source::from_bytes(trig.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+
+    let state_ds = st.get("org").unwrap();
+    crate::settings::store_runtime(
+        &st,
+        &state_ds,
+        &crate::settings::GRAPHRAG,
+        &json!({ "enabled": true, "principal": "local", "projection": { "graphs": ["urn:g:org"] } }),
+    )
+    .unwrap();
+
+    // 1) ASCII query matches accented summary (policied and unpolicied), without a vector index.
+    let accent_policied = mcp_tool(
+        &st,
+        "community_reports",
+        json!({ "query": "cafe", "reviewPolicy": "main", "limit": 1 }),
+    )
+    .unwrap();
+    assert_eq!(accent_policied["ranking"], "search", "{accent_policied}");
+    assert_eq!(
+        accent_policied["reports"][0]["iri"], "urn:r:main-cafe",
+        "{accent_policied}"
+    );
+
+    let accent_unpolicied = mcp_tool(
+        &st,
+        "community_reports",
+        json!({ "query": "cafe", "limit": 2 }),
+    )
+    .unwrap();
+    assert_eq!(
+        accent_unpolicied["ranking"], "search",
+        "{accent_unpolicied}"
+    );
+    let unpolicied_iris: Vec<&str> = accent_unpolicied["reports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["iri"].as_str())
+        .collect();
+    assert!(
+        unpolicied_iris.contains(&"urn:r:main-cafe")
+            && unpolicied_iris.contains(&"urn:r:other-cafe"),
+        "expected both café reports to match before high-rated unrelated report: {accent_unpolicied}"
+    );
+
+    // Accented query matches ASCII summary as well.
+    let reverse = mcp_tool(
+        &st,
+        "community_reports",
+        json!({ "query": "naïve façade", "reviewPolicy": "main", "limit": 1 }),
+    )
+    .unwrap();
+    assert_eq!(reverse["ranking"], "search", "{reverse}");
+    assert_eq!(
+        reverse["reports"][0]["iri"], "urn:r:main-naive",
+        "{reverse}"
+    );
+
+    // 2) Configured `max_text_bytes` truncation: terms past the indexed byte prefix do
+    // not rank reports.
+    ds.indexes()
+        .text()
+        .enable(sparkles::text::TextConfig {
+            max_text_bytes: 64,
+            ..sparkles::text::TextConfig::default()
+        })
+        .unwrap();
+
+    let trunc_trig = format!(
+        r#"<{REPORTS}> {{
+  <urn:c:in-prefix> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:in-prefix> .
+  <urn:r:in-prefix> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Short" ; <{sum}> "Brief zephyr note inside indexed prefix." ; <{stat}> "reviewed" ; <{rat}> 1 ; <{rp}> <{main}> ; <{pv}> 1 .
+
+  <urn:c:past-prefix> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:past-prefix> .
+  <urn:r:past-prefix> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Long" ; <{sum}> "{long_prefix} zephyr tailonly." ; <{stat}> "reviewed" ; <{rat}> 10 ; <{rp}> <{main}> ; <{pv}> 1 .
+}}"#,
+        main = main_iri.as_str(),
+    );
+    ds.store()
+        .load(&[Source::from_bytes(
+            trunc_trig.into_bytes(),
+            RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+
+    let prefix_hit = mcp_tool(
+        &st,
+        "community_reports",
+        json!({ "query": "zephyr", "reviewPolicy": "main", "limit": 2 }),
+    )
+    .unwrap();
+    assert_eq!(prefix_hit["ranking"], "search", "{prefix_hit}");
+    assert_eq!(
+        prefix_hit["reports"][0]["iri"], "urn:r:in-prefix",
+        "{prefix_hit}"
+    );
+    assert!(
+        prefix_hit["reports"][0]["score"].is_number(),
+        "{prefix_hit}"
+    );
+    assert!(
+        prefix_hit["reports"][1]["score"].is_null(),
+        "report whose term sits past max_text_bytes should not be search-scored: {prefix_hit}"
+    );
+
+    let tail_only = mcp_tool(
+        &st,
+        "community_reports",
+        json!({ "query": "tailonly", "reviewPolicy": "main", "limit": 2 }),
+    )
+    .unwrap();
+    assert_eq!(
+        tail_only["ranking"], "rating",
+        "term past max_text_bytes must not trigger search ranking: {tail_only}"
     );
 }

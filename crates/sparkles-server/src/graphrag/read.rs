@@ -379,7 +379,7 @@ fn with_findings_in(
         .map(|n| n.to_string())
         .collect();
     let q = format!(
-        "SELECT ?r ?f ?o ?text ?p ?cite WHERE {{ VALUES ?r {{ {} }} GRAPH <{graph}> {{ ?r <{finding}> ?f . ?f <{order}> ?o ; <{text}> ?text . OPTIONAL {{ ?f ?p ?cite FILTER(?p IN (<{about}>, <{cites}>, <{claim}>, <{decision}>)) }} }} }} ORDER BY ?r ?o",
+        "SELECT ?r ?f ?o ?text ?p ?cite WHERE {{ GRAPH <{graph}> {{ VALUES ?r {{ {} }} ?r <{finding}> ?f . ?f <{order}> ?o ; <{text}> ?text . OPTIONAL {{ {{ ?f <{about}> ?cite BIND(<{about}> AS ?p) }} UNION {{ ?f <{cites}> ?cite BIND(<{cites}> AS ?p) }} UNION {{ ?f <{claim}> ?cite BIND(<{claim}> AS ?p) }} UNION {{ ?f <{decision}> ?cite BIND(<{decision}> AS ?p) }} }} }} }} ORDER BY ?r ?o",
         names.join(" "),
         finding = gr("finding"),
         order = gr("order"),
