@@ -1352,3 +1352,383 @@ datasets = {{ ev = "read" }}
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn graphrag_disclosure_mcp_pins_and_graph_cache_enforce_support_visibility() {
+    use sparkles::evidence::{
+        self as ev_api, ClaimInput, ClaimKind, ConflictMode, DecisionInput, Disposition,
+        EvidenceInput, Polarity, Policy, ProposeOptions, RecordKey, RecordRef, RecordVersion,
+        ReviewOptions, Settings, Sha256Digest, SourceContent, SourceRevisionInput,
+    };
+    use sparkles::task::Control;
+
+    const SOURCES_A: &str = "urn:ev:sources-a";
+    const CLAIMS_A: &str = "urn:ev:claims-a";
+    const DECISIONS: &str = "urn:ev:decisions";
+    const SUPPORTS: &str = "urn:ev:supports";
+    const ACCEPTED: &str = "urn:ev:accepted";
+
+    let h = |pw: &str| hash_password_with(pw, 8, 1, 1).unwrap();
+    let s = build(Fixture {
+        extra: format!(
+            r#"
+[[users]]
+name = "rout"
+password = "{rout}"
+[[users.grants]]
+dataset = "ev"
+level = "read"
+graphs = ["{ACCEPTED}", "urn:x-sparkles:graphrag:*"]
+
+[[users]]
+name = "ra"
+password = "{ra}"
+[[users.grants]]
+dataset = "ev"
+level = "read"
+graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}", "urn:x-sparkles:graphrag:*"]
+"#,
+            rout = h("rout-pw"),
+            ra = h("ra-pw"),
+        ),
+        ..Default::default()
+    });
+
+    let ds = s.state.attach("ev", DbType::Memory, None).unwrap();
+    ds.store
+        .set_retention(sparkles::history::Retention {
+            keep_commits: Some(64),
+            ..Default::default()
+        })
+        .unwrap();
+    ds.store
+        .activate_memory_configuration_history(
+            &sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap(),
+        )
+        .unwrap();
+
+    let settings = Settings {
+        enabled: true,
+        source_records: vec![SOURCES_A.into()],
+        proposals: vec![CLAIMS_A.into()],
+        decisions: vec![DECISIONS.into()],
+        supports: vec![SUPPORTS.into()],
+        projections: vec![ACCEPTED.into()],
+        policies: [(
+            "main".to_string(),
+            Policy {
+                version: 1,
+                admitted_kinds: vec![ClaimKind::Reported],
+                required_scope: Vec::new(),
+                conflicts: ConflictMode::AdmitLabelled,
+                boundary: vec![SOURCES_A.into(), CLAIMS_A.into()],
+                decisions: DECISIONS.into(),
+                supports: SUPPORTS.into(),
+                output: ACCEPTED.into(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Settings::default()
+    };
+    ev_api::configure(&ds.dataset, &settings, &Control::none()).unwrap();
+
+    let iri = |u: &str| oxrdf::NamedNode::new(u).unwrap();
+    let sha = |t: &str| Sha256Digest::of_bytes(t.as_bytes(), &Control::none()).unwrap();
+    let all = || Some(Arc::new(sparkles::access::GraphAccess::all()));
+    let prop = oxrdf::Triple::new(
+        iri("urn:release"),
+        iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+        iri("urn:Release"),
+    );
+    let input = EvidenceInput {
+        revisions: vec![SourceRevisionInput {
+            version: RecordVersion::V1,
+            key: RecordKey::new("rev-a").unwrap(),
+            source: iri("urn:source:a"),
+            source_key: RecordKey::new("src-a").unwrap(),
+            upstream_version: None,
+            content: SourceContent::MetadataOnly {
+                digest: sha("src-a"),
+            },
+            metadata: Default::default(),
+            times: Default::default(),
+            lineage: Default::default(),
+        }],
+        claims: vec![ClaimInput {
+            version: RecordVersion::V1,
+            key: RecordKey::new("claim-a").unwrap(),
+            occurrence_key: RecordKey::new("c1").unwrap(),
+            revision: RecordRef::Local(RecordKey::new("rev-a").unwrap()),
+            proposition: prop,
+            kind: ClaimKind::Reported,
+            polarity: Polarity::Positive,
+            attributed_author: iri("urn:author"),
+            scope: Default::default(),
+            confidence: Default::default(),
+            validity: None,
+        }],
+        ..Default::default()
+    };
+    let mut po = ProposeOptions::new(iri("urn:importer"));
+    po.source_graph = Some(iri(SOURCES_A));
+    po.proposal_graph = Some(iri(CLAIMS_A));
+    let p = ev_api::propose(
+        None,
+        &ds.dataset,
+        &ds.dataset,
+        &input,
+        &po,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    let rec = p.records.iter().find(|r| r.key == "claim-a").unwrap();
+    let mut ro = ReviewOptions::new(iri("urn:reviewer"));
+    ro.if_head = Some(ds.store.head_commit().seq);
+    ev_api::review(
+        None,
+        &ds.dataset,
+        &ds.dataset,
+        "main",
+        1,
+        &[DecisionInput {
+            key: "d1".into(),
+            target: rec.iri.clone(),
+            target_digest: rec.digest,
+            disposition: Disposition::Accepted,
+            supersedes: None,
+        }],
+        &ro,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+
+    // 1. GraphRAG disclosure guard: write a persisted report & footprint covering ACCEPTED.
+    const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
+    let fp = crate::graphrag::guard::capture(&crate::graphrag::guard::CaptureInput {
+        dataset: "ev",
+        branch: "main",
+        source_commit: ds.store.head_commit().seq,
+        principal: "alice",
+        caller: &sparkles::access::triples::Caller::default(),
+        endpoint: "graphrag",
+        view: None,
+        graphs: &[ACCEPTED.to_string()],
+        reports: &["urn:report:1".to_string()],
+    })
+    .unwrap();
+    {
+        let mut t = ds.store.write();
+        let mut labels = std::collections::HashMap::new();
+        for q in fp.quads(REPORTS) {
+            let ids = t.encode_quad(&q, &mut labels).unwrap();
+            t.insert(ids).unwrap();
+        }
+        let rq = oxrdf::Quad::new(
+            iri("urn:report:1"),
+            iri(&crate::graphrag::guard::gr("summary")),
+            oxrdf::Literal::new_simple_literal("secret projected release summary"),
+            oxrdf::GraphName::NamedNode(iri(REPORTS)),
+        );
+        let dq = oxrdf::Quad::new(
+            iri("urn:report:1"),
+            iri(&crate::graphrag::guard::gr("disclosure")),
+            iri(&fp.iri()),
+            oxrdf::GraphName::NamedNode(iri(REPORTS)),
+        );
+        for q in [rq, dq] {
+            let ids = t.encode_quad(&q, &mut labels).unwrap();
+            t.insert(ids).unwrap();
+        }
+        t.commit().unwrap();
+    }
+
+    // Admin (`alice`) sees the report; restricted `rout` (who has grant on ACCEPTED + reports) must NOT!
+    let report_q = format!(
+        "SELECT ?sum WHERE {{ GRAPH <{REPORTS}> {{ <urn:report:1> <{}> ?sum }} }}",
+        crate::graphrag::guard::gr("summary")
+    );
+    let admin_rep = call(
+        &s.app,
+        "POST",
+        "/ev/sparql",
+        &[
+            ("authorization", &b("alice")),
+            ("content-type", "application/sparql-query"),
+            ("accept", "application/sparql-results+json"),
+        ],
+        &report_q,
+    )
+    .await;
+    assert_eq!(admin_rep.status, StatusCode::OK, "{}", admin_rep.text());
+    assert!(
+        admin_rep
+            .text()
+            .contains("secret projected release summary")
+    );
+
+    let rout_rep = call(
+        &s.app,
+        "POST",
+        "/ev/sparql",
+        &[
+            ("authorization", &b("rout")),
+            ("content-type", "application/sparql-query"),
+            ("accept", "application/sparql-results+json"),
+        ],
+        &report_q,
+    )
+    .await;
+    assert_eq!(rout_rep.status, StatusCode::OK, "{}", rout_rep.text());
+    assert!(
+        !rout_rep.text().contains("secret projected release summary"),
+        "GraphRAG report over review-policy output graph leaked to restricted reader: {}",
+        rout_rep.text()
+    );
+
+    // Controlled guard path must also refuse exemption for `rout`.
+    let snap = ds.store.snapshot();
+    let rout_view = sparkles::access::GraphAccess::graphs(
+        sparkles::access::Graphs::Only(sparkles::access::GraphRule::new(
+            [ACCEPTED, "urn:x-sparkles:graphrag:*"],
+            &[],
+        )),
+        sparkles::access::Graphs::none(),
+    );
+    let guarded = crate::graphrag::guard::apply(rout_view, Some(&s.state.graphrag_guard));
+    let prep = sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+    let prepared = guarded.masked_controlled(&snap, &prep).unwrap();
+    assert!(
+        !prepared.allows_read_iri(REPORTS),
+        "controlled GraphRAG guard must not exempt reports over review-policy output graph"
+    );
+
+    // 2. HTTP /$/graph/{ds}/groups cache must invalidate after detach + re-configure at same commit.
+    let groups_req = || {
+        let app = s.app.clone();
+        async move {
+            let r = call(
+                &app,
+                "POST",
+                &format!("/$/graph/ev/groups?default-graph-uri={ACCEPTED}"),
+                &[
+                    ("authorization", &b("ra")),
+                    ("content-type", "application/json"),
+                ],
+                &serde_json::json!({
+                    "within": { "class": "urn:Release" },
+                })
+                .to_string(),
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            r.json()
+        }
+    };
+    let g_before = groups_req().await;
+    assert_eq!(
+        g_before["within"]["size"], 1,
+        "expected urn:release member before detach: {g_before}"
+    );
+    // Detach and re-protect ACCEPTED without advancing commit sequence.
+    ds.store
+        .detach_managed(sparkles::managed::OwnerKind::Evidence, ACCEPTED)
+        .unwrap();
+    ev_api::configure(&ds.dataset, &settings, &Control::none()).unwrap();
+    let g_after = groups_req().await;
+    assert_eq!(
+        g_after["within"]["size"], 0,
+        "stale groups cache returned urn:release after detach at same commit: {g_after}"
+    );
+
+    // 3. MCP Pins: warm vs cold explicit At::Commit and At::Snapshot preserve historical config
+    //    even after the live policy is removed.
+    let commit_with_policy = ds.store.head_commit().seq;
+    let ev_view = ds
+        .store
+        .evidence_view(
+            &sparkles::history::At::Commit(commit_with_policy),
+            &sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap(),
+        )
+        .unwrap();
+    ds.store
+        .create_bound_snapshot("snap-policy", &ev_view, &Default::default())
+        .unwrap();
+    let pins = crate::mcp::pins::Pins::default();
+    let ho = sparkles::history::HistoryOptions::default();
+    let map_err =
+        |e: sparkles::error::Error| crate::mcp::errors::ToolError::new("err", 500, e.to_string());
+    // Warm the MCP pin table at `At::Head` AND at explicit `At::Commit(commit_with_policy)`.
+    let _ = pins.resolve(&ds, None, &ho, &map_err).unwrap();
+    let warm_commit = pins
+        .resolve(
+            &ds,
+            Some(&sparkles::history::At::Commit(commit_with_policy)),
+            &ho,
+            &map_err,
+        )
+        .unwrap();
+
+    // Remove the review policy from live settings (detaching ACCEPTED first).
+    ds.store
+        .detach_managed(sparkles::managed::OwnerKind::Evidence, ACCEPTED)
+        .unwrap();
+    let mut removed = settings.clone();
+    removed.policies.clear();
+    removed.projections.clear();
+    ev_api::configure(&ds.dataset, &removed, &Control::none()).unwrap();
+
+    // Both warm and cold explicit At::Commit and At::Snapshot selections must still hide
+    // ACCEPTED from `rout` (who has only ACCEPTED grant).
+    let warm_commit_again = pins
+        .resolve(
+            &ds,
+            Some(&sparkles::history::At::Commit(commit_with_policy)),
+            &ho,
+            &map_err,
+        )
+        .unwrap();
+    let cold_pins = crate::mcp::pins::Pins::default();
+    let cold_commit = cold_pins
+        .resolve(
+            &ds,
+            Some(&sparkles::history::At::Commit(commit_with_policy)),
+            &ho,
+            &map_err,
+        )
+        .unwrap();
+    let named_snap = pins
+        .resolve(
+            &ds,
+            Some(&sparkles::history::At::Snapshot("snap-policy".into())),
+            &ho,
+            &map_err,
+        )
+        .unwrap();
+    let rout_only = Arc::new(sparkles::access::GraphAccess::graphs(
+        sparkles::access::Graphs::Only(sparkles::access::GraphRule::new([ACCEPTED], &[])),
+        sparkles::access::Graphs::none(),
+    ));
+    for (label, snap) in [
+        ("warm-first", warm_commit),
+        ("warm-again", warm_commit_again),
+        ("cold", cold_commit),
+        ("named-pin", named_snap),
+    ] {
+        let res = sparkles::sparql::query(
+            snap,
+            &format!("ASK {{ GRAPH <{ACCEPTED}> {{ ?s ?p ?o }} }}"),
+            &sparkles::sparql::QueryOptions {
+                graphs: Some(rout_only.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !res.boolean,
+            "MCP pin selection ({label}) leaked projected triple after live policy removal"
+        );
+    }
+}

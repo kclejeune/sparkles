@@ -393,7 +393,10 @@ impl super::Store {
         // remaining credit coupled before any permission-mask construction.
         held.release_to(retained);
         let snapshot = if !matches!(at, At::Head) && self.configuration_activated() {
-            self.pin_historical_evidence(logical, at, resolved_seq, snapshot, &selection)?
+            let (pinned_snap, pin_held) =
+                self.pin_historical_evidence(logical, at, resolved_seq, snapshot, &selection)?;
+            held.merge(pin_held);
+            pinned_snap
         } else {
             snapshot
         };

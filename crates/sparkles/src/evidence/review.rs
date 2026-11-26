@@ -1615,7 +1615,7 @@ fn caller_view(
     head: &Arc<crate::store::Snapshot>,
     preparation: &crate::access::Preparation,
 ) -> Result<Option<crate::access::PreparedView>> {
-    match access.filter(|a| a.hides_triples()) {
+    match access.filter(|a| !a.reads_everything()) {
         None => Ok(None),
         Some(a) => a
             .masked_controlled(head, preparation)

@@ -193,7 +193,7 @@ impl Runtime {
                 })
             }
             OpenedView::Rebuild(rebuild) => {
-                let whole = whole_reason(rebuild.access.as_ref())
+                let whole = key::whole_reason_on(rebuild.access.as_ref(), &rebuild.snap)
                     .map(str::to_string)
                     .or_else(|| rebuild.inference.as_ref().map(|i| i.reason().to_string()));
                 let mut c = Circuit::new(

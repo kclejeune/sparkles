@@ -732,6 +732,11 @@ impl Store {
         to: &Snapshot,
         o: &DiffOptions,
     ) -> Result<Option<Diff>> {
+        if o.graphs.as_ref().is_some_and(|a| !a.reads_everything())
+            && self.has_potential_evidence_visibility()
+        {
+            return Ok(None);
+        }
         let Some(generation) = mark.generation.upgrade() else {
             return Ok(None);
         };
@@ -796,12 +801,15 @@ impl Store {
         };
         let (mut log_changes, mut compared) = (0u64, 0u64);
         let mut method = DiffMethod::Same;
-        // protections that depend on the data: the difference of the two states as the
-        // view sees them, so that triples whose visibility changed count too
+        // protections that depend on the data (classes, patterns, or support-aware
+        // projection visibility): the difference of the two states as the view sees
+        // them, so that triples whose visibility changed count too
+        let evidence_vis = self.has_potential_evidence_visibility();
         let data_view = o.graphs.as_ref().filter(|a| {
             a.triples
                 .as_ref()
                 .is_some_and(|t| t.hides() && !t.state_independent())
+                || (evidence_vis && !a.reads_everything())
         });
         if lo != hi
             && let Some(view) = data_view
@@ -810,9 +818,10 @@ impl Store {
                 self.check_readable(r, at)?;
             }
             method = DiffMethod::Compare;
-            let (sa, _) = self.snapshot_at(&At::Commit(lo), &self.history_opts(o))?;
-            let (sb, _) = self.snapshot_at(&At::Commit(hi), &self.history_opts(o))?;
-            let (sa, sb) = (view.masked(&sa)?, view.masked(&sb)?);
+            let (at_lo, at_hi) = if a <= b { (from, to) } else { (to, from) };
+            let (sa, _) = self.snapshot_at(at_lo, &self.history_opts(o))?;
+            let (sb, _) = self.snapshot_at(at_hi, &self.history_opts(o))?;
+            let (sa, sb) = (view.bound(&sa).masked(&sa)?, view.bound(&sb).masked(&sb)?);
             compared += compare_states(&sa, &sb, &mut net)?;
         } else if lo != hi
             && let Some(n) = self.diff_via_change_log(&rf, from, &rt, to, o, &mut net)?

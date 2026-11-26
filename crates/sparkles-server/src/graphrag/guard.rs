@@ -322,8 +322,14 @@ fn uses_var(pattern: &str, var: &str) -> bool {
     })
 }
 
-/// Decide whether a reader's view covers a footprint.
-pub fn covers(reader: Option<&GraphAccess>, fp: &Footprint) -> Decision {
+/// Decide whether a reader's view covers a footprint, optionally checking whether any
+/// footprint input graph is governed by support-aware projection visibility (or an
+/// unavailable evidence registry) on the snapshot being read.
+pub fn covers_with_evidence(
+    reader: Option<&GraphAccess>,
+    fp: &Footprint,
+    is_support_gated: impl Fn(&str) -> bool,
+) -> Decision {
     if unrestricted(reader) {
         return Decision::Proven;
     }
@@ -342,6 +348,13 @@ pub fn covers(reader: Option<&GraphAccess>, fp: &Footprint) -> Decision {
         if !reads(v, &g.graph) {
             return Decision::Denied;
         }
+        // A GraphRAG footprint records only graph names and ordinary triple protections,
+        // not support-aware projection dependencies. Fail closed for restricted readers
+        // whenever an input graph is a review-policy output graph or evidence settings
+        // are unavailable.
+        if is_support_gated(&g.graph) {
+            return Decision::Unproven;
+        }
         for r in in_force_on(v, &g.graph) {
             let Some(p) = FpProtection::of(&r.protection) else {
                 return Decision::Unproven;
@@ -359,6 +372,11 @@ pub fn covers(reader: Option<&GraphAccess>, fp: &Footprint) -> Decision {
         }
     }
     Decision::Proven
+}
+
+/// Decide whether a reader's view covers a footprint.
+pub fn covers(reader: Option<&GraphAccess>, fp: &Footprint) -> Decision {
+    covers_with_evidence(reader, fp, |_| false)
 }
 
 /// The guarded graph that holds every footprint of a dataset (§6.2). No footprint
@@ -470,6 +488,21 @@ pub struct Index {
 impl Index {
     /// The guarded graphs that `view` may read at this snapshot (§6.3).
     pub fn proven(&self, view: &GraphAccess) -> Vec<String> {
+        self.proven_with_evidence(view, |_| false)
+    }
+
+    /// The guarded graphs that `view` may read at `snap`, failing closed for restricted
+    /// readers when any footprint input graph is governed by support-aware projection
+    /// visibility or unavailable evidence configuration.
+    pub fn proven_on(&self, snap: &Snapshot, view: &GraphAccess) -> Vec<String> {
+        self.proven_with_evidence(view, |g| snap.is_evidence_output_or_unavailable(g))
+    }
+
+    fn proven_with_evidence(
+        &self,
+        view: &GraphAccess,
+        is_support_gated: impl Fn(&str) -> bool,
+    ) -> Vec<String> {
         self.graphs
             .iter()
             .filter(|(g, f)| {
@@ -477,8 +510,10 @@ impl Index {
                     && !f.missing
                     && !f.footprints.is_empty()
                     && f.footprints.iter().all(|fp| {
-                        fp.as_ref()
-                            .is_some_and(|fp| covers(Some(view), fp) == Decision::Proven)
+                        fp.as_ref().is_some_and(|fp| {
+                            covers_with_evidence(Some(view), fp, &is_support_gated)
+                                == Decision::Proven
+                        })
                     })
             })
             .map(|(g, _)| g.clone())
@@ -682,7 +717,7 @@ struct Decide {
 
 impl GuardDecision for Decide {
     fn exempt(&self, snap: &Arc<Snapshot>) -> Vec<String> {
-        self.guard.index(snap).proven(&self.view)
+        self.guard.index(snap).proven_on(snap, &self.view)
     }
 
     fn exempt_controlled(

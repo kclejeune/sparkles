@@ -133,7 +133,7 @@ pub(super) fn exempt(
             };
             let mut output = Exemptions::new(preparation)?;
             for (name, state) in &cached.value.graphs {
-                if proven(name, state, view, preparation)? {
+                if proven(snap, name, state, view, preparation)? {
                     output.push(name)?;
                 }
             }
@@ -147,7 +147,7 @@ pub(super) fn exempt(
     let mut output = Exemptions::new(preparation)?;
     for bucket in index.value.graphs.values() {
         for graph in bucket {
-            if proven(&graph.name, &graph.state, view, preparation)? {
+            if proven(snap, &graph.name, &graph.state, view, preparation)? {
                 output.push(&graph.name)?;
             }
         }
@@ -584,7 +584,12 @@ fn normalized(a: &[String], b: &[String], preparation: &Preparation) -> Result<b
     Ok(true)
 }
 
-fn coverage(view: &GraphAccess, fp: &Footprint, preparation: &Preparation) -> Result<Decision> {
+fn coverage(
+    snap: &GuardSnapshot<'_>,
+    view: &GraphAccess,
+    fp: &Footprint,
+    preparation: &Preparation,
+) -> Result<Decision> {
     preparation.check()?;
     if view.read.is_all() {
         let mut hides = false;
@@ -607,6 +612,12 @@ fn coverage(view: &GraphAccess, fp: &Footprint, preparation: &Preparation) -> Re
     for graph in &fp.graphs {
         if !preparation.allows_iri(&view.read, &graph.graph)? {
             return Ok(Decision::Denied);
+        }
+        // Footprints do not capture support-aware projection visibility dependencies;
+        // fail closed for restricted readers whenever an input graph is a review-policy
+        // output graph or evidence configuration is unavailable.
+        if snap.is_evidence_output_or_unavailable(&graph.graph) {
+            return Ok(Decision::Unproven);
         }
         if let Some(rules) = &view.triples {
             for rule in &rules.rules {
@@ -657,6 +668,7 @@ fn coverage(view: &GraphAccess, fp: &Footprint, preparation: &Preparation) -> Re
 }
 
 fn proven(
+    snap: &GuardSnapshot<'_>,
     name: &str,
     state: &GraphFootprints,
     view: &GraphAccess,
@@ -670,7 +682,7 @@ fn proven(
         let Some(fp) = fp else {
             return Ok(false);
         };
-        if coverage(view, fp, preparation)? != Decision::Proven {
+        if coverage(snap, view, fp, preparation)? != Decision::Proven {
             return Ok(false);
         }
     }

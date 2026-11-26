@@ -260,10 +260,25 @@ pub(super) fn masked(
     rules: Option<&TripleRules>,
     snap: &Arc<Snapshot>,
 ) -> Result<Arc<Snapshot>> {
-    let ev_config = snap.evidence_projection_config();
-    let ev_active = match &ev_config {
-        Some(cfg) => cfg.has_applicable_output_uncontrolled(access, snap)?,
-        None => false,
+    let ev_config = if access.reads_everything() {
+        evidence::EvidenceConfig::None
+    } else {
+        snap.evidence_projection_config()
+    };
+    let ev_cfg = match &ev_config {
+        evidence::EvidenceConfig::None => None,
+        evidence::EvidenceConfig::Active(cfg) => Some(cfg),
+        evidence::EvidenceConfig::Unavailable(reason) => {
+            return Err(evidence::unavailable_error(reason));
+        }
+    };
+    let ev_policy_applicable =
+        ev_cfg.is_some_and(|cfg| cfg.has_readable_policy_output_uncontrolled(access));
+    let ev_active = match ev_cfg {
+        Some(cfg) if ev_policy_applicable => {
+            cfg.has_applicable_output_uncontrolled(access, snap)?
+        }
+        _ => false,
     };
     if rules.is_none() && !ev_active {
         return Ok(snap.clone());
@@ -272,7 +287,7 @@ pub(super) fn masked(
         Some(rules) => format!("{:?}|{}", access.read, rules.read_key()),
         None => format!("{:?}|none", access.read),
     };
-    if ev_active && let Some(cfg) = &ev_config {
+    if ev_policy_applicable && let Some(cfg) = ev_cfg {
         key.push_str("|ev:");
         key.push_str(&cfg.fingerprint);
     }
@@ -286,7 +301,7 @@ pub(super) fn masked(
             Some(rules) => hidden_quads(access, rules, snap)?,
             None => Vec::new(),
         };
-        if ev_active && let Some(cfg) = &ev_config {
+        if ev_active && let Some(cfg) = ev_cfg {
             let limits = rules.map_or_else(Limits::default, |r| r.limits);
             let prep = crate::access::Preparation::new(
                 crate::task::Control::none(),
@@ -295,12 +310,11 @@ pub(super) fn masked(
             let mut extra = crate::access::preparation::Buffer::new(&prep)?;
             evidence::append_hidden(access, &hidden, cfg, snap, &limits, &prep, &mut extra)?;
             if !extra.is_empty() {
-                if hidden.len().saturating_add(extra.len()) as u64 > limits.max_hidden {
-                    return Err(too_many(
-                        &limits,
-                        hidden.len().saturating_add(extra.len()) as u64,
-                    ));
+                let total = hidden.len().saturating_add(extra.len()) as u64;
+                if total > limits.max_hidden {
+                    return Err(too_many(&limits, total));
                 }
+                let _merge = prep.reserve((extra.len() as u64).saturating_mul(32))?;
                 hidden.extend_from_slice(&extra);
                 hidden.sort_unstable();
                 hidden.dedup();

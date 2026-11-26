@@ -284,6 +284,8 @@ pub struct Circuit {
     pub applied: u64,
     /// the snapshot of the latest pass
     pub snap: Option<Arc<Snapshot>>,
+    /// evidence projection visibility key of the latest pass
+    evidence_key: Option<String>,
     /// whose view of the dataset the circuit reads
     pub access: Option<Arc<GraphAccess>>,
     /// counters of the latest pass
@@ -520,6 +522,7 @@ impl Circuit {
             result: ZSet::new(),
             applied: 0,
             snap: None,
+            evidence_key: None,
             access,
             last: PassStats::default(),
             max_memory_bytes: None,
@@ -1337,8 +1340,17 @@ impl Circuit {
         // the schema may have changed in changes no pass saw
         self.inferred = InferredFootprint::default();
         self.budget.shrink_state_to(0);
-        let vis = Vis::new(self.access.as_ref(), &snap);
-        let (mut p, root) = self.pass(snap.clone(), None, &[], &[], &vis, control);
+        // When support-aware projection visibility is active or unavailable for a
+        // restricted caller, mask `snap` (or fail closed) before initializing operators.
+        let ev_key = snap.evidence_visibility_key();
+        let eval_snap = match self.access.as_ref().filter(|a| !a.reads_everything()) {
+            Some(a) if snap.has_evidence_projection_or_unavailable() => {
+                a.bound(&snap).masked(&snap)?
+            }
+            _ => snap.clone(),
+        };
+        let vis = Vis::new(self.access.as_ref(), &eval_snap);
+        let (mut p, root) = self.pass(eval_snap, None, &[], &[], &vis, control);
         let width = root.schema.len();
         let budget = p.budget_handle();
         let res = if p.prov.is_none() {
@@ -1389,6 +1401,7 @@ impl Circuit {
         let prev_applied = self.applied;
         self.applied = snap.commit;
         self.snap = Some(snap);
+        self.evidence_key = ev_key;
         self.last = stats;
         if let Err(e) = self.publish_fresh_version_budgeted() {
             self.applied = prev_applied;
@@ -1716,13 +1729,24 @@ impl Circuit {
                 remapped = true;
             }
         }
+        let ev_restricted = self.access.as_ref().is_some_and(|a| !a.reads_everything());
+        let new_ev_key = snap.evidence_visibility_key();
+        let ev_active_or_changed =
+            ev_restricted && (new_ev_key.is_some() || self.evidence_key.is_some());
+        let whole = super::runtime::whole_reason(self.access.as_ref()).is_some();
+        // If support-aware projection visibility is active or unavailable (or just turned
+        // off) on an incremental circuit that was not compiled as a whole-query recompute,
+        // rebuild over the masked snapshot so hidden projections never leak via deltas.
+        if ev_active_or_changed && !whole {
+            let (diff, lease) = self.reset_charged(d, control)?;
+            return Ok(ChargedAdvance::Reset(diff, lease));
+        }
         let vis = Vis::new(self.access.as_ref(), &snap);
         // protections that depend on the data make the whole query one `recompute`
         // node, and a change anywhere, even in a graph the principal cannot read, can
         // change what they hide: every change runs the pass. Inference makes the whole
         // query one `recompute` node too, which runs when the changes touch its
         // footprint over the inferred data.
-        let whole = super::runtime::whole_reason(self.access.as_ref()).is_some();
         if whole || self.inference.is_some() {
             let skip = match &self.inference {
                 Some(inf) if !whole => !self.inferred.touches(
@@ -1734,7 +1758,7 @@ impl Circuit {
                     &d.removed,
                     &vis,
                 )?,
-                _ => d.added.is_empty() && d.removed.is_empty(),
+                _ => d.added.is_empty() && d.removed.is_empty() && self.evidence_key == new_ev_key,
             };
             if skip {
                 let commit = snap.commit;
@@ -1754,7 +1778,9 @@ impl Circuit {
             let res = Self::run_delta(root, &mut p);
             let stats = p.stats;
             drop(p);
-            return self.finish_delta_pass(res, snap, stats, remapped);
+            let out = self.finish_delta_pass(res, snap, stats, remapped)?;
+            self.evidence_key = new_ev_key;
+            return Ok(out);
         }
         let (added, removed): (Vec<[Id; 4]>, Vec<[Id; 4]>) = if vis.everything() {
             (d.added.clone(), d.removed.clone())

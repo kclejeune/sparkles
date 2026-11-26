@@ -2347,10 +2347,19 @@ impl Store {
             .store(up.guard_required.load(Ordering::Relaxed), Ordering::Relaxed);
         let mut state = (*store.snapshot()).clone();
         state.dataset_id = self.owner_dataset_id();
+        state.branch_id = store.branch_id();
         state.delta = snap.delta.clone();
         state.version = snap.version;
         state.commit = root.seq;
         state.cache = set.cache.clone();
+        store.history_origin = Arc::new(evidence_view::HistoryOrigin::new_memory(
+            self.owner_dataset_id(),
+            store.branch_id(),
+            store.mem_history.clone(),
+            store.family.managed.clone(),
+            Arc::downgrade(&store.current),
+        ));
+        state.history_origin = Some(Arc::downgrade(&store.history_origin));
         store.current.store(Arc::new(state));
         self.failpoint("memory-branch-indexes");
         up.configure_indexes(&store)?;
@@ -3147,10 +3156,29 @@ impl Store {
                     }
                     let owner = self.owned_set()?.normalize(commit);
                     let upstream = self.branch_by_id(owner.branch_id)?;
-                    match at {
-                        At::Time(_) => self.snapshot_pinned(&upstream, at, options),
-                        _ => self.snapshot_pinned(&upstream, &At::Commit(commit.seq), options),
-                    }
+                    let (snapshot, resolved, origin) = match at {
+                        At::Time(_) => self.snapshot_pinned(&upstream, at, options)?,
+                        _ => self.snapshot_pinned(&upstream, &At::Commit(commit.seq), options)?,
+                    };
+                    // A named snapshot on `store` may carry a semantic `PinnedConfiguration`
+                    // distinct from the inherited RDF commit's own binding: re-pin it using
+                    // `store`'s pin table before returning.
+                    let snapshot =
+                        if matches!(at, At::Snapshot(_)) && self.configuration_activated() {
+                            use crate::history::ReadControl;
+                            let prep = options.temporary(crate::evidence::resolve::MEMORY_BYTES)?;
+                            let (pinned, _held) = self.pin_historical_evidence(
+                                store,
+                                at,
+                                resolved.commit.seq,
+                                snapshot,
+                                &prep,
+                            )?;
+                            pinned
+                        } else {
+                            snapshot
+                        };
+                    Ok((snapshot, resolved, origin))
                 }
                 None => Err(error),
             },

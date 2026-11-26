@@ -314,12 +314,15 @@ impl Store {
             managed_history::resolve_memory(published, configuration, &selection)?
         };
         selection.check()?;
-        let pinned = crate::access::triples::evidence::ProjectionConfig::from_generation(
-            configuration,
-            &document.value.owners,
-            &document.value.owner_settings,
-            &selection,
-        )?;
+        let (pinned, pin_held) =
+            crate::access::triples::evidence::ProjectionConfig::from_generation(
+                configuration,
+                &document.value.owners,
+                &document.value.owner_settings,
+                &selection,
+            )?;
+        let mut held = pair.held;
+        held.merge(pin_held);
         let snapshot = Arc::new(Snapshot {
             pinned_evidence: Some(pinned),
             ..(*pair.snapshot).clone()
@@ -337,7 +340,7 @@ impl Store {
                 configuration,
                 original_data_binding: pair.data,
                 document,
-                _held: pair.held,
+                _held: held,
                 preparation: preparation.without_selection_scope(),
             }),
         })
@@ -472,19 +475,36 @@ impl Store {
         seq: u64,
         preparation: &Preparation,
     ) -> Result<ConfigurationBinding> {
-        enum Source<'a> {
-            Borrowed(&'a Store),
-            Resident(Arc<Store>),
-            Cold(uuid::Uuid),
-        }
+        self.configuration_of_source(ConfigSource::Borrowed(store), seq, preparation)
+    }
+
+    fn configuration_of_branch_id(
+        &self,
+        branch_id: uuid::Uuid,
+        seq: u64,
+        preparation: &Preparation,
+    ) -> Result<ConfigurationBinding> {
+        let start = if branch_id == self.branch_id() {
+            ConfigSource::Borrowed(self)
+        } else {
+            ConfigSource::Cold(branch_id)
+        };
+        self.configuration_of_source(start, seq, preparation)
+    }
+
+    fn configuration_of_source<'a>(
+        &'a self,
+        mut source: ConfigSource<'a>,
+        seq: u64,
+        preparation: &Preparation,
+    ) -> Result<ConfigurationBinding> {
         use branching::readonly::{OriginRead, Purpose};
-        let mut source = Source::Borrowed(store);
         for _ in 0..1024 {
             preparation.check()?;
             let resident = match &source {
-                Source::Borrowed(store) => Some(*store),
-                Source::Resident(store) => Some(store.as_ref()),
-                Source::Cold(_) => None,
+                ConfigSource::Borrowed(store) => Some(*store),
+                ConfigSource::Resident(store) => Some(store.as_ref()),
+                ConfigSource::Cold(_) => None,
             };
             if let Some(store) = resident {
                 if let Some(identity) = &store.branching.ident
@@ -492,16 +512,16 @@ impl Store {
                 {
                     // Do not normalize through intermediate branch roots: each
                     // one's own primary origin must win at its exact sequence.
-                    source = Source::Cold(identity.from.branch_id);
+                    source = ConfigSource::Cold(identity.from.branch_id);
                     continue;
                 }
                 return store.configuration_binding_at(seq, preparation);
             }
-            let Source::Cold(id) = source else {
+            let ConfigSource::Cold(id) = source else {
                 unreachable!()
             };
             if id == self.branch_id() {
-                source = Source::Borrowed(self);
+                source = ConfigSource::Borrowed(self);
                 continue;
             }
             let (allowance, temporary) = preparation.reserve_available()?;
@@ -522,8 +542,8 @@ impl Store {
             )?;
             drop(temporary);
             match result {
-                OriginRead::Resident(store) => source = Source::Resident(store),
-                OriginRead::Inherited(parent) => source = Source::Cold(parent.branch_id),
+                OriginRead::Resident(store) => source = ConfigSource::Resident(store),
+                OriginRead::Inherited(parent) => source = ConfigSource::Cold(parent.branch_id),
                 OriginRead::Configuration {
                     binding,
                     first_bound_own,
@@ -548,10 +568,33 @@ impl Store {
         ))
     }
 
+    /// Pin a fail-closed [`EvidenceConfig::Unavailable`] onto `snapshot`, charging the
+    /// cloned snapshot header to `preparation`.
+    fn pin_unavailable(
+        snapshot: Arc<Snapshot>,
+        reason: String,
+        preparation: &Preparation,
+    ) -> Result<(Arc<Snapshot>, Reservation)> {
+        let bytes = (reason.capacity() as u64)
+            .saturating_add(crate::access::triples::evidence::PINNED_SNAPSHOT_HEADER_BYTES);
+        let held = preparation.reserve(bytes)?;
+        let pinned = Arc::new(Snapshot {
+            pinned_evidence: Some(
+                crate::access::triples::evidence::EvidenceConfig::Unavailable(reason),
+            ),
+            ..(*snapshot).clone()
+        });
+        Ok((pinned, held))
+    }
+
     /// When configuration history is activated and `at` selects a historical state or
     /// named snapshot, pin the resolved historical evidence visibility configuration onto
     /// `snapshot` so support-aware projection visibility uses the exact policies and
     /// protection nonces recorded at that state rather than current live settings.
+    ///
+    /// Fails closed by pinning [`EvidenceConfig::Unavailable`] whenever the managed
+    /// registry is unavailable, the named pin changed/expired, or an authenticated
+    /// historical configuration generation cannot be resolved.
     pub(super) fn pin_historical_evidence(
         &self,
         store: &Store,
@@ -559,34 +602,63 @@ impl Store {
         seq: u64,
         snapshot: Arc<Snapshot>,
         preparation: &Preparation,
-    ) -> Result<Arc<Snapshot>> {
+    ) -> Result<(Arc<Snapshot>, Reservation)> {
         if matches!(at, At::Head) || !self.configuration_activated() {
-            return Ok(snapshot);
+            return Ok((snapshot, preparation.reserve(0)?));
         }
         let Some(state) = self.managed_state_shared() else {
-            return Ok(snapshot);
+            return Ok((snapshot, preparation.reserve(0)?));
         };
-        let ManagedState::Installed(installed) = state.as_ref() else {
-            return Ok(snapshot);
+        let installed = match state.as_ref() {
+            ManagedState::Installed(installed) => installed,
+            ManagedState::Unavailable { reason, .. } => {
+                return Self::pin_unavailable(snapshot, reason.clone(), preparation);
+            }
         };
         let Some(history) = installed.configuration_history.as_ref() else {
-            return Ok(snapshot);
+            return Ok((snapshot, preparation.reserve(0)?));
         };
         let binding = match at {
             At::Snapshot(name) => {
                 let pinned = if let Some(h) = &store.history {
                     let h = preparation.lock(h)?;
-                    h.pins.get(name).and_then(|pin| pin.configuration.clone())
+                    h.pins
+                        .get(name)
+                        .map(|pin| (pin.seq, pin.expires_ms, pin.configuration.clone()))
                 } else if let Some(h) = &store.mem_history {
                     let h = preparation.lock(h)?;
                     h.pins
                         .get(name)
-                        .and_then(|(pin, _)| pin.configuration.clone())
+                        .map(|(pin, _)| (pin.seq, pin.expires_ms, pin.configuration.clone()))
                 } else {
                     None
                 };
-                match pinned {
-                    Some(cfg) => cfg.binding,
+                let Some((pin_seq, expires_ms, cfg)) = pinned else {
+                    return Self::pin_unavailable(
+                        snapshot,
+                        "named snapshot is no longer retained during configuration selection"
+                            .into(),
+                        preparation,
+                    );
+                };
+                if pin_seq != seq || expires_ms.is_some_and(|expiry| expiry <= store.now_ms()) {
+                    return Self::pin_unavailable(
+                        snapshot,
+                        "named snapshot changed or expired during configuration selection".into(),
+                        preparation,
+                    );
+                }
+                match cfg {
+                    Some(cfg) => {
+                        if let Err(e) = cfg.validate(self.owner_dataset_id()) {
+                            return Self::pin_unavailable(
+                                snapshot,
+                                format!("named snapshot configuration is invalid: {e}"),
+                                preparation,
+                            );
+                        }
+                        cfg.binding
+                    }
                     None => ConfigurationBinding::LegacyUnbound,
                 }
             }
@@ -601,13 +673,84 @@ impl Store {
                     Err(e @ (Error::Cancelled | Error::Timeout | Error::BudgetExceeded(_))) => {
                         return Err(e);
                     }
-                    Err(_) => return Ok(snapshot),
+                    Err(e) => {
+                        return Self::pin_unavailable(
+                            snapshot,
+                            format!("historical configuration binding cannot be resolved: {e}"),
+                            preparation,
+                        );
+                    }
                 }
             }
-            At::Head => return Ok(snapshot),
+            At::Head => return Ok((snapshot, preparation.reserve(0)?)),
         };
+        self.pin_resolved_binding(installed, history, binding, snapshot, preparation)
+    }
+
+    /// Pin historical evidence for a branch identified by `branch_id` (resident or cold).
+    pub(super) fn pin_historical_evidence_for_branch(
+        &self,
+        branch_id: uuid::Uuid,
+        at: &At,
+        seq: u64,
+        snapshot: Arc<Snapshot>,
+        preparation: &Preparation,
+    ) -> Result<(Arc<Snapshot>, Reservation)> {
+        if matches!(at, At::Head) || !self.configuration_activated() {
+            return Ok((snapshot, preparation.reserve(0)?));
+        }
+        if branch_id == self.branch_id() {
+            return self.pin_historical_evidence(self, at, seq, snapshot, preparation);
+        }
+        let Some(state) = self.managed_state_shared() else {
+            return Ok((snapshot, preparation.reserve(0)?));
+        };
+        let installed = match state.as_ref() {
+            ManagedState::Installed(installed) => installed,
+            ManagedState::Unavailable { reason, .. } => {
+                return Self::pin_unavailable(snapshot, reason.clone(), preparation);
+            }
+        };
+        let Some(history) = installed.configuration_history.as_ref() else {
+            return Ok((snapshot, preparation.reserve(0)?));
+        };
+        if matches!(at, At::Snapshot(_)) {
+            // Try resident branch store if open so named snapshot configuration is read.
+            if let Ok(branching::BranchStore::Other(branch_store)) = self.branch_by_id(branch_id) {
+                return self.pin_historical_evidence(&branch_store, at, seq, snapshot, preparation);
+            }
+            return Self::pin_unavailable(
+                snapshot,
+                "cold branch named snapshot configuration cannot be verified".into(),
+                preparation,
+            );
+        }
+        let binding = match self.configuration_of_branch_id(branch_id, seq, preparation) {
+            Ok(b) => b,
+            Err(e @ (Error::Cancelled | Error::Timeout | Error::BudgetExceeded(_))) => {
+                return Err(e);
+            }
+            Err(e) => {
+                return Self::pin_unavailable(
+                    snapshot,
+                    format!("cold branch historical configuration binding cannot be resolved: {e}"),
+                    preparation,
+                );
+            }
+        };
+        self.pin_resolved_binding(installed, history, binding, snapshot, preparation)
+    }
+
+    fn pin_resolved_binding(
+        &self,
+        installed: &crate::managed::Installed,
+        history: &managed_history::Root,
+        binding: ConfigurationBinding,
+        snapshot: Arc<Snapshot>,
+        preparation: &Preparation,
+    ) -> Result<(Arc<Snapshot>, Reservation)> {
         let Some(configuration) = binding.configuration() else {
-            return Ok(snapshot);
+            return Ok((snapshot, preparation.reserve(0)?));
         };
         let document = if let Some(root) = self.managed_root() {
             managed_history::resolve(
@@ -621,28 +764,422 @@ impl Store {
             if published.prepared.identity == history.identity(self.owner_dataset_id()) {
                 managed_history::resolve_memory(published, configuration, preparation)
             } else {
-                return Ok(snapshot);
+                return Self::pin_unavailable(
+                    snapshot,
+                    "historical configuration memory root differs".into(),
+                    preparation,
+                );
             }
         } else {
-            return Ok(snapshot);
+            return Self::pin_unavailable(
+                snapshot,
+                "historical configuration document storage is unavailable".into(),
+                preparation,
+            );
         };
         let document = match document {
             Ok(doc) => doc,
             Err(e @ (Error::Cancelled | Error::Timeout | Error::BudgetExceeded(_))) => {
                 return Err(e);
             }
-            Err(_) => return Ok(snapshot),
+            Err(e) => {
+                return Self::pin_unavailable(
+                    snapshot,
+                    format!("historical configuration document cannot be resolved: {e}"),
+                    preparation,
+                );
+            }
         };
-        let pinned = crate::access::triples::evidence::ProjectionConfig::from_generation(
+        let (pinned, held) = crate::access::triples::evidence::ProjectionConfig::from_generation(
             configuration,
             &document.value.owners,
             &document.value.owner_settings,
             preparation,
         )?;
-        Ok(Arc::new(Snapshot {
-            pinned_evidence: Some(pinned),
-            ..(*snapshot).clone()
-        }))
+        Ok((
+            Arc::new(Snapshot {
+                pinned_evidence: Some(pinned),
+                ..(*snapshot).clone()
+            }),
+            held,
+        ))
+    }
+}
+
+enum ConfigSource<'a> {
+    Borrowed(&'a Store),
+    Resident(Arc<Store>),
+    Cold(uuid::Uuid),
+}
+
+/// Non-owning handle owned by [`Store`] and weakly referenced by [`Snapshot`] so
+/// support-aware visibility can verify earlier-commit same-branch `ev:StoredFact`
+/// references against retained history without retaining `Family` or its process lock.
+pub(crate) struct HistoryOrigin {
+    dataset_id: uuid::Uuid,
+    branch_id: uuid::Uuid,
+    root: Option<PathBuf>,
+    managed_root: Option<PathBuf>,
+    history: Option<Arc<Mutex<crate::history::HistoryState>>>,
+    mem_history: Option<Arc<Mutex<crate::history::MemHistory>>>,
+    managed: Arc<arc_swap::ArcSwapOption<ManagedState>>,
+    current: std::sync::Weak<arc_swap::ArcSwap<Snapshot>>,
+    cache: Option<Arc<BlockCache>>,
+    results: Option<Arc<crate::sparql::cache::ResultCache>>,
+    union_default_graph: bool,
+    aggregate_errors: crate::sparql::AggregateErrors,
+    geo_op_vertices: u64,
+    history_cache_bytes: u64,
+}
+
+impl HistoryOrigin {
+    pub(crate) fn new_memory(
+        dataset_id: uuid::Uuid,
+        branch_id: uuid::Uuid,
+        mem_history: Option<Arc<Mutex<crate::history::MemHistory>>>,
+        managed: Arc<arc_swap::ArcSwapOption<ManagedState>>,
+        current: std::sync::Weak<arc_swap::ArcSwap<Snapshot>>,
+    ) -> Self {
+        Self {
+            dataset_id,
+            branch_id,
+            root: None,
+            managed_root: None,
+            history: None,
+            mem_history,
+            managed,
+            current,
+            cache: None,
+            results: None,
+            union_default_graph: false,
+            aggregate_errors: Default::default(),
+            geo_op_vertices: 0,
+            history_cache_bytes: 0,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_persistent(
+        dataset_id: uuid::Uuid,
+        branch_id: uuid::Uuid,
+        root: PathBuf,
+        managed_root: PathBuf,
+        history: Option<Arc<Mutex<crate::history::HistoryState>>>,
+        managed: Arc<arc_swap::ArcSwapOption<ManagedState>>,
+        current: std::sync::Weak<arc_swap::ArcSwap<Snapshot>>,
+        cache: Arc<BlockCache>,
+        results: Arc<crate::sparql::cache::ResultCache>,
+        union_default_graph: bool,
+        aggregate_errors: crate::sparql::AggregateErrors,
+        geo_op_vertices: u64,
+        history_cache_bytes: u64,
+    ) -> Self {
+        Self {
+            dataset_id,
+            branch_id,
+            root: Some(root),
+            managed_root: Some(managed_root),
+            history,
+            mem_history: None,
+            managed,
+            current,
+            cache: Some(cache),
+            results: Some(results),
+            union_default_graph,
+            aggregate_errors,
+            geo_op_vertices,
+            history_cache_bytes,
+        }
+    }
+
+    /// Resolve retained commit `seq` on this branch within `preparation`'s controls and
+    /// memory budget, pinning its historical evidence configuration when configuration
+    /// history is activated. Returns `Ok(None)` when the commit is no longer retained.
+    pub(crate) fn snapshot_at_commit(
+        &self,
+        seq: u64,
+        preparation: &Preparation,
+    ) -> Result<Option<(Arc<Snapshot>, Reservation)>> {
+        preparation.check()?;
+        let Some(current_swap) = self.current.upgrade() else {
+            return Ok(None);
+        };
+        let live = current_swap.load_full();
+        if let Some(mem) = &self.mem_history {
+            let m = preparation.lock(mem)?;
+            let snap = if seq == live.commit {
+                live.clone()
+            } else {
+                let Some(s) = m.get(seq) else {
+                    return Ok(None);
+                };
+                s
+            };
+            let binding = m.configurations.get(&seq).copied().unwrap_or_default();
+            drop(m);
+            let delta_bytes = history_limited::preparation_delta_bytes(&snap.delta)
+                .max(history_limited::SHARED_SNAPSHOT_BYTES);
+            let mut held = preparation.reserve(delta_bytes)?;
+            let (snap, pin_held) = self.pin_commit_binding(binding, snap, preparation)?;
+            held.merge(pin_held);
+            return Ok(Some((snap, held)));
+        }
+        let (Some(root), Some(hist), Some(cache), Some(results)) =
+            (&self.root, &self.history, &self.cache, &self.results)
+        else {
+            return Ok(None);
+        };
+        let current_gen = commit::generation_number(&live.generation.name);
+        let head_seq = live.commit;
+        let options = HistoryOptions {
+            cancel: Some(preparation.control().cancel.flag()),
+            deadline: preparation.control().deadline,
+        };
+        let (allowance, temp_guard) = preparation.reserve_available()?;
+        let mem_cap = allowance.min(
+            self.history_cache_bytes
+                .max(history_limited::SHARED_SNAPSHOT_BYTES),
+        );
+        let limit = ReadLimit {
+            options: &options,
+            memory: Some(mem_cap),
+            held: crate::history::READ_METADATA_BYTES,
+        };
+        let h = limit.lock(hist)?;
+        let Some(owner) = h.owner_with(seq, current_gen, head_seq, &limit)? else {
+            return Ok(None);
+        };
+        let cached = h
+            .cache
+            .iter()
+            .find(|e| e.generation == owner && e.seq == seq)
+            .map(|e| e.snap.clone());
+        let entry = h.gens.get(&owner).cloned();
+        drop(h);
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        let (snap, retained_bytes) = if let Some(cached) = cached {
+            (cached, history_limited::SHARED_SNAPSHOT_BYTES)
+        } else if seq == live.commit {
+            (live.clone(), history_limited::SHARED_SNAPSHOT_BYTES)
+        } else {
+            let mut budget = cold::ColdBudget::new(limit)?;
+            let generation = if owner == current_gen {
+                live.generation.clone()
+            } else {
+                let loaded = match cold::read_link_controlled(&entry.dir, &mut budget)? {
+                    Some(file) => Generation::open_linked_controlled(
+                        &entry.dir,
+                        &entry.name,
+                        root,
+                        file,
+                        cache,
+                        &mut budget,
+                    )?,
+                    None => Generation::open_sealed_controlled(
+                        &entry.dir,
+                        &entry.name,
+                        None,
+                        &mut budget,
+                    )?,
+                };
+                Arc::new(loaded.value)
+            };
+            let seed = generation.link.as_ref().map(|link| &link.base_delta);
+            let mut delta = seed.cloned().unwrap_or_default();
+            if seq > entry.base.seq {
+                let wal_path = entry.dir.join("wal.log");
+                let from = wal::WalPoint {
+                    seq: entry.base.seq,
+                    offset: 0,
+                };
+                let cursor_limit = budget.owned_limit()?;
+                let mut cursor = wal::WalCursor::open_with(&wal_path, from, &cursor_limit, 0)?;
+                let mut target = None;
+                while let Some((found, _, offset)) = cursor.next_with(&cursor_limit, 0)? {
+                    if found == seq {
+                        target = Some(wal::WalPoint { seq: found, offset });
+                        break;
+                    }
+                    if found > seq {
+                        break;
+                    }
+                }
+                let Some(target) = target else {
+                    return Ok(None);
+                };
+                wal::apply_forward(
+                    &wal_path,
+                    &generation,
+                    cache,
+                    &mut delta,
+                    from,
+                    target,
+                    &budget.owned_limit()?,
+                )?;
+            }
+            let delta_bytes = history_limited::preparation_delta_bytes(&delta)
+                .max(history_limited::SHARED_SNAPSHOT_BYTES);
+            let dvocab_len = generation.dvocab.len_limited(&limit)?;
+            let built = Arc::new(
+                SnapshotBuilder::of_generation(
+                    snapshot::Shared {
+                        dataset_id: self.dataset_id,
+                        branch_id: self.branch_id,
+                        cache,
+                        results,
+                        union_default_graph: self.union_default_graph,
+                        aggregate_errors: self.aggregate_errors,
+                        geo_op_vertices: self.geo_op_vertices,
+                        change_log: None,
+                        managed: Some(self.managed.clone()),
+                        history_origin: None,
+                    },
+                    generation,
+                    seq,
+                )
+                .delta(delta)
+                .dvocab_len(dvocab_len)
+                .historical(true)
+                .build(),
+            );
+            (built, delta_bytes)
+        };
+        drop(temp_guard);
+        let mut held = preparation.reserve(retained_bytes)?;
+        // Resolve historical configuration binding for persistent commit when activated.
+        let binding = self.persistent_binding_for(&entry, seq, preparation)?;
+        let (snap, pin_held) = self.pin_commit_binding(binding, snap, preparation)?;
+        held.merge(pin_held);
+        Ok(Some((snap, held)))
+    }
+
+    fn persistent_binding_for(
+        &self,
+        entry: &crate::history::GenEntry,
+        seq: u64,
+        preparation: &Preparation,
+    ) -> Result<ConfigurationBinding> {
+        let state = self.managed.load_full();
+        let Some(ManagedState::Installed(installed)) = state.as_deref() else {
+            return Ok(ConfigurationBinding::LegacyUnbound);
+        };
+        let Some(history) = installed.configuration_history.as_ref() else {
+            return Ok(ConfigurationBinding::LegacyUnbound);
+        };
+        let (allowance, _temp) = preparation.reserve_available()?;
+        let options = HistoryOptions {
+            cancel: Some(preparation.control().cancel.flag()),
+            deadline: preparation.control().deadline,
+        };
+        let limit = ReadLimit {
+            options: &options,
+            memory: Some(allowance),
+            held: 0,
+        };
+        let mut budget = cold::ColdBudget::new(limit)?;
+        let physical =
+            commit::read_gen_commit_controlled(&entry.dir, &mut budget)?.ok_or_else(|| {
+                managed_history::unavailable("retained generation has no commit identity")
+            })?;
+        if physical.value.commit.seq == seq {
+            return Ok(physical.value.configuration);
+        }
+        let from = wal::WalPoint {
+            seq: entry.base.seq,
+            offset: 0,
+        };
+        let cursor_limit = budget.owned_limit()?;
+        let mut cursor =
+            wal::WalCursor::open_with(&entry.dir.join("wal.log"), from, &cursor_limit, 0)?;
+        while let Some((found, _, _)) = cursor.next_with(&cursor_limit, 0)? {
+            if found > seq {
+                break;
+            }
+            if found == seq {
+                return Ok(match cursor.configuration() {
+                    Some(generation) => managed_history::binding(ConfigurationIdentity {
+                        dataset_id: self.dataset_id,
+                        lineage_id: history.lineage_id,
+                        generation,
+                    }),
+                    None => ConfigurationBinding::LegacyUnbound,
+                });
+            }
+        }
+        Err(managed_history::unavailable(
+            "retained WAL has no selected binding",
+        ))
+    }
+
+    fn pin_commit_binding(
+        &self,
+        binding: ConfigurationBinding,
+        snapshot: Arc<Snapshot>,
+        preparation: &Preparation,
+    ) -> Result<(Arc<Snapshot>, Reservation)> {
+        let state = self.managed.load_full();
+        let Some(state) = state else {
+            return Ok((snapshot, preparation.reserve(0)?));
+        };
+        let installed = match state.as_ref() {
+            ManagedState::Installed(installed) => installed,
+            ManagedState::Unavailable { reason, .. } => {
+                return Store::pin_unavailable(snapshot, reason.clone(), preparation);
+            }
+        };
+        let Some(history) = installed.configuration_history.as_ref() else {
+            return Ok((snapshot, preparation.reserve(0)?));
+        };
+        let Some(configuration) = binding.configuration() else {
+            return Ok((snapshot, preparation.reserve(0)?));
+        };
+        let document = if let Some(root) = &self.managed_root {
+            managed_history::resolve(root, self.dataset_id, history, configuration, preparation)
+        } else if let Some(published) = installed.history_memory.as_ref() {
+            if published.prepared.identity == history.identity(self.dataset_id) {
+                managed_history::resolve_memory(published, configuration, preparation)
+            } else {
+                return Store::pin_unavailable(
+                    snapshot,
+                    "historical configuration memory root differs".into(),
+                    preparation,
+                );
+            }
+        } else {
+            return Store::pin_unavailable(
+                snapshot,
+                "historical configuration document storage is unavailable".into(),
+                preparation,
+            );
+        };
+        let document = match document {
+            Ok(doc) => doc,
+            Err(e @ (Error::Cancelled | Error::Timeout | Error::BudgetExceeded(_))) => {
+                return Err(e);
+            }
+            Err(e) => {
+                return Store::pin_unavailable(
+                    snapshot,
+                    format!("historical configuration document cannot be resolved: {e}"),
+                    preparation,
+                );
+            }
+        };
+        let (pinned, held) = crate::access::triples::evidence::ProjectionConfig::from_generation(
+            configuration,
+            &document.value.owners,
+            &document.value.owner_settings,
+            preparation,
+        )?;
+        Ok((
+            Arc::new(Snapshot {
+                pinned_evidence: Some(pinned),
+                ..(*snapshot).clone()
+            }),
+            held,
+        ))
     }
 }
 

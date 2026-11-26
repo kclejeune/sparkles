@@ -44,7 +44,7 @@ mod notify;
 #[cfg(feature = "ontology")]
 mod ontology;
 mod paths;
-mod pins;
+pub(crate) mod pins;
 pub(crate) mod profiles;
 pub(crate) mod relevance;
 pub(crate) mod render;

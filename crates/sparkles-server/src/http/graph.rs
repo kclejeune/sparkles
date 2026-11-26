@@ -101,18 +101,20 @@ pub(super) async fn groups(
     blocking(move || {
         let started = Instant::now();
         let (snap, _) = super::history::snapshot_for(&ds, req.at.as_ref(), &opts)?;
+        let ev_key = snap.evidence_visibility_key();
         let key = cache::Key {
             branch: ds.store.branch_id(),
             commit: snap.commit,
             view: cache::view_key(opts.graphs.as_ref()),
-            // the dataset a request names with default-graph-uri and named-graph-uri, and
-            // the inferred overlay the dataset adds to the default graph
+            // the dataset a request names with default-graph-uri and named-graph-uri,
+            // the inferred overlay, and any active evidence projection visibility config
             extra: format!(
-                "{:?}|{:?}|{:?}|{}",
+                "{:?}|{:?}|{:?}|{}|{}",
                 opts.default_graph_uris,
                 opts.named_graph_uris,
                 opts.default_graph_extra,
-                rdfs_key(opts.rdfs.as_deref())
+                rdfs_key(opts.rdfs.as_deref()),
+                ev_key.as_deref().unwrap_or("")
             ),
             request: req.key(),
         };
@@ -155,19 +157,22 @@ pub(super) async fn facets(
     blocking(move || {
         let started = Instant::now();
         let (snap, _) = super::history::snapshot_for(&ds, req.at.as_ref(), &opts)?;
+        let ev_key = snap.evidence_visibility_key();
         let key = cache::Key {
             branch: ds.store.branch_id(),
             commit: snap.commit,
             view: cache::view_key(opts.graphs.as_ref()),
-            // a query set reads the prefixes and base the request's options give it
+            // a query set reads the prefixes and base the request's options give it,
+            // plus any active evidence projection visibility config
             extra: format!(
-                "{:?}|{:?}|{:?}|{}|{:?}|{:?}",
+                "{:?}|{:?}|{:?}|{}|{:?}|{:?}|{}",
                 opts.default_graph_uris,
                 opts.named_graph_uris,
                 opts.default_graph_extra,
                 rdfs_key(opts.rdfs.as_deref()),
                 opts.base_iri,
-                opts.prefixes
+                opts.prefixes,
+                ev_key.as_deref().unwrap_or("")
             ),
             request: req.key(),
         };

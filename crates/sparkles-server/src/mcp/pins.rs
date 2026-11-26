@@ -28,6 +28,9 @@ pub const IDLE: Duration = Duration::from_secs(600);
 struct Pin {
     commit: u64,
     snap: Arc<Snapshot>,
+    /// Whether `snap` carries pinned historical configuration (when configuration history
+    /// is activated) so explicit `At::Commit` selectors never reuse an unpinned live head.
+    pinned_config: bool,
     /// the dataset instance the snapshot belongs to: a dataset deleted and recreated
     /// under the same name never serves old pins
     owner: Weak<Dataset>,
@@ -67,10 +70,19 @@ impl Pins {
     ) -> Result<Arc<Snapshot>, ToolError> {
         let head = ds.store.snapshot();
         let now = self.now();
+        let cfg_active = ds.store.configuration_history_activated();
+        // Named snapshots may carry their own PinnedConfiguration distinct from the RDF
+        // commit's binding, and may expire or be replaced: always resolve directly through
+        // `snapshot_at` without reducing to `At::Commit` or serving commit-keyed pins.
+        if let Some(sel @ At::Snapshot(_)) = at {
+            return match ds.store.snapshot_at(sel, ho) {
+                Ok((snap, _)) => Ok(snap),
+                Err(e) => Err(history_error(ds, sel, head.commit, e, engine)),
+            };
+        }
         let c = match at {
             None | Some(At::Head) => None,
             Some(At::Commit(c)) => Some(*c),
-            // a time or a snapshot name selects a commit of the catalog
             Some(sel) => match ds.store.resolve(sel) {
                 Ok(r) => Some(r.commit.seq),
                 Err(e) => return Err(history_error(ds, sel, head.commit, e, engine)),
@@ -79,13 +91,22 @@ impl Pins {
         let c = {
             let mut inner = self.inner.lock();
             expire(&mut inner, now);
-            let Some(c) = c.filter(|&c| c != head.commit) else {
-                touch(&mut inner, ds, head.clone(), now);
+            let Some(c) = c else {
+                // Live `At::Head` (or omitted): return unpinned live head and record it
+                // as an unpinned entry without overwriting any pinned historical entry.
+                touch(&mut inner, ds, head.clone(), false, now);
                 return Ok(head);
             };
+            if !cfg_active && c == head.commit {
+                touch(&mut inner, ds, head.clone(), false, now);
+                return Ok(head);
+            }
             if let Some(p) = inner.get_mut(&ds.key()).and_then(|pins| {
-                pins.iter_mut()
-                    .find(|p| p.commit == c && p.owner.ptr_eq(&Arc::downgrade(ds)))
+                pins.iter_mut().find(|p| {
+                    p.commit == c
+                        && (!cfg_active || p.pinned_config)
+                        && p.owner.ptr_eq(&Arc::downgrade(ds))
+                })
             }) {
                 p.last_used = now;
                 return Ok(p.snap.clone());
@@ -103,15 +124,15 @@ impl Pins {
             }
             c
         };
-        // Not held here, but the dataset's history may keep the state. The table's lock
-        // is not held while the state is materialized.
+        // Not held here (or needs historical configuration pinning): resolve from the
+        // dataset's retained history. The table's lock is not held while materializing.
         let sel = At::Commit(c);
         let snap = match ds.store.snapshot_at(&sel, ho) {
             Ok((snap, _)) => snap,
             Err(e) => return Err(history_error(ds, &sel, head.commit, e, engine)),
         };
         let mut inner = self.inner.lock();
-        touch(&mut inner, ds, snap.clone(), self.now());
+        touch(&mut inner, ds, snap.clone(), cfg_active, self.now());
         Ok(snap)
     }
 
@@ -138,6 +159,7 @@ fn touch(
     inner: &mut HashMap<String, VecDeque<Pin>>,
     ds: &Arc<Dataset>,
     snap: Arc<Snapshot>,
+    pinned_config: bool,
     now: Instant,
 ) {
     let owner = Arc::downgrade(ds);
@@ -146,11 +168,16 @@ fn touch(
     pins.retain(|p| p.owner.ptr_eq(&owner));
     if let Some(p) = pins.iter_mut().find(|p| p.commit == snap.commit) {
         p.last_used = now;
-        p.snap = snap;
+        // Never downgrade a pinned historical snapshot to an unpinned live snapshot.
+        if pinned_config || !p.pinned_config {
+            p.snap = snap;
+            p.pinned_config = pinned_config;
+        }
     } else {
         pins.push_back(Pin {
             commit: snap.commit,
             snap,
+            pinned_config,
             owner,
             last_used: now,
         });

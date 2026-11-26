@@ -16,6 +16,19 @@ pub fn whole_reason(access: Option<&Arc<GraphAccess>>) -> Option<&'static str> {
         .map(|_| "protections that depend on the data")
 }
 
+/// Like [`whole_reason`], also forcing whole-query evaluation when `snap` has active
+/// or unavailable support-aware projection visibility for a restricted caller.
+pub fn whole_reason_on(
+    access: Option<&Arc<GraphAccess>>,
+    snap: &crate::store::Snapshot,
+) -> Option<&'static str> {
+    whole_reason(access).or_else(|| {
+        (access.is_some_and(|a| !a.reads_everything())
+            && snap.has_evidence_projection_or_unavailable())
+        .then_some("support-aware projection visibility")
+    })
+}
+
 /// A stable hash of what `access` lets a reader see: equal for equal grants. Guards a
 /// request decides at its snapshot count as keeping their graphs out, as they do in a
 /// circuit ([`Circuit::new`]).

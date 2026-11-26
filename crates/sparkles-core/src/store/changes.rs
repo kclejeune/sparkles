@@ -188,6 +188,16 @@ impl Store {
                     .into(),
             ));
         }
+        if o.graphs
+            .as_ref()
+            .is_some_and(|a| self.has_evidence_visibility_for_access(a))
+        {
+            return Err(Error::NotPermitted(
+                "the change feed is not available to a caller whose view is subject to \
+                 support-aware projection visibility; the diff between two commits is"
+                    .into(),
+            ));
+        }
         let head = self.head_commit();
         if after > head.seq {
             return Err(Error::NotFound(format!(

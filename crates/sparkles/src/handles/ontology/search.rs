@@ -400,7 +400,7 @@ impl Ontologies {
             }
         }
         let kinds = search.kinds.iter().fold(0u16, |k, x| k | x.bit());
-        let protected = access.as_ref().is_some_and(|a| a.hides_triples());
+        let protected = view.has_mask();
         let scope = query::Scope::new(ix, graphs, kinds, protected.then_some(&*view));
         let langs = query::language_ranks(ix, &search.languages);
         let prefixes = self.ds.prefixes();

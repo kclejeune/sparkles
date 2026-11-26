@@ -13,6 +13,7 @@ use super::*;
 /// result caches, the settings that shape its queries and its change log.
 pub(crate) struct Shared<'a> {
     pub dataset_id: uuid::Uuid,
+    pub branch_id: uuid::Uuid,
     pub cache: &'a Arc<BlockCache>,
     pub results: &'a Arc<crate::sparql::cache::ResultCache>,
     pub union_default_graph: bool,
@@ -20,6 +21,7 @@ pub(crate) struct Shared<'a> {
     pub geo_op_vertices: u64,
     pub change_log: Option<Arc<ChangeLog>>,
     pub managed: Option<Arc<arc_swap::ArcSwapOption<crate::managed::ManagedState>>>,
+    pub history_origin: Option<std::sync::Weak<evidence_view::HistoryOrigin>>,
 }
 
 /// A [`Snapshot`] under construction (see the module documentation).
@@ -38,6 +40,7 @@ impl SnapshotBuilder {
         let dvocab_len = generation.dvocab.len();
         SnapshotBuilder(Snapshot {
             dataset_id: shared.dataset_id,
+            branch_id: shared.branch_id,
             generation,
             delta: Delta::default(),
             version: 0,
@@ -58,6 +61,7 @@ impl SnapshotBuilder {
             change_log: shared.change_log,
             managed: shared.managed,
             pinned_evidence: None,
+            history_origin: shared.history_origin,
         })
     }
 
@@ -69,6 +73,7 @@ impl SnapshotBuilder {
     pub(crate) fn of_base(base: &Snapshot) -> SnapshotBuilder {
         SnapshotBuilder(Snapshot {
             dataset_id: base.dataset_id,
+            branch_id: base.branch_id,
             generation: base.generation.clone(),
             delta: Delta::default(),
             version: base.version,
@@ -89,6 +94,7 @@ impl SnapshotBuilder {
             change_log: base.change_log.clone(),
             managed: base.managed.clone(),
             pinned_evidence: None,
+            history_origin: base.history_origin.clone(),
         })
     }
 
@@ -164,6 +170,7 @@ impl Store {
     pub(super) fn shared(&self) -> Shared<'_> {
         Shared {
             dataset_id: self.owner_dataset_id(),
+            branch_id: self.branch_id(),
             cache: &self.cache,
             results: &self.results,
             union_default_graph: self.opts.union_default_graph,
@@ -171,6 +178,7 @@ impl Store {
             geo_op_vertices: self.opts.geo_op_vertices,
             change_log: self.changelog.clone(),
             managed: Some(self.family.managed.clone()),
+            history_origin: Some(Arc::downgrade(&self.history_origin)),
         }
     }
 

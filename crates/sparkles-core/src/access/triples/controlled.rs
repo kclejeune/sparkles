@@ -196,22 +196,33 @@ fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<Prepared
         }
     }
     let rules = access.triples.as_ref().filter(|_| hides);
-    let ev_config = snap.evidence_projection_config();
-    let ev_active = match &ev_config {
-        Some(cfg) => cfg.has_applicable_output(&access, snap, preparation)?,
+    let ev_config = if access.reads_everything() {
+        evidence::EvidenceConfig::None
+    } else {
+        snap.evidence_projection_config()
+    };
+    let ev_cfg = match &ev_config {
+        evidence::EvidenceConfig::None => None,
+        evidence::EvidenceConfig::Active(cfg) => Some(cfg),
+        evidence::EvidenceConfig::Unavailable(reason) => {
+            return Err(evidence::unavailable_error(reason));
+        }
+    };
+    let ev_policy_applicable = match ev_cfg {
+        Some(cfg) => cfg.has_readable_policy_output(&access, preparation)?,
         None => false,
     };
-    if rules.is_none() && !ev_active {
-        // A policy that hides no triples keeps an existing mask, which only hides more.
-        preparation.check()?;
-        return finish(access, snap.clone(), held, preparation, input);
-    }
-    let ev_fp = ev_active
-        .then(|| ev_config.as_ref().map(|c| c.fingerprint.as_str()))
-        .flatten();
-    let (key, key_held) =
-        cache_key_with_evidence(&access, rules.map(Arc::as_ref), ev_fp, preparation)?;
-    if let Some(mask) = &snap.mask {
+    if let Some(mask) = snap.mask.as_ref() {
+        if rules.is_none() && !ev_policy_applicable {
+            // A policy that hides no triples keeps an existing mask, which only hides more.
+            preparation.check()?;
+            return finish(access, snap.clone(), held, preparation, input);
+        }
+        let ev_fp = ev_policy_applicable
+            .then(|| ev_cfg.map(|c| c.fingerprint.as_str()))
+            .flatten();
+        let (key, key_held) =
+            cache_key_with_evidence(&access, rules.map(Arc::as_ref), ev_fp, preparation)?;
         // A mask left by another policy could show triples this policy hides, so only
         // this exact policy's own mask can be returned as its prepared view.
         if !preparation.compare(&mask.key, &key)?.is_eq() {
@@ -221,6 +232,21 @@ fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<Prepared
         preparation.check()?;
         return finish(access, snap.clone(), held, preparation, input);
     }
+    let ev_active = match ev_cfg {
+        Some(cfg) if ev_policy_applicable => {
+            cfg.has_applicable_output(&access, snap, preparation)?
+        }
+        _ => false,
+    };
+    if rules.is_none() && !ev_active {
+        preparation.check()?;
+        return finish(access, snap.clone(), held, preparation, input);
+    }
+    let ev_fp = ev_policy_applicable
+        .then(|| ev_cfg.map(|c| c.fingerprint.as_str()))
+        .flatten();
+    let (key, key_held) =
+        cache_key_with_evidence(&access, rules.map(Arc::as_ref), ev_fp, preparation)?;
     let existing = if use_controlled_cache {
         snap.counts.prepared_mask_slot(&key, preparation)?
     } else {
@@ -246,7 +272,7 @@ fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<Prepared
         Some(rules) => hidden(&access, rules, snap, preparation)?,
         None => Buffer::new(preparation)?,
     };
-    if ev_active && let Some(cfg) = &ev_config {
+    if ev_active && let Some(cfg) = ev_cfg {
         let limits = rules.map_or_else(Limits::default, |r| r.limits);
         let mut extra = Buffer::new(preparation)?;
         evidence::append_hidden(
@@ -266,6 +292,7 @@ fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<Prepared
                 ));
             }
             for &k in extra.iter() {
+                preparation.check()?;
                 hidden.push(k)?;
             }
             drop(extra);
@@ -300,6 +327,89 @@ fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<Prepared
     drop(key_held);
     preparation.check()?;
     finish(access, snapshot, held, preparation, input)
+}
+
+/// Mask a retained historical snapshot for nested `ev:StoredFact` verification under
+/// `access`, `preparation`, and recursion `depth`. Never populates any shared mask cache.
+pub(super) fn prepare_stored_fact_snapshot(
+    access: &GraphAccess,
+    snap: &Arc<Snapshot>,
+    preparation: &Preparation,
+    depth: u8,
+) -> Result<(Arc<Snapshot>, Reservation)> {
+    preparation.check()?;
+    let mut hides = false;
+    if let Some(rules) = &access.triples {
+        for rule in &rules.rules {
+            preparation.check()?;
+            if !rule.read.is_all() {
+                hides = true;
+                break;
+            }
+        }
+    }
+    let rules = access.triples.as_ref().filter(|_| hides);
+    let ev_config = if access.reads_everything() {
+        evidence::EvidenceConfig::None
+    } else {
+        snap.evidence_projection_config()
+    };
+    let ev_cfg = match &ev_config {
+        evidence::EvidenceConfig::None => None,
+        evidence::EvidenceConfig::Active(cfg) => Some(cfg),
+        evidence::EvidenceConfig::Unavailable(reason) => {
+            return Err(evidence::unavailable_error(reason));
+        }
+    };
+    let ev_active = match ev_cfg {
+        Some(cfg) => cfg.has_applicable_output(access, snap, preparation)?,
+        None => false,
+    };
+    if rules.is_none() && !ev_active {
+        return Ok((snap.clone(), preparation.reserve(0)?));
+    }
+    let mut hid = match rules {
+        Some(rules) => hidden(access, rules, snap, preparation)?,
+        None => Buffer::new(preparation)?,
+    };
+    if ev_active && let Some(cfg) = ev_cfg {
+        let limits = rules.map_or_else(Limits::default, |r| r.limits);
+        let mut extra = Buffer::new(preparation)?;
+        evidence::append_hidden_with_depth(
+            access,
+            &hid,
+            cfg,
+            snap,
+            &limits,
+            preparation,
+            &mut extra,
+            depth,
+        )?;
+        if !extra.is_empty() {
+            if hid.len().saturating_add(extra.len()) as u64 > limits.max_hidden {
+                return Err(too_many(
+                    &limits,
+                    hid.len().saturating_add(extra.len()) as u64,
+                ));
+            }
+            for &k in extra.iter() {
+                preparation.check()?;
+                hid.push(k)?;
+            }
+            drop(extra);
+            crate::access::preparation::sort_keys(&mut hid, preparation)?;
+            let mut kept = 0;
+            for index in 0..hid.len() {
+                preparation.check()?;
+                if kept == 0 || hid[kept - 1] != hid[index] {
+                    hid.swap(kept, index);
+                    kept += 1;
+                }
+            }
+            hid.truncate(kept);
+        }
+    }
+    apply_controlled(snap, hid, "", preparation)
 }
 
 fn already_masked() -> Error {

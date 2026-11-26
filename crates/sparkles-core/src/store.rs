@@ -624,6 +624,8 @@ impl Delta {
 pub struct Snapshot {
     /// Dataset family identity (shared by its branches and derived views).
     pub dataset_id: uuid::Uuid,
+    /// Logical branch identity (dataset id for `main`, branch UUID for a branch).
+    pub branch_id: uuid::Uuid,
     pub generation: Arc<Generation>,
     pub delta: Delta,
     pub version: u64,
@@ -665,9 +667,10 @@ pub struct Snapshot {
     /// Live family managed-graph registry, shared without holding `Family` or its lock.
     pub(crate) managed: Option<Arc<arc_swap::ArcSwapOption<crate::managed::ManagedState>>>,
     /// Pinned historical evidence visibility config resolved from configuration history.
-    /// `Some(None)` means the historical configuration had no active review policies.
-    pub(crate) pinned_evidence:
-        Option<Option<Arc<crate::access::triples::evidence::ProjectionConfig>>>,
+    pub(crate) pinned_evidence: Option<crate::access::triples::evidence::EvidenceConfig>,
+    /// Non-owning handle to the originating branch's retained history for exact
+    /// same-branch `ev:StoredFact` verification without retaining `Family`.
+    pub(crate) history_origin: Option<std::sync::Weak<evidence_view::HistoryOrigin>>,
 }
 
 /// The kind of term an id stands for (see [`Snapshot::term_kind`]).
@@ -725,17 +728,51 @@ pub enum Chunk<'a> {
 
 impl Snapshot {
     /// Active evidence review-policy configuration governing support-aware visibility of
-    /// accepted projections on this snapshot, if any.
+    /// accepted projections on this snapshot, or [`EvidenceConfig::Unavailable`] when the
+    /// governing registry or historical configuration cannot be verified.
     pub(crate) fn evidence_projection_config(
         &self,
-    ) -> Option<Arc<crate::access::triples::evidence::ProjectionConfig>> {
+    ) -> crate::access::triples::evidence::EvidenceConfig {
+        use crate::access::triples::evidence::EvidenceConfig;
         if let Some(pinned) = &self.pinned_evidence {
             return pinned.clone();
         }
-        let state = self.managed.as_ref()?.load_full()?;
+        let Some(state) = self.managed.as_ref().and_then(|m| m.load_full()) else {
+            return EvidenceConfig::None;
+        };
         match state.as_ref() {
             crate::managed::ManagedState::Installed(installed) => installed.evidence_visibility(),
-            crate::managed::ManagedState::Unavailable { .. } => None,
+            crate::managed::ManagedState::Unavailable { reason, .. } => {
+                EvidenceConfig::Unavailable(reason.clone())
+            }
+        }
+    }
+
+    /// Stable cache-key suffix capturing this snapshot's active support-aware projection
+    /// visibility configuration, if any (or `"unavailable"` when fail-closed).
+    pub fn evidence_visibility_key(&self) -> Option<String> {
+        use crate::access::triples::evidence::EvidenceConfig;
+        match self.evidence_projection_config() {
+            EvidenceConfig::None => None,
+            EvidenceConfig::Active(cfg) => Some(cfg.fingerprint.clone()),
+            EvidenceConfig::Unavailable(_) => Some("unavailable".to_string()),
+        }
+    }
+
+    /// Whether support-aware projection visibility is active or unavailable (requiring
+    /// masking or fail-closed refusal for restricted callers).
+    pub fn has_evidence_projection_or_unavailable(&self) -> bool {
+        !self.evidence_projection_config().is_none()
+    }
+
+    /// Whether `graph_iri` is a review-policy projection output graph on this snapshot or
+    /// the snapshot's managed evidence configuration is unavailable (fail closed).
+    pub fn is_evidence_output_or_unavailable(&self, graph_iri: &str) -> bool {
+        use crate::access::triples::evidence::EvidenceConfig;
+        match self.evidence_projection_config() {
+            EvidenceConfig::None => false,
+            EvidenceConfig::Active(cfg) => cfg.is_output_graph(graph_iri),
+            EvidenceConfig::Unavailable(_) => true,
         }
     }
     /// Whether this snapshot carries a triple-level access mask.
@@ -2102,7 +2139,10 @@ pub struct Store {
     /// pins, retention, generations and materialized past states (persistent stores)
     history: Option<Arc<Mutex<crate::history::HistoryState>>>,
     /// pins and the retention window of an in-memory store, as kept snapshots
-    mem_history: Option<Mutex<crate::history::MemHistory>>,
+    mem_history: Option<Arc<Mutex<crate::history::MemHistory>>>,
+    /// Non-owning handle owned by this store and weakly referenced by its snapshots so
+    /// support-aware masking can resolve retained same-branch `ev:StoredFact` commits.
+    history_origin: Arc<evidence_view::HistoryOrigin>,
     /// the net changes of every commit, kept across generations
     changelog: Option<Arc<ChangeLog>>,
     /// write guard checked before every commit (write-time validation)
@@ -2419,27 +2459,43 @@ impl Store {
         // long as the store
         let control_log = None;
         let control_state = None;
+        let mem_history = Some(Arc::new(Mutex::new(Default::default())));
+        let current = Arc::new(ArcSwap::from_pointee(
+            SnapshotBuilder::of_generation(
+                Shared {
+                    dataset_id,
+                    branch_id: dataset_id,
+                    cache: &cache,
+                    results: &results,
+                    union_default_graph: opts.union_default_graph,
+                    aggregate_errors: opts.aggregate_errors,
+                    geo_op_vertices: opts.geo_op_vertices,
+                    change_log: changelog.clone(),
+                    managed: Some(family.managed.clone()),
+                    history_origin: None,
+                },
+                gen_,
+                root.seq,
+            )
+            .build(),
+        ));
+        let history_origin = Arc::new(evidence_view::HistoryOrigin::new_memory(
+            dataset_id,
+            dataset_id,
+            mem_history.clone(),
+            family.managed.clone(),
+            Arc::downgrade(&current),
+        ));
+        {
+            let mut init = (*current.load_full()).clone();
+            init.history_origin = Some(Arc::downgrade(&history_origin));
+            current.store(Arc::new(init));
+        }
         let store = Store {
             root: None,
             group: None,
             commit_stats: Default::default(),
-            current: Arc::new(ArcSwap::from_pointee(
-                SnapshotBuilder::of_generation(
-                    Shared {
-                        dataset_id,
-                        cache: &cache,
-                        results: &results,
-                        union_default_graph: opts.union_default_graph,
-                        aggregate_errors: opts.aggregate_errors,
-                        geo_op_vertices: opts.geo_op_vertices,
-                        change_log: changelog.clone(),
-                        managed: Some(family.managed.clone()),
-                    },
-                    gen_,
-                    root.seq,
-                )
-                .build(),
-            )),
+            current,
             writer: Arc::new(Mutex::new(WriterState {
                 wal: None,
                 wal_len: 0,
@@ -2475,7 +2531,8 @@ impl Store {
             embed: Default::default(),
             deltas: Default::default(),
             history: None,
-            mem_history: Some(Mutex::new(Default::default())),
+            mem_history,
+            history_origin,
             changelog,
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
@@ -2964,32 +3021,69 @@ impl Store {
                 branching.set = branching::SetRef::Owner(set);
             }
         }
+        let owner_dataset_id = branching
+            .ident
+            .as_ref()
+            .map_or(dataset_id, |i| i.dataset_id);
+        let history_arc = Some(Arc::new(Mutex::new({
+            let mut history = history;
+            history.use_budget(match &opts.shared {
+                Some(s) => s.caches.history().clone(),
+                None => Arc::new(caches::ByteBudget::new(opts.history_cache_bytes)),
+            });
+            history
+        })));
+        let managed_root = branching
+            .set()
+            .filter(|s| !s.is_memory())
+            .map(|s| s.root().to_path_buf())
+            .unwrap_or_else(|| root.to_path_buf());
+        let current = Arc::new(ArcSwap::from_pointee(
+            SnapshotBuilder::of_generation(
+                Shared {
+                    dataset_id: owner_dataset_id,
+                    branch_id: dataset_id,
+                    cache: &cache,
+                    results: &results,
+                    union_default_graph: opts.union_default_graph,
+                    aggregate_errors: opts.aggregate_errors,
+                    geo_op_vertices: opts.geo_op_vertices,
+                    change_log: changelog.clone(),
+                    managed: Some(family.managed.clone()),
+                    history_origin: None,
+                },
+                gen_,
+                head.seq,
+            )
+            .delta(delta)
+            .version(version)
+            .build(),
+        ));
+        let history_origin = Arc::new(evidence_view::HistoryOrigin::new_persistent(
+            owner_dataset_id,
+            dataset_id,
+            root.to_path_buf(),
+            managed_root,
+            history_arc.clone(),
+            family.managed.clone(),
+            Arc::downgrade(&current),
+            cache.clone(),
+            results.clone(),
+            opts.union_default_graph,
+            opts.aggregate_errors,
+            opts.geo_op_vertices,
+            opts.history_cache_bytes,
+        ));
+        {
+            let mut init = (*current.load_full()).clone();
+            init.history_origin = Some(Arc::downgrade(&history_origin));
+            current.store(Arc::new(init));
+        }
         let store = Store {
             root: Some(root.to_path_buf()),
             group: Some(Arc::new(group::Coordinator::default())),
             commit_stats: Default::default(),
-            current: Arc::new(ArcSwap::from_pointee(
-                SnapshotBuilder::of_generation(
-                    Shared {
-                        dataset_id: branching
-                            .ident
-                            .as_ref()
-                            .map_or(dataset_id, |i| i.dataset_id),
-                        cache: &cache,
-                        results: &results,
-                        union_default_graph: opts.union_default_graph,
-                        aggregate_errors: opts.aggregate_errors,
-                        geo_op_vertices: opts.geo_op_vertices,
-                        change_log: changelog.clone(),
-                        managed: Some(family.managed.clone()),
-                    },
-                    gen_,
-                    head.seq,
-                )
-                .delta(delta)
-                .version(version)
-                .build(),
-            )),
+            current,
             writer: Arc::new(Mutex::new(WriterState {
                 wal: Some(Arc::new(wal)),
                 wal_len,
@@ -3024,15 +3118,9 @@ impl Store {
             vector: Default::default(),
             embed: Default::default(),
             deltas: Default::default(),
-            history: Some(Arc::new(Mutex::new({
-                let mut history = history;
-                history.use_budget(match &opts.shared {
-                    Some(s) => s.caches.history().clone(),
-                    None => Arc::new(caches::ByteBudget::new(opts.history_cache_bytes)),
-                });
-                history
-            }))),
+            history: history_arc,
             mem_history: None,
+            history_origin,
             changelog,
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
@@ -3388,6 +3476,65 @@ impl Store {
         Error::Branch(Box::new(e))
     }
 
+    /// Whether configuration history is activated on this store's family.
+    pub fn configuration_history_activated(&self) -> bool {
+        self.configuration_activated()
+    }
+
+    /// Whether support-aware projection visibility may apply on live or historical states
+    /// of this store (live active policies, unavailable managed state, or activated
+    /// configuration history that may have historical review policies).
+    pub(crate) fn has_potential_evidence_visibility(&self) -> bool {
+        if self.configuration_activated() {
+            return true;
+        }
+        let Some(state) = self.family.managed.load_full() else {
+            return false;
+        };
+        match state.as_ref() {
+            crate::managed::ManagedState::Unavailable { .. } => true,
+            crate::managed::ManagedState::Installed(installed) => {
+                !installed.evidence_visibility().is_none()
+            }
+        }
+    }
+
+    /// Whether support-aware projection visibility restricts a caller with `access` on
+    /// live or historical states of this store.
+    pub(crate) fn has_evidence_visibility_for_access(
+        &self,
+        access: &crate::access::GraphAccess,
+    ) -> bool {
+        if access.reads_everything() {
+            return false;
+        }
+        let Some(state) = self.family.managed.load_full() else {
+            return false;
+        };
+        match state.as_ref() {
+            crate::managed::ManagedState::Unavailable { .. } => true,
+            crate::managed::ManagedState::Installed(installed) => {
+                match installed.evidence_visibility() {
+                    crate::access::triples::evidence::EvidenceConfig::Unavailable(_) => true,
+                    crate::access::triples::evidence::EvidenceConfig::Active(cfg) => {
+                        cfg.settings.policies.values().any(|p| {
+                            oxrdf::NamedNode::new(&p.output).map_or(true, |n| {
+                                access.read.may_allow(Some(&oxrdf::Term::NamedNode(n)))
+                            })
+                        }) || self.configuration_activated()
+                    }
+                    crate::access::triples::evidence::EvidenceConfig::None => {
+                        self.configuration_activated()
+                            && installed
+                                .graphs
+                                .owners
+                                .contains_key(&crate::managed::OwnerKind::Evidence)
+                    }
+                }
+            }
+        }
+    }
+
     /// The state at `at`: the live snapshot when it names the current state, otherwise
     /// the retained generation's base index with its WAL replayed through the commit
     /// (cached, within `history_cache_bytes`).
@@ -3398,16 +3545,11 @@ impl Store {
     ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
         let (snap, resolved, _) = self.snapshot_at_inner(at, o, None)?;
         let snap = if !matches!(at, crate::history::At::Head) && self.configuration_activated() {
-            let control = crate::task::Control {
-                deadline: o.deadline,
-                ..o.cancel.clone().map_or_else(
-                    crate::task::Control::none,
-                    crate::task::Control::with_cancel,
-                )
-            };
-            let prep =
-                crate::access::Preparation::new(control, crate::evidence::resolve::MEMORY_BYTES)?;
-            self.pin_historical_evidence(self, at, resolved.commit.seq, snap, &prep)?
+            use crate::history::ReadControl;
+            let prep = o.temporary(crate::evidence::resolve::MEMORY_BYTES)?;
+            let (pinned, _held) =
+                self.pin_historical_evidence(self, at, resolved.commit.seq, snap, &prep)?;
+            pinned
         } else {
             snap
         };
@@ -3424,7 +3566,17 @@ impl Store {
         o: &crate::history::HistoryOptions,
         max_memory_bytes: u64,
     ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
-        let (snap, resolved, _) = self.snapshot_at_inner(at, o, Some(max_memory_bytes))?;
+        let (snap, resolved, charge) = self.snapshot_at_inner(at, o, Some(max_memory_bytes))?;
+        let snap = if !matches!(at, crate::history::At::Head) && self.configuration_activated() {
+            use crate::history::ReadControl;
+            let remaining = max_memory_bytes.saturating_sub(charge.delta_bytes);
+            let prep = o.temporary(remaining)?;
+            let (pinned, _held) =
+                self.pin_historical_evidence(self, at, resolved.commit.seq, snap, &prep)?;
+            pinned
+        } else {
+            snap
+        };
         Ok((snap, resolved))
     }
 
@@ -7340,9 +7492,15 @@ impl WriteTxn<'_> {
     /// not be retained past [`Self::discard_terms`]; prefer [`Self::prepare_read_view`]
     /// for budgeted read paths.
     pub fn read_view(&self) -> Result<Arc<Snapshot>> {
-        match self.opts.graphs.as_ref().filter(|a| a.hides_triples()) {
-            Some(a) if !self.is_dirty() => a.masked(&self.base),
-            Some(a) => a.masked(&Arc::new(self.view())),
+        match self.opts.graphs.as_ref().filter(|a| !a.reads_everything()) {
+            Some(a) => {
+                let snap = if !self.is_dirty() {
+                    self.base.clone()
+                } else {
+                    Arc::new(self.view())
+                };
+                a.bound(&snap).masked(&snap)
+            }
             None => Ok(Arc::new(self.view())),
         }
     }
@@ -8862,6 +9020,7 @@ pub(crate) fn replay_wal(
     let probe = SnapshotBuilder::of_generation(
         Shared {
             dataset_id: uuid::Uuid::nil(),
+            branch_id: uuid::Uuid::nil(),
             cache,
             results: from.results,
             union_default_graph: false,
@@ -8869,6 +9028,7 @@ pub(crate) fn replay_wal(
             geo_op_vertices: StoreOptions::default().geo_op_vertices,
             change_log: None,
             managed: None,
+            history_origin: None,
         },
         from.generation.clone(),
         0,

@@ -815,6 +815,7 @@ impl Store {
             SnapshotBuilder::of_generation(
                 Shared {
                     dataset_id: set.dataset_id,
+                    branch_id: id,
                     cache: &self.cache,
                     results: &self.results,
                     union_default_graph: set.opts.union_default_graph,
@@ -822,6 +823,7 @@ impl Store {
                     geo_op_vertices: set.opts.geo_op_vertices,
                     change_log: Some(log.value),
                     managed: Some(self.family.managed.clone()),
+                    history_origin: None,
                 },
                 generation,
                 metadata.seq,

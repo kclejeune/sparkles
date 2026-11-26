@@ -597,10 +597,9 @@ pub(crate) struct Installed {
     /// Present only after a real configuration-history activation/publication.
     pub configuration_history: Option<crate::store::managed_history::Root>,
     pub history_memory: Option<Arc<crate::store::managed_history::MemoryHistory>>,
-    /// Cached review-policy configuration for support-aware projection visibility
-    /// (spec C25 §5, item 582), computed lazily once per installed registry revision.
-    evidence_visibility:
-        std::sync::OnceLock<Option<Arc<crate::access::triples::evidence::ProjectionConfig>>>,
+    /// Review-policy configuration for support-aware projection visibility
+    /// (spec C25 §5, item 582), computed once when this registry revision is installed.
+    evidence_visibility: crate::access::triples::evidence::EvidenceConfig,
 }
 
 impl Installed {
@@ -628,27 +627,24 @@ impl Installed {
                 }
             }
         }
+        let evidence_visibility =
+            crate::access::triples::evidence::ProjectionConfig::from_installed_parts(
+                &graphs, &settings,
+            );
         Ok(Installed {
             graphs,
             by_key,
             settings,
             configuration_history: None,
             history_memory: None,
-            evidence_visibility: std::sync::OnceLock::new(),
+            evidence_visibility,
         })
     }
 
-    /// Cached evidence review-policy configuration for support-aware projection
-    /// visibility, or `None` when evidence is absent, disabled, or declares no review
-    /// policies.
-    pub(crate) fn evidence_visibility(
-        &self,
-    ) -> Option<Arc<crate::access::triples::evidence::ProjectionConfig>> {
-        self.evidence_visibility
-            .get_or_init(|| {
-                crate::access::triples::evidence::ProjectionConfig::from_installed(self)
-            })
-            .clone()
+    /// Evidence review-policy configuration for support-aware projection visibility,
+    /// resolved once at registry installation.
+    pub(crate) fn evidence_visibility(&self) -> crate::access::triples::evidence::EvidenceConfig {
+        self.evidence_visibility.clone()
     }
 
     /// The owner of the graph whose vocabulary key is `key`.

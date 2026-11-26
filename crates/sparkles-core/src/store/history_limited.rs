@@ -233,8 +233,17 @@ impl Store {
         options: &HistoryOptions,
         max_memory_bytes: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
-        let (snapshot, resolved, origin, _) =
+        let (snapshot, resolved, origin, charge) =
             self.snapshot_at_with_branch_limited_charged(store, at, options, max_memory_bytes)?;
+        let snapshot = if !matches!(at, At::Head) && self.configuration_activated() {
+            let remaining = max_memory_bytes.saturating_sub(charge.delta_bytes);
+            let prep = options.temporary(remaining)?;
+            let (pinned, _held) =
+                self.pin_historical_evidence(store, at, resolved.commit.seq, snapshot, &prep)?;
+            pinned
+        } else {
+            snapshot
+        };
         Ok((snapshot, resolved, origin))
     }
 
@@ -318,20 +327,40 @@ impl Store {
                 "a branch is resolved through the dataset's main store",
             ));
         }
-        if branch == self.dataset_id {
-            return self.snapshot_from_limited(
+        let (snapshot, resolved, origin, charge) = if branch == self.dataset_id {
+            self.snapshot_from_limited(
                 PinnedSource::Resident(branching::BranchStore::Main(self)),
                 at,
                 options,
                 max_memory_bytes,
-            );
-        }
-        self.listed_limited(branch, &limit)?;
-        let read =
-            self.snapshot_from_limited(PinnedSource::Cold(branch), at, options, max_memory_bytes)?;
-        // A branch deleted while it was read no longer names this state.
-        self.listed_limited(branch, &limit)?;
-        Ok(read)
+            )?
+        } else {
+            self.listed_limited(branch, &limit)?;
+            let read = self.snapshot_from_limited(
+                PinnedSource::Cold(branch),
+                at,
+                options,
+                max_memory_bytes,
+            )?;
+            // A branch deleted while it was read no longer names this state.
+            self.listed_limited(branch, &limit)?;
+            read
+        };
+        let snapshot = if !matches!(at, At::Head) && self.configuration_activated() {
+            let remaining = max_memory_bytes.saturating_sub(charge.delta_bytes);
+            let prep = options.temporary(remaining)?;
+            let (pinned, _held) = self.pin_historical_evidence_for_branch(
+                branch,
+                at,
+                resolved.commit.seq,
+                snapshot,
+                &prep,
+            )?;
+            pinned
+        } else {
+            snapshot
+        };
+        Ok((snapshot, resolved, origin, charge))
     }
 
     fn snapshot_pinned_limited(

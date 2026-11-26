@@ -345,6 +345,16 @@ impl Store {
     /// left out. Commits whose changes the log does not hold are listed in
     /// [`HistoryResult::unrecorded`].
     pub fn history_changes(&self, q: &HistoryQuery) -> Result<HistoryResult> {
+        if q.access
+            .as_ref()
+            .is_some_and(|a| self.has_evidence_visibility_for_access(a))
+        {
+            return Err(Error::NotPermitted(
+                "history queries are not available to a caller whose view is subject to \
+                 support-aware projection visibility"
+                    .into(),
+            ));
+        }
         let Some(log) = &self.changelog else {
             return Err(Error::HistoryUnsupported(
                 "this store has no change log".into(),
