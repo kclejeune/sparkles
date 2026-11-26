@@ -162,7 +162,7 @@ pub(crate) fn finish_sum_avg(
 ) -> Result<Id> {
     // AVG is Sum over Count, and Count leaves the errors out
     if rows > 0 && undef == rows && is_avg && ctx.aggregate_errors.avg_of_errors_zero() {
-        return Ok(ctx.intern_value(&Value::Integer(0.into())));
+        return ctx.try_intern_value(&Value::Integer(0.into()));
     }
     let _scratch = match value.as_ref() {
         Some(Value::BigInteger(i)) => {
@@ -173,7 +173,10 @@ pub(crate) fn finish_sum_avg(
         }
         _ => None,
     };
-    let id = value.as_ref().map_or(Id::UNDEF, |v| ctx.intern_value(v));
+    let id = match value.as_ref() {
+        Some(v) => ctx.try_intern_value(v)?,
+        None => Id::UNDEF,
+    };
     drop(value);
     drop(_scratch);
     ctx.check()?;
@@ -208,7 +211,7 @@ pub(crate) fn finish_concat(
         return Ok(Id::UNDEF);
     }
     if text.is_empty() {
-        let id = ctx.intern_key(&[b'"', crate::id::KEY_SEP]);
+        let id = ctx.try_intern_key(&[b'"', crate::id::KEY_SEP])?;
         ctx.check()?;
         return Ok(id);
     }
@@ -238,7 +241,7 @@ pub(crate) fn finish_concat(
     key.copy_within(0..len, 1);
     key[0] = b'"';
     key.push(crate::id::KEY_SEP);
-    let id = ctx.intern_key(&key);
+    let id = ctx.try_intern_key(&key)?;
     drop(key);
     drop(_scratch);
     ctx.check()?;
@@ -271,9 +274,10 @@ pub(crate) trait Accumulator: Send {
 
     /// Fold group `j` of `other`, which saw rows that come after the rows of this
     /// accumulator, into group `into[j]` of this one, for every group of `other`.
-    /// `other` is of the same kind and aggregate. An accumulator that is not
-    /// [`mergeable`](Accumulator::mergeable) leaves its groups as they are and fails.
-    #[allow(dead_code, reason = "merge serves item 1066's parallel grouping")]
+    /// `other` is of the same kind and aggregate. `into` must have one entry per group
+    /// of `other`, every destination must be in bounds of `self`, and all destinations
+    /// must be distinct; violating that precondition or attempting an inexact merge
+    /// leaves both accumulators unchanged and returns `Err(Error::Unsupported(_))`.
     fn merge(
         &mut self,
         _ctx: &Ctx,
@@ -315,6 +319,13 @@ pub(crate) trait Accumulator: Send {
         Err(Error::unsupported(
             "this aggregate cannot be read without finishing",
         ))
+    }
+
+    /// Upper bound on bytes that calling [`Accumulator::finish`] for every group can
+    /// charge to `ctx.retain_bytes()` when interning results. Polls `ctx.check()` in
+    /// bounded chunks so cancellation and deadlines remain responsive.
+    fn finish_intern_bytes(&self, _ctx: &Ctx) -> Result<u64> {
+        Ok(0)
     }
 
     /// Whether [`Accumulator::retract`] can take back every row.
@@ -410,12 +421,40 @@ pub(crate) fn retractable(agg: &Agg, row_width: usize) -> Result<Box<dyn Accumul
     }
 }
 
+/// Whether `into` contains an out-of-bounds (`>= limit`) or repeated destination.
+fn has_invalid_or_duplicate_dest(into: &[u32], limit: usize) -> bool {
+    if into.len() <= 1 {
+        return into.first().is_some_and(|&to| to as usize >= limit);
+    }
+    if limit <= 4_096 {
+        let mut seen = [0u64; 64];
+        for &to in into {
+            let idx = to as usize;
+            if idx >= limit {
+                return true;
+            }
+            let bit = 1u64 << (idx & 63);
+            let word = &mut seen[idx >> 6];
+            if (*word & bit) != 0 {
+                return true;
+            }
+            *word |= bit;
+        }
+        false
+    } else {
+        let mut seen = FxHashSet::with_capacity_and_hasher(into.len(), Default::default());
+        into.iter()
+            .any(|&to| to as usize >= limit || !seen.insert(to))
+    }
+}
+
 /// The aggregates whose state is [`AggState`]: COUNT, SUM, AVG, MIN, MAX, SAMPLE and
 /// ARQ's variance and deviation aggregates.
 #[derive(Clone)]
 pub(crate) struct Running {
     agg: Agg,
-    /// Whether the decoded bytes of the best values are tracked, for a charged grouping
+    /// Whether heap-owned state (decoded best values, `Box<DecimalSum>`) is tracked, for
+    /// a charged grouping
     track: bool,
     states: Vec<AggState>,
     /// The decoded bytes of the best value of each group of a MIN or MAX, which the
@@ -464,7 +503,7 @@ impl Accumulator for Running {
         for _ in 0..groups {
             self.states.push(AggState::new(&self.agg));
         }
-        if self.is_best() {
+        if self.track && self.is_best() {
             self.payload.resize(self.states.len(), 0);
         }
     }
@@ -630,12 +669,9 @@ impl Accumulator for Running {
         Ok(())
     }
 
-    /// A merged SUM or AVG can differ from one pass in three ways. A float or double
-    /// subtotal can round differently. An integer subtotal beyond the decimal range
-    /// leaves the result unbound where one pass would have promoted it to a double. A
-    /// decimal sum that overflows partway through one pass, and so stays unbound, can
-    /// fit when its parts are summed apart. No caller merges these yet. Roadmap item
-    /// 1066, the parallel split that merges partitions, settles them before it does.
+    /// `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` and `SAMPLE` support merging; `SUM`, `AVG`,
+    /// `MIN` and `MAX` verify exactness against single-pass semantics per group and
+    /// refuse cleanly when rounding, overflow or non-transitive ordering could differ.
     fn mergeable(&self) -> bool {
         crate::sparql::exec::stat_aggregate(&self.agg.func).is_none()
     }
@@ -651,6 +687,16 @@ impl Accumulator for Running {
             .as_any()
             .downcast_mut::<Running>()
             .expect("an accumulator of the same kind");
+        if other.states.len() != into.len()
+            || has_invalid_or_duplicate_dest(into, self.states.len())
+            || other
+                .states
+                .iter()
+                .zip(into)
+                .any(|(state, &to)| !self.states[to as usize].can_merge(state))
+        {
+            return Err(Error::unsupported("this aggregate cannot be merged"));
+        }
         if self.is_best() {
             for (from, &to) in other.payload.iter().zip(into) {
                 let held = &mut self.payload[to as usize];
@@ -666,9 +712,8 @@ impl Accumulator for Running {
             other.payload.clear();
         }
         for (state, &to) in std::mem::take(&mut other.states).into_iter().zip(into) {
-            if !self.states[to as usize].merge(ctx, &self.agg, state) {
-                return Err(Error::unsupported("this aggregate cannot be merged"));
-            }
+            let merged = self.states[to as usize].merge(ctx, &self.agg, state);
+            debug_assert!(merged, "validated by can_merge");
             if self.track && self.is_sum() {
                 let held_now = self.states[to as usize].sum_heap_bytes();
                 if held_now > 0 {
@@ -730,6 +775,26 @@ impl Accumulator for Running {
 
     fn read(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
         self.states[group].read(ctx, &self.agg)
+    }
+
+    fn finish_intern_bytes(&self, ctx: &Ctx) -> Result<u64> {
+        if matches!(
+            self.agg.func,
+            AggregateFunction::Count
+                | AggregateFunction::Min
+                | AggregateFunction::Max
+                | AggregateFunction::Sample
+        ) {
+            return Ok(0);
+        }
+        let mut total = 0u64;
+        for (i, state) in self.states.iter().enumerate() {
+            if i.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            total = total.saturating_add(state.finish_intern_bytes(&self.agg));
+        }
+        Ok(total)
     }
 
     fn retractable(&self) -> bool {
@@ -2206,6 +2271,11 @@ impl Accumulator for Concat {
             .as_any()
             .downcast_mut::<Concat>()
             .expect("an accumulator of the same kind");
+        if other.groups.len() != into.len()
+            || has_invalid_or_duplicate_dest(into, self.groups.len())
+        {
+            return Err(Error::unsupported("this aggregate cannot be merged"));
+        }
         for (i, (from, &to)) in std::mem::take(&mut other.groups)
             .into_iter()
             .zip(into)
@@ -2268,6 +2338,19 @@ impl Accumulator for Concat {
             },
         );
         finish_concat(ctx, self.distinct, state.empty, state.ok, state.text)
+    }
+
+    fn finish_intern_bytes(&self, ctx: &Ctx) -> Result<u64> {
+        let mut total = 0u64;
+        for (i, state) in self.groups.iter().enumerate() {
+            if i.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            if state.ok {
+                total = total.saturating_add((state.text.len() as u64).saturating_add(128));
+            }
+        }
+        Ok(total)
     }
 
     fn group_bytes(&self) -> u64 {
@@ -2408,6 +2491,10 @@ impl Accumulator for Distinct {
     ) -> Result<Id> {
         self.inner
             .finish_replay(ctx, group, aggregate, deferred, scratch)
+    }
+
+    fn finish_intern_bytes(&self, ctx: &Ctx) -> Result<u64> {
+        self.inner.finish_intern_bytes(ctx)
     }
 
     fn take_growth(&mut self) -> u64 {

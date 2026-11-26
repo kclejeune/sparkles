@@ -546,3 +546,105 @@ fn a_group_larger_than_its_partition_is_aggregated_whole() {
     assert!(plan.contains("\"spillPasses\""), "{plan}");
     assert_eq!(spill.reserved_bytes(), 0);
 }
+
+/// An eager parallel grouping (`>= PAR_THRESHOLD` rows on multiple threads) whose charged
+/// state or non-inline double finalization exceeds the memory budget must hand off cleanly
+/// through `group_or_spill` without latching `ctx.memory_failure`.
+#[test]
+fn parallel_eager_grouping_hands_off_cleanly_to_spill() {
+    use sparkles_core::sparql::{ExecutionMode, QueryExecution, query_execution};
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+
+    // 1. High-cardinality eager grouping (60,000 rows, 20,000 groups) on 4 threads.
+    let s = store(20_000);
+    let tmp = tempfile::tempdir().unwrap();
+    let sp = spill(tmp.path());
+    let q = "SELECT (COUNT(*) AS ?groups) (SUM(?n) AS ?rows) (SUM(?sum) AS ?total) { \
+             SELECT ?s (COUNT(*) AS ?n) (SUM(?v) AS ?sum) { ?s <urn:p> ?v } GROUP BY ?s }";
+    let expected = eager(&s, q);
+    let opts = QueryOptions {
+        max_memory_bytes: Some(MEMORY),
+        spill: Some(sp.clone()),
+        no_cache: true,
+        ..Default::default()
+    };
+    let cursor = CursorOptions::default();
+    let (rows, plan) = pool.install(|| {
+        let execution =
+            query_execution(s.snapshot(), q, &opts, &cursor, ExecutionMode::Eager).unwrap();
+        let plan = execution.plan_json().unwrap();
+        let QueryExecution::Eager(r) = execution else {
+            panic!("expected eager result: {plan}");
+        };
+        let rows: Vec<String> = r
+            .result()
+            .rows()
+            .unwrap()
+            .into_iter()
+            .map(|r| format!("{r:?}"))
+            .collect();
+        (rows, plan)
+    });
+    assert_eq!(rows, expected);
+    assert!(plan.contains("partitioned to disk"), "{plan}");
+    assert_eq!(sp.reserved_bytes(), 0);
+
+    // 2. Non-inline tiny-double AVG(?v) eager grouping (8,192 groups × 2 rows = 16,384 rows):
+    // tight memory forces `group_or_spill` retry; unlatched fallible interning lets spill
+    // complete cleanly and match the unconstrained eager result.
+    let ds = Store::in_memory(StoreOptions::default());
+    let tiny_base = (1e-250_f64).to_bits();
+    let mut data = String::new();
+    for k in 0..8_192usize {
+        let x = f64::from_bits(tiny_base + ((k as u64) << 4) + 1);
+        data.push_str(&format!(
+            "<urn:d:{k}> <urn:v> \"{x}\"^^<http://www.w3.org/2001/XMLSchema#double> .\n"
+        ));
+        data.push_str(&format!(
+            "<urn:d:{k}> <urn:v> \"0.0\"^^<http://www.w3.org/2001/XMLSchema#double> .\n"
+        ));
+    }
+    ds.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let q_avg = "SELECT (COUNT(*) AS ?groups) { \
+                 SELECT ?s (AVG(?v) AS ?avg) { ?s <urn:v> ?v } GROUP BY ?s }";
+    let expected_avg = eager(&ds, q_avg);
+    let opts_avg = QueryOptions {
+        max_memory_bytes: Some(5 << 20),
+        spill: Some(sp.clone()),
+        no_cache: true,
+        ..Default::default()
+    };
+    let (rows_avg, plan_avg) = pool.install(|| {
+        let execution = query_execution(
+            ds.snapshot(),
+            q_avg,
+            &opts_avg,
+            &cursor,
+            ExecutionMode::Eager,
+        )
+        .unwrap();
+        let plan = execution.plan_json().unwrap();
+        let QueryExecution::Eager(r) = execution else {
+            panic!("expected eager result: {plan}");
+        };
+        let rows: Vec<String> = r
+            .result()
+            .rows()
+            .unwrap()
+            .into_iter()
+            .map(|r| format!("{r:?}"))
+            .collect();
+        (rows, plan)
+    });
+    assert_eq!(rows_avg, expected_avg);
+    assert!(plan_avg.contains("partitioned to disk"), "{plan_avg}");
+    assert_eq!(sp.reserved_bytes(), 0);
+}

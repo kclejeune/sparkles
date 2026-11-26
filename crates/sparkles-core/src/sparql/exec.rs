@@ -8237,88 +8237,154 @@ impl SumAdmit for CallbackAdmit<'_> {
     }
 }
 
-/// Non-`i128` numeric subtotal of [`AggState::Sum`].
+/// Upper bound on bytes [`Ctx::try_intern_value`] can charge to `ctx.retain_bytes()`
+/// for a `Value::Double(x)`. Rust's `f64` `Display` writes fixed-point decimal text
+/// (up to 327 bytes for negative subnormals / `~1e-308`, up to 310 bytes near `f64::MAX`),
+/// plus typed-literal key framing (`"` + `KEY_SEP` + `^` + `xsd:double`, 43 bytes) and
+/// the interner's 96-byte local-vocabulary overhead.
+pub(super) fn double_intern_bytes(x: f64) -> u64 {
+    if Id::from_f64(x).is_some() {
+        return 0;
+    }
+    const OVERHEAD: u64 = 144;
+    if !x.is_finite() {
+        return 4 + OVERHEAD;
+    }
+    let biased = (x.to_bits() >> 52) & 0x7ff;
+    let lex_bound = if biased >= 1023 {
+        let e2 = biased - 1023;
+        ((e2 + 1) * 30_103) / 100_000 + 20
+    } else {
+        let e2_neg = if biased == 0 { 1074 } else { 1023 - biased };
+        (e2_neg * 30_103) / 100_000 + 21
+    };
+    lex_bound + OVERHEAD
+}
+
+/// Heap bytes owned by a `SumAcc::Decimal(Box<DecimalSum>)` allocation.
+pub(super) const DECIMAL_SUM_BYTES: u64 = size_of::<DecimalSum>() as u64;
+
+/// Value-space hazard flags tracked on `AggState::Best` so `can_merge` only combines
+/// slice winners when `order_cmp` is guaranteed to be a transitive total preorder
+/// across every value seen in the merged group.
+const BEST_EXACT_NUM: u8 = 1 << 0;
+const BEST_FLOAT: u8 = 1 << 1;
+const BEST_INCOMPARABLE: u8 = 1 << 2;
+
+#[inline]
+fn best_value_flag(v: Option<&Value>) -> u8 {
+    match v {
+        None => BEST_INCOMPARABLE,
+        Some(
+            Value::Integer(_) | Value::Decimal(_) | Value::BigInteger(_) | Value::BigDecimal(_),
+        ) => BEST_EXACT_NUM,
+        Some(Value::Float(f)) => {
+            if f32::from(*f).is_nan() {
+                BEST_INCOMPARABLE
+            } else {
+                BEST_FLOAT
+            }
+        }
+        Some(Value::Double(d)) => {
+            if f64::from(*d).is_nan() {
+                BEST_INCOMPARABLE
+            } else {
+                BEST_FLOAT
+            }
+        }
+        Some(
+            Value::BNode(_)
+            | Value::Iri(_)
+            | Value::Str(_)
+            | Value::Lang(..)
+            | Value::LangDir(..)
+            | Value::Bool(_),
+        ) => 0,
+        Some(
+            Value::DateTime(_)
+            | Value::Date(_)
+            | Value::Time(_)
+            | Value::Duration(_)
+            | Value::YearMonth(_)
+            | Value::DayTime(_)
+            | Value::Triple(_)
+            | Value::Other { .. },
+        ) => BEST_INCOMPARABLE,
+    }
+}
+
+/// Decimal accumulator state with exact prefix bounds so merging two exact sums matches
+/// a single sequential pass on every intermediate overflow boundary.
+#[derive(Clone)]
+pub(super) struct DecimalSum {
+    /// Current scaled decimal sum (`value × 10^18`).
+    val: i128,
+    /// Minimum scaled decimal value across all decimal steps in this partition.
+    min: i128,
+    /// Maximum scaled decimal value across all decimal steps in this partition.
+    max: i128,
+    /// Unscaled integer sum just before the first decimal arrived.
+    int_before: i128,
+    /// Minimum unscaled integer prefix sum before the first decimal arrived (including 0).
+    int_min: i128,
+    /// Maximum unscaled integer prefix sum before the first decimal arrived (including 0).
+    int_max: i128,
+    /// Whether `int_min`/`int_max` are exact (false only after `retract`).
+    exact_int_prefix: bool,
+}
+
+/// Running numeric state of `SUM` / `AVG`.
 ///
 /// Big-number variants keep bounded headroom ([`super::bignum::AGG_MAX_INT_DIGITS`] /
 /// [`super::bignum::AGG_MAX_DEC_DIGITS`]) so cancellation and averaging at the digit cap
 /// stay independent of row order, while enforcing the final value limits in
-/// [`AggState::finish`].
+/// [`AggState::finish_with`].
 #[derive(Clone)]
-pub(super) enum SumGeneric {
-    Decimal(oxsdatatypes::Decimal),
+pub(super) enum SumAcc {
+    /// Pure exact integer sum in `i128`, with exact prefix bounds `[min, max]` (including 0).
+    Int {
+        sum: i128,
+        min: i128,
+        max: i128,
+    },
+    /// Pure integer sum after a retraction, whose historical prefix bounds are unknown.
+    IntRetracted(i128),
+    /// Exact fixed-width decimal sum with prefix bounds for merge verification.
+    Decimal(Box<DecimalSum>),
+    /// Arbitrary-precision integer sum.
+    BigInt(Box<super::bignum::BigInt>),
+    /// Arbitrary-precision decimal sum.
+    BigDec(Box<super::bignum::BigDec>),
     Float(oxsdatatypes::Float),
     Double(oxsdatatypes::Double),
-    BigInt(Box<super::bignum::BigInt>),
-    BigDec(Box<super::bignum::BigDec>),
+    /// Failed on `Id::UNDEF` or a non-numeric value: guaranteed to fail any single pass.
+    HardError,
+    /// Failed on exceeding big-number digit limits: may succeed if preceded by a non-empty
+    /// left partition that cancels or promotes to float/double.
+    Overflow,
 }
 
-impl SumGeneric {
-    fn from_int(int: i128) -> Self {
-        Self::BigInt(Box::new(super::bignum::BigInt::from_i128(int)))
-    }
-
+impl SumAcc {
+    #[inline]
     fn heap_bytes(&self) -> u64 {
         match self {
-            SumGeneric::BigInt(i) => i.heap_bytes() + 32,
-            SumGeneric::BigDec(d) => d.heap_bytes() + 32,
+            SumAcc::Decimal(_) => DECIMAL_SUM_BYTES,
+            SumAcc::BigInt(i) => i.heap_bytes() + 32,
+            SumAcc::BigDec(d) => d.heap_bytes() + 32,
             _ => 0,
         }
     }
 
-    fn add_from_int<'a>(
-        ctx: &'a Ctx,
-        int: i128,
-        rhs: &Value,
-        admit: &mut dyn ScratchAdmit,
-    ) -> Result<(Option<Self>, Option<super::ctx::Charge<'a>>)> {
-        use super::bignum::{
-            AGG_MAX_DEC_DIGITS, AGG_MAX_INT_DIGITS, AGG_SUM_SCRATCH_BYTES, BigDec, BigInt,
-        };
-        use super::value::Num;
-        use oxsdatatypes::{Decimal, Double, Float};
-        let Ok(n) = Num::of(rhs) else {
-            return Ok((None, None));
-        };
-        Ok(match n {
-            Num::Integer(b) => {
-                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                let sum = BigInt::from_i128(int)
-                    .checked_add_with_limit(&BigInt::from_i64(b.into()), AGG_MAX_INT_DIGITS);
-                (sum.map(|s| SumGeneric::BigInt(Box::new(s))), Some(scratch))
-            }
-            Num::BigInteger(b) => {
-                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                let sum = BigInt::from_i128(int).checked_add_with_limit(b, AGG_MAX_INT_DIGITS);
-                (sum.map(|s| SumGeneric::BigInt(Box::new(s))), Some(scratch))
-            }
-            Num::Decimal(b) => {
-                if let Ok(i) = Decimal::try_from(int)
-                    && let Some(d) = i.checked_add(b)
-                {
-                    return Ok((Some(SumGeneric::Decimal(d)), None));
-                }
-                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                let sum = BigDec::from_bigint(BigInt::from_i128(int))
-                    .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS);
-                (sum.map(|s| SumGeneric::BigDec(Box::new(s))), Some(scratch))
-            }
-            Num::BigDecimal(b) => {
-                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                let sum = BigDec::from_bigint(BigInt::from_i128(int))
-                    .checked_add_with_limit(b, AGG_MAX_DEC_DIGITS);
-                (sum.map(|s| SumGeneric::BigDec(Box::new(s))), Some(scratch))
-            }
-            Num::Float(b) => (Some(SumGeneric::Float(Float::from(int as f32) + b)), None),
-            Num::Double(b) => (Some(SumGeneric::Double(Double::from(int as f64) + b)), None),
-        })
-    }
-
-    fn add_value<'a>(
+    /// Compute the next `SumAcc` for any transition or arbitrary-precision operation that
+    /// could not update `self` in place. Returns any transient scratch charge alongside
+    /// the candidate so it stays covered until retained admission completes and the old
+    /// subtotal drops (or refusal drops the candidate).
+    fn add_value_slow<'a>(
         &self,
         ctx: &'a Ctx,
         rhs: &Value,
         admit: &mut dyn ScratchAdmit,
-    ) -> Result<(Option<Self>, Option<super::ctx::Charge<'a>>)> {
+    ) -> Result<(Self, Option<super::ctx::Charge<'a>>)> {
         use super::bignum::{
             AGG_MAX_DEC_DIGITS, AGG_MAX_INT_DIGITS, AGG_SUM_SCRATCH_BYTES, BigDec, BigInt,
             TO_F32_SCRATCH_BYTES, TO_F64_SCRATCH_BYTES,
@@ -8326,201 +8392,218 @@ impl SumGeneric {
         use super::value::Num;
         use oxsdatatypes::{Double, Float};
         let Ok(n) = Num::of(rhs) else {
-            return Ok((None, None));
+            return Ok((SumAcc::HardError, None));
         };
-        // Charge transient alignment, result and normalization scratch only when
-        // arbitrary-precision arithmetic or big-number float conversion runs. Return
-        // the guard alongside any boxed candidate so it stays covered until retained
-        // admission completes and the previous subtotal drops (or refusal drops it).
         Ok(match (self, n) {
-            (SumGeneric::Decimal(a), Num::Integer(b)) => match a.checked_add(b) {
-                Some(d) => (Some(SumGeneric::Decimal(d)), None),
-                None => {
-                    let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                    let sum = BigDec::from_oxs_decimal(*a)
-                        .checked_add_with_limit(&BigDec::from_i64(b.into()), AGG_MAX_DEC_DIGITS);
-                    (sum.map(|s| SumGeneric::BigDec(Box::new(s))), Some(scratch))
+            (SumAcc::Int { sum, min, max }, Num::Decimal(b)) => {
+                let (int_before, int_min, int_max) = (*sum, *min, *max);
+                if let Some(v) = int_before
+                    .checked_mul(super::value::DECIMAL_SCALE)
+                    .and_then(|s| s.checked_add(super::value::decimal_raw(b)))
+                {
+                    return Ok((
+                        SumAcc::Decimal(Box::new(DecimalSum {
+                            val: v,
+                            min: v,
+                            max: v,
+                            int_before,
+                            int_min,
+                            int_max,
+                            exact_int_prefix: true,
+                        })),
+                        None,
+                    ));
                 }
-            },
-            (SumGeneric::Decimal(a), Num::Decimal(b)) => match a.checked_add(b) {
-                Some(d) => (Some(SumGeneric::Decimal(d)), None),
-                None => {
-                    let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                    let sum = BigDec::from_oxs_decimal(*a)
-                        .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS);
-                    (sum.map(|s| SumGeneric::BigDec(Box::new(s))), Some(scratch))
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let next = BigDec::from_bigint(BigInt::from_i128(int_before))
+                    .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::IntRetracted(sum), Num::Decimal(b)) => {
+                let int_before = *sum;
+                if let Some(v) = int_before
+                    .checked_mul(super::value::DECIMAL_SCALE)
+                    .and_then(|s| s.checked_add(super::value::decimal_raw(b)))
+                {
+                    return Ok((
+                        SumAcc::Decimal(Box::new(DecimalSum {
+                            val: v,
+                            min: v,
+                            max: v,
+                            int_before,
+                            int_min: 0,
+                            int_max: 0,
+                            exact_int_prefix: false,
+                        })),
+                        None,
+                    ));
                 }
-            },
-            (SumGeneric::Decimal(a), Num::BigInteger(b)) => {
                 let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                let sum = BigDec::from_oxs_decimal(*a)
-                    .checked_add_with_limit(&BigDec::from_bigint(b.clone()), AGG_MAX_DEC_DIGITS);
-                (sum.map(|s| SumGeneric::BigDec(Box::new(s))), Some(scratch))
+                let next = BigDec::from_bigint(BigInt::from_i128(int_before))
+                    .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
             }
-            (SumGeneric::Decimal(a), Num::BigDecimal(b)) => {
+            (SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum), Num::Integer(b)) => {
                 let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                let sum =
-                    BigDec::from_oxs_decimal(*a).checked_add_with_limit(b, AGG_MAX_DEC_DIGITS);
-                (sum.map(|s| SumGeneric::BigDec(Box::new(s))), Some(scratch))
+                let next = BigInt::from_i128(*sum)
+                    .checked_add_with_limit(&BigInt::from_i64(b.into()), AGG_MAX_INT_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigInt(Box::new(s)));
+                (next, Some(scratch))
             }
-            (SumGeneric::Decimal(a), Num::Float(b)) => {
-                (Some(SumGeneric::Float(Float::from(*a) + b)), None)
-            }
-            (SumGeneric::Decimal(a), Num::Double(b)) => {
-                (Some(SumGeneric::Double(Double::from(*a) + b)), None)
-            }
-            (SumGeneric::BigInt(a), Num::Integer(b)) => {
+            (SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum), Num::BigInteger(b)) => {
                 let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                let sum = a.checked_add_with_limit(&BigInt::from_i64(b.into()), AGG_MAX_INT_DIGITS);
-                (sum.map(|s| SumGeneric::BigInt(Box::new(s))), Some(scratch))
+                let next = BigInt::from_i128(*sum)
+                    .checked_add_with_limit(b, AGG_MAX_INT_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigInt(Box::new(s)));
+                (next, Some(scratch))
             }
-            (SumGeneric::BigInt(a), Num::BigInteger(b)) => {
+            (SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum), Num::BigDecimal(b)) => {
                 let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                let sum = a.checked_add_with_limit(b, AGG_MAX_INT_DIGITS);
-                (sum.map(|s| SumGeneric::BigInt(Box::new(s))), Some(scratch))
+                let next = BigDec::from_bigint(BigInt::from_i128(*sum))
+                    .checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
             }
-            (SumGeneric::BigInt(a), Num::Decimal(b)) => {
+            (SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum), Num::Float(b)) => {
+                (SumAcc::Float(Float::from(*sum as f32) + b), None)
+            }
+            (SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum), Num::Double(b)) => {
+                (SumAcc::Double(Double::from(*sum as f64) + b), None)
+            }
+            (SumAcc::Decimal(ds), Num::Integer(b)) => {
                 let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                let sum = BigDec::from_bigint((**a).clone())
-                    .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS);
-                (sum.map(|s| SumGeneric::BigDec(Box::new(s))), Some(scratch))
+                let a = super::value::decimal_from_raw(ds.val);
+                let next = BigDec::from_oxs_decimal(a)
+                    .checked_add_with_limit(&BigDec::from_i64(b.into()), AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
             }
-            (SumGeneric::BigInt(a), Num::BigDecimal(b)) => {
+            (SumAcc::Decimal(ds), Num::Decimal(b)) => {
                 let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                let sum = BigDec::from_bigint((**a).clone())
-                    .checked_add_with_limit(b, AGG_MAX_DEC_DIGITS);
-                (sum.map(|s| SumGeneric::BigDec(Box::new(s))), Some(scratch))
+                let a = super::value::decimal_from_raw(ds.val);
+                let next = BigDec::from_oxs_decimal(a)
+                    .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
             }
-            (SumGeneric::BigInt(a), Num::Float(b)) => {
+            (SumAcc::Decimal(ds), Num::BigInteger(b)) => {
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let a = super::value::decimal_from_raw(ds.val);
+                let next = BigDec::from_oxs_decimal(a)
+                    .checked_add_with_limit(&BigDec::from_bigint(b.clone()), AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::Decimal(ds), Num::BigDecimal(b)) => {
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let a = super::value::decimal_from_raw(ds.val);
+                let next = BigDec::from_oxs_decimal(a)
+                    .checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::Decimal(ds), Num::Float(b)) => {
+                let a = super::value::decimal_from_raw(ds.val);
+                (SumAcc::Float(Float::from(a) + b), None)
+            }
+            (SumAcc::Decimal(ds), Num::Double(b)) => {
+                let a = super::value::decimal_from_raw(ds.val);
+                (SumAcc::Double(Double::from(a) + b), None)
+            }
+            (SumAcc::BigInt(a), Num::Integer(b)) => {
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let next = a
+                    .checked_add_with_limit(&BigInt::from_i64(b.into()), AGG_MAX_INT_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigInt(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::BigInt(a), Num::BigInteger(b)) => {
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let next = a
+                    .checked_add_with_limit(b, AGG_MAX_INT_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigInt(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::BigInt(a), Num::Decimal(b)) => {
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let next = BigDec::from_bigint((**a).clone())
+                    .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::BigInt(a), Num::BigDecimal(b)) => {
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let next = BigDec::from_bigint((**a).clone())
+                    .checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::BigInt(a), Num::Float(b)) => {
                 let _scratch = admit.charge_scratch(ctx, TO_F32_SCRATCH_BYTES)?;
-                (Some(SumGeneric::Float(Float::from(a.to_f32()) + b)), None)
+                (SumAcc::Float(Float::from(a.to_f32()) + b), None)
             }
-            (SumGeneric::BigInt(a), Num::Double(b)) => {
+            (SumAcc::BigInt(a), Num::Double(b)) => {
                 let _scratch = admit.charge_scratch(ctx, TO_F64_SCRATCH_BYTES)?;
-                (Some(SumGeneric::Double(Double::from(a.to_f64()) + b)), None)
+                (SumAcc::Double(Double::from(a.to_f64()) + b), None)
             }
-            (SumGeneric::BigDec(a), Num::Integer(b)) => {
+            (SumAcc::BigDec(a), Num::Integer(b)) => {
                 let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                let sum = a.checked_add_with_limit(&BigDec::from_i64(b.into()), AGG_MAX_DEC_DIGITS);
-                (sum.map(|s| SumGeneric::BigDec(Box::new(s))), Some(scratch))
+                let next = a
+                    .checked_add_with_limit(&BigDec::from_i64(b.into()), AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
             }
-            (SumGeneric::BigDec(a), Num::BigInteger(b)) => {
+            (SumAcc::BigDec(a), Num::BigInteger(b)) => {
                 let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                let sum =
-                    a.checked_add_with_limit(&BigDec::from_bigint(b.clone()), AGG_MAX_DEC_DIGITS);
-                (sum.map(|s| SumGeneric::BigDec(Box::new(s))), Some(scratch))
+                let next = a
+                    .checked_add_with_limit(&BigDec::from_bigint(b.clone()), AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
             }
-            (SumGeneric::BigDec(a), Num::Decimal(b)) => {
+            (SumAcc::BigDec(a), Num::Decimal(b)) => {
                 let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                let sum =
-                    a.checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS);
-                (sum.map(|s| SumGeneric::BigDec(Box::new(s))), Some(scratch))
+                let next = a
+                    .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
             }
-            (SumGeneric::BigDec(a), Num::BigDecimal(b)) => {
+            (SumAcc::BigDec(a), Num::BigDecimal(b)) => {
                 let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                let sum = a.checked_add_with_limit(b, AGG_MAX_DEC_DIGITS);
-                (sum.map(|s| SumGeneric::BigDec(Box::new(s))), Some(scratch))
+                let next = a
+                    .checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
             }
-            (SumGeneric::BigDec(a), Num::Float(b)) => {
+            (SumAcc::BigDec(a), Num::Float(b)) => {
                 let _scratch = admit.charge_scratch(ctx, TO_F32_SCRATCH_BYTES)?;
-                (Some(SumGeneric::Float(Float::from(a.to_f32()) + b)), None)
+                (SumAcc::Float(Float::from(a.to_f32()) + b), None)
             }
-            (SumGeneric::BigDec(a), Num::Double(b)) => {
+            (SumAcc::BigDec(a), Num::Double(b)) => {
                 let _scratch = admit.charge_scratch(ctx, TO_F64_SCRATCH_BYTES)?;
-                (Some(SumGeneric::Double(Double::from(a.to_f64()) + b)), None)
+                (SumAcc::Double(Double::from(a.to_f64()) + b), None)
             }
-            (SumGeneric::Float(a), Num::Double(b)) => {
-                (Some(SumGeneric::Double(Double::from(*a) + b)), None)
-            }
-            (SumGeneric::Float(a), Num::BigInteger(b)) => {
+            (SumAcc::Float(a), Num::Double(b)) => (SumAcc::Double(Double::from(*a) + b), None),
+            (SumAcc::Float(a), Num::BigInteger(b)) => {
                 let _scratch = admit.charge_scratch(ctx, TO_F32_SCRATCH_BYTES)?;
-                (Some(SumGeneric::Float(*a + Float::from(b.to_f32()))), None)
+                (SumAcc::Float(*a + Float::from(b.to_f32())), None)
             }
-            (SumGeneric::Float(a), Num::BigDecimal(b)) => {
+            (SumAcc::Float(a), Num::BigDecimal(b)) => {
                 let _scratch = admit.charge_scratch(ctx, TO_F32_SCRATCH_BYTES)?;
-                (Some(SumGeneric::Float(*a + Float::from(b.to_f32()))), None)
+                (SumAcc::Float(*a + Float::from(b.to_f32())), None)
             }
-            (SumGeneric::Float(a), other) => (Some(SumGeneric::Float(*a + other.to_float())), None),
-            (SumGeneric::Double(a), Num::BigInteger(b)) => {
+            (SumAcc::Float(a), other) => (SumAcc::Float(*a + other.to_float()), None),
+            (SumAcc::Double(a), Num::BigInteger(b)) => {
                 let _scratch = admit.charge_scratch(ctx, TO_F64_SCRATCH_BYTES)?;
-                (
-                    Some(SumGeneric::Double(*a + Double::from(b.to_f64()))),
-                    None,
-                )
+                (SumAcc::Double(*a + Double::from(b.to_f64())), None)
             }
-            (SumGeneric::Double(a), Num::BigDecimal(b)) => {
+            (SumAcc::Double(a), Num::BigDecimal(b)) => {
                 let _scratch = admit.charge_scratch(ctx, TO_F64_SCRATCH_BYTES)?;
-                (
-                    Some(SumGeneric::Double(*a + Double::from(b.to_f64()))),
-                    None,
-                )
+                (SumAcc::Double(*a + Double::from(b.to_f64())), None)
             }
-            (SumGeneric::Double(a), other) => {
-                (Some(SumGeneric::Double(*a + other.to_double())), None)
-            }
-        })
-    }
-
-    fn merge(self, other: Self) -> Option<Self> {
-        use super::bignum::{AGG_MAX_DEC_DIGITS, AGG_MAX_INT_DIGITS, BigDec};
-        use oxsdatatypes::{Double, Float};
-        Some(match (self, other) {
-            (SumGeneric::Decimal(a), SumGeneric::Decimal(b)) => match a.checked_add(b) {
-                Some(d) => SumGeneric::Decimal(d),
-                None => SumGeneric::BigDec(Box::new(
-                    BigDec::from_oxs_decimal(a)
-                        .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)?,
-                )),
-            },
-            (SumGeneric::BigInt(a), SumGeneric::BigInt(b)) => {
-                SumGeneric::BigInt(Box::new(a.checked_add_with_limit(&b, AGG_MAX_INT_DIGITS)?))
-            }
-            (SumGeneric::BigDec(a), SumGeneric::BigDec(b)) => {
-                SumGeneric::BigDec(Box::new(a.checked_add_with_limit(&b, AGG_MAX_DEC_DIGITS)?))
-            }
-            (SumGeneric::BigDec(a), SumGeneric::BigInt(b))
-            | (SumGeneric::BigInt(b), SumGeneric::BigDec(a)) => SumGeneric::BigDec(Box::new(
-                a.checked_add_with_limit(&BigDec::from_bigint(*b), AGG_MAX_DEC_DIGITS)?,
-            )),
-            (SumGeneric::BigDec(a), SumGeneric::Decimal(b))
-            | (SumGeneric::Decimal(b), SumGeneric::BigDec(a)) => SumGeneric::BigDec(Box::new(
-                a.checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)?,
-            )),
-            (SumGeneric::BigInt(a), SumGeneric::Decimal(b))
-            | (SumGeneric::Decimal(b), SumGeneric::BigInt(a)) => SumGeneric::BigDec(Box::new(
-                BigDec::from_bigint(*a)
-                    .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)?,
-            )),
-            (SumGeneric::Float(a), SumGeneric::Float(b)) => SumGeneric::Float(a + b),
-            (SumGeneric::Float(a), SumGeneric::Decimal(b))
-            | (SumGeneric::Decimal(b), SumGeneric::Float(a)) => {
-                SumGeneric::Float(a + Float::from(b))
-            }
-            (SumGeneric::Float(a), SumGeneric::BigInt(b))
-            | (SumGeneric::BigInt(b), SumGeneric::Float(a)) => {
-                SumGeneric::Float(a + Float::from(b.to_f32()))
-            }
-            (SumGeneric::Float(a), SumGeneric::BigDec(b))
-            | (SumGeneric::BigDec(b), SumGeneric::Float(a)) => {
-                SumGeneric::Float(a + Float::from(b.to_f32()))
-            }
-            (SumGeneric::Double(a), SumGeneric::Double(b)) => SumGeneric::Double(a + b),
-            (SumGeneric::Double(a), SumGeneric::Float(b))
-            | (SumGeneric::Float(b), SumGeneric::Double(a)) => {
-                SumGeneric::Double(a + Double::from(b))
-            }
-            (SumGeneric::Double(a), SumGeneric::Decimal(b))
-            | (SumGeneric::Decimal(b), SumGeneric::Double(a)) => {
-                SumGeneric::Double(a + Double::from(b))
-            }
-            (SumGeneric::Double(a), SumGeneric::BigInt(b))
-            | (SumGeneric::BigInt(b), SumGeneric::Double(a)) => {
-                SumGeneric::Double(a + Double::from(b.to_f64()))
-            }
-            (SumGeneric::Double(a), SumGeneric::BigDec(b))
-            | (SumGeneric::BigDec(b), SumGeneric::Double(a)) => {
-                SumGeneric::Double(a + Double::from(b.to_f64()))
-            }
+            (SumAcc::Double(a), other) => (SumAcc::Double(*a + other.to_double()), None),
+            (SumAcc::HardError | SumAcc::Overflow, _) => unreachable!(),
         })
     }
 }
@@ -8530,24 +8613,20 @@ impl SumGeneric {
 pub(super) enum AggState {
     /// COUNT(*) / COUNT(?v): rows / bound values
     Count(u64),
-    /// SUM / AVG: an exact integer sum while every value is an inline integer, then the
-    /// generic numeric sum; `ok` is false once a value was unbound or not numeric. The
-    /// integer sum is held in an `i128`, so that a sum whose result fits an
-    /// `xsd:integer` is found whatever the order of its rows, and only the result is
-    /// checked. `errs` counts the rows whose argument was an error, apart from values
-    /// that are not numbers, for the reading in which AVG over only errors is zero.
+    /// SUM / AVG: an exact integer sum while every value is an integer, then decimal,
+    /// arbitrary-precision integer/decimal, float or double, or a recorded failure. `errs`
+    /// counts rows whose argument was `Id::UNDEF`, for the reading in which AVG over only
+    /// errors is zero.
     Sum {
-        int: i128,
-        generic: Option<SumGeneric>,
-        ok: bool,
+        acc: SumAcc,
         rows: u64,
         errs: u64,
         deferred: bool,
     },
-    /// MIN / MAX: the best id and its value, and the count of arguments that were
-    /// errors, which some readings make the result unbound (see
-    /// [`super::AggregateErrors`])
-    Best(Option<Id>, Option<Value>, u64),
+    /// MIN / MAX: the best id and its value, the count of arguments that were errors
+    /// (which some readings make the result unbound, see [`super::AggregateErrors`]),
+    /// and a value-space hazard bitmask for exact merge validation.
+    Best(Option<Id>, Option<Value>, u64, u8),
     Sample(Option<Id>),
     /// ARQ's variance and deviation aggregates
     Stat(super::aggext::Arq, super::aggext::StatAcc),
@@ -8560,27 +8639,126 @@ impl AggState {
         }
         match agg.func {
             AggregateFunction::Sum | AggregateFunction::Avg => AggState::Sum {
-                int: 0,
-                generic: None,
-                ok: true,
+                acc: SumAcc::Int {
+                    sum: 0,
+                    min: 0,
+                    max: 0,
+                },
                 rows: 0,
                 errs: 0,
                 deferred: false,
             },
-            AggregateFunction::Min | AggregateFunction::Max => AggState::Best(None, None, 0),
+            AggregateFunction::Min | AggregateFunction::Max => AggState::Best(None, None, 0, 0),
             AggregateFunction::Sample => AggState::Sample(None),
             _ => AggState::Count(0),
         }
     }
 
-    /// Owned heap bytes held by a `SUM`/`AVG` big-number subtotal.
+    /// Owned heap bytes held by a `SUM`/`AVG` subtotal (`Box<DecimalSum>`, `Box<BigInt>`,
+    /// or `Box<BigDec>`).
     #[inline]
     pub(super) fn sum_heap_bytes(&self) -> u64 {
         match self {
-            AggState::Sum {
-                generic: Some(g), ..
-            } => g.heap_bytes(),
+            AggState::Sum { acc, .. } => acc.heap_bytes(),
             _ => 0,
+        }
+    }
+
+    /// Upper bound on bytes [`AggState::finish_with`] can charge to `ctx.retain_bytes()`
+    /// when interning the finalized result value.
+    pub(super) fn finish_intern_bytes(&self, agg: &Agg) -> u64 {
+        match self {
+            AggState::Count(_) | AggState::Best(..) | AggState::Sample(_) => 0,
+            AggState::Sum {
+                acc, rows, errs, ..
+            } => {
+                let is_avg = matches!(agg.func, AggregateFunction::Avg);
+                if *rows > 0 && *errs == *rows && is_avg {
+                    return 0;
+                }
+                match acc {
+                    SumAcc::HardError | SumAcc::Overflow => 0,
+                    SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum) => {
+                        if is_avg {
+                            if *rows == 0 {
+                                0
+                            } else {
+                                let needs_big = match (i64::try_from(*sum), i64::try_from(*rows)) {
+                                    (Ok(i), Ok(r)) => super::value::int_div_needs_big(i, r),
+                                    _ => true,
+                                };
+                                if needs_big {
+                                    super::bignum::AGG_SUM_SCRATCH_BYTES + 4500
+                                } else {
+                                    256
+                                }
+                            }
+                        } else if i64::try_from(*sum)
+                            .ok()
+                            .is_some_and(|i| Id::from_i64(i).is_some())
+                        {
+                            0
+                        } else {
+                            256
+                        }
+                    }
+                    SumAcc::Decimal(ds) => {
+                        if is_avg {
+                            if *rows == 0 {
+                                0
+                            } else {
+                                let d = super::value::decimal_from_raw(ds.val);
+                                let needs_big = match i64::try_from(*rows)
+                                    .ok()
+                                    .map(oxsdatatypes::Decimal::from)
+                                {
+                                    Some(rd) => {
+                                        super::value::decimal_div_needs_big(d, rd)
+                                            || d.checked_div(rd).is_none()
+                                    }
+                                    None => true,
+                                };
+                                if needs_big {
+                                    super::bignum::AGG_SUM_SCRATCH_BYTES + 4500
+                                } else {
+                                    256
+                                }
+                            }
+                        } else {
+                            256
+                        }
+                    }
+                    SumAcc::BigInt(bi) => {
+                        if is_avg {
+                            super::bignum::AGG_SUM_SCRATCH_BYTES + 4500
+                        } else {
+                            super::bignum::intern_scratch_bytes(bi.lexical_len())
+                                .saturating_add(bi.lexical_len() as u64 + 144)
+                        }
+                    }
+                    SumAcc::BigDec(bd) => {
+                        if is_avg {
+                            super::bignum::AGG_SUM_SCRATCH_BYTES + 4500
+                        } else {
+                            super::bignum::intern_scratch_bytes(bd.lexical_len())
+                                .saturating_add(bd.lexical_len() as u64 + 144)
+                        }
+                    }
+                    SumAcc::Float(_) => 256,
+                    SumAcc::Double(d) => {
+                        let x = if is_avg {
+                            if *rows == 0 {
+                                return 0;
+                            }
+                            f64::from(*d) / (*rows as f64)
+                        } else {
+                            f64::from(*d)
+                        };
+                        double_intern_bytes(x)
+                    }
+                }
+            }
+            AggState::Stat(arq, acc) => acc.finish_value(*arq).map_or(0, double_intern_bytes),
         }
     }
 
@@ -8623,107 +8801,35 @@ impl AggState {
     ) -> Result<bool> {
         match self {
             AggState::Count(n) => *n += id.is_none_or(|id| !id.is_undef()) as u64,
-            AggState::Sum {
-                int,
-                generic,
-                ok,
-                rows,
-                errs,
-                ..
-            } => {
+            AggState::Sum { acc, rows, .. } => {
                 *rows += 1;
                 let id = id.unwrap_or(Id::UNDEF);
-                let err = u64::from(id.is_undef());
-                *errs += err;
-                if !*ok {
-                    return Ok(true);
-                }
-                if generic.is_none()
+                if let SumAcc::Int { sum, min, max } = acc
                     && id.tag() == crate::id::Tag::Int
-                    && let Some(s) = int.checked_add(id.as_i64().into())
                 {
-                    *int = s;
-                    return Ok(true);
-                }
-                let value = if id.is_undef() {
-                    None
-                } else {
-                    ctx.value_checked(id)?
-                };
-                // An integer too large to be inlined joins the exact sum as well.
-                if generic.is_none()
-                    && let Some(Value::Integer(i)) = &value
-                    && let Some(s) = int.checked_add(i64::from(*i).into())
-                {
-                    *int = s;
-                    return Ok(true);
-                }
-                let (next, scratch) = match (generic.as_ref(), value.as_ref()) {
-                    (Some(acc), Some(value)) => match acc.add_value(ctx, value, admit) {
-                        Ok(pair) => pair,
-                        Err(error) => {
-                            *rows -= 1;
-                            *errs -= err;
-                            return Err(error);
-                        }
-                    },
-                    (None, Some(value)) => {
-                        match SumGeneric::add_from_int(ctx, *int, value, admit) {
-                            Ok(pair) => pair,
-                            Err(error) => {
-                                *rows -= 1;
-                                *errs -= err;
-                                return Err(error);
+                    let x = id.as_i64();
+                    if let Some(s) = sum.checked_add(x.into()) {
+                        *sum = s;
+                        if x >= 0 {
+                            if s > *max {
+                                *max = s;
                             }
+                        } else if s < *min {
+                            *min = s;
                         }
-                    }
-                    (_, None) => (None, None),
-                };
-                let old_bytes = generic.as_ref().map_or(0, SumGeneric::heap_bytes);
-                let new_bytes = next.as_ref().map_or(0, SumGeneric::heap_bytes);
-                // All arithmetic temporaries have been dropped; narrow the scratch guard
-                // to cover the live candidate until retained admission completes and the
-                // old subtotal drops, or until refusal drops the candidate.
-                if let Some(guard) = &scratch
-                    && let Err(error) = guard.resize(new_bytes)
-                {
-                    drop(next);
-                    drop(scratch);
-                    *rows -= 1;
-                    *errs -= err;
-                    return Err(error);
-                }
-                if old_bytes != new_bytes {
-                    match admit.admit(old_bytes, new_bytes) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            drop(next);
-                            drop(scratch);
-                            *rows -= 1;
-                            *errs -= err;
-                            return Ok(false);
-                        }
-                        Err(error) => {
-                            drop(next);
-                            drop(scratch);
-                            *rows -= 1;
-                            *errs -= err;
-                            return Err(error);
-                        }
+                        return Ok(true);
                     }
                 }
-                *ok = next.is_some();
-                let old = std::mem::replace(generic, next);
-                drop(old);
-                drop(scratch);
+                return self.add_sum_slow(ctx, id, admit);
             }
-            AggState::Best(best, best_v, errs) => {
+            AggState::Best(best, best_v, errs, flags) => {
                 let Some(id) = id.filter(|id| !id.is_undef()) else {
                     *errs += 1;
                     return Ok(true);
                 };
                 let decode = ctx.charge(0)?;
                 let v = ctx.value_checked_into(id, &decode)?;
+                *flags |= best_value_flag(v.as_ref());
                 let better = match best_v {
                     None => best.is_none(),
                     Some(b) => {
@@ -8754,57 +8860,491 @@ impl AggState {
         Ok(true)
     }
 
+    #[cold]
+    #[inline(never)]
+    fn add_sum_slow(&mut self, ctx: &Ctx, id: Id, admit: &mut dyn SumAdmit) -> Result<bool> {
+        let AggState::Sum {
+            acc, rows, errs, ..
+        } = self
+        else {
+            unreachable!()
+        };
+        let err = u64::from(id.is_undef());
+        *errs += err;
+        if matches!(acc, SumAcc::HardError | SumAcc::Overflow) {
+            return Ok(true);
+        }
+        if id.is_undef() {
+            let old_bytes = acc.heap_bytes();
+            if old_bytes != 0 {
+                let _ = admit.admit(old_bytes, 0)?;
+            }
+            *acc = SumAcc::HardError;
+            return Ok(true);
+        }
+        match (&mut *acc, id.tag()) {
+            (SumAcc::IntRetracted(sum), crate::id::Tag::Int) => {
+                if let Some(s) = sum.checked_add(id.as_i64().into()) {
+                    *sum = s;
+                    return Ok(true);
+                }
+            }
+            (SumAcc::Decimal(ds), crate::id::Tag::Int) => {
+                let raw = i128::from(id.as_i64()) * super::value::DECIMAL_SCALE;
+                if let Some(v) = ds.val.checked_add(raw) {
+                    ds.val = v;
+                    ds.min = ds.min.min(v);
+                    ds.max = ds.max.max(v);
+                    return Ok(true);
+                }
+            }
+            (SumAcc::Float(f), crate::id::Tag::Int) => {
+                *f = *f + oxsdatatypes::Float::from(oxsdatatypes::Integer::from(id.as_i64()));
+                return Ok(true);
+            }
+            (SumAcc::Float(f), crate::id::Tag::Double) => {
+                *acc = SumAcc::Double(
+                    oxsdatatypes::Double::from(*f) + oxsdatatypes::Double::from(id.as_f64()),
+                );
+                return Ok(true);
+            }
+            (SumAcc::Double(d), crate::id::Tag::Int) => {
+                *d = *d + oxsdatatypes::Double::from(oxsdatatypes::Integer::from(id.as_i64()));
+                return Ok(true);
+            }
+            (SumAcc::Double(d), crate::id::Tag::Double) => {
+                *d = *d + oxsdatatypes::Double::from(id.as_f64());
+                return Ok(true);
+            }
+            _ => {}
+        }
+        let value = match ctx.value_checked(id) {
+            Ok(v) => v,
+            Err(error) => {
+                *rows -= 1;
+                *errs -= err;
+                return Err(error);
+            }
+        };
+        let Some(value) = value else {
+            let old_bytes = acc.heap_bytes();
+            if old_bytes != 0 {
+                let _ = admit.admit(old_bytes, 0)?;
+            }
+            *acc = SumAcc::HardError;
+            return Ok(true);
+        };
+        // Fast in-place updates that never change heap ownership or need big-number scratch.
+        match (&mut *acc, &value) {
+            (SumAcc::Int { sum, min, max }, Value::Integer(i)) => {
+                let x = i64::from(*i);
+                if let Some(s) = sum.checked_add(x.into()) {
+                    *sum = s;
+                    if x >= 0 {
+                        if s > *max {
+                            *max = s;
+                        }
+                    } else if s < *min {
+                        *min = s;
+                    }
+                    return Ok(true);
+                }
+            }
+            (SumAcc::IntRetracted(sum), Value::Integer(i)) => {
+                if let Some(s) = sum.checked_add(i64::from(*i).into()) {
+                    *sum = s;
+                    return Ok(true);
+                }
+            }
+            (SumAcc::Decimal(ds), Value::Integer(i)) => {
+                let raw = i128::from(i64::from(*i)) * super::value::DECIMAL_SCALE;
+                if let Some(v) = ds.val.checked_add(raw) {
+                    ds.val = v;
+                    ds.min = ds.min.min(v);
+                    ds.max = ds.max.max(v);
+                    return Ok(true);
+                }
+            }
+            (SumAcc::Decimal(ds), Value::Decimal(d)) => {
+                if let Some(v) = ds.val.checked_add(super::value::decimal_raw(*d)) {
+                    ds.val = v;
+                    ds.min = ds.min.min(v);
+                    ds.max = ds.max.max(v);
+                    return Ok(true);
+                }
+            }
+            (SumAcc::Float(f), Value::Integer(i)) => {
+                *f = *f + oxsdatatypes::Float::from(*i);
+                return Ok(true);
+            }
+            (SumAcc::Float(f), Value::Decimal(d)) => {
+                *f = *f + oxsdatatypes::Float::from(*d);
+                return Ok(true);
+            }
+            (SumAcc::Float(f), Value::Float(g)) => {
+                *f = *f + *g;
+                return Ok(true);
+            }
+            (SumAcc::Float(f), Value::Double(d)) => {
+                *acc = SumAcc::Double(oxsdatatypes::Double::from(*f) + *d);
+                return Ok(true);
+            }
+            (SumAcc::Double(d), Value::Integer(i)) => {
+                *d = *d + oxsdatatypes::Double::from(*i);
+                return Ok(true);
+            }
+            (SumAcc::Double(d), Value::Decimal(x)) => {
+                *d = *d + oxsdatatypes::Double::from(*x);
+                return Ok(true);
+            }
+            (SumAcc::Double(d), Value::Float(f)) => {
+                *d = *d + oxsdatatypes::Double::from(*f);
+                return Ok(true);
+            }
+            (SumAcc::Double(d), Value::Double(x)) => {
+                *d = *d + *x;
+                return Ok(true);
+            }
+            _ => {}
+        }
+
+        let (next, scratch) = match acc.add_value_slow(ctx, &value, admit) {
+            Ok(pair) => pair,
+            Err(error) => {
+                *rows -= 1;
+                *errs -= err;
+                return Err(error);
+            }
+        };
+        let old_bytes = acc.heap_bytes();
+        let new_bytes = next.heap_bytes();
+        // All arithmetic temporaries have been dropped; narrow the scratch guard to cover
+        // the live candidate until retained admission completes and the old subtotal drops,
+        // or until refusal drops the candidate.
+        if let Some(guard) = &scratch
+            && let Err(error) = guard.resize(new_bytes)
+        {
+            drop(next);
+            drop(scratch);
+            *rows -= 1;
+            *errs -= err;
+            return Err(error);
+        }
+        if old_bytes != new_bytes {
+            match admit.admit(old_bytes, new_bytes) {
+                Ok(true) => {}
+                Ok(false) => {
+                    drop(next);
+                    drop(scratch);
+                    *rows -= 1;
+                    *errs -= err;
+                    return Ok(false);
+                }
+                Err(error) => {
+                    drop(next);
+                    drop(scratch);
+                    *rows -= 1;
+                    *errs -= err;
+                    return Err(error);
+                }
+            }
+        }
+        let old = std::mem::replace(acc, next);
+        drop(old);
+        drop(scratch);
+        Ok(true)
+    }
+
+    /// Whether [`AggState::merge`] of `other` into `self` is guaranteed to match a single
+    /// sequential pass bit-for-bit without mutating either state.
+    pub(super) fn can_merge(&self, other: &AggState) -> bool {
+        match (self, other) {
+            (AggState::Count(_), AggState::Count(_))
+            | (AggState::Sample(_), AggState::Sample(_)) => true,
+            (AggState::Best(lb, _, _, lf), AggState::Best(rb, _, _, rf)) => {
+                if lb.is_none() || rb.is_none() {
+                    return true;
+                }
+                let combined = lf | rf;
+                (combined & BEST_INCOMPARABLE) == 0
+                    && (combined & (BEST_EXACT_NUM | BEST_FLOAT)) != (BEST_EXACT_NUM | BEST_FLOAT)
+            }
+            (
+                AggState::Sum {
+                    acc: la,
+                    rows: lr,
+                    deferred: ld,
+                    ..
+                },
+                AggState::Sum {
+                    acc: ra,
+                    rows: rr,
+                    errs: re,
+                    deferred: rd,
+                },
+            ) => {
+                if *ld || *rd {
+                    return false;
+                }
+                if *lr == 0 || *rr == 0 {
+                    return true;
+                }
+                if matches!(la, SumAcc::HardError | SumAcc::Overflow) {
+                    return true;
+                }
+                if matches!(ra, SumAcc::HardError) {
+                    return true;
+                }
+                if matches!(ra, SumAcc::Overflow) {
+                    return *re > 0;
+                }
+                match (la, ra) {
+                    (
+                        SumAcc::Int { sum: ls, .. },
+                        SumAcc::Int {
+                            sum: rs,
+                            min: rmin,
+                            max: rmax,
+                        },
+                    ) => {
+                        ls.checked_add(*rs).is_some()
+                            && ls.checked_add(*rmin).is_some()
+                            && ls.checked_add(*rmax).is_some()
+                    }
+                    (
+                        SumAcc::Int { sum: ls, .. } | SumAcc::IntRetracted(ls),
+                        SumAcc::Int { sum: rs, .. } | SumAcc::IntRetracted(rs),
+                    ) => ls.checked_add(*rs).is_some(),
+                    (
+                        SumAcc::Decimal(l),
+                        SumAcc::Int {
+                            sum: osum,
+                            min: omin,
+                            max: omax,
+                        },
+                    ) => {
+                        super::value::add_scaled_int(l.val, *omin).is_some()
+                            && super::value::add_scaled_int(l.val, *omax).is_some()
+                            && super::value::add_scaled_int(l.val, *osum).is_some()
+                    }
+                    (SumAcc::Int { sum: ls, .. }, SumAcc::Decimal(r)) => {
+                        r.exact_int_prefix
+                            && ls
+                                .checked_add(r.int_before)
+                                .and_then(|t| t.checked_mul(super::value::DECIMAL_SCALE))
+                                .is_some()
+                            && ls.checked_add(r.int_min).is_some()
+                            && ls.checked_add(r.int_max).is_some()
+                            && super::value::add_scaled_int(r.min, *ls).is_some()
+                            && super::value::add_scaled_int(r.max, *ls).is_some()
+                            && super::value::add_scaled_int(r.val, *ls).is_some()
+                    }
+                    (SumAcc::Decimal(l), SumAcc::Decimal(r)) => {
+                        r.exact_int_prefix
+                            && super::value::add_scaled_int(l.val, r.int_min).is_some()
+                            && super::value::add_scaled_int(l.val, r.int_max).is_some()
+                            && l.val.checked_add(r.min).is_some()
+                            && l.val.checked_add(r.max).is_some()
+                            && l.val.checked_add(r.val).is_some()
+                    }
+                    (SumAcc::Decimal(_), SumAcc::IntRetracted(_))
+                    | (SumAcc::IntRetracted(_), SumAcc::Decimal(_)) => false,
+                    (SumAcc::BigInt(_) | SumAcc::BigDec(_), _)
+                    | (_, SumAcc::BigInt(_) | SumAcc::BigDec(_)) => false,
+                    (
+                        SumAcc::Float(_) | SumAcc::Double(_),
+                        SumAcc::Int { .. }
+                        | SumAcc::Decimal(_)
+                        | SumAcc::Float(_)
+                        | SumAcc::Double(_),
+                    )
+                    | (
+                        SumAcc::Int { .. } | SumAcc::IntRetracted(_) | SumAcc::Decimal(_),
+                        SumAcc::Float(_) | SumAcc::Double(_),
+                    ) => *rr == 1,
+                    (SumAcc::Float(_) | SumAcc::Double(_), SumAcc::IntRetracted(_)) => false,
+                    (SumAcc::HardError | SumAcc::Overflow, _)
+                    | (_, SumAcc::HardError | SumAcc::Overflow) => unreachable!(),
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// Fold `other`, the state of the same aggregate over rows that come after this
     /// state's rows, into this one, so that the result is what one state over all the
     /// rows in that order gives. `false`, with this state unchanged, for a state that
-    /// cannot be combined exactly, such as ARQ's shifted sums.
-    #[allow(dead_code, reason = "the parallel split and item 418's view operator")]
+    /// cannot be combined exactly, such as ARQ's shifted sums, multi-row float/double
+    /// subtotals, big-number arithmetic merges, or a right-side numeric overflow that a
+    /// single pass might have avoided.
     pub(super) fn merge(&mut self, ctx: &Ctx, agg: &Agg, other: AggState) -> bool {
+        if !self.can_merge(&other) {
+            let _ = ctx;
+            return false;
+        }
         match (&mut *self, other) {
             (AggState::Count(a), AggState::Count(b)) => *a += b,
             (
                 AggState::Sum {
-                    int,
-                    generic,
-                    ok,
-                    rows,
-                    errs,
-                    ..
+                    acc, rows, errs, ..
                 },
                 AggState::Sum {
-                    int: oint,
-                    generic: ogeneric,
-                    ok: ook,
+                    acc: oacc,
                     rows: orows,
                     errs: oerrs,
                     ..
                 },
             ) => {
+                if orows == 0 {
+                    return true;
+                }
+                if *rows == 0 {
+                    *acc = oacc;
+                    *rows = orows;
+                    *errs = oerrs;
+                    return true;
+                }
                 *rows += orows;
                 *errs += oerrs;
-                if !*ok {
+                if matches!(acc, SumAcc::HardError | SumAcc::Overflow) {
                     return true;
                 }
-                if !ook {
-                    *ok = false;
-                    return true;
-                }
-                if generic.is_none()
-                    && ogeneric.is_none()
-                    && let Some(s) = int.checked_add(oint)
+                if matches!(oacc, SumAcc::HardError)
+                    || (matches!(oacc, SumAcc::Overflow) && oerrs > 0)
                 {
-                    *int = s;
+                    *acc = SumAcc::HardError;
                     return true;
                 }
-                let left = generic.take().unwrap_or_else(|| SumGeneric::from_int(*int));
-                let right = ogeneric.unwrap_or_else(|| SumGeneric::from_int(oint));
-                match left.merge(right) {
-                    Some(v) => *generic = Some(v),
-                    None => *ok = false,
+                match (&mut *acc, oacc) {
+                    (
+                        SumAcc::Int { sum, min, max },
+                        SumAcc::Int {
+                            sum: osum,
+                            min: omin,
+                            max: omax,
+                        },
+                    ) => {
+                        let base = *sum;
+                        *sum = base + osum;
+                        *min = (*min).min(base + omin);
+                        *max = (*max).max(base + omax);
+                    }
+                    (
+                        SumAcc::Int { sum: ls, .. } | SumAcc::IntRetracted(ls),
+                        SumAcc::Int { sum: rs, .. } | SumAcc::IntRetracted(rs),
+                    ) => {
+                        *acc = SumAcc::IntRetracted(*ls + rs);
+                    }
+                    (
+                        SumAcc::Decimal(l),
+                        SumAcc::Int {
+                            sum: osum,
+                            min: omin,
+                            max: omax,
+                        },
+                    ) => {
+                        let smin = super::value::add_scaled_int(l.val, omin)
+                            .expect("validated by can_merge");
+                        let smax = super::value::add_scaled_int(l.val, omax)
+                            .expect("validated by can_merge");
+                        let val = super::value::add_scaled_int(l.val, osum)
+                            .expect("validated by can_merge");
+                        l.val = val;
+                        l.min = l.min.min(smin);
+                        l.max = l.max.max(smax);
+                    }
+                    (SumAcc::Int { sum, min, max }, SumAcc::Decimal(mut r)) => {
+                        let base = *sum;
+                        let trans_int = base + r.int_before;
+                        let smin = super::value::add_scaled_int(r.min, base)
+                            .expect("validated by can_merge");
+                        let smax = super::value::add_scaled_int(r.max, base)
+                            .expect("validated by can_merge");
+                        let val = super::value::add_scaled_int(r.val, base)
+                            .expect("validated by can_merge");
+                        r.val = val;
+                        r.min = smin;
+                        r.max = smax;
+                        r.int_before = trans_int;
+                        debug_assert!(r.exact_int_prefix);
+                        r.int_min = (*min).min(base + r.int_min);
+                        r.int_max = (*max).max(base + r.int_max);
+                        *acc = SumAcc::Decimal(r);
+                    }
+                    (SumAcc::Decimal(l), SumAcc::Decimal(r)) => {
+                        let imin = super::value::add_scaled_int(l.val, r.int_min)
+                            .expect("validated by can_merge");
+                        let imax = super::value::add_scaled_int(l.val, r.int_max)
+                            .expect("validated by can_merge");
+                        let dmin = l.val.checked_add(r.min).expect("validated by can_merge");
+                        let dmax = l.val.checked_add(r.max).expect("validated by can_merge");
+                        let val = l.val.checked_add(r.val).expect("validated by can_merge");
+                        l.val = val;
+                        l.min = l.min.min(imin).min(dmin);
+                        l.max = l.max.max(imax).max(dmax);
+                    }
+                    // Single-row right partition with Float or Double on either side.
+                    (left_acc, right_acc) => {
+                        debug_assert_eq!(orows, 1);
+                        use oxsdatatypes::{Double, Float};
+                        match (&*left_acc, right_acc) {
+                            (
+                                SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum),
+                                SumAcc::Float(f),
+                            ) => *left_acc = SumAcc::Float(Float::from(*sum as f32) + f),
+                            (
+                                SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum),
+                                SumAcc::Double(d),
+                            ) => *left_acc = SumAcc::Double(Double::from(*sum as f64) + d),
+                            (SumAcc::Decimal(ds), SumAcc::Float(f)) => {
+                                *left_acc = SumAcc::Float(
+                                    Float::from(super::value::decimal_from_raw(ds.val)) + f,
+                                );
+                            }
+                            (SumAcc::Decimal(ds), SumAcc::Double(d)) => {
+                                *left_acc = SumAcc::Double(
+                                    Double::from(super::value::decimal_from_raw(ds.val)) + d,
+                                );
+                            }
+                            (SumAcc::Float(f), SumAcc::Int { sum, .. }) => {
+                                *left_acc = SumAcc::Float(*f + Float::from(sum as f32));
+                            }
+                            (SumAcc::Float(f), SumAcc::Decimal(ds)) => {
+                                *left_acc = SumAcc::Float(
+                                    *f + Float::from(super::value::decimal_from_raw(ds.val)),
+                                );
+                            }
+                            (SumAcc::Float(f), SumAcc::Float(g)) => {
+                                *left_acc = SumAcc::Float(*f + g);
+                            }
+                            (SumAcc::Float(f), SumAcc::Double(d)) => {
+                                *left_acc = SumAcc::Double(Double::from(*f) + d);
+                            }
+                            (SumAcc::Double(d), SumAcc::Int { sum, .. }) => {
+                                *left_acc = SumAcc::Double(*d + Double::from(sum as f64));
+                            }
+                            (SumAcc::Double(d), SumAcc::Decimal(ds)) => {
+                                *left_acc = SumAcc::Double(
+                                    *d + Double::from(super::value::decimal_from_raw(ds.val)),
+                                );
+                            }
+                            (SumAcc::Double(d), SumAcc::Float(f)) => {
+                                *left_acc = SumAcc::Double(*d + Double::from(f));
+                            }
+                            (SumAcc::Double(d), SumAcc::Double(x)) => {
+                                *left_acc = SumAcc::Double(*d + x);
+                            }
+                            _ => unreachable!("validated by can_merge"),
+                        }
+                    }
                 }
             }
-            (AggState::Best(best, best_v, errs), AggState::Best(Some(id), v, oerrs)) => {
+            (
+                AggState::Best(best, best_v, errs, flags),
+                AggState::Best(Some(id), v, oerrs, oflags),
+            ) => {
                 *errs += oerrs;
+                *flags |= oflags;
                 let better = match best_v.as_ref() {
                     None => best.is_none(),
                     Some(b) => {
@@ -8821,16 +9361,16 @@ impl AggState {
                     *best_v = v;
                 }
             }
-            (AggState::Best(_, _, errs), AggState::Best(None, _, oerrs)) => *errs += oerrs,
+            (AggState::Best(_, _, errs, flags), AggState::Best(None, _, oerrs, oflags)) => {
+                *errs += oerrs;
+                *flags |= oflags;
+            }
             (AggState::Sample(x), AggState::Sample(y)) => {
                 if x.is_none() {
                     *x = y;
                 }
             }
-            _ => {
-                let _ = ctx;
-                return false;
-            }
+            _ => unreachable!("validated by can_merge"),
         }
         true
     }
@@ -8853,7 +9393,7 @@ impl AggState {
                     *n += weight;
                 }
             }
-            AggState::Best(_, _, errs) => {
+            AggState::Best(_, _, errs, _) => {
                 if id.is_none_or(|id| id.is_undef()) {
                     *errs += weight;
                 } else {
@@ -8864,7 +9404,7 @@ impl AggState {
                 let _ = self.add_admitted(ctx, agg, id, admit)?;
             }
             AggState::Sum {
-                ok: false,
+                acc: SumAcc::HardError | SumAcc::Overflow,
                 rows,
                 errs,
                 ..
@@ -8874,23 +9414,31 @@ impl AggState {
                     *errs += weight;
                 }
             }
-            AggState::Sum { ok, rows, errs, .. } if id.is_none_or(|id| id.is_undef()) => {
+            AggState::Sum {
+                acc, rows, errs, ..
+            } if id.is_none_or(|id| id.is_undef()) => {
                 *rows += weight;
                 *errs += weight;
-                *ok = false;
+                *acc = SumAcc::HardError;
             }
             AggState::Sum {
-                int,
-                generic: None,
-                ok: true,
+                acc: SumAcc::Int { sum, min, max },
                 rows,
                 ..
             } if id.is_some_and(|id| id.tag() == crate::id::Tag::Int) => {
                 let id = id.expect("checked above");
-                if let Some(delta) = i128::from(id.as_i64()).checked_mul(i128::from(weight))
-                    && let Some(s) = int.checked_add(delta)
+                let x = id.as_i64();
+                if let Some(delta) = i128::from(x).checked_mul(i128::from(weight))
+                    && let Some(s) = sum.checked_add(delta)
                 {
-                    *int = s;
+                    *sum = s;
+                    if x >= 0 {
+                        if s > *max {
+                            *max = s;
+                        }
+                    } else if s < *min {
+                        *min = s;
+                    }
                     *rows += weight;
                     return Ok(());
                 }
@@ -8900,7 +9448,9 @@ impl AggState {
                     }
                     let _ = self.add_admitted(ctx, agg, Some(id), admit)?;
                     if let AggState::Sum {
-                        ok: false, rows, ..
+                        acc: SumAcc::HardError | SumAcc::Overflow,
+                        rows,
+                        ..
                     } = self
                     {
                         *rows += weight - 1 - i;
@@ -8915,7 +9465,7 @@ impl AggState {
                     }
                     let _ = self.add_admitted(ctx, agg, id, admit)?;
                     if let AggState::Sum {
-                        ok: false,
+                        acc: SumAcc::HardError | SumAcc::Overflow,
                         rows,
                         errs,
                         ..
@@ -8949,23 +9499,21 @@ impl AggState {
                 }
                 true
             }
-            AggState::Sum {
-                int,
-                generic: None,
-                ok: true,
-                rows,
-                ..
-            } => {
+            AggState::Sum { acc, rows, .. } => {
+                let sum = match acc {
+                    SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum) => *sum,
+                    _ => return false,
+                };
                 let Some(id) = id.filter(|id| id.tag() == crate::id::Tag::Int) else {
                     return false;
                 };
                 let Some(delta) = i128::from(id.as_i64()).checked_mul(i128::from(weight)) else {
                     return false;
                 };
-                let Some(s) = int.checked_sub(delta) else {
+                let Some(s) = sum.checked_sub(delta) else {
                     return false;
                 };
-                *int = s;
+                *acc = SumAcc::IntRetracted(s);
                 *rows = rows.saturating_sub(weight);
                 true
             }
@@ -8978,14 +9526,14 @@ impl AggState {
         match self {
             AggState::Count(n) => Ok(Id::from_i64(*n as i64).unwrap_or(Id::UNDEF)),
             AggState::Sum { .. } => self.clone().finish(ctx, agg),
-            AggState::Best(best, _, errs) => Ok(super::group::acc::finish_best(
+            AggState::Best(best, _, errs, _) => Ok(super::group::acc::finish_best(
                 ctx,
                 matches!(agg.func, AggregateFunction::Min),
                 *errs,
                 *best,
             )),
             AggState::Sample(x) => Ok(x.unwrap_or(Id::UNDEF)),
-            AggState::Stat(arq, acc) => Ok(acc.clone().finish(ctx, *arq)),
+            AggState::Stat(arq, acc) => acc.try_finish(ctx, *arq),
         }
     }
 
@@ -9002,12 +9550,7 @@ impl AggState {
         match self {
             AggState::Count(n) => Ok(Id::from_i64(n as i64).unwrap_or(Id::UNDEF)),
             AggState::Sum {
-                int,
-                generic,
-                ok,
-                rows,
-                errs,
-                ..
+                acc, rows, errs, ..
             } => {
                 // AVG is Sum over Count, and Count leaves the errors out
                 if rows > 0
@@ -9015,21 +9558,21 @@ impl AggState {
                     && matches!(agg.func, AggregateFunction::Avg)
                     && ctx.aggregate_errors.avg_of_errors_zero()
                 {
-                    return Ok(ctx.intern_value(&Value::Integer(0.into())));
+                    return ctx.try_intern_value(&Value::Integer(0.into()));
                 }
-                if !ok {
+                if matches!(acc, SumAcc::HardError | SumAcc::Overflow) {
                     return Ok(Id::UNDEF);
                 }
                 let is_avg = matches!(agg.func, AggregateFunction::Avg);
                 if is_avg && rows == 0 {
-                    return Ok(ctx.intern_value(&Value::Integer(0.into())));
+                    return ctx.try_intern_value(&Value::Integer(0.into()));
                 }
                 let denom_value = || match i64::try_from(rows) {
                     Ok(r) => Value::Integer(r.into()),
                     Err(_) => Value::from_bigint(super::bignum::BigInt::from_u64(rows)),
                 };
-                let (v, scratch) = match generic {
-                    None => {
+                let (v, scratch) = match acc {
+                    SumAcc::Int { sum: int, .. } | SumAcc::IntRetracted(int) => {
                         let needs_big = is_avg
                             && match (i64::try_from(int), i64::try_from(rows)) {
                                 (Ok(i), Ok(r)) => super::value::int_div_needs_big(i, r),
@@ -9052,7 +9595,8 @@ impl AggState {
                         };
                         (v, scratch)
                     }
-                    Some(SumGeneric::Decimal(d)) => {
+                    SumAcc::Decimal(ds) => {
+                        let d = super::value::decimal_from_raw(ds.val);
                         let needs_big = is_avg
                             && match i64::try_from(rows).ok().map(oxsdatatypes::Decimal::from) {
                                 Some(rd) => {
@@ -9078,7 +9622,7 @@ impl AggState {
                         };
                         (v, scratch)
                     }
-                    Some(SumGeneric::Float(f)) => {
+                    SumAcc::Float(f) => {
                         let v = if is_avg {
                             Some(Value::Float(f / oxsdatatypes::Float::from(rows as f32)))
                         } else {
@@ -9086,7 +9630,7 @@ impl AggState {
                         };
                         (v, None)
                     }
-                    Some(SumGeneric::Double(d)) => {
+                    SumAcc::Double(d) => {
                         let v = if is_avg {
                             Some(Value::Double(d / oxsdatatypes::Double::from(rows as f64)))
                         } else {
@@ -9094,7 +9638,7 @@ impl AggState {
                         };
                         (v, None)
                     }
-                    Some(SumGeneric::BigInt(bi)) => {
+                    SumAcc::BigInt(bi) => {
                         if is_avg {
                             let scratch = scratch_admit
                                 .charge_scratch(ctx, super::bignum::AGG_SUM_SCRATCH_BYTES)?;
@@ -9104,7 +9648,7 @@ impl AggState {
                             (bi.fits_limits().then(|| Value::from_bigint(*bi)), None)
                         }
                     }
-                    Some(SumGeneric::BigDec(bd)) => {
+                    SumAcc::BigDec(bd) => {
                         if is_avg {
                             let scratch = scratch_admit
                                 .charge_scratch(ctx, super::bignum::AGG_SUM_SCRATCH_BYTES)?;
@@ -9115,6 +9659,7 @@ impl AggState {
                             (bd.fits_limits().then(|| Value::from_bigdec(*bd)), None)
                         }
                     }
+                    SumAcc::HardError | SumAcc::Overflow => unreachable!(),
                 };
                 let intern_scratch = if scratch.is_none() {
                     match v.as_ref() {
@@ -9131,20 +9676,23 @@ impl AggState {
                 } else {
                     None
                 };
-                let id = v.as_ref().map_or(Id::UNDEF, |v| ctx.intern_value(v));
+                let id = match v.as_ref() {
+                    Some(v) => ctx.try_intern_value(v)?,
+                    None => Id::UNDEF,
+                };
                 drop(v);
                 drop(intern_scratch);
                 drop(scratch);
                 Ok(id)
             }
-            AggState::Best(best, _, errs) => Ok(super::group::acc::finish_best(
+            AggState::Best(best, _, errs, _) => Ok(super::group::acc::finish_best(
                 ctx,
                 matches!(agg.func, AggregateFunction::Min),
                 errs,
                 best,
             )),
             AggState::Sample(x) => Ok(x.unwrap_or(Id::UNDEF)),
-            AggState::Stat(arq, acc) => Ok(acc.finish(ctx, arq)),
+            AggState::Stat(arq, acc) => acc.try_finish(ctx, arq),
         }
     }
 }

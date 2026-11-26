@@ -1198,6 +1198,13 @@ impl LocalVocab {
             }
         }
     }
+
+    fn append_only_clone_bytes(&self) -> u64 {
+        match self {
+            Self::Owned(v) => v.append_only_clone_bytes(),
+            Self::Circuit(t) => t.bytes(),
+        }
+    }
 }
 
 pub struct Ctx {
@@ -2575,7 +2582,7 @@ impl Ctx {
                 .saturating_add(local.append_only_clone_bytes());
             if bytes <= admitted {
                 *trial.var_names.get_mut() = names.clone();
-                *trial.local.get_mut() = local.clone();
+                *trial.local.get_mut() = LocalVocab::Owned(local.clone_owned());
                 break;
             }
             // Admission may wake a pool entrant. Keep both vocabulary and
@@ -2626,23 +2633,34 @@ impl Ctx {
         }
     }
 
+    /// Fallible variant of [`Ctx::retain_bytes`]: charges `bytes` more of query-local
+    /// terms and memos without latching [`Ctx::memory_failure`] on refusal, so callers
+    /// with a recovery path (such as parallel fallback or `group_or_spill`) can handle
+    /// the memory error directly.
+    pub(crate) fn try_retain_bytes(&self, bytes: u64) -> Result<()> {
+        self.check_memory_failure()?;
+        let retained = &self.retained;
+        let used = retained.used.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        if retained.charge.covers(used) {
+            return Ok(());
+        }
+        match self.grow_reservation(&retained.charge, used, u64::MAX, true) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                retained.used.fetch_sub(bytes, Ordering::AcqRel);
+                Err(error)
+            }
+        }
+    }
+
     /// Charge `bytes` more of query-local terms and memos, which stay until the context
     /// drops, in both accounting modes. Infallible expression interning must not turn a
     /// resource failure into an ordinary unbound BIND, so a refusal is recorded and fails
     /// the next check, and `false` tells the caller not to allocate.
     pub(crate) fn retain_bytes(&self, bytes: u64) -> bool {
-        if self.memory_failure.failed.load(Ordering::Acquire) {
-            return false;
-        }
-        let retained = &self.retained;
-        let used = retained.used.fetch_add(bytes, Ordering::AcqRel) + bytes;
-        if retained.charge.covers(used) {
-            return true;
-        }
-        match self.grow_reservation(&retained.charge, used, u64::MAX, true) {
+        match self.try_retain_bytes(bytes) {
             Ok(()) => true,
             Err(error) => {
-                retained.used.fetch_sub(bytes, Ordering::AcqRel);
                 self.fail_memory(&error);
                 false
             }
@@ -3224,21 +3242,33 @@ impl Ctx {
 
     // ---------------------------------------------------------------- terms ------
 
+    /// Fallible variant of [`Ctx::intern_term`] that returns memory refusals without
+    /// latching [`Ctx::memory_failure`].
+    pub(crate) fn try_intern_term(&self, t: &Term) -> Result<Id> {
+        if let Term::BlankNode(b) = t {
+            return match id::parse_bnode_payload(b.as_str()) {
+                Some(p) => Ok(Id::bnode(p)),
+                None => self.try_outside_bnode(b.as_str()),
+            };
+        }
+        if let Some(id) = id::inline_id(t) {
+            return Ok(id);
+        }
+        let key = id::term_key(t);
+        self.try_intern_key(&key)
+    }
+
     /// The id of a term this query decoded from one of its own ids: stored id if the
     /// term exists in the store, else a local id. A blank node label written by
     /// [`bnode_for`] maps back to its id, a stored node's or one this query minted.
     pub fn intern_term(&self, t: &Term) -> Id {
-        if let Term::BlankNode(b) = t {
-            return match id::parse_bnode_payload(b.as_str()) {
-                Some(p) => Id::bnode(p),
-                None => self.outside_bnode(b.as_str()),
-            };
+        match self.try_intern_term(t) {
+            Ok(id) => id,
+            Err(error) => {
+                self.fail_memory(&error);
+                Id::UNDEF
+            }
         }
-        if let Some(id) = id::inline_id(t) {
-            return id;
-        }
-        let key = id::term_key(t);
-        self.intern_key(&key)
     }
 
     /// A literal written in the query text. A blank node label inside a composite literal
@@ -3328,18 +3358,27 @@ impl Ctx {
             .map(|(k, _)| k.clone())
     }
 
-    /// A blank node of this query for a label from outside it.
-    fn outside_bnode(&self, label: &str) -> Id {
+    /// Fallible variant of [`Ctx::outside_bnode`].
+    fn try_outside_bnode(&self, label: &str) -> Result<Id> {
         let mut memo = self.outside_bnodes.lock();
         if let Some(&id) = memo.get(label) {
-            return id;
+            return Ok(id);
         }
-        if !self.retain_bytes(label.len() as u64 + 128) {
-            return Id::UNDEF;
-        }
+        self.try_retain_bytes(label.len() as u64 + 128)?;
         let id = self.fresh_bnode();
         memo.insert(label.to_string(), id);
-        id
+        Ok(id)
+    }
+
+    /// A blank node of this query for a label from outside it.
+    fn outside_bnode(&self, label: &str) -> Id {
+        match self.try_outside_bnode(label) {
+            Ok(id) => id,
+            Err(error) => {
+                self.fail_memory(&error);
+                Id::UNDEF
+            }
+        }
     }
 
     /// Id for a graph name, mapping Jena's special default-graph IRI.
@@ -3357,21 +3396,31 @@ impl Ctx {
         id.tag() == Tag::Local && !self.local_facts
     }
 
-    pub fn intern_key(&self, key: &[u8]) -> Id {
+    /// Fallible variant of [`Ctx::intern_key`] that returns memory refusals without
+    /// latching [`Ctx::memory_failure`].
+    pub(crate) fn try_intern_key(&self, key: &[u8]) -> Result<Id> {
         if let Some(id) = self.snap.lookup_key(key) {
-            return id;
+            return Ok(id);
         }
         if let Some(i) = self.local.read().find(key) {
-            return Id::local(i);
+            return Ok(Id::local(i));
         }
         let mut local = self.local.write();
         if let Some(i) = local.find(key) {
-            return Id::local(i);
+            return Ok(Id::local(i));
         }
-        if !self.retain_bytes(key.len() as u64 + 96) {
-            return Id::UNDEF;
+        self.try_retain_bytes(key.len() as u64 + 96)?;
+        Ok(Id::local(local.insert(key).0))
+    }
+
+    pub fn intern_key(&self, key: &[u8]) -> Id {
+        match self.try_intern_key(key) {
+            Ok(id) => id,
+            Err(error) => {
+                self.fail_memory(&error);
+                Id::UNDEF
+            }
         }
-        Id::local(local.insert(key).0)
     }
 
     /// SERVICE-created encoded terms retain the existing key-byte estimate in eager
@@ -3418,20 +3467,32 @@ impl Ctx {
         Ok(id)
     }
 
-    pub fn intern_value(&self, v: &Value) -> Id {
+    /// Fallible variant of [`Ctx::intern_value`] that returns memory refusals without
+    /// latching [`Ctx::memory_failure`].
+    pub(crate) fn try_intern_value(&self, v: &Value) -> Result<Id> {
         match v {
-            Value::Bool(b) => Id::from_bool(*b),
+            Value::Bool(b) => Ok(Id::from_bool(*b)),
             Value::Integer(i) => match Id::from_i64(i64::from(*i)) {
-                Some(id) => id,
-                None => self.intern_term(&v.to_term()),
+                Some(id) => Ok(id),
+                None => self.try_intern_term(&v.to_term()),
             },
             // The canonical form of a decimal value parses back to the same value, so
             // its inline id needs neither the text nor the parse of `intern_term`.
             Value::Decimal(d) => match id::pack_decimal(*d) {
-                Some(p) => Id::new(Tag::Decimal, p),
-                None => self.intern_term(&v.to_term()),
+                Some(p) => Ok(Id::new(Tag::Decimal, p)),
+                None => self.try_intern_term(&v.to_term()),
             },
-            _ => self.intern_term(&v.to_term()),
+            _ => self.try_intern_term(&v.to_term()),
+        }
+    }
+
+    pub fn intern_value(&self, v: &Value) -> Id {
+        match self.try_intern_value(v) {
+            Ok(id) => id,
+            Err(error) => {
+                self.fail_memory(&error);
+                Id::UNDEF
+            }
         }
     }
 
