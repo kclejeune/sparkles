@@ -340,7 +340,7 @@ impl Base {
 
     /// The passes of an ordered scan: one per input graph.
     #[inline]
-    fn passes(&self) -> usize {
+    pub(crate) fn passes(&self) -> usize {
         self.graphs.len().max(1)
     }
 
@@ -852,7 +852,9 @@ impl Base {
             return self.probe(memo, t);
         };
         let k = *t;
-        if let Some((any, _)) = l.peek(&k) {
+        if let Some((any, complete)) = l.peek(&k)
+            && (complete || any)
+        {
             return Ok(any);
         }
         let found = self.probe(memo, t)?;

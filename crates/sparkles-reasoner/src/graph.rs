@@ -1147,14 +1147,21 @@ impl Graph {
         })
     }
 
-    /// Whether `t` is a live fact among ids `< hi`.
+    /// Whether `t` is a live fact among ids `< hi`. A fact present in the derived tier at
+    /// row `>= hi` (such as a newly inserted explicit row appended at `start` during
+    /// incremental saturation) did not hold before `hi` even when the new snapshot's base
+    /// tier already holds it.
     pub fn holds_before(&self, memo: &mut Memo, t: &Triple, hi: u32) -> bool {
-        self.position(t).is_some_and(|r| r < hi)
-            || (self.reads_base(0, hi)
-                && self
-                    .base
-                    .as_ref()
-                    .is_some_and(|b| b.contains_with(memo, t).unwrap_or(false)))
+        match self.position(t) {
+            Some(r) => r < hi,
+            None => {
+                self.reads_base(0, hi)
+                    && self
+                        .base
+                        .as_ref()
+                        .is_some_and(|b| b.contains_with(memo, t).unwrap_or(false))
+            }
+        }
     }
 
     /// The objects of `(s p ?)` among ids `< hi`, the base tier's first and the derived
@@ -1264,6 +1271,35 @@ impl Graph {
         nil: u64,
         hi: u32,
     ) -> Option<Vec<u64>> {
+        self.list_filtered(memo, head, first, rest, nil, hi, false)
+    }
+
+    /// Members of an RDF list reading only explicit (`base` and flagged) `rdf:first` and
+    /// `rdf:rest` triples, ignoring unflagged derived rows (such as removed list triples
+    /// temporarily held as deletion candidates).
+    pub fn list_explicit(
+        &self,
+        memo: &mut Memo,
+        head: u64,
+        first: u64,
+        rest: u64,
+        nil: u64,
+        hi: u32,
+    ) -> Option<Vec<u64>> {
+        self.list_filtered(memo, head, first, rest, nil, hi, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn list_filtered(
+        &self,
+        memo: &mut Memo,
+        head: u64,
+        first: u64,
+        rest: u64,
+        nil: u64,
+        hi: u32,
+        explicit_only: bool,
+    ) -> Option<Vec<u64>> {
         const MAX_LEN: usize = 1 << 20;
         let mut out = Vec::new();
         let mut cur = head;
@@ -1274,10 +1310,45 @@ impl Graph {
             }
             // with several values (e.g. copies made by owl:sameAs replacement) the
             // earliest (asserted) one wins
-            out.push(*self.objects(memo, cur, first, hi).first()?);
-            cur = *self.objects(memo, cur, rest, hi).first()?;
+            let first_val = self.first_object(memo, cur, first, hi, explicit_only)?;
+            out.push(first_val);
+            cur = self.first_object(memo, cur, rest, hi, explicit_only)?;
         }
         Some(out)
+    }
+
+    /// The earliest object of `(s p ?)` among ids `< hi`, restricting derived rows to
+    /// flagged-explicit ones when `explicit_only` is set.
+    fn first_object(
+        &self,
+        memo: &mut Memo,
+        s: u64,
+        p: u64,
+        hi: u32,
+        explicit_only: bool,
+    ) -> Option<u64> {
+        if let Some(b) = &self.base
+            && self.reads_base(0, hi)
+        {
+            let mut found = None;
+            let _ = b.for_each_with(memo, Some(s), Some(p), None, |t| {
+                found = Some(t[2]);
+                false
+            });
+            if found.is_some() {
+                return found;
+            }
+        }
+        let mut best: Option<(u32, u64)> = None;
+        for i in self.cands(Some(s), Some(p), None, 0, hi).iter() {
+            if self.alive(i) && (!explicit_only || self.flagged(i)) {
+                let t = self.triple(i);
+                if t[0] == s && t[1] == p && best.is_none_or(|(bi, _)| i < bi) {
+                    best = Some((i, t[2]));
+                }
+            }
+        }
+        best.map(|(_, o)| o)
     }
 }
 

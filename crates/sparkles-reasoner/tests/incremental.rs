@@ -436,7 +436,7 @@ fn compaction_restarts_and_bulk_loads() {
 }
 
 #[test]
-fn large_deletions_run_in_full() {
+fn large_deletions_use_cost_estimate_not_fixed_ratio() {
     let s = Store::in_memory(StoreOptions::default());
     let data: String = (0..12_000)
         .map(|i| format!("<{EX}i{i}> <{RDF}type> <{EX}C{}> .\n", i % 7))
@@ -451,26 +451,27 @@ fn large_deletions_run_in_full() {
     let cache = Cache::default();
     let r = run(&s, &p, None, Some(&cache));
     let since = r.receipt.unwrap().commit.seq;
+    // Deleting 700 of 12,000 explicit triples (> 5%) with zero rule fan-out stays
+    // incremental now that LARGE_DELETION is replaced by the cost estimate (F16 §7.3).
     let del: Vec<Triple> = (0..700)
         .map(|i| t(&format!("ex:i{i}"), "rdf:type", &format!("ex:C{}", i % 7)))
         .collect();
     change(&s, &[], &del);
     let r = run(&s, &p, Some(since), Some(&cache));
+    assert_eq!(r.method, Method::Incremental, "{:?}", r.fallback);
+    check(&s, &p, &r, "low-fanout deletion above 5%");
+    // A deletion whose estimated rule-instance visits exceed item 798's visit bound falls
+    // back before running backward searches.
+    let r = delete_from_a_product("(ex:s ex:r ex:o)", 32, Some(32 << 20));
     assert_eq!(r.method, Method::Full);
     assert!(
         r.fallback
             .as_deref()
-            .unwrap()
-            .starts_with("700 of 12000 explicit"),
+            .unwrap_or_default()
+            .starts_with("the deletion is estimated to visit"),
         "{:?}",
         r.fallback
     );
-    // fewer go incrementally
-    let since = r.receipt.unwrap().commit.seq;
-    change(&s, &[], &[t("ex:i800", "rdf:type", "ex:C2")]);
-    let r = run(&s, &p, Some(since), Some(&cache));
-    assert_eq!(r.method, Method::Incremental, "{:?}", r.fallback);
-    check(&s, &p, &r, "one deletion");
 }
 
 #[test]
@@ -502,18 +503,13 @@ fn fallbacks() {
     assert_eq!(r.method, Method::Full);
     assert!(r.fallback.unwrap().contains("noValue"));
     check(&s, &rules, &run(&s, &rules, None, None), "noValue");
-    // owl-rl reads lists: a list change runs in full
+    // owl-rl reads lists: changing an explicit list stays incremental (F16 §7.3)
     let p = Profile::OwlRl;
     let r = run(&s, &p, None, Some(&cache));
     let since = r.receipt.unwrap().commit.seq;
     ttl(&s, "ex:U owl:unionOf (ex:A ex:Q) .");
     let r = run(&s, &p, Some(since), Some(&cache));
-    assert_eq!(r.method, Method::Full);
-    assert!(
-        r.fallback.as_deref().unwrap().contains("list"),
-        "{:?}",
-        r.fallback
-    );
+    assert_eq!(r.method, Method::Incremental, "{:?}", r.fallback);
     check(&s, &p, &r, "list");
     // with the list in place, other changes are incremental, and see it
     let since = r.receipt.unwrap().commit.seq;
@@ -521,6 +517,27 @@ fn fallbacks() {
     let r = run(&s, &p, Some(since), Some(&cache));
     assert_eq!(r.method, Method::Incremental, "{:?}", r.fallback);
     check(&s, &p, &r, "after the list");
+    // lists derived by rules still fall back to a full run (F16 §7.3)
+    let derived_list_rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [make: (?x ex:head ?m) -> (?x rdf:first ?m), (?x rdf:rest rdf:nil)]
+         [read: (?c ex:uses ?l), listMember(?l, ?m) -> (?c ex:has ?m)]"
+            .into(),
+    );
+    let ds = Store::in_memory(StoreOptions::default());
+    ttl(&ds, "ex:l0 ex:head ex:v1 . ex:c0 ex:uses ex:l0 .");
+    let dcache = Cache::default();
+    let r = run(&ds, &derived_list_rules, None, Some(&dcache));
+    let since = r.receipt.unwrap().commit.seq;
+    change(&ds, &[t("ex:l1", "ex:head", "ex:v2")], &[]);
+    let r = run(&ds, &derived_list_rules, Some(since), Some(&dcache));
+    assert_eq!(r.method, Method::Full);
+    assert!(
+        r.fallback.as_deref().unwrap_or_default().contains("list"),
+        "{:?}",
+        r.fallback
+    );
+    check(&ds, &derived_list_rules, &r, "derived list fallback");
     // a store with no kept closure and no files: full
     let other = Store::in_memory(StoreOptions::default());
     ttl(&other, "ex:B rdfs:subClassOf ex:A .");
@@ -941,9 +958,7 @@ fn deleting_edges_of_a_clique_stays_within_a_full_runs_memory() {
     change(&s, &[], &del);
     let r = go(since).unwrap_or_else(|e| panic!("the run after the deletion: {e:#}"));
     check(&s, &p, &r, "after deleting edges of the clique");
-    assert_eq!(r.method, Method::Full);
-    let why = r.fallback.as_deref().unwrap_or_default();
-    assert!(why.starts_with("the deletion "), "{why}");
+    assert_eq!(r.method, Method::Incremental, "{:?}", r.fallback);
 }
 
 /// The bound of roadmap item 798 leaves the deletion of an edge of a small clique to
@@ -1020,6 +1035,58 @@ fn delete_from_a_product(head: &str, ps: usize, limit: Option<usize>) -> ReasonR
 #[test]
 fn the_consequences_of_a_deletion_count_their_instances() {
     let r = delete_from_a_product("(ex:s ex:r ex:o)", 32, Some(32 << 20));
+    assert_eq!(r.method, Method::Full);
+    let why = r.fallback.as_deref().unwrap_or_default();
+    assert!(why.starts_with("the deletion "), "{why}");
+}
+
+/// Even when the upfront cost estimate stays below the visit bound (because average
+/// per-key fan-out is small across many distinct keys), item 798's runtime visit counter
+/// still stops a skewed deletion that visits past the bound.
+#[test]
+fn the_runtime_visit_bound_stops_skewed_consequences() {
+    let (_d, s) = persistent();
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [a: (?x ex:p ?k), (?y ex:q ?k) -> (ex:s ex:r ex:o)]"
+            .into(),
+    );
+    let mut nt = String::new();
+    // 50,000 singleton keys keep average fan-out near 2, while key ex:hot has 50,000 rows
+    for n in 0..50_000 {
+        nt.push_str(&format!("<{EX}q{n}> <{EX}q> <{EX}k{n}> .\n"));
+        nt.push_str(&format!("<{EX}h{n}> <{EX}q> <{EX}hot> .\n"));
+    }
+    let ps: Vec<Triple> = (0..32)
+        .map(|n| t(&format!("ex:p{n}"), "ex:p", "ex:hot"))
+        .collect();
+    for p in &ps {
+        nt.push_str(&format!("{} {} {} .\n", p.subject, p.predicate, p.object));
+    }
+    s.load(&[Source::from_bytes(
+        nt.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let opts = ReasonOptions {
+        max_memory: Some(64 << 20),
+        ..ReasonOptions::default()
+    };
+    let go = |since| {
+        materialize_incremental(
+            &s,
+            &rules,
+            &Extras::default(),
+            Incremental { since, cache: None },
+            &opts,
+        )
+    };
+    let full = go(None).unwrap();
+    check(&s, &rules, &full, "skewed full");
+    change(&s, &[], &ps);
+    let r = go(Some(full.receipt.unwrap().commit.seq)).unwrap();
+    check(&s, &rules, &r, "skewed deletion");
     assert_eq!(r.method, Method::Full);
     let why = r.fallback.as_deref().unwrap_or_default();
     assert!(why.starts_with("the deletion visited"), "{why}");
@@ -1295,8 +1362,218 @@ fn a_maintained_history_of_list_edits_equals_full_runs() {
         for (what, add, del) in &steps {
             change(&s, add, del);
             let rep = run(&s, &p, Some(since), cache);
+            assert_eq!(
+                rep.method,
+                Method::Incremental,
+                "{what} (kept {kept}): {:?}",
+                rep.fallback
+            );
             check(&s, &p, &rep, &format!("{what} (kept {kept})"));
             since = rep.receipt.unwrap().commit.seq;
         }
+    }
+}
+
+/// Operator-maintained closure relations (F23 Phase 4, item 837 / item 521 second half):
+/// splitting a symmetric+transitive clique by deleting its bridge edge, and deleting the
+/// `owl:TransitiveProperty` guard triple, both stay incremental and match full runs and
+/// emit exact Z-set changes.
+#[test]
+fn operator_maintained_clique_bridge_split_and_guard_deletion() {
+    let (_d, s) = persistent();
+    let mut text = String::from("ex:near a owl:SymmetricProperty, owl:TransitiveProperty .\n");
+    for base_i in [0usize, 100] {
+        for i in 0..100 {
+            let a = base_i + i;
+            let b = base_i + (i + 1) % 100;
+            text += &format!("ex:p{a} ex:near ex:p{b} .\n");
+        }
+    }
+    let bridge = t("ex:p0", "ex:near", "ex:p100");
+    text += "ex:p0 ex:near ex:p100 .\n";
+    ttl(&s, &text);
+    let p = Profile::OwlRl;
+    let cache = Cache::default();
+    let full = run_reporting(&s, &p, None, &cache);
+    check(&s, &p, &full, "clique bridge initial");
+    let before = inferred(&s);
+    change(&s, &[], &[bridge]);
+    let split = run_reporting(&s, &p, Some(full.receipt.unwrap().commit.seq), &cache);
+    assert_eq!(split.method, Method::Incremental, "{:?}", split.fallback);
+    check(&s, &p, &split, "clique bridge split");
+    let after = inferred(&s);
+    check_change(&s, &split, &before, &after, "clique bridge split change");
+    // Deleting the TransitiveProperty guard removes all multi-hop pairs while keeping
+    // 1-hop symmetric pairs, incrementally.
+    let before = after;
+    change(
+        &s,
+        &[],
+        &[t("ex:near", "rdf:type", "owl:TransitiveProperty")],
+    );
+    let guard_del = run_reporting(&s, &p, Some(split.receipt.unwrap().commit.seq), &cache);
+    assert_eq!(
+        guard_del.method,
+        Method::Incremental,
+        "{:?}",
+        guard_del.fallback
+    );
+    check(&s, &p, &guard_del, "guard deletion");
+    let after = inferred(&s);
+    check_change(&s, &guard_del, &before, &after, "guard deletion change");
+}
+
+/// Operator-maintained closure relations with mixed rules: a subproperty feeding a
+/// transitive property (`prp-spo1` + `prp-trp`), an `owl:sameAs` equivalence class split
+/// and re-merge, and a directed `rdfs:subClassOf` diamond all stay incremental and match
+/// full runs.
+#[test]
+fn operator_maintained_mixed_subproperty_and_equivalence() {
+    let (_d, s) = persistent();
+    ttl(
+        &s,
+        "ex:sub rdfs:subPropertyOf ex:tr .
+         ex:tr a owl:TransitiveProperty .
+         ex:tr rdfs:domain ex:Dom .
+         ex:a ex:sub ex:b .
+         ex:b ex:tr ex:c .
+         ex:a ex:tr ex:c .
+         ex:x owl:sameAs ex:y .
+         ex:y owl:sameAs ex:z .
+         ex:x ex:tag ex:v .
+         ex:C3 rdfs:subClassOf ex:C2 .
+         ex:C2 rdfs:subClassOf ex:C1 .
+         ex:C3 rdfs:subClassOf ex:C4 .
+         ex:C4 rdfs:subClassOf ex:C1 .
+         ex:inst a ex:C3 .",
+    );
+    let p = Profile::OwlRl;
+    let cache = Cache::default();
+    let full = run_reporting(&s, &p, None, &cache);
+    check(&s, &p, &full, "mixed initial");
+    let mut since = full.receipt.unwrap().commit.seq;
+    let steps: Vec<(&str, Vec<Triple>, Vec<Triple>)> = vec![
+        // Deleting explicit `a tr c` while `a sub b` + `b tr c` still derives it
+        (
+            "delete shortcut kept via subproperty",
+            vec![],
+            vec![t("ex:a", "ex:tr", "ex:c")],
+        ),
+        // Deleting `a sub b` now kills `a tr b`, `a tr c`, and `a a ex:Dom`
+        (
+            "delete subproperty edge",
+            vec![],
+            vec![t("ex:a", "ex:sub", "ex:b")],
+        ),
+        // Split sameAs class: `z` loses `ex:tag ex:v`
+        (
+            "split sameAs class",
+            vec![],
+            vec![t("ex:y", "owl:sameAs", "ex:z")],
+        ),
+        // Re-merge sameAs class via late-edge operator mode
+        (
+            "re-merge sameAs class",
+            vec![t("ex:x", "owl:sameAs", "ex:z")],
+            vec![],
+        ),
+        // Delete one branch of subClassOf diamond: `C3 subClassOf C1` survives via C4
+        (
+            "delete diamond branch",
+            vec![],
+            vec![t("ex:C2", "rdfs:subClassOf", "ex:C1")],
+        ),
+        // Delete second branch: `C3 subClassOf C1` and `inst a C1` disappear
+        (
+            "delete second branch",
+            vec![],
+            vec![t("ex:C4", "rdfs:subClassOf", "ex:C1")],
+        ),
+    ];
+    for (what, add, del) in &steps {
+        let before = inferred(&s);
+        change(&s, add, del);
+        let rep = run_reporting(&s, &p, Some(since), &cache);
+        assert_eq!(
+            rep.method,
+            Method::Incremental,
+            "{what}: {:?}",
+            rep.fallback
+        );
+        check(&s, &p, &rep, what);
+        let after = inferred(&s);
+        check_change(&s, &rep, &before, &after, what);
+        since = rep.receipt.unwrap().commit.seq;
+    }
+}
+
+/// Per-list tracking (F16 §7.3) with `listLength`, `listNotContains`, `listEntry` and
+/// `listForAll`: adding and removing cells stays incremental and matches full runs.
+#[test]
+fn changed_lists_with_nonmonotonic_list_builtins_stay_incremental() {
+    let rdf_nil = format!("{RDF}nil");
+    let nil = rdf_nil.as_str();
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [len: (?c ex:items ?l), listLength(?l, ?n) -> (?c ex:count ?n)]
+         [notc: (?c ex:items ?l), listNotContains(?l, ex:bad) -> (?c ex:ok ex:yes)]
+         [ent: (?c ex:items ?l), listEntry(?l, 1, ?x) -> (?c ex:second ?x)]"
+            .into(),
+    );
+    let (_d, s) = persistent();
+    let cache = Cache::default();
+    change(
+        &s,
+        &[
+            t("ex:c0", "ex:items", "ex:l0"),
+            t("ex:l0", "rdf:first", "ex:a"),
+            t("ex:l0", "rdf:rest", "ex:l1"),
+            t("ex:l1", "rdf:first", "ex:b"),
+            t("ex:l1", "rdf:rest", nil),
+        ],
+        &[],
+    );
+    let full = run(&s, &rules, None, Some(&cache));
+    check(&s, &rules, &full, "list builtins initial");
+    let mut since = full.receipt.unwrap().commit.seq;
+    let steps: Vec<(&str, Vec<Triple>, Vec<Triple>)> = vec![
+        // Append ex:bad -> count changes 2->3, ex:ok is removed!
+        (
+            "append ex:bad",
+            vec![
+                t("ex:l1", "rdf:rest", "ex:l2"),
+                t("ex:l2", "rdf:first", "ex:bad"),
+                t("ex:l2", "rdf:rest", nil),
+            ],
+            vec![t("ex:l1", "rdf:rest", nil)],
+        ),
+        // Remove ex:bad -> count changes 3->2, ex:ok returns!
+        (
+            "remove ex:bad",
+            vec![t("ex:l1", "rdf:rest", nil)],
+            vec![
+                t("ex:l1", "rdf:rest", "ex:l2"),
+                t("ex:l2", "rdf:first", "ex:bad"),
+                t("ex:l2", "rdf:rest", nil),
+            ],
+        ),
+        // Replace second element ex:b -> ex:c
+        (
+            "replace second element",
+            vec![t("ex:l1", "rdf:first", "ex:c")],
+            vec![t("ex:l1", "rdf:first", "ex:b")],
+        ),
+    ];
+    for (what, add, del) in &steps {
+        change(&s, add, del);
+        let rep = run(&s, &rules, Some(since), Some(&cache));
+        assert_eq!(
+            rep.method,
+            Method::Incremental,
+            "{what}: {:?}",
+            rep.fallback
+        );
+        check(&s, &rules, &rep, what);
+        since = rep.receipt.unwrap().commit.seq;
     }
 }

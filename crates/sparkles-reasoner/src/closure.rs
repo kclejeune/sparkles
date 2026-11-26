@@ -834,6 +834,26 @@ impl Closures {
         self.ops.iter().any(|op| !op.off && op.rules.contains(&ri))
     }
 
+    /// Force every operator covering any predicate in `preds` to re-close that predicate
+    /// from row 0 in the next step, even when no new edges arrive after `start`. Used by
+    /// incremental saturation after a deletion removed facts from an operator relation.
+    pub(crate) fn reset_predicates(&mut self, preds: &[u64]) {
+        for op in &mut self.ops {
+            if op.off {
+                continue;
+            }
+            for &q in preds {
+                let covers = match op.over {
+                    Over::Fixed(c) => c == q,
+                    Over::Guarded(..) => true,
+                };
+                if covers {
+                    op.marks.insert(q, 0);
+                }
+            }
+        }
+    }
+
     /// What the operators did so far.
     pub(crate) fn stats(&self) -> Stats {
         self.stats
@@ -1094,12 +1114,19 @@ impl Closures {
         Ok(stepped)
     }
 
-    /// [`Restart`] when the program reads lists and the run has derived list structure.
+    /// [`Restart`] when the program reads lists and the run has derived list structure
+    /// (alive, non-explicit `rdf:first` or `rdf:rest` rows in the derived tier).
     fn check_lists(&self, g: &Graph) -> anyhow::Result<()> {
         if let Some([first, rest]) = self.lists {
             let (lo, hi) = (g.offset(), g.len());
-            if g.count_p(first, lo, hi) > 0 || g.count_p(rest, lo, hi) > 0 {
-                return Err(Restart.into());
+            for p in [first, rest] {
+                if g.count_p(p, lo, hi) > 0
+                    && g.cands(None, Some(p), None, lo, hi)
+                        .iter()
+                        .any(|r| g.alive(r) && !g.flagged(r) && g.triple(r)[1] == p)
+                {
+                    return Err(Restart.into());
+                }
             }
         }
         Ok(())
@@ -2051,6 +2078,723 @@ impl Local {
             }
         }
         Ok(true)
+    }
+}
+
+/// A guarded symmetric rule `(?p G O), (?x ?p ?y) [notLiteral(?y)] -> (?y ?p ?x)`,
+/// such as `prp-symp`: returns `(G, O, not_literal_y)`.
+fn guarded_symmetric(r: &CRule) -> Option<(u64, u64, bool)> {
+    let [CHead::Triple(hs, hp, ho)] = r.head.as_slice() else {
+        return None;
+    };
+    let (y, p, x) = (var(*hs)?, var(*hp)?, var(*ho)?);
+    if x == y || p == x || p == y || r.nvars != 3 || r.atoms.len() != 2 {
+        return None;
+    }
+    let not_lit_y = match r.builtins.as_slice() {
+        [] => false,
+        [b] if b.kind == BuiltinKind::NotLiteral && b.args.as_slice() == [Slot::Var(y)] => true,
+        _ => return None,
+    };
+    let gi = r.atoms.iter().position(|a| {
+        a.s == Slot::Var(p) && matches!(a.p, Slot::Const(_)) && matches!(a.o, Slot::Const(_))
+    })?;
+    let edge = &r.atoms[1 - gi];
+    if edge.s != Slot::Var(x) || edge.p != Slot::Var(p) || edge.o != Slot::Var(y) {
+        return None;
+    }
+    let (Slot::Const(gp), Slot::Const(go)) = (r.atoms[gi].p, r.atoms[gi].o) else {
+        return None;
+    };
+    Some((gp, go, not_lit_y))
+}
+
+/// Reachability over the confirmed explicit edges of one operator-governed predicate `q`
+/// during incremental deletion.
+enum BaseReach {
+    /// Undirected connected components (equivalence operator, or transitive + explicit
+    /// symmetric property with no literal objects).
+    Undirected {
+        /// node id -> (component root, whether the component has >= 2 nodes or a self-loop)
+        comp: FxHashMap<u64, (u32, bool)>,
+        irreflexive: bool,
+        bytes: usize,
+    },
+    /// Directed strongly connected components + compressed adjacency over explicit edges.
+    Directed {
+        at: FxHashMap<u64, u32>,
+        off: Vec<u32>,
+        adj: Vec<u32>,
+        comp: Vec<u32>,
+        cyclic: Vec<bool>,
+        irreflexive: bool,
+        bytes: usize,
+    },
+}
+
+impl BaseReach {
+    fn bytes(&self) -> usize {
+        match self {
+            BaseReach::Undirected { bytes, .. } | BaseReach::Directed { bytes, .. } => *bytes,
+        }
+    }
+
+    /// Whether `[x, q, z]` follows from the confirmed explicit edges of `q` via the
+    /// closure operator.
+    fn proves(&self, x: u64, z: u64) -> bool {
+        match self {
+            BaseReach::Undirected {
+                comp, irreflexive, ..
+            } => {
+                if *irreflexive && x == z {
+                    return false;
+                }
+                let (Some(&(cx, cyc)), Some(&(cz, _))) = (comp.get(&x), comp.get(&z)) else {
+                    return false;
+                };
+                cx == cz && (x != z || cyc)
+            }
+            BaseReach::Directed {
+                at,
+                off,
+                adj,
+                comp,
+                cyclic,
+                irreflexive,
+                ..
+            } => {
+                if *irreflexive && x == z {
+                    return false;
+                }
+                let (Some(&ix), Some(&iz)) = (at.get(&x), at.get(&z)) else {
+                    return false;
+                };
+                let (cx, cz) = (comp[ix as usize], comp[iz as usize]);
+                if cx == cz {
+                    return x != z || cyclic[cx as usize];
+                }
+                // Tarjan numbers SCCs in reverse topological order: a lower SCC id cannot
+                // reach a higher SCC id.
+                if cx < cz {
+                    return false;
+                }
+                // Bounded DFS over the explicit base graph of `q`, pruned by SCC order.
+                let mut seen: FxHashSet<u32> = FxHashSet::default();
+                let mut stack = vec![ix];
+                seen.insert(ix);
+                while let Some(u) = stack.pop() {
+                    let lo = off[u as usize] as usize;
+                    let hi = off[u as usize + 1] as usize;
+                    for &v in &adj[lo..hi] {
+                        if v == iz {
+                            return true;
+                        }
+                        if comp[v as usize] >= cz && seen.insert(v) {
+                            stack.push(v);
+                        }
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    fn build_undirected(
+        q: u64,
+        g: &Graph,
+        irreflexive: bool,
+        budget: &Arc<Budget>,
+        cancel: Option<&AtomicBool>,
+    ) -> anyhow::Result<BaseReach> {
+        let mut poll = Poll::new(cancel);
+        let mut b = Builder::new(budget);
+        let mut self_loops: Vec<u32> = Vec::new();
+        let mut add = |s: u64, o: u64| -> anyhow::Result<()> {
+            let (a, _) = b.node(s)?;
+            let (c, _) = b.node(o)?;
+            if a == c {
+                self_loops.push(a);
+            }
+            b.room(0)?;
+            b.pairs.push((a, c));
+            poll.tick(1)
+        };
+        if let Some(base) = g.base() {
+            let mut err: Option<anyhow::Error> = None;
+            base.for_each(None, Some(q), None, |t| match add(t[0], t[2]) {
+                Ok(()) => true,
+                Err(e) => {
+                    err = Some(e);
+                    false
+                }
+            })?;
+            if let Some(e) = err {
+                return Err(e);
+            }
+        }
+        let c = g.cands(None, Some(q), None, g.offset(), g.len());
+        for r in c.iter() {
+            if g.alive(r) && g.flagged(r) {
+                let t = g.triple(r);
+                if t[1] == q {
+                    add(t[0], t[2])?;
+                }
+            }
+        }
+        let n = b.ids.len();
+        let _work = Held::try_new(budget, n * (2 * size_of::<u32>() + size_of::<bool>()))?;
+        let mut parent: Vec<u32> = (0..n as u32).collect();
+        fn find(parent: &mut [u32], mut x: u32) -> u32 {
+            while parent[x as usize] != x {
+                let p = parent[x as usize];
+                parent[x as usize] = parent[p as usize];
+                x = p;
+            }
+            x
+        }
+        for &(a, c) in &b.pairs {
+            poll.tick(1)?;
+            let (ra, rb) = (find(&mut parent, a), find(&mut parent, c));
+            if ra != rb {
+                let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+                parent[hi as usize] = lo;
+            }
+        }
+        let mut sizes = vec![0u32; n];
+        let mut has_loop = vec![false; n];
+        for i in 0..n as u32 {
+            let r = find(&mut parent, i);
+            sizes[r as usize] += 1;
+        }
+        for a in self_loops {
+            let r = find(&mut parent, a);
+            has_loop[r as usize] = true;
+        }
+        let mut comp: FxHashMap<u64, (u32, bool)> =
+            FxHashMap::with_capacity_and_hasher(n, Default::default());
+        for (i, &id) in b.ids.iter().enumerate() {
+            let r = find(&mut parent, i as u32);
+            comp.insert(id, (r, sizes[r as usize] >= 2 || has_loop[r as usize]));
+        }
+        let bytes = table_bytes(comp.capacity(), size_of::<(u64, (u32, bool))>());
+        Ok(BaseReach::Undirected {
+            comp,
+            irreflexive,
+            bytes,
+        })
+    }
+
+    fn build_directed(
+        q: u64,
+        g: &Graph,
+        irreflexive: bool,
+        add_non_literal_reverse: bool,
+        terms: &Terms,
+        budget: &Arc<Budget>,
+        cancel: Option<&AtomicBool>,
+    ) -> anyhow::Result<BaseReach> {
+        let mut poll = Poll::new(cancel);
+        let mut b = Builder::new(budget);
+        let mut add = |s: u64, o: u64| -> anyhow::Result<()> {
+            b.edge(s, o)?;
+            if add_non_literal_reverse && terms.kind(o) != Kind::Literal {
+                b.edge(o, s)?;
+            }
+            poll.tick(1)
+        };
+        if let Some(base) = g.base() {
+            let mut err: Option<anyhow::Error> = None;
+            base.for_each(None, Some(q), None, |t| match add(t[0], t[2]) {
+                Ok(()) => true,
+                Err(e) => {
+                    err = Some(e);
+                    false
+                }
+            })?;
+            if let Some(e) = err {
+                return Err(e);
+            }
+        }
+        let c = g.cands(None, Some(q), None, g.offset(), g.len());
+        for r in c.iter() {
+            if g.alive(r) && g.flagged(r) {
+                let t = g.triple(r);
+                if t[1] == q {
+                    add(t[0], t[2])?;
+                }
+            }
+        }
+        let at = b.at.clone();
+        let local = b.finish(Vec::new())?;
+        let (comp, ncomp) = local.components(budget, &mut poll)?;
+        let mut sizes = vec![0u32; ncomp];
+        for &c in &comp {
+            sizes[c as usize] += 1;
+        }
+        let mut cyclic: Vec<bool> = sizes.iter().map(|&sz| sz >= 2).collect();
+        for u in 0..local.ids.len() as u32 {
+            let cu = comp[u as usize] as usize;
+            if !cyclic[cu] && local.out(u).binary_search(&u).is_ok() {
+                cyclic[cu] = true;
+            }
+        }
+        let bytes = table_bytes(at.capacity(), size_of::<(u64, u32)>())
+            + (local.off.capacity() + local.adj.capacity() + comp.capacity()) * size_of::<u32>()
+            + cyclic.capacity();
+        Ok(BaseReach::Directed {
+            at,
+            off: local.off,
+            adj: local.adj,
+            comp,
+            cyclic,
+            irreflexive,
+            bytes,
+        })
+    }
+}
+
+/// Operator-maintained transitive and equivalence relations during incremental deletion
+/// (F23 Phase 4, item 837 / item 521 second half).
+pub(crate) struct DeletionOps {
+    ops: Vec<Op>,
+    /// guarded symmetric rules `(gp, go, not_literal_y)` such as `prp-symp`
+    guarded_sym: Vec<(u64, u64, bool)>,
+    /// per predicate `q` materialized on demand: confirmed explicit-edge reachability
+    base_graphs: FxHashMap<u64, BaseReach>,
+    /// per guarded `(q, gp, go)`, cached provability of the guard
+    guard_ok: FxHashMap<(u64, u64, u64), bool>,
+    /// predicates whose live derived facts were scanned once for operator consequences
+    scanned_all: FxHashSet<u64>,
+    /// operator predicates that lost facts during deletion, so saturation resets their marks
+    dirty: FxHashSet<u64>,
+    /// dead edges seen per operator predicate so far
+    dead_counts: FxHashMap<u64, usize>,
+    /// budget charge for `base_graphs` and bookkeeping
+    held: Held,
+}
+
+impl DeletionOps {
+    /// Detect active closure operators for incremental deletion, disabling any
+    /// irreflexive operator whose predicate currently meets literal value ambiguity so
+    /// its rules stay with the join evaluator.
+    pub(crate) fn detect(
+        rules: &[CRule],
+        g: &Graph,
+        terms: &Terms,
+        budget: &Arc<Budget>,
+    ) -> Result<Option<DeletionOps>, BudgetFailure> {
+        let Some(mut closures) = Closures::detect(rules, terms, None, None)? else {
+            return Ok(None);
+        };
+        let guarded_sym: Vec<(u64, u64, bool)> =
+            rules.iter().filter_map(guarded_symmetric).collect();
+        for op in &mut closures.ops {
+            if !op.irreflexive {
+                continue;
+            }
+            let unsafe_lits = match op.over {
+                Over::Fixed(c) => match op.shape {
+                    Shape::Transitive => Self::pred_has_literal_subject(g, c, terms),
+                    Shape::Equivalence => Self::pred_has_ambiguous_literals(g, c, terms),
+                },
+                Over::Guarded(gp, go) => Self::guarded_has_literal_subject(g, gp, go, terms),
+            };
+            if unsafe_lits {
+                op.off = true;
+            }
+        }
+        closures.ops.retain(|op| !op.off);
+        if closures.ops.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(DeletionOps {
+            ops: closures.ops,
+            guarded_sym,
+            base_graphs: FxHashMap::default(),
+            guard_ok: FxHashMap::default(),
+            scanned_all: FxHashSet::default(),
+            dirty: FxHashSet::default(),
+            dead_counts: FxHashMap::default(),
+            held: Held::new(budget),
+        }))
+    }
+
+    fn pred_has_literal_subject(g: &Graph, q: u64, terms: &Terms) -> bool {
+        if let Some(base) = g.base() {
+            let mut found = false;
+            let _ = base.for_each(None, Some(q), None, |t| {
+                if terms.kind(t[0]) == Kind::Literal {
+                    found = true;
+                    return false;
+                }
+                true
+            });
+            if found {
+                return true;
+            }
+        }
+        let c = g.cands(None, Some(q), None, g.offset(), g.len());
+        c.iter().any(|r| {
+            g.alive(r) && {
+                let t = g.triple(r);
+                t[1] == q && terms.kind(t[0]) == Kind::Literal
+            }
+        })
+    }
+
+    fn pred_has_ambiguous_literals(g: &Graph, q: u64, terms: &Terms) -> bool {
+        let mut lits: Vec<u64> = Vec::new();
+        let mut see = |id: u64| -> bool {
+            if terms.kind(id) != Kind::Literal {
+                return false;
+            }
+            if lits.contains(&id) {
+                return false;
+            }
+            if lits.len() >= 64 || lits.iter().any(|&other| same_value(terms, id, other)) {
+                return true;
+            }
+            lits.push(id);
+            false
+        };
+        if let Some(base) = g.base() {
+            let mut bad = false;
+            let _ = base.for_each(None, Some(q), None, |t| {
+                if see(t[0]) || see(t[2]) {
+                    bad = true;
+                    return false;
+                }
+                true
+            });
+            if bad {
+                return true;
+            }
+        }
+        let c = g.cands(None, Some(q), None, g.offset(), g.len());
+        for r in c.iter() {
+            if g.alive(r) {
+                let t = g.triple(r);
+                if t[1] == q && (see(t[0]) || see(t[2])) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn guarded_has_literal_subject(g: &Graph, gp: u64, go: u64, terms: &Terms) -> bool {
+        let mut preds: Vec<u64> = Vec::new();
+        if let Some(base) = g.base() {
+            let _ = base.for_each(None, Some(gp), Some(go), |t| {
+                preds.push(t[0]);
+                true
+            });
+        }
+        let c = g.cands(None, Some(gp), Some(go), g.offset(), g.len());
+        for r in c.iter() {
+            if g.alive(r) {
+                let t = g.triple(r);
+                if t[1] == gp && t[2] == go {
+                    preds.push(t[0]);
+                }
+            }
+        }
+        preds.sort_unstable();
+        preds.dedup();
+        preds
+            .into_iter()
+            .any(|q| Self::pred_has_literal_subject(g, q, terms))
+    }
+
+    /// Whether rule `ri` is maintained by an active closure operator.
+    pub(crate) fn replaces(&self, ri: usize) -> bool {
+        self.ops.iter().any(|op| !op.off && op.rules.contains(&ri))
+    }
+
+    /// Whether `t` is currently present as an explicit fact (in the base tier or as a
+    /// live flagged row in the derived tier).
+    fn is_explicit(g: &Graph, t: &Triple) -> bool {
+        g.base().is_some_and(|b| b.contains(t).unwrap_or(false))
+            || g.position(t).is_some_and(|r| g.flagged(r))
+    }
+
+    /// Whether `t` is currently alive in `g` (base or derived).
+    fn is_alive(g: &Graph, t: &Triple) -> bool {
+        g.position(t).is_some() || g.base().is_some_and(|b| b.contains(t).unwrap_or(false))
+    }
+
+    /// Index of the active operator governing predicate `q` in `g`, if any.
+    fn op_for(&self, q: u64, g: &Graph) -> Option<usize> {
+        for (i, op) in self.ops.iter().enumerate() {
+            if op.off {
+                continue;
+            }
+            match op.over {
+                Over::Fixed(c) if c == q => return Some(i),
+                Over::Guarded(gp, go) => {
+                    if self.guard_ok.get(&(q, gp, go)) == Some(&false) {
+                        continue;
+                    }
+                    if Self::is_alive(g, &[q, gp, go]) {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Whether predicate `q` is governed by an active closure operator.
+    pub(crate) fn is_governed(&self, q: u64, g: &Graph) -> bool {
+        self.op_for(q, g).is_some()
+    }
+
+    /// Ensure the confirmed explicit-edge reachability graph for predicate `q` is built
+    /// (verifying its guard if guarded), returning whether `q` is actively governed.
+    pub(crate) fn ensure_pred(
+        &mut self,
+        q: u64,
+        g: &Graph,
+        terms: &Terms,
+        budget: &Arc<Budget>,
+        cancel: Option<&AtomicBool>,
+        prove_guard: &mut dyn FnMut(Triple) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<bool> {
+        let Some(oi) = self.op_for(q, g) else {
+            return Ok(false);
+        };
+        let (over, shape, irreflexive) = {
+            let op = &self.ops[oi];
+            (op.over, op.shape, op.irreflexive)
+        };
+        if let Over::Guarded(gp, go) = over {
+            let ok = match self.guard_ok.get(&(q, gp, go)).copied() {
+                Some(v) => v,
+                None => {
+                    let v = if Self::is_explicit(g, &[q, gp, go]) {
+                        true
+                    } else {
+                        prove_guard([q, gp, go])?
+                    };
+                    self.guard_ok.insert((q, gp, go), v);
+                    v
+                }
+            };
+            if !ok {
+                return Ok(false);
+            }
+        }
+        if self.base_graphs.contains_key(&q) {
+            return Ok(true);
+        }
+        let reach = match shape {
+            Shape::Equivalence => BaseReach::build_undirected(q, g, irreflexive, budget, cancel)?,
+            Shape::Transitive => {
+                // If `q` also has an explicit guarded symmetric declaration (`prp-symp`),
+                // include 1-hop symmetric reverses of explicit edges.
+                let sym = self
+                    .guarded_sym
+                    .iter()
+                    .find(|&&(sgp, sgo, _)| Self::is_explicit(g, &[q, sgp, sgo]))
+                    .copied();
+                match sym {
+                    Some((_, _, not_lit_y)) => {
+                        let has_lit_obj =
+                            not_lit_y && Self::pred_has_explicit_literal_obj(g, q, terms);
+                        if !has_lit_obj {
+                            BaseReach::build_undirected(q, g, irreflexive, budget, cancel)?
+                        } else {
+                            BaseReach::build_directed(
+                                q,
+                                g,
+                                irreflexive,
+                                true,
+                                terms,
+                                budget,
+                                cancel,
+                            )?
+                        }
+                    }
+                    None => {
+                        BaseReach::build_directed(q, g, irreflexive, false, terms, budget, cancel)?
+                    }
+                }
+            }
+        };
+        self.held.try_grow(reach.bytes())?;
+        self.base_graphs.insert(q, reach);
+        Ok(true)
+    }
+
+    fn pred_has_explicit_literal_obj(g: &Graph, q: u64, terms: &Terms) -> bool {
+        if let Some(base) = g.base() {
+            let mut found = false;
+            let _ = base.for_each(None, Some(q), None, |t| {
+                if terms.kind(t[2]) == Kind::Literal {
+                    found = true;
+                    return false;
+                }
+                true
+            });
+            if found {
+                return true;
+            }
+        }
+        let c = g.cands(None, Some(q), None, g.offset(), g.len());
+        c.iter().any(|r| {
+            g.alive(r) && g.flagged(r) && {
+                let t = g.triple(r);
+                t[1] == q && terms.kind(t[2]) == Kind::Literal
+            }
+        })
+    }
+
+    /// Read-only O(1)/bounded check whether `t` is proved by the confirmed explicit edges
+    /// of its operator relation (`Sync` across parallel `prove_all` chunks).
+    #[inline]
+    pub(crate) fn proved_by_base(&self, t: &Triple) -> bool {
+        self.base_graphs
+            .get(&t[1])
+            .is_some_and(|r| r.proves(t[0], t[2]))
+    }
+
+    /// Enumerate operator consequences of `dead` while `dead` rows are still live in `g`.
+    pub(crate) fn consequences(
+        &mut self,
+        dead: &[Triple],
+        g: &Graph,
+        terms: &Terms,
+        budget: &Arc<Budget>,
+        cancel: Option<&AtomicBool>,
+        out: &mut dyn FnMut(Triple) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let mut poll = Poll::new(cancel);
+        // 1. Dead guards invalidate the operator for those predicates: emit all live
+        //    non-explicit derived facts of each such predicate.
+        let mut dead_guards: Vec<u64> = Vec::new();
+        for op in &self.ops {
+            if let Over::Guarded(gp, go) = op.over {
+                for d in dead {
+                    if d[1] == gp && d[2] == go {
+                        let q = d[0];
+                        self.guard_ok.insert((q, gp, go), false);
+                        if let Some(old) = self.base_graphs.remove(&q) {
+                            self.held.shrink(old.bytes());
+                        }
+                        dead_guards.push(q);
+                    }
+                }
+            }
+        }
+        dead_guards.sort_unstable();
+        dead_guards.dedup();
+        for q in dead_guards {
+            self.dirty.insert(q);
+            self.scanned_all.insert(q);
+            let c = g.cands(None, Some(q), None, g.offset(), g.len());
+            for r in c.iter() {
+                poll.tick(1)?;
+                if g.alive(r) && !g.flagged(r) {
+                    let t = g.triple(r);
+                    if t[1] == q {
+                        out(t)?;
+                    }
+                }
+            }
+        }
+        // 2. Group dead edges by governed predicate `q`.
+        let mut by_pred: FxHashMap<u64, (usize, Vec<Triple>)> = FxHashMap::default();
+        for &d in dead {
+            if let Some(oi) = self.op_for(d[1], g) {
+                by_pred
+                    .entry(d[1])
+                    .or_insert_with(|| (oi, Vec::new()))
+                    .1
+                    .push(d);
+            }
+        }
+        // 3. Emit operator consequences for each affected predicate.
+        let mut memo = Memo::default();
+        for (q, (oi, edges)) in by_pred {
+            self.dirty.insert(q);
+            if self.scanned_all.contains(&q) {
+                continue;
+            }
+            // Ensure `base_graphs[q]` exists when the guard holds so we skip surviving
+            // pairs immediately.
+            let guard_ok = match self.ops[oi].over {
+                Over::Fixed(_) => true,
+                Over::Guarded(gp, go) => self
+                    .guard_ok
+                    .get(&(q, gp, go))
+                    .copied()
+                    .unwrap_or_else(|| Self::is_explicit(g, &[q, gp, go])),
+            };
+            if guard_ok && !self.base_graphs.contains_key(&q) {
+                let mut always = |_: Triple| Ok(true);
+                let _ = self.ensure_pred(q, g, terms, budget, cancel, &mut always)?;
+            }
+            let total = self.dead_counts.entry(q).or_default();
+            *total = total.saturating_add(edges.len());
+            let shape = self.ops[oi].shape;
+            let irreflexive = self.ops[oi].irreflexive;
+            if *total <= 32 && edges.len() <= 32 {
+                // Small deletion: 1-step operator consequences via the graph indexes.
+                let mut emit = |cand: Triple| -> anyhow::Result<()> {
+                    if irreflexive && cand[0] == cand[2] {
+                        return Ok(());
+                    }
+                    if g.position(&cand).is_some_and(|r| !g.flagged(r))
+                        && !self.proved_by_base(&cand)
+                    {
+                        out(cand)?;
+                    }
+                    Ok(())
+                };
+                for d in &edges {
+                    let (u, v) = (d[0], d[2]);
+                    if shape == Shape::Equivalence {
+                        emit([v, q, u])?;
+                    }
+                    g.each_subject(&mut memo, q, u, g.len(), |x| {
+                        poll.tick(1)?;
+                        emit([x, q, v])?;
+                        Ok(true)
+                    })?;
+                    g.each_object(&mut memo, v, q, g.len(), |z| {
+                        poll.tick(1)?;
+                        emit([u, q, z])?;
+                        Ok(true)
+                    })?;
+                }
+            } else {
+                // Larger deletion (e.g. a bridge split in a clique): one linear scan of
+                // live non-explicit derived rows of `q`, skipping pairs proved by
+                // `base_graphs[q]`, so total work stays O(|E_derived(q)|).
+                self.scanned_all.insert(q);
+                let c = g.cands(None, Some(q), None, g.offset(), g.len());
+                for r in c.iter() {
+                    poll.tick(1)?;
+                    if g.alive(r) && !g.flagged(r) {
+                        let t = g.triple(r);
+                        if t[1] == q && !self.proved_by_base(&t) {
+                            out(t)?;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(base) = g.base() {
+            base.add_scans(memo.scans);
+        }
+        Ok(())
+    }
+
+    /// Operator predicates that lost facts during deletion and need their saturation
+    /// marks reset to row 0.
+    pub(crate) fn dirty_preds(&self) -> Vec<u64> {
+        self.dirty.iter().copied().collect()
     }
 }
 

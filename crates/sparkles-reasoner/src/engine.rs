@@ -1053,6 +1053,11 @@ pub(crate) struct Eval<'a> {
     bmemo: Memo,
     /// the members of the RDF lists builtins read
     lists: FxHashMap<u64, Option<std::rc::Rc<[u64]>>>,
+    /// when set, read RDF lists only from explicit (`base` and flagged) rows
+    explicit_lists: bool,
+    /// when set, override the members of listed heads (used to enumerate old list-rule
+    /// instances before a list change)
+    list_override: Option<&'a FxHashMap<u64, Option<std::rc::Rc<[u64]>>>>,
     /// stop at this plan step and keep the bindings instead, up to this many
     pub collect_at: Option<(usize, usize)>,
     pub collected: Vec<Vec<u64>>,
@@ -1138,6 +1143,8 @@ impl<'a> Eval<'a> {
             scratch: Vec::new(),
             bmemo: Memo::default(),
             lists: FxHashMap::default(),
+            explicit_lists: false,
+            list_override: None,
             collect_at: None,
             collected: Vec::new(),
             deadline: None,
@@ -1148,6 +1155,20 @@ impl<'a> Eval<'a> {
     /// with the abort flag, every 1,024 steps.
     pub(crate) fn set_deadline(&mut self, deadline: Option<std::time::Instant>) {
         self.deadline = deadline;
+    }
+
+    /// Read RDF lists only from explicit (`base` and flagged) rows, ignoring unflagged
+    /// derived list rows (such as removed list triples held as deletion candidates).
+    pub(crate) fn set_explicit_lists(&mut self, explicit: bool) {
+        self.explicit_lists = explicit;
+    }
+
+    /// Override the members of RDF list heads present in `map`.
+    pub(crate) fn set_list_override(
+        &mut self,
+        map: Option<&'a FxHashMap<u64, Option<std::rc::Rc<[u64]>>>>,
+    ) {
+        self.list_override = map;
     }
 
     /// Read the base tier's remembered lookups through `memo`, the blocks a caller's
@@ -1169,12 +1190,17 @@ impl<'a> Eval<'a> {
     /// The members of the RDF list at `head` among the visible rows, or `None` when it
     /// is not a well-formed list.
     pub fn list(&mut self, head: u64) -> Option<std::rc::Rc<[u64]>> {
+        if let Some(ov) = self.list_override
+            && let Some(l) = ov.get(&head)
+        {
+            return l.clone();
+        }
         if let Some(l) = self.lists.get(&head) {
             return l.clone();
         }
         let (g, t) = (self.g, self.terms);
-        let l = g
-            .list(
+        let l = if self.explicit_lists {
+            g.list_explicit(
                 &mut self.bmemo,
                 head,
                 t.rdf_first,
@@ -1182,7 +1208,17 @@ impl<'a> Eval<'a> {
                 t.rdf_nil,
                 self.end,
             )
-            .map(std::rc::Rc::<[u64]>::from);
+        } else {
+            g.list(
+                &mut self.bmemo,
+                head,
+                t.rdf_first,
+                t.rdf_rest,
+                t.rdf_nil,
+                self.end,
+            )
+        }
+        .map(std::rc::Rc::<[u64]>::from);
         if self.lists.len() >= REMEMBER_LOOKUPS {
             self.forget();
         }
@@ -2498,6 +2534,28 @@ pub(crate) fn run(
     run_observed(g, rules, terms, limits, start, None)
 }
 
+/// [`run`] for incremental saturation when operator predicates in `dirty_preds` lost
+/// facts during deletion and must re-close from row 0.
+pub(crate) fn run_with_dirty(
+    g: &mut Graph,
+    rules: &[CRule],
+    terms: &Terms,
+    limits: &Limits,
+    start: Option<u32>,
+    dirty_preds: &[u64],
+) -> anyhow::Result<Outcome> {
+    run_from_with_dirty(
+        g,
+        rules,
+        terms,
+        limits,
+        start,
+        None,
+        Origin::default(),
+        dirty_preds,
+    )
+}
+
 /// Evaluate a program of the IR to its fixpoint (item 839's plan, §1.3 and §10.2). A
 /// program without an IR feature runs as Jena's rules do, in one stratum with Jena's
 /// `noValue`. One with relations and no negation runs its lowered rules in one stratum.
@@ -2606,8 +2664,22 @@ pub(crate) fn run_from(
     terms: &Terms,
     limits: &Limits,
     start: Option<u32>,
+    boundary: Option<&mut dyn FnMut(u32)>,
+    origin: Origin,
+) -> anyhow::Result<Outcome> {
+    run_from_with_dirty(g, rules, terms, limits, start, boundary, origin, &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_from_with_dirty(
+    g: &mut Graph,
+    rules: &[CRule],
+    terms: &Terms,
+    limits: &Limits,
+    start: Option<u32>,
     mut boundary: Option<&mut dyn FnMut(u32)>,
     origin: Origin,
+    dirty_preds: &[u64],
 ) -> anyhow::Result<Outcome> {
     let here = g.len();
     let base_len = origin.base_len.unwrap_or(here).min(here);
@@ -2634,6 +2706,11 @@ pub(crate) fn run_from(
     } else {
         None
     };
+    if let Some(c) = closures.as_mut()
+        && !dirty_preds.is_empty()
+    {
+        c.reset_predicates(dirty_preds);
+    }
     if let Some(c) = &closures {
         tracing::debug!(operators = ?c.describe(rules), "closure operators");
     }

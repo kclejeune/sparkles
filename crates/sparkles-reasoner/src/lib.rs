@@ -1239,12 +1239,6 @@ pub fn rules_digest(profile: &Profile, extras: &Extras) -> u64 {
     fnv(&[extras.geo_default_geometry as u8], h)
 }
 
-/// A run that removes more than one explicit triple in this many (of 10,000 or more)
-/// runs in full: the search for other proofs of their consequences then costs more than
-/// deriving everything again (measured on the benchmark data: removing 10% of 100,000 triples
-/// took longer incrementally, removing 1% of 1,000,000 took a quarter of a full run).
-const LARGE_DELETION: u64 = 20;
-
 /// What an incremental run asks for.
 #[derive(Clone, Copy, Default)]
 pub struct Incremental<'a> {
@@ -1286,8 +1280,8 @@ pub fn materialize_with(
 ///
 /// It needs the previous closure, from `inc.cache` or saved with a persistent dataset,
 /// the same rules (see [`rules_digest`]), and a commit the diff still reaches. Rules
-/// that are not monotonic, or that create blank nodes, need a full run, and so do RDF
-/// lists that change while the rules read lists. The run then materializes in full and
+/// that are not monotonic, or that create blank nodes, need a full run, and so do
+/// derived RDF lists while the rules read lists. The run then materializes in full and
 /// says why in [`ReasonReport::fallback`].
 ///
 /// A run is admitted to [`ReasonOptions::pool`] before it takes the writer lock, and a
@@ -1949,19 +1943,6 @@ fn update_closure(
         return Err(Fallback(why).into());
     }
     let graphs = resolved.graph_set();
-    if let Ok(r) = &raw {
-        let removed = r.base_removed() as u64;
-        let mut explicit = removed;
-        for g in resolved.ids(snap) {
-            explicit += snap.count(Perm::Gspo, &[g.0])?;
-        }
-        if explicit >= 10_000 && removed * LARGE_DELETION > explicit {
-            return Err(Fallback(format!(
-                "{removed} of {explicit} explicit triples were removed, more than a full run handles faster"
-            ))
-            .into());
-        }
-    }
     laps.lap("rules");
     progress(opts, 0.0, "reading the previous closure");
     // on the run's threads: this thread may stand in for a parked worker of the pool
@@ -2000,7 +1981,7 @@ fn update_closure(
         deadline: None,
         progress: opts.progress.clone(),
         budget: budget.clone(),
-        closures: false,
+        closures: true,
         magic: None,
         sampled_planning: opts.sampled_planning,
     };

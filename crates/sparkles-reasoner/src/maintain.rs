@@ -728,16 +728,6 @@ pub(crate) enum RawChanges {
 }
 
 impl RawChanges {
-    /// Triples removed from the default graph.
-    pub(crate) fn base_removed(&self) -> usize {
-        match self {
-            RawChanges::Ids(c) => c.base_removed.len(),
-            RawChanges::Quads { base, .. } => {
-                base.iter().filter(|(op, _)| *op == DiffOp::Remove).count()
-            }
-        }
-    }
-
     /// The changes as ids of `terms`, whose snapshot is `snap`; `inputs` are the ids of
     /// the input graphs in it.
     fn resolve(self, terms: &Terms, snap: &Snapshot, inputs: &[Id]) -> anyhow::Result<Changes> {

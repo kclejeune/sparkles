@@ -28,6 +28,7 @@
 //! reached has a proof, and they are all remembered as unprovable.
 
 use crate::budget::{Budget, BudgetFailure, Held, table_bytes, table_capacity, table_grown};
+use crate::closure::DeletionOps;
 use crate::engine::{self, CHead, CRule, Eval, First, Limits, Mode, Slot, Step, VISIT_BATCH};
 use crate::facts::{Base, Memo};
 use crate::graph::{Cands, Graph, Triple};
@@ -114,12 +115,17 @@ pub(crate) struct Bound {
 }
 
 impl Bound {
+    /// The maximum rule-instance visits allowed for a deletion on `c`.
+    pub(crate) fn max_visits_for(c: &Closure) -> u64 {
+        let facts = c.graph.offset() as u64 + c.graph.live() as u64;
+        facts.saturating_mul(VISITS_PER_FACT).max(MIN_VISITS)
+    }
+
     /// The bound for the deletion of an update of `c`, charged to `budget`, as it starts.
     pub(crate) fn for_closure(c: &Closure, budget: &Arc<Budget>) -> Bound {
-        let facts = c.graph.offset() as u64 + c.graph.live() as u64;
         Bound::new(
             budget,
-            facts.saturating_mul(VISITS_PER_FACT).max(MIN_VISITS),
+            Bound::max_visits_for(c),
             held_bound(c.heap_bytes().max(MIN_HELD)),
         )
     }
@@ -716,12 +722,21 @@ pub(crate) fn update_with<'a>(
     // allocated until the removed facts are copied out of them
     let change_bytes = changes.capacity() * size_of::<Change<Triple>>();
     let mut held = Held::try_new(budget, change_bytes)?;
-    // the removed facts stay with the update, charged before their buffer is allocated
-    let n = changes.iter().filter(|ch| ch.weight < 0).count();
+    // the removed facts stay with the update, charged before their buffer is allocated;
+    // a fact over-deleted during operator maintenance and re-derived in saturation stays
+    // alive in `c` and is not reported as deleted
+    let n = changes
+        .iter()
+        .filter(|ch| ch.weight < 0 && c.graph.position(&ch.fact).is_none())
+        .count();
     held.try_grow(n * size_of::<Triple>())?;
     out.deleted.reserve_exact(n);
-    out.deleted
-        .extend(changes.iter().filter(|ch| ch.weight < 0).map(|ch| ch.fact));
+    out.deleted.extend(
+        changes
+            .iter()
+            .filter(|ch| ch.weight < 0 && c.graph.position(&ch.fact).is_none())
+            .map(|ch| ch.fact),
+    );
     drop(changes);
     held.shrink(change_bytes);
     out.held = Some(held);
@@ -871,6 +886,14 @@ pub(crate) struct TierProgram<'a> {
     lists: bool,
     /// whether the deletion removed an RDF list fact
     list_deleted: bool,
+    /// explicit RDF lists whose members changed in this update (F16 §7.3)
+    changed_lists: Option<ChangedLists>,
+    /// live derived facts produced by list-reading rules over old list members before a
+    /// list change, added to the first deletion frontier
+    list_frontier: Vec<Triple>,
+    /// facts deleted during Phase 1 whose proof search encountered an unproved live fact
+    /// of an operator-governed predicate, checked for 1-step revival after saturation
+    overdeleted_touching_op: Vec<Triple>,
     _store: PhantomData<TierStore<'a>>,
 }
 
@@ -879,10 +902,20 @@ struct Deletion {
     plans: Plans,
     /// the plans' charge
     _plans_held: Held,
+    /// operator-maintained transitive and equivalence relations for this deletion
+    ops: Option<DeletionOps>,
     /// made by the first round, once the first frontier is held
     bound: Option<Bound>,
     search: Search,
     abort: AtomicBool,
+}
+
+/// Explicit RDF list heads whose member sequences changed between the old and new
+/// snapshots, with their old member lists (F16 §7.3).
+struct ChangedLists {
+    heads: Vec<u64>,
+    old_members: FxHashMap<u64, Option<std::rc::Rc<[u64]>>>,
+    _held: Held,
 }
 
 impl TierProgram<'_> {
@@ -951,7 +984,8 @@ impl<'a> Program for TierProgram<'a> {
         }
         let c: &Closure = store.c;
         let (first, rest) = (c.terms.rdf_first, c.terms.rdf_rest);
-        if self.lists && facts.iter().any(|t| t[1] == first || t[1] == rest) {
+        let is_list = |t: &Triple| t[1] == first || t[1] == rest;
+        if self.lists && facts.iter().any(|t| is_list(t) && !cx.removed.contains(t)) {
             self.list_deleted = true;
         }
         let d = self.deletion()?;
@@ -967,6 +1001,16 @@ impl<'a> Program for TierProgram<'a> {
             Some(bound),
             &mut |t| out.push((t, ())),
         )?;
+        if let Some(ops) = d.ops.as_mut() {
+            ops.consequences(
+                facts,
+                &c.graph,
+                &c.terms,
+                &cx.limits.budget,
+                cx.limits.cancel.as_deref(),
+                &mut |t| out.push((t, ())),
+            )?;
+        }
         Ok(())
     }
 
@@ -993,23 +1037,86 @@ impl<'a> Program for TierProgram<'a> {
         let c: &Closure = store.c;
         let limits = cx.limits;
         let budget = &limits.budget;
-        let Deletion {
+        let explicit_lists = self.lists;
+        let (first, rest) = (c.terms.rdf_first, c.terms.rdf_rest);
+        let is_list = |t: &Triple| t[1] == first || t[1] == rest;
+        let Some(Deletion {
             plans,
+            ops,
             bound,
             search,
             abort,
             ..
-        } = self.deletion()?;
+        }) = self.del.as_mut()
+        else {
+            anyhow::bail!("a deletion round of an update that removed nothing");
+        };
+        let overdeleted = &mut self.overdeleted_touching_op;
         // after the plans and the first frontier, as the deletion starts
         let bound = &*bound.get_or_insert_with(|| Bound::for_closure(c, budget));
+        // Materialize confirmed explicit-edge reachability graphs for any operator
+        // predicates in this round before parallel search starts.
+        if let Some(ops) = ops.as_mut() {
+            let mut preds: Vec<u64> = Vec::new();
+            for t in facts {
+                if ops.is_governed(t[1], &c.graph) && !preds.contains(&t[1]) {
+                    preds.push(t[1]);
+                }
+            }
+            for q in preds {
+                let mut prove_guard = |guard: Triple| -> anyhow::Result<bool> {
+                    let scx = Cx {
+                        c,
+                        rules: cx.rules,
+                        plans,
+                        ops: None,
+                        explicit_lists,
+                        abort,
+                        cancel: limits.cancel.as_deref(),
+                        budget,
+                        bound,
+                        known: None,
+                    };
+                    let ok = search.prove(&scx, guard);
+                    if let Some(e) = search.err.take() {
+                        return Err(e);
+                    }
+                    Ok(ok)
+                };
+                ops.ensure_pred(
+                    q,
+                    &c.graph,
+                    &c.terms,
+                    budget,
+                    limits.cancel.as_deref(),
+                    &mut prove_guard,
+                )?;
+            }
+        }
+        let out_start = out.len();
+        let ops_ref = ops.as_ref();
         if rayon::current_num_threads() > 1 && facts.len() >= PAR_SEARCH {
             // the searches of a round are independent: see `prove_all`
-            prove_all(c, cx.rules, plans, abort, limits, bound, search, facts, out)?;
+            prove_all(
+                c,
+                cx.rules,
+                plans,
+                ops_ref,
+                explicit_lists,
+                abort,
+                limits,
+                bound,
+                search,
+                facts,
+                out,
+            )?;
         } else {
             let scx = Cx {
                 c,
                 rules: cx.rules,
                 plans,
+                ops: ops_ref,
+                explicit_lists,
                 abort,
                 cancel: limits.cancel.as_deref(),
                 budget,
@@ -1025,6 +1132,14 @@ impl<'a> Program for TierProgram<'a> {
             }
             // the round's blocks are not kept until the next round
             search.memo = Memo::default();
+        }
+        for (&t, v) in facts.iter().zip(&out[out_start..]) {
+            if v.is_none() && search.unprovable_touched_op.contains(&t) {
+                overdeleted.push(t);
+            }
+            if explicit_lists && v.is_some() && is_list(&t) && !c.explicit_held(&t) {
+                return Err(Fallback("the rules read RDF lists that are derived".into()).into());
+            }
         }
         Ok(())
     }
@@ -1056,9 +1171,6 @@ impl<'a> Program for TierProgram<'a> {
         let (first, rest) = (c.terms.rdf_first, c.terms.rdf_rest);
         let is_list = |t: &Triple| t[1] == first || t[1] == rest;
         if self.lists {
-            if cx.inserted.iter().chain(cx.removed).any(is_list) {
-                return Err(Fallback("an RDF list changed and the rules read lists".into()).into());
-            }
             let g = &c.graph;
             for p in [first, rest] {
                 let rows = g.cands(None, Some(p), None, 0, g.len());
@@ -1116,12 +1228,44 @@ impl<'a> Program for TierProgram<'a> {
         if let Some(f) = cx.before_delete.as_mut() {
             (*f)(c)?;
         }
-        if !cx.removed.is_empty() {
-            let plans = Plans::new(&mut c.graph, rules)?;
+        // Per-list tracking (F16 §7.3): when explicit RDF list triples changed, find every
+        // list head whose member sequence changed and seed the first deletion frontier
+        // with the live derived heads that list-reading rules produced over the old lists.
+        if self.lists && cx.inserted.iter().chain(cx.removed).any(is_list) {
+            let changed = changed_lists(c, cx.inserted, cx.removed, budget)?;
+            if !changed.heads.is_empty() {
+                self.list_frontier = eval_list_rules_old(c, rules, &changed, cx.limits)?;
+                self.changed_lists = Some(changed);
+            }
+        }
+        if !cx.removed.is_empty() || !self.list_frontier.is_empty() {
+            let ops = if cx.limits.closures {
+                DeletionOps::detect(rules, &c.graph, &c.terms, budget)?
+            } else {
+                None
+            };
+            let plans = Plans::new_without(&mut c.graph, rules, |ri| {
+                ops.as_ref().is_some_and(|o| o.replaces(ri))
+            })?;
+            // F16 §7.3 cost estimate against item 798's visit bound (replaces
+            // LARGE_DELETION): estimate non-operator join visits from removed predicates
+            // and closure fan-out before running backward searches.
+            if !cx.removed.is_empty() {
+                let max_visits = Bound::max_visits_for(c);
+                let est = estimate_deletion_visits(c, rules, &plans, cx.removed);
+                if est > max_visits {
+                    return Err(Fallback(format!(
+                        "the deletion is estimated to visit {est} rule instances, past the \
+                         bound of {max_visits} for the closure, which costs more than a full run"
+                    ))
+                    .into());
+                }
+            }
             let plans_held = Held::try_new(budget, plans.bytes)?;
             self.del = Some(Deletion {
                 plans,
                 _plans_held: plans_held,
+                ops,
                 bound: None,
                 search: Search::new(budget),
                 abort: AtomicBool::new(false),
@@ -1139,6 +1283,9 @@ impl<'a> Program for TierProgram<'a> {
         for t in cx.removed {
             out.push(*t)?;
         }
+        for t in &self.list_frontier {
+            out.push(*t)?;
+        }
         Ok(())
     }
 
@@ -1146,13 +1293,20 @@ impl<'a> Program for TierProgram<'a> {
         let c = &mut *store.c;
         let limits = cx.limits;
         let (rules, budget) = (cx.rules, &limits.budget);
+        let mut dirty_preds: Vec<u64> = Vec::new();
+        let mut saved_plans: Option<(Plans, Held)> = None;
         if let Some(d) = self.del.take() {
             cx.out.checked = d.search.checked;
             if let Some(b) = &d.bound {
                 cx.out.visited = b.visits();
                 cx.out.held_beside = b.peak_held();
             }
-            drop(d);
+            if let Some(ops) = &d.ops {
+                dirty_preds = ops.dirty_preds();
+            }
+            if !self.overdeleted_touching_op.is_empty() {
+                saved_plans = Some((d.plans, d._plans_held));
+            }
             if cancelled(limits) {
                 anyhow::bail!("reasoning cancelled");
             }
@@ -1179,11 +1333,16 @@ impl<'a> Program for TierProgram<'a> {
         for r in start..c.graph.len() {
             c.set_flag_with(r, true, true)?;
         }
+        // Per-list tracking (F16 §7.3): evaluate list-reading rules for changed explicit
+        // lists using their new member sequences so newly enabled instances enter `start..`.
+        if let Some(changed) = self.changed_lists.take() {
+            eval_list_rules_new(c, rules, &changed, limits)?;
+        }
         budget.check()?;
         // after a rebuild, the relation facts are new to the rules too, and the rebuilt
         // facts count against the limit of inferred facts with the insertion's
         let from = self.rebuilt.map_or(start, |(lo, ..)| lo.min(start));
-        if c.graph.len() > from {
+        if c.graph.len() > from || !dirty_preds.is_empty() {
             let narrowed;
             // the limit of iterations bounds the rebuild and the insertion each, and the
             // explicit rows the insertion appended count against neither limit
@@ -1204,8 +1363,47 @@ impl<'a> Program for TierProgram<'a> {
                     &narrowed
                 }
             };
-            let o = engine::run(&mut c.graph, rules, &c.terms, limits, Some(from))?;
+            let run_res = engine::run_with_dirty(
+                &mut c.graph,
+                rules,
+                &c.terms,
+                limits,
+                Some(from),
+                &dirty_preds,
+            );
+            let o = match run_res {
+                Ok(o) => o,
+                Err(e) if e.is::<crate::closure::Restart>() => {
+                    return Err(Fallback("an RDF list fact was derived".into()).into());
+                }
+                Err(e) => return Err(e),
+            };
             cx.out.iterations = o.iterations;
+            // If any Phase-1 deleted fact failed its proof after encountering a live
+            // operator-governed fact (mixed R_other + operator derivation), check 1-step
+            // revival over the now-reclosed closure and saturate until quiescent.
+            if let Some((plans, _plans_held)) = saved_plans.take() {
+                revive_overdeleted(
+                    c,
+                    rules,
+                    &plans,
+                    limits,
+                    &mut self.overdeleted_touching_op,
+                    &mut cx.out.iterations,
+                )?;
+            }
+            if self.lists && cx.out.added(c).any(|t| is_list(&t) && !c.explicit_held(&t)) {
+                return Err(Fallback("an RDF list fact was derived".into()).into());
+            }
+        } else if let Some((plans, _plans_held)) = saved_plans.take() {
+            revive_overdeleted(
+                c,
+                rules,
+                &plans,
+                limits,
+                &mut self.overdeleted_touching_op,
+                &mut cx.out.iterations,
+            )?;
             if self.lists && cx.out.added(c).any(|t| is_list(&t) && !c.explicit_held(&t)) {
                 return Err(Fallback("an RDF list fact was derived".into()).into());
             }
@@ -1249,6 +1447,9 @@ impl<'a> Program for TierProgram<'a> {
 
     fn pass_end(&mut self, _cx: &mut TierCx<'_>) -> anyhow::Result<()> {
         self.del = None;
+        self.changed_lists = None;
+        self.list_frontier.clear();
+        self.overdeleted_touching_op.clear();
         Ok(())
     }
 
@@ -1341,6 +1542,15 @@ pub(crate) struct Plans {
 
 impl Plans {
     pub(crate) fn new(g: &mut Graph, rules: &[CRule]) -> Result<Plans, BudgetFailure> {
+        Self::new_without(g, rules, |_| false)
+    }
+
+    /// Build forward and backward plans for every rule for which `skip(ri)` is false.
+    pub(crate) fn new_without(
+        g: &mut Graph,
+        rules: &[CRule],
+        skip: impl Fn(usize) -> bool,
+    ) -> Result<Plans, BudgetFailure> {
         let mut p = Plans {
             back: Vec::with_capacity(rules.len()),
             by_pred: FxHashMap::default(),
@@ -1350,6 +1560,11 @@ impl Plans {
         };
         let all = |r: &CRule| vec![(0, g.len()); r.atoms.len()];
         for (ri, r) in rules.iter().enumerate() {
+            if skip(ri) {
+                p.back.push(Vec::new());
+                p.forward.push(Vec::new());
+                continue;
+            }
             let ranges = all(r);
             let mut in_atoms = vec![false; r.nvars];
             for a in &r.atoms {
@@ -1475,6 +1690,9 @@ fn consequences_into(
     let rows: Vec<u32> = dead.iter().filter_map(|t| g.position(t)).collect();
     let mut work: Vec<(usize, usize, Vec<u32>)> = Vec::new();
     for (ri, r) in rules.iter().enumerate() {
+        if plans.forward[ri].is_empty() {
+            continue;
+        }
         for (d, a) in r.atoms.iter().enumerate() {
             if plans.forward[ri][d].is_none() {
                 continue;
@@ -1600,6 +1818,8 @@ fn prove_all(
     c: &Closure,
     rules: &[CRule],
     plans: &Plans,
+    ops: Option<&DeletionOps>,
+    explicit_lists: bool,
     abort: &AtomicBool,
     limits: &Limits,
     bound: &Bound,
@@ -1617,6 +1837,8 @@ fn prove_all(
             c,
             rules,
             plans,
+            ops,
+            explicit_lists,
             abort,
             cancel: limits.cancel.as_deref(),
             budget,
@@ -1696,6 +1918,10 @@ struct Cx<'a> {
     c: &'a Closure,
     rules: &'a [CRule],
     plans: &'a Plans,
+    /// operator-maintained closure relations for fast explicit-edge reachability proofs
+    ops: Option<&'a DeletionOps>,
+    /// read RDF lists only from explicit (`base` and flagged) rows
+    explicit_lists: bool,
     abort: &'a AtomicBool,
     cancel: Option<&'a AtomicBool>,
     budget: &'a Arc<Budget>,
@@ -1712,6 +1938,11 @@ struct Cx<'a> {
 struct Search {
     proved: FxHashSet<Triple>,
     unprovable: FxHashSet<Triple>,
+    /// subset of `unprovable` whose failed proof encountered a live unproved fact of an
+    /// operator-governed predicate (eligible for 1-step revival after saturation)
+    unprovable_touched_op: FxHashSet<Triple>,
+    /// whether the search currently running encountered a live unproved operator fact
+    touched_op_now: bool,
     checked: u64,
     nodes: Vec<Node>,
     node_of: FxHashMap<Triple, u32>,
@@ -1757,6 +1988,8 @@ impl Search {
         Search {
             proved: FxHashSet::default(),
             unprovable: FxHashSet::default(),
+            unprovable_touched_op: FxHashSet::default(),
+            touched_op_now: false,
             checked: 0,
             nodes: Vec::new(),
             node_of: FxHashMap::default(),
@@ -1794,6 +2027,14 @@ impl Search {
         self.unprovable.contains(t) || cx.known.is_some_and(|k| k.unprovable.contains(t))
     }
 
+    #[inline]
+    fn is_unprovable_touched_op(&self, cx: &Cx<'_>, t: &Triple) -> bool {
+        self.unprovable_touched_op.contains(t)
+            || cx
+                .known
+                .is_some_and(|k| k.unprovable_touched_op.contains(t))
+    }
+
     /// Take in what another search of the same round learned, charging the growth of
     /// the sets before it is allocated.
     fn absorb(&mut self, other: Search) -> Result<(), BudgetFailure> {
@@ -1801,6 +2042,10 @@ impl Search {
         for (mine, theirs) in [
             (&mut self.proved, &other.proved),
             (&mut self.unprovable, &other.unprovable),
+            (
+                &mut self.unprovable_touched_op,
+                &other.unprovable_touched_op,
+            ),
         ] {
             let (cap, len) = (mine.capacity(), mine.len());
             let to = table_grown(cap, len, theirs.len());
@@ -1866,7 +2111,7 @@ impl Search {
             return false;
         };
         let fact = size_of::<Triple>();
-        if cx.c.flagged(row) {
+        if cx.c.flagged(row) || cx.ops.is_some_and(|ops| ops.proved_by_base(&t)) {
             let (cap, len) = (self.proved.capacity(), self.proved.len());
             let Some(old) = self.table_growth(cap, len, 1, fact) else {
                 return false;
@@ -1876,6 +2121,7 @@ impl Search {
             return true;
         }
         self.checked += 1;
+        self.touched_op_now = false;
         self.nodes.clear();
         self.node_of.clear();
         self.insts.clear();
@@ -1907,18 +2153,36 @@ impl Search {
             .filter(|n| n.state == State::Proved)
             .count();
         let lost = if proved { 0 } else { self.nodes.len() - gained };
+        let touched = !proved && self.touched_op_now;
         let (pc, pl) = (self.proved.capacity(), self.proved.len());
         let (uc, ul) = (self.unprovable.capacity(), self.unprovable.len());
-        let (pt, ut) = (table_grown(pc, pl, gained), table_grown(uc, ul, lost));
+        let (tc, tl) = (
+            self.unprovable_touched_op.capacity(),
+            self.unprovable_touched_op.len(),
+        );
+        let (pt, ut, tt) = (
+            table_grown(pc, pl, gained),
+            table_grown(uc, ul, lost),
+            if touched {
+                table_grown(tc, tl, lost)
+            } else {
+                tc
+            },
+        );
         let new = if pt == pc { 0 } else { table_bytes(pt, fact) }
-            + if ut == uc { 0 } else { table_bytes(ut, fact) };
+            + if ut == uc { 0 } else { table_bytes(ut, fact) }
+            + if tt == tc { 0 } else { table_bytes(tt, fact) };
         let old = if pt == pc { 0 } else { table_bytes(pc, fact) }
-            + if ut == uc { 0 } else { table_bytes(uc, fact) };
+            + if ut == uc { 0 } else { table_bytes(uc, fact) }
+            + if tt == tc { 0 } else { table_bytes(tc, fact) };
         if !self.charge(new) {
             return false;
         }
         self.proved.reserve(gained);
         self.unprovable.reserve(lost);
+        if touched {
+            self.unprovable_touched_op.reserve(lost);
+        }
         self.held.shrink(old);
         for n in &self.nodes {
             match n.state {
@@ -1928,6 +2192,9 @@ impl Search {
                 // with no proof of the root, the search explored everything it reached
                 _ if !proved => {
                     self.unprovable.insert(n.t);
+                    if touched {
+                        self.unprovable_touched_op.insert(n.t);
+                    }
                 }
                 _ => {}
             }
@@ -2016,6 +2283,9 @@ impl Search {
         self.nodes[n as usize].state = State::Open;
         let t = self.nodes[n as usize].t;
         let g = &cx.c.graph;
+        if cx.ops.is_some_and(|ops| ops.is_governed(t[1], g)) {
+            self.touched_op_now = true;
+        }
         for (ri, hi) in cx.plans.heads(t[1]) {
             let Some((steps, pre)) = &cx.plans.back[ri][hi] else {
                 continue;
@@ -2046,6 +2316,7 @@ impl Search {
                     },
                     cx.budget,
                 );
+                ev.set_explicit_lists(cx.explicit_lists);
                 ev.lend_memo(memo);
                 ev.run(0, &mut b, None);
                 (ev.err.take(), ev.take_memo())
@@ -2089,11 +2360,20 @@ impl Search {
         let mut facts: smallvec::SmallVec<[Triple; 4]> = smallvec::SmallVec::new();
         for u in body {
             // an instance that uses its own head or an unprovable fact proves nothing
-            if u == t || self.is_unprovable(cx, &u) {
+            if u == t {
+                return true;
+            }
+            if self.is_unprovable(cx, &u) {
+                if self.is_unprovable_touched_op(cx, &u) {
+                    self.touched_op_now = true;
+                }
                 return true;
             }
             // a body fact the derived tier does not hold is from the base tier
-            if self.is_proved(cx, &u) || cx.c.explicit_held(&u) {
+            if self.is_proved(cx, &u)
+                || cx.c.explicit_held(&u)
+                || cx.ops.is_some_and(|ops| ops.proved_by_base(&u))
+            {
                 continue;
             }
             facts.push(u);
@@ -2138,6 +2418,640 @@ impl Search {
         }
         true
     }
+}
+
+// ---------------------------------------------------- per-list & cost helpers ----
+
+/// List-head slots (`args[0]`) read by list builtins in `r`.
+fn list_head_slots(r: &CRule) -> Vec<Slot> {
+    use crate::builtins::BuiltinKind as B;
+    let mut out = Vec::new();
+    for b in &r.builtins {
+        if matches!(
+            b.kind,
+            B::ListMember
+                | B::ListContains
+                | B::ListNotContains
+                | B::ListLength
+                | B::ListEntry
+                | B::ListForAll
+        ) && let Some(&s) = b.args.first()
+            && !out.contains(&s)
+        {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// Read an explicit RDF list at `head` as it existed BEFORE the update: `base` + flagged
+/// rows, minus `inserted_list`, plus `removed_first`/`removed_rest`. Returns `Err(Fallback)`
+/// only if a branching list cell changed across multiple input graphs where the removed
+/// triple's graph rank relative to surviving objects is unknown.
+#[allow(clippy::too_many_arguments)]
+fn old_explicit_list(
+    g: &Graph,
+    memo: &mut Memo,
+    head: u64,
+    first: u64,
+    rest: u64,
+    nil: u64,
+    inserted_list: &FxHashSet<Triple>,
+    removed_first: &FxHashMap<u64, Vec<u64>>,
+    removed_rest: &FxHashMap<u64, Vec<u64>>,
+) -> anyhow::Result<Option<Vec<u64>>> {
+    const MAX_LEN: usize = 1 << 20;
+    let find_obj = |memo: &mut Memo,
+                    s: u64,
+                    p: u64,
+                    rem: &FxHashMap<u64, Vec<u64>>|
+     -> anyhow::Result<Option<u64>> {
+        let rem_o = rem.get(&s).and_then(|v| v.iter().copied().min());
+        if let Some(b) = g.base() {
+            let mut base_o = None;
+            let _ = b.for_each_with(memo, Some(s), Some(p), None, |t| {
+                if !inserted_list.contains(&t) {
+                    base_o = Some(t[2]);
+                    return false;
+                }
+                true
+            });
+            match (base_o, rem_o) {
+                (Some(bo), Some(ro)) => {
+                    if b.passes() > 1 {
+                        return Err(Fallback(
+                            "a branching RDF list changed across multiple input graphs".into(),
+                        )
+                        .into());
+                    }
+                    // For a single input graph, `Base::for_each_with(Some(s), Some(p), None)`
+                    // scans `Perm::Gspo`, yielding objects in ascending id order.
+                    return Ok(Some(bo.min(ro)));
+                }
+                (Some(bo), None) => return Ok(Some(bo)),
+                (None, Some(ro)) => return Ok(Some(ro)),
+                (None, None) => {}
+            }
+        }
+        let mut best: Option<(u32, u64)> = None;
+        for i in g.cands(Some(s), Some(p), None, g.offset(), g.len()).iter() {
+            if g.alive(i) && g.flagged(i) {
+                let t = g.triple(i);
+                if t[0] == s
+                    && t[1] == p
+                    && !inserted_list.contains(&t)
+                    && best.is_none_or(|(bi, _)| i < bi)
+                {
+                    best = Some((i, t[2]));
+                }
+            }
+        }
+        if let Some((_, o)) = best {
+            return Ok(Some(o));
+        }
+        Ok(rem_o)
+    };
+    let mut out = Vec::new();
+    let mut cur = head;
+    let mut seen: FxHashSet<u64> = FxHashSet::default();
+    while cur != nil {
+        if !seen.insert(cur) || out.len() > MAX_LEN {
+            return Ok(None);
+        }
+        let Some(f) = find_obj(memo, cur, first, removed_first)? else {
+            return Ok(None);
+        };
+        out.push(f);
+        let Some(r) = find_obj(memo, cur, rest, removed_rest)? else {
+            return Ok(None);
+        };
+        cur = r;
+    }
+    Ok(Some(out))
+}
+
+/// Find every explicit RDF list head whose member sequence changed between the old and
+/// new snapshots, walking backward along `rdf:rest` in both snapshots (F16 §7.3).
+fn changed_lists(
+    c: &Closure,
+    inserted: &[Triple],
+    removed: &[Triple],
+    budget: &Arc<Budget>,
+) -> anyhow::Result<ChangedLists> {
+    let (first, rest, nil) = (c.terms.rdf_first, c.terms.rdf_rest, c.terms.rdf_nil);
+    let is_list = |t: &Triple| t[1] == first || t[1] == rest;
+    let mut held = Held::new(budget);
+    let mut inserted_list: FxHashSet<Triple> = FxHashSet::default();
+    let mut removed_first: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+    let mut removed_rest: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+    let mut removed_rev_rest: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+    let mut affected: FxHashSet<u64> = FxHashSet::default();
+    let mut queue: Vec<u64> = Vec::new();
+    for &t in inserted.iter().filter(|t| is_list(t)) {
+        inserted_list.insert(t);
+        if affected.insert(t[0]) {
+            queue.push(t[0]);
+        }
+    }
+    for &t in removed.iter().filter(|t| is_list(t)) {
+        if t[1] == first {
+            removed_first.entry(t[0]).or_default().push(t[2]);
+        } else {
+            removed_rest.entry(t[0]).or_default().push(t[2]);
+            removed_rev_rest.entry(t[2]).or_default().push(t[0]);
+        }
+        if affected.insert(t[0]) {
+            queue.push(t[0]);
+        }
+    }
+    let g = &c.graph;
+    let mut memo = Memo::default();
+    while let Some(cell) = queue.pop() {
+        if let Some(base) = g.base() {
+            base.for_each_with(&mut memo, None, Some(rest), Some(cell), |t| {
+                if affected.insert(t[0]) {
+                    queue.push(t[0]);
+                }
+                true
+            })?;
+        }
+        for r in g
+            .cands(None, Some(rest), Some(cell), g.offset(), g.len())
+            .iter()
+        {
+            if g.alive(r) && g.flagged(r) {
+                let t = g.triple(r);
+                if t[1] == rest && t[2] == cell && affected.insert(t[0]) {
+                    queue.push(t[0]);
+                }
+            }
+        }
+        if let Some(prevs) = removed_rev_rest.get(&cell) {
+            for &p in prevs {
+                if affected.insert(p) {
+                    queue.push(p);
+                }
+            }
+        }
+        if affected.len().is_multiple_of(1024) {
+            held.try_set(
+                table_bytes(affected.capacity(), size_of::<u64>())
+                    + queue.capacity() * size_of::<u64>(),
+            )?;
+        }
+    }
+    let mut heads: Vec<u64> = Vec::new();
+    let mut old_members: FxHashMap<u64, Option<std::rc::Rc<[u64]>>> = FxHashMap::default();
+    for &h in &affected {
+        let new_m = g.list_explicit(&mut memo, h, first, rest, nil, g.len());
+        let old_m = old_explicit_list(
+            g,
+            &mut memo,
+            h,
+            first,
+            rest,
+            nil,
+            &inserted_list,
+            &removed_first,
+            &removed_rest,
+        )?;
+        if old_m != new_m {
+            heads.push(h);
+        }
+        let m_bytes = old_m
+            .as_ref()
+            .map_or(0, |v| v.len() * size_of::<u64>() + 16);
+        held.try_grow(m_bytes + 32)?;
+        old_members.insert(h, old_m.map(std::rc::Rc::<[u64]>::from));
+    }
+    if let Some(base) = g.base() {
+        base.add_scans(memo.scans);
+    }
+    heads.sort_unstable();
+    heads.dedup();
+    Ok(ChangedLists {
+        heads,
+        old_members,
+        _held: held,
+    })
+}
+
+/// Evaluate list-reading rules over `changed.old_members` to find live derived heads that
+/// depended on a changed explicit RDF list and must enter the first deletion frontier.
+fn eval_list_rules_old(
+    c: &Closure,
+    rules: &[CRule],
+    changed: &ChangedLists,
+    limits: &Limits,
+) -> anyhow::Result<Vec<Triple>> {
+    let g = &c.graph;
+    let abort = AtomicBool::new(false);
+    let mut out: Vec<Triple> = Vec::new();
+    let mut seen: FxHashSet<Triple> = FxHashSet::default();
+    for r in rules {
+        if !engine::reads_lists(r) {
+            continue;
+        }
+        let ranges = vec![(0, g.len()); r.atoms.len()];
+        for slot in list_head_slots(r) {
+            match slot {
+                Slot::Var(lv) => {
+                    let Some(steps) = engine::plan_with(r, &ranges, Some(g), None, &[lv]) else {
+                        continue;
+                    };
+                    let mut ev = Eval::new(
+                        g,
+                        &c.terms,
+                        r,
+                        &steps,
+                        g.len(),
+                        &abort,
+                        limits.cancel.as_deref(),
+                        usize::MAX,
+                        Mode::Existing { visit: None },
+                        &limits.budget,
+                    );
+                    ev.set_explicit_lists(true);
+                    ev.set_list_override(Some(&changed.old_members));
+                    let mut b = vec![0u64; r.nvars];
+                    for &h in &changed.heads {
+                        if cancelled(limits) {
+                            anyhow::bail!("reasoning cancelled");
+                        }
+                        b[lv] = h;
+                        ev.run(0, &mut b, None);
+                        if let Some(e) = ev.err.take() {
+                            return Err(e);
+                        }
+                    }
+                    let (found, _h) = ev.take_out();
+                    for t in found {
+                        if g.position(&t).is_some_and(|row| !c.flagged(row)) && seen.insert(t) {
+                            out.push(t);
+                        }
+                    }
+                }
+                Slot::Const(h) if changed.heads.binary_search(&h).is_ok() => {
+                    let Some(steps) = engine::plan_with(r, &ranges, Some(g), None, &[]) else {
+                        continue;
+                    };
+                    let mut ev = Eval::new(
+                        g,
+                        &c.terms,
+                        r,
+                        &steps,
+                        g.len(),
+                        &abort,
+                        limits.cancel.as_deref(),
+                        usize::MAX,
+                        Mode::Existing { visit: None },
+                        &limits.budget,
+                    );
+                    ev.set_explicit_lists(true);
+                    ev.set_list_override(Some(&changed.old_members));
+                    let mut b = vec![0u64; r.nvars];
+                    ev.run(0, &mut b, None);
+                    if let Some(e) = ev.err.take() {
+                        return Err(e);
+                    }
+                    let (found, _h) = ev.take_out();
+                    for t in found {
+                        if g.position(&t).is_some_and(|row| !c.flagged(row)) && seen.insert(t) {
+                            out.push(t);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Evaluate list-reading rules for `changed.heads` using the new explicit RDF lists and
+/// merge any newly derived facts into `c.graph`.
+fn eval_list_rules_new(
+    c: &mut Closure,
+    rules: &[CRule],
+    changed: &ChangedLists,
+    limits: &Limits,
+) -> anyhow::Result<()> {
+    let abort = AtomicBool::new(false);
+    let mut fresh: Vec<Triple> = Vec::new();
+    {
+        let g = &c.graph;
+        let mut seen: FxHashSet<Triple> = FxHashSet::default();
+        for r in rules {
+            if !engine::reads_lists(r) {
+                continue;
+            }
+            let ranges = vec![(0, g.len()); r.atoms.len()];
+            for slot in list_head_slots(r) {
+                match slot {
+                    Slot::Var(lv) => {
+                        let Some(steps) = engine::plan_with(r, &ranges, Some(g), None, &[lv])
+                        else {
+                            continue;
+                        };
+                        let mut ev = Eval::new(
+                            g,
+                            &c.terms,
+                            r,
+                            &steps,
+                            g.len(),
+                            &abort,
+                            limits.cancel.as_deref(),
+                            limits.max_inferred,
+                            Mode::New,
+                            &limits.budget,
+                        );
+                        ev.set_explicit_lists(true);
+                        let mut b = vec![0u64; r.nvars];
+                        for &h in &changed.heads {
+                            if cancelled(limits) {
+                                anyhow::bail!("reasoning cancelled");
+                            }
+                            b[lv] = h;
+                            ev.run(0, &mut b, None);
+                            if let Some(e) = ev.err.take() {
+                                return Err(e);
+                            }
+                        }
+                        let (found, _h) = ev.take_out();
+                        for t in found {
+                            if g.position(&t).is_none()
+                                && !g
+                                    .base()
+                                    .is_some_and(|base| base.contains(&t).unwrap_or(false))
+                                && seen.insert(t)
+                            {
+                                fresh.push(t);
+                            }
+                        }
+                    }
+                    Slot::Const(h) if changed.heads.binary_search(&h).is_ok() => {
+                        let Some(steps) = engine::plan_with(r, &ranges, Some(g), None, &[]) else {
+                            continue;
+                        };
+                        let mut ev = Eval::new(
+                            g,
+                            &c.terms,
+                            r,
+                            &steps,
+                            g.len(),
+                            &abort,
+                            limits.cancel.as_deref(),
+                            limits.max_inferred,
+                            Mode::New,
+                            &limits.budget,
+                        );
+                        ev.set_explicit_lists(true);
+                        let mut b = vec![0u64; r.nvars];
+                        ev.run(0, &mut b, None);
+                        if let Some(e) = ev.err.take() {
+                            return Err(e);
+                        }
+                        let (found, _h) = ev.take_out();
+                        for t in found {
+                            if g.position(&t).is_none()
+                                && !g
+                                    .base()
+                                    .is_some_and(|base| base.contains(&t).unwrap_or(false))
+                                && seen.insert(t)
+                            {
+                                fresh.push(t);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if !fresh.is_empty() {
+        c.graph.try_add_batch(fresh)?;
+    }
+    Ok(())
+}
+
+/// Estimate rule-instance visits for a deletion from the removed triples' predicates and
+/// the closure's fan-out over non-operator rules (`plans`), to compare against item 798's
+/// visit bound (F16 §7.3, replacing `LARGE_DELETION`).
+fn estimate_deletion_visits(
+    c: &Closure,
+    rules: &[CRule],
+    plans: &Plans,
+    removed: &[Triple],
+) -> u64 {
+    let g = &c.graph;
+    let hi = g.len();
+    let total_facts = g.offset() as u64 + g.live() as u64;
+    if total_facts == 0 || removed.is_empty() {
+        return 0;
+    }
+    let mut by_p: FxHashMap<u64, u64> = FxHashMap::default();
+    for t in removed {
+        *by_p.entry(t[1]).or_default() += 1;
+    }
+    let total_removed = removed.len() as u64;
+    let dist_p = g.distinct_predicates().max(1) as u64;
+    let dist_s = g.distinct_subjects().max(1) as u64;
+    let dist_o = g.distinct_objects().max(1) as u64;
+    let avg_p = total_facts.div_ceil(dist_p).max(1);
+
+    let plan_fanout = |r: &CRule, steps: &[Step], skip_atom: Option<usize>, pre: &[usize]| -> u64 {
+        let mut bound = vec![false; r.nvars];
+        let bind = |s: Slot, b: &mut [bool]| {
+            if let Slot::Var(v) = s {
+                b[v] = true;
+            }
+        };
+        if let Some(d) = skip_atom {
+            let a = &r.atoms[d];
+            bind(a.s, &mut bound);
+            bind(a.p, &mut bound);
+            bind(a.o, &mut bound);
+        }
+        for &v in pre {
+            bound[v] = true;
+        }
+        let is_bound = |s: Slot, b: &[bool]| match s {
+            Slot::Const(_) => true,
+            Slot::Var(v) => b[v],
+            Slot::Any => false,
+        };
+        let mut fanout = 1u64;
+        for step in steps {
+            let Step::Atom { atom, .. } = *step else {
+                continue;
+            };
+            if skip_atom == Some(atom) {
+                continue;
+            }
+            let a = &r.atoms[atom];
+            let sb = is_bound(a.s, &bound);
+            let ob = is_bound(a.o, &bound);
+            let est = match a.p {
+                Slot::Const(p) => {
+                    let n = g.count_p(p, 0, hi) as u64;
+                    if n == 0 {
+                        return 0;
+                    }
+                    let (ds, do_) = g.pstats(p);
+                    match (sb, ob) {
+                        (true, true) => 1,
+                        (true, false) => n.div_ceil(ds.max(1) as u64).max(1),
+                        (false, true) => n.div_ceil(do_.max(1) as u64).max(1),
+                        (false, false) => n,
+                    }
+                }
+                Slot::Var(vp) if bound[vp] => match (sb, ob) {
+                    (true, true) => 1,
+                    (true, false) => avg_p.div_ceil(dist_s).max(1),
+                    (false, true) => avg_p.div_ceil(dist_o).max(1),
+                    (false, false) => avg_p,
+                },
+                _ => match (sb, ob) {
+                    (true, true) => 1,
+                    (true, false) => total_facts.div_ceil(dist_s).max(1),
+                    (false, true) => total_facts.div_ceil(dist_o).max(1),
+                    (false, false) => total_facts,
+                },
+            };
+            fanout = fanout.saturating_mul(est);
+            bind(a.s, &mut bound);
+            bind(a.p, &mut bound);
+            bind(a.o, &mut bound);
+        }
+        fanout
+    };
+
+    let mut total = 0u64;
+    // 1. Forward consequence fan-out for non-operator rules matching removed predicates.
+    for (ri, r) in rules.iter().enumerate() {
+        if plans.forward[ri].is_empty() {
+            continue;
+        }
+        for (d, a) in r.atoms.iter().enumerate() {
+            let Some(steps) = plans.forward[ri][d].as_deref() else {
+                continue;
+            };
+            let count = match a.p {
+                Slot::Const(p) => by_p.get(&p).copied().unwrap_or(0),
+                _ => total_removed,
+            };
+            if count == 0 {
+                continue;
+            }
+            let f = plan_fanout(r, steps, Some(d), &[]);
+            total = total.saturating_add(count.saturating_mul(f));
+        }
+    }
+    // 2. Backward proof fan-out for non-operator rule heads matching removed predicates.
+    for (&p, &count) in &by_p {
+        for (ri, hi_head) in plans.heads(p) {
+            let Some((steps, pre)) = plans.back[ri][hi_head].as_ref() else {
+                continue;
+            };
+            let f = plan_fanout(&rules[ri], steps, None, pre);
+            total = total.saturating_add(count.saturating_mul(f));
+        }
+    }
+    total
+}
+
+/// Re-derive any fact deleted during Phase 1 after its proof search touched an unproved
+/// live fact of an operator-governed predicate, once saturation has re-closed the
+/// operator relations. Repeats until quiescent.
+fn revive_overdeleted(
+    c: &mut Closure,
+    rules: &[CRule],
+    plans: &Plans,
+    limits: &Limits,
+    candidates: &mut Vec<Triple>,
+    iterations: &mut usize,
+) -> anyhow::Result<()> {
+    candidates.sort_unstable();
+    candidates.dedup();
+    let abort = AtomicBool::new(false);
+    loop {
+        candidates.retain(|t| {
+            c.graph.position(t).is_none()
+                && !c
+                    .graph
+                    .base()
+                    .is_some_and(|b| b.contains(t).unwrap_or(false))
+        });
+        if candidates.is_empty() {
+            break;
+        }
+        let mut revived: Vec<Triple> = Vec::new();
+        {
+            let g = &c.graph;
+            for &t in candidates.iter() {
+                if cancelled(limits) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+                let mut found = false;
+                for (ri, hi) in plans.heads(t[1]) {
+                    let Some((steps, pre)) = &plans.back[ri][hi] else {
+                        continue;
+                    };
+                    let rule = &rules[ri];
+                    let Some(mut b) = bind_head(rule, hi, pre, t) else {
+                        continue;
+                    };
+                    let failed = {
+                        let mut sink = |_: &[Triple], _: &[Triple], _: &[u64]| -> bool {
+                            found = true;
+                            false
+                        };
+                        let mut ev = Eval::new(
+                            g,
+                            &c.terms,
+                            rule,
+                            steps,
+                            g.len(),
+                            &abort,
+                            limits.cancel.as_deref(),
+                            usize::MAX,
+                            Mode::Instances {
+                                head: hi,
+                                target: t,
+                                sink: &mut sink,
+                            },
+                            &limits.budget,
+                        );
+                        ev.run(0, &mut b, None);
+                        ev.err.take()
+                    };
+                    if let Some(e) = failed {
+                        return Err(e);
+                    }
+                    if found {
+                        break;
+                    }
+                }
+                if found {
+                    revived.push(t);
+                }
+            }
+        }
+        if revived.is_empty() {
+            break;
+        }
+        let start = c.graph.len();
+        c.graph.try_add_batch(revived)?;
+        let o = match engine::run(&mut c.graph, rules, &c.terms, limits, Some(start)) {
+            Ok(o) => o,
+            Err(e) if e.is::<crate::closure::Restart>() => {
+                return Err(Fallback("an RDF list fact was derived".into()).into());
+            }
+            Err(e) => return Err(e),
+        };
+        *iterations += o.iterations;
+    }
+    Ok(())
 }
 
 /// Bindings of rule `ri`'s head `hi` unified with `t` (only the variables in `pre`), or

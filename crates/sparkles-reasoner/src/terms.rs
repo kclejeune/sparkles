@@ -1148,6 +1148,16 @@ impl Terms {
         mut seed: FxHashMap<u64, u64>,
     ) -> Result<FxHashMap<u64, u64>, BudgetFailure> {
         seed.extend(self.rebase_keys(snap));
+        for field in [
+            &mut self.rdf_first,
+            &mut self.rdf_rest,
+            &mut self.rdf_nil,
+            &mut self.now,
+        ] {
+            if let Some(&new) = seed.get(field) {
+                *field = new;
+            }
+        }
         self.move_tails(&mut seed)?;
         Ok(seed)
     }
