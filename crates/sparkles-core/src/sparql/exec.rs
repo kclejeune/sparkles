@@ -3199,7 +3199,7 @@ impl NumAtom {
     /// generic evaluator answers it. For two numbers, `compare` and `equals` are
     /// `num_cmp`, and an incomparable pair (NaN) is false.
     #[inline]
-    fn holds(&self, x: Id, v: super::value::Num) -> bool {
+    fn holds(&self, x: Id, v: super::value::Num<'_>) -> bool {
         use super::plan::RangeOp;
         use Ordering::*;
         if self.op == RangeOp::Eq && self.id == Some(x) {
@@ -3283,8 +3283,7 @@ pub(super) fn apply_range_filter(
             },
             (Tag::Int | Tag::Double | Tag::Decimal, _) => ctx
                 .value(x)
-                .and_then(|v| Num::of(&v).ok())
-                .map(|v| test(x, v)),
+                .and_then(|v| Num::of(&v).ok().map(|n| test(x, n))),
             _ => None,
         }
     };
@@ -6902,7 +6901,15 @@ fn topk_candidates(
     };
     let mut sorted = numbers.clone();
     let (_, kth, _) = sorted.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
-    let threshold = *kth;
+    // The other numeric conversions are correctly rounded. Fixed decimals round
+    // once converting the mantissa and again dividing by an exactly representable
+    // power of ten. The two rounding errors on either side can reverse the exact
+    // order by up to four representable steps. Keep these rows for exact comparison.
+    let threshold = if kth.is_finite() {
+        kth.next_down().next_down().next_down().next_down()
+    } else {
+        *kth
+    };
     let mut selected = Vec::new();
     for (i, number) in numbers.into_iter().enumerate() {
         if i.is_multiple_of(1024) {
@@ -7286,34 +7293,61 @@ fn first_key_candidates(
     Ok((cand.len() < t.len()).then_some(cand))
 }
 
-fn key_rows(
+/// Evaluate a column with one variable map and one set of EXISTS answers.
+fn with_key_evaluator<T>(
     ctx: &Ctx,
     t: &Table,
     e: &Expr,
     dec: Option<&super::expr::DecodedCols>,
-) -> Result<Vec<Option<Value>>> {
+    run: impl FnOnce(&(dyn Fn(usize) -> Result<Option<Value>> + Sync)) -> Result<T>,
+) -> Result<T> {
+    let _map_charge = ctx.charge(ctx.nvars() as u64 * 16 + 128)?;
     let nested = super::exists::nested(ctx, t, &[e])?;
     let exists = nested.as_ref().map(|n| &n.answers);
     let map = t.var_map(ctx.nvars());
-    let f = |i: usize| {
-        eval(
-            e,
-            &Row {
-                table: t,
-                i,
-                map: &map,
-                dec,
-                exists,
-            },
-            ctx,
-        )
-        .ok()
-        .and_then(|v| match v {
-            Val::Id(id) => ctx.value(id),
-            Val::V(v) | Val::Dec(_, v) => Some(v),
-        })
-    };
-    map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD && e.parallel(), f)
+    let result = run(&|i| match eval(
+        e,
+        &Row {
+            table: t,
+            i,
+            map: &map,
+            dec,
+            exists,
+        },
+        ctx,
+    ) {
+        Ok(Val::Id(id)) => ctx.cursor_value_checked(id),
+        Ok(Val::V(v) | Val::Dec(_, v)) => Ok(Some(v)),
+        Err(_) => {
+            if ctx.has_memory_failure() {
+                ctx.check()?;
+            }
+            Ok(None)
+        }
+    })?;
+    ctx.check()?;
+    Ok(result)
+}
+
+/// Classify each spill merge key after admitting its owned payload.
+pub(super) fn spill_order_keys(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    mut admit: impl FnMut(u64) -> Result<()>,
+) -> Result<Vec<super::sortkey::SortKey>> {
+    with_key_evaluator(ctx, t, e, None, |eval| {
+        let mut values = Vec::with_capacity(t.len());
+        for i in 0..t.len() {
+            if i.is_multiple_of(MAP_POLL_ROWS) {
+                ctx.check()?;
+            }
+            let value = eval(i)?;
+            admit(key_payload(&value))?;
+            values.push(super::sortkey::SortKey::new(value));
+        }
+        Ok(values)
+    })
 }
 
 /// The bytes an ORDER key's value holds beyond its slot.
@@ -7324,248 +7358,184 @@ fn key_payload(value: &Option<Value>) -> u64 {
             (s.len() + lang.len()) as u64 + 128
         }
         Some(Value::Other { lex, dt }) => (lex.len() + dt.len()) as u64 + 128,
+        Some(Value::BigInteger(i)) => i.heap_bytes() + 32,
+        Some(Value::BigDecimal(d)) => d.heap_bytes() + 32,
         Some(Value::Triple(triple)) => super::graph_triple_bytes(triple),
         _ => 0,
     }
 }
 
-/// Evaluate an ORDER BY expression over `t`, admitting each row's heap payload BEFORE
-/// retaining it in the result vector. Large parallel inputs evaluate in chunks, each
-/// holding a `RetainedCharge::part` (or local `Charge` when unowned) that transfers to
-/// `charge` without any release gap; on refusal every allocated value drops before its
-/// credit.
-fn key_rows_admitted(
-    ctx: &Ctx,
-    t: &Table,
-    e: &Expr,
-    dec: Option<&super::expr::DecodedCols>,
-    charge: &mut Option<super::ctx::RetainedCharge>,
-) -> Result<Vec<Option<Value>>> {
-    let nested = super::exists::nested(ctx, t, &[e])?;
-    let exists = nested.as_ref().map(|n| &n.answers);
-    let map = t.var_map(ctx.nvars());
-    let step = ctx.reservation_step();
-    let eval_row = |i: usize| -> Result<Option<Value>> {
-        match eval(
-            e,
-            &Row {
-                table: t,
-                i,
-                map: &map,
-                dec,
-                exists,
-            },
-            ctx,
-        ) {
-            Ok(Val::Id(id)) => {
-                let v = ctx.value(id);
-                if v.is_none() && ctx.has_memory_failure() {
-                    ctx.check()?;
-                }
-                Ok(v)
-            }
-            Ok(Val::V(v) | Val::Dec(_, v)) => Ok(Some(v)),
-            Err(_) => {
-                if ctx.has_memory_failure() {
-                    ctx.check()?;
-                }
-                Ok(None)
-            }
-        }
-    };
-    let mut out: Vec<Option<Value>> = vec![None; t.len()];
-    if t.len() > PAR_THRESHOLD && e.parallel() {
-        let owner = charge.as_ref();
-        let mut pieces: Vec<_> = out
-            .par_chunks_mut(PAR_MIN_LEN)
-            .enumerate()
-            .map(|(chunk_idx, chunk)| {
-                let part = match owner {
-                    Some(c) => c.part(ctx),
-                    None => match ctx.charge(0) {
-                        Ok(c) => c,
-                        Err(e) => return (Err(e), 0u64, 0u64, None),
-                    },
-                };
-                let mut bytes = 0u64;
-                let mut covered = 0u64;
-                let start = chunk_idx * PAR_MIN_LEN;
-                let res = (|| -> Result<()> {
-                    ctx.check()?;
-                    for (offset, slot) in chunk.iter_mut().enumerate() {
-                        if offset.is_multiple_of(1024) {
-                            ctx.check()?;
-                        }
-                        let val = eval_row(start + offset)?;
-                        let p = key_payload(&val);
-                        if p > 0 {
-                            bytes = bytes.saturating_add(p);
-                            if bytes > covered {
-                                let ahead = bytes.saturating_add(step.min(bytes / 4));
-                                match part.add(ahead - covered) {
-                                    Ok(()) => covered = ahead,
-                                    Err(_) => {
-                                        part.add(bytes - covered)?;
-                                        covered = bytes;
-                                    }
-                                }
-                            }
-                        }
-                        *slot = val;
-                    }
-                    ctx.check()
-                })();
-                (res, bytes, covered, Some(part))
-            })
-            .collect();
-        if let Some(at) = pieces.iter().position(|(res, ..)| res.is_err()) {
-            let (res, _, _, part) = pieces.swap_remove(at);
-            // Values drop before the charges that admitted them.
-            out.par_iter_mut()
-                .with_min_len(PAR_MIN_LEN)
-                .for_each(|v| *v = None);
-            drop((part, pieces));
-            return Err(res.unwrap_err());
-        }
-        let mut slack = 0u64;
-        for (_, bytes, covered, part) in pieces {
-            if let Some(part) = part {
-                if let Some(charge) = charge.as_mut() {
-                    slack = slack.saturating_add(covered.saturating_sub(bytes));
-                    charge.absorb(part);
-                } else {
-                    drop(part);
-                }
-            }
-        }
-        if let Some(charge) = charge.as_mut()
-            && slack > 0
-        {
-            charge.resize(charge.bytes().saturating_sub(slack))?;
-        }
-        return Ok(out);
-    }
-    let part = match charge.as_ref() {
-        Some(c) => c.part(ctx),
-        None => ctx.charge(0)?,
-    };
-    let mut bytes = 0u64;
-    let mut covered = 0u64;
-    let res = (|| -> Result<()> {
-        for (i, slot) in out.iter_mut().enumerate() {
-            if i.is_multiple_of(1024) {
-                ctx.check()?;
-            }
-            let val = eval_row(i)?;
-            let p = key_payload(&val);
-            if p > 0 {
-                bytes = bytes.saturating_add(p);
-                if bytes > covered {
-                    let ahead = bytes.saturating_add(step.min(bytes / 4));
-                    match part.add(ahead - covered) {
-                        Ok(()) => covered = ahead,
-                        Err(_) => {
-                            part.add(bytes - covered)?;
-                            covered = bytes;
-                        }
-                    }
-                }
-            }
-            *slot = val;
-        }
-        ctx.check()
-    })();
-    if let Err(err) = res {
-        drop(out);
-        drop(part);
-        return Err(err);
-    }
-    if let Some(charge) = charge.as_mut() {
-        let slack = covered.saturating_sub(bytes);
-        charge.absorb(part);
-        if slack > 0 {
-            charge.resize(charge.bytes().saturating_sub(slack))?;
-        }
-    } else {
-        drop(part);
-    }
-    Ok(out)
-}
-
-/// The value of an ORDER key on every row, charged until the sort releases it. An input
-/// of at most [`PAR_THRESHOLD`] rows is evaluated on this thread, each value admitted
-/// before the column keeps it. A larger input is evaluated in parallel chunks, admitting
-/// each chunk's payload onto an owned charge before retaining values.
+/// Own decoded ORDER keys until the sort releases them. Admit a value's payload
+/// before keeping it in the key column.
 fn key_column_charged(
     ctx: &Ctx,
     t: &Table,
     e: &Expr,
     dec: Option<&super::expr::DecodedCols>,
 ) -> Result<super::exprcache::Column<Option<Value>>> {
-    if t.len() <= PAR_THRESHOLD {
-        return key_rows_charged(ctx, t, e);
-    }
-    let slots = t.len() as u64 * std::mem::size_of::<Option<Value>>() as u64 + 128;
-    let mut charge = ctx.retained_charge(slots)?;
-    let vals = key_rows_admitted(ctx, t, e, dec, &mut charge)?;
+    let mut bytes = t.len() as u64 * std::mem::size_of::<Option<Value>>() as u64 + 128;
+    let mut charge = ctx.retained_charge(bytes)?;
+    let vals = key_rows_retained(ctx, t, e, dec, &mut charge, &mut bytes)?;
     Ok(super::exprcache::Column::Rows {
         vals,
         _charge: charge,
     })
 }
 
-/// Own decoded ORDER keys until the sort releases them. The current evaluated
-/// value is transient expression memory; admit its payload before retaining it
-/// in the column, rather than retaining an uncharged whole-answer value array.
-pub(super) fn key_rows_charged(
+fn key_rows_retained(
     ctx: &Ctx,
     t: &Table,
     e: &Expr,
-) -> Result<super::exprcache::Column<Option<Value>>> {
-    let _map_charge = ctx.charge(ctx.nvars() as u64 * 16 + 128)?;
-    let nested = super::exists::nested(ctx, t, &[e])?;
-    let exists = nested.as_ref().map(|n| &n.answers);
-    let map = t.var_map(ctx.nvars());
-    let mut bytes = t.len() as u64 * std::mem::size_of::<Option<Value>>() as u64 + 128;
-    let mut charge = ctx.retained_charge(bytes)?;
-    // Each payload is admitted before the column keeps it, with the charge a step ahead,
-    // so that short strings take a charge once per step rather than once per row.
-    let step = ctx.reservation_step();
-    let mut values = Vec::with_capacity(t.len());
-    for i in 0..t.len() {
-        if i.is_multiple_of(1024) {
-            ctx.check()?;
-        }
-        let value = match eval(
-            e,
-            &Row {
-                table: t,
-                i,
-                map: &map,
-                dec: None,
-                exists,
-            },
-            ctx,
-        ) {
-            Ok(Val::Id(id)) => ctx.cursor_value_checked(id)?,
-            Ok(Val::V(v) | Val::Dec(_, v)) => Some(v),
-            Err(_) => {
-                if ctx.has_memory_failure() {
+    dec: Option<&super::expr::DecodedCols>,
+    charge: &mut Option<super::ctx::RetainedCharge>,
+    bytes: &mut u64,
+) -> Result<Vec<Option<Value>>> {
+    with_key_evaluator(ctx, t, e, dec, |eval| {
+        let may_split = t.len() > PAR_THRESHOLD;
+        let parallel_key = (may_split || cfg!(feature = "geo")) && e.parallel_order_key();
+        let step = if cfg!(feature = "geo") && !parallel_key {
+            // A later key evaluation may need credit to serialize a geometry.
+            // Keep only the payload we already evaluated.
+            0
+        } else {
+            ctx.reservation_step()
+        };
+        let eval_retained =
+            |i: usize, charge: &mut Option<super::ctx::RetainedCharge>, bytes: &mut u64| {
+                if i.is_multiple_of(MAP_POLL_ROWS) {
                     ctx.check()?;
                 }
-                None
-            }
+                let value = eval(i)?;
+                *bytes = bytes.saturating_add(key_payload(&value));
+                if let Some(charge) = charge {
+                    charge.cover(*bytes, step)?;
+                }
+                Ok::<_, Error>(value)
+            };
+        // Fill the final slots directly. Bound the number of pieces so each can
+        // keep one transient result if its retained charge runs out of room.
+        const TRANSIENT: u64 = super::bignum::AGG_SUM_PAYLOAD_BYTES;
+        const PIECE_BYTES: u64 = 128;
+        // Resume offsets fit on the stack so the heap piece records can be
+        // freed before the serial suffixes need their memory.
+        const MAX_PIECES: usize = 64;
+        let piece_rows = if may_split && parallel_key {
+            t.len()
+                .div_ceil(rayon::current_num_threads().min(MAX_PIECES))
+                .max(PAR_MIN_LEN)
+        } else {
+            t.len().max(1)
         };
-        bytes = bytes.saturating_add(key_payload(&value));
-        if let Some(charge) = &mut charge {
-            charge.cover(bytes, step.min(bytes / 4))?;
+        let pieces = t.len().div_ceil(piece_rows) as u64;
+        let piece_bytes = pieces * PIECE_BYTES;
+        let reserve_scratch = || {
+            let bytes = piece_bytes + pieces * TRANSIENT;
+            let Some(owner) = charge.as_ref() else {
+                return ctx.charge(bytes);
+            };
+            let scratch = owner.part(ctx);
+            scratch.add(bytes)?;
+            Ok(scratch)
+        };
+        if pieces > 1
+            && let Ok(scratch) = reserve_scratch()
+        {
+            let mut values = vec![None; t.len()];
+            let part_owner = charge.as_ref();
+            let mut parts: Vec<_> = values
+                .par_chunks_mut(piece_rows)
+                .enumerate()
+                .map(|(piece, slots)| {
+                    let start = piece * piece_rows;
+                    let part = part_owner.map(|owner| owner.part(ctx));
+                    let mut payload = 0u64;
+                    let progress = (|| {
+                        for (offset, slot) in slots.iter_mut().enumerate() {
+                            if offset.is_multiple_of(MAP_POLL_ROWS) {
+                                ctx.check()?;
+                            }
+                            let value = eval(start + offset)?;
+                            let key_bytes = key_payload(&value);
+                            let needed = payload.saturating_add(key_bytes);
+                            if let Some(part) = &part
+                                && needed > part.bytes()
+                                && part.resize(needed.saturating_add(step)).is_err()
+                            {
+                                match part.resize(needed) {
+                                    Ok(()) => {}
+                                    Err(Error::BudgetExceeded(_)) if key_bytes <= TRANSIENT => {
+                                        *slot = value;
+                                        return Ok((offset + 1, key_bytes));
+                                    }
+                                    // A wider result cannot stay in scratch.
+                                    // Retry this row only if evaluation is repeatable.
+                                    Err(Error::BudgetExceeded(_))
+                                        if super::exprcache::repeatable(e) =>
+                                    {
+                                        return Ok((offset, 0));
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            payload = needed;
+                            *slot = value;
+                        }
+                        Ok((slots.len(), 0))
+                    })();
+                    if let Some(part) = &part {
+                        part.resize(payload).expect("shrinking a piece's charge");
+                    }
+                    (progress, payload, part)
+                })
+                .collect();
+            for (_, payload, part) in &mut parts {
+                if let (Some(charge), Some(part)) = (charge.as_mut(), part.take()) {
+                    charge.absorb(part);
+                }
+                *bytes = bytes.saturating_add(*payload);
+            }
+            let mut resume = [0; MAX_PIECES];
+            let mut pending = 0;
+            let mut has_suffix = false;
+            for (((progress, _, _), slots), offset) in parts
+                .into_iter()
+                .zip(values.chunks(piece_rows))
+                .zip(&mut resume)
+            {
+                let (done, saved) = progress?;
+                *offset = done;
+                pending += saved;
+                has_suffix |= done < slots.len();
+            }
+            // The collection is gone. Release its charge and the unused
+            // transient allowance before admitting any more key payload.
+            scratch.resize(pending)?;
+            if pending > 0 {
+                charge.as_mut().expect("retained pieces").absorb(scratch);
+                *bytes = bytes.saturating_add(pending);
+            }
+            if has_suffix {
+                ctx.check()?;
+                for (piece, (slots, &done)) in
+                    values.chunks_mut(piece_rows).zip(&resume).enumerate()
+                {
+                    let start = piece * piece_rows;
+                    for (offset, slot) in slots.iter_mut().enumerate().skip(done) {
+                        *slot = eval_retained(start + offset, charge, bytes)?;
+                    }
+                }
+                charge.as_mut().expect("retained pieces").resize(*bytes)?;
+            }
+            return Ok(values);
         }
-        values.push(value);
-    }
-    ctx.check()?;
-    Ok(super::exprcache::Column::Rows {
-        vals: values,
-        _charge: charge,
+        let mut values = Vec::with_capacity(t.len());
+        for i in 0..t.len() {
+            values.push(eval_retained(i, charge, bytes)?);
+        }
+        if let Some(charge) = charge {
+            charge.resize(*bytes)?;
+        }
+        Ok(values)
     })
 }
 
@@ -7635,31 +7605,27 @@ fn key_per_value(
     e: &Expr,
     report: &mut ExprReport,
 ) -> Result<Option<super::exprcache::PerValue<Option<Value>>>> {
-    // Numeric keys reuse their input ids, from a dense range of integers at any size and
-    // from a sort up to `PAR_THRESHOLD` rows. A variable's values are decoded once each
-    // in key order at any size, so that the sort holds one value per distinct term, and
-    // another key of a larger input evaluates each distinct value once, in parallel.
-    // None of them takes fewer than `MIN_ROWS` rows, which return here.
+    // Numeric keys over inline ids and variable keys have specialized reuse.
+    // The general cache is useful only when enough rows can evaluate in parallel.
     if t.len() < super::exprcache::MIN_ROWS {
         return Ok(None);
     }
     if let Some(values) =
-        super::exprcache::cursor_numeric_values(ctx, t, e, report, |v| key_rows(ctx, v, e, None))?
+        super::exprcache::cursor_numeric_values(ctx, t, e, report, |v, charge, bytes| {
+            key_rows_retained(ctx, v, e, None, charge, bytes)
+        })?
     {
         return Ok(Some(values));
-    }
-    if t.len() <= PAR_THRESHOLD {
-        return super::exprcache::cursor_variable_values(ctx, t, e);
     }
     if let Some(values) = super::exprcache::cursor_variable_values(ctx, t, e)? {
         return Ok(Some(values));
     }
-    if t.len() < super::exprcache::MIN_ROWS {
+    if t.len() <= PAR_THRESHOLD {
         return Ok(None);
     }
-    super::exprcache::per_value_charged(ctx, t, &[e], false, report, |v, charge| {
+    super::exprcache::per_value_retained(ctx, t, &[e], false, report, |v, charge, bytes| {
         let dec = decode_for(ctx, v, &[e])?;
-        key_rows_admitted(ctx, v, e, Decoded::cols(&dec), charge)
+        key_rows_retained(ctx, v, e, Decoded::cols(&dec), charge, bytes)
     })
 }
 
@@ -7744,13 +7710,13 @@ fn order_by_rows(
         _ => idx.par_sort_by(cmp),
     }
     ctx.check()?;
-    ctx.check_output(idx.len(), t.width())?;
-    let sorted = t.take_rows(&idx);
-    // A large key column's decoded values are freed on the pool, not on this thread.
+    // Sorting has used the last key. Free the key columns on the pool before
+    // checking room for the output table.
     key_vals
         .into_iter()
         .for_each(super::exprcache::Column::drop_in_parallel);
-    Ok(sorted)
+    ctx.check_output(idx.len(), t.width())?;
+    Ok(t.take_rows(&idx))
 }
 
 /// The rows of `t` that DISTINCT keeps, each value's first, in input order.
@@ -7852,6 +7818,169 @@ pub(super) fn stat_aggregate(func: &AggregateFunction) -> Option<super::aggext::
     }
 }
 
+/// Non-`i128` numeric subtotal of [`AggState::Sum`].
+///
+/// Big-number variants keep bounded headroom ([`super::bignum::AGG_MAX_INT_DIGITS`] /
+/// [`super::bignum::AGG_MAX_DEC_DIGITS`]) so cancellation and averaging at the digit cap
+/// stay independent of row order, while enforcing the final value limits in
+/// [`AggState::finish`].
+pub(super) enum SumGeneric {
+    Decimal(oxsdatatypes::Decimal),
+    Float(oxsdatatypes::Float),
+    Double(oxsdatatypes::Double),
+    BigInt(Box<super::bignum::BigInt>),
+    BigDec(Box<super::bignum::BigDec>),
+}
+
+impl SumGeneric {
+    fn from_int(int: i128) -> Self {
+        Self::BigInt(Box::new(super::bignum::BigInt::from_i128(int)))
+    }
+
+    fn heap_bytes(&self) -> u64 {
+        match self {
+            SumGeneric::BigInt(i) => i.heap_bytes() + 32,
+            SumGeneric::BigDec(d) => d.heap_bytes() + 32,
+            _ => 0,
+        }
+    }
+
+    fn add_value(&self, rhs: &Value) -> Option<Self> {
+        use super::bignum::{AGG_MAX_DEC_DIGITS, AGG_MAX_INT_DIGITS, BigDec, BigInt};
+        use super::value::Num;
+        use oxsdatatypes::{Double, Float};
+        let n = Num::of(rhs).ok()?;
+        Some(match (self, n) {
+            (SumGeneric::Decimal(a), Num::Integer(b)) => match a.checked_add(b) {
+                Some(d) => SumGeneric::Decimal(d),
+                None => SumGeneric::BigDec(Box::new(
+                    BigDec::from_oxs_decimal(*a)
+                        .checked_add_with_limit(&BigDec::from_i64(b.into()), AGG_MAX_DEC_DIGITS)?,
+                )),
+            },
+            (SumGeneric::Decimal(a), Num::Decimal(b)) => match a.checked_add(b) {
+                Some(d) => SumGeneric::Decimal(d),
+                None => SumGeneric::BigDec(Box::new(
+                    BigDec::from_oxs_decimal(*a)
+                        .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)?,
+                )),
+            },
+            (SumGeneric::Decimal(a), Num::BigInteger(b)) => SumGeneric::BigDec(Box::new(
+                BigDec::from_oxs_decimal(*a)
+                    .checked_add_with_limit(&BigDec::from_bigint(b.clone()), AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::Decimal(a), Num::BigDecimal(b)) => SumGeneric::BigDec(Box::new(
+                BigDec::from_oxs_decimal(*a).checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::Decimal(a), Num::Float(b)) => SumGeneric::Float(Float::from(*a) + b),
+            (SumGeneric::Decimal(a), Num::Double(b)) => SumGeneric::Double(Double::from(*a) + b),
+            (SumGeneric::BigInt(a), Num::Integer(b)) => SumGeneric::BigInt(Box::new(
+                a.checked_add_with_limit(&BigInt::from_i64(b.into()), AGG_MAX_INT_DIGITS)?,
+            )),
+            (SumGeneric::BigInt(a), Num::BigInteger(b)) => {
+                SumGeneric::BigInt(Box::new(a.checked_add_with_limit(b, AGG_MAX_INT_DIGITS)?))
+            }
+            (SumGeneric::BigInt(a), Num::Decimal(b)) => SumGeneric::BigDec(Box::new(
+                BigDec::from_bigint((**a).clone())
+                    .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::BigInt(a), Num::BigDecimal(b)) => SumGeneric::BigDec(Box::new(
+                BigDec::from_bigint((**a).clone()).checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::BigInt(a), Num::Float(b)) => {
+                SumGeneric::Float(Float::from(a.to_f32()) + b)
+            }
+            (SumGeneric::BigInt(a), Num::Double(b)) => {
+                SumGeneric::Double(Double::from(a.to_f64()) + b)
+            }
+            (SumGeneric::BigDec(a), Num::Integer(b)) => SumGeneric::BigDec(Box::new(
+                a.checked_add_with_limit(&BigDec::from_i64(b.into()), AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::BigDec(a), Num::BigInteger(b)) => SumGeneric::BigDec(Box::new(
+                a.checked_add_with_limit(&BigDec::from_bigint(b.clone()), AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::BigDec(a), Num::Decimal(b)) => SumGeneric::BigDec(Box::new(
+                a.checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::BigDec(a), Num::BigDecimal(b)) => {
+                SumGeneric::BigDec(Box::new(a.checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)?))
+            }
+            (SumGeneric::BigDec(a), Num::Float(b)) => {
+                SumGeneric::Float(Float::from(a.to_f32()) + b)
+            }
+            (SumGeneric::BigDec(a), Num::Double(b)) => {
+                SumGeneric::Double(Double::from(a.to_f64()) + b)
+            }
+            (SumGeneric::Float(a), Num::Double(b)) => SumGeneric::Double(Double::from(*a) + b),
+            (SumGeneric::Float(a), other) => SumGeneric::Float(*a + other.to_float()),
+            (SumGeneric::Double(a), other) => SumGeneric::Double(*a + other.to_double()),
+        })
+    }
+
+    fn merge(self, other: Self) -> Option<Self> {
+        use super::bignum::{AGG_MAX_DEC_DIGITS, AGG_MAX_INT_DIGITS, BigDec};
+        use oxsdatatypes::{Double, Float};
+        Some(match (self, other) {
+            (SumGeneric::Decimal(a), SumGeneric::Decimal(b)) => match a.checked_add(b) {
+                Some(d) => SumGeneric::Decimal(d),
+                None => SumGeneric::BigDec(Box::new(
+                    BigDec::from_oxs_decimal(a)
+                        .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)?,
+                )),
+            },
+            (SumGeneric::BigInt(a), SumGeneric::BigInt(b)) => {
+                SumGeneric::BigInt(Box::new(a.checked_add_with_limit(&b, AGG_MAX_INT_DIGITS)?))
+            }
+            (SumGeneric::BigDec(a), SumGeneric::BigDec(b)) => {
+                SumGeneric::BigDec(Box::new(a.checked_add_with_limit(&b, AGG_MAX_DEC_DIGITS)?))
+            }
+            (SumGeneric::BigDec(a), SumGeneric::BigInt(b))
+            | (SumGeneric::BigInt(b), SumGeneric::BigDec(a)) => SumGeneric::BigDec(Box::new(
+                a.checked_add_with_limit(&BigDec::from_bigint(*b), AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::BigDec(a), SumGeneric::Decimal(b))
+            | (SumGeneric::Decimal(b), SumGeneric::BigDec(a)) => SumGeneric::BigDec(Box::new(
+                a.checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::BigInt(a), SumGeneric::Decimal(b))
+            | (SumGeneric::Decimal(b), SumGeneric::BigInt(a)) => SumGeneric::BigDec(Box::new(
+                BigDec::from_bigint(*a)
+                    .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::Float(a), SumGeneric::Float(b)) => SumGeneric::Float(a + b),
+            (SumGeneric::Float(a), SumGeneric::Decimal(b))
+            | (SumGeneric::Decimal(b), SumGeneric::Float(a)) => {
+                SumGeneric::Float(a + Float::from(b))
+            }
+            (SumGeneric::Float(a), SumGeneric::BigInt(b))
+            | (SumGeneric::BigInt(b), SumGeneric::Float(a)) => {
+                SumGeneric::Float(a + Float::from(b.to_f32()))
+            }
+            (SumGeneric::Float(a), SumGeneric::BigDec(b))
+            | (SumGeneric::BigDec(b), SumGeneric::Float(a)) => {
+                SumGeneric::Float(a + Float::from(b.to_f32()))
+            }
+            (SumGeneric::Double(a), SumGeneric::Double(b)) => SumGeneric::Double(a + b),
+            (SumGeneric::Double(a), SumGeneric::Float(b))
+            | (SumGeneric::Float(b), SumGeneric::Double(a)) => {
+                SumGeneric::Double(a + Double::from(b))
+            }
+            (SumGeneric::Double(a), SumGeneric::Decimal(b))
+            | (SumGeneric::Decimal(b), SumGeneric::Double(a)) => {
+                SumGeneric::Double(a + Double::from(b))
+            }
+            (SumGeneric::Double(a), SumGeneric::BigInt(b))
+            | (SumGeneric::BigInt(b), SumGeneric::Double(a)) => {
+                SumGeneric::Double(a + Double::from(b.to_f64()))
+            }
+            (SumGeneric::Double(a), SumGeneric::BigDec(b))
+            | (SumGeneric::BigDec(b), SumGeneric::Double(a)) => {
+                SumGeneric::Double(a + Double::from(b.to_f64()))
+            }
+        })
+    }
+}
+
 /// Running state of one aggregate of one group (same results as [`aggregate`]).
 pub(super) enum AggState {
     /// COUNT(*) / COUNT(?v): rows / bound values
@@ -7864,10 +7993,11 @@ pub(super) enum AggState {
     /// that are not numbers, for the reading in which AVG over only errors is zero.
     Sum {
         int: i128,
-        generic: Option<Value>,
+        generic: Option<SumGeneric>,
         ok: bool,
         rows: u64,
         errs: u64,
+        deferred: bool,
     },
     /// MIN / MAX: the best id and its value, and the count of arguments that were
     /// errors, which some readings make the result unbound (see
@@ -7890,6 +8020,7 @@ impl AggState {
                 ok: true,
                 rows: 0,
                 errs: 0,
+                deferred: false,
             },
             AggregateFunction::Min | AggregateFunction::Max => AggState::Best(None, None, 0),
             AggregateFunction::Sample => AggState::Sample(None),
@@ -7897,16 +8028,56 @@ impl AggState {
         }
     }
 
+    /// Owned heap bytes held by a `SUM`/`AVG` big-number subtotal.
+    #[inline]
+    pub(super) fn sum_heap_bytes(&self) -> u64 {
+        match self {
+            AggState::Sum {
+                generic: Some(g), ..
+            } => g.heap_bytes(),
+            _ => 0,
+        }
+    }
+
     /// Add one row; `id` is the aggregated column's value (`None` for COUNT(*)).
-    /// `on_best` admits any retained `MIN`/`MAX` payload before replacing `best_v`.
+    /// `on_payload` admits any retained `MIN`/`MAX` or `SUM`/`AVG` payload before
+    /// replacing the state.
     #[inline(always)]
     pub(super) fn add(
         &mut self,
         ctx: &Ctx,
         agg: &Agg,
         id: Option<Id>,
-        on_best: &mut dyn FnMut(u64) -> Result<()>,
+        on_payload: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<()> {
+        let _ = self.add_admitted(ctx, agg, id, &mut |_, new| {
+            on_payload(new)?;
+            Ok(true)
+        })?;
+        Ok(())
+    }
+
+    /// Whether later arguments of this subtotal must be replayed from disk.
+    pub(super) fn sum_deferred(&self) -> bool {
+        matches!(self, Self::Sum { deferred: true, .. })
+    }
+
+    pub(super) fn defer_sum(&mut self) {
+        if let Self::Sum { deferred, .. } = self {
+            *deferred = true;
+        }
+    }
+
+    /// Try one row. If a subtotal's new heap capacity is refused, preserve its
+    /// prefix so the caller can replay this argument and the rest of the group.
+    #[inline(always)]
+    pub(super) fn add_admitted(
+        &mut self,
+        ctx: &Ctx,
+        agg: &Agg,
+        id: Option<Id>,
+        admit: &mut dyn FnMut(u64, u64) -> Result<bool>,
+    ) -> Result<bool> {
         match self {
             AggState::Count(n) => *n += id.is_none_or(|id| !id.is_undef()) as u64,
             AggState::Sum {
@@ -7915,19 +8086,21 @@ impl AggState {
                 ok,
                 rows,
                 errs,
+                ..
             } => {
                 *rows += 1;
                 let id = id.unwrap_or(Id::UNDEF);
-                *errs += u64::from(id.is_undef());
+                let err = u64::from(id.is_undef());
+                *errs += err;
                 if !*ok {
-                    return Ok(());
+                    return Ok(true);
                 }
                 if generic.is_none()
                     && id.tag() == crate::id::Tag::Int
                     && let Some(s) = int.checked_add(id.as_i64().into())
                 {
                     *int = s;
-                    return Ok(());
+                    return Ok(true);
                 }
                 let value = if id.is_undef() {
                     None
@@ -7940,24 +8113,36 @@ impl AggState {
                     && let Some(s) = int.checked_add(i64::from(*i).into())
                 {
                     *int = s;
-                    return Ok(());
+                    return Ok(true);
                 }
-                let Some(acc) = generic.take().or_else(|| super::value::exact_sum(*int)) else {
-                    *ok = false;
-                    return Ok(());
+                let next = match (generic.as_ref(), value.as_ref()) {
+                    (Some(acc), Some(value)) => acc.add_value(value),
+                    (None, Some(value)) => {
+                        if let Value::Decimal(d) = value
+                            && let Ok(i) = oxsdatatypes::Decimal::try_from(*int)
+                            && let Some(s) = i.checked_add(*d)
+                        {
+                            *generic = Some(SumGeneric::Decimal(s));
+                            return Ok(true);
+                        }
+                        SumGeneric::from_int(*int).add_value(value)
+                    }
+                    (_, None) => None,
                 };
-                match value {
-                    Some(v) => match arith(NumOp::Add, &acc, &v) {
-                        Ok(v) => *generic = Some(v),
-                        Err(_) => *ok = false,
-                    },
-                    None => *ok = false,
+                let old_bytes = generic.as_ref().map_or(0, SumGeneric::heap_bytes);
+                let new_bytes = next.as_ref().map_or(0, SumGeneric::heap_bytes);
+                if old_bytes != new_bytes && !admit(old_bytes, new_bytes)? {
+                    *rows -= 1;
+                    *errs -= err;
+                    return Ok(false);
                 }
+                *ok = next.is_some();
+                *generic = next;
             }
             AggState::Best(best, best_v, errs) => {
                 let Some(id) = id.filter(|id| !id.is_undef()) else {
                     *errs += 1;
-                    return Ok(());
+                    return Ok(true);
                 };
                 let decode = ctx.charge(0)?;
                 let v = ctx.value_checked_into(id, &decode)?;
@@ -7973,7 +8158,7 @@ impl AggState {
                     }
                 };
                 if better {
-                    on_best(key_payload(&v))?;
+                    let _ = admit(0, key_payload(&v))?;
                     *best = Some(id);
                     *best_v = v;
                 } else {
@@ -7988,7 +8173,7 @@ impl AggState {
             }
             AggState::Stat(_, acc) => acc.add(ctx, id)?,
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Fold `other`, the state of the same aggregate over rows that come after this
@@ -8006,6 +8191,7 @@ impl AggState {
                     ok,
                     rows,
                     errs,
+                    ..
                 },
                 AggState::Sum {
                     int: oint,
@@ -8013,6 +8199,7 @@ impl AggState {
                     ok: ook,
                     rows: orows,
                     errs: oerrs,
+                    ..
                 },
             ) => {
                 *rows += orows;
@@ -8031,14 +8218,11 @@ impl AggState {
                     *int = s;
                     return true;
                 }
-                let left = generic.take().or_else(|| super::value::exact_sum(*int));
-                let right = ogeneric.or_else(|| super::value::exact_sum(oint));
-                match (left, right) {
-                    (Some(l), Some(r)) => match arith(NumOp::Add, &l, &r) {
-                        Ok(v) => *generic = Some(v),
-                        Err(_) => *ok = false,
-                    },
-                    _ => *ok = false,
+                let left = generic.take().unwrap_or_else(|| SumGeneric::from_int(*int));
+                let right = ogeneric.unwrap_or_else(|| SumGeneric::from_int(oint));
+                match left.merge(right) {
+                    Some(v) => *generic = Some(v),
+                    None => *ok = false,
                 }
             }
             (AggState::Best(best, best_v, errs), AggState::Best(Some(id), v, oerrs)) => {
@@ -8116,6 +8300,7 @@ impl AggState {
                 ok,
                 rows,
                 errs,
+                ..
             } => {
                 // AVG is Sum over Count, and Count leaves the errors out
                 if rows > 0
@@ -8128,21 +8313,61 @@ impl AggState {
                 if !ok {
                     return Id::UNDEF;
                 }
-                let sum = match generic {
-                    Some(sum) => sum,
-                    None => match i64::try_from(int) {
-                        Ok(int) => Value::Integer(int.into()),
-                        Err(_) => return Id::UNDEF,
-                    },
-                };
-                let v = if matches!(agg.func, AggregateFunction::Avg) {
-                    if rows == 0 {
-                        Some(Value::Integer(0.into()))
-                    } else {
-                        arith(NumOp::Div, &sum, &Value::Integer((rows as i64).into())).ok()
+                let is_avg = matches!(agg.func, AggregateFunction::Avg);
+                if is_avg && rows == 0 {
+                    return ctx.intern_value(&Value::Integer(0.into()));
+                }
+                let v = match generic {
+                    None => {
+                        let sum = super::value::exact_sum(int);
+                        if is_avg {
+                            let denom = Value::from_bigint(super::bignum::BigInt::from_u64(rows));
+                            arith(NumOp::Div, &sum, &denom).ok()
+                        } else {
+                            Some(sum)
+                        }
                     }
-                } else {
-                    Some(sum)
+                    Some(SumGeneric::Decimal(d)) => {
+                        let sum = Value::Decimal(d);
+                        if is_avg {
+                            let denom = Value::from_bigint(super::bignum::BigInt::from_u64(rows));
+                            arith(NumOp::Div, &sum, &denom).ok()
+                        } else {
+                            Some(sum)
+                        }
+                    }
+                    Some(SumGeneric::Float(f)) => {
+                        let sum = Value::Float(f);
+                        if is_avg {
+                            let denom = Value::from_bigint(super::bignum::BigInt::from_u64(rows));
+                            arith(NumOp::Div, &sum, &denom).ok()
+                        } else {
+                            Some(sum)
+                        }
+                    }
+                    Some(SumGeneric::Double(d)) => {
+                        let sum = Value::Double(d);
+                        if is_avg {
+                            let denom = Value::from_bigint(super::bignum::BigInt::from_u64(rows));
+                            arith(NumOp::Div, &sum, &denom).ok()
+                        } else {
+                            Some(sum)
+                        }
+                    }
+                    Some(SumGeneric::BigInt(bi)) => {
+                        if is_avg {
+                            super::value::avg_big_int(*bi, rows)
+                        } else {
+                            bi.fits_limits().then(|| Value::from_bigint(*bi))
+                        }
+                    }
+                    Some(SumGeneric::BigDec(bd)) => {
+                        if is_avg {
+                            super::value::avg_big_decimal(&bd, rows)
+                        } else {
+                            bd.fits_limits().then(|| Value::from_bigdec(*bd))
+                        }
+                    }
                 };
                 v.map_or(Id::UNDEF, |v| ctx.intern_value(&v))
             }
@@ -14218,4 +14443,586 @@ mod string_order_tests {
         assert_eq!(large_hi, large_n);
         assert!(large_hi > large_lo);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn cursor_big_numeric_sort_keys_are_admitted_as_they_are_evaluated() {
+    use super::expr::ArithOp;
+
+    let store = crate::store::Store::in_memory(Default::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.mem_limit = 360 * 1024;
+    let var = ctx.var("v");
+    let ctx = std::sync::Arc::new(ctx);
+    ctx.attach_owner();
+
+    let mut table = Table::new(vec![var]);
+    for i in 1..=512 {
+        let id = Id::from_i64(i).unwrap();
+        table.push_row(&[id]);
+        table.push_row(&[id]);
+    }
+    let factor = Id::from_i64(100_000_000_000_000_003).unwrap();
+    let expr = (0..96).fold(Expr::Var(var), |expr, _| {
+        Expr::Arith(Box::new(expr), Box::new(Expr::Const(factor)), ArithOp::Mul)
+    });
+    let mut report = ExprReport::default();
+    let result = key_per_value(&ctx, &table, &expr, &mut report);
+    assert!(matches!(result, Err(Error::BudgetExceeded(_))));
+    // The initial fixed reservation is about 260 KiB. A one-shot payload charge
+    // would fail there, before the ledger had admitted any of the big values.
+    assert!(ctx.mem_peak() >= 310 * 1024, "peak: {}", ctx.mem_peak());
+    assert_eq!(ctx.live_bytes(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn cursor_fixed_width_sort_reuses_keys_under_a_tight_budget() {
+    use super::expr::ArithOp;
+
+    let store = crate::store::Store::in_memory(Default::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.mem_limit = 260 * 1024;
+    let var = ctx.var("v");
+    let ctx = std::sync::Arc::new(ctx);
+    ctx.attach_owner();
+
+    let mut table = Table::new(vec![var]);
+    for i in 1..=512 {
+        let id = Id::from_i64(i).unwrap();
+        table.push_row(&[id]);
+        table.push_row(&[id]);
+    }
+    let expr = Expr::Arith(
+        Box::new(Expr::Var(var)),
+        Box::new(Expr::Const(Id::from_i64(1).unwrap())),
+        ArithOp::Add,
+    );
+    let mut report = ExprReport::default();
+    let keys = key_per_value(&ctx, &table, &expr, &mut report)
+        .unwrap()
+        .expect("fixed-width keys fit in the cache");
+    assert_eq!(keys.vals.len(), 512);
+    assert!(matches!(
+        keys.get(1023),
+        Some(Value::Integer(value)) if i64::from(*value) == 513
+    ));
+    drop(keys);
+    assert_eq!(ctx.live_bytes(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn cursor_large_sparse_and_uncached_sort_keys_admit_payload_incrementally() {
+    use super::expr::ArithOp;
+
+    for cached in [true, false] {
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 5 << 20;
+        let var = ctx.var("v");
+        let ctx = std::sync::Arc::new(ctx);
+        ctx.attach_owner();
+
+        let mut table = Table::new(vec![var]);
+        for i in 1..=PAR_THRESHOLD as i64 {
+            let id = Id::from_i64(i * 16).unwrap();
+            table.push_row(&[id]);
+            table.push_row(&[id]);
+        }
+        let factor = Value::from_typed(&"9".repeat(1700), oxrdf::vocab::xsd::INTEGER.as_str());
+        let expr = Expr::Arith(
+            Box::new(Expr::Var(var)),
+            Box::new(Expr::Lit(Id::UNDEF, factor)),
+            ArithOp::Mul,
+        );
+        let mut report = ExprReport::default();
+        let err = if cached {
+            key_per_value(&ctx, &table, &expr, &mut report).err()
+        } else {
+            key_column_charged(&ctx, &table, &expr, None).err()
+        };
+        assert!(
+            matches!(err, Some(Error::BudgetExceeded(_))),
+            "cached {cached}"
+        );
+        assert!(
+            ctx.mem_peak() >= 4 << 20,
+            "cached {cached}, peak {}",
+            ctx.mem_peak()
+        );
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn parallel_full_sort_fits_without_a_second_key_column() {
+    use super::expr::ArithOp;
+
+    let store = crate::store::Store::in_memory(Default::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.opt.expr_cache = false;
+    let var = ctx.var("v");
+    let rows = 2 * PAR_THRESHOLD;
+    let mut table = Table::new(vec![var]);
+    for i in (1..=rows as i64).rev() {
+        table.push_row(&[Id::from_i64(i).unwrap()]);
+    }
+    let factor = Value::from_typed(&"9".repeat(1700), oxrdf::vocab::xsd::INTEGER.as_str());
+    let expr = Expr::Arith(
+        Box::new(Expr::Var(var)),
+        Box::new(Expr::Lit(Id::UNDEF, factor)),
+        ArithOp::Mul,
+    );
+    let payload = with_key_evaluator(&ctx, &table, &expr, None, |eval| {
+        (0..rows).try_fold(0, |bytes, i| Ok(bytes + key_payload(&eval(i)?)))
+    })
+    .unwrap();
+    let slots = (rows * size_of::<Option<Value>>()) as u64;
+    assert!(payload > slots);
+    let sort = rows as u64 * 24 + 2 * table.mem_bytes() + 128 + 1024;
+    let evaluator = ctx.nvars() as u64 * 16 + 128;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    // The complete sort has room for only half the old scratch column's slots.
+    ctx.mem_limit = sort + slots + 128 + evaluator + payload + slots / 2;
+    let ctx = ctx.into_shared();
+    let sorted = pool
+        .install(|| {
+            order_by_rows(
+                &ctx,
+                table.clone(),
+                &[(expr.clone(), true)],
+                None,
+                &mut ExprReport::default(),
+            )
+        })
+        .unwrap();
+    assert!(
+        sorted.cols[0]
+            .iter()
+            .map(|id| id.as_i64())
+            .eq(1..=rows as i64)
+    );
+    assert_eq!(ctx.live_bytes(), 0);
+
+    // The column alone has room for the keys and piece metadata. The workers
+    // must hand off when the transient allowance occupies the remaining room.
+    let mut tight = Ctx::new(store.snapshot());
+    assert_eq!(tight.var("v"), var);
+    tight.mem_limit = slots + 128 + evaluator + payload + 4 * 128;
+    let tight = tight.into_shared();
+    let keys = pool
+        .install(|| key_column_charged(&tight, &table, &expr, None))
+        .unwrap();
+    with_key_evaluator(&ctx, &table, &expr, None, |eval| {
+        for i in 0..rows {
+            assert_eq!(
+                order_cmp(keys.get(i).as_ref(), eval(i)?.as_ref()),
+                Ordering::Equal
+            );
+        }
+        Ok(())
+    })
+    .unwrap();
+    drop(keys);
+    assert_eq!(tight.live_bytes(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn parallel_full_sort_hands_off_wide_string_keys() {
+    use super::expr::Func;
+    use spargebra::algebra::Function;
+
+    let (ctx, table) = parallel_full_sort_fixture(2 * PAR_THRESHOLD);
+    let var = table.vars[0];
+    let expr = Expr::Call(
+        Func::Builtin(Function::Concat),
+        vec![
+            Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(var)]),
+            Expr::Lit(Id::UNDEF, Value::Str("#".repeat(4096).into())),
+        ],
+    );
+    // The final column fits with room for the old piece metadata, but a
+    // worker that runs out of room cannot stash its string in the transient.
+    let mut expected: Vec<_> = (1..=table.len() as i64).collect();
+    expected.sort_by_cached_key(i64::to_string);
+    assert_parallel_full_sort_at_budget(ctx, table, expr, 4 * 128, expected);
+}
+
+#[cfg(test)]
+#[test]
+fn parallel_full_sort_releases_piece_metadata_before_finishing_keys() {
+    use super::expr::{ArithOp, CmpOp};
+
+    let (ctx, table) = parallel_full_sort_fixture(2 * PAR_THRESHOLD);
+    let var = table.vars[0];
+    let wide_rows = 32;
+    let factor = Value::from_typed(&"9".repeat(1700), oxrdf::vocab::xsd::INTEGER.as_str());
+    let expr = Expr::If(
+        Box::new(Expr::Cmp(
+            Box::new(Expr::Var(var)),
+            Box::new(Expr::Const(Id::from_i64(wide_rows).unwrap())),
+            CmpOp::Le,
+        )),
+        Box::new(Expr::Arith(
+            Box::new(Expr::Var(var)),
+            Box::new(Expr::Lit(Id::UNDEF, factor)),
+            ArithOp::Mul,
+        )),
+        Box::new(Expr::Var(var)),
+    );
+    // The sparse wide keys leave room to start the parallel evaluation, but
+    // finishing the suffix needs every byte remaining after the handoff.
+    let expected = (wide_rows + 1..=table.len() as i64).chain(1..=wide_rows);
+    assert_parallel_full_sort_at_budget(ctx, table, expr, 0, expected);
+}
+
+#[cfg(all(test, feature = "geo"))]
+#[test]
+fn parallel_full_sort_preserves_wide_geometry_keys_geof() {
+    assert_full_sort_with_wide_geometry_key(format!("{}asWKT", crate::geo::vocab::GEOF), vec![]);
+}
+
+#[cfg(all(test, feature = "geo"))]
+#[test]
+fn parallel_full_sort_preserves_wide_geometry_keys_spatialf() {
+    let dt = crate::geo::WKT_LITERAL;
+    assert_full_sort_with_wide_geometry_key(
+        format!("{}transformDatatype", crate::geo::vocab::SPATIALF),
+        vec![Expr::Lit(Id::UNDEF, Value::Iri(dt.into()))],
+    );
+}
+
+#[cfg(all(test, feature = "geo"))]
+fn assert_full_sort_with_wide_geometry_key(iri: String, extra_args: Vec<Expr>) {
+    use super::expr::Func;
+    use crate::geo::{WKT_LITERAL, memo::GeoMemo};
+    use spargebra::algebra::Function;
+
+    const KEY_LEN: i64 = 20_000;
+    let coordinates: Vec<_> = ["0 0", "1 1"].into_iter().cycle().take(6000).collect();
+    let wkt = format!("LINESTRING({})", coordinates.join(", "));
+    let geometry = crate::geo::parse(&wkt, WKT_LITERAL).unwrap();
+    let geometry_bytes = crate::geo::to_wkt(&geometry).len() as u64 + 64;
+    let key_bytes = KEY_LEN as u64 + 64;
+    assert!(geometry_bytes > key_bytes);
+    let literal =
+        oxrdf::Literal::new_typed_literal(wkt, oxrdf::NamedNodeRef::new_unchecked(WKT_LITERAL));
+
+    for threads in [1, 4] {
+        let (mut ctx, table) = parallel_full_sort_fixture(2 * PAR_THRESHOLD);
+        ctx.geo = GeoMemo::with_budget(0);
+        let var = table.vars[0];
+        let unbound = ctx.var("unbound");
+        let geometry_id = ctx.intern_term(&oxrdf::Term::Literal(literal.clone()));
+        assert_ne!(geometry_id, Id::UNDEF);
+        let mut args = vec![Expr::Lit(geometry_id, Value::from_literal(&literal))];
+        args.extend(extra_args.iter().cloned());
+        let first = table.cols[0][0];
+        let key = Expr::If(
+            Box::new(Expr::SameTerm(
+                Box::new(Expr::Var(var)),
+                Box::new(Expr::Const(first)),
+            )),
+            Box::new(Expr::Call(
+                Func::Builtin(Function::SubStr),
+                vec![
+                    Expr::Call(
+                        Func::Builtin(Function::Str),
+                        vec![Expr::Call(Func::Ext(iri.clone()), args)],
+                    ),
+                    Expr::Const(Id::from_i64(1).unwrap()),
+                    Expr::Const(Id::from_i64(KEY_LEN).unwrap()),
+                ],
+            )),
+            Box::new(Expr::Var(unbound)),
+        );
+        let rows = table.len();
+        let slots = (rows * size_of::<Option<Value>>()) as u64 + 128;
+        let sort = rows as u64 * 24 + 2 * table.mem_bytes() + 128 + 1024;
+        let evaluator = ctx.nvars() as u64 * 16 + 128;
+        let setup = ctx.live_bytes();
+        // One serialization and one retained key fit together. Four workers'
+        // scratch fits under the key's allowance, but leaves too little room
+        // to keep the evaluated key in the column.
+        ctx.mem_limit = setup + sort + evaluator + slots + geometry_bytes + key_bytes;
+        let ctx = ctx.into_shared();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let sorted = pool
+            .install(|| {
+                order_by_rows(
+                    &ctx,
+                    table,
+                    &[(key, true)],
+                    None,
+                    &mut ExprReport::default(),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            sorted.cols[0].last().copied(),
+            Some(first),
+            "{threads} threads"
+        );
+        assert!(
+            sorted.cols[0][..rows - 1]
+                .iter()
+                .map(|id| id.as_i64())
+                .eq((1..rows as i64).rev()),
+            "{threads} threads"
+        );
+        assert_eq!(
+            ctx.live_bytes(),
+            setup + geometry_bytes,
+            "{threads} threads"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "geo"))]
+#[test]
+fn parallel_full_sort_keeps_credit_for_later_geometry_keys() {
+    use super::expr::Func;
+    use crate::geo::{WKT_LITERAL, memo::GeoMemo};
+    use spargebra::algebra::Function;
+
+    const ROWS: usize = 8 * PAR_THRESHOLD;
+    const KEY_LEN: i64 = 20_000;
+    for threads in [1, 4] {
+        let (mut ctx, table) = parallel_full_sort_fixture(ROWS);
+        ctx.geo = GeoMemo::with_budget(0);
+        let var = table.vars[0];
+        let unbound = ctx.var("unbound");
+        let wkt_key = |points| {
+            let coordinates: Vec<_> = ["0 0", "1 1"].into_iter().cycle().take(points).collect();
+            let wkt = format!("LINESTRING({})", coordinates.join(", "));
+            let geometry = crate::geo::parse(&wkt, WKT_LITERAL).unwrap();
+            let bytes = crate::geo::to_wkt(&geometry).len() as u64 + 64;
+            let literal = oxrdf::Literal::new_typed_literal(
+                wkt,
+                oxrdf::NamedNodeRef::new_unchecked(WKT_LITERAL),
+            );
+            let id = ctx.intern_term(&oxrdf::Term::Literal(literal.clone()));
+            assert_ne!(id, Id::UNDEF);
+            let as_wkt = Expr::Call(
+                Func::Ext(format!("{}asWKT", crate::geo::vocab::GEOF)),
+                vec![Expr::Lit(id, Value::from_literal(&literal))],
+            );
+            (
+                Expr::Call(Func::Builtin(Function::Str), vec![as_wkt]),
+                bytes,
+            )
+        };
+        let (first_wkt, first_bytes) = wkt_key(6000);
+        let (second_wkt, second_bytes) = wkt_key(12000);
+        let first = table.cols[0][0];
+        let second = table.cols[0][1];
+        let is_row = |id| {
+            Box::new(Expr::SameTerm(
+                Box::new(Expr::Var(var)),
+                Box::new(Expr::Const(id)),
+            ))
+        };
+        let key = Expr::If(
+            is_row(first),
+            Box::new(Expr::Call(
+                Func::Builtin(Function::SubStr),
+                vec![
+                    first_wkt,
+                    Expr::Const(Id::from_i64(1).unwrap()),
+                    Expr::Const(Id::from_i64(KEY_LEN).unwrap()),
+                ],
+            )),
+            Box::new(Expr::If(
+                is_row(second),
+                Box::new(Expr::Call(
+                    Func::Builtin(Function::StrLen),
+                    vec![second_wkt],
+                )),
+                Box::new(Expr::Var(unbound)),
+            )),
+        );
+        let slots = (ROWS * size_of::<Option<Value>>()) as u64 + 128;
+        let sort = ROWS as u64 * 24 + 2 * table.mem_bytes() + 128 + 1024;
+        let evaluator = ctx.nvars() as u64 * 16 + 128;
+        let setup = ctx.live_bytes();
+        let geometry_bytes = first_bytes + second_bytes;
+        let key_bytes = KEY_LEN as u64 + 64;
+        // The first key can reserve a growth step, but its unused credit
+        // would leave too little for the second WKT serialization.
+        let headroom = 4 * (128 + super::bignum::AGG_SUM_PAYLOAD_BYTES);
+        ctx.mem_limit = setup + sort + evaluator + slots + geometry_bytes + key_bytes + headroom;
+        assert!(ctx.reservation_step() > headroom);
+        assert!(ctx.reservation_step() <= headroom + second_bytes);
+        let ctx = ctx.into_shared();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let sorted = pool
+            .install(|| {
+                order_by_rows(
+                    &ctx,
+                    table,
+                    &[(key, true)],
+                    None,
+                    &mut ExprReport::default(),
+                )
+            })
+            .unwrap();
+        let (unbound_rows, bound_rows) = sorted.cols[0].split_at(ROWS - 2);
+        assert_eq!(bound_rows, &[first, second], "{threads} threads");
+        assert!(
+            unbound_rows
+                .iter()
+                .map(|id| id.as_i64())
+                .eq((1..=ROWS as i64 - 2).rev()),
+            "{threads} threads"
+        );
+        assert_eq!(
+            ctx.live_bytes(),
+            setup + geometry_bytes,
+            "{threads} threads"
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "geo")]
+#[test]
+fn full_sort_releases_serial_key_slack_before_geometry_column() {
+    use super::expr::Func;
+    use crate::geo::{WKT_LITERAL, memo::GeoMemo};
+    use spargebra::algebra::Function;
+
+    let wkt = format!("LINESTRING({}0 0)", "0 0, 1 1, ".repeat(7000));
+    let geometry = crate::geo::parse(&wkt, WKT_LITERAL).unwrap();
+    let geometry_bytes = crate::geo::to_wkt(&geometry).len() as u64 + 64;
+    let literal =
+        oxrdf::Literal::new_typed_literal(wkt, oxrdf::NamedNodeRef::new_unchecked(WKT_LITERAL));
+    let text = Value::Str("x".repeat(20_000).into());
+    let key_bytes = key_payload(&Some(text.clone()));
+    for (rows, threads) in [
+        (PAR_THRESHOLD, 1),
+        (PAR_THRESHOLD, 4),
+        (8 * PAR_THRESHOLD, 1),
+    ] {
+        let (mut ctx, table) = parallel_full_sort_fixture(rows);
+        ctx.geo = GeoMemo::with_budget(0);
+        let var = table.vars[0];
+        let unbound = ctx.var("unbound");
+        let id = ctx.intern_term(&oxrdf::Term::Literal(literal.clone()));
+        let [first, second, ..] = table.cols[0][..] else {
+            unreachable!("the fixture has at least two rows");
+        };
+        let key_for = |row, value| {
+            Expr::If(
+                Box::new(Expr::SameTerm(
+                    Box::new(Expr::Var(var)),
+                    Box::new(Expr::Const(row)),
+                )),
+                Box::new(value),
+                Box::new(Expr::Var(unbound)),
+            )
+        };
+        let as_wkt = Expr::Call(
+            Func::Ext(format!("{}asWKT", crate::geo::vocab::GEOF)),
+            vec![Expr::Lit(id, Value::from_literal(&literal))],
+        );
+        let length = Expr::Call(
+            Func::Builtin(Function::StrLen),
+            vec![Expr::Call(Func::Builtin(Function::Str), vec![as_wkt])],
+        );
+        let keys = [
+            (key_for(first, Expr::Lit(Id::UNDEF, text.clone())), true),
+            (key_for(second, length), true),
+        ];
+        let slots = (rows * size_of::<Option<Value>>()) as u64 + 128;
+        let sort = rows as u64 * 24 + 2 * table.mem_bytes() + 2 * 128 + 1024;
+        let evaluator = ctx.nvars() as u64 * 16 + 128;
+        let setup = ctx.live_bytes();
+        ctx.mem_limit = setup + sort + evaluator + 2 * slots + key_bytes + geometry_bytes;
+        assert!(ctx.reservation_step() < geometry_bytes);
+        let ctx = ctx.into_shared();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let sorted = pool
+            .install(|| order_by_rows(&ctx, table, &keys, None, &mut ExprReport::default()))
+            .unwrap();
+        let (unbound_rows, bound_rows) = sorted.cols[0].split_at(rows - 2);
+        assert_eq!(
+            bound_rows,
+            &[second, first],
+            "{rows} rows, {threads} threads"
+        );
+        assert!(
+            unbound_rows
+                .iter()
+                .map(|id| id.as_i64())
+                .eq((1..=rows as i64 - 2).rev()),
+            "{rows} rows, {threads} threads"
+        );
+        assert_eq!(ctx.live_bytes(), setup + geometry_bytes);
+    }
+}
+
+#[cfg(test)]
+fn parallel_full_sort_fixture(rows: usize) -> (Ctx, Table) {
+    let store = crate::store::Store::in_memory(Default::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.opt.expr_cache = false;
+    let var = ctx.var("v");
+    let mut table = Table::new(vec![var]);
+    for i in (1..=rows as i64).rev() {
+        table.push_row(&[Id::from_i64(i).unwrap()]);
+    }
+    (ctx, table)
+}
+
+#[cfg(test)]
+fn assert_parallel_full_sort_at_budget(
+    mut ctx: Ctx,
+    table: Table,
+    expr: Expr,
+    headroom: u64,
+    expected: impl IntoIterator<Item = i64>,
+) {
+    let rows = table.len();
+    let payload = with_key_evaluator(&ctx, &table, &expr, None, |eval| {
+        (0..rows).try_fold(0, |bytes, i| Ok(bytes + key_payload(&eval(i)?)))
+    })
+    .unwrap();
+    let slots = (rows * size_of::<Option<Value>>()) as u64;
+    let sort = rows as u64 * 24 + 2 * table.mem_bytes() + 128 + 1024;
+    let evaluator = ctx.nvars() as u64 * 16 + 128;
+    ctx.mem_limit = sort + slots + 128 + evaluator + payload + headroom;
+    let ctx = ctx.into_shared();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let sorted = pool
+        .install(|| {
+            order_by_rows(
+                &ctx,
+                table,
+                &[(expr, true)],
+                None,
+                &mut ExprReport::default(),
+            )
+        })
+        .unwrap();
+    assert!(sorted.cols[0].iter().map(|id| id.as_i64()).eq(expected));
+    assert_eq!(ctx.live_bytes(), 0);
 }

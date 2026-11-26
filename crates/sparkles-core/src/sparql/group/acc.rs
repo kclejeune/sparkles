@@ -10,6 +10,8 @@
 //! this one, `finish` gives a group's value, and `retract` takes rows back for a state
 //! that can, which item 418's view operator needs.
 
+use super::deferred::{Deferred, subtotal};
+use super::op::BatchBudget;
 use crate::error::Result;
 use crate::id::Id;
 use crate::sparql::ctx::Ctx;
@@ -100,14 +102,14 @@ pub(crate) trait Accumulator: Send {
     fn init(&mut self, groups: usize);
 
     /// Fold row `i` of the batch into group `slots[i]`, for every row, in row order. A
-    /// row's slot is the number of its group among those `init` made. `retain` admits any
-    /// retained state growth before allocation.
+    /// row's slot is the number of its group among those `init` made. `budget` admits any
+    /// retained state growth before allocation and handles spilling sum subtotals.
     fn add_batch(
         &mut self,
         ctx: &Ctx,
         batch: &Batch<'_>,
         slots: &[u32],
-        retain: &mut dyn FnMut(u64) -> Result<()>,
+        budget: &mut BatchBudget<'_>,
     ) -> Result<()>;
 
     /// Whether [`Accumulator::merge`] gives what one accumulator over all the rows gives.
@@ -133,6 +135,17 @@ pub(crate) trait Accumulator: Send {
 
     /// The value of group `group`, which the call takes out of the accumulator.
     fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id>;
+
+    /// Finish in slot and aggregate order when some subtotals have deferred arguments.
+    fn finish_replay(
+        &mut self,
+        ctx: &Ctx,
+        group: usize,
+        _aggregate: usize,
+        _deferred: &mut Deferred,
+    ) -> Result<Id> {
+        self.finish(ctx, group)
+    }
 
     /// Whether [`Accumulator::retract`] can take back every row.
     fn retractable(&self) -> bool {
@@ -198,6 +211,13 @@ impl Running {
             AggregateFunction::Min | AggregateFunction::Max
         )
     }
+
+    fn is_sum(&self) -> bool {
+        matches!(
+            self.agg.func,
+            AggregateFunction::Sum | AggregateFunction::Avg
+        )
+    }
 }
 
 impl Accumulator for Running {
@@ -205,7 +225,7 @@ impl Accumulator for Running {
         for _ in 0..groups {
             self.states.push(AggState::new(&self.agg));
         }
-        if self.is_best() {
+        if self.is_best() || (self.track && self.is_sum()) {
             self.payload.resize(self.states.len(), 0);
         }
     }
@@ -215,9 +235,29 @@ impl Accumulator for Running {
         ctx: &Ctx,
         batch: &Batch<'_>,
         slots: &[u32],
-        retain: &mut dyn FnMut(u64) -> Result<()>,
+        budget: &mut BatchBudget<'_>,
     ) -> Result<()> {
         let agg = &self.agg;
+        if self.is_sum()
+            && let Some(sum_budget) = budget.sum_budget()
+        {
+            for (row, &slot) in slots.iter().enumerate() {
+                if row.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                let id = batch.value(row);
+                let state = &mut self.states[slot as usize];
+                if state.sum_deferred()
+                    || !state.add_admitted(ctx, agg, id, &mut |old, new| {
+                        sum_budget.replace(old, new)
+                    })?
+                {
+                    sum_budget.defer(ctx, slot, id)?;
+                    state.defer_sum();
+                }
+            }
+            return Ok(());
+        }
         match (&agg.func, batch.arg) {
             // running counts need no per-row dispatch
             (AggregateFunction::Count, Arg::Star) => {
@@ -235,7 +275,7 @@ impl Accumulator for Running {
                 }
             }
             _ => {
-                let best = self.track && self.is_best();
+                let track_payload = self.track && (self.is_best() || self.is_sum());
                 let states = &mut self.states;
                 let payload = &mut self.payload;
                 let growth = &mut self.growth;
@@ -245,19 +285,19 @@ impl Accumulator for Running {
                     }
                     let id = batch.value(row);
                     let slot_idx = slot as usize;
-                    let mut on_best = |new_bytes: u64| -> Result<()> {
-                        if best {
+                    let mut on_payload = |new_bytes: u64| -> Result<()> {
+                        if track_payload {
                             let held = &mut payload[slot_idx];
                             if new_bytes > *held {
                                 let delta = new_bytes - *held;
-                                retain(delta)?;
+                                budget.retain(delta)?;
                                 *growth += delta;
                                 *held = new_bytes;
                             }
                         }
                         Ok(())
                     };
-                    states[slot_idx].add(ctx, agg, id, &mut on_best)?;
+                    states[slot_idx].add(ctx, agg, id, &mut on_payload)?;
                 }
                 ctx.check()?;
             }
@@ -306,6 +346,16 @@ impl Accumulator for Running {
                     "this aggregate cannot be merged",
                 ));
             }
+            if self.track && self.is_sum() {
+                let held_now = self.states[to as usize].sum_heap_bytes();
+                let held = &mut self.payload[to as usize];
+                if held_now > *held {
+                    let delta = held_now - *held;
+                    retain(delta)?;
+                    self.growth += delta;
+                    *held = held_now;
+                }
+            }
         }
         Ok(())
     }
@@ -315,6 +365,22 @@ impl Accumulator for Running {
         let id = state.finish(ctx, &self.agg);
         ctx.check()?;
         Ok(id)
+    }
+
+    fn finish_replay(
+        &mut self,
+        ctx: &Ctx,
+        group: usize,
+        aggregate: usize,
+        deferred: &mut Deferred,
+    ) -> Result<Id> {
+        let state = &mut self.states[group];
+        if state.sum_deferred() {
+            deferred.replay(ctx, subtotal(group, aggregate), |id| {
+                state.add(ctx, &self.agg, Some(id), &mut |_| Ok(()))
+            })?;
+        }
+        self.finish(ctx, group)
     }
 
     fn retractable(&self) -> bool {
@@ -398,7 +464,7 @@ impl Accumulator for Concat {
         ctx: &Ctx,
         batch: &Batch<'_>,
         slots: &[u32],
-        retain: &mut dyn FnMut(u64) -> Result<()>,
+        budget: &mut BatchBudget<'_>,
     ) -> Result<()> {
         for (row, &slot) in slots.iter().enumerate() {
             if row.is_multiple_of(1024) {
@@ -436,14 +502,14 @@ impl Accumulator for Concat {
                 let next_cap = needed.max(before.saturating_mul(2));
                 // the string and its reallocation coexist while it grows
                 let delta = (next_cap.saturating_sub(before) as u64).saturating_mul(2);
-                if retain(delta).is_err() {
+                if budget.retain(delta).is_err() {
                     let exact = (needed.saturating_sub(before) as u64).saturating_mul(2);
-                    retain(exact)?;
+                    budget.retain(exact)?;
                     state.text.reserve_exact(add_len);
                     let actual =
                         (state.text.capacity().saturating_sub(before) as u64).saturating_mul(2);
                     if actual > exact {
-                        retain(actual - exact)?;
+                        budget.retain(actual - exact)?;
                     }
                     self.growth += actual.max(exact);
                 } else {
@@ -451,7 +517,7 @@ impl Accumulator for Concat {
                     let actual =
                         (state.text.capacity().saturating_sub(before) as u64).saturating_mul(2);
                     if actual > delta {
-                        retain(actual - delta)?;
+                        budget.retain(actual - delta)?;
                     }
                     self.growth += actual.max(delta);
                 }
@@ -604,7 +670,7 @@ impl Accumulator for Distinct {
         ctx: &Ctx,
         batch: &Batch<'_>,
         slots: &[u32],
-        retain: &mut dyn FnMut(u64) -> Result<()>,
+        budget: &mut BatchBudget<'_>,
     ) -> Result<()> {
         // The slots and values of the rows that are new, which the aggregate underneath
         // reads, are charged until it has read them.
@@ -629,7 +695,7 @@ impl Accumulator for Distinct {
                 } else {
                     // the boxed row, the set's entry and room for its table to grow
                     let bytes = batch.table.cols.len() as u64 * 8 + 96;
-                    retain(bytes)?;
+                    budget.retain(bytes)?;
                     self.growth += bytes;
                     self.rows.insert(entry)
                 }
@@ -641,7 +707,7 @@ impl Accumulator for Distinct {
                             false
                         } else {
                             // the set's entry, with room for its table to grow
-                            retain(64)?;
+                            budget.retain(64)?;
                             self.growth += 64;
                             self.values.insert((slot, id))
                         }
@@ -665,7 +731,7 @@ impl Accumulator for Distinct {
             rows: None,
             base: batch.base,
         };
-        self.inner.add_batch(ctx, &inner, &keep, retain)
+        self.inner.add_batch(ctx, &inner, &keep, budget)
     }
 
     fn group_bytes(&self) -> u64 {
@@ -674,6 +740,16 @@ impl Accumulator for Distinct {
 
     fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
         self.inner.finish(ctx, group)
+    }
+
+    fn finish_replay(
+        &mut self,
+        ctx: &Ctx,
+        group: usize,
+        aggregate: usize,
+        deferred: &mut Deferred,
+    ) -> Result<Id> {
+        self.inner.finish_replay(ctx, group, aggregate, deferred)
     }
 
     fn take_growth(&mut self) -> u64 {
@@ -713,7 +789,7 @@ impl Accumulator for Rows {
         ctx: &Ctx,
         batch: &Batch<'_>,
         _slots: &[u32],
-        _retain: &mut dyn FnMut(u64) -> Result<()>,
+        _budget: &mut BatchBudget<'_>,
     ) -> Result<()> {
         let index = batch.rows.expect("a batch of whole groups");
         let map = batch.table.var_map(ctx.nvars());

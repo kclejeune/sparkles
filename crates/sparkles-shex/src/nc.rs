@@ -410,7 +410,9 @@ fn is_inline(tag: Tag) -> bool {
 fn digits(v: &Value) -> Option<(u64, u64)> {
     let s = match v {
         Value::Integer(i) => i.to_string(),
+        Value::BigInteger(i) => i.to_string(),
         Value::Decimal(d) => d.to_string(),
+        Value::BigDecimal(d) => d.to_string(),
         _ => return None,
     };
     let s = s.trim_start_matches(['+', '-']);

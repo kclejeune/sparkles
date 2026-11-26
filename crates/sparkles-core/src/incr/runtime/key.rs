@@ -5,7 +5,7 @@ use super::*;
 
 /// The version of the compiler, part of a checkpoint's fingerprint: a state written
 /// by another compiler is not loaded.
-pub(super) const COMPILER: &str = "f13-phase2-4";
+pub(in crate::incr) const COMPILER: &str = "f13-phase2-5";
 
 /// Whether `access` has protections that depend on the data, with the reason the
 /// whole query is then evaluated again (spec F13 §6.2).
@@ -51,7 +51,7 @@ pub fn covers(caller: Option<&Arc<GraphAccess>>, view: Option<&Arc<GraphAccess>>
 /// The query's text with the variables the parser names at random (aggregates' and
 /// others' that the source `text` does not hold) renamed in order of appearance, so
 /// that one query parsed twice gives one text.
-pub(super) fn normalized(q: &Query, text: &str) -> String {
+pub(in crate::incr) fn normalized(q: &Query, text: &str) -> String {
     let word = |c: char| c.is_alphanumeric() || c == '_';
     let in_source = |name: &str| {
         ['?', '$'].iter().any(|p| {
@@ -149,6 +149,9 @@ mod compiler_tests {
         // an EXISTS whose LIMIT/OFFSET slice mentions an outer variable compiles to
         // substitution (exists or recompute under GRAPH) instead of a match join (item 1121)
         ("f13-phase2-4", "33695b11351c501e"),
+        // arbitrary-precision xsd:integer and xsd:decimal semantics, transitive numeric
+        // ORDER BY, and checkpointed big-number SUM/AVG state (item 1065)
+        ("f13-phase2-5", "33695b11351c501e"),
     ];
 
     /// The variants of `ops::Op` as the source declares them, without comments or

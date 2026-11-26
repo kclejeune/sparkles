@@ -212,6 +212,8 @@ impl ValueCache {
             Value::Iri(a) | Value::BNode(a) | Value::Str(a) => text(a),
             Value::Lang(a, b) | Value::LangDir(a, b, _) => text(a) + text(b),
             Value::Other { lex, dt } => text(lex) + text(dt),
+            Value::BigInteger(i) => i.heap_bytes() + 16,
+            Value::BigDecimal(d) => d.heap_bytes() + 16,
             Value::Triple(t) => 64 + super::graph_triple_bytes(t),
             _ => 0,
         };

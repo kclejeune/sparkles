@@ -12,6 +12,30 @@ The batch gate verifies a cached Rust test pass against the original gate's reta
 JUnit report and manifest. The replayed log links the receipts, including when an
 earlier run's output has been archived. This completes roadmap item 1094.
 
+### Arbitrary-precision `xsd:integer` and `xsd:decimal` evaluation (item 1065)
+
+SPARQL expressions, comparisons, arithmetic, unary operations, rounding functions, casts,
+`ORDER BY`, range filters, aggregates, maintained views, ShEx digit facets and the reasoner
+now evaluate `xsd:integer`, derived integer types and `xsd:decimal` values beyond the
+fixed-width `i64` and `oxsdatatypes::Decimal` ranges using bounded arbitrary-precision
+representations capped at 4,096 significant digits and 4,096 fractional digits, while
+keeping ordinary fixed-width values on their existing fast paths. `ORDER BY` compares
+non-NaN numbers by their exact mathematical value across integer, decimal, float and double
+types so sorting and top-k selection stay transitive, while `FILTER` keeps XPath numeric
+promotion. Float and double casts to `xsd:integer` and derived integer types truncate the
+binary floating-point value directly.
+
+- **Format.** The derived numeric vocabulary sidecar `gen-*/vocab.num` moves from magic
+  `SPKVNUM3` to `SPKVNUM4` so out-of-range integers and decimals record `UNKNOWN` rather
+  than `NOT_NUMERIC`. Older `SPKVNUM2` and `SPKVNUM3` files are ignored on open while queries
+  decode from the vocabulary, and compaction or `sparkles vocab-index` rebuilds `SPKVNUM4`. The
+  incremental-view compiler version moves from `f13-phase2-4` to `f13-phase2-5` so
+  pre-upgrade view checkpoints rebuild under the new numeric semantics and arbitrary-precision
+  `SUM`/`AVG` state checkpoints and recovers cleanly.
+- **Compatibility.** In the public Rust surface (`sparkles::sparql::value`), `Value` adds
+  `BigInteger(BigIntValue)` and `BigDecimal(BigDecValue)` with opaque canonicalizing
+  wrappers, `Num<'a>` gains a lifetime parameter, and `NumConst` implements `Clone` rather
+  than `Copy`.
 ### Prepared and evidence views no longer leak raw snapshots, masks or bound policies
 
 `PreparedView::{snapshot, access}`, `BoundEvidenceView::{snapshot, shared_snapshot}`,

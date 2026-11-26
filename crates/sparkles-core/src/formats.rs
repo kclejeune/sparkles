@@ -224,14 +224,16 @@ pub const VOCAB_FSST: FileKind = FileKind {
     reads: &[1],
 };
 
-/// The numeric column of a generation's vocabulary.
+/// The numeric column of a generation's vocabulary. Derived from the vocabulary keys: a
+/// version this build does not read is ignored so queries decode from the vocabulary, and
+/// compaction or `vocab-index` rebuilds the current version.
 pub const NUMERIC_COLUMN: FileKind = FileKind {
     id: "numeric-column",
     files: "gen-*/vocab.num",
-    marker: "magic `SPKVNUM3`",
-    class: Class::Primary,
-    writes: 3,
-    reads: &[3],
+    marker: "magic `SPKVNUM4`; another version is not used, queries decode from the vocabulary, and compaction or `vocab-index` rebuilds it",
+    class: Class::Derived,
+    writes: 4,
+    reads: &[4],
 };
 
 /// A generation's predicate patterns (X11 Phase 1). Derived from the generation's SPO

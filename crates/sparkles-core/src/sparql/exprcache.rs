@@ -23,7 +23,7 @@
 //! and each row's index into them are the cache: at most one entry per input row, charged
 //! to the query's memory budget while they are built.
 
-use super::ctx::Ctx;
+use super::ctx::{Ctx, RetainedCharge};
 use super::exec::PAR_MIN_LEN;
 use super::expr::{Expr, Func, needs_values};
 use super::table::{Table, VarId};
@@ -160,6 +160,11 @@ impl Report {
 /// Why `e` may differ between two evaluations on the same input, if it may.
 pub fn impurity(e: &Expr) -> Option<&'static str> {
     impurity_with(e, false, &|_| Some("EXISTS"))
+}
+
+/// Whether evaluation on the same row can be retried after a handoff.
+pub(super) fn repeatable(e: &Expr) -> bool {
+    impurity_with(e, true, &|_| Some("EXISTS")).is_none()
 }
 
 /// Why the order or the grouping of the rows that `e` is evaluated on can be observed
@@ -409,42 +414,38 @@ pub fn per_value<T: Send>(
     report: &mut Report,
     eval: impl FnOnce(&Table) -> Result<Vec<T>>,
 ) -> Result<Option<PerValue<T>>> {
-    per_value_charged(ctx, t, exprs, always, report, |values, _| eval(values))
+    per_value_retained(ctx, t, exprs, always, report, |values, _, _| eval(values))
 }
 
-/// Like [`per_value`], passing the retained charge into `eval` so expression results
-/// with heap payloads (such as ORDER BY strings) admit their payload as values are
-/// produced rather than after materializing the entire vector.
-pub(super) fn per_value_charged<T: Send>(
+/// Evaluate a distinct column while admitting the heap payload of each result.
+pub(super) fn per_value_retained<T: Send>(
     ctx: &Ctx,
     t: &Table,
     exprs: &[&Expr],
     always: bool,
     report: &mut Report,
-    eval: impl FnOnce(&Table, &mut Option<super::ctx::RetainedCharge>) -> Result<Vec<T>>,
+    eval: impl FnOnce(&Table, &mut Option<RetainedCharge>, &mut u64) -> Result<Vec<T>>,
 ) -> Result<Option<PerValue<T>>> {
     let Some(d) = distinct(ctx, t, exprs, always, report)? else {
         return Ok(None);
     };
-    // The slots, the distinct values and their results live until the caller has
-    // expanded or read them, so they stay charged until then in both accounting modes.
-    let held = (d.slot.as_ref().map_or(0, Vec::capacity) as u64)
-        .saturating_mul(4)
-        .saturating_add(d.values.mem_bytes());
+    let distinct_bytes = d.values.capacity_bytes();
     let size = std::mem::size_of::<T>() as u64;
-    let base = held.saturating_add((d.values.len() as u64).saturating_mul(size));
+    let mut retained = (d.slot.as_ref().map_or(0, Vec::capacity) as u64)
+        .saturating_mul(4)
+        .saturating_add(distinct_bytes)
+        .saturating_add((d.values.len() as u64).saturating_mul(size));
     // Reuse is optional, so a charge that does not fit, before or after the evaluation,
     // leaves the rows to the caller instead of failing the query.
-    let Ok(mut charge) = ctx.retained_charge(base) else {
+    let Ok(mut charge) = ctx.retained_charge(retained) else {
         return Ok(None);
     };
-    let vals = eval(&d.values, &mut charge)?;
+    let vals = eval(&d.values, &mut charge, &mut retained)?;
     debug_assert_eq!(vals.len(), d.values.len());
-    let cap_extra = (vals.capacity().saturating_sub(d.values.len()) as u64).saturating_mul(size);
-    if cap_extra > 0
-        && let Some(charge) = &mut charge
+    drop(d.values);
+    if let Some(charge) = &mut charge
         && charge
-            .resize(charge.bytes().saturating_add(cap_extra))
+            .resize(retained - distinct_bytes + (vals.capacity() - vals.len()) as u64 * size)
             .is_err()
     {
         drop(vals);
@@ -458,9 +459,9 @@ pub(super) fn per_value_charged<T: Send>(
     }))
 }
 
-/// Fixed-size numeric ORDER keys can reuse input IDs without retaining decoded
-/// strings or populating the eager value cache. Own the reservation with the
-/// returned values/slots; it must survive until the sort has finished.
+/// Numeric ORDER keys can reuse fixed-width input IDs without retaining decoded
+/// strings or populating the eager value cache. The reservation follows the returned
+/// values and slots until the sort has finished.
 ///
 /// An input of more than [`super::exec::PAR_THRESHOLD`] rows takes this path only when
 /// its integers span a dense range, which [`cursor_integer_distinct`] reads in parallel,
@@ -470,7 +471,11 @@ pub(super) fn cursor_numeric_values(
     t: &Table,
     e: &Expr,
     report: &mut Report,
-    eval: impl FnOnce(&Table) -> Result<Vec<Option<super::value::Value>>>,
+    eval: impl FnOnce(
+        &Table,
+        &mut Option<RetainedCharge>,
+        &mut u64,
+    ) -> Result<Vec<Option<super::value::Value>>>,
 ) -> Result<Option<PerValue<Option<super::value::Value>>>> {
     fn numeric(e: &Expr) -> bool {
         match e {
@@ -525,14 +530,34 @@ pub(super) fn cursor_numeric_values(
     let Some(d) = d else {
         return Ok(None);
     };
-    let vals = eval(&d.values)?;
-    ctx.check()?;
-    let retained = vals.capacity() as u64
+    let distinct_bytes = d.values.capacity_bytes();
+    let mut retained = d.values.len() as u64
         * std::mem::size_of::<Option<super::value::Value>>() as u64
         + d.slot.as_ref().map_or(0, |s| s.capacity() as u64 * 4)
-        + 4096;
+        + 4096
+        + distinct_bytes;
     if let Some(charge) = &mut charge {
-        charge.resize(retained)?;
+        // Only the distinct table and its slots survive construction.
+        if charge.resize(retained).is_err() {
+            return Ok(None);
+        }
+    }
+    // A numeric expression can widen even though its input is fixed-width.
+    // Reserve a transient result before evaluation and charge every result
+    // before the evaluator adds it to the retained column.
+    let Ok(scratch) = (!matches!(e, Expr::Var(_)))
+        .then(|| ctx.charge(super::bignum::AGG_SUM_PAYLOAD_BYTES))
+        .transpose()
+    else {
+        return Ok(None);
+    };
+    let vals = eval(&d.values, &mut charge, &mut retained)?;
+    ctx.check()?;
+    drop((scratch, d.values));
+    if let Some(charge) = &mut charge {
+        let extra_slots = (vals.capacity() - vals.len()) as u64
+            * std::mem::size_of::<Option<super::value::Value>>() as u64;
+        charge.resize(retained - distinct_bytes + extra_slots)?;
     }
     Ok(Some(PerValue {
         vals,

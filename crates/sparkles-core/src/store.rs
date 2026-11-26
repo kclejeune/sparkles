@@ -6894,17 +6894,16 @@ impl Store {
     /// Write or rebuild the numeric column (`vocab.num`) of the current generation when
     /// it has none in the current format, because an older version built it. The store
     /// opened next uses it. Returns the number of values in it, or `None` when the
-    /// generation already uses a current numeric column or the store is in memory.
+    /// generation already uses a current numeric column or the store is in memory. A
+    /// generation without numeric terms returns `Some(0)` without writing a sidecar, and
+    /// a later call scans its vocabulary again.
     pub fn add_numeric_column(&self) -> Result<Option<u64>> {
         let _w = self.guarded_writer();
         let snap = self.snapshot();
         let Some(dir) = snap.generation.dir.as_ref() else {
             return Ok(None);
         };
-        if snap.generation.vocab.has_current_numeric_column(dir) {
-            return Ok(None);
-        }
-        crate::vocab::add_numeric_column(dir).map(Some)
+        snap.generation.vocab.ensure_numeric_column(dir)
     }
 
     pub fn disk_bytes(&self) -> u64 {

@@ -403,9 +403,13 @@ intermediate solutions is left uncompared, and so is one that reads a number of 
 16 digits. The comparison found disagreements, which items 1064, 1065, 1071 and 1077 held. The
 engine passes over an error in MIN and MAX, where the specification's order makes MIN an
 error and Jena makes both an error, and it follows Jena in making AVG over errors only an
-error and in letting GROUP_CONCAT read IRIs and numbers. It does not read an
+error and in letting GROUP_CONCAT read IRIs and numbers. It did not read an
 `xsd:integer` or `xsd:decimal` beyond the range of its decimal type as a number, which
-XSD permits and Jena does not do. Its string functions once took a directional string and a
+item 1065 resolved by adding bounded arbitrary-precision `BigInt` and `BigDec` fallback
+variants capped at 4,096 significant digits and 4,096 fractional digits while keeping
+ordinary `i64` and `Decimal` values on their fixed-width fast paths, and bumping
+`vocab.num` to magic `SPKVNUM4` so out-of-range numeric literals classify as `UNKNOWN`
+and decode from the vocabulary. Its string functions once took a directional string and a
 language-tagged string of the same language as compatible arguments, which SPARQL 1.2
 and Jena do not. With item 1071, `STRSTARTS`, `STRENDS`, `CONTAINS`, `STRBEFORE`,
 `STRAFTER` and vocabulary-key filters compare language tag and base direction.

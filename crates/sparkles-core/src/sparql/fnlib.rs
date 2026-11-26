@@ -3,6 +3,7 @@
 //! duration components, timezone adjustment, `fn:dateTime`, Unicode normalization and
 //! ARQ's zero-based substring.
 
+use super::bignum::{BigDec, BigInt};
 use super::value::{EvalResult, Num, TypeError, Value};
 use oxsdatatypes::{
     Date, DateTime, DayTimeDuration, Decimal, Double, Float, Integer, Time, TimezoneOffset,
@@ -13,15 +14,31 @@ use std::str::FromStr;
 /// `fn:round-half-to-even($x, $precision)`, as ARQ computes them: the exact value is
 /// rounded to `precision` digits after the decimal point (before it when negative), and
 /// the result has the argument's type.
-pub fn round(n: Num, precision: i64, half_even: bool) -> EvalResult<Value> {
+pub fn round(n: Num<'_>, precision: i64, half_even: bool) -> EvalResult<Value> {
     Ok(match n {
         Num::Integer(i) => {
             let s = round_digits(&i.to_string(), precision, half_even);
-            Value::Integer(Integer::from_str(&s).map_err(|_| TypeError)?)
+            if let Ok(v) = Integer::from_str(&s) {
+                Value::Integer(v)
+            } else {
+                Value::from_bigint(BigInt::parse(&s).ok_or(TypeError)?)
+            }
+        }
+        Num::BigInteger(i) => {
+            let s = round_digits(&i.to_string(), precision, half_even);
+            Value::from_bigint(BigInt::parse(&s).ok_or(TypeError)?)
         }
         Num::Decimal(d) => {
             let s = round_digits(&d.to_string(), precision, half_even);
-            Value::Decimal(Decimal::from_str(&s).map_err(|_| TypeError)?)
+            if let Ok(v) = Decimal::from_str(&s) {
+                Value::Decimal(v)
+            } else {
+                Value::from_bigdec(BigDec::parse(&s).ok_or(TypeError)?)
+            }
+        }
+        Num::BigDecimal(d) => {
+            let s = round_digits(&d.to_string(), precision, half_even);
+            Value::from_bigdec(BigDec::parse(&s).ok_or(TypeError)?)
         }
         Num::Float(f) => {
             let x = f32::from(f);
@@ -50,16 +67,15 @@ fn round_digits(s: &str, precision: i64, half_even: bool) -> String {
         None => (false, s),
     };
     let (int, frac) = body.split_once('.').unwrap_or((body, ""));
-    let mut digits: Vec<u8> = int.bytes().chain(frac.bytes()).map(|c| c - b'0').collect();
     let mut point = int.len() as i64;
-    let keep = point + precision;
-    if keep >= digits.len() as i64 {
+    if precision >= frac.len() as i64 {
         return s.to_string();
     }
-    if keep < 0 {
+    if precision < -point {
         return "0".to_string();
     }
-    let keep = keep as usize;
+    let mut digits: Vec<u8> = int.bytes().chain(frac.bytes()).map(|c| c - b'0').collect();
+    let keep = (point + precision) as usize;
     let tail = digits.split_off(keep);
     let rest_zero = tail[1..].iter().all(|&d| d == 0);
     let up = match tail[0].cmp(&5) {
@@ -118,20 +134,34 @@ fn round_digits(s: &str, precision: i64, half_even: bool) -> String {
 
 /// `fn:numeric-mod`: the remainder of a truncating division, in the promoted type of the
 /// operands; division by zero is an error (also for floats and doubles, as in ARQ).
-pub fn numeric_mod(a: Num, b: Num) -> EvalResult<Value> {
+pub fn numeric_mod(a: Num<'_>, b: Num<'_>) -> EvalResult<Value> {
     Ok(match a.rank().max(b.rank()) {
         0 => {
-            let (Num::Integer(x), Num::Integer(y)) = (a, b) else {
-                return Err(TypeError);
-            };
-            Value::Integer(x.checked_rem(y).ok_or(TypeError)?)
+            if let (Num::Integer(x), Num::Integer(y)) = (a, b) {
+                if i64::from(y) == 0 {
+                    return Err(TypeError);
+                }
+                if let Some(r) = x.checked_rem(y) {
+                    return Ok(Value::Integer(r));
+                }
+            }
+            let x = a.to_big_int().ok_or(TypeError)?;
+            let y = b.to_big_int().ok_or(TypeError)?;
+            let (_, r) = x.checked_div_rem(&y).ok_or(TypeError)?;
+            Value::from_bigint(r)
         }
         1 => {
-            let (x, y) = (
-                a.to_decimal().ok_or(TypeError)?,
-                b.to_decimal().ok_or(TypeError)?,
-            );
-            Value::Decimal(x.checked_rem(y).ok_or(TypeError)?)
+            if let (Some(x), Some(y)) = (a.to_decimal(), b.to_decimal()) {
+                if y == Decimal::from(0) {
+                    return Err(TypeError);
+                }
+                if let Some(r) = x.checked_rem(y) {
+                    return Ok(Value::Decimal(r));
+                }
+            }
+            let x = a.to_big_dec().ok_or(TypeError)?;
+            let y = b.to_big_dec().ok_or(TypeError)?;
+            Value::from_bigdec(x.checked_rem(&y).ok_or(TypeError)?)
         }
         2 => {
             let (x, y) = (f32::from(a.to_float()), f32::from(b.to_float()));
@@ -152,29 +182,39 @@ pub fn numeric_mod(a: Num, b: Num) -> EvalResult<Value> {
 
 /// `fn:numeric-integer-divide` (`idiv`): the quotient truncated towards zero, as an
 /// `xsd:integer`. Division by zero, NaN and infinite operands are errors.
-pub fn numeric_integer_divide(a: Num, b: Num) -> EvalResult<Value> {
-    let q = match a.rank().max(b.rank()) {
+pub fn numeric_integer_divide(a: Num<'_>, b: Num<'_>) -> EvalResult<Value> {
+    Ok(match a.rank().max(b.rank()) {
         0 => {
-            let (Num::Integer(x), Num::Integer(y)) = (a, b) else {
-                return Err(TypeError);
-            };
-            x.checked_div(y).ok_or(TypeError)?
+            if let (Num::Integer(x), Num::Integer(y)) = (a, b) {
+                if i64::from(y) == 0 {
+                    return Err(TypeError);
+                }
+                if let Some(q) = x.checked_div(y) {
+                    return Ok(Value::Integer(q));
+                }
+            }
+            let x = a.to_big_int().ok_or(TypeError)?;
+            let y = b.to_big_int().ok_or(TypeError)?;
+            let (q, _) = x.checked_div_rem(&y).ok_or(TypeError)?;
+            Value::from_bigint(q)
         }
         1 => {
-            let (x, y) = (
-                a.to_decimal().ok_or(TypeError)?,
-                b.to_decimal().ok_or(TypeError)?,
-            );
-            if y == Decimal::from(0) {
-                return Err(TypeError);
+            if let (Some(x), Some(y)) = (a.to_decimal(), b.to_decimal()) {
+                if y == Decimal::from(0) {
+                    return Err(TypeError);
+                }
+                if let Some(q) = x
+                    .checked_rem(y)
+                    .and_then(|r| x.checked_sub(r))
+                    .and_then(|d| d.checked_div(y))
+                    .and_then(|q| Integer::try_from(q).ok())
+                {
+                    return Ok(Value::Integer(q));
+                }
             }
-            // x = q * y + r, |r| < |y|, r with the sign of x
-            let r = x.checked_rem(y).ok_or(TypeError)?;
-            let q = x
-                .checked_sub(r)
-                .and_then(|d| d.checked_div(y))
-                .ok_or(TypeError)?;
-            Integer::try_from(q).map_err(|_| TypeError)?
+            let x = a.to_big_dec().ok_or(TypeError)?;
+            let y = b.to_big_dec().ok_or(TypeError)?;
+            Value::from_bigint(x.checked_idiv(&y).ok_or(TypeError)?)
         }
         _ => {
             let (x, y) = (f64::from(a.to_double()), f64::from(b.to_double()));
@@ -182,13 +222,13 @@ pub fn numeric_integer_divide(a: Num, b: Num) -> EvalResult<Value> {
                 return Err(TypeError);
             }
             let q = (x / y).trunc();
-            if q.abs() >= 9.2e18 {
-                return Err(TypeError);
+            if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&q) {
+                Value::Integer(Integer::from(q as i64))
+            } else {
+                Value::from_bigint(BigInt::from_f64_trunc(q).ok_or(TypeError)?)
             }
-            Integer::from(q as i64)
         }
-    };
-    Ok(Value::Integer(q))
+    })
 }
 
 /// The components of a duration, normalized and signed as F&O has them

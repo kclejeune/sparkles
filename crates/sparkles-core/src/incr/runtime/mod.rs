@@ -48,7 +48,7 @@ mod attach;
 mod catalog;
 mod cell;
 mod internal;
-mod key;
+pub(in crate::incr) mod key;
 mod read;
 mod registry;
 mod round;

@@ -281,7 +281,29 @@ fn arith_value(t: &Terms, kind: BuiltinKind, a: u64, b: u64) -> Option<Value> {
     let (x, y) = (num(t, a)?, num(t, b)?);
     let r = match (kind, &x, &y) {
         // Jena: long division for integers
-        (Quotient, Value::Integer(i), Value::Integer(j)) => Value::Integer(i.checked_div(*j)?),
+        (Quotient, Value::Integer(i), Value::Integer(j)) => {
+            i.checked_div(*j).map(Value::Integer).or_else(|| {
+                if i64::from(*j) == 0 {
+                    return None;
+                }
+                let a = sparkles_core::sparql::bignum::BigInt::from_i64(i64::from(*i));
+                let b = sparkles_core::sparql::bignum::BigInt::from_i64(i64::from(*j));
+                a.checked_div_rem(&b).map(|(q, _)| Value::from_bigint(q))
+            })?
+        }
+        (
+            Quotient,
+            Value::Integer(_) | Value::BigInteger(_),
+            Value::Integer(_) | Value::BigInteger(_),
+        ) => {
+            let to_bi = |v: &Value| match v {
+                Value::Integer(i) => sparkles_core::sparql::bignum::BigInt::from_i64(i64::from(*i)),
+                Value::BigInteger(i) => (**i).clone(),
+                _ => unreachable!(),
+            };
+            let (q, _) = to_bi(&x).checked_div_rem(&to_bi(&y))?;
+            Value::from_bigint(q)
+        }
         _ => {
             let op = match kind {
                 Sum => NumOp::Add,
@@ -315,44 +337,24 @@ fn is_dtype(t: &Terms, v: u64, dt: u64) -> bool {
     if l.language().is_some() {
         return d == "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
     }
-    // derived / compatible XSD types: the lexical form must be valid for the target
-    // type and the value spaces must be related (integer family ⊂ decimal)
+    // derived / compatible XSD types: `Value::from_literal` already checks lexical form
+    // and XSD value-space bounds for every derived integer type (including beyond `i128`),
+    // so matching the value families suffices.
     let src = Value::from_literal(&l);
     let target = Value::from_literal(&Literal::new_typed_literal(
         l.value(),
         NamedNode::new_unchecked(d),
     ));
-    match (&src, &target) {
-        (Value::Integer(_), Value::Integer(_)) | (Value::Integer(_), Value::Decimal(_)) => {
-            integer_in_range(l.value(), d)
-        }
-        (Value::Decimal(_), Value::Decimal(_)) => true,
-        _ => false,
-    }
-}
-
-fn integer_in_range(lex: &str, dt: &str) -> bool {
-    let Ok(v) = lex.trim().parse::<i128>() else {
-        // larger than i128: only unbounded types
-        return dt.ends_with("#integer") || dt.ends_with("#decimal");
-    };
-    let local = dt.rsplit('#').next().unwrap_or("");
-    match local {
-        "integer" | "decimal" => true,
-        "long" => i64::try_from(v).is_ok(),
-        "int" => i32::try_from(v).is_ok(),
-        "short" => i16::try_from(v).is_ok(),
-        "byte" => i8::try_from(v).is_ok(),
-        "nonNegativeInteger" => v >= 0,
-        "positiveInteger" => v > 0,
-        "nonPositiveInteger" => v <= 0,
-        "negativeInteger" => v < 0,
-        "unsignedLong" => u64::try_from(v).is_ok(),
-        "unsignedInt" => u32::try_from(v).is_ok(),
-        "unsignedShort" => u16::try_from(v).is_ok(),
-        "unsignedByte" => u8::try_from(v).is_ok(),
-        _ => false,
-    }
+    matches!(
+        (&src, &target),
+        (
+            Value::Integer(_) | Value::BigInteger(_),
+            Value::Integer(_) | Value::BigInteger(_) | Value::Decimal(_) | Value::BigDecimal(_)
+        ) | (
+            Value::Decimal(_) | Value::BigDecimal(_),
+            Value::Decimal(_) | Value::BigDecimal(_)
+        )
+    )
 }
 
 fn string_id(t: &Terms, s: String) -> Result<u64, BudgetFailure> {
@@ -717,5 +719,54 @@ fn bind_all(ev: &mut Eval<'_>, slots: &[Slot], vals: &[u64], k: usize, b: &mut [
     }
     for x in newly {
         b[x] = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxrdf::vocab::xsd;
+
+    #[test]
+    fn is_dtype_checks_derived_integer_bounds_beyond_i128() {
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        let t = Terms::new(store.snapshot());
+        let dt = |iri: &str| {
+            t.try_id_for(&Term::NamedNode(NamedNode::new_unchecked(iri)))
+                .unwrap()
+        };
+        let int_lit = |lex: &str| {
+            t.try_id_for(&Term::Literal(Literal::new_typed_literal(
+                lex,
+                xsd::INTEGER,
+            )))
+            .unwrap()
+        };
+        let pos_huge = int_lit("10000000000000000000000000000000000000000");
+        let neg_huge = int_lit("-10000000000000000000000000000000000000000");
+
+        let pos_int = dt("http://www.w3.org/2001/XMLSchema#positiveInteger");
+        let non_neg = dt("http://www.w3.org/2001/XMLSchema#nonNegativeInteger");
+        let neg_int = dt("http://www.w3.org/2001/XMLSchema#negativeInteger");
+        let non_pos = dt("http://www.w3.org/2001/XMLSchema#nonPositiveInteger");
+        let long_dt = dt("http://www.w3.org/2001/XMLSchema#long");
+        let ulong_dt = dt("http://www.w3.org/2001/XMLSchema#unsignedLong");
+        let dec_dt = dt(xsd::DECIMAL.as_str());
+
+        assert!(is_dtype(&t, pos_huge, pos_int));
+        assert!(is_dtype(&t, pos_huge, non_neg));
+        assert!(is_dtype(&t, pos_huge, dec_dt));
+        assert!(!is_dtype(&t, pos_huge, neg_int));
+        assert!(!is_dtype(&t, pos_huge, non_pos));
+        assert!(!is_dtype(&t, pos_huge, long_dt));
+        assert!(!is_dtype(&t, pos_huge, ulong_dt));
+
+        assert!(is_dtype(&t, neg_huge, neg_int));
+        assert!(is_dtype(&t, neg_huge, non_pos));
+        assert!(is_dtype(&t, neg_huge, dec_dt));
+        assert!(!is_dtype(&t, neg_huge, pos_int));
+        assert!(!is_dtype(&t, neg_huge, non_neg));
+        assert!(!is_dtype(&t, neg_huge, long_dt));
+        assert!(!is_dtype(&t, neg_huge, ulong_dt));
     }
 }

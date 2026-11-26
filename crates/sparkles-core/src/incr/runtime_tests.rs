@@ -2436,7 +2436,7 @@ fn shared_exists_window_skips_old_compiler_checkpoint() {
     let old_fp =
         super::runtime::checkpoint_fingerprint_for_compiler("f13-phase2-3", &parsed, QUERY);
     let new_fp =
-        super::runtime::checkpoint_fingerprint_for_compiler("f13-phase2-4", &parsed, QUERY);
+        super::runtime::checkpoint_fingerprint_for_compiler(super::runtime::key::COMPILER, &parsed, QUERY);
     assert_eq!(header.fingerprint, new_fp);
     assert_ne!(old_fp, new_fp);
     let old_bytes = super::persist::encode_as(
@@ -2477,4 +2477,232 @@ fn shared_exists_window_skips_old_compiler_checkpoint() {
         );
         rt.close(&s);
     }
+}
+
+/// Maintained SUM/AVG views with arbitrary-precision values checkpoint and recover across
+/// restarts and enforce caps only after cancellation and averaging.
+#[test]
+fn big_numeric_sum_avg_view_checkpoints_and_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = persistent(dir.path(), true);
+    let max_int = "9".repeat(4_096);
+    let setup = format!(
+        "INSERT DATA {{ \
+         :a :g :g1 ; :v \"{max_int}\"^^<http://www.w3.org/2001/XMLSchema#integer> . \
+         :b :g :g1 ; :v \"{max_int}\"^^<http://www.w3.org/2001/XMLSchema#integer> . \
+         :c :g :g1 ; :v \"-{max_int}\"^^<http://www.w3.org/2001/XMLSchema#integer> . \
+         :d :g :g2 ; :v \"{max_int}\"^^<http://www.w3.org/2001/XMLSchema#integer> . \
+         :e :g :g2 ; :v \"{max_int}\"^^<http://www.w3.org/2001/XMLSchema#integer> . \
+         :f :g :decimal ; :v 0.00000000000000000004 . \
+         :g :g :decimal ; :v 0.00000000000000000002 \
+         }}"
+    );
+    upd(&s, &setup);
+    let sum_q = "SELECT ?g (SUM(?v) AS ?s) WHERE { ?x :g ?g ; :v ?v } GROUP BY ?g";
+    let avg_q = "SELECT ?g (AVG(?v) AS ?a) WHERE { ?x :g ?g ; :v ?v } GROUP BY ?g";
+    {
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.put(&s, "big-sum", ViewDef::table(q(sum_q))).unwrap();
+        rt.put(&s, "big-avg", ViewDef::table(q(avg_q))).unwrap();
+        rt.round(&s);
+        let mut got_sum = read(&rt, &s, "big-sum", None).unwrap();
+        let mut want_sum = oracle(&s, sum_q, None);
+        got_sum.sort();
+        want_sum.sort();
+        assert_eq!(got_sum, want_sum);
+        let mut got_avg = read(&rt, &s, "big-avg", None).unwrap();
+        let mut want_avg = oracle(&s, avg_q, None);
+        got_avg.sort();
+        want_avg.sort();
+        assert_eq!(got_avg, want_avg);
+        rt.close(&s);
+    }
+    // Checkpoints were written for both views holding big-number state.
+    let sum_state_dir = dir.path().join("views/big-sum/main");
+    let sum_files = super::persist::list(&sum_state_dir);
+    assert_eq!(sum_files.len(), 1, "big-number SUM view must checkpoint");
+    assert_eq!(
+        super::persist::list(&dir.path().join("views/big-avg/main")).len(),
+        1,
+        "big-number AVG view must checkpoint"
+    );
+
+    drop(s);
+    let s = persistent(dir.path(), true);
+    let rt = runtime(&s, Some(dir.path().to_path_buf()));
+    rt.round(&s);
+    assert_eq!(rt.stats(&s).loaded, 2);
+    assert_eq!(rt.stats(&s).resets, 0);
+
+    let check_decimal = |sum: &str, avg: &str| {
+        let decimal_row = |name| {
+            read(&rt, &s, name, None)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.starts_with("decimal "))
+                .unwrap()
+        };
+        assert_eq!(decimal_row("big-sum"), format!("decimal {sum}"));
+        assert_eq!(decimal_row("big-avg"), format!("decimal {avg}"));
+    };
+    check_decimal("0.00000000000000000006", "0.00000000000000000003");
+
+    // Retract the values only after recovery so both restored maps must take them back.
+    upd(
+        &s,
+        &format!(
+            "DELETE DATA {{
+                :e :g :g2 ; :v \"{max_int}\"^^<http://www.w3.org/2001/XMLSchema#integer> .
+                :f :g :decimal ; :v 0.00000000000000000004
+            }}"
+        ),
+    );
+    rt.round(&s);
+    assert_eq!(
+        rt.stats(&s).resets,
+        0,
+        "retractions use the recovered state"
+    );
+    check_decimal("0.00000000000000000002", "0.00000000000000000002");
+    assert_eq!(
+        read(&rt, &s, "big-sum", None).unwrap(),
+        oracle(&s, sum_q, None)
+    );
+    assert_eq!(
+        read(&rt, &s, "big-avg", None).unwrap(),
+        oracle(&s, avg_q, None)
+    );
+    rt.close(&s);
+}
+
+#[test]
+fn sum_view_rebuilds_a_version_three_checkpoint() {
+    use super::persist::{self, Writer};
+    use super::terms::Terms;
+    use super::zset::ZSet;
+    use crate::id::Id;
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let s = persistent(dir.path(), true);
+    let big = "\"99999999999999999999999\"^^<http://www.w3.org/2001/XMLSchema#integer>";
+    upd(&s, &format!("INSERT DATA {{ :g :v 4, {big} }}"));
+    let query = q("SELECT ?g (SUM(?v) AS ?s) WHERE { ?g :v ?v } GROUP BY ?g");
+    let state_dir = dir.path().join("views/legacy-sum/main");
+    {
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.put(&s, "legacy-sum", ViewDef::table(query.clone()))
+            .unwrap();
+        rt.round(&s);
+        rt.close(&s);
+    }
+
+    let snap = s.snapshot();
+    let terms = Terms::default();
+    let group = snap.lookup_iri("http://ex/g").unwrap();
+    let mut saved = ZSet::new();
+    saved.add(vec![group, Id::UNDEF].into(), 1);
+    let mut legacy = Writer::new(&snap, &terms);
+    legacy.zset(&saved).unwrap();
+    // Version 3 wrote the group and its last output before the SUM state.
+    // Project, extend and the single triple-pattern child held no checkpoint state.
+    legacy.u64(1);
+    legacy.row(&[group]).unwrap();
+    legacy.i64(2);
+    legacy.u64(1);
+    legacy.row(&[group, Id::UNDEF]).unwrap();
+    legacy.i64(2); // rows
+    legacy.i64(1); // the old compiler classified the big integer as an error
+    legacy.i64(0); // unbound arguments
+    legacy.i128(4); // integer subtotal
+    legacy.u64(0); // decimal map
+    legacy.u64(0); // float map
+    legacy.u64(0); // double map
+
+    let parsed = spargebra::SparqlParser::new().parse_query(&query).unwrap();
+    let mut key = Sha256::new();
+    key.update(b"f13-phase2-3\0");
+    key.update(super::runtime::key::normalized(&parsed, &query));
+    key.update([0]);
+    key.update(0u64.to_le_bytes()); // unrestricted access
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(&key.finalize()[..8]);
+    fingerprint.update(b"\0aggregate-errors\0");
+    fingerprint.update(sparql::AggregateErrors::default().as_str());
+    let fingerprint = u64::from_le_bytes(fingerprint.finalize()[..8].try_into().unwrap());
+
+    let files = persist::list(&state_dir);
+    assert_eq!(files.len(), 1);
+    let latest = &files[0].1;
+    let bytes = std::fs::read(latest).unwrap();
+    let (mut header, _) = persist::decode(&bytes).unwrap();
+    assert_ne!(
+        fingerprint, header.fingerprint,
+        "version 3 must have a distinct key"
+    );
+    header.fingerprint = fingerprint;
+    std::fs::write(latest, persist::encode(&header, &legacy.finish())).unwrap();
+    drop(snap);
+    drop(s);
+
+    let s = persistent(dir.path(), true);
+    let rt = runtime(&s, Some(dir.path().to_path_buf()));
+    rt.round(&s);
+    let stats = rt.stats(&s);
+    assert_eq!(stats.loaded, 0);
+    assert_eq!(stats.passes, 1, "the view was built from the store");
+    assert_eq!(
+        read(&rt, &s, "legacy-sum", None).unwrap(),
+        ["g 100000000000000000000003"]
+    );
+    upd(&s, &format!("DELETE DATA {{ :g :v {big} }}"));
+    rt.round(&s);
+    assert_eq!(read(&rt, &s, "legacy-sum", None).unwrap(), ["g 4"]);
+    rt.close(&s);
+}
+
+#[test]
+fn maintained_numeric_aggregates_keep_fixed_avg_and_staged_float_promotion() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+         INSERT DATA {
+            :a :g :decimal ; :v 100000000000000000000.0 .
+            :b :g :decimal ; :v 100000000000000000000.0 .
+            :c :g :decimal ; :v -100000000000000000000.0 .
+            :d :g :decimal ; :v -100000000000000000000.0 .
+            :e :g :decimal ; :v 0.0 .
+            :f :g :decimal ; :v 0.000000000000000001 .
+            :g :g :float ; :v \"2e38\"^^xsd:float .
+            :h :g :float ; :v \"3e38\"^^xsd:float .
+            :i :g :float ; :v \"0\"^^xsd:double .
+            :j :g :fixed ; :v 1.000000059604644776 .
+            :k :g :fixed ; :v \"0\"^^xsd:float .
+            :l :g :fixed ; :v \"0\"^^xsd:double .
+            :m :g :cancelled ; :v 1.000000059604644776 .
+            :n :g :cancelled ; :v 0.00000000000000000001 .
+            :o :g :cancelled ; :v -0.00000000000000000001 .
+            :p :g :cancelled ; :v \"0\"^^xsd:float .
+            :r :g :cancelled ; :v \"0\"^^xsd:double .
+         }",
+    );
+    let rt = runtime(&s, None);
+    rt.put(
+        &s,
+        "numeric",
+        ViewDef::table(q("SELECT ?g (SUM(?v) AS ?s) (AVG(?v) AS ?a)
+                          WHERE { ?x :g ?g ; :v ?v } GROUP BY ?g")),
+    )
+    .unwrap();
+    rt.round(&s);
+    assert_eq!(
+        read(&rt, &s, "numeric", None).unwrap(),
+        [
+            "cancelled 1 0.2",
+            "decimal 0.000000000000000001 0",
+            "fixed 1 0.3333333333333333",
+            "float INF INF",
+        ]
+    );
 }

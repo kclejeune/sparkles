@@ -70,7 +70,7 @@ pub(super) fn has_desc(p: &PlanInfo, needle: &str) -> bool {
 /// allows. The reference reads no text, spatial or extension indexes, so a query that
 /// uses them is one it does not evaluate, and neither is a query whose nested loops pass
 /// the work limit. A query that reads a number of more than 16 digits is not compared,
-/// since XSD lets the engine limit those (roadmap item 1065). Where the query meets a
+/// since the test-only reference evaluator uses fixed-width `i128` and `Decimal`. Where the query meets a
 /// question that the engine reads otherwise than the specification's text, such as an
 /// error in MIN or MAX under the default of item 1064's setting, it is compared exactly
 /// under the engine's reading.
@@ -2508,4 +2508,39 @@ fn order_keys_skip_a_bind_whose_variable_is_initially_bound() {
     };
     assert_eq!(rows(&a), rows(&b));
     assert!(rows(&a)[0].contains("\"2\""), "{:?}", rows(&a));
+}
+
+#[test]
+fn numeric_top_k_prefilter_keeps_the_exact_decimal_winner() {
+    let with = Optimizations {
+        ordered_topk: false,
+        topk_heap: false,
+        ..Optimizations::ALL
+    };
+    let without = Optimizations {
+        topk_prefilter: false,
+        ..with
+    };
+    for (sign, order) in [("", "DESC(?v)"), ("-", "ASC(?v)")] {
+        let s = Store::in_memory(StoreOptions::default());
+        update(
+            &s,
+            &format!(
+                "INSERT DATA {{ ex:double ex:v \"{sign}26772049.014582634\"^^<http://www.w3.org/2001/XMLSchema#double> .
+                 ex:decimal ex:v {sign}26772049.014582634 .
+                 ex:z1 ex:v 0 . ex:z2 ex:v 0 . ex:z3 ex:v 0 .
+                 ex:z4 ex:v 0 . ex:z5 ex:v 0 . ex:z6 ex:v 0 }}"
+            ),
+        );
+        let q = format!("SELECT ?s WHERE {{ ?s ex:v ?v }} ORDER BY {order} LIMIT 1");
+        let fast = run(&s, &q, with);
+        let slow = run(&s, &q, without);
+        assert!(has_desc(fast.plan(), "numeric prefilter"), "{q}");
+        assert_eq!(
+            fast.test_application_rows(),
+            slow.test_application_rows(),
+            "{q}"
+        );
+        assert_eq!(solutions(&fast), ["<http://ex.org/decimal>"]);
+    }
 }

@@ -254,7 +254,8 @@ locking whose semantics differ from `flock`.
 |---|---|---|---|
 | Dataset | `dataset.json` | `format` 1 and `minimumReader`, read up to `DATASET_READER` 5 (`commit.rs`) | primary |
 | Generation index | `gen-*/meta.json` and the index files | `format_version`, must equal `FORMAT_VERSION` 2 (`builder.rs`) | primary |
-| Vocabulary | `vocab.idx` (`SPKVIDX1`), numeric vocabulary (`SPKVNUM3`) | magic | primary |
+| Vocabulary | `vocab.idx` (`SPKVIDX1`) | magic | primary |
+| Numeric vocabulary column | `gen-*/vocab.num` (`SPKVNUM4`) | magic `SPKVNUM4`; another version is ignored so queries decode from the vocabulary, and compaction or `vocab-index` rebuilds it | derived |
 | Delta vocabulary | `delta.vocab` | framed header `\x89SDV`, `VERSION` 2, or legacy without a header | primary |
 | Write-ahead log | `wal.log` | A 33-byte header record starts with `\x89SPKWAL\n` and version 1. Headerless logs are version 0. Commit-record flag bits in byte 27 are added compatibly. A headerless log is strictly framed from the offset in the additive `walStrictFrom` member of its generation's `commit.json`. The member needs no reader version, because a release that ignores it reads the log by its old rules. | primary |
 | Commit catalog | `commits.bin` | magic `SPKCMTS\0`, 64-byte records, flag bits added compatibly | primary |

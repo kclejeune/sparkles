@@ -17,8 +17,9 @@
 //!
 //! * [`NOT_NUMERIC`]: the literal's value is not a number (a string, a date, an
 //!   ill-typed numeric literal…). Comparing it with a number is a type error.
-//! * [`UNKNOWN`]: a number the column does not hold, a decimal with more significant
-//!   digits than fit into 59 bits. Its key is decoded as before.
+//! * [`UNKNOWN`]: a number the column does not hold, such as an integer outside `i64`, a
+//!   decimal outside `oxsdatatypes::Decimal`, or a decimal with more significant digits
+//!   than fit into 59 bits. Its key is decoded as before.
 //! * [`INTEGER`], [`DECIMAL`], [`FLOAT`], [`DOUBLE`] (bit 3 set): the value is the next
 //!   entry of the value array, in id order. An integer is its `i64`, a float the bits of
 //!   its `f32`, a double the bits of its `f64` and a decimal its exact value as a
@@ -39,7 +40,7 @@
 //! Layout, little-endian:
 //!
 //! ```text
-//! magic "SPKVNUM3" | vocabulary length u64 | covered u64 | values u64
+//! magic "SPKVNUM4" | vocabulary length u64 | covered u64 | values u64
 //!   | positions u64 | segments u64
 //! kinds: ceil(positions / 16) u64 words, position p in bits 4·(p % 16) of word p / 16
 //! rank: ceil(positions / 128) u32, the values before each group of 128 positions,
@@ -61,7 +62,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// The column's file name in a generation directory.
 pub const FILE: &str = "vocab.num";
-const MAGIC: &[u8; 8] = b"SPKVNUM3";
+const MAGIC: &[u8; 8] = b"SPKVNUM4";
 const HEADER: usize = 48;
 /// The kinds and the rank are kept in memory up to this size. DBpedia's take 4.3 MB.
 const RESIDENT: usize = 64 << 20;
@@ -182,6 +183,7 @@ pub fn classify(key: &[u8]) -> (u8, u64) {
             Some(p) => (DECIMAL, p),
             None => (UNKNOWN, 0),
         },
+        Value::BigInteger(_) | Value::BigDecimal(_) => (UNKNOWN, 0),
         Value::Float(f) => (FLOAT, f32::from(f).to_bits() as u64),
         Value::Double(d) => (DOUBLE, f64::from(d).to_bits()),
         _ => (NOT_NUMERIC, 0),
@@ -1343,7 +1345,9 @@ pub(crate) mod tests {
     fn same(a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Integer(x), Value::Integer(y)) => x == y,
+            (Value::BigInteger(x), Value::BigInteger(y)) => x == y,
             (Value::Decimal(x), Value::Decimal(y)) => x == y,
+            (Value::BigDecimal(x), Value::BigDecimal(y)) => x == y,
             (Value::Float(x), Value::Float(y)) => {
                 f32::from(*x).to_bits() == f32::from(*y).to_bits()
             }
@@ -1630,7 +1634,7 @@ pub(crate) mod tests {
         }
         w.finish().unwrap();
         let current = std::fs::read(dir.path().join(FILE)).unwrap();
-        assert_eq!(&current[..8], b"SPKVNUM3");
+        assert_eq!(&current[..8], b"SPKVNUM4");
 
         // Downgrade the magic to legacy SPKVNUM2 (as written before item 1077).
         let mut legacy = current.clone();
@@ -1645,7 +1649,7 @@ pub(crate) mod tests {
             matches!(check, Err((false, _))),
             "expected warning for legacy SPKVNUM2, got {check:?}"
         );
-        // Rebuilding upgrades vocab.num back to SPKVNUM3.
+        // Rebuilding upgrades vocab.num back to SPKVNUM4.
         assert!(crate::vocab::add_numeric_column(dir.path()).unwrap() > 0);
         assert_eq!(std::fs::read(dir.path().join(FILE)).unwrap(), current);
         assert!(Vocab::open(dir.path()).unwrap().numeric().is_some());
