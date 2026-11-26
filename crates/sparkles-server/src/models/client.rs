@@ -757,6 +757,7 @@ pub(super) mod test_hooks {
     type HookFn = Arc<dyn Fn() + Send + Sync>;
 
     static BEFORE_CONSUME: OnceLock<Mutex<BTreeMap<String, HookFn>>> = OnceLock::new();
+    static AFTER_ABANDON: OnceLock<Mutex<BTreeMap<String, HookFn>>> = OnceLock::new();
 
     /// Scoped hook invoked on the consumer thread immediately before inspecting
     /// `Handoff::Finished` (and on the non-cancellable path right after `post_json_until`
@@ -783,6 +784,38 @@ pub(super) mod test_hooks {
 
     pub(super) fn run_before_consume(url: &str) {
         let hook = BEFORE_CONSUME
+            .get()
+            .and_then(|map| map.lock().get(url).cloned());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Scoped hook invoked on the caller thread immediately after marking
+    /// `Handoff::Abandoned` and unlocking the handoff mutex, before returning to
+    /// caller-side accounting. Removed automatically on drop.
+    pub(crate) struct AfterAbandonHook {
+        url: String,
+    }
+
+    impl AfterAbandonHook {
+        pub(crate) fn install(url: String, hook: impl Fn() + Send + Sync + 'static) -> Self {
+            let mut map = AFTER_ABANDON.get_or_init(Default::default).lock();
+            map.insert(url.clone(), Arc::new(hook));
+            Self { url }
+        }
+    }
+
+    impl Drop for AfterAbandonHook {
+        fn drop(&mut self) {
+            if let Some(map) = AFTER_ABANDON.get() {
+                map.lock().remove(&self.url);
+            }
+        }
+    }
+
+    pub(super) fn run_after_abandon(url: &str) {
+        let hook = AFTER_ABANDON
             .get()
             .and_then(|map| map.lock().get(url).cloned());
         if let Some(hook) = hook {
@@ -818,7 +851,7 @@ pub(super) fn sleep_until(
 enum Handoff {
     Pending,
     Abandoned,
-    NotSent(bool),
+    NotSent(bool, Option<super::SlotGuard>),
     Finished(
         Result<sparkles::outbound::Posted, sparkles::outbound::Failure>,
         Option<super::admission::Ticket>,
@@ -955,8 +988,9 @@ fn post_json_cancellable(
                     }
                     let mut g = handoff_worker.0.lock();
                     if matches!(*g, Handoff::Pending) {
-                        *g = Handoff::NotSent(cancelled);
+                        *g = Handoff::NotSent(cancelled, slot);
                         handoff_worker.1.notify_one();
+                        return;
                     }
                     drop(g);
                     drop(slot);
@@ -1025,8 +1059,8 @@ fn post_json_cancellable(
                 }
                 return PostOutcome::Failed(f, s);
             }
-            Handoff::NotSent(true) => return PostOutcome::Cancelled(None),
-            Handoff::NotSent(false) => return PostOutcome::TimedOut(None),
+            Handoff::NotSent(true, s) => return PostOutcome::Cancelled(s),
+            Handoff::NotSent(false, s) => return PostOutcome::TimedOut(s),
             Handoff::Pending => {}
             Handoff::Abandoned => {
                 *g = Handoff::Abandoned;
@@ -1039,11 +1073,17 @@ fn post_json_cancellable(
         }
         if flag.load(Ordering::Relaxed) {
             *g = Handoff::Abandoned;
+            drop(g);
+            #[cfg(test)]
+            test_hooks::run_after_abandon(url);
             return PostOutcome::Cancelled(None);
         }
         let now = Instant::now();
         if now >= deadline {
             *g = Handoff::Abandoned;
+            drop(g);
+            #[cfg(test)]
+            test_hooks::run_after_abandon(url);
             return PostOutcome::TimedOut(None);
         }
         let wake = deadline.min(now + Duration::from_millis(20));
@@ -1056,8 +1096,11 @@ fn post_json_cancellable(
 /// `admission`, every HTTP attempt, retries included, is admitted before it is sent,
 /// and each admitted attempt is settled with the usage its answer reported.
 /// On error, returns any provider-reported token usage from failed or unparseable answers.
-/// When cancelled or timed out mid-flight, the worker retains `slot` and settles any
-/// late usage via `on_abandoned` before releasing `slot`.
+/// Whenever an HTTP response reports usage, `on_budget` is invoked immediately with the
+/// incremental rounded step budget delta while `slot` is still held, before any retry or
+/// return. When cancelled or timed out mid-flight, the worker retains `slot` and settles
+/// any late usage via `on_abandoned` before releasing `slot`; on all other returns `slot`
+/// stays in the caller's `Option` so the caller releases it only after recording usage.
 #[allow(clippy::too_many_arguments)]
 pub fn send_admitted_cancellable(
     t: &Transport<'_>,
@@ -1067,8 +1110,9 @@ pub fn send_admitted_cancellable(
     deadline: Instant,
     admission: Option<&dyn super::admission::Admission>,
     cancel: Option<&Arc<AtomicBool>>,
-    mut slot: Option<super::SlotGuard>,
+    slot: &mut Option<super::SlotGuard>,
     prior_usage: Usage,
+    on_budget: Option<&dyn Fn(u64)>,
     on_abandoned: Option<AbandonedUsageFn>,
 ) -> Result<ChatResponse, (CallError, Usage)> {
     let started = Instant::now();
@@ -1172,19 +1216,19 @@ pub fn send_admitted_cancellable(
             on_abandoned.as_ref(),
         ) {
             PostOutcome::Posted(posted, tk, s) => {
-                slot = s;
+                *slot = s;
                 (posted, tk)
             }
             PostOutcome::Cancelled(s) => {
-                drop(s);
+                *slot = s;
                 return Err((CallError::Cancelled, failed_usage));
             }
             PostOutcome::TimedOut(s) => {
-                drop(s);
+                *slot = s;
                 return Err((timed_out(), failed_usage));
             }
             PostOutcome::Failed(sparkles::outbound::Failure::Refused(m), s) => {
-                drop(s);
+                *slot = s;
                 return Err((
                     CallError::Refused(scrub(
                         format!("provider {name}: the outbound policy refuses {m}"),
@@ -1194,20 +1238,34 @@ pub fn send_admitted_cancellable(
                 ));
             }
             PostOutcome::Failed(f, s) => {
-                drop(s);
+                *slot = s;
                 return Err((
                     CallError::Unavailable(scrub(format!("provider {name}: {f}"), key)),
                     failed_usage,
                 ));
             }
         };
-        // the usage settles the reservation whatever the content holds
+        // the usage settles the reservation whatever the content holds, and publishes its
+        // incremental rounded budget delta to the provider cap immediately while `slot`
+        // is still held (before any retry handoff or return).
         let body_usage = serde_json::from_slice::<Value>(&posted.body)
             .ok()
             .map(|v| read_usage(p.kind, &v, ttl).0)
             .unwrap_or_default();
         if let Some(tk) = ticket {
             tk.settle(usage_of(p.kind, &posted.body, ttl));
+        }
+        if body_usage != Usage::default()
+            && let Some(publish) = on_budget
+        {
+            let prev_step = prior_usage.plus(failed_usage);
+            let delta_budget = prev_step
+                .plus(body_usage)
+                .budget()
+                .saturating_sub(prev_step.budget());
+            if delta_budget > 0 {
+                publish(delta_budget);
+            }
         }
         if is_cancelled(cancel) {
             failed_usage = failed_usage.plus(body_usage);

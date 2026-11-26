@@ -888,22 +888,21 @@ impl Models {
                 ))
             })
         };
-        let charge_usage = |rec: &mut StepRecord, usage: admission::Usage| {
+        let publish_provider_budget = |delta: u64| {
+            if delta == 0 {
+                return;
+            }
+            let mut t = rt.tokens.lock();
+            if t.0 != today() {
+                *t = (today(), 0);
+            }
+            t.1 = t.1.saturating_add(delta);
+        };
+        let record_usage = |rec: &mut StepRecord, usage: admission::Usage| {
             if usage == admission::Usage::default() {
                 return;
             }
-            // the provider's budget counts what the step's budget grew by, so both
-            // round the step's cache classes once
-            let before = rec.budget_tokens();
             rec.add(usage);
-            {
-                let mut t = rt.tokens.lock();
-                if t.0 != today() {
-                    *t = (today(), 0);
-                }
-                t.1 =
-                    t.1.saturating_add(rec.budget_tokens().saturating_sub(before));
-            }
             rec.estimated_cost = pricing.map(|pr| rec.usage().cost(&pr));
         };
         // the provider's own connect timeout and certificate checks; the destination
@@ -1044,6 +1043,7 @@ impl Models {
                         }
                     })
                 };
+                let mut slot = Some(slot);
                 let resp = client::send_admitted_cancellable(
                     &t,
                     &pair.provider,
@@ -1052,14 +1052,20 @@ impl Models {
                     call_deadline,
                     admission,
                     cancel,
-                    Some(slot),
+                    &mut slot,
                     rec.usage(),
+                    Some(&publish_provider_budget),
                     Some(abandoned_cb),
                 );
                 let resp = match resp {
-                    Ok(r) => r,
+                    Ok(r) => {
+                        record_usage(&mut rec, r.usage);
+                        drop(slot);
+                        r
+                    }
                     Err((e, usage)) => {
-                        charge_usage(&mut rec, usage);
+                        record_usage(&mut rec, usage);
+                        drop(slot);
                         match e {
                             CallError::Cancelled => {
                                 rec.latency = started.elapsed();
@@ -1096,7 +1102,6 @@ impl Models {
                         }
                     }
                 };
-                charge_usage(&mut rec, resp.usage);
                 rec.stop = resp.stop.clone();
                 match structured::value_of(&resp, out, level) {
                     Ok(value) => {

@@ -36,7 +36,7 @@ use std::fmt;
 use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -747,10 +747,14 @@ impl OutboundPolicy {
         }
         let failed = Arc::new(Mutex::new(None));
         let aborted_before_connect = Arc::new(Mutex::new(None));
+        let initial_dns_in_flight = Arc::new(AtomicBool::new(false));
+        let redirected = Arc::new(AtomicBool::new(false));
         let client = self
             .client(
                 &failed,
                 aborted_before_connect.clone(),
+                initial_dns_in_flight.clone(),
+                redirected.clone(),
                 abort.clone(),
                 deadline,
             )
@@ -791,12 +795,25 @@ impl OutboundPolicy {
             Ok(r) => r,
             Err(e) => {
                 budget.spend_time(start.elapsed());
-                if let Some(cancelled) = aborted_before_connect.lock().take() {
-                    return Err(if cancelled {
-                        InnerSendFailure::CancelledBeforeSend
-                    } else {
-                        InnerSendFailure::TimedOutBeforeSend(late)
-                    });
+                if !redirected.load(Ordering::SeqCst) {
+                    if let Some(cancelled) = aborted_before_connect.lock().take() {
+                        return Err(if cancelled {
+                            InnerSendFailure::CancelledBeforeSend
+                        } else {
+                            InnerSendFailure::TimedOutBeforeSend(late)
+                        });
+                    }
+                    if initial_dns_in_flight.load(Ordering::SeqCst)
+                        && (e.is_timeout()
+                            || start.elapsed() >= remaining_now
+                            || Instant::now() >= deadline)
+                    {
+                        return Err(if abort.as_deref().and_then(|f| f()) == Some(true) {
+                            InnerSendFailure::CancelledBeforeSend
+                        } else {
+                            InnerSendFailure::TimedOutBeforeSend(late)
+                        });
+                    }
                 }
                 // a refused or unresolvable name, in words fit for the caller
                 if let Some(f) = failed.lock().take() {
@@ -869,12 +886,18 @@ impl OutboundPolicy {
         &self,
         failed: &Arc<Mutex<Option<Failure>>>,
         aborted: Arc<Mutex<Option<bool>>>,
+        initial_dns_in_flight: Arc<AtomicBool>,
+        redirected: Arc<AtomicBool>,
         abort: Option<AbortCheck>,
         deadline: Instant,
     ) -> reqwest::Result<reqwest::blocking::Client> {
         let (p, slot, max) = (self.clone(), failed.clone(), self.max_redirects);
         let custom = self.tls.is_custom();
+        let redirected_for_policy = redirected.clone();
         let redirect = reqwest::redirect::Policy::custom(move |a| {
+            // Receiving any redirect proves an earlier hop already reached a server,
+            // so later DNS/connect aborts must never be classified as before-send.
+            redirected_for_policy.store(true, Ordering::SeqCst);
             if a.previous().len() > max {
                 return a.error(format!("more than {max} redirects"));
             }
@@ -913,6 +936,8 @@ impl OutboundPolicy {
                 policy: self.clone(),
                 failed: failed.clone(),
                 aborted,
+                initial_dns_in_flight,
+                redirected,
                 abort,
                 deadline,
             }))
@@ -935,28 +960,40 @@ struct Pinned {
     policy: OutboundPolicy,
     failed: Arc<Mutex<Option<Failure>>>,
     aborted: Arc<Mutex<Option<bool>>>,
+    initial_dns_in_flight: Arc<AtomicBool>,
+    redirected: Arc<AtomicBool>,
     abort: Option<AbortCheck>,
     deadline: Instant,
 }
 
 impl reqwest::dns::Resolve for Pinned {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let (policy, failed, aborted, abort, deadline) = (
+        let (policy, failed, aborted, initial_dns_in_flight, redirected, abort, deadline) = (
             self.policy.clone(),
             self.failed.clone(),
             self.aborted.clone(),
+            self.initial_dns_in_flight.clone(),
+            self.redirected.clone(),
             self.abort.clone(),
             self.deadline,
         );
         let host = name.as_str().to_string();
         Box::pin(async move {
+            let is_initial = !redirected.load(Ordering::SeqCst);
+            if is_initial {
+                initial_dns_in_flight.store(true, Ordering::SeqCst);
+            }
             let check = || -> Result<(), BoxError> {
                 if let Some(cancelled) = abort.as_deref().and_then(|f| f()) {
-                    *aborted.lock() = Some(cancelled);
+                    if is_initial && !redirected.load(Ordering::SeqCst) {
+                        *aborted.lock() = Some(cancelled);
+                    }
                     return Err("outbound request aborted before connect".into());
                 }
                 if Instant::now() >= deadline {
-                    *aborted.lock() = Some(false);
+                    if is_initial && !redirected.load(Ordering::SeqCst) {
+                        *aborted.lock() = Some(false);
+                    }
                     return Err("outbound deadline expired before connect".into());
                 }
                 Ok(())
@@ -964,6 +1001,11 @@ impl reqwest::dns::Resolve for Pinned {
             check()?;
             let checked = tokio::task::spawn_blocking(move || policy.check_host(&host)).await?;
             check()?;
+            // Initial DNS completed before any deadline/abort: clear before handing
+            // addresses to the connector (or reporting a DNS/policy failure).
+            if is_initial {
+                initial_dns_in_flight.store(false, Ordering::SeqCst);
+            }
             let r: Result<reqwest::dns::Addrs, BoxError> = match checked {
                 Ok(addrs) => Ok(Box::new(addrs.into_iter().map(|ip| SocketAddr::new(ip, 0)))),
                 Err(f) => {
@@ -1828,5 +1870,168 @@ mod tests {
             ..base
         };
         assert!(p.check_host("partner.test").is_ok());
+    }
+
+    #[test]
+    fn dns_deadline_classification_distinguishes_initial_and_redirect_hops() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::AtomicUsize;
+
+        struct RedirectServer {
+            port: u16,
+            hop1_hits: Arc<AtomicUsize>,
+            hop2_hits: Arc<AtomicUsize>,
+            stop: Arc<AtomicBool>,
+        }
+        impl Drop for RedirectServer {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::SeqCst);
+                let _ = TcpStream::connect(("127.0.0.1", self.port));
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirect server");
+        let port = listener.local_addr().unwrap().port();
+        let hop1_hits = Arc::new(AtomicUsize::new(0));
+        let hop2_hits = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let hop1_hits = hop1_hits.clone();
+            let hop2_hits = hop2_hits.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let Ok(mut stream) = conn else {
+                        continue;
+                    };
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut req_line = String::new();
+                    if reader.read_line(&mut req_line).is_err() || req_line.is_empty() {
+                        continue;
+                    }
+                    let mut content_len = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_err()
+                            || line == "\r\n"
+                            || line == "\n"
+                            || line.is_empty()
+                        {
+                            break;
+                        }
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    if content_len > 0 {
+                        let mut body = vec![0u8; content_len];
+                        let _ = reader.read_exact(&mut body);
+                    }
+                    if req_line.contains("/hop2") {
+                        hop2_hits.fetch_add(1, Ordering::SeqCst);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        );
+                    } else {
+                        hop1_hits.fetch_add(1, Ordering::SeqCst);
+                        let resp = format!(
+                            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://redirect.test:{port}/hop2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                    let _ = stream.flush();
+                }
+            });
+        }
+        let server = RedirectServer {
+            port,
+            hop1_hits,
+            hop2_hits,
+            stop,
+        };
+
+        struct ControlledResolver {
+            pause_host: &'static str,
+            deadline: Instant,
+            paused: Arc<AtomicBool>,
+        }
+        impl Resolver for ControlledResolver {
+            fn resolve(&self, host: &str) -> io::Result<Vec<IpAddr>> {
+                if host.eq_ignore_ascii_case(self.pause_host) {
+                    self.paused.store(true, Ordering::SeqCst);
+                    while Instant::now() < self.deadline {
+                        let rem = self.deadline.saturating_duration_since(Instant::now());
+                        std::thread::sleep(rem + Duration::from_millis(15));
+                    }
+                }
+                Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+            }
+        }
+
+        // 1. Expiry during initial DNS must report TimedOutBeforeSend with zero hits.
+        let dl1 = Instant::now() + Duration::from_millis(400);
+        let paused1 = Arc::new(AtomicBool::new(false));
+        let p1 = OutboundPolicy {
+            allow_private: true,
+            resolver: Arc::new(ControlledResolver {
+                pause_host: "initial.test",
+                deadline: dl1,
+                paused: paused1.clone(),
+            }),
+            ..Default::default()
+        };
+        let r1 = post_json_until_cancellable(
+            &p1,
+            &format!("http://initial.test:{}/hop1", server.port),
+            &[],
+            b"{}".to_vec(),
+            dl1,
+            None,
+        );
+        assert!(paused1.load(Ordering::SeqCst), "initial resolver must run");
+        assert!(
+            matches!(r1, Err(PostAbort::TimedOutBeforeSend)),
+            "initial DNS expiry must classify as TimedOutBeforeSend, got: {:?}",
+            r1.err()
+        );
+        assert_eq!(server.hop1_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(server.hop2_hits.load(Ordering::SeqCst), 0);
+
+        // 2. Expiry during redirect DNS must NOT report TimedOutBeforeSend because hop 1
+        // already received the POST.
+        let dl2 = Instant::now() + Duration::from_millis(400);
+        let paused2 = Arc::new(AtomicBool::new(false));
+        let p2 = OutboundPolicy {
+            allow_private: true,
+            resolver: Arc::new(ControlledResolver {
+                pause_host: "redirect.test",
+                deadline: dl2,
+                paused: paused2.clone(),
+            }),
+            ..Default::default()
+        };
+        let r2 = post_json_until_cancellable(
+            &p2,
+            &format!("http://hop1.test:{}/hop1", server.port),
+            &[],
+            b"{}".to_vec(),
+            dl2,
+            None,
+        );
+        assert!(paused2.load(Ordering::SeqCst), "redirect resolver must run");
+        assert!(
+            matches!(r2, Err(PostAbort::Failed(_))),
+            "redirect DNS expiry after sent hop must classify as Failed (unknown), got: {:?}",
+            r2.err()
+        );
+        assert_eq!(server.hop1_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(server.hop2_hits.load(Ordering::SeqCst), 0);
     }
 }
