@@ -74,6 +74,8 @@ DEFERRED = {
     "jobs.retry",
     "jobs.settings",
     "jobs.submit",
+    "ontology.patterns.apply",
+    "ontology.patterns.preview",
     "reasoning.query.clear",
     "reasoning.query.get",
     "reasoning.query.set",

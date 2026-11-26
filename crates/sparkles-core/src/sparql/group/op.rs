@@ -183,7 +183,7 @@ pub(crate) struct Grouping {
     pub(crate) passes: usize,
 }
 
-pub(in crate::sparql) struct GroupMemory {
+pub(crate) struct GroupMemory {
     charge: Option<RetainedCharge>,
     bytes: u64,
     reserved: u64,

@@ -2625,7 +2625,7 @@ impl LeafReader {
                                 ctx.check()?;
                                 match o {
                                     None => ReaderMode::Single(Some(Solution::pair(l, nid))),
-                                    Some(x) if integer(ctx, x) == integer(ctx, nid) => {
+                                    Some(x) if integer(ctx, x)? == integer(ctx, nid)? => {
                                         ReaderMode::Single(Some(Solution::pair(l, x)))
                                     }
                                     Some(_) => ReaderMode::Done,
@@ -2645,7 +2645,7 @@ impl LeafReader {
                 ids = Some(sids);
                 let (i_arg, m_arg) = (args[1], args[2]);
                 let target_pos = match i_arg {
-                    Some(i) => match integer(ctx, i) {
+                    Some(i) => match integer(ctx, i)? {
                         Some(p) if p >= 0 => Some(p),
                         _ => {
                             drop(args);
@@ -2738,10 +2738,12 @@ impl LeafReader {
                         charge,
                     );
                 };
-                let (Some(Term::Literal(text_lit)), Some(Term::Literal(pat_lit))) =
-                    (ctx.term(s), ctx.term(re_arg))
-                else {
-                    ctx.check()?;
+                let decode = ctx.charge(0)?;
+                let (Some(Term::Literal(text_lit)), Some(Term::Literal(pat_lit))) = (
+                    ctx.term_checked_into(s, &decode)?,
+                    ctx.term_checked_into(re_arg, &decode)?,
+                ) else {
+                    drop(decode);
                     drop(args);
                     return Self::empty(
                         spec.graph.clone(),
@@ -2762,6 +2764,7 @@ impl LeafReader {
                 text.push_str(text_lit.value());
                 drop(text_lit);
                 drop(pat_lit);
+                drop(decode);
                 let mut iter = StrSplitIter::new(program, cache, regex_bytes, text);
                 let box_bytes = std::mem::size_of::<StrSplitIter>() as u64;
                 charge.resize(
@@ -2775,7 +2778,7 @@ impl LeafReader {
                         s,
                         re: re_arg,
                     },
-                    Some(x) => match ctx.value(x) {
+                    Some(x) => match ctx.value_checked(x)? {
                         Some(Value::Str(v)) => {
                             let mut matched = false;
                             let mut checked = 0usize;
@@ -2807,11 +2810,13 @@ impl LeafReader {
             }
             PfKind::Concat => {
                 let mut total_len = 0usize;
+                let decode = ctx.charge(0)?;
                 for (idx, a) in args[1..].iter().enumerate() {
                     if idx.is_multiple_of(1024) {
                         ctx.check()?;
                     }
                     let Some(a) = a else {
+                        drop(decode);
                         drop(args);
                         return Self::empty(
                             spec.graph.clone(),
@@ -2821,11 +2826,11 @@ impl LeafReader {
                             charge,
                         );
                     };
-                    let piece_len = match ctx.term(*a) {
+                    let piece_len = match ctx.term_checked_into(*a, &decode)? {
                         Some(Term::NamedNode(n)) => n.as_str().len(),
                         Some(Term::Literal(l)) => l.value().len(),
                         _ => {
-                            ctx.check()?;
+                            drop(decode);
                             drop(args);
                             return Self::empty(
                                 spec.graph.clone(),
@@ -2836,6 +2841,7 @@ impl LeafReader {
                             );
                         }
                     };
+                    decode.resize(0)?;
                     total_len = total_len
                         .checked_add(piece_len)
                         .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
@@ -2851,14 +2857,16 @@ impl LeafReader {
                         if idx.is_multiple_of(1024) {
                             ctx.check()?;
                         }
-                        match ctx.term(a.expect("validated arg")) {
+                        match ctx.term_checked_into(a.expect("validated arg"), &decode)? {
                             Some(Term::NamedNode(n)) => {
                                 key.extend_from_slice(n.as_str().as_bytes())
                             }
                             Some(Term::Literal(l)) => key.extend_from_slice(l.value().as_bytes()),
                             _ => unreachable!("validated above"),
                         }
+                        decode.resize(0)?;
                     }
+                    drop(decode);
                     key.push(crate::id::KEY_SEP);
                     debug_assert_eq!(key.len(), key_len);
                     ctx.intern_key_checked(&key)?
@@ -2883,10 +2891,11 @@ impl LeafReader {
                 }
             }
             PfKind::Str => {
+                let decode = ctx.charge(0)?;
                 if let Some(s) = args[0]
-                    && !matches!(ctx.term(s), Some(Term::Literal(_)))
+                    && !matches!(ctx.term_checked_into(s, &decode)?, Some(Term::Literal(_)))
                 {
-                    ctx.check()?;
+                    drop(decode);
                     drop(args);
                     return Self::empty(
                         spec.graph.clone(),
@@ -2896,17 +2905,18 @@ impl LeafReader {
                         charge,
                     );
                 }
+                decode.resize(0)?;
                 let Some(o) = args[1] else {
                     return Err(bad("the object is an unbound variable"));
                 };
-                let v = match ctx.term(o) {
+                let v = match ctx.term_checked_into(o, &decode)? {
                     Some(Term::NamedNode(n)) => string(n.as_str())?,
                     Some(Term::Literal(l)) => string(l.value())?,
                     _ => {
-                        ctx.check()?;
                         return Err(bad("the object is a blank node"));
                     }
                 };
+                drop(decode);
                 ctx.check()?;
                 match args[0] {
                     None => ReaderMode::Single(Some(Solution::pair(v, o))),
@@ -2925,8 +2935,9 @@ impl LeafReader {
                         charge,
                     );
                 };
-                let Some(Term::NamedNode(iri)) = ctx.term(s) else {
-                    ctx.check()?;
+                let decode = ctx.charge(0)?;
+                let Some(Term::NamedNode(iri)) = ctx.term_checked_into(s, &decode)? else {
+                    drop(decode);
                     drop(args);
                     return Self::empty(
                         spec.graph.clone(),
@@ -2941,12 +2952,19 @@ impl LeafReader {
                 let nsv = match args[1] {
                     None => ctx.intern_iri_checked(ns)?,
                     Some(x) => {
-                        let text = match ctx.term(x) {
+                        let arg_decode = ctx.charge(0)?;
+                        let text = match ctx.term_checked_into(x, &arg_decode)? {
                             Some(Term::NamedNode(n)) => Some(n.as_str().to_string()),
-                            Some(Term::Literal(_)) => string_literal(ctx, x),
+                            Some(Term::Literal(_)) => {
+                                arg_decode.resize(0)?;
+                                string_literal(ctx, x, &arg_decode)?
+                            }
                             _ => None,
                         };
+                        drop(arg_decode);
                         if text.as_deref() != Some(ns) {
+                            drop(iri);
+                            drop(decode);
                             drop(args);
                             return Self::empty(
                                 spec.graph.clone(),
@@ -2962,7 +2980,12 @@ impl LeafReader {
                 let lv = match args[2] {
                     None => string(local)?,
                     Some(x) => {
-                        if string_literal(ctx, x).as_deref() != Some(local) {
+                        let arg_decode = ctx.charge(0)?;
+                        let ok = string_literal(ctx, x, &arg_decode)?.as_deref() == Some(local);
+                        drop(arg_decode);
+                        if !ok {
+                            drop(iri);
+                            drop(decode);
                             drop(args);
                             return Self::empty(
                                 spec.graph.clone(),
@@ -2975,6 +2998,8 @@ impl LeafReader {
                         x
                     }
                 };
+                drop(iri);
+                drop(decode);
                 ReaderMode::Single(Some(Solution::triple(s, nsv, lv)))
             }
             PfKind::Assign => match (args[0], args[1]) {
@@ -2982,9 +3007,17 @@ impl LeafReader {
                 (None, Some(o)) => ReaderMode::Single(Some(Solution::pair(o, o))),
                 (Some(s), None) => ReaderMode::Single(Some(Solution::pair(s, s))),
                 (Some(s), Some(o)) => {
-                    let same = s == o
-                        || matches!((ctx.term(s), ctx.term(o)), (Some(a), Some(b))
+                    let same = if s == o {
+                        true
+                    } else {
+                        let decode = ctx.charge(0)?;
+                        let a = ctx.term_checked_into(s, &decode)?;
+                        let b = ctx.term_checked_into(o, &decode)?;
+                        let eq = matches!((a, b), (Some(a), Some(b))
                             if super::cdt::same_value(&a, &b).unwrap_or(false));
+                        drop(decode);
+                        eq
+                    };
                     if same {
                         ReaderMode::Single(Some(Solution::pair(s, o)))
                     } else {
@@ -2996,8 +3029,9 @@ impl LeafReader {
                 let Some(s) = args[0] else {
                     return Err(bad("the subject is an unbound variable"));
                 };
-                let Some(Term::BlankNode(b)) = ctx.term(s) else {
-                    ctx.check()?;
+                let decode = ctx.charge(0)?;
+                let Some(Term::BlankNode(b)) = ctx.term_checked_into(s, &decode)? else {
+                    drop(decode);
                     drop(args);
                     return Self::empty(
                         spec.graph.clone(),
@@ -3008,6 +3042,8 @@ impl LeafReader {
                     );
                 };
                 let label = string(b.as_str())?;
+                drop(b);
+                drop(decode);
                 ctx.check()?;
                 match args[1] {
                     None => ReaderMode::Single(Some(Solution::pair(s, label))),
@@ -3148,18 +3184,17 @@ impl LeafReader {
             // `numbers_map_next_bytes(cap)` covers both old and new tables during rehash.
             self.sync_charge(numbers_map_next_bytes(self.numbers.capacity()))?;
         }
-        let num = match ctx.term(p) {
+        let decode = ctx.charge(0)?;
+        let num = match ctx.term_checked_into(p, &decode)? {
             Some(Term::NamedNode(n)) => n
                 .as_str()
                 .strip_prefix(RDF_NS)
                 .and_then(|l| l.strip_prefix('_'))
                 .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|d| d.parse().ok()),
-            _ => {
-                ctx.check()?;
-                None
-            }
+            _ => None,
         };
+        drop(decode);
         self.numbers.insert(p, num);
         if growing {
             self.sync_charge(0)?;

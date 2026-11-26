@@ -8211,7 +8211,7 @@ pub(super) fn stat_aggregate(func: &AggregateFunction) -> Option<super::aggext::
 
 /// How a caller admits transient big-number scratch (directly on `ctx` or by reclaiming
 /// speculative headroom from [`super::group::op::GroupMemory`] under budget pressure).
-pub(super) trait ScratchAdmit {
+pub(crate) trait ScratchAdmit {
     fn charge_scratch<'a>(&mut self, ctx: &'a Ctx, bytes: u64) -> Result<super::ctx::Charge<'a>> {
         ctx.charge(bytes)
     }
@@ -8263,6 +8263,7 @@ pub(super) fn double_intern_bytes(x: f64) -> u64 {
 
 /// Heap bytes owned by a `SumAcc::Decimal(Box<DecimalSum>)` allocation.
 pub(super) const DECIMAL_SUM_BYTES: u64 = size_of::<DecimalSum>() as u64;
+const INT128_SUM_BYTES: u64 = size_of::<Int128Sum>() as u64;
 
 /// Value-space hazard flags tracked on `AggState::Best` so `can_merge` only combines
 /// slice winners when `order_cmp` is guaranteed to be a transitive total preorder
@@ -8333,6 +8334,15 @@ pub(super) struct DecimalSum {
     exact_int_prefix: bool,
 }
 
+/// Boxed 128-bit integer accumulator with exact prefix bounds, used only when an integer
+/// sum overflows `i64` so ordinary `i64` sums keep [`SumAcc`] and [`AggState`] compact.
+#[derive(Clone)]
+pub(super) struct Int128Sum {
+    sum: i128,
+    min: i128,
+    max: i128,
+}
+
 /// Running numeric state of `SUM` / `AVG`.
 ///
 /// Big-number variants keep bounded headroom ([`super::bignum::AGG_MAX_INT_DIGITS`] /
@@ -8341,12 +8351,14 @@ pub(super) struct DecimalSum {
 /// [`AggState::finish_with`].
 #[derive(Clone)]
 pub(super) enum SumAcc {
-    /// Pure exact integer sum in `i128`, with exact prefix bounds `[min, max]` (including 0).
+    /// Pure exact integer sum in `i64`, with exact prefix bounds `[min, max]` (including 0).
     Int {
-        sum: i128,
-        min: i128,
-        max: i128,
+        sum: i64,
+        min: i64,
+        max: i64,
     },
+    /// Pure exact integer sum in `i128`, with exact prefix bounds `[min, max]` (including 0).
+    Int128(Box<Int128Sum>),
     /// Pure integer sum after a retraction, whose historical prefix bounds are unknown.
     IntRetracted(i128),
     /// Exact fixed-width decimal sum with prefix bounds for merge verification.
@@ -8368,11 +8380,36 @@ impl SumAcc {
     #[inline]
     fn heap_bytes(&self) -> u64 {
         match self {
+            SumAcc::Int128(_) => INT128_SUM_BYTES,
             SumAcc::Decimal(_) => DECIMAL_SUM_BYTES,
             SumAcc::BigInt(i) => i.heap_bytes() + 32,
             SumAcc::BigDec(d) => d.heap_bytes() + 32,
             _ => 0,
         }
+    }
+
+    #[inline]
+    fn int_bounds(&self) -> Option<(i128, i128, i128)> {
+        match self {
+            SumAcc::Int { sum, min, max } => Some(((*sum).into(), (*min).into(), (*max).into())),
+            SumAcc::Int128(b) => Some((b.sum, b.min, b.max)),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn int_sum(&self) -> Option<i128> {
+        match self {
+            SumAcc::Int { sum, .. } => Some((*sum).into()),
+            SumAcc::Int128(b) => Some(b.sum),
+            SumAcc::IntRetracted(s) => Some(*s),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn is_retracted_int(&self) -> bool {
+        matches!(self, SumAcc::IntRetracted(_))
     }
 
     /// Compute the next `SumAcc` for any transition or arbitrary-precision operation that
@@ -8395,8 +8432,21 @@ impl SumAcc {
             return Ok((SumAcc::HardError, None));
         };
         Ok(match (self, n) {
-            (SumAcc::Int { sum, min, max }, Num::Decimal(b)) => {
-                let (int_before, int_min, int_max) = (*sum, *min, *max);
+            (SumAcc::Int { sum, min, max }, Num::Integer(b)) => {
+                let s = i128::from(*sum) + i128::from(i64::from(b));
+                let lo = i128::from(*min).min(s);
+                let hi = i128::from(*max).max(s);
+                (
+                    SumAcc::Int128(Box::new(Int128Sum {
+                        sum: s,
+                        min: lo,
+                        max: hi,
+                    })),
+                    None,
+                )
+            }
+            (SumAcc::Int { .. } | SumAcc::Int128(_), Num::Decimal(b)) => {
+                let (int_before, int_min, int_max) = self.int_bounds().expect("int variant");
                 if let Some(v) = int_before
                     .checked_mul(super::value::DECIMAL_SCALE)
                     .and_then(|s| s.checked_add(super::value::decimal_raw(b)))
@@ -8445,32 +8495,43 @@ impl SumAcc {
                     .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
                 (next, Some(scratch))
             }
-            (SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum), Num::Integer(b)) => {
+            (SumAcc::Int128(_) | SumAcc::IntRetracted(_), Num::Integer(b)) => {
+                let sum = self.int_sum().expect("int variant");
                 let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                let next = BigInt::from_i128(*sum)
+                let next = BigInt::from_i128(sum)
                     .checked_add_with_limit(&BigInt::from_i64(b.into()), AGG_MAX_INT_DIGITS)
                     .map_or(SumAcc::Overflow, |s| SumAcc::BigInt(Box::new(s)));
                 (next, Some(scratch))
             }
-            (SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum), Num::BigInteger(b)) => {
+            (
+                SumAcc::Int { .. } | SumAcc::Int128(_) | SumAcc::IntRetracted(_),
+                Num::BigInteger(b),
+            ) => {
+                let sum = self.int_sum().expect("int variant");
                 let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                let next = BigInt::from_i128(*sum)
+                let next = BigInt::from_i128(sum)
                     .checked_add_with_limit(b, AGG_MAX_INT_DIGITS)
                     .map_or(SumAcc::Overflow, |s| SumAcc::BigInt(Box::new(s)));
                 (next, Some(scratch))
             }
-            (SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum), Num::BigDecimal(b)) => {
+            (
+                SumAcc::Int { .. } | SumAcc::Int128(_) | SumAcc::IntRetracted(_),
+                Num::BigDecimal(b),
+            ) => {
+                let sum = self.int_sum().expect("int variant");
                 let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
-                let next = BigDec::from_bigint(BigInt::from_i128(*sum))
+                let next = BigDec::from_bigint(BigInt::from_i128(sum))
                     .checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)
                     .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
                 (next, Some(scratch))
             }
-            (SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum), Num::Float(b)) => {
-                (SumAcc::Float(Float::from(*sum as f32) + b), None)
+            (SumAcc::Int { .. } | SumAcc::Int128(_) | SumAcc::IntRetracted(_), Num::Float(b)) => {
+                let sum = self.int_sum().expect("int variant");
+                (SumAcc::Float(Float::from(sum as f32) + b), None)
             }
-            (SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum), Num::Double(b)) => {
-                (SumAcc::Double(Double::from(*sum as f64) + b), None)
+            (SumAcc::Int { .. } | SumAcc::Int128(_) | SumAcc::IntRetracted(_), Num::Double(b)) => {
+                let sum = self.int_sum().expect("int variant");
+                (SumAcc::Double(Double::from(sum as f64) + b), None)
             }
             (SumAcc::Decimal(ds), Num::Integer(b)) => {
                 let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
@@ -8632,6 +8693,8 @@ pub(super) enum AggState {
     Stat(super::aggext::Arq, super::aggext::StatAcc),
 }
 
+const _: () = assert!(size_of::<AggState>() == 80);
+
 impl AggState {
     pub(super) fn new(agg: &Agg) -> AggState {
         if let Some(arq) = stat_aggregate(&agg.func) {
@@ -8678,12 +8741,13 @@ impl AggState {
                 }
                 match acc {
                     SumAcc::HardError | SumAcc::Overflow => 0,
-                    SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum) => {
+                    SumAcc::Int { .. } | SumAcc::Int128(_) | SumAcc::IntRetracted(_) => {
+                        let sum = acc.int_sum().expect("int variant");
                         if is_avg {
                             if *rows == 0 {
                                 0
                             } else {
-                                let needs_big = match (i64::try_from(*sum), i64::try_from(*rows)) {
+                                let needs_big = match (i64::try_from(sum), i64::try_from(*rows)) {
                                     (Ok(i), Ok(r)) => super::value::int_div_needs_big(i, r),
                                     _ => true,
                                 };
@@ -8693,7 +8757,7 @@ impl AggState {
                                     256
                                 }
                             }
-                        } else if i64::try_from(*sum)
+                        } else if i64::try_from(sum)
                             .ok()
                             .is_some_and(|i| Id::from_i64(i).is_some())
                         {
@@ -8808,7 +8872,7 @@ impl AggState {
                     && id.tag() == crate::id::Tag::Int
                 {
                     let x = id.as_i64();
-                    if let Some(s) = sum.checked_add(x.into()) {
+                    if let Some(s) = sum.checked_add(x) {
                         *sum = s;
                         if x >= 0 {
                             if s > *max {
@@ -8883,6 +8947,20 @@ impl AggState {
             return Ok(true);
         }
         match (&mut *acc, id.tag()) {
+            (SumAcc::Int128(b), crate::id::Tag::Int) => {
+                let x = id.as_i64();
+                if let Some(s) = b.sum.checked_add(x.into()) {
+                    b.sum = s;
+                    if x >= 0 {
+                        if s > b.max {
+                            b.max = s;
+                        }
+                    } else if s < b.min {
+                        b.min = s;
+                    }
+                    return Ok(true);
+                }
+            }
             (SumAcc::IntRetracted(sum), crate::id::Tag::Int) => {
                 if let Some(s) = sum.checked_add(id.as_i64().into()) {
                     *sum = s;
@@ -8938,7 +9016,7 @@ impl AggState {
         match (&mut *acc, &value) {
             (SumAcc::Int { sum, min, max }, Value::Integer(i)) => {
                 let x = i64::from(*i);
-                if let Some(s) = sum.checked_add(x.into()) {
+                if let Some(s) = sum.checked_add(x) {
                     *sum = s;
                     if x >= 0 {
                         if s > *max {
@@ -8946,6 +9024,20 @@ impl AggState {
                         }
                     } else if s < *min {
                         *min = s;
+                    }
+                    return Ok(true);
+                }
+            }
+            (SumAcc::Int128(b), Value::Integer(i)) => {
+                let x = i64::from(*i);
+                if let Some(s) = b.sum.checked_add(x.into()) {
+                    b.sum = s;
+                    if x >= 0 {
+                        if s > b.max {
+                            b.max = s;
+                        }
+                    } else if s < b.min {
+                        b.min = s;
                     }
                     return Ok(true);
                 }
@@ -9099,35 +9191,26 @@ impl AggState {
                     return *re > 0;
                 }
                 match (la, ra) {
-                    (
-                        SumAcc::Int { sum: ls, .. },
-                        SumAcc::Int {
-                            sum: rs,
-                            min: rmin,
-                            max: rmax,
-                        },
-                    ) => {
-                        ls.checked_add(*rs).is_some()
-                            && ls.checked_add(*rmin).is_some()
-                            && ls.checked_add(*rmax).is_some()
+                    (l, r) if l.int_bounds().is_some() && r.int_bounds().is_some() => {
+                        let (ls, _, _) = l.int_bounds().expect("checked above");
+                        let (rs, rmin, rmax) = r.int_bounds().expect("checked above");
+                        ls.checked_add(rs).is_some()
+                            && ls.checked_add(rmin).is_some()
+                            && ls.checked_add(rmax).is_some()
                     }
-                    (
-                        SumAcc::Int { sum: ls, .. } | SumAcc::IntRetracted(ls),
-                        SumAcc::Int { sum: rs, .. } | SumAcc::IntRetracted(rs),
-                    ) => ls.checked_add(*rs).is_some(),
-                    (
-                        SumAcc::Decimal(l),
-                        SumAcc::Int {
-                            sum: osum,
-                            min: omin,
-                            max: omax,
-                        },
-                    ) => {
-                        super::value::add_scaled_int(l.val, *omin).is_some()
-                            && super::value::add_scaled_int(l.val, *omax).is_some()
-                            && super::value::add_scaled_int(l.val, *osum).is_some()
+                    (l, r) if l.int_sum().is_some() && r.int_sum().is_some() => {
+                        let ls = l.int_sum().expect("checked above");
+                        let rs = r.int_sum().expect("checked above");
+                        ls.checked_add(rs).is_some()
                     }
-                    (SumAcc::Int { sum: ls, .. }, SumAcc::Decimal(r)) => {
+                    (SumAcc::Decimal(l), r) if r.int_bounds().is_some() => {
+                        let (osum, omin, omax) = r.int_bounds().expect("checked above");
+                        super::value::add_scaled_int(l.val, omin).is_some()
+                            && super::value::add_scaled_int(l.val, omax).is_some()
+                            && super::value::add_scaled_int(l.val, osum).is_some()
+                    }
+                    (l, SumAcc::Decimal(r)) if l.int_bounds().is_some() => {
+                        let (ls, _, _) = l.int_bounds().expect("checked above");
                         r.exact_int_prefix
                             && ls
                                 .checked_add(r.int_before)
@@ -9135,9 +9218,9 @@ impl AggState {
                                 .is_some()
                             && ls.checked_add(r.int_min).is_some()
                             && ls.checked_add(r.int_max).is_some()
-                            && super::value::add_scaled_int(r.min, *ls).is_some()
-                            && super::value::add_scaled_int(r.max, *ls).is_some()
-                            && super::value::add_scaled_int(r.val, *ls).is_some()
+                            && super::value::add_scaled_int(r.min, ls).is_some()
+                            && super::value::add_scaled_int(r.max, ls).is_some()
+                            && super::value::add_scaled_int(r.val, ls).is_some()
                     }
                     (SumAcc::Decimal(l), SumAcc::Decimal(r)) => {
                         r.exact_int_prefix
@@ -9147,24 +9230,29 @@ impl AggState {
                             && l.val.checked_add(r.max).is_some()
                             && l.val.checked_add(r.val).is_some()
                     }
-                    (SumAcc::Decimal(_), SumAcc::IntRetracted(_))
-                    | (SumAcc::IntRetracted(_), SumAcc::Decimal(_)) => false,
+                    (SumAcc::Decimal(_), r) if r.is_retracted_int() => false,
+                    (l, SumAcc::Decimal(_)) if l.is_retracted_int() => false,
                     (SumAcc::BigInt(_) | SumAcc::BigDec(_), _)
                     | (_, SumAcc::BigInt(_) | SumAcc::BigDec(_)) => false,
+                    (SumAcc::Float(_) | SumAcc::Double(_), r) if r.is_retracted_int() => false,
                     (
                         SumAcc::Float(_) | SumAcc::Double(_),
                         SumAcc::Int { .. }
+                        | SumAcc::Int128(_)
                         | SumAcc::Decimal(_)
                         | SumAcc::Float(_)
                         | SumAcc::Double(_),
                     )
                     | (
-                        SumAcc::Int { .. } | SumAcc::IntRetracted(_) | SumAcc::Decimal(_),
+                        SumAcc::Int { .. }
+                        | SumAcc::Int128(_)
+                        | SumAcc::IntRetracted(_)
+                        | SumAcc::Decimal(_),
                         SumAcc::Float(_) | SumAcc::Double(_),
                     ) => *rr == 1,
-                    (SumAcc::Float(_) | SumAcc::Double(_), SumAcc::IntRetracted(_)) => false,
                     (SumAcc::HardError | SumAcc::Overflow, _)
                     | (_, SumAcc::HardError | SumAcc::Overflow) => unreachable!(),
+                    _ => false,
                 }
             }
             _ => false,
@@ -9216,33 +9304,41 @@ impl AggState {
                     return true;
                 }
                 match (&mut *acc, oacc) {
-                    (
-                        SumAcc::Int { sum, min, max },
-                        SumAcc::Int {
-                            sum: osum,
-                            min: omin,
-                            max: omax,
-                        },
-                    ) => {
-                        let base = *sum;
-                        *sum = base + osum;
-                        *min = (*min).min(base + omin);
-                        *max = (*max).max(base + omax);
+                    (l, r) if l.int_bounds().is_some() && r.int_bounds().is_some() => {
+                        let (base, lmin, lmax) = l.int_bounds().expect("checked above");
+                        let (osum, omin, omax) = r.int_bounds().expect("checked above");
+                        let new_sum = base + osum;
+                        let new_min = lmin.min(base + omin);
+                        let new_max = lmax.max(base + omax);
+                        if let (Ok(s), Ok(lo), Ok(hi)) = (
+                            i64::try_from(new_sum),
+                            i64::try_from(new_min),
+                            i64::try_from(new_max),
+                        ) {
+                            *l = SumAcc::Int {
+                                sum: s,
+                                min: lo,
+                                max: hi,
+                            };
+                        } else if let SumAcc::Int128(b) = l {
+                            b.sum = new_sum;
+                            b.min = new_min;
+                            b.max = new_max;
+                        } else {
+                            *l = SumAcc::Int128(Box::new(Int128Sum {
+                                sum: new_sum,
+                                min: new_min,
+                                max: new_max,
+                            }));
+                        }
                     }
-                    (
-                        SumAcc::Int { sum: ls, .. } | SumAcc::IntRetracted(ls),
-                        SumAcc::Int { sum: rs, .. } | SumAcc::IntRetracted(rs),
-                    ) => {
-                        *acc = SumAcc::IntRetracted(*ls + rs);
+                    (l, r) if l.int_sum().is_some() && r.int_sum().is_some() => {
+                        let sum = l.int_sum().expect("checked above")
+                            + r.int_sum().expect("checked above");
+                        *l = SumAcc::IntRetracted(sum);
                     }
-                    (
-                        SumAcc::Decimal(l),
-                        SumAcc::Int {
-                            sum: osum,
-                            min: omin,
-                            max: omax,
-                        },
-                    ) => {
+                    (SumAcc::Decimal(l), r) if r.int_bounds().is_some() => {
+                        let (osum, omin, omax) = r.int_bounds().expect("checked above");
                         let smin = super::value::add_scaled_int(l.val, omin)
                             .expect("validated by can_merge");
                         let smax = super::value::add_scaled_int(l.val, omax)
@@ -9253,8 +9349,8 @@ impl AggState {
                         l.min = l.min.min(smin);
                         l.max = l.max.max(smax);
                     }
-                    (SumAcc::Int { sum, min, max }, SumAcc::Decimal(mut r)) => {
-                        let base = *sum;
+                    (l, SumAcc::Decimal(mut r)) if l.int_bounds().is_some() => {
+                        let (base, lmin, lmax) = l.int_bounds().expect("checked above");
                         let trans_int = base + r.int_before;
                         let smin = super::value::add_scaled_int(r.min, base)
                             .expect("validated by can_merge");
@@ -9267,9 +9363,9 @@ impl AggState {
                         r.max = smax;
                         r.int_before = trans_int;
                         debug_assert!(r.exact_int_prefix);
-                        r.int_min = (*min).min(base + r.int_min);
-                        r.int_max = (*max).max(base + r.int_max);
-                        *acc = SumAcc::Decimal(r);
+                        r.int_min = lmin.min(base + r.int_min);
+                        r.int_max = lmax.max(base + r.int_max);
+                        *l = SumAcc::Decimal(r);
                     }
                     (SumAcc::Decimal(l), SumAcc::Decimal(r)) => {
                         let imin = super::value::add_scaled_int(l.val, r.int_min)
@@ -9288,14 +9384,14 @@ impl AggState {
                         debug_assert_eq!(orows, 1);
                         use oxsdatatypes::{Double, Float};
                         match (&*left_acc, right_acc) {
-                            (
-                                SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum),
-                                SumAcc::Float(f),
-                            ) => *left_acc = SumAcc::Float(Float::from(*sum as f32) + f),
-                            (
-                                SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum),
-                                SumAcc::Double(d),
-                            ) => *left_acc = SumAcc::Double(Double::from(*sum as f64) + d),
+                            (l, SumAcc::Float(f)) if l.int_sum().is_some() => {
+                                let sum = l.int_sum().expect("checked above");
+                                *left_acc = SumAcc::Float(Float::from(sum as f32) + f);
+                            }
+                            (l, SumAcc::Double(d)) if l.int_sum().is_some() => {
+                                let sum = l.int_sum().expect("checked above");
+                                *left_acc = SumAcc::Double(Double::from(sum as f64) + d);
+                            }
                             (SumAcc::Decimal(ds), SumAcc::Float(f)) => {
                                 *left_acc = SumAcc::Float(
                                     Float::from(super::value::decimal_from_raw(ds.val)) + f,
@@ -9306,7 +9402,8 @@ impl AggState {
                                     Double::from(super::value::decimal_from_raw(ds.val)) + d,
                                 );
                             }
-                            (SumAcc::Float(f), SumAcc::Int { sum, .. }) => {
+                            (SumAcc::Float(f), r) if r.int_sum().is_some() => {
+                                let sum = r.int_sum().expect("checked above");
                                 *left_acc = SumAcc::Float(*f + Float::from(sum as f32));
                             }
                             (SumAcc::Float(f), SumAcc::Decimal(ds)) => {
@@ -9320,7 +9417,8 @@ impl AggState {
                             (SumAcc::Float(f), SumAcc::Double(d)) => {
                                 *left_acc = SumAcc::Double(Double::from(*f) + d);
                             }
-                            (SumAcc::Double(d), SumAcc::Int { sum, .. }) => {
+                            (SumAcc::Double(d), r) if r.int_sum().is_some() => {
+                                let sum = r.int_sum().expect("checked above");
                                 *left_acc = SumAcc::Double(*d + Double::from(sum as f64));
                             }
                             (SumAcc::Double(d), SumAcc::Decimal(ds)) => {
@@ -9428,7 +9526,8 @@ impl AggState {
             } if id.is_some_and(|id| id.tag() == crate::id::Tag::Int) => {
                 let id = id.expect("checked above");
                 let x = id.as_i64();
-                if let Some(delta) = i128::from(x).checked_mul(i128::from(weight))
+                if let Ok(w) = i64::try_from(weight)
+                    && let Some(delta) = x.checked_mul(w)
                     && let Some(s) = sum.checked_add(delta)
                 {
                     *sum = s;
@@ -9500,9 +9599,8 @@ impl AggState {
                 true
             }
             AggState::Sum { acc, rows, .. } => {
-                let sum = match acc {
-                    SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum) => *sum,
-                    _ => return false,
+                let Some(sum) = acc.int_sum() else {
+                    return false;
                 };
                 let Some(id) = id.filter(|id| id.tag() == crate::id::Tag::Int) else {
                     return false;
@@ -9572,7 +9670,8 @@ impl AggState {
                     Err(_) => Value::from_bigint(super::bignum::BigInt::from_u64(rows)),
                 };
                 let (v, scratch) = match acc {
-                    SumAcc::Int { sum: int, .. } | SumAcc::IntRetracted(int) => {
+                    SumAcc::Int { .. } | SumAcc::Int128(_) | SumAcc::IntRetracted(_) => {
+                        let int = acc.int_sum().expect("int variant");
                         let needs_big = is_avg
                             && match (i64::try_from(int), i64::try_from(rows)) {
                                 (Ok(i), Ok(r)) => super::value::int_div_needs_big(i, r),

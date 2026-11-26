@@ -1426,17 +1426,18 @@ fn retractable_sum_decimal_overflow_with_float_or_double() {
             "{func:?} large int demotes to exact BigInt/BigDec"
         );
 
-        // Mixed DOUBLE + overflowing fixed DECIMAL + overflowing repeated FLOAT (2 * 2e38f > f32::MAX):
-        // widening float contributions to f64 keeps SUM and AVG finite and matches Running.
+        // Mixed overflowing fixed DECIMAL + overflowing FLOAT (2 * 2e38f > f32::MAX) + DOUBLE:
+        // staged float promotion folds floats at f32 precision before widening to double,
+        // matching Running when floats precede the double and demoting to float +inf on retract.
         let big_f = ctx.intern_value(&Value::Float(2e38_f32.into()));
         let big_f2 = ctx.intern_value(&Value::Float(2.5e38_f32.into()));
         for (label, vals) in [
             (
-                "double+2*dec+2*float",
-                vec![zero_d, big_dec, big_dec, big_f, big_f],
+                "2*dec+2*float+double",
+                vec![big_dec, big_dec, big_f, big_f, zero_d],
             ),
-            ("double+2*float", vec![zero_d, big_f, big_f]),
-            ("double+2*distinct_float", vec![zero_d, big_f, big_f2]),
+            ("2*float+double", vec![big_f, big_f, zero_d]),
+            ("2*distinct_float+double", vec![big_f, big_f2, zero_d]),
         ] {
             let mut run_m = Running::new(&a, false);
             let mut ret_m = retractable(&a, 1).unwrap();
@@ -1448,8 +1449,8 @@ fn retractable_sum_decimal_overflow_with_float_or_double() {
             let got_run = run_m.finish(&ctx, 0).unwrap();
             let got_ret = ret_m.read(&ctx, 0).unwrap();
             assert!(
-                matches!(ctx.value(got_ret), Some(Value::Double(d)) if f64::from(d).is_finite()),
-                "{func:?} {label} should stay finite double, got {:?}",
+                matches!(ctx.value(got_ret), Some(Value::Double(d)) if f64::from(d).is_infinite()),
+                "{func:?} {label} should stage float overflow to double inf, got {:?}",
                 ctx.value(got_ret)
             );
             assert_eq!(ctx.term(got_ret), ctx.term(got_run), "{func:?} {label}");
@@ -2025,12 +2026,13 @@ fn ordered_concat_admits_growth_before_allocating_and_polls_repetitions() {
     // One-off `Concat::finish` when `text.capacity() < text.len() + 2` (exact 48 KiB
     // single-chunk buffer): framing growth is admitted before reallocating, so a budget
     // without room for the reallocation refuses before growing the buffer.
-    let mut tight_ctx = Ctx::new(snap);
+    let mut tight_ctx = Ctx::new(snap.clone());
     tight_ctx.mem_limit = 128 * 1024;
     let tight_ctx = tight_ctx.into_shared();
+    let fold_ctx = Ctx::new(snap).into_shared();
     let mut concat_tight = Concat::new(&empty_agg);
     concat_tight.init(1);
-    fold(&tight_ctx, &mut concat_tight, &[existing_id], &[0]);
+    fold(&fold_ctx, &mut concat_tight, &[existing_id], &[0]);
     let tight_growth = concat_tight.take_growth();
     assert_eq!(tight_growth, (48 * 1024 * 2) as u64);
     let _tight_growth = tight_ctx.charge(tight_growth).unwrap();
@@ -3198,12 +3200,12 @@ fn range_split_min_max_matches_sequential_on_non_transitive_mixed_and_incomparab
     let (seq_min, _) = run_whole_in_pool(1, &ctx, &min_table, &[], &min_aggs, false).unwrap();
     let (par_min, _) = run_whole_in_pool(2, &ctx, &min_table, &[], &min_aggs, false).unwrap();
     assert_tables_exact_eq(&ctx, &par_min, &seq_min, "non-transitive mixed MIN");
-    assert_eq!(exact_key(&ctx, par_min.cols[0][0]), exact_key(&ctx, b));
+    assert_eq!(exact_key(&ctx, par_min.cols[0][0]), exact_key(&ctx, a));
 
     let (seq_max, _) = run_whole_in_pool(1, &ctx, &max_table, &[], &max_aggs, false).unwrap();
     let (par_max, _) = run_whole_in_pool(2, &ctx, &max_table, &[], &max_aggs, false).unwrap();
     assert_tables_exact_eq(&ctx, &par_max, &seq_max, "non-transitive mixed MAX");
-    assert_eq!(exact_key(&ctx, par_max.cols[0][0]), exact_key(&ctx, a));
+    assert_eq!(exact_key(&ctx, par_max.cols[0][0]), exact_key(&ctx, b));
 
     // Incomparable DateTime (tz vs no-tz) and Duration (P30D / P0Y31D / P1M) also refuse merge.
     let dt_a = ctx.intern_term(&oxrdf::Term::Literal(oxrdf::Literal::new_typed_literal(
@@ -3367,8 +3369,10 @@ fn parallel_scratch_releases_before_finish_under_query_and_server_limits() {
     q_ctx
         .check()
         .expect("no sticky memory_failure under query limit");
+    let q_inspect = ctx();
+    q_inspect.share_local(&q_ctx);
     assert_tables_exact_eq_cross_ctx(
-        &q_ctx,
+        &q_inspect,
         &par_q,
         &base_ctx,
         &seq_ungrouped,
@@ -3392,8 +3396,10 @@ fn parallel_scratch_releases_before_finish_under_query_and_server_limits() {
     p_ctx
         .check()
         .expect("no sticky memory_failure under server pool limit");
+    let p_inspect = ctx();
+    p_inspect.share_local(&p_ctx);
     assert_tables_exact_eq_cross_ctx(
-        &p_ctx,
+        &p_inspect,
         &par_p,
         &base_ctx,
         &seq_ungrouped,

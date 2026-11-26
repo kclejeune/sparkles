@@ -22,7 +22,7 @@ use crate::sparql::group::acc::{self, Accumulator, Arg, Batch};
 use crate::sparql::group::op::BatchBudget;
 use crate::sparql::plan::Agg;
 use crate::sparql::table::Table;
-use rustc_hash::{FxBuildHasher, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use spargebra::algebra::{AggregateFunction, Expression};
 use std::fmt;
 

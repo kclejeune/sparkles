@@ -950,6 +950,7 @@ impl sparkles_core::sparql::viewsvc::ViewSource for LegacyViews {
                 .collect(),
             commit: 0,
             evaluated_under: None,
+            lease: None,
         })
     }
 }

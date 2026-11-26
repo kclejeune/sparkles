@@ -1833,8 +1833,11 @@ fn view_group_agg_ctx_zero_copy_and_memory_limit() {
         "Restore guard must return the exact Circuit::terms backing"
     );
 
-    // Apply a 1-row change with max_memory_bytes far smaller than `c.terms.bytes()`.
-    c.max_memory_bytes = Some(4096);
+    // Apply a 1-row change with headroom smaller than `c.terms.bytes()` on top of the
+    // circuit's already-retained state: copying `c.terms` would exceed the budget.
+    let before_bytes = c.bytes();
+    assert!(c.terms.bytes() > 8192 * 2);
+    c.max_memory_bytes = Some(before_bytes + 8192);
     upd(&s, &format!("{PREFIX}INSERT DATA {{ :s999 :p 999 }}")).unwrap();
     step(&s, &mut c);
     check(&s, &c, q, "1-row change under tight memory budget");
@@ -1895,8 +1898,9 @@ fn view_group_decimal_boundary_ties_sample_and_cancel() {
             with_double
         );
 
-        // Adding two copies of 2e38f (whose f32 product overflows) must stay finite double
-        // while 0.0e0 is present, and demote to float INF when 0.0e0 is retracted.
+        // Adding two copies of 2e38f stages float arithmetic before promoting to double,
+        // producing double INF while 0.0e0 is present and demoting to float INF when
+        // 0.0e0 is retracted.
         upd(
             &s,
             &format!(
@@ -1908,8 +1912,8 @@ fn view_group_decimal_boundary_ties_sample_and_cancel() {
         let with_mixed = result(&c);
         assert_eq!(with_mixed.len(), 1);
         assert!(
-            !with_mixed[0].contains("UNDEF") && !with_mixed[0].contains("INF"),
-            "expected finite double SUM and AVG with mixed float+double+decimal, got {:?}",
+            with_mixed[0].contains("\"INF\"^^<http://www.w3.org/2001/XMLSchema#double>"),
+            "expected staged float overflow promoted to double INF, got {:?}",
             with_mixed
         );
 

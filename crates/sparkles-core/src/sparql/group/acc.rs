@@ -1027,8 +1027,7 @@ impl SumState {
         }
         let has_big_int = self.big_ints.as_ref().is_some_and(|m| !m.is_empty());
         let has_big_dec = self.big_decs.as_ref().is_some_and(|m| !m.is_empty());
-        let has_double = !self.doubles.is_empty();
-        let has_approx = !self.floats.is_empty() || has_double;
+        let has_approx = !self.floats.is_empty() || !self.doubles.is_empty();
 
         // Accumulate exact subtotals with bounded headroom so cancellation and averaging at
         // the digit cap are evaluated on the final result rather than intermediate terms.
@@ -1121,21 +1120,15 @@ impl SumState {
             };
         }
 
-        // Fold floats at float precision when no double is present, or widen float terms
-        // into double arithmetic when a double is present so finite sums stay finite.
+        // Fold floats at float precision before the first double promotes the subtotal.
         let mut acc = match exact {
             ExactAcc::Fixed(v) => v,
-            ExactAcc::Dec(bd) => {
-                if has_double {
-                    Value::Double(Double::from(bd.to_f64()))
-                } else {
-                    match bd.to_oxs_decimal() {
-                        Some(decimal) => Value::Decimal(decimal),
-                        None => Value::Float(Float::from(bd.to_f32())),
-                    }
-                }
-            }
-            ExactAcc::Int(bi) if has_double => Value::Double(Double::from(bi.to_f64())),
+            ExactAcc::Dec(bd) => match bd.to_oxs_decimal() {
+                Some(decimal) => Value::Decimal(decimal),
+                None if self.floats.is_empty() => Value::Double(Double::from(bd.to_f64())),
+                None => Value::Float(Float::from(bd.to_f32())),
+            },
+            ExactAcc::Int(bi) if self.floats.is_empty() => Value::Double(Double::from(bi.to_f64())),
             ExactAcc::Int(bi) => Value::Float(Float::from(bi.to_f32())),
         };
         let mut floats: Vec<(f32, i64)> = self
@@ -1145,12 +1138,7 @@ impl SumState {
             .collect();
         floats.sort_by(|a, b| a.0.total_cmp(&b.0));
         for (f, n) in floats {
-            let term = if has_double {
-                Value::Double(Double::from(f64::from(f) * n as f64))
-            } else {
-                Value::Float(Float::from(f * n as f32))
-            };
-            acc = arith(NumOp::Add, &acc, &term).ok()?;
+            acc = arith(NumOp::Add, &acc, &Value::Float(Float::from(f * n as f32))).ok()?;
         }
         let mut doubles: Vec<(f64, i64)> = self
             .doubles

@@ -805,6 +805,7 @@ impl sparkles_core::sparql::viewsvc::ViewSource for LegacyViews {
             rows: vec![(vec![Some(Term::Literal(oxrdf::Literal::from(1)))], 1)],
             commit: 0,
             evaluated_under: None,
+            lease: None,
         })
     }
 }
