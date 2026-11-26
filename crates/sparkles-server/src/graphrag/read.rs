@@ -364,84 +364,181 @@ pub fn with_findings_source(
     with_findings_in(ReadInput::Source(source, store), opts, graph, reports)
 }
 
+fn balanced_union(branches: &[String]) -> String {
+    debug_assert!(!branches.is_empty());
+    if branches.len() == 1 {
+        return branches[0].clone();
+    }
+    let mid = branches.len() / 2;
+    format!(
+        "{{ {} }} UNION {{ {} }}",
+        balanced_union(&branches[..mid]),
+        balanced_union(&branches[mid..]),
+    )
+}
+
 fn with_findings_in(
     input: ReadInput<'_>,
     opts: &QueryOptions,
     graph: &str,
     reports: &mut [ReportRef],
 ) -> Result<(), Error> {
+    const REPORT_FINDINGS_BATCH: usize = 16;
+    const FINDING_PROPS_BATCH: usize = 16;
+
     if reports.is_empty() {
         return Ok(());
     }
-    let names: Vec<String> = reports
+    let report_nodes: Vec<oxrdf::NamedNode> = reports
         .iter()
         .filter_map(|r| oxrdf::NamedNode::new(r.iri.as_str()).ok())
-        .map(|n| n.to_string())
         .collect();
-    let q = format!(
-        "SELECT ?r ?f ?o ?text ?p ?cite WHERE {{ GRAPH <{graph}> {{ VALUES ?r {{ {} }} ?r <{finding}> ?f . ?f <{order}> ?o ; <{text}> ?text . OPTIONAL {{ {{ ?f <{about}> ?cite BIND(<{about}> AS ?p) }} UNION {{ ?f <{cites}> ?cite BIND(<{cites}> AS ?p) }} UNION {{ ?f <{claim}> ?cite BIND(<{claim}> AS ?p) }} UNION {{ ?f <{decision}> ?cite BIND(<{decision}> AS ?p) }} }} }} }} ORDER BY ?r ?o",
-        names.join(" "),
-        finding = gr("finding"),
-        order = gr("order"),
-        text = gr("text"),
-        about = gr("about"),
-        cites = gr("cites"),
-        claim = gr("citesClaim"),
-        decision = gr("citesDecision"),
-    );
-    let mut by: HashMap<String, Vec<FindingRef>> = HashMap::new();
-    for row in rows_in(input, opts, &q)? {
-        let row = row.values();
-        let (Some(r), Some(f), Some(text)) = (iri(&row[0]), iri(&row[1]), lit(&row[3])) else {
-            continue;
-        };
-        let list = by.entry(r).or_default();
-        let at = match list.iter().position(|x| x.iri == f) {
-            Some(i) => i,
-            None => {
-                list.push(FindingRef {
-                    iri: f,
-                    order: int(&row[2]).unwrap_or(0),
-                    text,
-                    about: Vec::new(),
-                    cites: Vec::new(),
-                    claims: Vec::new(),
-                    decisions: Vec::new(),
-                });
-                list.len() - 1
+    if report_nodes.is_empty() {
+        for r in reports {
+            r.findings.clear();
+        }
+        return Ok(());
+    }
+
+    // Step 1: fetch (report, finding) links via grounded GSPO point lookups for the
+    // selected reports only, avoiding full-graph scans under tight row budgets.
+    let finding_pred = gr("finding");
+    let mut report_findings: HashMap<String, Vec<String>> = HashMap::new();
+    let mut uniq_findings: Vec<oxrdf::NamedNode> = Vec::new();
+    let mut seen_findings: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for chunk in report_nodes.chunks(REPORT_FINDINGS_BATCH) {
+        let branches: Vec<String> = chunk
+            .iter()
+            .map(|rep| format!("BIND({rep} AS ?r) {rep} <{finding_pred}> ?f ."))
+            .collect();
+        let q = format!(
+            "SELECT ?r ?f WHERE {{ GRAPH <{graph}> {{ {} }} }}",
+            balanced_union(&branches),
+        );
+        for row in rows_in(input, opts, &q)? {
+            let row = row.values();
+            let (Some(r), Some(Term::NamedNode(f_node))) = (iri(&row[0]), &row[1]) else {
+                continue;
+            };
+            let f_iri = f_node.as_str().to_string();
+            let list = report_findings.entry(r).or_default();
+            if !list.iter().any(|existing| existing == &f_iri) {
+                list.push(f_iri.clone());
             }
-        };
-        let x = &mut list[at];
-        let p = iri(&row[4]);
-        match (p.as_deref(), &row[5]) {
-            (Some(p), Some(Term::NamedNode(n))) if p == gr("about") => {
-                if !x.about.iter().any(|a| a == n.as_str()) {
-                    x.about.push(n.as_str().to_string());
-                }
+            if seen_findings.insert(f_iri) {
+                uniq_findings.push(f_node.clone());
             }
-            (Some(p), Some(Term::NamedNode(n))) if p == gr("citesClaim") => {
-                if !x.claims.iter().any(|c| c == n.as_str()) {
-                    x.claims.push(n.as_str().to_string());
-                }
-            }
-            (Some(p), Some(Term::NamedNode(n))) if p == gr("citesDecision") => {
-                if !x.decisions.iter().any(|c| c == n.as_str()) {
-                    x.decisions.push(n.as_str().to_string());
-                }
-            }
-            (Some(p), Some(t)) if p == gr("cites") => {
-                let t = t.to_string();
-                if !x.cites.contains(&t) {
-                    x.cites.push(t);
-                }
-            }
-            _ => {}
         }
     }
+
+    // Step 2: fetch order, text, and optional citations strictly for the selected
+    // finding IDs (grounded GSPO prefix lookups per finding) so citations on unselected
+    // reports or other review policies are never scanned.
+    struct RawFinding {
+        has_order: bool,
+        order: u64,
+        text: Option<String>,
+        about: Vec<String>,
+        cites: Vec<String>,
+        claims: Vec<String>,
+        decisions: Vec<String>,
+    }
+    let (order_pred, text_pred, about_pred, cites_pred, claim_pred, decision_pred) = (
+        gr("order"),
+        gr("text"),
+        gr("about"),
+        gr("cites"),
+        gr("citesClaim"),
+        gr("citesDecision"),
+    );
+    let pred_filter = format!(
+        "FILTER(?p IN (<{order_pred}>, <{text_pred}>, <{about_pred}>, <{cites_pred}>, <{claim_pred}>, <{decision_pred}>))"
+    );
+    let mut raw: HashMap<String, RawFinding> = HashMap::with_capacity(uniq_findings.len());
+    for chunk in uniq_findings.chunks(FINDING_PROPS_BATCH) {
+        let branches: Vec<String> = chunk
+            .iter()
+            .map(|f| format!("BIND({f} AS ?f) {f} ?p ?v ."))
+            .collect();
+        let q = format!(
+            "SELECT ?f ?p ?v WHERE {{ GRAPH <{graph}> {{ {{ {} }} {pred_filter} }} }}",
+            balanced_union(&branches),
+        );
+        for row in rows_in(input, opts, &q)? {
+            let row = row.values();
+            let (Some(f_iri), Some(p)) = (iri(&row[0]), iri(&row[1])) else {
+                continue;
+            };
+            let entry = raw.entry(f_iri).or_insert_with(|| RawFinding {
+                has_order: false,
+                order: 0,
+                text: None,
+                about: Vec::new(),
+                cites: Vec::new(),
+                claims: Vec::new(),
+                decisions: Vec::new(),
+            });
+            if p == order_pred {
+                let ord = int(&row[2]).unwrap_or(0);
+                if !entry.has_order || ord < entry.order {
+                    entry.has_order = true;
+                    entry.order = ord;
+                }
+            } else if p == text_pred {
+                if entry.text.is_none() {
+                    entry.text = lit(&row[2]);
+                }
+            } else if p == about_pred {
+                if let Some(Term::NamedNode(n)) = &row[2]
+                    && !entry.about.iter().any(|a| a == n.as_str())
+                {
+                    entry.about.push(n.as_str().to_string());
+                }
+            } else if p == claim_pred {
+                if let Some(Term::NamedNode(n)) = &row[2]
+                    && !entry.claims.iter().any(|c| c == n.as_str())
+                {
+                    entry.claims.push(n.as_str().to_string());
+                }
+            } else if p == decision_pred {
+                if let Some(Term::NamedNode(n)) = &row[2]
+                    && !entry.decisions.iter().any(|c| c == n.as_str())
+                {
+                    entry.decisions.push(n.as_str().to_string());
+                }
+            } else if p == cites_pred
+                && let Some(t) = &row[2]
+            {
+                let t = t.to_string();
+                if !entry.cites.contains(&t) {
+                    entry.cites.push(t);
+                }
+            }
+        }
+    }
+
     for r in reports {
-        let mut f = by.remove(&r.iri).unwrap_or_default();
-        f.sort_by_key(|x| x.order);
-        r.findings = f;
+        let mut list: Vec<FindingRef> = Vec::new();
+        if let Some(f_iris) = report_findings.remove(&r.iri) {
+            for f_iri in f_iris {
+                if let Some(rf) = raw.get(&f_iri)
+                    && rf.has_order
+                    && let Some(text) = &rf.text
+                {
+                    list.push(FindingRef {
+                        iri: f_iri,
+                        order: rf.order,
+                        text: text.clone(),
+                        about: rf.about.clone(),
+                        cites: rf.cites.clone(),
+                        claims: rf.claims.clone(),
+                        decisions: rf.decisions.clone(),
+                    });
+                }
+            }
+        }
+        list.sort_by_key(|x| x.order);
+        r.findings = list;
     }
     Ok(())
 }

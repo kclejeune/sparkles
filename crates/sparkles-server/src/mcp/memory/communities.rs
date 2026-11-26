@@ -550,7 +550,7 @@ impl Tools<'_> {
                     .collect())
             };
         let mut lists: Vec<HashMap<String, usize>> = Vec::new();
-        if let Some(hits) = self.eligible_text_hits(ds, r, q, graph, &report_pat, depth)?
+        if let Some(hits) = self.eligible_text_hits(ds, r, q, graph, level, filter, depth)?
             && !hits.is_empty()
         {
             lists.push(rank_terms(hits.into_iter()));
@@ -578,21 +578,23 @@ impl Tools<'_> {
     }
 
     /// Eligible-only streaming BM25 text ranking over the report and finding literals
-    /// matched by `report_pat` in `graph`, gated on the dataset's full-text index being
-    /// enabled, ready, and covering `graph`.
+    /// matching `level` and `filter` in `graph`, gated on the dataset's full-text index
+    /// being enabled, ready, and covering `graph`.
     ///
     /// Uses the index's configured `maxTextBytes` prefix and default accent-folding
-    /// analyzer (`StandardAnalyzer`), streams eligible reports in bounded batches over
-    /// the same authorized read view in two passes (corpus stats, then per-report best
-    /// score into a bounded top-`depth` heap), and never materializes all eligible
-    /// literals or all matching reports in memory.
+    /// analyzer (`StandardAnalyzer`), enumerates candidate report IRIs via access-checked
+    /// single-predicate ordered index scans (zero `DISTINCT` hash set and `O(1)` scan
+    /// state), verifies eligibility in bounded batches, and streams literals in two passes
+    /// (corpus stats, then per-report best score into a bounded top-`depth` heap).
+    #[allow(clippy::too_many_arguments)]
     fn eligible_text_hits(
         &self,
         ds: &crate::state::Dataset,
         r: &Reader,
         q: &str,
         graph: &str,
-        report_pat: &str,
+        level: u32,
+        filter: Filter<'_>,
         depth: usize,
     ) -> Result<Option<Vec<(NamedNode, f64)>>, sparkles::error::Error> {
         if !ds.dataset.indexes().text().enabled() {
@@ -643,8 +645,17 @@ impl Tools<'_> {
             .join(", ");
         let max_text_bytes = status.config.max_text_bytes;
         let finding = crate::graphrag::guard::gr("finding");
-        let reports_sparql =
-            format!("SELECT DISTINCT ?r WHERE {{ GRAPH <{graph}> {{ {report_pat} }} }}");
+        let community = crate::graphrag::guard::gr("Community");
+        let lv = crate::graphrag::guard::gr("level");
+        let report_pred = crate::graphrag::guard::gr("report");
+        let status_pred = crate::graphrag::guard::gr("status");
+        let status_in = crate::graphrag::store::Status::ALL
+            .into_iter()
+            .filter(|s| filter.admits(*s))
+            .map(|s| format!("\"{}\"", s.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let anchor_scans = report_anchor_scans(graph, filter)?;
         let q_index: HashMap<&str, usize> = q_tokens
             .iter()
             .enumerate()
@@ -670,10 +681,12 @@ impl Tools<'_> {
             )
         }
 
+        // RejectMaterialization enforces that candidate report enumeration runs as a
+        // strictly streaming, single-predicate index scan with O(1) cursor state.
         let report_cursor_opts = sparkles::sparql::CursorOptions {
             batch_rows: REPORT_BATCH,
             batch_bytes: 256 << 10,
-            fallback: sparkles::sparql::FallbackPolicy::AllowMaterialization,
+            fallback: sparkles::sparql::FallbackPolicy::RejectMaterialization,
         };
         let lit_cursor_opts = sparkles::sparql::CursorOptions {
             batch_rows: LITERAL_BATCH_ROWS,
@@ -689,6 +702,48 @@ impl Tools<'_> {
         type BatchLitFn<'a> = &'a mut dyn FnMut(usize, &str) -> Result<(), sparkles::error::Error>;
         type ReportBatchFn<'a> =
             &'a mut dyn FnMut(&[NamedNode]) -> Result<(), sparkles::error::Error>;
+
+        let filter_eligible_batch = |candidates: &[NamedNode],
+                                     status_scan: Option<(&'static str, &[&'static str])>,
+                                     eligible: &mut Vec<NamedNode>|
+         -> Result<(), sparkles::error::Error> {
+            eligible.clear();
+            if candidates.is_empty() {
+                return Ok(());
+            }
+            let values_r = candidates
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let status_clause = match status_scan {
+                None => format!("?r <{status_pred}> ?status . FILTER(?status IN ({status_in}))"),
+                Some((st, prior)) => {
+                    let mut clause = format!("?r <{status_pred}> \"{st}\" .");
+                    for ps in prior {
+                        clause.push_str(&format!(
+                            " FILTER NOT EXISTS {{ GRAPH <{graph}> {{ ?r <{status_pred}> \"{ps}\" . }} }}"
+                        ));
+                    }
+                    clause
+                }
+            };
+            let sparql = format!(
+                "SELECT ?r WHERE {{ GRAPH <{graph}> {{ VALUES ?r {{ {values_r} }} {status_clause} ?c <{report_pred}> ?r ; a <{community}> ; <{lv}> ?l . FILTER(?l = {level}) }} }}"
+            );
+            let mut cursor = r.select_cursor(&sparql, &lit_cursor_opts)?;
+            while let Some(batch) = cursor.next_batch()? {
+                for row in 0..batch.len() {
+                    if let Some(owned) = batch.term(row, 0)?
+                        && let Term::NamedNode(rep) = owned.as_term()
+                        && !eligible.iter().any(|existing| existing == rep)
+                    {
+                        eligible.push(rep.clone());
+                    }
+                }
+            }
+            Ok(())
+        };
 
         // Ground each subject directly in a balanced UNION (depth <= 5) so every read is
         // a bounded GSPO point lookup for those subjects rather than a full predicate
@@ -811,20 +866,28 @@ impl Tools<'_> {
 
         let for_each_report_batch =
             |on_batch: ReportBatchFn<'_>| -> Result<(), sparkles::error::Error> {
-                let mut cursor = r.select_cursor(&reports_sparql, &report_cursor_opts)?;
+                let mut candidates: Vec<NamedNode> = Vec::with_capacity(REPORT_BATCH);
                 let mut reps: Vec<NamedNode> = Vec::with_capacity(REPORT_BATCH);
-                while let Some(batch) = cursor.next_batch()? {
-                    reps.clear();
-                    for row in 0..batch.len() {
-                        if let Some(owned) = batch.term(row, 0)?
-                            && let Term::NamedNode(rep) = owned.as_term()
-                        {
-                            reps.push(rep.clone());
+                for scan in &anchor_scans {
+                    let mut cursor = r.select_cursor(&scan.sparql, &report_cursor_opts)?;
+                    while let Some(batch) = cursor.next_batch()? {
+                        candidates.clear();
+                        for row in 0..batch.len() {
+                            if let Some(owned) = batch.term(row, 0)?
+                                && let Term::NamedNode(rep) = owned.as_term()
+                            {
+                                candidates.push(rep.clone());
+                            }
                         }
-                    }
-                    drop(batch);
-                    if !reps.is_empty() {
-                        on_batch(&reps)?;
+                        drop(batch);
+                        let status_scan = scan
+                            .status_scan
+                            .as_ref()
+                            .map(|(st, prior)| (*st, prior.as_slice()));
+                        filter_eligible_batch(&candidates, status_scan, &mut reps)?;
+                        if !reps.is_empty() {
+                            on_batch(&reps)?;
+                        }
                     }
                 }
                 Ok(())
@@ -968,6 +1031,49 @@ impl Tools<'_> {
     }
 }
 
+struct ReportAnchorScan {
+    sparql: String,
+    /// For unpolicied status scans, `(status, earlier_admitted_statuses)` so a report
+    /// carrying multiple admitted statuses is admitted at most once across scans.
+    status_scan: Option<(&'static str, Vec<&'static str>)>,
+}
+
+/// Build single-predicate, single-variable ordered scan queries over `graph` that cover
+/// every report matching `filter` without a `DISTINCT` hash set or join build table.
+fn report_anchor_scans(
+    graph: &str,
+    filter: Filter<'_>,
+) -> Result<Vec<ReportAnchorScan>, sparkles::error::Error> {
+    if let Some(p) = filter.review_policy_iri {
+        let node = NamedNode::new(p)
+            .map_err(|e| sparkles::error::Error::Invalid(format!("reviewPolicy IRI: {e}")))?;
+        let sparql = format!(
+            "SELECT ?r WHERE {{ GRAPH <{graph}> {{ ?r <{rp}> {node} . }} }}",
+            rp = crate::graphrag::guard::gr("reviewPolicy"),
+        );
+        return Ok(vec![ReportAnchorScan {
+            sparql,
+            status_scan: None,
+        }]);
+    }
+    let statuses: Vec<&'static str> = crate::graphrag::store::Status::ALL
+        .into_iter()
+        .filter(|s| filter.admits(*s))
+        .map(|s| s.as_str())
+        .collect();
+    let status_pred = crate::graphrag::guard::gr("status");
+    let mut scans = Vec::with_capacity(statuses.len());
+    for (i, &st) in statuses.iter().enumerate() {
+        let sparql =
+            format!("SELECT ?r WHERE {{ GRAPH <{graph}> {{ ?r <{status_pred}> \"{st}\" . }} }}");
+        scans.push(ReportAnchorScan {
+            sparql,
+            status_scan: Some((st, statuses[..i].to_vec())),
+        });
+    }
+    Ok(scans)
+}
+
 /// The predicates of the vector indexes that embed query text and may hold report text:
 /// an index over `gr:summary`, `gr:text` or `rdfs:label`, one with no predicate list, or
 /// one fed by its own query (round 1, finding 8).
@@ -1046,5 +1152,170 @@ mod tests {
         let err = budget_identities(&doc, &reports, MAX_IDENTITY_MEMBER_ENTRIES, 1024).unwrap_err();
         assert_eq!(err.code.as_ref(), "incomplete-evidence");
         assert_eq!(err.status, 422);
+    }
+
+    #[test]
+    fn report_enumeration_scan_plan_is_bounded_ordered_scan() {
+        const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
+        let gr = crate::graphrag::guard::gr;
+        let (c_cls, lv, rep, stat, rp) = (
+            gr("Community"),
+            gr("level"),
+            gr("report"),
+            gr("status"),
+            gr("reviewPolicy"),
+        );
+        let main_iri = "urn:ev:policy:main";
+
+        let build_store = |count: usize| -> sparkles::store::Store {
+            let store = sparkles::store::Store::in_memory(sparkles::store::StoreOptions::default());
+            let mut trig = format!("<{REPORTS}> {{\n");
+            for i in 0..count {
+                trig.push_str(&format!(
+                    "  <urn:c:{i:04}> a <{c_cls}> ; <{lv}> 0 ; <{rep}> <urn:r:{i:04}> .\n  <urn:r:{i:04}> <{stat}> \"reviewed\" ; <{rp}> <{main_iri}> .\n"
+                ));
+            }
+            trig.push_str("}\n");
+            store
+                .load(&[sparkles::io::Source::from_bytes(
+                    trig.into_bytes(),
+                    sparkles::io::RdfFormat::TriG,
+                    None,
+                )])
+                .unwrap();
+            store
+        };
+
+        fn assert_plan_bounded(plan: &sparkles::sparql::CursorPlan) {
+            assert!(
+                !plan.materializes,
+                "unexpected materialization at {}",
+                plan.operator.operator
+            );
+            assert!(
+                !plan.full_input_before_output,
+                "unexpected blocking operator {}",
+                plan.operator.operator
+            );
+            assert!(
+                !plan.growing_state,
+                "unexpected growing state at {}",
+                plan.operator.operator
+            );
+            assert_ne!(
+                plan.operator.operator, "Distinct",
+                "anchor scan must not introduce DISTINCT"
+            );
+            assert_ne!(
+                plan.operator.operator, "HashJoin",
+                "anchor scan must not introduce HashJoin"
+            );
+            for child in &plan.children {
+                assert_plan_bounded(child);
+            }
+        }
+
+        let scan_opts = sparkles::sparql::CursorOptions {
+            batch_rows: 16,
+            batch_bytes: 256 << 10,
+            fallback: sparkles::sparql::FallbackPolicy::RejectMaterialization,
+        };
+        let q_opts = sparkles::sparql::QueryOptions {
+            // Tight memory budget that rejects a 2,000-report DISTINCT/join build table
+            // while easily accommodating an O(1) ordered index scan.
+            max_memory_bytes: Some(128 << 10),
+            ..sparkles::sparql::QueryOptions::default()
+        };
+
+        let small = build_store(50);
+        let large = build_store(2_000);
+
+        for filter in [
+            Filter {
+                reviewed_only: false,
+                review_policy_iri: Some(main_iri),
+            },
+            Filter {
+                reviewed_only: false,
+                review_policy_iri: None,
+            },
+            Filter {
+                reviewed_only: true,
+                review_policy_iri: None,
+            },
+        ] {
+            let scans = report_anchor_scans(REPORTS, filter).unwrap();
+            let run_scans = |store: &sparkles::store::Store, expected: usize| -> u64 {
+                let snap = store.snapshot();
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut max_peak = 0u64;
+                for scan in &scans {
+                    let mut cursor = sparkles::sparql::select_cursor(
+                        snap.clone(),
+                        &scan.sparql,
+                        &q_opts,
+                        &scan_opts,
+                    )
+                    .unwrap();
+                    assert_plan_bounded(cursor.plan());
+                    while let Some(batch) = cursor.next_batch().unwrap() {
+                        for row in 0..batch.len() {
+                            if let Some(owned) = batch.term(row, 0).unwrap()
+                                && let Term::NamedNode(n) = owned.as_term()
+                            {
+                                assert!(
+                                    seen.insert(n.as_str().to_string()),
+                                    "duplicate report from single-predicate scan: {n}"
+                                );
+                            }
+                        }
+                    }
+                    max_peak = max_peak.max(cursor.stats().mem_peak_bytes);
+                }
+                assert_eq!(seen.len(), expected);
+                max_peak
+            };
+
+            let small_peak = run_scans(&small, 50);
+            let large_peak = run_scans(&large, 2_000);
+            assert!(
+                large_peak <= 64 << 10,
+                "anchor scan peak memory grew unexpectedly for 2,000 reports: {large_peak} bytes (50-report peak: {small_peak})"
+            );
+            assert!(
+                large_peak <= small_peak.saturating_add(16 << 10),
+                "anchor scan peak memory should remain O(1) across 40x report growth: small={small_peak}, large={large_peak}"
+            );
+        }
+
+        // Contrast: the old multi-pattern `SELECT DISTINCT ?r` query retains growing state
+        // (DISTINCT/join) on the same 2,000-report store.
+        let old_sparql = format!(
+            "SELECT DISTINCT ?r WHERE {{ GRAPH <{REPORTS}> {{ VALUES ?status {{ \"reviewed\" \"unreviewed\" \"stale\" }} ?c a <{c_cls}> ; <{lv}> ?l ; <{rep}> ?r . FILTER(?l = 0) ?r <{stat}> ?status ; <{rp}> <{main_iri}> . }} }}"
+        );
+        let old_cursor = sparkles::sparql::select_cursor(
+            large.snapshot(),
+            &old_sparql,
+            &sparkles::sparql::QueryOptions::default(),
+            &sparkles::sparql::CursorOptions {
+                batch_rows: 16,
+                batch_bytes: 256 << 10,
+                fallback: sparkles::sparql::FallbackPolicy::AllowMaterialization,
+            },
+        )
+        .unwrap();
+        fn has_growing_distinct_or_join(plan: &sparkles::sparql::CursorPlan) -> bool {
+            (plan.growing_state
+                && matches!(
+                    plan.operator.operator.as_str(),
+                    "Distinct" | "HashJoin" | "MergeJoin"
+                ))
+                || plan.children.iter().any(has_growing_distinct_or_join)
+        }
+        assert!(
+            has_growing_distinct_or_join(old_cursor.plan()),
+            "expected legacy SELECT DISTINCT join to carry growing state: {:?}",
+            old_cursor.plan()
+        );
     }
 }

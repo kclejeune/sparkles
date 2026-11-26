@@ -2431,7 +2431,7 @@ async fn policy_scoped_text_search_streams_under_tight_row_and_memory_budgets() 
     let gr = crate::graphrag::guard::gr;
     let main_iri = sparkles::evidence::review::policy_iri("main");
     let other_iri = sparkles::evidence::review::policy_iri("other");
-    let (c_cls, lv, cnt, rep, r_cls, sum, stat, rat, rp, pv, fnd, ord, txt) = (
+    let (c_cls, lv, cnt, rep, r_cls, sum, stat, rat, rp, pv, fnd, ord, txt, abt, cts, cclm, cdec) = (
         gr("Community"),
         gr("level"),
         gr("memberCount"),
@@ -2445,19 +2445,25 @@ async fn policy_scoped_text_search_streams_under_tight_row_and_memory_budgets() 
         gr("finding"),
         gr("order"),
         gr("text"),
+        gr("about"),
+        gr("cites"),
+        gr("citesClaim"),
+        gr("citesDecision"),
     );
 
     // 500 eligible reports * (1 label + 1 summary + 4 findings) = 3,000 eligible literals,
-    // with ~900-byte summaries and findings (~2.25 MiB of literal payloads).
+    // with ~900-byte summaries and findings (~2.25 MiB of literal payloads), PLUS 2,199
+    // `gr:about` citations across unselected reports (well above `max_rows = 1_000`) to
+    // verify `with_findings_in` never scans citations of unselected reports (R4-2).
     let pad = "detail ".repeat(120);
     let mut trig = format!("<{REPORTS}> {{\n");
     trig.push_str(&format!(
         r#"  <urn:c:main-hit> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:main-hit> .
   <urn:r:main-hit> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Quiet Main" ; <{sum}> "Mentions zephyr overview {pad}" ; <{stat}> "reviewed" ; <{rat}> 1 ; <{rp}> <{main}> ; <{pv}> 1 ; <{fnd}> <urn:r:main-hit#f1>, <urn:r:main-hit#f2>, <urn:r:main-hit#f3>, <urn:r:main-hit#f4> .
-  <urn:r:main-hit#f1> <{ord}> 1 ; <{txt}> "Single zephyr note {pad}" .
-  <urn:r:main-hit#f2> <{ord}> 2 ; <{txt}> "Background note two {pad}" .
-  <urn:r:main-hit#f3> <{ord}> 3 ; <{txt}> "Background note three {pad}" .
-  <urn:r:main-hit#f4> <{ord}> 4 ; <{txt}> "Background note four {pad}" .
+  <urn:r:main-hit#f1> <{ord}> 1 ; <{txt}> "Single zephyr note {pad}" ; <{abt}> <urn:ent:main-1> ; <{cts}> <urn:fact:main-1> ; <{cclm}> <urn:claim:main-1> ; <{cdec}> <urn:dec:main-1> .
+  <urn:r:main-hit#f2> <{ord}> 2 ; <{txt}> "Background note two {pad}" ; <{abt}> <urn:ent:main-2> .
+  <urn:r:main-hit#f3> <{ord}> 3 ; <{txt}> "Background note three {pad}" ; <{abt}> <urn:ent:main-3> .
+  <urn:r:main-hit#f4> <{ord}> 4 ; <{txt}> "Uncited background note four {pad}" .
 "#,
         main = main_iri.as_str(),
     ));
@@ -2465,10 +2471,10 @@ async fn policy_scoped_text_search_streams_under_tight_row_and_memory_budgets() 
         trig.push_str(&format!(
             r#"  <urn:c:fill-{i}> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:fill-{i}> .
   <urn:r:fill-{i}> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Fill {i}" ; <{sum}> "Unrelated overview {i} {pad}" ; <{stat}> "reviewed" ; <{rat}> 5 ; <{rp}> <{main}> ; <{pv}> 1 ; <{fnd}> <urn:r:fill-{i}#f1>, <urn:r:fill-{i}#f2>, <urn:r:fill-{i}#f3>, <urn:r:fill-{i}#f4> .
-  <urn:r:fill-{i}#f1> <{ord}> 1 ; <{txt}> "Background detail a {i} {pad}" .
-  <urn:r:fill-{i}#f2> <{ord}> 2 ; <{txt}> "Background detail b {i} {pad}" .
-  <urn:r:fill-{i}#f3> <{ord}> 3 ; <{txt}> "Background detail c {i} {pad}" .
-  <urn:r:fill-{i}#f4> <{ord}> 4 ; <{txt}> "Background detail d {i} {pad}" .
+  <urn:r:fill-{i}#f1> <{ord}> 1 ; <{txt}> "Background detail a {i} {pad}" ; <{abt}> <urn:ent:fill-{i}-1> .
+  <urn:r:fill-{i}#f2> <{ord}> 2 ; <{txt}> "Background detail b {i} {pad}" ; <{abt}> <urn:ent:fill-{i}-2> .
+  <urn:r:fill-{i}#f3> <{ord}> 3 ; <{txt}> "Background detail c {i} {pad}" ; <{abt}> <urn:ent:fill-{i}-3> .
+  <urn:r:fill-{i}#f4> <{ord}> 4 ; <{txt}> "Background detail d {i} {pad}" ; <{abt}> <urn:ent:fill-{i}-4> .
 "#,
             main = main_iri.as_str(),
         ));
@@ -2476,7 +2482,11 @@ async fn policy_scoped_text_search_streams_under_tight_row_and_memory_budgets() 
     for i in 0..50 {
         trig.push_str(&format!(
             r#"  <urn:c:off-{i}> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:off-{i}> .
-  <urn:r:off-{i}> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Off {i}" ; <{sum}> "zephyr zephyr excluded overview {i} {pad}" ; <{stat}> "reviewed" ; <{rat}> 10 ; <{rp}> <{other}> ; <{pv}> 1 .
+  <urn:r:off-{i}> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Off {i}" ; <{sum}> "zephyr zephyr excluded overview {i} {pad}" ; <{stat}> "reviewed" ; <{rat}> 10 ; <{rp}> <{other}> ; <{pv}> 1 ; <{fnd}> <urn:r:off-{i}#f1>, <urn:r:off-{i}#f2>, <urn:r:off-{i}#f3>, <urn:r:off-{i}#f4> .
+  <urn:r:off-{i}#f1> <{ord}> 1 ; <{txt}> "Excluded detail a {i} {pad}" ; <{abt}> <urn:ent:off-{i}-1> .
+  <urn:r:off-{i}#f2> <{ord}> 2 ; <{txt}> "Excluded detail b {i} {pad}" ; <{abt}> <urn:ent:off-{i}-2> .
+  <urn:r:off-{i}#f3> <{ord}> 3 ; <{txt}> "Excluded detail c {i} {pad}" ; <{abt}> <urn:ent:off-{i}-3> .
+  <urn:r:off-{i}#f4> <{ord}> 4 ; <{txt}> "Excluded detail d {i} {pad}" ; <{abt}> <urn:ent:off-{i}-4> .
 "#,
             other = other_iri.as_str(),
         ));
@@ -2505,7 +2515,7 @@ async fn policy_scoped_text_search_streams_under_tight_row_and_memory_budgets() 
         &st,
         tight_mcp.clone(),
         "community_reports",
-        json!({ "query": "zephyr", "reviewPolicy": "main", "level": 0, "limit": 5 }),
+        json!({ "query": "zephyr", "reviewPolicy": "main", "level": 0, "limit": 1 }),
     )
     .unwrap();
     assert_eq!(sparse_policied["ranking"], "search", "{sparse_policied}");
@@ -2513,6 +2523,56 @@ async fn policy_scoped_text_search_streams_under_tight_row_and_memory_budgets() 
         sparse_policied["reports"][0]["iri"], "urn:r:main-hit",
         "{sparse_policied}"
     );
+    // R4-2: Selected report keeps all 4 findings in order (including f4 with zero
+    // citations) and exact citations on f1, despite >2,000 citations on unselected reports
+    // exceeding `max_rows = 1_000`.
+    let hit_findings = sparse_policied["reports"][0]["findings"]
+        .as_array()
+        .unwrap();
+    assert_eq!(hit_findings.len(), 4, "{sparse_policied}");
+    assert_eq!(hit_findings[0]["iri"], "urn:r:main-hit#f1");
+    assert_eq!(hit_findings[0]["cites"], json!(["<urn:fact:main-1>"]));
+    assert_eq!(hit_findings[0]["claims"], json!(["urn:claim:main-1"]));
+    assert_eq!(hit_findings[0]["decisions"], json!(["urn:dec:main-1"]));
+    assert_eq!(hit_findings[1]["iri"], "urn:r:main-hit#f2");
+    assert_eq!(hit_findings[2]["iri"], "urn:r:main-hit#f3");
+    assert_eq!(hit_findings[3]["iri"], "urn:r:main-hit#f4");
+    assert_eq!(hit_findings[3]["cites"], json!([]));
+    assert_eq!(hit_findings[3]["claims"], json!([]));
+    assert_eq!(hit_findings[3]["decisions"], json!([]));
+
+    // Also verify `with_findings` directly preserves `gr:about` on cited findings and
+    // keeps uncited findings under the same `max_rows = 1_000` budget (while >2,000
+    // unselected `gr:about` triples exist in the reports graph).
+    let snap = ds.store().snapshot();
+    let tight_opts = sparkles::sparql::QueryOptions {
+        max_rows: Some(1_000),
+        max_memory_bytes: Some(1 << 20),
+        ..sparkles::sparql::QueryOptions::default()
+    };
+    let mut selected = crate::graphrag::read::reports_named(
+        &snap,
+        &tight_opts,
+        REPORTS,
+        &["urn:r:main-hit".to_string()],
+        crate::graphrag::read::Filter {
+            reviewed_only: false,
+            review_policy_iri: Some(main_iri.as_str()),
+        },
+    )
+    .unwrap();
+    crate::graphrag::read::with_findings(&snap, &tight_opts, REPORTS, &mut selected).unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].findings.len(), 4);
+    assert_eq!(selected[0].findings[0].about, vec!["urn:ent:main-1"]);
+    assert_eq!(selected[0].findings[0].cites, vec!["<urn:fact:main-1>"]);
+    assert_eq!(selected[0].findings[0].claims, vec!["urn:claim:main-1"]);
+    assert_eq!(selected[0].findings[0].decisions, vec!["urn:dec:main-1"]);
+    assert_eq!(selected[0].findings[3].iri, "urn:r:main-hit#f4");
+    assert!(selected[0].findings[3].about.is_empty());
+    assert!(selected[0].findings[3].cites.is_empty());
+    assert!(selected[0].findings[3].claims.is_empty());
+    assert!(selected[0].findings[3].decisions.is_empty());
 
     let broad_policied = mcp_tool_with_cfg(
         &st,
@@ -2533,6 +2593,161 @@ async fn policy_scoped_text_search_streams_under_tight_row_and_memory_budgets() 
     .unwrap();
     assert_eq!(broad_unpolicied["ranking"], "search", "{broad_unpolicied}");
     assert_eq!(broad_unpolicied["reports"].as_array().unwrap().len(), 5);
+}
+
+/// R4-1: Bounded ordered report enumeration handles many small reports under tight memory
+/// while preserving shared findings across reports, duplicate community links to one
+/// report, and reports carrying multiple admitted statuses without duplicates.
+#[cfg(feature = "text")]
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_scoped_text_search_enumerates_many_small_reports_and_deduplicates_links() {
+    const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
+    let mut st = AppState::standalone(Default::default(), Duration::from_secs(30));
+    st.limits.max_rows = 10_000;
+    st.limits.max_result_bytes = None;
+    let st = Arc::new(st);
+    let state_ds = st.attach("org", DbType::Mem, None).unwrap();
+    let p = sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+    state_ds
+        .dataset
+        .store()
+        .activate_memory_configuration_history(&p)
+        .unwrap();
+    state_ds
+        .store
+        .load(&[Source::from_bytes(
+            ORG.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let ds = state_ds.dataset.clone();
+    evidence::configure(&ds, &settings(), &Control::none()).unwrap();
+    ds.indexes()
+        .text()
+        .enable(sparkles::text::TextConfig::default())
+        .unwrap();
+
+    let gr = crate::graphrag::guard::gr;
+    let main_iri = sparkles::evidence::review::policy_iri("main");
+    let (c_cls, lv, cnt, rep, r_cls, sum, stat, rat, rp, pv, fnd, ord, txt) = (
+        gr("Community"),
+        gr("level"),
+        gr("memberCount"),
+        gr("report"),
+        gr("Report"),
+        gr("summary"),
+        gr("status"),
+        gr("rating"),
+        gr("reviewPolicy"),
+        gr("policyVersion"),
+        gr("finding"),
+        gr("order"),
+        gr("text"),
+    );
+
+    let mut trig = format!("<{REPORTS}> {{\n");
+    // 1) Duplicate community links pointing to the same report at level 0.
+    trig.push_str(&format!(
+        r#"  <urn:c:dup-a> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:dup-comm> .
+  <urn:c:dup-b> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:dup-comm> .
+  <urn:r:dup-comm> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Dup" ; <{sum}> "Unique marigold summary." ; <{stat}> "reviewed" ; <{rat}> 2 ; <{rp}> <{main}> ; <{pv}> 1 .
+"#,
+        main = main_iri.as_str(),
+    ));
+    // 2) Report carrying two admitted statuses ("reviewed" and "stale").
+    trig.push_str(&format!(
+        r#"  <urn:c:multi-stat> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:multi-stat> .
+  <urn:r:multi-stat> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Multi" ; <{sum}> "Unique saffron summary." ; <{stat}> "reviewed", "stale" ; <{rat}> 2 ; <{rp}> <{main}> ; <{pv}> 1 .
+"#,
+        main = main_iri.as_str(),
+    ));
+    // 3) Shared finding referenced by two distinct reports.
+    trig.push_str(&format!(
+        r#"  <urn:c:shared-a> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:shared-a> .
+  <urn:c:shared-b> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:shared-b> .
+  <urn:r:shared-a> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Shared A" ; <{sum}> "General overview." ; <{stat}> "reviewed" ; <{rat}> 1 ; <{rp}> <{main}> ; <{pv}> 1 ; <{fnd}> <urn:f:shared-cobalt> .
+  <urn:r:shared-b> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Shared B" ; <{sum}> "General overview." ; <{stat}> "reviewed" ; <{rat}> 1 ; <{rp}> <{main}> ; <{pv}> 1 ; <{fnd}> <urn:f:shared-cobalt> .
+  <urn:f:shared-cobalt> <{ord}> 1 ; <{txt}> "Shared cobalt finding across communities." .
+"#,
+        main = main_iri.as_str(),
+    ));
+    // 4) 1,500 small filler reports.
+    for i in 0..1_500 {
+        trig.push_str(&format!(
+            r#"  <urn:c:small-{i:04}> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:small-{i:04}> .
+  <urn:r:small-{i:04}> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "S{i}" ; <{sum}> "Small filler {i}" ; <{stat}> "reviewed" ; <{rat}> 5 ; <{rp}> <{main}> ; <{pv}> 1 .
+"#,
+            main = main_iri.as_str(),
+        ));
+    }
+    trig.push_str("}\n");
+    ds.store()
+        .load(&[Source::from_bytes(trig.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+
+    crate::settings::store_runtime(
+        &st,
+        &state_ds,
+        &crate::settings::GRAPHRAG,
+        &json!({ "enabled": true, "principal": "local", "projection": { "graphs": ["urn:g:org"] } }),
+    )
+    .unwrap();
+
+    let tight_mcp = crate::mcp::McpConfig {
+        query_memory_bytes: Some(512 << 10),
+        ..crate::mcp::McpConfig::default()
+    };
+
+    // Shared finding must score both reports deterministically (policied and unpolicied).
+    for extra in [json!({ "reviewPolicy": "main" }), json!({})] {
+        let mut args = json!({ "query": "cobalt", "level": 0, "limit": 2 });
+        if let Some(p) = extra.get("reviewPolicy") {
+            args["reviewPolicy"] = p.clone();
+        }
+        let res = mcp_tool_with_cfg(&st, tight_mcp.clone(), "community_reports", args).unwrap();
+        assert_eq!(res["ranking"], "search", "{res}");
+        let iris: Vec<&str> = res["reports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["iri"].as_str())
+            .collect();
+        assert_eq!(iris, vec!["urn:r:shared-a", "urn:r:shared-b"], "{res}");
+        assert_eq!(res["reports"][0]["score"], res["reports"][1]["score"]);
+    }
+
+    // Duplicate community link yields one hit (never duplicated).
+    let dup = mcp_tool_with_cfg(
+        &st,
+        tight_mcp.clone(),
+        "community_reports",
+        json!({ "query": "marigold", "reviewPolicy": "main", "level": 0, "limit": 3 }),
+    )
+    .unwrap();
+    assert_eq!(dup["ranking"], "search", "{dup}");
+    assert_eq!(dup["reports"][0]["iri"], "urn:r:dup-comm");
+    assert!(dup["reports"][0]["score"].is_number());
+    assert!(
+        dup["reports"][1]["score"].is_null(),
+        "duplicate community link must not emit report twice: {dup}"
+    );
+
+    // Multi-status report yields one hit across unpolicied status scans (never duplicated).
+    let multi = mcp_tool_with_cfg(
+        &st,
+        tight_mcp,
+        "community_reports",
+        json!({ "query": "saffron", "level": 0, "limit": 3 }),
+    )
+    .unwrap();
+    assert_eq!(multi["ranking"], "search", "{multi}");
+    assert_eq!(multi["reports"][0]["iri"], "urn:r:multi-stat");
+    assert!(multi["reports"][0]["score"].is_number());
+    assert!(
+        multi["reports"][1]["score"].is_null(),
+        "multi-status report must not emit twice across status scans: {multi}"
+    );
 }
 
 /// R3-2: Scoped text search preserves the full-text index's default accent-insensitive

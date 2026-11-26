@@ -484,10 +484,19 @@ pub fn report_blocks(n: usize, r: &Value, budget: u64) -> Vec<(String, Vec<usize
         block0_body,
         extra0,
     );
-    let summary_avail = if probe_body.finding_complete {
-        block0_body.saturating_sub(probe_body.core_chars)
+    let body_reserve = if probe_body.finding_complete {
+        probe_body.core_chars
+    } else if probe_body.admitted_count >= 2 {
+        probe_body
+            .must_chars
+            .max(probe_body.bare_chars.saturating_mul(2))
     } else {
-        (block0_body / 4).min(block0_body.saturating_sub(probe_body.must_chars))
+        probe_body.must_chars
+    };
+    let summary_avail = if probe_body.finding_complete {
+        block0_body.saturating_sub(body_reserve)
+    } else {
+        (block0_body / 4).min(block0_body.saturating_sub(body_reserve))
     };
     if summary_avail >= 16 {
         let summary_line = prompts::cut(&full_summary, summary_avail - 1);
@@ -1759,6 +1768,71 @@ mod tests {
             !parts[1].0.contains("more identities)"),
             "bare link should fit without omission: {}",
             parts[1].0
+        );
+    }
+
+    #[test]
+    fn report_blocks_first_block_summary_preserves_multiple_complete_identity_links() {
+        let budget = 256;
+        let max_chars = (budget * CHARS_PER_TOKEN) as usize;
+        let title = "T".repeat(200);
+        let summary = "S".repeat(300);
+        let finding = format!("FIRST_START_{}_FIRST_END", "f".repeat(828));
+        assert_eq!(finding.len(), 850);
+
+        // Two complete bare identity lines of exactly 202 chars each including trailing '\n'
+        // ("Identity: <" 11 + ent 88 + "> resolvesTo <" 14 + rep 87 + ">" 1 = 201 chars + '\n').
+        let ent1 = format!("http://example.org/entity/a/{}", "1".repeat(60));
+        let rep1 = format!("http://example.org/entity/r/{}", "1".repeat(59));
+        let ent2 = format!("http://example.org/entity/b/{}", "2".repeat(60));
+        let rep2 = format!("http://example.org/entity/r/{}", "2".repeat(59));
+        let bare1 = format!("Identity: <{ent1}> resolvesTo <{rep1}>");
+        let bare2 = format!("Identity: <{ent2}> resolvesTo <{rep2}>");
+        assert_eq!(bare1.len() + 1, 202);
+        assert_eq!(bare2.len() + 1, 202);
+
+        let r = json!({
+            "title": title,
+            "summary": summary,
+            "findings": [{
+                "text": finding,
+                "about": [ent1, ent2],
+            }],
+            "identities": [
+                {
+                    "entity": ent1,
+                    "representative": rep1,
+                    "members": [rep1, ent1],
+                    "membersComplete": true,
+                },
+                {
+                    "entity": ent2,
+                    "representative": rep2,
+                    "members": [rep2, ent2],
+                    "membersComplete": true,
+                },
+            ],
+        });
+        let parts = report_blocks(1, &r, budget);
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert_eq!(parts[0].1, vec![0], "{parts:?}");
+        let text = &parts[0].0;
+        assert!(
+            text.chars().count() <= max_chars,
+            "exceeded budget: {}",
+            text.chars().count()
+        );
+        assert!(
+            text.contains(&bare1),
+            "first complete bare identity link was dropped: {text}"
+        );
+        assert!(
+            text.contains(&bare2),
+            "second complete bare identity link was displaced by block-0 summary: {text}"
+        );
+        assert!(
+            !text.contains("more identities)"),
+            "both complete bare identity links should fit without omission: {text}"
         );
     }
 }
