@@ -66,6 +66,11 @@ struct Offer<'a> {
 }
 
 impl HeapRows<u32> for Offer<'_> {
+    fn reserve_key_slots(&mut self, _bytes: u64) -> Result<()> {
+        // The batch reservation already includes the candidate's key slots.
+        Ok(())
+    }
+
     fn keep(&mut self, i: usize, keys: &[SortKey]) -> Result<u32> {
         let added = keys.iter().map(SortKey::payload_bytes).sum::<u64>();
         let next_key_bytes = self.slots.key_bytes.saturating_add(added);
@@ -193,7 +198,11 @@ impl TopK {
             let used = slots.ids.len() / width.max(1);
             let room = (heap.k().saturating_add(1).saturating_sub(used)).min(table.len);
             slots.ids.reserve(room * width);
-            let base_entries = heap.kept() + room;
+            // A recycled ID slot still needs a fresh key vector for the offer.
+            let base_entries = heap
+                .k()
+                .saturating_add(1)
+                .min(heap.kept().saturating_add(table.len()));
             charge.resize(1024 + slots.bytes(base_entries, keys.len()))?;
             let mut rows = Offer {
                 slots: &mut *slots,
@@ -442,4 +451,63 @@ impl VectorOrder {
         }
         Ok(batch)
     }
+}
+
+#[cfg(test)]
+#[test]
+fn topk_cursor_admits_key_slots_once() {
+    use crate::sparql::table::Table;
+    use crate::sparql::value::Value;
+    use std::mem::size_of;
+
+    let store = crate::store::Store::in_memory(Default::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    let var = ctx.var("v");
+    let mut table = Table::new(vec![var]);
+    table.push_row(&[Id::from_i64(32).unwrap()]);
+    let keys = vec![(Expr::Var(var), true); 16];
+    let mut slots = Slots {
+        vars: vec![var],
+        ids: Vec::with_capacity(1),
+        free: Vec::new(),
+        batch: vec![Some(0)],
+        key_bytes: 0,
+    };
+    let reserved = 1024 + slots.bytes(1, keys.len());
+    // The first key's one-row sort column and its retained value column.
+    let first_keys = size_of::<SortKey>() as u64 + size_of::<Option<Value>>() as u64 + 256;
+    let map = ctx.nvars() as u64 * 16 + 128;
+    ctx.mem_limit = reserved + first_keys + map;
+    ctx.enable_cursor_accounting().unwrap();
+    let ctx = ctx.into_shared();
+    let mut charge = OwnedCharge::new(&ctx, reserved).unwrap();
+    let mut heap = Heap::new(1, vec![true; keys.len()]);
+    let mut rows = Offer {
+        slots: &mut slots,
+        table: &table,
+        charge: &mut charge,
+        keys_len: keys.len(),
+        step: ctx.reservation_step(),
+        base_entries: 1,
+    };
+
+    assert_eq!(
+        exec::offer_rows(
+            &ctx,
+            &mut heap,
+            &table,
+            &keys,
+            &mut Report::default(),
+            &mut rows
+        )
+        .unwrap(),
+        1,
+    );
+    assert_eq!(ctx.mem_peak(), ctx.mem_limit);
+    assert_eq!(ctx.live_bytes(), reserved);
+    assert_eq!(heap.kept(), 1);
+    drop(heap);
+    drop(slots);
+    drop(charge);
+    assert_eq!(ctx.live_bytes(), 0);
 }

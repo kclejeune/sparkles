@@ -4046,6 +4046,10 @@ struct RestOffer<'a> {
 }
 
 impl HeapRows<u32> for RestOffer<'_> {
+    fn reserve_key_slots(&mut self, _bytes: u64) -> Result<()> {
+        unreachable!("ordered top-k only offers a single key")
+    }
+
     fn keep(&mut self, i: usize, keys: &[SortKey]) -> Result<u32> {
         let s = &mut *self.slots;
         let slot = match s.free.pop() {
@@ -7431,6 +7435,8 @@ fn id_key(ctx: &Ctx, id: Id) -> Result<SortKey> {
 
 /// Where [`offer_rows`] keeps the rows that may enter a [`TopK`].
 pub(super) trait HeapRows<P> {
+    /// Make room for the candidate's key vector before allocating it.
+    fn reserve_key_slots(&mut self, bytes: u64) -> Result<()>;
     /// Keep row `i` of the input for an entry with these keys.
     fn keep(&mut self, i: usize, keys: &[SortKey]) -> Result<P>;
     /// An entry left the heap, or an offered row did not enter.
@@ -7464,6 +7470,16 @@ impl<'a> EagerHeapRows<'a> {
 }
 
 impl HeapRows<usize> for EagerHeapRows<'_> {
+    fn reserve_key_slots(&mut self, bytes: u64) -> Result<()> {
+        // The vector moves into the heap. Cover its slots here on the same
+        // charge that keep() uses for the complete entry.
+        let need = self.bytes.saturating_add(bytes);
+        if need > self.charge.bytes() {
+            self.charge.resize(need)?;
+        }
+        Ok(())
+    }
+
     fn keep(&mut self, i: usize, keys: &[SortKey]) -> Result<usize> {
         let added = Self::entry_bytes(keys);
         let next = self.bytes.saturating_add(added);
@@ -7632,7 +7648,8 @@ pub(super) fn offer_rows<P>(
             heap.skip();
             continue;
         }
-        let row_decode = ctx.charge(key_slots)?;
+        rows.reserve_key_slots(key_slots)?;
+        let row_decode = ctx.charge(0)?;
         let mut row = Vec::with_capacity(keys.len());
         row.push(first);
         for (k, source) in sources.iter().enumerate().skip(1) {
@@ -7665,6 +7682,57 @@ pub(super) fn offer_rows<P>(
     }
     ctx.check()?;
     Ok(ranked)
+}
+
+#[cfg(test)]
+#[test]
+fn topk_eager_admits_key_slots_once() {
+    use std::mem::size_of;
+
+    let store = crate::store::Store::in_memory(Default::default());
+    // The first key's one-row sort column and its retained value column.
+    let first_keys = size_of::<SortKey>() as u64 + size_of::<Option<Value>>() as u64 + 256;
+    let key_count = 16;
+    let key_slots = (key_count * size_of::<SortKey>()) as u64;
+    let entry = size_of::<Entry<usize>>() as u64 + key_slots;
+    for (cap, fits) in [
+        (first_keys + entry, true),
+        (first_keys + key_slots - 1, false),
+    ] {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = cap;
+        let ctx = ctx.into_shared();
+        let var = ctx.var("v");
+        let mut table = Table::new(vec![var]);
+        table.push_row(&[Id::from_i64(32).unwrap()]);
+        let keys = vec![(Expr::Var(var), true); key_count];
+        let mut rows = EagerHeapRows::new(&ctx).unwrap();
+        let mut heap = TopK::new(1, vec![true; keys.len()]);
+
+        let result = offer_rows(
+            &ctx,
+            &mut heap,
+            &table,
+            &keys,
+            &mut ExprReport::default(),
+            &mut rows,
+        );
+        if fits {
+            assert_eq!(result.unwrap(), 1);
+            assert_eq!(ctx.mem_peak(), cap);
+            assert_eq!(ctx.live_bytes(), entry);
+            assert_eq!(heap.kept(), 1);
+        } else {
+            assert!(
+                matches!(result, Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory)
+            );
+            assert_eq!(ctx.live_bytes(), 0);
+            assert_eq!(heap.kept(), 0);
+        }
+        drop(heap);
+        drop(rows);
+        assert_eq!(ctx.live_bytes(), 0);
+    }
 }
 
 #[cfg(test)]
@@ -7728,6 +7796,142 @@ fn topk_screens_tied_base_iris_across_batches() {
         assert_eq!(winner.payload, 1);
         assert_eq!(winner.seq, 5);
     }
+}
+
+#[cfg(test)]
+fn topk_compacted_keys() -> (crate::store::Store, [Id; 4]) {
+    use crate::sparql::opt_tests::load;
+    use oxrdf::{Literal, NamedNode, Term};
+
+    let store = crate::store::Store::in_memory(Default::default());
+    load(
+        &store,
+        "<urn:a> <urn:p> <urn:b> . <urn:c> <urn:p> \"text\" .",
+        crate::io::RdfFormat::Turtle,
+    );
+    store.compact().unwrap();
+    let snap = store.snapshot();
+    let keys = [
+        NamedNode::new_unchecked("urn:a").into(),
+        NamedNode::new_unchecked("urn:b").into(),
+        NamedNode::new_unchecked("urn:c").into(),
+        Term::Literal(Literal::new_simple_literal("text")),
+    ]
+    .map(|term| snap.lookup_term(&term).unwrap());
+    assert!(keys.iter().all(|id| id.tag() == crate::id::Tag::Vocab));
+    (store, keys)
+}
+
+#[cfg(test)]
+#[test]
+fn topk_orders_base_iris_with_other_keys() {
+    let (store, [a, b, c, text]) = topk_compacted_keys();
+    let ctx = Ctx::new(store.snapshot());
+    let primary = ctx.var("primary");
+    let secondary = ctx.var("secondary");
+    let first = Id::from_i64(2).unwrap();
+    let better = Id::from_i64(1).unwrap();
+    let run = |input: &[[Id; 2]], asc: bool, k| {
+        let keys = [(Expr::Var(primary), true), (Expr::Var(secondary), asc)];
+        let mut table = Table::new(vec![primary, secondary]);
+        for row in input {
+            table.push_row(row);
+        }
+        let mut rows = EagerHeapRows::new(&ctx).unwrap();
+        let mut heap = TopK::new(k, vec![true, asc]);
+        let ranked = offer_rows(
+            &ctx,
+            &mut heap,
+            &table,
+            &keys,
+            &mut ExprReport::default(),
+            &mut rows,
+        )
+        .unwrap();
+        let kept: Vec<_> = heap.into_sorted().into_iter().map(|e| e.payload).collect();
+        (ranked, kept)
+    };
+
+    for (asc, best, worst) in [(true, a, c), (false, c, a)] {
+        assert_eq!(run(&[[first, best], [better, worst]], asc, 1), (2, vec![1]));
+
+        // The third entry ties the worst base IRI and sifts up. The next two
+        // offers replace the worst and sift down against other base IRIs.
+        let sifting = [best, worst, worst, b, best, worst].map(|id| [first, id]);
+        assert_eq!(run(&sifting, asc, 3), (5, vec![0, 4, 3]));
+
+        for term in [Id::UNDEF, Id::bnode(1)] {
+            let winner = if asc { 1 } else { 0 };
+            assert_eq!(
+                run(&[[first, best], [first, term]], asc, 1),
+                (2, vec![winner])
+            );
+        }
+        for term in [text, Id::from_i64(32).unwrap()] {
+            let winner = if asc { 0 } else { 1 };
+            assert_eq!(
+                run(&[[first, best], [first, term]], asc, 1),
+                (2, vec![winner])
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn topk_polls_cancellation_before_skipping_a_base_iri_tie() {
+    struct CancelOnKeep<'a, 'b> {
+        inner: &'a mut EagerHeapRows<'b>,
+        cancel: &'a std::sync::atomic::AtomicBool,
+    }
+    impl HeapRows<usize> for CancelOnKeep<'_, '_> {
+        fn reserve_key_slots(&mut self, bytes: u64) -> Result<()> {
+            self.inner.reserve_key_slots(bytes)
+        }
+
+        fn keep(&mut self, i: usize, keys: &[SortKey]) -> Result<usize> {
+            let kept = self.inner.keep(i, keys)?;
+            self.cancel.store(true, AtomicOrdering::Relaxed);
+            Ok(kept)
+        }
+
+        fn release(&mut self, entry: Entry<usize>) -> Result<()> {
+            self.inner.release(entry)
+        }
+    }
+
+    let (store, [best, worse, ..]) = topk_compacted_keys();
+    let ctx = Ctx::new(store.snapshot());
+    let secondary = ctx.var("secondary");
+    let keys = [
+        (Expr::Const(Id::from_i64(32).unwrap()), true),
+        (Expr::Var(secondary), true),
+    ];
+    let mut table = Table::new(vec![secondary]);
+    table.push_row(&[best]);
+    table.push_row(&[worse]);
+    let mut rows = EagerHeapRows::new(&ctx).unwrap();
+    let mut heap = TopK::new(1, vec![true, true]);
+    let mut cancelling = CancelOnKeep {
+        inner: &mut rows,
+        cancel: &ctx.cancel,
+    };
+    assert!(matches!(
+        offer_rows(
+            &ctx,
+            &mut heap,
+            &table,
+            &keys,
+            &mut ExprReport::default(),
+            &mut cancelling
+        ),
+        Err(Error::Cancelled),
+    ));
+
+    // A poll only at the end of the batch would also return Cancelled, but
+    // would already have advanced the sequence past the rejected row.
+    assert!(heap.offer(vec![SortKey::NULL; 2], 0).is_some());
+    assert_eq!(heap.into_sorted()[0].seq, 1);
 }
 
 /// Candidates for `ORDER BY k1 k2 … LIMIT k`: a row whose first key is worse than the
