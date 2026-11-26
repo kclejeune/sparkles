@@ -140,6 +140,14 @@ impl Terms {
         self.local(key)
     }
 
+    #[cfg(test)]
+    pub(crate) fn backing_ptrs(&self) -> (usize, Option<usize>) {
+        (
+            self.keys.as_ptr() as usize,
+            self.keys.first().map(|k| Arc::as_ptr(k) as usize),
+        )
+    }
+
     pub fn bytes(&self) -> u64 {
         self.keys.iter().map(|k| k.retained_bytes() + 48).sum()
     }

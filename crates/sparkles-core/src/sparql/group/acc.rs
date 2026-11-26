@@ -373,7 +373,10 @@ impl Accumulator for Running {
         if let Some(weights) = batch.weights {
             match (&agg.func, batch.arg) {
                 (AggregateFunction::Count, Arg::Star) => {
-                    for (&slot, &w) in slots.iter().zip(weights) {
+                    for (row, (&slot, &w)) in slots.iter().zip(weights).enumerate() {
+                        if row.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
                         if w > 0
                             && let AggState::Count(n) = &mut self.states[slot as usize]
                         {
@@ -382,7 +385,12 @@ impl Accumulator for Running {
                     }
                 }
                 (AggregateFunction::Count, Arg::Column(values)) => {
-                    for ((&slot, id), &w) in slots.iter().zip(values).zip(weights) {
+                    for (row, ((&slot, id), &w)) in
+                        slots.iter().zip(values).zip(weights).enumerate()
+                    {
+                        if row.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
                         if w > 0
                             && !id.is_undef()
                             && let AggState::Count(n) = &mut self.states[slot as usize]
@@ -391,7 +399,9 @@ impl Accumulator for Running {
                         }
                     }
                 }
-                (AggregateFunction::Count, Arg::Unbound) => {}
+                (AggregateFunction::Count, Arg::Unbound) => {
+                    ctx.check()?;
+                }
                 _ => {
                     let best = self.track && self.is_best();
                     for (row, &slot) in slots.iter().enumerate() {
@@ -504,11 +514,14 @@ impl Accumulator for Running {
         ) && !self.agg.distinct
     }
 
-    fn retract(&mut self, _ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<bool> {
+    fn retract(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<bool> {
         if !self.retractable() {
             return Ok(false);
         }
         for (row, &slot) in slots.iter().enumerate() {
+            if row.is_multiple_of(1024) {
+                ctx.check()?;
+            }
             let w = batch.retract_weight(row);
             if w == 0 {
                 continue;
@@ -738,6 +751,7 @@ impl SumState {
         } else {
             Value::Integer(i64::try_from(self.int).ok()?.into())
         };
+        let has_double = !self.doubles.is_empty();
         let mut floats: Vec<(f32, i64)> = self
             .floats
             .iter()
@@ -745,7 +759,12 @@ impl SumState {
             .collect();
         floats.sort_by(|a, b| a.0.total_cmp(&b.0));
         for (f, n) in floats {
-            acc = arith(NumOp::Add, &acc, &Value::Float(Float::from(f * n as f32))).ok()?;
+            let term = if has_double {
+                Value::Double(Double::from(f64::from(f) * n as f64))
+            } else {
+                Value::Float(Float::from(f * n as f32))
+            };
+            acc = arith(NumOp::Add, &acc, &term).ok()?;
         }
         let mut doubles: Vec<(f64, i64)> = self
             .doubles
@@ -1128,6 +1147,8 @@ impl Accumulator for Ordered {
                     return Ok(Id::UNDEF);
                 }
                 let strings = ctx.aggregate_errors.concat_strings_only();
+                let charge = ctx.charge(0)?;
+                let mut charged = 0u64;
                 let mut out = String::new();
                 let mut empty = true;
                 for (v, n) in &m.vals {
@@ -1142,16 +1163,79 @@ impl Accumulator for Ordered {
                     else {
                         return Ok(Id::UNDEF);
                     };
-                    let reps = if *distinct { 1 } else { *n };
-                    for _ in 0..reps {
-                        if !empty {
-                            out.push_str(separator);
-                        }
+                    let reps = if *distinct { 1u64 } else { *n as u64 };
+                    if s.is_empty() && separator.is_empty() {
                         empty = false;
-                        out.push_str(&s);
+                        continue;
+                    }
+                    let seps = if empty { reps - 1 } else { reps };
+                    let added = reps
+                        .checked_mul(s.len() as u64)
+                        .and_then(|b| {
+                            seps.checked_mul(separator.len() as u64)
+                                .and_then(|sb| b.checked_add(sb))
+                        })
+                        .and_then(|b| usize::try_from(b).ok());
+                    let Some(added) = added else {
+                        return Err(Error::BudgetExceeded(crate::error::Budget {
+                            kind: crate::error::BudgetKind::Memory,
+                            limit: ctx.mem_limit,
+                            requested: u64::MAX,
+                        }));
+                    };
+                    let Some(new_len) = out.len().checked_add(added) else {
+                        return Err(Error::BudgetExceeded(crate::error::Budget {
+                            kind: crate::error::BudgetKind::Memory,
+                            limit: ctx.mem_limit,
+                            requested: u64::MAX,
+                        }));
+                    };
+                    let need = new_len as u64;
+                    if need > charged {
+                        charge.add(need - charged)?;
+                        charged = need;
+                    }
+                    let mut rem = reps;
+                    while rem > 0 {
+                        ctx.check()?;
+                        let chunk = rem.min(1024);
+                        let chunk_seps = if empty { chunk - 1 } else { chunk };
+                        let chunk_bytes =
+                            (chunk as usize) * s.len() + (chunk_seps as usize) * separator.len();
+                        let next_len = out.len() + chunk_bytes;
+                        if next_len > out.capacity() {
+                            let cap_bound = if rem == chunk {
+                                let amortized = new_len.max(out.capacity().saturating_mul(2));
+                                if amortized > new_len
+                                    && (amortized as u64) > charged
+                                    && charge.add(amortized as u64 - charged).is_ok()
+                                {
+                                    charged = amortized as u64;
+                                    amortized
+                                } else {
+                                    new_len
+                                }
+                            } else {
+                                next_len.max(out.capacity().saturating_mul(2)).min(new_len)
+                            };
+                            if cap_bound > out.capacity() {
+                                out.reserve_exact(cap_bound - out.len());
+                            }
+                        }
+                        for _ in 0..chunk {
+                            if !empty {
+                                out.push_str(separator);
+                            }
+                            empty = false;
+                            out.push_str(&s);
+                        }
+                        rem -= chunk;
                     }
                 }
-                Ok(finish_concat(ctx, *distinct, empty, true, out))
+                let id = finish_concat(ctx, *distinct, empty, true, out);
+                drop(charge);
+                ctx.check()?;
+                Ok(id)
             }
         }
     }

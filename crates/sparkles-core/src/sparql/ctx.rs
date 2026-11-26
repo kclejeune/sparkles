@@ -3860,6 +3860,14 @@ impl Ctx {
             LocalVocab::Owned(_) => crate::incr::terms::Terms::default(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn circuit_terms_backing_ptrs(&self) -> Option<(usize, Option<usize>)> {
+        match &*self.local.read() {
+            LocalVocab::Circuit(terms) => Some(terms.backing_ptrs()),
+            LocalVocab::Owned(_) => None,
+        }
+    }
 }
 
 /// The term of one decoded vocabulary key, admitted on `row` before it is built.

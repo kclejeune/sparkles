@@ -182,6 +182,9 @@ impl Group {
         for acc in &mut self.accs {
             acc.clear();
         }
+        if let Some(m) = self.gann.as_mut() {
+            *m = AnnMap::default();
+        }
     }
 
     fn shrink_unused(&mut self) {
@@ -191,6 +194,9 @@ impl Group {
             self.index = FxHashMap::default();
             for acc in &mut self.accs {
                 acc.clear();
+            }
+            if let Some(m) = self.gann.as_mut() {
+                m.shrink_unused();
             }
             return;
         }
@@ -205,11 +211,19 @@ impl Group {
         for acc in &mut self.accs {
             acc.shrink_unused();
         }
+        if let Some(m) = self.gann.as_mut() {
+            m.shrink_unused();
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn backing_capacities(&self) -> (usize, usize) {
         (self.slots.capacity(), self.index.capacity())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gann_capacity(&self) -> usize {
+        self.gann.as_ref().map_or(0, |m| m.capacity())
     }
 
     fn push_group(&mut self, key: Row) -> u32 {
@@ -325,6 +339,7 @@ impl Group {
         }
         if let Some(m) = self.gann.as_mut() {
             m.retain(|k, _| self.index.contains_key(k));
+            m.shrink_unused();
         }
         Ok(out)
     }
@@ -659,5 +674,108 @@ impl Group {
             *m = prov::load_map(r, mode)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::incr::compile::compile;
+    use crate::incr::ops::Op;
+    use crate::incr::pass::{Pass, Vis};
+    use crate::incr::terms::Terms;
+    use crate::sparql;
+    use crate::store::{Store, StoreOptions};
+    use crate::task::Control;
+
+    fn find_group_mut(n: &mut Node) -> Option<&mut Group> {
+        match &mut n.op {
+            Op::Group(g) => Some(g),
+            Op::Project(p) => find_group_mut(&mut p.inner),
+            Op::Filter(f) => find_group_mut(&mut f.inner),
+            Op::Extend(e) => find_group_mut(&mut e.inner),
+            Op::Distinct(d) => find_group_mut(&mut d.inner),
+            _ => None,
+        }
+    }
+
+    /// Directly invokes `Group::apply` (bypassing `Node::delta`) to verify both the
+    /// operator's own cancellation checks and weighted `COUNT` polling.
+    #[test]
+    fn group_apply_polls_cancellation_after_entry() {
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let parsed = sparql::parse_query(
+            "PREFIX : <http://ex/> SELECT ?g (COUNT(*) AS ?c) WHERE { ?x :g ?g } GROUP BY ?g",
+            None,
+            &[],
+        )
+        .unwrap();
+        let mut plan = compile(&parsed, None).unwrap();
+        let group = find_group_mut(&mut plan.root).expect("Group operator");
+        let vis = Vis::new(None, &snap);
+        let mut terms = Terms::default();
+
+        // 1. Pre-cancelled control aborts inside `Group::apply` itself.
+        let ctl = Control::none();
+        ctl.cancel.cancel();
+        let mut pass = Pass::new(
+            snap.clone(),
+            None,
+            &[],
+            &[],
+            &mut terms,
+            &vis,
+            None,
+            &ctl,
+            &plan.vars,
+        );
+        let one_row: Changes = vec![(
+            vec![Id::from_i64(1).unwrap(); group.inner.schema.len()].into(),
+            1,
+        )];
+        let err = group
+            .apply(&mut pass, one_row)
+            .expect_err("expected Cancelled inside Group::apply");
+        assert!(matches!(err, Error::Cancelled), "got {err:?}");
+
+        // 2. Large weighted COUNT(*) batch polls `ctx.check()` inside weighted add & retract.
+        let ok_ctl = Control::none();
+        let mut pass = Pass::new(
+            snap,
+            None,
+            &[],
+            &[],
+            &mut terms,
+            &vis,
+            None,
+            &ok_ctl,
+            &plan.vars,
+        );
+        let pos_rows: Changes = (0..5000i64)
+            .map(|i| {
+                let mut r = vec![Id::from_i64(i).unwrap(); group.inner.schema.len()];
+                if let Some(Some(k)) = group.keys.first() {
+                    r[*k] = Id::from_i64(0).unwrap();
+                }
+                (r.into_boxed_slice(), 1)
+            })
+            .collect();
+        let before_add = crate::sparql::ctx::CHECKS.with(|n| n.get());
+        group.apply(&mut pass, pos_rows.clone()).unwrap();
+        let add_checks = crate::sparql::ctx::CHECKS.with(|n| n.get()) - before_add;
+        assert!(
+            add_checks >= 5,
+            "expected weighted COUNT(*) add_batch to poll ctx.check(), got {add_checks}"
+        );
+
+        let neg_rows: Changes = pos_rows.into_iter().map(|(r, _)| (r, -1)).collect();
+        let before_ret = crate::sparql::ctx::CHECKS.with(|n| n.get());
+        group.apply(&mut pass, neg_rows).unwrap();
+        let ret_checks = crate::sparql::ctx::CHECKS.with(|n| n.get()) - before_ret;
+        assert!(
+            ret_checks >= 5,
+            "expected weighted COUNT(*) retract to poll ctx.check(), got {ret_checks}"
+        );
     }
 }

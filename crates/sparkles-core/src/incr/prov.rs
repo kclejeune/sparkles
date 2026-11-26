@@ -462,6 +462,17 @@ impl AnnMap {
         });
         self.bytes = bytes;
     }
+
+    /// Release excess hash-table backing capacity after deletions.
+    pub fn shrink_unused(&mut self) {
+        const SHRINK_MIN_CAP: usize = 64;
+        if self.map.is_empty() {
+            self.map = FxHashMap::default();
+        } else if self.map.capacity() >= SHRINK_MIN_CAP && self.map.len() * 4 <= self.map.capacity()
+        {
+            self.map.shrink_to(self.map.len() * 2);
+        }
+    }
 }
 
 /// Annotated changes: each row's weight change and the change of its annotation. A row
@@ -899,9 +910,11 @@ pub fn load_map(r: &mut Reader, mode: Provenance) -> Result<AnnMap> {
     Ok(m)
 }
 
-/// The approximate memory of a state's annotations.
+/// The approximate memory of a state's annotations, including hash-table backing capacity.
 pub fn map_bytes(m: &AnnMap, width: usize) -> u64 {
-    m.bytes + m.len() as u64 * super::zset::row_bytes(width)
+    let live_rows = m.len() as u64 * (width as u64 * 8);
+    let table = m.capacity() as u64 * (std::mem::size_of::<(Row, Ann)>() as u64 + 8);
+    m.bytes + live_rows + table
 }
 
 /// Add change `d` to row `row`'s annotation in `m`, dropping it when it becomes zero,
@@ -1069,9 +1082,21 @@ mod tests {
                     }
                 }
                 let sum: u64 = m.values().map(Ann::bytes).sum();
-                let rows = m.len() as u64 * super::super::zset::row_bytes(1);
-                assert_eq!(map_bytes(&m, 1), sum + rows);
+                let live_rows = m.len() as u64 * 8;
+                let table = m.capacity() as u64 * (std::mem::size_of::<(Row, Ann)>() as u64 + 8);
+                assert_eq!(map_bytes(&m, 1), sum + live_rows + table);
             }
+            // Retaining nothing leaves backing capacity charged until `shrink_unused` frees it.
+            for k in 0..200i64 {
+                m.insert(vec![id(k)].into(), Ann::derivation(mode, vec![]));
+            }
+            m.retain(|_, _| false);
+            assert!(m.is_empty());
+            assert!(m.capacity() >= 200);
+            assert!(map_bytes(&m, 1) > 0);
+            m.shrink_unused();
+            assert_eq!(m.capacity(), 0);
+            assert_eq!(map_bytes(&m, 1), 0);
         }
     }
 

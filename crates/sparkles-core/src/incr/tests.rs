@@ -1596,74 +1596,107 @@ fn view_group_budget_reclaims_backing_allocations_after_deletions() {
         "SELECT ?g (COUNT(*) AS ?c) WHERE { ?x :g ?g } GROUP BY ?g",
         "SELECT ?g (SUM(?v) AS ?s) (MIN(?v) AS ?lo) (COUNT(DISTINCT ?v) AS ?cd) WHERE { ?x :g ?g ; :v ?v } GROUP BY ?g",
     ];
-    for q in queries {
-        let s = Store::in_memory(StoreOptions::default());
-        let mut c = circuit(&s, q);
-        let mut ins = String::from(PREFIX);
-        ins.push_str("INSERT DATA { ");
-        for i in 0..1000 {
-            ins.push_str(&format!(":s{i} :g :g{i} ; :v {i} . "));
-        }
-        ins.push('}');
-        upd(&s, &ins).unwrap();
-        step(&s, &mut c);
-        let group = find_group(&c.root).expect("Group operator");
-        let peak_bytes = group.bytes();
-        let (peak_slots_cap, peak_idx_cap) = group.backing_capacities();
-        assert!(peak_slots_cap >= 1000 && peak_idx_cap >= 1000);
-        // COUNT stores Vec<AggState> per slot; Group::bytes() must not undercount at 8 B/group.
-        assert!(
-            peak_bytes >= 1000 * 64,
-            "peak_bytes={peak_bytes} too small for 1000 groups: {q}"
-        );
+    for prov in [
+        super::prov::Provenance::None,
+        super::prov::Provenance::Count,
+    ] {
+        for q in queries {
+            let s = Store::in_memory(StoreOptions::default());
+            let parsed = sparql::parse_query(&format!("{PREFIX}{q}"), None, &[]).expect("parse");
+            let mut c = Circuit::new(compile(&parsed, None).expect("compile"), None);
+            c.set_provenance(prov).expect("set provenance");
+            c.build(s.snapshot(), &Control::none()).expect("build");
 
-        // Delete 850 groups -> backing buffers shrink well below peak.
-        let mut del = String::from(PREFIX);
-        del.push_str("DELETE DATA { ");
-        for i in 0..850 {
-            del.push_str(&format!(":s{i} :g :g{i} ; :v {i} . "));
-        }
-        del.push('}');
-        upd(&s, &del).unwrap();
-        step(&s, &mut c);
-        let group = find_group(&c.root).expect("Group operator");
-        let shrunk_bytes = group.bytes();
-        let (shrunk_slots_cap, shrunk_idx_cap) = group.backing_capacities();
-        assert!(
-            shrunk_bytes < peak_bytes / 2,
-            "expected shrunk bytes {shrunk_bytes} < peak/2 ({}): {q}",
-            peak_bytes / 2
-        );
-        assert!(shrunk_slots_cap < peak_slots_cap && shrunk_idx_cap < peak_idx_cap);
-        check(&s, &c, q, "after partial drain");
+            let mut ins = String::from(PREFIX);
+            ins.push_str("INSERT DATA { ");
+            for i in 0..1000 {
+                ins.push_str(&format!(":s{i} :g :g{i} ; :v {i} . "));
+            }
+            ins.push('}');
+            upd(&s, &ins).unwrap();
+            step(&s, &mut c);
+            let group = find_group(&c.root).expect("Group operator");
+            let peak_bytes = group.bytes();
+            let (peak_slots_cap, peak_idx_cap) = group.backing_capacities();
+            let peak_gann_cap = group.gann_capacity();
+            assert!(peak_slots_cap >= 1000 && peak_idx_cap >= 1000);
+            if !prov.is_none() {
+                assert!(
+                    peak_gann_cap >= 1000,
+                    "expected provenance gann capacity >= 1000, got {peak_gann_cap}: {q}"
+                );
+            }
+            // COUNT stores Vec<AggState> per slot; Group::bytes() must not undercount at 8 B/group.
+            assert!(
+                peak_bytes >= 1000 * 64,
+                "peak_bytes={peak_bytes} too small for 1000 groups ({prov:?}): {q}"
+            );
 
-        // Drain the remaining 150 groups -> 0 bytes and 0 retained backing capacity.
-        let mut del2 = String::from(PREFIX);
-        del2.push_str("DELETE DATA { ");
-        for i in 850..1000 {
-            del2.push_str(&format!(":s{i} :g :g{i} ; :v {i} . "));
-        }
-        del2.push('}');
-        upd(&s, &del2).unwrap();
-        step(&s, &mut c);
-        let group = find_group(&c.root).expect("Group operator");
-        assert_eq!(group.bytes(), 0, "drained group must report 0 bytes: {q}");
-        assert_eq!(
-            group.backing_capacities(),
-            (0, 0),
-            "drained group must release backing allocations: {q}"
-        );
-        check(&s, &c, q, "after full drain");
+            // Delete 850 groups -> backing buffers (and gann) shrink well below peak.
+            let mut del = String::from(PREFIX);
+            del.push_str("DELETE DATA { ");
+            for i in 0..850 {
+                del.push_str(&format!(":s{i} :g :g{i} ; :v {i} . "));
+            }
+            del.push('}');
+            upd(&s, &del).unwrap();
+            step(&s, &mut c);
+            let group = find_group(&c.root).expect("Group operator");
+            let shrunk_bytes = group.bytes();
+            let (shrunk_slots_cap, shrunk_idx_cap) = group.backing_capacities();
+            let shrunk_gann_cap = group.gann_capacity();
+            assert!(
+                shrunk_bytes < peak_bytes / 2,
+                "expected shrunk bytes {shrunk_bytes} < peak/2 ({}) ({prov:?}): {q}",
+                peak_bytes / 2
+            );
+            assert!(shrunk_slots_cap < peak_slots_cap && shrunk_idx_cap < peak_idx_cap);
+            if !prov.is_none() {
+                assert!(
+                    shrunk_gann_cap < peak_gann_cap,
+                    "expected gann capacity {shrunk_gann_cap} < peak {peak_gann_cap}: {q}"
+                );
+            }
+            check(&s, &c, q, "after partial drain");
 
-        // Re-populate and rebuild on an empty store -> clear_state drops allocations too.
-        upd(&s, &ins).unwrap();
-        step(&s, &mut c);
-        assert!(find_group(&c.root).unwrap().bytes() >= 1000 * 64);
-        let empty = Store::in_memory(StoreOptions::default());
-        c.build(empty.snapshot(), &Control::none()).unwrap();
-        let group = find_group(&c.root).expect("Group operator");
-        assert_eq!(group.bytes(), 0);
-        assert_eq!(group.backing_capacities(), (0, 0));
+            // Drain the remaining 150 groups -> 0 bytes and 0 retained backing capacity.
+            let mut del2 = String::from(PREFIX);
+            del2.push_str("DELETE DATA { ");
+            for i in 850..1000 {
+                del2.push_str(&format!(":s{i} :g :g{i} ; :v {i} . "));
+            }
+            del2.push('}');
+            upd(&s, &del2).unwrap();
+            step(&s, &mut c);
+            let group = find_group(&c.root).expect("Group operator");
+            assert_eq!(
+                group.bytes(),
+                0,
+                "drained group must report 0 bytes ({prov:?}): {q}"
+            );
+            assert_eq!(
+                group.backing_capacities(),
+                (0, 0),
+                "drained group must release backing allocations ({prov:?}): {q}"
+            );
+            assert_eq!(
+                group.gann_capacity(),
+                0,
+                "drained group must release gann capacity ({prov:?}): {q}"
+            );
+            check(&s, &c, q, "after full drain");
+
+            // Re-populate and rebuild on an empty store -> clear_state drops allocations too.
+            upd(&s, &ins).unwrap();
+            step(&s, &mut c);
+            assert!(find_group(&c.root).unwrap().bytes() >= 1000 * 64);
+            let empty = Store::in_memory(StoreOptions::default());
+            c.build(empty.snapshot(), &Control::none()).unwrap();
+            let group = find_group(&c.root).expect("Group operator");
+            assert_eq!(group.bytes(), 0);
+            assert_eq!(group.backing_capacities(), (0, 0));
+            assert_eq!(group.gann_capacity(), 0);
+        }
     }
 }
 
@@ -1696,25 +1729,69 @@ fn view_group_agg_ctx_zero_copy_and_memory_limit() {
     assert!(c.terms.key_count() >= 200);
     assert!(c.terms.bytes() > 16_384);
 
+    // Directly observe that `Pass::with_agg_ctx` moves `c.terms`'s exact backing into
+    // `agg_ctx` with zero copies and zero memory charge for historical keys, and restores
+    // the exact same backing on return.
+    let ptrs_before = c.terms.backing_ptrs();
+    {
+        let snap = s.snapshot();
+        let vis = super::pass::Vis::new(None, &snap);
+        let ctl = Control::none();
+        let mut pass = super::pass::Pass::new(
+            snap,
+            None,
+            &[],
+            &[],
+            &mut c.terms,
+            &vis,
+            None,
+            &ctl,
+            &c.vars,
+        );
+        pass.max_memory_bytes = Some(4096);
+        pass.with_agg_ctx(|ctx| {
+            assert_eq!(
+                ctx.circuit_terms_backing_ptrs(),
+                Some(ptrs_before),
+                "agg_ctx must borrow Circuit::terms backing directly without copying"
+            );
+            assert_eq!(
+                ctx.mem_peak(),
+                0,
+                "attaching historical Circuit::terms must charge 0 bytes"
+            );
+            assert!(
+                ctx.value(crate::id::Id::local(0)).is_some(),
+                "historical local term must resolve through moved Terms"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+    assert_eq!(
+        c.terms.backing_ptrs(),
+        ptrs_before,
+        "Restore guard must return the exact Circuit::terms backing"
+    );
+
     // Apply a 1-row change with max_memory_bytes far smaller than `c.terms.bytes()`.
-    // If `with_agg_ctx` copied historical local keys into `agg_ctx`, this would fail or
-    // exceed the budget; sharing `terms` directly succeeds.
     c.max_memory_bytes = Some(4096);
     upd(&s, &format!("{PREFIX}INSERT DATA {{ :s999 :p 999 }}")).unwrap();
     step(&s, &mut c);
     check(&s, &c, q, "1-row change under tight memory budget");
 
-    // When an aggregate actually interns a new local term exceeding `max_memory_bytes`,
-    // `agg_ctx` enforces the limit rather than silently returning UNDEF.
+    // When GROUP_CONCAT expands a single distinct string with large multiplicity past
+    // `max_memory_bytes`, `Ordered::read` refuses it before allocating past the limit.
     let s2 = Store::in_memory(StoreOptions::default());
     let q2 = "SELECT ?g (GROUP_CONCAT(?v; SEPARATOR=\",\") AS ?gc) WHERE { ?x :g ?g ; :v ?v } GROUP BY ?g";
     let mut c2 = circuit(&s2, q2);
-    let big = "x".repeat(4096);
-    upd(
-        &s2,
-        &format!("{PREFIX}INSERT DATA {{ :a :g :g1 ; :v \"{big}\" . :b :g :g1 ; :v \"{big}\" }}"),
-    )
-    .unwrap();
+    let mut rep_ins = String::from(PREFIX);
+    rep_ins.push_str("INSERT DATA { ");
+    for i in 0..500 {
+        rep_ins.push_str(&format!(":r{i} :g :g1 ; :v \"0123456789abcdef\" . "));
+    }
+    rep_ins.push('}');
+    upd(&s2, &rep_ins).unwrap();
     c2.max_memory_bytes = Some(2048);
     let d2 = DeltaSet::read(&s2, c2.applied, &Control::none());
     let err = c2
@@ -1723,7 +1800,7 @@ fn view_group_agg_ctx_zero_copy_and_memory_limit() {
         .expect("expected BudgetExceeded error");
     assert!(
         matches!(err, crate::Error::BudgetExceeded(_)),
-        "expected BudgetExceeded from agg_ctx, got {err:?}"
+        "expected BudgetExceeded from repeated GROUP_CONCAT, got {err:?}"
     );
 }
 
@@ -1759,9 +1836,48 @@ fn view_group_decimal_boundary_ties_sample_and_cancel() {
             with_double
         );
 
+        // Adding two copies of 2e38f (whose f32 product overflows) must stay finite double
+        // while 0.0e0 is present, and demote to float INF when 0.0e0 is retracted.
+        upd(
+            &s,
+            &format!(
+                "{PREFIX}{XSD}INSERT DATA {{ :f1 :v \"2.0e38\"^^xsd:float . :f2 :v \"2.0e38\"^^xsd:float }}"
+            ),
+        )
+        .unwrap();
+        step(&s, &mut c);
+        let with_mixed = result(&c);
+        assert_eq!(with_mixed.len(), 1);
+        assert!(
+            !with_mixed[0].contains("UNDEF") && !with_mixed[0].contains("INF"),
+            "expected finite double SUM and AVG with mixed float+double+decimal, got {:?}",
+            with_mixed
+        );
+
         upd(&s, &format!("{PREFIX}{XSD}DELETE DATA {{ :c :v 0.0e0 }}")).unwrap();
         step(&s, &mut c);
-        check(&s, &c, q, "after retracting double back to overflow");
+        let without_double = result(&c);
+        assert_eq!(without_double.len(), 1);
+        assert!(
+            without_double[0].contains("\"INF\"^^<http://www.w3.org/2001/XMLSchema#float>"),
+            "retracting 0.0e0 with two 2e38f floats should demote to float INF, got {:?}",
+            without_double
+        );
+
+        upd(
+            &s,
+            &format!(
+                "{PREFIX}{XSD}DELETE DATA {{ :f1 :v \"2.0e38\"^^xsd:float . :f2 :v \"2.0e38\"^^xsd:float }}"
+            ),
+        )
+        .unwrap();
+        step(&s, &mut c);
+        check(
+            &s,
+            &c,
+            q,
+            "after retracting double and floats back to overflow",
+        );
 
         upd(
             &s,
@@ -1773,12 +1889,13 @@ fn view_group_decimal_boundary_ties_sample_and_cancel() {
     }
 
     // 2. MIN/MAX lexical ties ("01"^^xsd:integer vs "001"^^xsd:integer) across retraction
-    //    and compaction.
+    //    and compaction, asserting BOTH projected cells.
     {
         let s = Store::in_memory(StoreOptions::default());
         let q =
             "SELECT ?g (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) WHERE { ?x :g ?g ; :v ?v } GROUP BY ?g";
         let mut c = circuit(&s, q);
+        assert_eq!(c.columns(), ["g", "lo", "hi"]);
         upd(
             &s,
             &format!("{PREFIX}{XSD}INSERT DATA {{ :a :g :g1 ; :v \"01\"^^xsd:integer }}"),
@@ -1791,16 +1908,23 @@ fn view_group_decimal_boundary_ties_sample_and_cancel() {
         )
         .unwrap();
         step(&s, &mut c);
-        let tied = result(&c);
-        assert_eq!(tied.len(), 1);
-        assert!(
-            tied[0].contains("\"01\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
-            "first-seen lexical tie should win before retraction: {tied:?}"
+        let expected_tied = vec![
+            "<http://ex/g1> \"01\"^^<http://www.w3.org/2001/XMLSchema#integer> \"01\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+                .to_string(),
+        ];
+        assert_eq!(
+            result(&c),
+            expected_tied,
+            "first-seen lexical tie must win for both MIN and MAX before compaction"
         );
-        // Compaction keeps the tie-run order.
+        // Compaction keeps the tie-run order for both MIN and MAX.
         s.compact().unwrap();
         step(&s, &mut c);
-        assert_eq!(result(&c), tied, "compaction preserves lexical tie order");
+        assert_eq!(
+            result(&c),
+            expected_tied,
+            "compaction preserves lexical tie order for both MIN and MAX"
+        );
 
         // Retracting "01" switches both MIN and MAX to "001".
         upd(
@@ -1809,11 +1933,14 @@ fn view_group_decimal_boundary_ties_sample_and_cancel() {
         )
         .unwrap();
         step(&s, &mut c);
-        let after = result(&c);
-        assert_eq!(after.len(), 1);
-        assert!(
-            after[0].contains("\"001\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
-            "retracting first tie reveals second: {after:?}"
+        let expected_after = vec![
+            "<http://ex/g1> \"001\"^^<http://www.w3.org/2001/XMLSchema#integer> \"001\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+                .to_string(),
+        ];
+        assert_eq!(
+            result(&c),
+            expected_after,
+            "retracting first tie must reveal second for both MIN and MAX"
         );
         check(&s, &c, q, "after retracting lexical tie");
     }

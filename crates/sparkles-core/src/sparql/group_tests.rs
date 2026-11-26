@@ -474,6 +474,44 @@ fn retractable_sum_decimal_overflow_with_float_or_double() {
         );
         assert!(ret_i.retract(&ctx, &retract_d, &[0]).unwrap());
         assert!(ret_i.read(&ctx, 0).unwrap().is_undef());
+
+        // Mixed DOUBLE + overflowing DECIMAL + overflowing repeated FLOAT (2 * 2e38f > f32::MAX):
+        // widening float contributions to f64 keeps SUM and AVG finite and matches Running.
+        let big_f = ctx.intern_value(&Value::Float(2e38_f32.into()));
+        let big_f2 = ctx.intern_value(&Value::Float(2.5e38_f32.into()));
+        for (label, vals) in [
+            (
+                "double+2*dec+2*float",
+                vec![zero_d, big_dec, big_dec, big_f, big_f],
+            ),
+            ("double+2*float", vec![zero_d, big_f, big_f]),
+            ("double+2*distinct_float", vec![zero_d, big_f, big_f2]),
+        ] {
+            let mut run_m = Running::new(&a, false);
+            let mut ret_m = retractable(&a, 1).unwrap();
+            run_m.init(1);
+            ret_m.init(1);
+            let mslots = vec![0u32; vals.len()];
+            fold(&ctx, &mut run_m, &vals, &mslots);
+            fold(&ctx, &mut *ret_m, &vals, &mslots);
+            let got_run = run_m.finish(&ctx, 0).unwrap();
+            let got_ret = ret_m.read(&ctx, 0).unwrap();
+            assert!(
+                matches!(ctx.value(got_ret), Some(Value::Double(d)) if f64::from(d).is_finite()),
+                "{func:?} {label} should stay finite double, got {:?}",
+                ctx.value(got_ret)
+            );
+            assert_eq!(ctx.term(got_ret), ctx.term(got_run), "{func:?} {label}");
+
+            // Retracting 0.0e0 demotes back to xsd:float (+inf).
+            assert!(ret_m.retract(&ctx, &retract_d, &[0]).unwrap());
+            let after_demote = ret_m.read(&ctx, 0).unwrap();
+            assert!(
+                matches!(ctx.value(after_demote), Some(Value::Float(f)) if f32::from(f).is_infinite()),
+                "{func:?} {label} after retracting double should demote to float inf, got {:?}",
+                ctx.value(after_demote)
+            );
+        }
     }
 }
 
@@ -615,4 +653,183 @@ fn retractable_retained_bytes_charges_capacity_and_reclaims_on_drain() {
         acc.swap_remove(0);
     }
     assert_eq!(acc.retained_bytes(), 0);
+}
+
+#[test]
+fn ordered_concat_admits_growth_before_allocating_and_polls_repetitions() {
+    let concat_agg = agg(
+        AggregateFunction::GroupConcat {
+            separator: Some(",".into()),
+        },
+        true,
+        false,
+    );
+    let table = Table::new(vec![0]);
+
+    // 1. One distinct string with huge weight under a tight memory budget must fail before
+    //    allocating past `mem_limit`.
+    let mut tight = ctx();
+    tight.mem_limit = 4096;
+    let tight = tight.into_shared();
+    let s = tight.intern_value(&Value::Str("payload-0123456789abcdef".into()));
+    let mut acc = retractable(&concat_agg, 1).unwrap();
+    acc.init(1);
+    let batch = Batch {
+        table: &table,
+        arg: Arg::Column(&[s]),
+        rows: None,
+        weights: Some(&[100_000]),
+        base: 0,
+    };
+    acc.add_batch(&tight, &batch, &[0]).unwrap();
+    let err = acc
+        .read(&tight, 0)
+        .expect_err("expected BudgetExceeded before expanding repetitions");
+    assert!(
+        matches!(err, crate::Error::BudgetExceeded(_)),
+        "expected BudgetExceeded, got {err:?}"
+    );
+    assert!(
+        tight.mem_peak() <= 4096,
+        "mem_peak {} exceeded limit 4096 before admission",
+        tight.mem_peak()
+    );
+
+    // 2. Expanding many repetitions of one distinct string polls `ctx.check()` every 1,024 reps.
+    let ok = ctx().into_shared();
+    let short = ok.intern_value(&Value::Str("a".into()));
+    let mut acc_ok = retractable(&concat_agg, 1).unwrap();
+    acc_ok.init(1);
+    let rep_batch = Batch {
+        table: &table,
+        arg: Arg::Column(&[short]),
+        rows: None,
+        weights: Some(&[5_000]),
+        base: 0,
+    };
+    acc_ok.add_batch(&ok, &rep_batch, &[0]).unwrap();
+    let before_checks = crate::sparql::ctx::CHECKS.with(|n| n.get());
+    let out = acc_ok.read(&ok, 0).unwrap();
+    let checks = crate::sparql::ctx::CHECKS.with(|n| n.get()) - before_checks;
+    assert!(
+        checks >= 5,
+        "expected repetition loop to poll check() across chunks, got {checks}"
+    );
+    assert_eq!(
+        ok.value(out)
+            .and_then(|v| v.lexical().ok().map(|l| l.len())),
+        Some(5_000 * 2 - 1)
+    );
+
+    // 3. Cancellation on one distinct string with huge weight aborts immediately without allocation.
+    let cancelled = ctx().into_shared();
+    let s2 = cancelled.intern_value(&Value::Str("abcd".into()));
+    let mut acc_cancel = retractable(&concat_agg, 1).unwrap();
+    acc_cancel.init(1);
+    let big_batch = Batch {
+        table: &table,
+        arg: Arg::Column(&[s2]),
+        rows: None,
+        weights: Some(&[10_000_000]),
+        base: 0,
+    };
+    acc_cancel.add_batch(&cancelled, &big_batch, &[0]).unwrap();
+    let peak_before = cancelled.mem_peak();
+    cancelled
+        .cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let err = acc_cancel
+        .read(&cancelled, 0)
+        .expect_err("expected Cancelled");
+    assert!(matches!(err, crate::Error::Cancelled), "got {err:?}");
+    assert_eq!(
+        cancelled.mem_peak(),
+        peak_before,
+        "cancelled GROUP_CONCAT must not allocate output buffer"
+    );
+
+    // 4. Empty string + empty separator with huge weight finishes in O(1).
+    let empty_agg = agg(
+        AggregateFunction::GroupConcat {
+            separator: Some(String::new()),
+        },
+        true,
+        false,
+    );
+    let empty_str = ok.intern_value(&Value::Str("".into()));
+    let mut acc_empty = retractable(&empty_agg, 1).unwrap();
+    acc_empty.init(1);
+    let empty_batch = Batch {
+        table: &table,
+        arg: Arg::Column(&[empty_str]),
+        rows: None,
+        weights: Some(&[10_000_000]),
+        base: 0,
+    };
+    acc_empty.add_batch(&ok, &empty_batch, &[0]).unwrap();
+    let empty_out = acc_empty.read(&ok, 0).unwrap();
+    assert_eq!(
+        ok.value(empty_out)
+            .and_then(|v| v.lexical().ok().map(|l| l.to_string())),
+        Some(String::new())
+    );
+}
+
+#[test]
+fn weighted_running_count_add_and_retract_poll_cancellation() {
+    let ctx = ctx();
+    let v1 = int(&ctx, 1);
+    let table = Table::new(vec![0]);
+    let slots = vec![0u32; 5_000];
+    let vals = vec![v1; 5_000];
+    let pos_weights = vec![1i64; 5_000];
+    let neg_weights = vec![-1i64; 5_000];
+
+    for (expr, arg_star) in [(false, true), (true, false)] {
+        let count_agg = agg(AggregateFunction::Count, expr, false);
+        let mut acc = Running::new(&count_agg, false);
+        acc.init(1);
+        let arg = if arg_star {
+            Arg::Star
+        } else {
+            Arg::Column(&vals)
+        };
+        let add_batch = Batch {
+            table: &table,
+            arg,
+            rows: None,
+            weights: Some(&pos_weights),
+            base: 0,
+        };
+        let before = crate::sparql::ctx::CHECKS.with(|n| n.get());
+        acc.add_batch(&ctx, &add_batch, &slots).unwrap();
+        let checks = crate::sparql::ctx::CHECKS.with(|n| n.get()) - before;
+        assert!(
+            checks >= 5,
+            "weighted COUNT (expr={expr}) add_batch must poll check(), got {checks}"
+        );
+
+        let ret_batch = Batch {
+            table: &table,
+            arg,
+            rows: None,
+            weights: Some(&neg_weights),
+            base: 0,
+        };
+        let before_ret = crate::sparql::ctx::CHECKS.with(|n| n.get());
+        assert!(acc.retract(&ctx, &ret_batch, &slots).unwrap());
+        let ret_checks = crate::sparql::ctx::CHECKS.with(|n| n.get()) - before_ret;
+        assert!(
+            ret_checks >= 5,
+            "weighted COUNT (expr={expr}) retract must poll check(), got {ret_checks}"
+        );
+
+        ctx.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let err = acc.add_batch(&ctx, &add_batch, &slots).unwrap_err();
+        assert!(matches!(err, crate::Error::Cancelled), "got {err:?}");
+        let err = acc.retract(&ctx, &ret_batch, &slots).unwrap_err();
+        assert!(matches!(err, crate::Error::Cancelled), "got {err:?}");
+        ctx.cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 }
