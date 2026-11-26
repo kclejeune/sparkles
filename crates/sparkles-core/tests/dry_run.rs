@@ -1122,13 +1122,13 @@ fn replay_preview_projects_a_wal_commit_marker_for_every_source_step() {
     let dev = main.branch("dev").unwrap();
     upd(
         &dev,
-        "INSERT DATA {<urn:first> <urn:p> 1}",
+        "INSERT DATA {<urn:base> <urn:p> 1}",
         Default::default(),
     )
     .unwrap();
     upd(
         &dev,
-        "INSERT DATA {<urn:second> <urn:p> 2}",
+        "INSERT DATA {<urn:base> <urn:p> 2}",
         Default::default(),
     )
     .unwrap();

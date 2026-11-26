@@ -792,28 +792,19 @@ impl DeltaVocab {
     }
 
     /// Borrow dictionary bytes under `control`, acquiring the read lock and checking
-    /// controls before and after the callback.
+    /// controls and caller-held bytes before and after the callback.
     pub(crate) fn with_control<C: Control, R>(
         &self,
         control: &C,
-        f: impl FnOnce(&AppendVocab) -> Result<R>,
-    ) -> Result<R> {
-        let guard = control.read_lock(&self.inner)?;
-        let result = f(&guard)?;
-        control.check(0)?;
-        Ok(result)
-    }
-
-    pub(crate) fn with_limited<R>(
-        &self,
-        limit: &crate::history::ReadLimit<'_>,
         held: u64,
         f: impl FnOnce(&AppendVocab) -> Result<R>,
     ) -> Result<R> {
-        limit.check(held)?;
-        let guard = limit.read_lock(&self.inner)?;
+        if C::CHECKS && held != 0 {
+            control.check(held)?;
+        }
+        let guard = control.read_lock(&self.inner)?;
         let result = f(&guard)?;
-        limit.check(held)?;
+        control.check(held)?;
         Ok(result)
     }
 
@@ -824,7 +815,7 @@ impl DeltaVocab {
         control: &crate::task::Control,
         f: impl FnOnce(&AppendVocab) -> Result<R>,
     ) -> Result<R> {
-        self.with_control(control, f)
+        self.with_control(control, 0, f)
     }
 
     /// Find a key visible to the snapshot with interruptible lock acquisition and search.
@@ -844,7 +835,7 @@ impl DeltaVocab {
         preparation: &crate::access::Preparation,
         f: impl FnOnce(&AppendVocab) -> Result<R>,
     ) -> Result<R> {
-        self.with_control(preparation, f)
+        self.with_control(preparation, 0, f)
     }
 
     #[cfg(test)]
@@ -1729,7 +1720,7 @@ mod tests {
         assert_eq!(
             controlled
                 .value
-                .with_control(&prep, |v| Ok(v.find(b"<urn:two>")))
+                .with_control(&prep, 0, |v| Ok(v.find(b"<urn:two>")))
                 .unwrap(),
             Some(1)
         );
@@ -1737,7 +1728,7 @@ mod tests {
         assert_eq!(
             controlled
                 .value
-                .with_control(&task_ok, |v| Ok(v.find(b"<urn:three>")))
+                .with_control(&task_ok, 0, |v| Ok(v.find(b"<urn:three>")))
                 .unwrap(),
             Some(2)
         );
@@ -1774,7 +1765,9 @@ mod tests {
         // TaskControl cancellation and timeout on with_control.
         let cancelled_task = TaskControl::with_cancel(cancel);
         assert!(matches!(
-            controlled.value.with_control(&cancelled_task, |_| Ok(())),
+            controlled
+                .value
+                .with_control(&cancelled_task, 0, |_| Ok(())),
             Err(Error::Cancelled)
         ));
         let expired_task = TaskControl {
@@ -1782,7 +1775,7 @@ mod tests {
             ..TaskControl::none()
         };
         assert!(matches!(
-            controlled.value.with_control(&expired_task, |_| Ok(())),
+            controlled.value.with_control(&expired_task, 0, |_| Ok(())),
             Err(Error::Timeout)
         ));
 

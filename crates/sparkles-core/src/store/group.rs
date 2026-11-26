@@ -866,17 +866,14 @@ impl WriteTxn<'_> {
             Some(m) => crate::annotations::validate_message(m)?,
             None => None,
         };
-        let generation = self.base.generation.clone();
         let bytes = self.wal_bytes();
         // The commit's new terms stay in memory until its fence writes them with its
         // records, so the quota and the free-space reserve count them with the records
         // until the fence has written both. The commit reserves them before it checks,
         // so that the check of a racing fence's preallocation sees them, or this check
         // sees its promise (see `Quota::unwritten`).
-        let terms = generation.dvocab.key_bytes(self.mark.entries());
-        // So does the commit's annotation record, which its fence writes too.
-        let ann_bytes = crate::annotations::record_len(message.as_deref(), store.commit_digests());
-        let reserved = store.quota.reserve(bytes + terms + ann_bytes);
+        let extra = self.pending_storage_bytes(self.mark.entries(), message.as_deref());
+        let reserved = store.quota.reserve(bytes.saturating_add(extra));
         self.check_storage_for(self.net_ins > 0, 0)?;
         let c = self.next_commit(validation.as_deref());
         // the control frame the commit carries, which names it (spec C26 §7.1)

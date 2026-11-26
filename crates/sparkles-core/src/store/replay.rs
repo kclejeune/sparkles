@@ -209,6 +209,8 @@ impl Store {
             ));
         }
         let inferred: Arc<[u8]> = crate::id::iri_key(INFERRED_GRAPH).into();
+        let mut terms_from = txn.mark.entries();
+        let mut extra = 0u64;
         for (index, &(branch_id, seq)) in commits.iter().enumerate() {
             txn.opts.check()?;
             options.progress.report(
@@ -291,7 +293,10 @@ impl Store {
             let wal_bytes = txn
                 .wal_bytes()
                 .saturating_add((index as u64).saturating_mul(WAL_REC as u64));
-            let storage = txn.preview_storage(inserts, wal_bytes);
+            extra = extra
+                .saturating_add(txn.pending_storage_bytes(terms_from, txn.opts.message.as_deref()));
+            terms_from = txn.base.generation.dvocab.len();
+            let storage = txn.preview_storage(inserts, wal_bytes.saturating_add(extra));
             let refused = precondition
                 .as_ref()
                 .is_some_and(|outcome| outcome.is_err())

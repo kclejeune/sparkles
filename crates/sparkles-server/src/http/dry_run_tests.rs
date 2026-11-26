@@ -564,16 +564,14 @@ async fn preconditions_are_reported_with_the_rest() {
 async fn the_quota_is_reported() {
     let s = server();
     let store = &s.ds().store;
+    let update = format!("INSERT DATA {{ <urn:big:{}> <urn:p> 1 }}", "x".repeat(1024));
+    let headers = [
+        ("content-type", UPDATE),
+        ("sparkles-commit-message", "check projected storage"),
+    ];
     let used = store.disk_usage();
     store.set_quota(Some(used + 10)).unwrap();
-    let r = call(
-        &s.app,
-        "POST",
-        "/d/update?dryRun=true",
-        &[("content-type", UPDATE)],
-        "INSERT DATA { <urn:big> <urn:p> 1 }",
-    )
-    .await;
+    let r = call(&s.app, "POST", "/d/update?dryRun=true", &headers, &update).await;
     assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
     let j = r.json();
     assert_eq!(j["outcome"], "storage-refused");
@@ -582,14 +580,7 @@ async fn the_quota_is_reported() {
     assert_eq!(j["storage"]["limit"], used + 10);
     assert!(j["storage"]["projected"].as_u64().unwrap() > used + 10);
     // the real write gets the same refusal
-    let real = call(
-        &s.app,
-        "POST",
-        "/d/update",
-        &[("content-type", UPDATE)],
-        "INSERT DATA { <urn:big> <urn:p> 1 }",
-    )
-    .await;
+    let real = call(&s.app, "POST", "/d/update", &headers, &update).await;
     assert_eq!(real.status, StatusCode::INSUFFICIENT_STORAGE);
     assert_eq!(real.json()["error"], j["error"]);
     // deletes fit

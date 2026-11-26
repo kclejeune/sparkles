@@ -305,12 +305,12 @@ impl Quota {
         })
     }
 
-    /// Before a small commit that inserts quads appends `wal_bytes` to the log.
-    pub(crate) fn check_commit(&self, wal_bytes: u64) -> Result<()> {
+    /// Check the quota before a small commit that inserts quads.
+    pub(crate) fn check_commit(&self, pending_bytes: u64) -> Result<()> {
         let Some(limit) = self.limit() else {
             return Ok(());
         };
-        let projected = self.used().saturating_add(wal_bytes);
+        let projected = self.used().saturating_add(pending_bytes);
         if projected > limit {
             return Err(Self::exceeded(limit, projected));
         }
@@ -342,11 +342,11 @@ impl Quota {
     }
 
     /// For a preview of a small commit: the quota, the bytes used, and the bytes after
-    /// appending `wal_bytes` (`None` without a quota).
-    pub(crate) fn project_commit(&self, wal_bytes: u64) -> Option<(u64, u64, u64)> {
+    /// writing its pending records (`None` without a quota).
+    pub(crate) fn project_commit(&self, pending_bytes: u64) -> Option<(u64, u64, u64)> {
         let limit = self.limit()?;
         let used = self.used();
-        Some((limit, used, used.saturating_add(wal_bytes)))
+        Some((limit, used, used.saturating_add(pending_bytes)))
     }
 
     /// For a preview of a rebuild: the quota, the bytes used before the generation in

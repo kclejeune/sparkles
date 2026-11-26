@@ -344,20 +344,10 @@ impl Generation {
     ) -> Result<bool> {
         match id.tag() {
             Tag::Vocab => Ok(self.vocab.is_triple(id.payload())),
-            Tag::Delta => {
-                if C::CHECKS {
-                    let rl = limit.read_limit();
-                    self.dvocab.with_limited(&rl, held, |d| {
-                        Ok(d.get(id.payload())
-                            .is_some_and(|key| key.first() == Some(&b'(')))
-                    })
-                } else {
-                    Ok(self.dvocab.with(|d| {
-                        d.get(id.payload())
-                            .is_some_and(|key| key.first() == Some(&b'('))
-                    }))
-                }
-            }
+            Tag::Delta => self.dvocab.with_control(limit, held, |d| {
+                Ok(d.get(id.payload())
+                    .is_some_and(|key| key.first() == Some(&b'(')))
+            }),
             _ => Ok(false),
         }
     }
@@ -370,25 +360,14 @@ impl Generation {
         held: u64,
     ) -> Result<u64> {
         let found = if C::CHECKS {
-            let scratch = std::cell::Cell::new(0u64);
-            let base = self.vocab.find_with_controlled_capacity(
-                crate::reifiers::RDF_REIFIES_KEY,
-                |old, new| {
-                    let peak = (old as u64).saturating_add(new as u64);
-                    limit.check(held.saturating_add(peak))
-                },
-                |cap| {
-                    scratch.set(cap as u64);
-                    limit.check(held.saturating_add(scratch.get()))
-                },
-                |_| limit.check(held.saturating_add(scratch.get())),
-            )?;
-            if let Ok(id) = base {
+            if let Ok(id) = self
+                .vocab
+                .find_exact_controlled(crate::reifiers::RDF_REIFIES_KEY, |_| limit.check(held))?
+            {
                 Id::vocab(id)
             } else {
-                let rl = limit.read_limit();
                 self.dvocab
-                    .with_limited(&rl, held, |d| {
+                    .with_control(limit, held, |d| {
                         Ok(
                             d.find_prepared(crate::reifiers::RDF_REIFIES_KEY, d.len(), |_| {
                                 limit.check(held)
@@ -474,15 +453,13 @@ impl Generation {
             if !is_triple {
                 return Ok(None);
             }
-            let mut workspace = preparation.reserve(0)?;
-            let found = if let Ok(id) = self.vocab.find_with_controlled(
-                crate::reifiers::RDF_REIFIES_KEY,
-                |bytes| workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256)),
-                |phase| preparation.checkpoint(phase),
-            )? {
+            let found = if let Ok(id) = self
+                .vocab
+                .find_exact_controlled(crate::reifiers::RDF_REIFIES_KEY, |phase| {
+                    preparation.checkpoint(phase)
+                })? {
                 Id::vocab(id)
             } else {
-                drop(workspace);
                 self.dvocab
                     .with_prepared(preparation, |d| {
                         Ok(
@@ -599,8 +576,7 @@ impl Generation {
             }
             Tag::Delta => {
                 if C::CHECKS {
-                    let rl = limit.read_limit();
-                    self.dvocab.with_limited(&rl, held, |d| {
+                    self.dvocab.with_control(limit, held, |d| {
                         let Some(key) = d.get(id.payload()) else {
                             return Ok(None);
                         };
@@ -8527,6 +8503,21 @@ impl WriteTxn<'_> {
             + self.control_wal_bytes()
     }
 
+    /// The pending dictionary and annotation records counted with a persistent commit.
+    fn pending_storage_bytes(&self, terms_from: u64, message: Option<&str>) -> u64 {
+        if self.store.root.is_none() {
+            return 0;
+        }
+        self.base
+            .generation
+            .dvocab
+            .key_bytes(terms_from)
+            .saturating_add(crate::annotations::record_len(
+                message,
+                self.store.commit_digests(),
+            ))
+    }
+
     /// The most this commit may preallocate in the WAL past its records (see
     /// [`StoreOptions::wal_prealloc_bytes`]): none when that would take the disk below
     /// the free space the store keeps. The preallocation only saves time, so it never
@@ -8555,14 +8546,14 @@ impl WriteTxn<'_> {
         self.check_storage_for(self.net_ins > 0, self.wal_bytes())
     }
 
-    fn check_storage_for(&self, inserts: bool, wal_bytes: u64) -> Result<()> {
+    fn check_storage_for(&self, inserts: bool, pending_bytes: u64) -> Result<()> {
         // grouped commits queued for their fence have not written their records and terms
         // yet, nor running fences their preallocation, so the free space on disk does not
         // show them
         self.store
-            .check_disk(wal_bytes.saturating_add(self.store.quota.unwritten()))?;
+            .check_disk(pending_bytes.saturating_add(self.store.quota.unwritten()))?;
         if inserts {
-            self.store.quota.check_commit(wal_bytes)?;
+            self.store.quota.check_commit(pending_bytes)?;
         }
         if inserts && self.store.root.is_none() && self.store.opts.max_memory_bytes.is_some() {
             self.store.check_memory(self.memory_size())?;
@@ -8861,6 +8852,13 @@ impl crate::budgeted::Control for HistoryCeiling<'_> {
 
     fn read_limit(&self) -> crate::history::ReadLimit<'_> {
         self.limit
+    }
+
+    fn read_lock<'m, T>(
+        &self,
+        lock: &'m parking_lot::RwLock<T>,
+    ) -> Result<parking_lot::RwLockReadGuard<'m, T>> {
+        self.limit.read_lock(lock)
     }
 
     fn check_delta(&self, delta: &Delta) -> Result<()> {

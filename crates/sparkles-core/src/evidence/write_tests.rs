@@ -1422,8 +1422,7 @@ fn mask_preparation_admits_graphs_before_full_decoding() {
     };
 
     // 1. Exact allowlist rejects the 512 KiB unreadable graph by ID under a 400 KiB cap
-    //    (smaller than the unreadable graph IRI itself, while comfortably covering the
-    //    7-way parallel permutation headroom of `apply_controlled`).
+    //    (smaller than the unreadable graph IRI itself).
     let exact_prep = Preparation::new(crate::task::Control::none(), 400 << 10).unwrap();
     let exact_access = GraphAccess::with_triples(
         Graphs::Only(GraphRule::new([g_ok], &[])),

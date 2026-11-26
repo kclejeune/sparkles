@@ -1134,6 +1134,13 @@ fn forget_removed(
     check()
 }
 
+/// One extra level covers a root split during a batch.
+fn permutation_mutation_bound(ins: &KeySet, del: &KeySet) -> u64 {
+    ins.mutation_bound()
+        .max(del.mutation_bound())
+        .saturating_add(KeySet::level_bound())
+}
+
 /// Hide `hidden` in one permutation: remove the keys the delta inserted and add the
 /// others to its deletions. Returns the admission of the nodes the writes allocated.
 fn write_permutation(
@@ -1150,11 +1157,7 @@ fn write_permutation(
     // so no other writer can reuse the allowance of nodes that are still alive.
     let mut at = 0;
     while at < hidden.len() {
-        // One more level than either set has now covers a root split in the batch.
-        let bound = ins
-            .mutation_bound()
-            .max(del.mutation_bound())
-            .saturating_add(KeySet::level_bound());
+        let bound = permutation_mutation_bound(ins, del);
         // A batch admits at most a quarter of what the writes already own, or an eighth
         // of the room the cap leaves each of the seven writers, so headroom stays small
         // next to the charge and the cap while admissions stay few.
@@ -1274,10 +1277,9 @@ fn apply_controlled(
     preparation.stage("applying permission mask")?;
     let mut held = preparation.reserve(SNAPSHOT_HEADERS)?;
     // The clone shares every node of the input delta, and hiding quads copies the
-    // nodes on their paths. The seven permutations are written in parallel, as the
-    // legacy path writes them. Each batch of key-set writes is admitted at an upper
-    // bound before it runs and then keeps only the bytes it allocated, so the view is
-    // charged for the nodes it owns and the cap holds at the peak of every batch.
+    // nodes on their paths. Each batch of key-set writes is admitted at an upper bound
+    // before it runs and then keeps only the bytes it allocated, so the view is charged
+    // for the nodes it owns and the cap holds at the peak of every batch.
     let mut inserted = Buffer::new(preparation)?;
     for key in hidden.iter() {
         inserted.push(snap.delta.ins[Perm::Spo.index()].contains(key))?;
@@ -1300,15 +1302,25 @@ fn apply_controlled(
         .zip(delta.ins.iter_mut().zip(delta.del.iter_mut()))
         .map(|(perm, (ins, del))| (perm, ins, del))
         .collect();
-    {
+    let parallel_headroom = sets.iter().fold(0u64, |sum, (_, ins, del)| {
+        sum.saturating_add(permutation_mutation_bound(ins, del))
+    });
+    let write = |(perm, ins, del), owned: &mut Reservation| {
+        write_permutation(perm, ins, del, &hidden, &inserted, preparation, owned)
+    };
+    // Each running permutation needs space for at least one mutation. Serialize under
+    // a tighter cap so permutations can reuse the headroom returned after each write.
+    if !hidden.is_empty() && parallel_headroom <= preparation.available_room() {
         use rayon::prelude::*;
         sets.into_par_iter()
             .zip(copies.par_iter_mut())
-            .map(|((perm, ins, del), owned)| {
-                write_permutation(perm, ins, del, &hidden, &inserted, preparation, owned)
-            })
-            .collect::<Result<()>>()?
-    };
+            .map(|(set, owned)| write(set, owned))
+            .collect::<Result<()>>()?;
+    } else {
+        for (set, owned) in sets.into_iter().zip(&mut copies) {
+            write(set, owned)?;
+        }
+    }
     write_reifiers(
         &snap.generation,
         &mut delta.reifiers_ins,
