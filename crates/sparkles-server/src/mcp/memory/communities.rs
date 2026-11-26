@@ -620,7 +620,7 @@ impl Tools<'_> {
         if q_tokens.is_empty() {
             return Ok(None);
         }
-        let preds: Vec<NamedNode> = match &status.config.predicates {
+        let mut preds: Vec<NamedNode> = match &status.config.predicates {
             sparkles::text::PredicateSet::Only(p) => p
                 .iter()
                 .filter_map(|p| NamedNode::new(p.as_str()).ok())
@@ -631,6 +631,8 @@ impl Tools<'_> {
                 NamedNode::new_unchecked(crate::graphrag::guard::gr("text")),
             ],
         };
+        preds.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        preds.dedup();
         if preds.is_empty() {
             return Ok(None);
         }

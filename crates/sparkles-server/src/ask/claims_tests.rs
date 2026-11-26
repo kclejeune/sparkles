@@ -3131,3 +3131,183 @@ async fn text_search_preserves_accent_folding_and_max_text_bytes_truncation() {
         "term past max_text_bytes must not trigger search ranking: {tail_only}"
     );
 }
+
+/// R7-1: Repeating a configured full-text predicate IRI in `PredicateSet::Only` must not
+/// emit duplicate literal-lookup branches or alter BM25 corpus stats, scores, or ranking.
+#[cfg(feature = "text")]
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_configured_text_predicates_do_not_change_scores_or_ranking() {
+    const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
+
+    let m = mock(Arc::new(OnceLock::new()));
+    let (st, _app) = app(&m.url()).await;
+    let ds = dataset(&st);
+    evidence::configure(&ds, &settings(), &Control::none()).unwrap();
+
+    let gr = crate::graphrag::guard::gr;
+    let main_iri = sparkles::evidence::review::policy_iri("main");
+    let (c_cls, lv, cnt, rep, r_cls, sum, stat, rat, rp, pv) = (
+        gr("Community"),
+        gr("level"),
+        gr("memberCount"),
+        gr("report"),
+        gr("Report"),
+        gr("summary"),
+        gr("status"),
+        gr("rating"),
+        gr("reviewPolicy"),
+        gr("policyVersion"),
+    );
+    let label = crate::graphrag::store::RDFS_LABEL;
+
+    // Equal-length title/summary pairs: `<urn:r:a-summary>` matches `marigold` in its
+    // summary and sorts first by IRI; `<urn:r:b-title>` matches `verbena` in its title.
+    let trig = format!(
+        r#"<{REPORTS}> {{
+  <urn:c:a-summary> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:a-summary> .
+  <urn:r:a-summary> a <{r_cls}> ; <{label}> "alpha" ; <{sum}> "marigold" ; <{stat}> "reviewed" ; <{rat}> 5 ; <{rp}> <{main}> ; <{pv}> 1 .
+
+  <urn:c:b-title> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:b-title> .
+  <urn:r:b-title> a <{r_cls}> ; <{label}> "verbena" ; <{sum}> "omega" ; <{stat}> "reviewed" ; <{rat}> 5 ; <{rp}> <{main}> ; <{pv}> 1 .
+}}
+"#,
+        main = main_iri.as_str(),
+    );
+    ds.store()
+        .load(&[Source::from_bytes(trig.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+
+    let state_ds = st.get("org").unwrap();
+    crate::settings::store_runtime(
+        &st,
+        &state_ds,
+        &crate::settings::GRAPHRAG,
+        &json!({ "enabled": true, "principal": "local", "projection": { "graphs": ["urn:g:org"] } }),
+    )
+    .unwrap();
+
+    let run_pair = |predicates: Vec<String>| -> Vec<(Vec<(String, f64)>, String)> {
+        ds.indexes()
+            .text()
+            .enable(sparkles::text::TextConfig {
+                predicates: sparkles::text::PredicateSet::Only(predicates),
+                ..sparkles::text::TextConfig::default()
+            })
+            .unwrap();
+        let mut results = Vec::new();
+        for with_policy in [true, false] {
+            let mut args2 = json!({ "query": "marigold verbena", "level": 0, "limit": 2 });
+            let mut args1 = json!({ "query": "marigold verbena", "level": 0, "limit": 1 });
+            if with_policy {
+                args2["reviewPolicy"] = json!("main");
+                args1["reviewPolicy"] = json!("main");
+            }
+            let r2 = mcp_tool(&st, "community_reports", args2).unwrap();
+            assert_eq!(r2["ranking"], "search", "{r2}");
+            let scored: Vec<(String, f64)> = r2["reports"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| {
+                    (
+                        item["iri"].as_str().unwrap().to_string(),
+                        item["score"].as_f64().unwrap(),
+                    )
+                })
+                .collect();
+            let r1 = mcp_tool(&st, "community_reports", args1).unwrap();
+            assert_eq!(r1["ranking"], "search", "{r1}");
+            let top1 = r1["reports"][0]["iri"].as_str().unwrap().to_string();
+            results.push((scored, top1));
+        }
+        results
+    };
+
+    let unique = run_pair(vec![sum.clone(), label.to_string()]);
+    let repeated = run_pair(vec![sum.clone(), label.to_string(), sum.clone()]);
+
+    for (u, r) in unique.iter().zip(repeated.iter()) {
+        assert_eq!(u.0.len(), 2);
+        assert_eq!(u.0[0].0, "urn:r:a-summary");
+        assert_eq!(u.0[1].0, "urn:r:b-title");
+        assert_eq!(u.0[0].1, u.0[1].1, "expected exact score tie: {u:?}");
+        assert_eq!(u.1, "urn:r:a-summary");
+        assert_eq!(
+            r, u,
+            "repeated configured text predicate changed scores or ranking: unique={u:?}, repeated={r:?}"
+        );
+    }
+}
+
+/// R7-2: A blank-node community link at the same level must not shadow a valid named
+/// community during named hydration and drop a scored search hit.
+#[cfg(feature = "text")]
+#[tokio::test(flavor = "multi_thread")]
+async fn blank_node_community_link_does_not_hide_named_search_hit() {
+    const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
+
+    let m = mock(Arc::new(OnceLock::new()));
+    let (st, _app) = app(&m.url()).await;
+    let ds = dataset(&st);
+    evidence::configure(&ds, &settings(), &Control::none()).unwrap();
+    ds.indexes()
+        .text()
+        .enable(sparkles::text::TextConfig::default())
+        .unwrap();
+
+    let gr = crate::graphrag::guard::gr;
+    let main_iri = sparkles::evidence::review::policy_iri("main");
+    let (c_cls, lv, cnt, rep, r_cls, sum, stat, rat, rp, pv) = (
+        gr("Community"),
+        gr("level"),
+        gr("memberCount"),
+        gr("report"),
+        gr("Report"),
+        gr("summary"),
+        gr("status"),
+        gr("rating"),
+        gr("reviewPolicy"),
+        gr("policyVersion"),
+    );
+    let label = crate::graphrag::store::RDFS_LABEL;
+
+    let trig = format!(
+        r#"<{REPORTS}> {{
+  _:bnode_shadow a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:bnode-shadow> .
+  <urn:c:named-shadow> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 4 ; <{rep}> <urn:r:bnode-shadow> .
+  <urn:r:bnode-shadow> a <{r_cls}> ; <{label}> "Larkspur" ; <{sum}> "Unique larkspur summary." ; <{stat}> "reviewed" ; <{rat}> 1 ; <{rp}> <{main}> ; <{pv}> 1 .
+
+  <urn:c:high-peer> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:high-peer> .
+  <urn:r:high-peer> a <{r_cls}> ; <{label}> "Peer" ; <{sum}> "Unrelated high-rated report." ; <{stat}> "reviewed" ; <{rat}> 9 ; <{rp}> <{main}> ; <{pv}> 1 .
+}}
+"#,
+        main = main_iri.as_str(),
+    );
+    ds.store()
+        .load(&[Source::from_bytes(trig.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+
+    let state_ds = st.get("org").unwrap();
+    crate::settings::store_runtime(
+        &st,
+        &state_ds,
+        &crate::settings::GRAPHRAG,
+        &json!({ "enabled": true, "principal": "local", "projection": { "graphs": ["urn:g:org"] } }),
+    )
+    .unwrap();
+
+    for args in [
+        json!({ "query": "larkspur", "reviewPolicy": "main", "level": 0, "limit": 1 }),
+        json!({ "query": "larkspur", "level": 0, "limit": 1 }),
+    ] {
+        let res = mcp_tool(&st, "community_reports", args).unwrap();
+        assert_eq!(res["ranking"], "search", "{res}");
+        assert_eq!(res["reports"][0]["iri"], "urn:r:bnode-shadow", "{res}");
+        assert_eq!(
+            res["reports"][0]["community"], "urn:c:named-shadow",
+            "{res}"
+        );
+        assert_eq!(res["reports"][0]["memberCount"], 4, "{res}");
+        assert!(res["reports"][0]["score"].is_number(), "{res}");
+    }
+}

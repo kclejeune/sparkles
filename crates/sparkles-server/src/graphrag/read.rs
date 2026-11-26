@@ -139,8 +139,52 @@ fn iri(t: &Option<Term>) -> Option<String> {
     }
 }
 
+const XSD_INTEGER_TYPES: &[&str] = &[
+    "http://www.w3.org/2001/XMLSchema#integer",
+    "http://www.w3.org/2001/XMLSchema#long",
+    "http://www.w3.org/2001/XMLSchema#int",
+    "http://www.w3.org/2001/XMLSchema#short",
+    "http://www.w3.org/2001/XMLSchema#byte",
+    "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
+    "http://www.w3.org/2001/XMLSchema#nonPositiveInteger",
+    "http://www.w3.org/2001/XMLSchema#positiveInteger",
+    "http://www.w3.org/2001/XMLSchema#unsignedLong",
+    "http://www.w3.org/2001/XMLSchema#unsignedInt",
+    "http://www.w3.org/2001/XMLSchema#unsignedShort",
+    "http://www.w3.org/2001/XMLSchema#unsignedByte",
+];
+
 fn int(t: &Option<Term>) -> Option<u64> {
     lit(t).and_then(|v| v.parse().ok())
+}
+
+/// Decode an admitted non-negative XSD integer rating literal (`0..=i64::MAX`),
+/// matching [`optional_rating_clause`] so SPARQL sort/continuation keys and Rust
+/// decoding agree on every RDF term.
+fn rating_int(t: &Option<Term>) -> Option<u64> {
+    match t {
+        Some(Term::Literal(l)) if XSD_INTEGER_TYPES.contains(&l.datatype().as_str()) => l
+            .value()
+            .parse::<i64>()
+            .ok()
+            .and_then(|v| u64::try_from(v).ok()),
+        _ => None,
+    }
+}
+
+/// Optional `gr:rating` binding restricted to valid non-negative XSD integer literals.
+/// Ratings outside the admitted domain (e.g. `xsd:boolean`, `xsd:string`, decimals,
+/// negative integers, or IRIs) fail the filter inside `OPTIONAL`, leaving `?rating`
+/// unbound so the report is preserved as unrated and cannot disrupt keyset pagination.
+fn optional_rating_clause(rating_pred: &str) -> String {
+    let dts = XSD_INTEGER_TYPES
+        .iter()
+        .map(|dt| format!("<{dt}>"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "OPTIONAL {{ ?r <{rating_pred}> ?rating . FILTER(isNumeric(?rating) && DATATYPE(?rating) IN ({dts}) && ?rating >= 0) }}"
+    )
 }
 
 /// The number of usable reports at each level.
@@ -251,6 +295,7 @@ fn reports_at_in(
     let page_limit = limit.max(32);
     let policy_clause = filter.policy_clause()?;
     let level_filter = level.map_or(String::new(), |l| format!("FILTER(?l = {l})"));
+    let rating_clause = optional_rating_clause(&gr("rating"));
     let mut out: Vec<ReportRef> = Vec::with_capacity(limit);
     let mut seen: std::collections::HashSet<String> =
         std::collections::HashSet::with_capacity(limit);
@@ -269,7 +314,7 @@ fn reports_at_in(
             ),
         };
         let q = format!(
-            "SELECT ?r ?c ?l ?title ?summary ?status ?rating ?n ?policy ?version ?configuration WHERE {{ {values} GRAPH <{graph}> {{ ?c a <{community}> ; <{level_pred}> ?l ; <{report}> ?r ; <{count}> ?n . {level_filter} ?r <{status}> ?status ; <{label}> ?title ; <{summary}> ?summary{policy_clause} . OPTIONAL {{ ?r <{rating}> ?rating }} OPTIONAL {{ ?r <{policy}> ?policy }} OPTIONAL {{ ?r <{version}> ?version }} OPTIONAL {{ ?r <{configuration}> ?configuration }} {cursor_filter} }} }} ORDER BY DESC(?rating) ?r ?c ?status LIMIT {page_limit}",
+            "SELECT ?r ?c ?l ?title ?summary ?status ?rating ?n ?policy ?version ?configuration WHERE {{ {values} GRAPH <{graph}> {{ ?c a <{community}> ; <{level_pred}> ?l ; <{report}> ?r ; <{count}> ?n . FILTER(isIRI(?c) && isIRI(?r)) {level_filter} ?r <{status}> ?status ; <{label}> ?title ; <{summary}> ?summary{policy_clause} . {rating_clause} OPTIONAL {{ ?r <{policy}> ?policy }} OPTIONAL {{ ?r <{version}> ?version }} OPTIONAL {{ ?r <{configuration}> ?configuration }} {cursor_filter} }} }} ORDER BY DESC(?rating) ?r ?c ?status LIMIT {page_limit}",
             values = filter.values(),
             community = gr("Community"),
             level_pred = gr("level"),
@@ -278,7 +323,6 @@ fn reports_at_in(
             status = gr("status"),
             label = store::RDFS_LABEL,
             summary = gr("summary"),
-            rating = gr("rating"),
             policy = gr("reviewPolicy"),
             version = gr("policyVersion"),
             configuration = gr("evidenceConfiguration"),
@@ -291,7 +335,7 @@ fn reports_at_in(
             let Some(rep_iri) = iri(&r[0]) else {
                 continue;
             };
-            let rating = int(&r[6]);
+            let rating = rating_int(&r[6]);
             last_key = Some((rating, rep_iri.clone()));
             if seen.contains(&rep_iri) {
                 continue;
@@ -453,11 +497,13 @@ fn reports_where_in(
         gr("rating"),
     );
 
-    // Step 1: pick one deterministic canonical community `MIN(?c)` per distinct
+    // Step 1: pick one deterministic canonical named community `MIN(?c)` per distinct
     // eligible report IRI before applying `ORDER BY` and `LIMIT`, so multiple
-    // community links or admitted statuses on one report never evict another report.
+    // community links, blank-node links, or admitted statuses on one report never hide
+    // or evict an eligible report.
+    let rating_clause = optional_rating_clause(&rating_pred);
     let q = format!(
-        "SELECT ?r (MIN(?c) AS ?comm) (MAX(?rating) AS ?best_rating) WHERE {{ {values} {extra} GRAPH <{graph}> {{ ?c a <{community}> ; <{level_pred}> ?l ; <{report}> ?r ; <{count}> ?n . {level_filter} ?r <{status_pred}> ?status ; <{label_pred}> ?title ; <{summary_pred}> ?summary{policy_clause} . OPTIONAL {{ ?r <{rating_pred}> ?rating }} }} }} GROUP BY ?r ORDER BY DESC(?best_rating) ?r LIMIT {limit}",
+        "SELECT ?r (MIN(?c) AS ?comm) (MAX(?rating) AS ?best_rating) WHERE {{ {values} {extra} GRAPH <{graph}> {{ ?c a <{community}> ; <{level_pred}> ?l ; <{report}> ?r ; <{count}> ?n . FILTER(isIRI(?c)) {level_filter} ?r <{status_pred}> ?status ; <{label_pred}> ?title ; <{summary_pred}> ?summary{policy_clause} . {rating_clause} }} }} GROUP BY ?r ORDER BY DESC(?best_rating) ?r LIMIT {limit}",
         values = filter.values(),
     );
     let mut selected: Vec<(oxrdf::NamedNode, oxrdf::NamedNode)> = Vec::new();
@@ -589,7 +635,7 @@ fn reports_where_in(
                     entry.status = Some(st);
                 }
             } else if p == rating_pred {
-                if let Some(v) = int(&row[2]) {
+                if let Some(v) = rating_int(&row[2]) {
                     entry.rating = Some(entry.rating.map_or(v, |cur| cur.max(v)));
                 }
             } else if p == policy_pred {
@@ -1025,5 +1071,235 @@ mod tests {
             review_policy_iri: Some("not a valid iri"),
         };
         assert!(bad.policy_clause().is_err());
+    }
+
+    fn load_test_store(trig: &str) -> Store {
+        let store = Store::in_memory(sparkles::store::StoreOptions::default());
+        let prep =
+            sparkles::access::Preparation::new(sparkles::task::Control::none(), 64 << 20).unwrap();
+        store.activate_memory_configuration_history(&prep).unwrap();
+        store
+            .load(&[sparkles::io::Source::from_bytes(
+                trig.as_bytes().to_vec(),
+                sparkles::io::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn reports_named_at_and_reports_at_ignore_blank_node_community_links() {
+        const GRAPH: &str = "urn:x-sparkles:graphrag:reports";
+        let (c_cls, lv, cnt, rep, r_cls, sum, stat, rat) = (
+            gr("Community"),
+            gr("level"),
+            gr("memberCount"),
+            gr("report"),
+            gr("Report"),
+            gr("summary"),
+            gr("status"),
+            gr("rating"),
+        );
+        let label = store::RDFS_LABEL;
+        let trig = format!(
+            r#"<{GRAPH}> {{
+  _:bnode_comm a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:mixed> .
+  <urn:c:named-0> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 4 ; <{rep}> <urn:r:mixed> .
+  <urn:r:mixed> a <{r_cls}> ; <{label}> "Mixed" ; <{sum}> "Linked from blank and named." ; <{stat}> "reviewed" ; <{rat}> 5 .
+
+  _:bnode_only a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 3 ; <{rep}> <urn:r:bnode-only> .
+  <urn:r:bnode-only> a <{r_cls}> ; <{label}> "Blank Only" ; <{sum}> "No named community." ; <{stat}> "reviewed" ; <{rat}> 9 .
+}}
+"#
+        );
+        let store = load_test_store(&trig);
+        let opts = QueryOptions::default();
+        let filter = Filter::default();
+        let wanted = vec!["urn:r:mixed".to_string(), "urn:r:bnode-only".to_string()];
+
+        let prep =
+            sparkles::access::Preparation::new(sparkles::task::Control::none(), 64 << 20).unwrap();
+        let view = store
+            .evidence_view(&sparkles::history::At::Head, &prep)
+            .unwrap();
+
+        for (named, at) in [
+            (
+                reports_named_at(&store.snapshot(), &opts, GRAPH, &wanted, 0, filter).unwrap(),
+                reports_at(&store.snapshot(), &opts, GRAPH, Some(0), filter, 10).unwrap(),
+            ),
+            (
+                reports_named_at_source(
+                    &view.read_source(),
+                    &store,
+                    &opts,
+                    GRAPH,
+                    &wanted,
+                    0,
+                    filter,
+                )
+                .unwrap(),
+                reports_at_source(
+                    &view.read_source(),
+                    &store,
+                    &opts,
+                    GRAPH,
+                    Some(0),
+                    filter,
+                    10,
+                )
+                .unwrap(),
+            ),
+        ] {
+            for list in [named, at] {
+                assert_eq!(list.len(), 1, "{list:?}");
+                assert_eq!(list[0].iri, "urn:r:mixed");
+                assert_eq!(list[0].community, "urn:c:named-0");
+                assert_eq!(list[0].level, 0);
+                assert_eq!(list[0].member_count, 4);
+                assert_eq!(list[0].rating, Some(5));
+            }
+        }
+    }
+
+    #[test]
+    fn reports_at_boundary_page_with_non_integer_ratings_preserves_rated_and_unrated_peers() {
+        const GRAPH: &str = "urn:x-sparkles:graphrag:reports";
+        const XSD_INT: &str = "http://www.w3.org/2001/XMLSchema#int";
+        let (c_cls, lv, cnt, rep, r_cls, sum, stat, rat) = (
+            gr("Community"),
+            gr("level"),
+            gr("memberCount"),
+            gr("report"),
+            gr("Report"),
+            gr("summary"),
+            gr("status"),
+            gr("rating"),
+        );
+        let label = store::RDFS_LABEL;
+
+        // 1) Minimal boundary-page case: 32 level-0 links to a `true`-rated report plus
+        //    a single peer rated `8` under `limit: 2`.
+        let mut minimal = format!("<{GRAPH}> {{\n");
+        for i in 0..32 {
+            minimal.push_str(&format!(
+                "  <urn:c:bool-{i:02}> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:00-bool> .\n"
+            ));
+        }
+        minimal.push_str(&format!(
+            r#"  <urn:r:00-bool> a <{r_cls}> ; <{label}> "Bool Rated" ; <{sum}> "Boolean rating." ; <{stat}> "reviewed" ; <{rat}> true .
+  <urn:c:int-00> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:01-valid> .
+  <urn:r:01-valid> a <{r_cls}> ; <{label}> "Valid Rated" ; <{sum}> "Integer rating." ; <{stat}> "reviewed" ; <{rat}> 8 .
+}}
+"#
+        ));
+        let min_store = load_test_store(&minimal);
+        let opts = QueryOptions::default();
+        let filter = Filter {
+            reviewed_only: true,
+            review_policy_iri: None,
+        };
+        let prep =
+            sparkles::access::Preparation::new(sparkles::task::Control::none(), 64 << 20).unwrap();
+        let min_view = min_store
+            .evidence_view(&sparkles::history::At::Head, &prep)
+            .unwrap();
+        for res in [
+            reports_at(&min_store.snapshot(), &opts, GRAPH, Some(0), filter, 2).unwrap(),
+            reports_at_source(
+                &min_view.read_source(),
+                &min_store,
+                &opts,
+                GRAPH,
+                Some(0),
+                filter,
+                2,
+            )
+            .unwrap(),
+        ] {
+            let pairs: Vec<(&str, Option<u64>)> =
+                res.iter().map(|r| (r.iri.as_str(), r.rating)).collect();
+            assert_eq!(
+                pairs,
+                vec![("urn:r:01-valid", Some(8)), ("urn:r:00-bool", None)],
+                "{res:?}"
+            );
+        }
+
+        // 2) Multi-page mixed ratings: Boolean (32 links), string (32 links), numeric
+        //    string, negative integer, decimal, genuinely unrated, valid xsd:integer,
+        //    valid derived xsd:int, and mixed (true + 6).
+        let mut full = format!("<{GRAPH}> {{\n");
+        for i in 0..32 {
+            full.push_str(&format!(
+                "  <urn:c:bool-{i:02}> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:00-bool> .\n  <urn:c:str-{i:02}> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:01-str> .\n"
+            ));
+        }
+        full.push_str(&format!(
+            r#"  <urn:r:00-bool> a <{r_cls}> ; <{label}> "Bool" ; <{sum}> "Bool rating." ; <{stat}> "reviewed" ; <{rat}> true .
+  <urn:r:01-str> a <{r_cls}> ; <{label}> "Str" ; <{sum}> "Str rating." ; <{stat}> "reviewed" ; <{rat}> "high" .
+  <urn:c:snum> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:02-str-num> .
+  <urn:r:02-str-num> a <{r_cls}> ; <{label}> "StrNum" ; <{sum}> "String digits." ; <{stat}> "reviewed" ; <{rat}> "9" .
+  <urn:c:neg> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:03-neg> .
+  <urn:r:03-neg> a <{r_cls}> ; <{label}> "Neg" ; <{sum}> "Negative rating." ; <{stat}> "reviewed" ; <{rat}> -5 .
+  <urn:c:dec> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:04-dec> .
+  <urn:r:04-dec> a <{r_cls}> ; <{label}> "Dec" ; <{sum}> "Decimal rating." ; <{stat}> "reviewed" ; <{rat}> 9.5 .
+  <urn:c:unrated> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:05-unrated> .
+  <urn:r:05-unrated> a <{r_cls}> ; <{label}> "Unrated" ; <{sum}> "No rating triple." ; <{stat}> "reviewed" .
+  <urn:c:valid> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:06-valid-int> .
+  <urn:r:06-valid-int> a <{r_cls}> ; <{label}> "Valid" ; <{sum}> "Valid integer." ; <{stat}> "reviewed" ; <{rat}> 8 .
+  <urn:c:mixed> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:07-mixed> .
+  <urn:r:07-mixed> a <{r_cls}> ; <{label}> "Mixed" ; <{sum}> "Bool plus valid int." ; <{stat}> "reviewed" ; <{rat}> true, 6 .
+  <urn:c:derived> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:08-derived-int> .
+  <urn:r:08-derived-int> a <{r_cls}> ; <{label}> "Derived" ; <{sum}> "Derived xsd:int." ; <{stat}> "reviewed" ; <{rat}> "7"^^<{XSD_INT}> .
+}}
+"#
+        ));
+        let full_store = load_test_store(&full);
+        let full_view = full_store
+            .evidence_view(&sparkles::history::At::Head, &prep)
+            .unwrap();
+        let expected = vec![
+            ("urn:r:06-valid-int", Some(8)),
+            ("urn:r:08-derived-int", Some(7)),
+            ("urn:r:07-mixed", Some(6)),
+            ("urn:r:00-bool", None),
+            ("urn:r:01-str", None),
+            ("urn:r:02-str-num", None),
+            ("urn:r:03-neg", None),
+            ("urn:r:04-dec", None),
+            ("urn:r:05-unrated", None),
+        ];
+        let all_names: Vec<String> = expected.iter().map(|(iri, _)| (*iri).to_string()).collect();
+
+        for res in [
+            reports_at(&full_store.snapshot(), &opts, GRAPH, Some(0), filter, 9).unwrap(),
+            reports_at_source(
+                &full_view.read_source(),
+                &full_store,
+                &opts,
+                GRAPH,
+                Some(0),
+                filter,
+                9,
+            )
+            .unwrap(),
+            reports_named_at(&full_store.snapshot(), &opts, GRAPH, &all_names, 0, filter).unwrap(),
+            reports_named_at_source(
+                &full_view.read_source(),
+                &full_store,
+                &opts,
+                GRAPH,
+                &all_names,
+                0,
+                filter,
+            )
+            .unwrap(),
+        ] {
+            let pairs: Vec<(&str, Option<u64>)> =
+                res.iter().map(|r| (r.iri.as_str(), r.rating)).collect();
+            assert_eq!(pairs, expected, "{res:?}");
+        }
     }
 }
