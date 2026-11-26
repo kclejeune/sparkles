@@ -4,10 +4,11 @@
 import os
 from pathlib import Path
 import re
-import socket
 import subprocess
 import tempfile
 import time
+
+from sparkles_test_server import stop_server, wait_for_listener
 
 root = Path(__file__).resolve().parent.parent
 readme = (root / 'README.md').read_text()
@@ -23,29 +24,29 @@ with tempfile.TemporaryDirectory(prefix='sparkles-quickstart-') as work:
                             capture_output=True, check=True, timeout=60)
     if not result.stdout.replace('\r', '').strip().endswith('n\n1'):
         raise SystemExit(f'Unexpected local query result: {result.stdout}')
-    with socket.socket() as listener:
-        listener.bind(('127.0.0.1', 0))
-        port = listener.getsockname()[1]
-    process = subprocess.Popen(server.split() + ['--port', str(port)], cwd=work, env=env,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    log = Path(work) / 'server.log'
+    with log.open('w') as stderr:
+        process = subprocess.Popen(server.split() + ['--host', '127.0.0.1', '--port', '0'],
+                                   cwd=work, env={**env, 'RUST_LOG': 'info', 'NO_COLOR': '1'},
+                                   stdout=subprocess.DEVNULL, stderr=stderr)
     try:
         deadline = time.monotonic() + 30
-        while True:
-            result = subprocess.run(http.replace('localhost:3030', f'localhost:{port}'),
-                                    shell=True, cwd=work, env=env, text=True,
+        base = wait_for_listener(process, log, deadline)
+        command = http.replace('localhost:3030', base.removeprefix('http://'))
+        query_env = {**env, 'no_proxy': '127.0.0.1', 'NO_PROXY': '127.0.0.1'}
+        while process.poll() is None:
+            result = subprocess.run(command,
+                                    shell=True, cwd=work, env=query_env, text=True,
                                     capture_output=True, timeout=10)
-            if result.returncode == 0:
+            if result.returncode == 0 and process.poll() is None:
                 break
             if process.poll() is not None or time.monotonic() >= deadline:
                 raise RuntimeError(f'Server did not answer: {result.stderr}')
             time.sleep(0.1)
+        else:
+            raise RuntimeError(f'sparkles serve exited; see {log}')
         if result.stdout.replace('\r', '').strip() != 'n\n1':
             raise RuntimeError(f'Unexpected HTTP query response: {result.stdout!r}')
     finally:
-        process.terminate()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+        stop_server(process, timeout=10)
 print('README quick start returned one local and one HTTP result.')

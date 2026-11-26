@@ -5,11 +5,15 @@
 //! sealed by default with a key the server generates, which `sparkles secrets unseal`
 //! undoes offline.
 
+mod common;
+
 use serde_json::{Value as J, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
+#[cfg(feature = "auth")]
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,38 +23,21 @@ const DECLARED_KEY: &str = "declared-key-c19-11";
 
 /// A server started by the test, stopped when dropped.
 struct Server {
-    child: Child,
+    child: common::ServerProcess,
     port: u16,
 }
 
 impl Server {
-    /// Start on the first free port of 47400–47419, with its log in `log`.
     fn start(data: &Path, extra: &[&str], log: &Path) -> Server {
-        Server::start_in(data, extra, log, 47400..47420)
-    }
-
-    /// Start on the first free port of `ports`, with its log in `log`.
-    fn start_in(data: &Path, extra: &[&str], log: &Path, ports: std::ops::Range<u16>) -> Server {
-        let port = ports
-            .clone()
-            .find(|p| TcpListener::bind(("127.0.0.1", *p)).is_ok())
-            .unwrap_or_else(|| panic!("a free port in {ports:?}"));
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log)
-            .unwrap();
-        let child = Command::new(BIN)
-            .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
-            .arg("--data")
-            .arg(data)
-            .args(extra)
-            .env_remove("SPARKLES_BACKUP_CONFIG")
-            .env("RUST_LOG", "trace")
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .unwrap();
+        let (child, port) = common::ServerProcess::start(
+            common::serve()
+                .arg("--data")
+                .arg(data)
+                .args(extra)
+                .env_remove("SPARKLES_BACKUP_CONFIG")
+                .env("RUST_LOG", "trace"),
+            log,
+        );
         let s = Server { child, port };
         let t0 = Instant::now();
         while s.call("GET", "/$/ready", None).0 != 200 {
@@ -67,12 +54,6 @@ impl Server {
         let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", self.port)) else {
             return (0, J::Null);
         };
-        // While nothing listens on the port, the kernel may pick the port itself as the
-        // ephemeral source, and the socket connects to itself: the read below would then
-        // return the request and wait forever for an end that never comes.
-        if c.local_addr().ok() == c.peer_addr().ok() {
-            return (0, J::Null);
-        }
         // a server that accepts and never answers fails the test instead of hanging it
         let _ = c.set_read_timeout(Some(Duration::from_secs(60)));
         let _ = c.set_write_timeout(Some(Duration::from_secs(60)));
@@ -102,13 +83,6 @@ impl Server {
             unsafe { libc::kill(self.child.id() as i32, libc::SIGHUP) },
             0
         );
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -410,7 +384,7 @@ fn global_settings_and_secrets_commands() {
     )
     .unwrap();
     let secret = format!("gw=file:{}", key_file.display());
-    let s = Server::start_in(
+    let s = Server::start(
         &data,
         &[
             "--model-config",
@@ -422,7 +396,6 @@ fn global_settings_and_secrets_commands() {
             "--outbound-allow-private",
         ],
         &log,
-        47600..47620,
     );
     let mut outputs: Vec<String> = Vec::new();
     let mut run = |args: &[&str], stdin: &str| {
@@ -622,11 +595,10 @@ fn provider_presets_and_insecure_warning() {
     let cfg = dir.path().join("models.json");
     let log = dir.path().join("server.log");
     std::fs::write(&cfg, models(9, false).to_string()).unwrap();
-    let s = Server::start_in(
+    let s = Server::start(
         &dir.path().join("data"),
         &["--model-config", cfg.to_str().unwrap()],
         &log,
-        47800..47820,
     );
     let run = |args: &[&str]| cli(&s, &home, args, "");
     let provider = |name: &str| {
@@ -770,7 +742,6 @@ fn secrets_key_none_and_unseal() {
     let log = dir.path().join("server.log");
     let (mock_port, seen) = mock();
     std::fs::write(&cfg, models(mock_port, false).to_string()).unwrap();
-    let ports = 48450..48470;
     let args = [
         "--model-config",
         cfg.to_str().unwrap(),
@@ -789,7 +760,7 @@ fn secrets_key_none_and_unseal() {
     // --secrets-key none: plaintext, as releases before sealing kept it
     let mut none = args.to_vec();
     none.extend(["--secrets-key", "none"]);
-    let s = Server::start_in(&data, &none, &log, ports.clone());
+    let s = Server::start(&data, &none, &log);
     let (st, _) = s.call("PUT", "/$/server/secrets/gw", Some(json!({ "value": KEY })));
     assert_eq!(st, 204);
     let (_, v) = s.call("GET", "/$/server/secrets", None);
@@ -799,7 +770,7 @@ fn secrets_key_none_and_unseal() {
     drop(s);
 
     // the default seals them at the start with a generated key
-    let s = Server::start_in(&data, &args, &log, ports.clone());
+    let s = Server::start(&data, &args, &log);
     let stored = std::fs::read_to_string(&gw).unwrap();
     assert!(stored.starts_with("sparkles-sealed-secret/1 "), "{stored}");
     test(&s);
@@ -825,7 +796,7 @@ fn secrets_key_none_and_unseal() {
     assert_eq!(std::fs::read_to_string(&gw).unwrap(), KEY);
 
     // a server that does not seal reads them again
-    let s = Server::start_in(&data, &none, &log, ports);
+    let s = Server::start(&data, &none, &log);
     test(&s);
     drop(s);
     let text = std::fs::read_to_string(&log).unwrap();

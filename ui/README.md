@@ -233,8 +233,8 @@ when it is stale, and `SPARKLES_FMT_BLESS=1` rewrites it.
 ## End-to-end tests
 
 `tests/e2e` holds Playwright smoke tests of the UI against a real `sparkles serve`.
-`global-setup.ts` starts `../target/debug/sparkles` (or `$SPARKLES_BIN`) twice on free
-ports of 127.0.0.1, each with a temporary data directory. The first server has an auth
+`global-setup.ts` starts `../target/debug/sparkles` (or `$SPARKLES_BIN`) twice on
+kernel-assigned loopback ports, each with a temporary data directory. The first server has an auth
 configuration with a user `alice`, who has a password, and a static server-admin API
 token. The setup loads a small dataset (`data.ts`) into it in two commits, enables
 full-text search and signs `alice` in. The dataset has labels, comments for full-text
@@ -243,8 +243,9 @@ the default `sparkles serve` does, with a backup configuration that lets its API
 repositories under a temporary directory, a settings file (`--settings`) that also locks
 a model provider's endpoint, a model configuration (`--model-config`) with a declared
 key, and an in-memory dataset it declares (`--mem`). The teardown stops both servers and deletes
-the directories. `SPARKLES_E2E_KEEP=1` keeps them, with `server.log`, and
-`SPARKLES_E2E_PORT=N` runs the two servers on ports N and N + 1. A debug binary
+the directories. `SPARKLES_E2E_KEEP=1` keeps them, with `server.log`. Unset
+`SPARKLES_E2E_PORT` or set it to zero for two kernel-assigned ports. A positive value N
+runs the two servers on ports N and N + 1. A debug binary
 reads `build/` from disk, so run `pnpm build` first. The tests cover signing in with a
 password, a token minted on the tokens page that calls the API but cannot sign in to the
 UI, the query page, Explore, Similar, text search and the dataset history. Against the

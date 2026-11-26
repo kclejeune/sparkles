@@ -110,7 +110,7 @@ impl Batches {
     }
 
     /// Close every window now (tests).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "auth"))]
     pub(crate) fn close_all(&self) {
         let now = Instant::now();
         for b in self.open.lock().values_mut() {
@@ -119,7 +119,7 @@ impl Batches {
     }
 
     /// The batches that wait (tests).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "auth"))]
     pub(crate) fn waiting(&self) -> Vec<Batch> {
         self.open.lock().values().cloned().collect()
     }

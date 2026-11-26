@@ -2,9 +2,11 @@
 //! `serve --fuseki-config` as the real binary
 //! (spec G08), on Apache Jena's example configurations in `testsuite/fuseki/jena`.
 
+mod common;
+
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_sparkles");
@@ -223,15 +225,6 @@ fn a_fuseki_base_directory_with_shiro() {
     }
 }
 
-/// A free port of `range`, within 5580-5599, which no other test uses. Tests that run
-/// at once use separate ranges.
-fn port(range: std::ops::Range<u16>) -> u16 {
-    range
-        .clone()
-        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-        .unwrap_or_else(|| panic!("a free port in {range:?}"))
-}
-
 /// A GET on the server, returning the body.
 /// Whether the server on `port` answers `GET /$/ready` with `200`: it listens before its
 /// datasets open.
@@ -268,30 +261,24 @@ fn serve_from_a_fuseki_configuration() {
            fuseki:dataset [ a ja:MemoryDataset ; ja:data \"data.trig\" ] .\n",
     )
     .unwrap();
-    let port = port(5580..5586);
-    let mut child = Command::new(BIN)
-        .args([
-            "serve",
-            "--port",
-            &port.to_string(),
-            "--data",
-            "data",
-            "--fuseki-config",
-            "config.ttl",
-            "--idle-release-ms",
-            "0",
-        ])
-        .current_dir(d.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let (mut child, port) = common::ServerProcess::start(
+        common::serve()
+            .args([
+                "--data",
+                "data",
+                "--fuseki-config",
+                "config.ttl",
+                "--idle-release-ms",
+                "0",
+            ])
+            .current_dir(d.path()),
+        &d.path().join("server.log"),
+    );
     let t0 = Instant::now();
     while !ready(port) {
-        if let Ok(Some(status)) = child.try_wait() {
-            let mut e = String::new();
-            child.stderr.take().unwrap().read_to_string(&mut e).unwrap();
-            panic!("the server exited with {status}: {e}");
+        if let Some(status) = child.try_wait().unwrap() {
+            let log = std::fs::read_to_string(d.path().join("server.log")).unwrap();
+            panic!("the server exited with {status}: {log}");
         }
         assert!(
             t0.elapsed() < Duration::from_secs(120),
@@ -312,7 +299,7 @@ fn serve_from_a_fuseki_configuration() {
         &[
             "serve",
             "--port",
-            &port.to_string(),
+            "0",
             "--data",
             "data2",
             "--fuseki-config",
@@ -343,21 +330,19 @@ fn serve_sh_starts() {
             &["config", "import", "fuseki", &config, "--out", "out"],
         );
         assert_eq!(o.status.code(), Some(0), "{}{}", out(&o), err(&o));
-        let port = port(5586..5600);
-        let mut child = Command::new("sh")
-            .arg(d.path().join("out/serve.sh"))
-            .args(["--port", &port.to_string(), "--idle-release-ms", "0"])
-            .env("SPARKLES", BIN)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let (mut child, port) = common::ServerProcess::start(
+            Command::new("sh")
+                .arg(d.path().join("out/serve.sh"))
+                .args(["--port", "0", "--idle-release-ms", "0"])
+                .env("SPARKLES", BIN)
+                .env("RUST_LOG", "info"),
+            &d.path().join("server.log"),
+        );
         let t0 = Instant::now();
         while !ready(port) {
-            if let Ok(Some(status)) = child.try_wait() {
-                let mut e = String::new();
-                child.stderr.take().unwrap().read_to_string(&mut e).unwrap();
-                panic!("{config}: the server exited with {status}: {e}");
+            if let Some(status) = child.try_wait().unwrap() {
+                let log = std::fs::read_to_string(d.path().join("server.log")).unwrap();
+                panic!("{config}: the server exited with {status}: {log}");
             }
             assert!(
                 t0.elapsed() < Duration::from_secs(120),

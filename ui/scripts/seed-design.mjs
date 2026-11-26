@@ -10,13 +10,13 @@
 // The ontology and the thesaurus are downloaded once into SPARKLES_SEED_CACHE (default
 // ~/.cache/sparkles-ui-seed). SPARKLES_BIN selects the binary (default
 // ../target/debug/sparkles), SPARKLES_UI_DIR a UI build to serve instead of the embedded
-// one, and SPARKLES_SEED_PORT the port (default a free one). SPARKLES_SEED_SKIP=go leaves
+// one, and SPARKLES_SEED_PORT the port (default assigned by the kernel). SPARKLES_SEED_SKIP=go leaves
 // out the slow GO load. SPARKLES_SEED_ASK=1 also starts the stand-in model provider of
 // scripts/ask-stub.mjs and turns on the `demo` dataset's assistant, so that the Ask thread
 // can be checked against a real server without a paid model. The script prints
 // `ready <url>` once every dataset answers.
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import {
   createWriteStream,
   existsSync,
@@ -26,12 +26,12 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { createServer } from 'node:net';
 import { startAskStub, stubModelConfig } from './ask-stub.mjs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { fetchLocal, runSeedServer, waitForReady } from './server-process.mjs';
 
 const ROOT = resolve(import.meta.dirname, '../..');
 const BIN = process.env.SPARKLES_BIN ?? join(ROOT, 'target/debug/sparkles');
@@ -72,19 +72,6 @@ const STORED = {
   },
 };
 
-function freePort() {
-  return new Promise((ok, fail) => {
-    const s = createServer();
-    s.once('error', fail);
-    s.listen(0, '127.0.0.1', () => {
-      const { port } = s.address();
-      s.close(() => ok(port));
-    });
-  });
-}
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 async function download(name) {
   const { file, url } = SOURCES[name];
   const path = join(CACHE, file);
@@ -106,88 +93,71 @@ function load(dir, ds, file) {
 }
 
 async function call(url, method, path, body) {
-  const r = await fetch(url + path, {
-    method,
-    headers: body ? { 'content-type': 'application/json' } : {},
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  const r = await fetchLocal(
+    new Request(url + path, {
+      method,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  );
   if (!r.ok) throw new Error(`${method} ${path} answered ${r.status}: ${await r.text()}`);
+  await r.body?.cancel();
 }
 
 async function main() {
   if (!existsSync(BIN)) throw new Error(`no Sparkles binary at ${BIN}`);
   const dir = mkdtempSync(join(tmpdir(), 'sparkles-design-'));
-  const datasets = ['demo'];
-  const demo = join(ROOT, 'docs/demo');
-  const files = readdirSync(demo)
-    .filter((f) => f.endsWith('.ttl'))
-    .sort((a, b) => Number(b === 'vocab.ttl') - Number(a === 'vocab.ttl') || a.localeCompare(b));
-  for (const f of files) load(dir, 'demo', join(demo, f));
-  for (const ds of ['unesco', 'go']) {
-    if (SKIP.has(ds)) continue;
-    load(dir, ds, await download(ds));
-    datasets.push(ds);
-  }
+  let stub;
+  try {
+    const datasets = ['demo'];
+    const demo = join(ROOT, 'docs/demo');
+    const files = readdirSync(demo)
+      .filter((f) => f.endsWith('.ttl'))
+      .sort((a, b) => Number(b === 'vocab.ttl') - Number(a === 'vocab.ttl') || a.localeCompare(b));
+    for (const f of files) load(dir, 'demo', join(demo, f));
+    for (const ds of ['unesco', 'go']) {
+      if (SKIP.has(ds)) continue;
+      load(dir, ds, await download(ds));
+      datasets.push(ds);
+    }
 
-  const port = Number(process.env.SPARKLES_SEED_PORT ?? (await freePort()));
-  const url = `http://127.0.0.1:${port}`;
-  const args = [
-    'serve',
-    '--data',
-    join(dir, 'data'),
-    '--host',
-    '127.0.0.1',
-    '--port',
-    String(port),
-  ];
-  for (const ds of datasets) args.push('--loc', `${ds}=${join(dir, ds)}`);
-  args.push('--text', 'demo', '--geo', 'demo');
-  const stub = ASK ? await startAskStub() : null;
-  if (stub) {
-    const cfg = join(dir, 'models.json');
-    writeFileSync(cfg, JSON.stringify(stubModelConfig(stub.url)));
-    args.push('--model-config', cfg, '--outbound-allow-private');
-  }
-  const child = spawn(BIN, args, { stdio: 'inherit' });
-  const stop = () => {
-    child.kill('SIGTERM');
+    const args = [
+      'serve',
+      '--data',
+      join(dir, 'data'),
+      '--host',
+      '127.0.0.1',
+      '--port',
+      process.env.SPARKLES_SEED_PORT ?? '0',
+    ];
+    for (const ds of datasets) args.push('--loc', `${ds}=${join(dir, ds)}`);
+    args.push('--text', 'demo', '--geo', 'demo');
+    if (ASK) stub = await startAskStub();
+    if (stub) {
+      const cfg = join(dir, 'models.json');
+      writeFileSync(cfg, JSON.stringify(stubModelConfig(stub.url)));
+      args.push('--model-config', cfg, '--outbound-allow-private');
+    }
+    await runSeedServer(BIN, args, join(dir, 'server.log'), 60_000, async (child, url) => {
+      for (const ds of datasets) await waitForReady(child, `${url}/$/ready/${ds}`, 300_000);
+      for (const [name, def] of Object.entries(STORED))
+        await call(url, 'PUT', `/$/queries/demo/${name}`, def);
+      for (const name of ['draft-places', 'review-2026'])
+        await call(url, 'POST', '/$/branches/demo', { name, note: `Seeded branch ${name}` });
+      if (stub)
+        await call(url, 'PUT', '/$/assistant/demo', {
+          enabled: true,
+          send: 'rows',
+          historyDays: 30,
+        });
+    });
+  } finally {
     stub?.close();
-  };
-  process.once('SIGINT', stop);
-  process.once('SIGTERM', stop);
-  child.once('exit', () => {
     rmSync(dir, { recursive: true, force: true });
-    process.exit(0);
-  });
-
-  for (let i = 0; ; i++) {
-    try {
-      if ((await fetch(`${url}/$/ping`)).ok) break;
-    } catch {
-      // not listening yet
-    }
-    if (i > 600) throw new Error('sparkles serve did not answer within 60 s');
-    await sleep(100);
   }
-  for (const ds of datasets) {
-    for (let i = 0; ; i++) {
-      const r = await fetch(`${url}/$/ready/${ds}`);
-      if (r.ok) break;
-      if (i > 3000) throw new Error(`dataset ${ds} did not open within 5 min`);
-      await sleep(100);
-    }
-  }
-  for (const [name, def] of Object.entries(STORED))
-    await call(url, 'PUT', `/$/queries/demo/${name}`, def);
-  for (const name of ['draft-places', 'review-2026'])
-    await call(url, 'POST', '/$/branches/demo', { name, note: `Seeded branch ${name}` });
-  if (stub)
-    await call(url, 'PUT', '/$/assistant/demo', { enabled: true, send: 'rows', historyDays: 30 });
-  console.log(`ready ${url}`);
 }
 
 main().catch((e) => {
   console.error(e);
   process.exitCode = 1;
-  process.emit('SIGTERM');
 });

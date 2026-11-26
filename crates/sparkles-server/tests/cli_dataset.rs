@@ -1,4 +1,7 @@
 //! The actual dataset CLI against a stopped catalog and a running server.
+#[cfg(feature = "auth")]
+mod common;
+
 use serde_json::Value as J;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -225,50 +228,16 @@ fn item62_audit_dataset_commands_log_local_identity_and_actual_clone_commit() {
 #[cfg(feature = "auth")]
 #[test]
 fn online_dataset_cli_crud_clone() {
-    use std::process::{Child, Stdio};
-    use std::time::{Duration, Instant};
-    struct Server(Child);
-    impl Drop for Server {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
     let temp = tempfile::tempdir().unwrap();
     let dir = temp.path();
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let mut server = Server(
-        Command::new(BIN)
+    let (_server, port) = common::ServerProcess::start(
+        common::serve()
             .current_dir(dir)
-            .args([
-                "serve",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-                "--data",
-                "data",
-            ])
+            .args(["--data", "data"])
             .env_remove("SPARKLES_AUTH_CONFIG")
-            .env_remove("SPARKLES_BACKUP_CONFIG")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .env_remove("SPARKLES_BACKUP_CONFIG"),
+        &dir.join("server.log"),
     );
-    let start = Instant::now();
-    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(server.0.try_wait().unwrap().is_none(), "server exited");
-        assert!(
-            start.elapsed() < Duration::from_secs(30),
-            "server did not start"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
     wait_ready(port);
     let url = format!("http://127.0.0.1:{port}");
     let created = ok(

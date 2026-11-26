@@ -1281,7 +1281,7 @@ impl AppState {
     }
 
     /// Hold `name` as leaving, as a deletion that is draining does (tests).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "auth"))]
     pub(crate) fn leave_for_tests(&self, name: &str) -> impl Drop + '_ {
         self.leave(name).unwrap()
     }

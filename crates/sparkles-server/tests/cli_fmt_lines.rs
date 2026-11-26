@@ -5,6 +5,8 @@
 
 #![cfg(feature = "fmt")]
 
+mod common;
+
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -341,26 +343,17 @@ fn files_of_every_language_print_in_order() {
 
 /// A server on a temporary data directory, stopped when dropped.
 struct Server {
-    child: std::process::Child,
+    _child: common::ServerProcess,
     port: u16,
 }
 
 impl Server {
     fn start(data: &Path) -> Server {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let mut command = common::serve();
+        command.arg("--data").arg(data.join("data"));
+        let (child, port) = common::ServerProcess::start(&mut command, &data.join("server.log"));
         let s = Server {
-            child: Command::new(BIN)
-                .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
-                .arg("--data")
-                .arg(data.join("data"))
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
+            _child: child,
             port,
         };
         let t0 = std::time::Instant::now();
@@ -388,13 +381,6 @@ impl Server {
         let (head, body) = buf.split_once("\r\n\r\n")?;
         let status = head.split(' ').nth(1)?.parse().ok()?;
         Some((status, body.to_string()))
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 

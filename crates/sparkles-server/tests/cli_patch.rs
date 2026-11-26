@@ -1,6 +1,9 @@
 //! `sparkles patch` and `sparkles rdfpatch` as the real binary (spec F10 P15): applying
 //! patch files to a local database and through a server, and printing their rows.
 
+#[cfg(feature = "auth")]
+mod common;
+
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -129,40 +132,20 @@ fn rdfpatch_prints_rows_and_counts() {
     assert_eq!(o.status.code(), Some(1));
 }
 
-/// A free port in 5520–5539.
-#[cfg(feature = "auth")]
-fn port() -> u16 {
-    (5520..5540)
-        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-        .expect("a free port in 5520-5539")
-}
-
 #[cfg(feature = "auth")]
 #[test]
 fn patch_through_a_server() {
-    use std::process::Stdio;
-    use std::time::{Duration, Instant};
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
     std::fs::write(dir.join("p.rdfp"), P).unwrap();
-    let port = port();
-    let mut child = Command::new(BIN)
-        .args(["serve", "--port", &port.to_string(), "--mem", "ds"])
-        .arg("--data")
-        .arg(dir.join("data"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let (mut child, port) = common::ServerProcess::start(
+        common::serve()
+            .args(["--mem", "ds"])
+            .arg("--data")
+            .arg(dir.join("data")),
+        &dir.join("server.log"),
+    );
     let base = format!("http://127.0.0.1:{port}");
-    let t0 = Instant::now();
-    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(
-            t0.elapsed() < Duration::from_secs(60),
-            "server did not start"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
     wait_ready(port);
     let o = run(
         dir,

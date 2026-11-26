@@ -1,5 +1,5 @@
 // Starts a real `sparkles serve` for the end-to-end tests: a temporary data directory, a
-// free port on 127.0.0.1 and an auth configuration with one local user and one static API
+// kernel-assigned port on 127.0.0.1 and an auth configuration with one local user and one static API
 // token. It loads a small dataset (labels, comments for full-text search, vectors for
 // "Similar"), signs the user in, and hands the details to the tests through environment
 // variables (inherited by the workers). A second server without auth (the default
@@ -17,24 +17,21 @@
 // browser module.
 
 import { request, type FullConfig } from '@playwright/test';
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { spawnSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import {
-  closeSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
-  openSync,
   readdirSync,
-  readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { BROWSE_TURTLE } from '../browse-fixture';
+import { startServer, stopServer } from '../../scripts/server-process.mjs';
 import {
   BROWSE_EDIT_AUTH,
   BROWSE_EDIT_OPEN_GRAPH,
@@ -106,56 +103,7 @@ function checkModule(bin: string) {
     );
 }
 
-/** A port that was free a moment ago (the server is retried on another if it is taken). */
-function freePort(): Promise<number> {
-  return new Promise((ok, fail) => {
-    const s = createServer();
-    s.once('error', fail);
-    s.listen(0, '127.0.0.1', () => {
-      const addr = s.address();
-      s.close(() =>
-        addr && typeof addr === 'object' ? ok(addr.port) : fail(new Error('no port')),
-      );
-    });
-  });
-}
-
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-/** SIGTERM (a graceful drain), then SIGKILL if it has not exited after `ms`. */
-async function stop(child: ChildProcess, ms = 10_000) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  const exited = new Promise<void>((r) => child.once('exit', () => r()));
-  child.kill('SIGTERM');
-  const timer = setTimeout(() => child.kill('SIGKILL'), ms);
-  await exited;
-  clearTimeout(timer);
-}
-
-/** Start the server; resolves once `/$/ping` answers, rejects if the process exits first. */
-async function start(bin: string, args: string[], log: string) {
-  const out = openSync(log, 'a');
-  const child = spawn(bin, args, {
-    stdio: ['ignore', out, out],
-    env: { ...process.env, RUST_LOG: process.env.RUST_LOG ?? 'info' },
-  });
-  closeSync(out);
-  let exit: string | null = null;
-  child.once('exit', (code, signal) => (exit = `exited with ${signal ?? code}`));
-  const url = `http://${args[args.indexOf('--host') + 1]}:${args[args.indexOf('--port') + 1]}`;
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
-    if (exit) return { child, url, error: exit };
-    try {
-      if ((await fetch(`${url}/$/ping`)).ok) return { child, url, error: null };
-    } catch {
-      // not listening yet
-    }
-    await sleep(100);
-  }
-  await stop(child);
-  return { child, url, error: 'did not answer /$/ping within 30 s' };
-}
 
 async function check(r: Response, what: string) {
   if (!r.ok) throw new Error(`${what}: ${r.status} ${await r.text()}`);
@@ -165,29 +113,14 @@ async function check(r: Response, what: string) {
 /** `SPARKLES_E2E_PORT`: the first server's port, and the next one the second server's. */
 const fixedPort = process.env.SPARKLES_E2E_PORT ? Number(process.env.SPARKLES_E2E_PORT) : null;
 
-/**
- * `sparkles serve` on 127.0.0.1 with these extra arguments, on a free port, or on
- * `SPARKLES_E2E_PORT` plus `offset` when that is set.
- */
-async function serve(bin: string, data: string, log: string, extra: string[], offset = 0) {
-  let server: Awaited<ReturnType<typeof start>> | null = null;
-  for (let attempt = 0; attempt < (fixedPort == null ? 3 : 1); attempt++) {
-    const port = fixedPort == null ? await freePort() : fixedPort + offset;
-    // --host is explicit: the tests must not listen on every interface
-    server = await start(
-      bin,
-      ['serve', '--data', data, '--host', '127.0.0.1', '--port', String(port), ...extra],
-      log,
-    );
-    if (!server.error) break;
-    // retried only when another process took the port in the meantime
-    if (!/address already in use|binding/i.test(readFileSync(log, 'utf8'))) break;
-  }
-  if (!server || server.error) {
-    const tail = readFileSync(log, 'utf8').split('\n').slice(-30).join('\n');
-    throw new Error(`sparkles serve ${server?.error}; log ${log}:\n${tail}`);
-  }
-  return server;
+/** Start on loopback with a kernel-assigned port unless a port was requested. */
+function serve(bin: string, data: string, log: string, extra: string[], offset = 0) {
+  const port = fixedPort == null || fixedPort === 0 ? 0 : fixedPort + offset;
+  return startServer(
+    bin,
+    ['serve', '--data', data, '--host', '127.0.0.1', '--port', String(port), ...extra],
+    log,
+  );
 }
 
 export default async function globalSetup(_config: FullConfig) {
@@ -461,15 +394,15 @@ graphs = ["urn:x-arq:DefaultGraph"]
     process.env.SPARKLES_E2E_REPOS = repos;
   } catch (e) {
     process.off('exit', kill);
-    await stop(child);
-    if (open) await stop(open);
+    await stopServer(child);
+    if (open) await stopServer(open);
     throw new Error(`${e instanceof Error ? e.message : e} (server log: ${log})`, { cause: e });
   }
 
   return async () => {
     process.off('exit', kill);
-    await stop(child);
-    if (open) await stop(open);
+    await stopServer(child);
+    if (open) await stopServer(open);
     if (process.env.SPARKLES_E2E_KEEP) console.log(`sparkles e2e: kept ${dir}`);
     else rmSync(dir, { recursive: true, force: true });
   };

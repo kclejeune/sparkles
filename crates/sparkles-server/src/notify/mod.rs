@@ -631,7 +631,7 @@ pub fn active_keys(st: &AppState) -> Vec<String> {
 /// Turn notifications on for the tests of other modules: a settings file in `dir`
 /// routes every event to a webhook on loopback, which the outbound policy refuses, so
 /// an event is raised and recorded without any network traffic.
-#[cfg(test)]
+#[cfg(all(test, feature = "backup"))]
 pub fn enable_for_tests(st: &mut AppState, dir: &std::path::Path) {
     st.outbound.allow_private = false;
     let f = dir.join("notify-settings.json");

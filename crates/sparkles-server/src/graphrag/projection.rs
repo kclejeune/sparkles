@@ -13,7 +13,9 @@ use crate::models::Pair;
 use oxrdf::Term;
 use sparkles::algo::{Aggregate, Control, Graph, Par, RawEdges};
 use sparkles::sparql::{self, QueryOptions};
-use sparkles::store::{BoundReadSource, Snapshot, Store};
+use sparkles::store::Snapshot;
+#[cfg(feature = "mcp")]
+use sparkles::store::{BoundReadSource, Store};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -120,6 +122,7 @@ pub fn read_with(
 
 /// Read the projection from a bound read source (such as an evidence view) with the
 /// principal's options and `extra`'s graphs, keeping the source's reservation alive.
+#[cfg(feature = "mcp")]
 pub fn read_with_source(
     source: BoundReadSource,
     store: &Store,

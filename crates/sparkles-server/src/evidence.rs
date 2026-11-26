@@ -51,7 +51,9 @@ pub fn routes() -> Router<Arc<AppState>> {
 mod claims;
 mod review;
 
-pub(crate) use claims::{caller_fence, principal_iri, propose_ingested, record_json};
+pub(crate) use claims::principal_iri;
+#[cfg(feature = "mcp")]
+pub(crate) use claims::{caller_fence, propose_ingested, record_json};
 
 /// The response body: the canonical settings, their digest, the registry revision and
 /// the role graphs that are protected or detached.

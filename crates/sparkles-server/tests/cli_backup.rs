@@ -4,6 +4,8 @@
 
 #![cfg(feature = "backup")]
 
+mod common;
+
 use serde_json::Value as J;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -66,6 +68,8 @@ fn encrypted_configuration_is_rejected_by_the_server_without_opening_it() {
         h,
         &[
             "serve",
+            "--port",
+            "0",
             "--data",
             s(&h.join("data")),
             "--backup-config",
@@ -1632,27 +1636,23 @@ fn memory_repositories() {
 
 /// A server on a data directory, stopped when dropped.
 struct Server {
-    child: Child,
+    _child: common::ServerProcess,
     port: u16,
 }
 
 impl Server {
     fn start(data: &Path) -> Server {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let child = Command::new(BIN)
-            .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
-            .arg("--data")
-            .arg(data)
-            .env_remove("SPARKLES_BACKUP_CONFIG")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let s = Server { child, port };
+        let (child, port) = common::ServerProcess::start(
+            common::serve()
+                .arg("--data")
+                .arg(data)
+                .env_remove("SPARKLES_BACKUP_CONFIG"),
+            &data.with_extension("server.log"),
+        );
+        let s = Server {
+            _child: child,
+            port,
+        };
         let t0 = Instant::now();
         while s.try_get("/$/ready").is_none() {
             assert!(
@@ -1678,13 +1678,6 @@ impl Server {
     fn get(&self, path: &str) -> J {
         let body = self.try_get(path).unwrap_or_else(|| panic!("GET {path}"));
         serde_json::from_str(&body).unwrap()
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 

@@ -3,51 +3,36 @@
 //! `--spill on` or `--spill encrypted` given, the same directory fails the start, and
 //! `--spill off` turns spill off and leaves the directory unopened.
 
+mod common;
+
 use serde_json::Value as J;
 use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_sparkles");
-const PORTS: std::ops::Range<u16> = 47900..47920;
-
-/// The `sparkles serve` command on a free port, with its log in `log`.
-fn serve(data: &Path, extra: &[&str], log: &Path) -> (Command, u16) {
-    let port = PORTS
-        .clone()
-        .find(|p| TcpListener::bind(("127.0.0.1", *p)).is_ok())
-        .unwrap_or_else(|| panic!("a free port in {PORTS:?}"));
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
-        .unwrap();
-    let mut command = Command::new(BIN);
+fn serve(data: &Path, extra: &[&str]) -> Command {
+    let mut command = common::serve();
     command
-        .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
         .arg("--data")
         .arg(data)
         .args(extra)
         .env_remove("SPARKLES_BACKUP_CONFIG")
-        .env("RUST_LOG", "info")
-        .stdout(Stdio::null())
-        .stderr(log);
-    (command, port)
+        .env("RUST_LOG", "info");
+    command
 }
 
 /// A server started by the test, stopped when dropped.
 struct Server {
-    child: Child,
+    _child: common::ServerProcess,
     port: u16,
 }
 
 impl Server {
     fn start(data: &Path, extra: &[&str], log: &Path) -> Server {
-        let (mut command, port) = serve(data, extra, log);
+        let (child, port) = common::ServerProcess::start(&mut serve(data, extra), log);
         let s = Server {
-            child: command.spawn().unwrap(),
+            _child: child,
             port,
         };
         let t0 = Instant::now();
@@ -88,13 +73,6 @@ impl Server {
     }
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 #[test]
 fn spill_is_on_by_default_and_an_unusable_directory_only_fails_an_explicit_request() {
     let dir = tempfile::tempdir().unwrap();
@@ -122,19 +100,11 @@ fn spill_is_on_by_default_and_an_unusable_directory_only_fails_an_explicit_reque
         assert!(text.contains("running without spill"), "{text}");
     }
     for mode in ["on", "encrypted"] {
-        let (mut command, _) = serve(&data, &["--spill", mode, "--spill-dir", unusable], &log);
-        let mut child = command.spawn().unwrap();
-        let t0 = Instant::now();
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            if t0.elapsed() > Duration::from_secs(30) {
-                let _ = child.kill();
-                panic!("--spill {mode} with an unusable directory did not fail the start");
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
+        let status = common::ServerProcess::spawn(
+            &mut serve(&data, &["--spill", mode, "--spill-dir", unusable]),
+            std::fs::File::create(&log).unwrap(),
+        )
+        .wait_for_exit(Duration::from_secs(30), &log);
         assert!(!status.success(), "--spill {mode}");
     }
     for mode in ["on", "encrypted"] {

@@ -3,6 +3,9 @@
 //! a missing column, conversion to RML-Core, stored mappings run into a database in add
 //! and replace mode, and CSVW standard mode with a failing foreign key.
 
+#[cfg(feature = "auth")]
+mod common;
+
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -454,50 +457,16 @@ fn templates_read_the_target_database_with_lookup() {
 #[cfg(feature = "auth")]
 #[test]
 fn stored_mappings_on_a_server() {
-    use std::process::{Child, Stdio};
-    use std::time::{Duration, Instant};
-    struct Server(Child);
-    impl Drop for Server {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
     let dir = setup();
     let d = dir.path();
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let mut server = Server(
-        Command::new(BIN)
+    let (_server, port) = common::ServerProcess::start(
+        common::serve()
             .current_dir(d)
-            .args([
-                "serve",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-                "--data",
-                "data",
-            ])
+            .args(["--data", "data"])
             .env_remove("SPARKLES_AUTH_CONFIG")
-            .env_remove("SPARKLES_BACKUP_CONFIG")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .env_remove("SPARKLES_BACKUP_CONFIG"),
+        &d.join("server.log"),
     );
-    let start = Instant::now();
-    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(server.0.try_wait().unwrap().is_none(), "server exited");
-        assert!(
-            start.elapsed() < Duration::from_secs(30),
-            "server did not start"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
     wait_ready(port);
     let url = format!("http://127.0.0.1:{port}");
     expect(d, &["dataset", "create", "ds", "--server", &url], 0);

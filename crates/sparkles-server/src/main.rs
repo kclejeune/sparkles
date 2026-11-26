@@ -2626,6 +2626,7 @@ fn rejected_exit(e: anyhow::Error) -> anyhow::Error {
 
 /// The input graphs that `sparkles infer` was given, or `None` when it was given none of
 /// the input options and the recorded inputs apply.
+#[cfg(feature = "reasoning")]
 fn cli_inputs(
     data_graphs: &[String],
     ontology_graphs: &[String],
@@ -3480,7 +3481,11 @@ fn run() -> Result<()> {
             // and runs its request itself, instead of waking this thread to accept and
             // then another worker to serve it.
             let serve = async move {
-                let addr = format!("{host}:{port}");
+                let addr = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+                    format!("[{host}]:{port}")
+                } else {
+                    format!("{host}:{port}")
+                };
                 let tcp = match &unix_socket {
                     None => Some(
                         tokio::net::TcpListener::bind(&addr)
@@ -3502,7 +3507,17 @@ fn run() -> Result<()> {
                     let l = tokio::net::TcpListener::bind(maddr)
                         .await
                         .with_context(|| format!("binding --metrics-addr {maddr}"))?;
-                    tracing::info!("metrics at http://{maddr}/$/metrics");
+                    let bound = if maddr
+                        .rsplit_once(':')
+                        .is_some_and(|(_, port)| port.parse::<u16>() == Ok(0))
+                    {
+                        l.local_addr()
+                            .context("reading the metrics listener address")?
+                            .to_string()
+                    } else {
+                        maddr.clone()
+                    };
+                    tracing::info!("metrics at http://{bound}/$/metrics");
                     let service = obs::metrics_router(st.clone())
                         .into_make_service_with_connect_info::<auth::Peer>();
                     tokio::spawn(async move {
@@ -3521,17 +3536,22 @@ fn run() -> Result<()> {
                     bail!("--unix-socket needs a Unix platform");
                 }
                 let scheme = if tls_cert.is_some() { "https" } else { "http" };
-                // the address and port the socket bound, which differ from a `--host`
-                // name or `--port 0`, for recognising SERVICE calls to this server
-                if let Some(addr) = tcp.as_ref().and_then(|l| l.local_addr().ok()) {
+                let addr = if let Some(listener) = &tcp {
+                    // Recognise SERVICE calls to the actual socket address.
+                    let bound = listener
+                        .local_addr()
+                        .context("reading the listener address")?;
                     let _ = st.listener.set(http::self_service::Listener {
                         scheme,
-                        ip: addr.ip(),
-                        port: addr.port(),
+                        ip: bound.ip(),
+                        port: bound.port(),
                     });
-                }
+                    if port == 0 { bound.to_string() } else { addr }
+                } else {
+                    addr
+                };
                 let listening = match &unix_socket {
-                    Some(p) => format!("unix:{}", p.display()),
+                    Some(path) => format!("unix:{}", path.display()),
                     None => format!("{scheme}://{addr}/"),
                 };
                 tracing::info!(

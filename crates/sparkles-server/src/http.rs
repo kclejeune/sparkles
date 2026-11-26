@@ -1595,12 +1595,12 @@ pub(crate) fn demand_view(
     profile: Option<&str>,
     max_derived: Option<usize>,
 ) -> ApiResult<Option<sparkles::reasoning::InferenceView>> {
-    use sparkles::reasoning::ReasoningMode;
     if mode.demand().is_none() {
         return Ok(None);
     }
     #[cfg(feature = "reasoning")]
     {
+        use sparkles::reasoning::ReasoningMode;
         let profile = match profile {
             None => None,
             Some(p) => Some(p.parse::<sparkles_reasoner::Profile>().map_err(|e| {
