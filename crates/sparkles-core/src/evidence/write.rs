@@ -1564,6 +1564,9 @@ impl<'a> Reads<'a> {
                     if self.snap.delta.del[spo].contains(&[s.0, p.0, tt.0, g.0]) {
                         continue;
                     }
+                    if !self.quad_exists(s, p, tt, g)? {
+                        continue;
+                    }
                     if self.triple_mentions_entity(tt, entity)? {
                         let start = if seen.is_empty() { SEEN_START } else { 0 };
                         ids_held.grow_by(start + SEEN_ENTRY)?;
@@ -1613,6 +1616,16 @@ impl<'a> Reads<'a> {
             }
         }
         Ok((out, false))
+    }
+
+    fn quad_exists(&self, s: Id, p: Id, o: Id, g: Id) -> Result<bool> {
+        let mut found = false;
+        self.preparation
+            .scan(self.snap, Perm::Spo, &[s.0, p.0, o.0, g.0], |_| {
+                found = true;
+                Ok(false)
+            })?;
+        Ok(found)
     }
 
     fn triple_mentions_entity(&self, tt: Id, entity: &str) -> Result<bool> {

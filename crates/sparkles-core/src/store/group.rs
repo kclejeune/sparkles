@@ -1872,7 +1872,7 @@ mod tests {
         // the transaction is abandoned and its term rolled back, as a dry run or a failed
         // commit does
         let generation = t.base.generation.clone();
-        generation.dvocab.rollback(&t.mark).unwrap();
+        generation.rollback_dvocab(&t.mark).unwrap();
         assert_eq!(
             generation.dvocab.len(),
             t.mark.entries(),

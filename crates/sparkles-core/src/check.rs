@@ -1281,7 +1281,7 @@ impl Checker<'_> {
             Ok(None) => {
                 if recorded
                     .as_ref()
-                    .is_some_and(|r| r.format > 0 && r.entries > 0)
+                    .is_some_and(|r| r.format > 0 && (r.entries > 0 || r.bytes > 0))
                 {
                     run.add(
                         Issue::warning(
@@ -1300,19 +1300,29 @@ impl Checker<'_> {
                 run.add(Issue::error(e.to_string()).file(&file));
                 "unreadable".to_string()
             }
-            Ok(Some(f)) if !self.full => format!("{} entries, {} bytes", f.entries(), f.bytes()),
-            Ok(Some(_)) => match crate::reifiers::verify(dir, fsst, MAX_ISSUES) {
-                Ok((problems, summary)) => {
-                    for p in problems {
-                        run.add(Issue::error(p).file(&file));
+            Ok(Some(f)) => {
+                if let Some(mismatch) =
+                    crate::reifiers::metadata_mismatch(dir, &f, recorded.as_ref())
+                {
+                    run.add(Issue::error(mismatch).file(&file));
+                }
+                if !self.full {
+                    format!("{} entries, {} bytes", f.entries(), f.bytes())
+                } else {
+                    match crate::reifiers::verify(dir, fsst, MAX_ISSUES) {
+                        Ok((problems, summary)) => {
+                            for p in problems {
+                                run.add(Issue::error(p).file(&file));
+                            }
+                            summary
+                        }
+                        Err(e) => {
+                            run.add(Issue::error(e.to_string()).file(&file));
+                            "unreadable".to_string()
+                        }
                     }
-                    summary
                 }
-                Err(e) => {
-                    run.add(Issue::error(e.to_string()).file(&file));
-                    "unreadable".to_string()
-                }
-            },
+            }
         };
         self.checks.push(run.done(summary));
     }

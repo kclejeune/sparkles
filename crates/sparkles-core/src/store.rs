@@ -361,6 +361,111 @@ impl Generation {
         })
     }
 
+    /// Whether `id` names a stored triple term, checked cheaply without reconstructing
+    /// base vocabulary keys.
+    fn is_triple_term_with<C: crate::budgeted::Control>(
+        &self,
+        id: Id,
+        limit: &C,
+        held: u64,
+    ) -> Result<bool> {
+        match id.tag() {
+            Tag::Vocab => Ok(self.vocab.is_triple(id.payload())),
+            Tag::Delta => {
+                if C::CHECKS {
+                    let rl = limit.read_limit();
+                    self.dvocab.with_limited(&rl, held, |d| {
+                        Ok(d.get(id.payload())
+                            .is_some_and(|key| key.first() == Some(&b'(')))
+                    })
+                } else {
+                    Ok(self.dvocab.with(|d| {
+                        d.get(id.payload())
+                            .is_some_and(|key| key.first() == Some(&b'('))
+                    }))
+                }
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Resolve `rdf:reifies` once on a cold-opened generation, caching either its ID or
+    /// `Id::UNDEF` (cold-opened generations are immutable and read-only).
+    fn resolve_rdf_reifies_with<C: crate::budgeted::Control>(
+        &self,
+        limit: &C,
+        held: u64,
+    ) -> Result<u64> {
+        let found = if C::CHECKS {
+            let scratch = std::cell::Cell::new(0u64);
+            let base = self.vocab.find_with_controlled_capacity(
+                crate::reifiers::RDF_REIFIES_KEY,
+                |old, new| {
+                    let peak = (old as u64).saturating_add(new as u64);
+                    limit.check(held.saturating_add(peak))
+                },
+                |cap| {
+                    scratch.set(cap as u64);
+                    limit.check(held.saturating_add(scratch.get()))
+                },
+                |_| limit.check(held.saturating_add(scratch.get())),
+            )?;
+            if let Ok(id) = base {
+                Id::vocab(id)
+            } else {
+                let rl = limit.read_limit();
+                self.dvocab
+                    .with_limited(&rl, held, |d| {
+                        Ok(
+                            d.find_prepared(crate::reifiers::RDF_REIFIES_KEY, d.len(), |_| {
+                                limit.check(held)
+                            })?
+                            .map(Id::delta),
+                        )
+                    })?
+                    .unwrap_or(Id::UNDEF)
+            }
+        } else {
+            self.vocab
+                .find(crate::reifiers::RDF_REIFIES_KEY)
+                .ok()
+                .map(Id::vocab)
+                .or_else(|| {
+                    self.dvocab
+                        .find(crate::reifiers::RDF_REIFIES_KEY)
+                        .map(Id::delta)
+                })
+                .unwrap_or(Id::UNDEF)
+        };
+        self.rdf_reifies.store(found.0, Ordering::Release);
+        Ok(found.0)
+    }
+
+    /// When `pred` is `rdf:reifies` and `obj` is a stored triple term, return the distinct
+    /// 64-bit hashes of its IRI subject and IRI object, respecting replay control `limit`
+    /// with `held` bytes already committed.
+    pub(crate) fn is_rdf_reifies_triple_with<C: crate::budgeted::Control>(
+        &self,
+        pred: Id,
+        obj: Id,
+        limit: &C,
+        held: u64,
+    ) -> Result<Option<crate::reifiers::TermHashes>> {
+        let mut cached = self.rdf_reifies.load(Ordering::Acquire);
+        if cached == RDF_REIFIES_UNRESOLVED {
+            // Cold-opened generation: avoid touching vocab during cold open; resolve
+            // `rdf:reifies` once when replay actually encounters a triple-term object.
+            if !self.is_triple_term_with(obj, limit, held)? {
+                return Ok(None);
+            }
+            cached = self.resolve_rdf_reifies_with(limit, held)?;
+        }
+        if cached == Id::UNDEF.0 || pred.0 != cached {
+            return Ok(None);
+        }
+        self.triple_term_hashes_with(obj, limit, held)
+    }
+
     /// When `pred` is `rdf:reifies` and `obj` is a stored triple term, return the distinct
     /// 64-bit hashes of its IRI subject and IRI object.
     #[inline]
@@ -368,38 +473,87 @@ impl Generation {
         &self,
         pred: Id,
         obj: Id,
-    ) -> Option<(Option<u64>, Option<u64>)> {
-        let cached = self.rdf_reifies.load(Ordering::Acquire);
-        if cached != RDF_REIFIES_UNRESOLVED {
-            if cached == Id::UNDEF.0 || pred.0 != cached {
-                return None;
+    ) -> Option<crate::reifiers::TermHashes> {
+        self.is_rdf_reifies_triple_with(pred, obj, &crate::budgeted::Unlimited, 0)
+            .ok()
+            .flatten()
+    }
+
+    /// Controlled variant of [`Self::is_rdf_reifies_triple`] governed by a
+    /// [`crate::access::Preparation`].
+    pub(crate) fn is_rdf_reifies_triple_prepared(
+        &self,
+        pred: Id,
+        obj: Id,
+        preparation: &crate::access::Preparation,
+    ) -> Result<Option<crate::reifiers::TermHashes>> {
+        preparation.check()?;
+        let mut cached = self.rdf_reifies.load(Ordering::Acquire);
+        if cached == RDF_REIFIES_UNRESOLVED {
+            let is_triple = match obj.tag() {
+                Tag::Vocab => self.vocab.is_triple(obj.payload()),
+                Tag::Delta => self.dvocab.with_prepared(preparation, |d| {
+                    Ok(d.get(obj.payload())
+                        .is_some_and(|key| key.first() == Some(&b'(')))
+                })?,
+                _ => false,
+            };
+            if !is_triple {
+                return Ok(None);
             }
-            return self.triple_term_hashes(obj);
+            let mut workspace = preparation.reserve(0)?;
+            let found = if let Ok(id) = self.vocab.find_with_controlled(
+                crate::reifiers::RDF_REIFIES_KEY,
+                |bytes| workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256)),
+                |phase| preparation.checkpoint(phase),
+            )? {
+                Id::vocab(id)
+            } else {
+                drop(workspace);
+                self.dvocab
+                    .with_prepared(preparation, |d| {
+                        Ok(
+                            d.find_prepared(crate::reifiers::RDF_REIFIES_KEY, d.len(), |_| {
+                                preparation.check()
+                            })?
+                            .map(Id::delta),
+                        )
+                    })?
+                    .unwrap_or(Id::UNDEF)
+            };
+            self.rdf_reifies.store(found.0, Ordering::Release);
+            cached = found.0;
         }
-        // Cold-opened generation: avoid touching vocab during cold open; resolve only
-        // when a WAL-replayed quad actually carries a triple-term object.
-        let hashes = self.triple_term_hashes(obj)?;
-        let matches = match pred.tag() {
-            Tag::Vocab => self
-                .vocab
-                .get_with_checked(
-                    pred.payload(),
-                    |_| Ok::<(), ()>(()),
-                    |key| key == crate::reifiers::RDF_REIFIES_KEY,
-                )
-                .ok()
-                .flatten()
-                .unwrap_or(false),
-            Tag::Delta => self
-                .dvocab
-                .with(|d| d.get(pred.payload()) == Some(crate::reifiers::RDF_REIFIES_KEY)),
-            _ => false,
-        };
-        if matches {
-            self.rdf_reifies.store(pred.0, Ordering::Release);
-            Some(hashes)
-        } else {
-            None
+        if cached == Id::UNDEF.0 || pred.0 != cached {
+            return Ok(None);
+        }
+        match obj.tag() {
+            Tag::Vocab if self.vocab.is_triple(obj.payload()) => {
+                let mut workspace = preparation.reserve(0)?;
+                Ok(self
+                    .vocab
+                    .get_with_controlled(
+                        obj.payload(),
+                        |bytes| {
+                            workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256))
+                        },
+                        |phase| preparation.checkpoint(phase),
+                        |key| {
+                            crate::reifiers::triple_key_term_hashes_controlled(key, || {
+                                preparation.check()
+                            })
+                        },
+                    )?
+                    .transpose()?
+                    .flatten())
+            }
+            Tag::Delta => self.dvocab.with_prepared(preparation, |d| {
+                let Some(key) = d.get(obj.payload()) else {
+                    return Ok(None);
+                };
+                crate::reifiers::triple_key_term_hashes_controlled(key, || preparation.check())
+            }),
+            _ => Ok(None),
         }
     }
 
@@ -412,25 +566,83 @@ impl Generation {
         Ok(id)
     }
 
+    /// Roll back delta vocabulary entries added since `mark`, invalidating the cached
+    /// `rdf:reifies` delta ID whenever it falls in the truncated range.
+    pub(crate) fn rollback_dvocab(&self, mark: &crate::vocab::VocabMark) -> Result<()> {
+        let raw = self.rdf_reifies.load(Ordering::Acquire);
+        if raw != RDF_REIFIES_UNRESOLVED {
+            let cached = Id(raw);
+            if cached.tag() == Tag::Delta && cached.payload() >= mark.entries() {
+                self.rdf_reifies.store(Id::UNDEF.0, Ordering::Release);
+            }
+        }
+        self.dvocab.rollback(mark)
+    }
+
     /// Extract the distinct 64-bit hashes of the IRI subject and IRI object of a stored
     /// triple-term id, returning `None` when `id` is not a triple term.
-    pub(crate) fn triple_term_hashes(&self, id: Id) -> Option<(Option<u64>, Option<u64>)> {
+    pub(crate) fn triple_term_hashes_with<C: crate::budgeted::Control>(
+        &self,
+        id: Id,
+        limit: &C,
+        held: u64,
+    ) -> Result<Option<crate::reifiers::TermHashes>> {
         match id.tag() {
-            Tag::Vocab if self.vocab.is_triple(id.payload()) => self
-                .vocab
-                .get_with_checked(
-                    id.payload(),
-                    |_| Ok::<(), ()>(()),
-                    crate::reifiers::triple_key_term_hashes,
-                )
-                .ok()
-                .flatten()
-                .flatten(),
-            Tag::Delta => self.dvocab.with(|d| {
-                d.get(id.payload())
-                    .and_then(crate::reifiers::triple_key_term_hashes)
-            }),
-            _ => None,
+            Tag::Vocab if self.vocab.is_triple(id.payload()) => {
+                if C::CHECKS {
+                    let scratch = std::cell::Cell::new(0u64);
+                    Ok(self
+                        .vocab
+                        .get_with_controlled_capacity_checked(
+                            id.payload(),
+                            |old, new| {
+                                let peak = (old as u64).saturating_add(new as u64);
+                                limit.check(held.saturating_add(peak))
+                            },
+                            |cap| {
+                                scratch.set(cap as u64);
+                                limit.check(held.saturating_add(scratch.get()))
+                            },
+                            |_| limit.check(held.saturating_add(scratch.get())),
+                            |key| {
+                                crate::reifiers::triple_key_term_hashes_controlled(key, || {
+                                    limit.check(held.saturating_add(scratch.get()))
+                                })
+                            },
+                        )?
+                        .flatten())
+                } else {
+                    Ok(self
+                        .vocab
+                        .get_with_checked(
+                            id.payload(),
+                            |_| Ok::<(), ()>(()),
+                            crate::reifiers::triple_key_term_hashes,
+                        )
+                        .ok()
+                        .flatten()
+                        .flatten())
+                }
+            }
+            Tag::Delta => {
+                if C::CHECKS {
+                    let rl = limit.read_limit();
+                    self.dvocab.with_limited(&rl, held, |d| {
+                        let Some(key) = d.get(id.payload()) else {
+                            return Ok(None);
+                        };
+                        crate::reifiers::triple_key_term_hashes_controlled(key, || {
+                            limit.check(held)
+                        })
+                    })
+                } else {
+                    Ok(self.dvocab.with(|d| {
+                        d.get(id.payload())
+                            .and_then(crate::reifiers::triple_key_term_hashes)
+                    }))
+                }
+            }
+            _ => Ok(None),
         }
     }
 
@@ -5964,7 +6176,7 @@ impl Store {
                 let error = load_error.into_inner();
                 // No uncommitted views escape this loader. Remove its terms while
                 // holding the writer lock; earlier group-commit terms precede mark.
-                if let Err(rollback_error) = txn.base.generation.dvocab.rollback(&txn.mark) {
+                if let Err(rollback_error) = txn.base.generation.rollback_dvocab(&txn.mark) {
                     // A partial file rollback may leave append state inconsistent.
                     // Refuse subsequent writes until the store is reopened.
                     txn.guard.poisoned = true;
@@ -7156,29 +7368,49 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     Ok(crate::fsutil::sync_dir(dir)?)
 }
 
-/// Apply an insert/delete to a delta, preserving the invariants
-/// `ins ∩ base = ∅` and `del ⊆ base`, and maintaining `delta.reifiers_ins` for
-/// inserted `rdf:reifies` triple-term quads.
-fn apply(generation: &Generation, delta: &mut Delta, q: &[Id; 4], insert: bool, in_base: bool) {
+/// Apply an insert/delete to a delta under replay control `limit` (with `held` bytes
+/// already committed), preserving the invariants `ins ∩ base = ∅` and `del ⊆ base` and
+/// maintaining `delta.reifiers_ins` for inserted `rdf:reifies` triple-term quads.
+/// Predicate resolution and triple-term hashing run before `delta` is mutated so a
+/// budget, deadline, or cancellation refusal leaves `delta` unchanged.
+pub(crate) fn apply_with<C: crate::budgeted::Control>(
+    generation: &Generation,
+    delta: &mut Delta,
+    q: &[Id; 4],
+    insert: bool,
+    in_base: bool,
+    limit: &C,
+    held: u64,
+) -> Result<()> {
     // The invariants above determine the only set this operation can change, so the
     // opposite set is left alone. The inserted quads' writes keep their statistics.
+    let spo = Perm::Spo.index();
     match (insert, in_base) {
         (true, false) => {
-            if delta.insert_quad(q)
-                && let Some((hs, ho)) = generation.is_rdf_reifies_triple(q[1], q[2])
-            {
-                for h in [hs, ho].into_iter().flatten() {
-                    delta.reifiers_ins.insert([q[3].0, h, q[0].0, q[2].0]);
+            if !delta.ins[spo].contains(&Perm::Spo.to_key(q)) {
+                let hashes = generation.is_rdf_reifies_triple_with(q[1], q[2], limit, held)?;
+                if delta.insert_quad(q)
+                    && let Some((hs, ho)) = hashes
+                {
+                    for h in [hs, ho].into_iter().flatten() {
+                        delta.reifiers_ins.insert([q[3].0, h, q[0].0, q[2].0]);
+                    }
                 }
             }
         }
         (false, false) => {
-            if delta.remove_inserted(q)
-                && !delta.reifiers_ins.is_empty()
-                && let Some((hs, ho)) = generation.is_rdf_reifies_triple(q[1], q[2])
-            {
-                for h in [hs, ho].into_iter().flatten() {
-                    delta.reifiers_ins.remove(&[q[3].0, h, q[0].0, q[2].0]);
+            if delta.ins[spo].contains(&Perm::Spo.to_key(q)) {
+                let hashes = if !delta.reifiers_ins.is_empty() {
+                    generation.is_rdf_reifies_triple_with(q[1], q[2], limit, held)?
+                } else {
+                    None
+                };
+                if delta.remove_inserted(q)
+                    && let Some((hs, ho)) = hashes
+                {
+                    for h in [hs, ho].into_iter().flatten() {
+                        delta.reifiers_ins.remove(&[q[3].0, h, q[0].0, q[2].0]);
+                    }
                 }
             }
         }
@@ -7193,6 +7425,20 @@ fn apply(generation: &Generation, delta: &mut Delta, q: &[Id; 4], insert: bool, 
             }
         }
     }
+    Ok(())
+}
+
+/// Apply an insert/delete to a delta without replay control limits.
+fn apply(generation: &Generation, delta: &mut Delta, q: &[Id; 4], insert: bool, in_base: bool) {
+    let _ = apply_with(
+        generation,
+        delta,
+        q,
+        insert,
+        in_base,
+        &crate::budgeted::Unlimited,
+        0,
+    );
 }
 
 /// Declaration order releases the writer mutex before the last permit, including
@@ -7279,7 +7525,7 @@ impl Drop for WriteTxn<'_> {
         // a dry run leaves no terms and no blank-node ids behind, however it ended; the
         // writer lock is still held here, and only this transaction's views reached them
         if self.opts.dry_run.is_some() {
-            if let Err(e) = self.base.generation.dvocab.rollback(&self.mark) {
+            if let Err(e) = self.base.generation.rollback_dvocab(&self.mark) {
                 tracing::warn!(target: "sparkles::store", "a dry run could not remove the terms it added: {e}");
             }
             self.guard.next_bnode = self.start_bnode;
@@ -7543,7 +7789,7 @@ impl WriteTxn<'_> {
     /// rollback that fails part way poisons the store's writer until it is reopened, as a
     /// failed load does.
     pub fn discard_terms(&mut self) -> Result<()> {
-        if let Err(e) = self.base.generation.dvocab.rollback(&self.mark) {
+        if let Err(e) = self.base.generation.rollback_dvocab(&self.mark) {
             self.guard.poisoned = true;
             return Err(e);
         }
@@ -8381,10 +8627,14 @@ fn dump_snapshot(snap: &Snapshot, w: impl Write) -> Result<u64> {
 
 /// Estimated memory of one quad of a delta (seven ordered sets of 32-byte keys).
 const DELTA_QUAD_BYTES: u64 = 7 * 64;
+/// Estimated memory of one reifier index key in a delta.
+const DELTA_REIFIER_KEY_BYTES: u64 = 64;
 
 /// Estimated memory of a (replayed) delta.
 fn delta_bytes(d: &Delta) -> u64 {
-    (d.inserts() + d.deletes()) as u64 * DELTA_QUAD_BYTES
+    ((d.inserts() + d.deletes()) as u64)
+        .saturating_mul(DELTA_QUAD_BYTES)
+        .saturating_add((d.reifiers_ins.len() as u64).saturating_mul(DELTA_REIFIER_KEY_BYTES))
 }
 
 /// The control of one historical read, which narrows to the history cache once the

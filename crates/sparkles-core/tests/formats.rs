@@ -481,7 +481,7 @@ fn a_newer_pattern_file_is_not_used() {
 }
 
 /// A reifier index of a newer version is not used: the database opens, claim lookups fall
-/// back to scanning, `check` warns, and the next full compaction writes the current version.
+/// back to scanning, `check` warns, and the next compaction writes the current version.
 #[test]
 fn a_newer_reifier_file_is_not_used() {
     let tmp = tempfile::tempdir().unwrap();
@@ -542,10 +542,150 @@ fn a_newer_reifier_file_is_not_used() {
     drop(held);
     drop(snap);
 
-    // Next full compaction rebuilds version 1
+    // Next compaction rebuilds version 1
     s.compact().unwrap();
     assert!(s.snapshot().generation.reifiers.file.is_some());
     assert!(s.snapshot().generation.reifiers.is_indexed());
+}
+
+/// A payload-corrupted `reifiers.bin` with valid header/footer framing and entry count
+/// cannot attach an unrelated claim; runtime open verifies integrity and falls back to
+/// scanning, and `sparkles check` reports metadata mismatches in both quick and full modes.
+#[test]
+fn damaged_reifier_payload_and_metadata_mismatch_fall_back_and_fail_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("db");
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let reifies = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
+    sparkles_core::sparql::update::update(
+        &s,
+        &format!(
+            "INSERT DATA {{ GRAPH <urn:g> {{\
+             <urn:c1> <{reifies}> <<( <urn:e1> <urn:p> <urn:o1> )>> .\
+             <urn:c2> <{reifies}> <<( <urn:e2> <urn:p> <urn:o2> )>> . }} }}"
+        ),
+        &sparkles_core::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    s.compact().unwrap();
+    let gen_dir = s.snapshot().generation.dir.clone().unwrap();
+    let c1_id = s.snapshot().lookup_iri("urn:c1").unwrap().0;
+    let c2_id = s.snapshot().lookup_iri("urn:c2").unwrap().0;
+    drop(s);
+
+    let reif_path = gen_dir.join(sparkles_core::reifiers::FILE);
+    let orig_reif = std::fs::read(&reif_path).unwrap();
+    let meta_path = gen_dir.join("meta.json");
+    let orig_meta = std::fs::read(&meta_path).unwrap();
+
+    // 1. Shape-preserving payload tamper: replace c1's reifier ID with c2's while keeping
+    // header, footer framing, and entry count valid.
+    let mut tampered = orig_reif.clone();
+    let mut replaced = 0usize;
+    let entries = u64::from_le_bytes(tampered[16..24].try_into().unwrap()) as usize;
+    for i in 0..entries {
+        let off = 32 + i * 32;
+        let reifier = u64::from_le_bytes(tampered[off + 16..off + 24].try_into().unwrap());
+        if reifier == c1_id {
+            tampered[off + 16..off + 24].copy_from_slice(&c2_id.to_le_bytes());
+            replaced += 1;
+        }
+    }
+    assert!(replaced > 0);
+    std::fs::write(&reif_path, &tampered).unwrap();
+
+    // Full check reports checksum damage.
+    let r = check(&root, &CheckOptions { quick: false }).unwrap();
+    assert_eq!(
+        r.get("reifiers").unwrap().status,
+        Status::Error,
+        "{}",
+        r.to_text()
+    );
+
+    // Runtime open rejects the damaged sidecar, falls back to scanning, and returns only c1.
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let snap = s.snapshot();
+    assert!(snap.generation.reifiers.file.is_none());
+    assert!(!snap.generation.reifiers.is_indexed());
+    assert!(
+        snap.generation
+            .reifiers
+            .missing
+            .as_deref()
+            .unwrap()
+            .contains("checksum")
+    );
+    let prep =
+        sparkles_core::access::Preparation::new(sparkles_core::task::Control::none(), 16 << 20)
+            .unwrap();
+    let mut reads = sparkles_core::evidence::write::Reads::new(&prep, &snap);
+    let mut held = prep.reserve(0).unwrap();
+    let wanted: std::collections::BTreeSet<String> = ["urn:e1".to_string()].into();
+    let (rows, more) = reads
+        .reifiers_about(reifies, "urn:g", &wanted, 100, &mut held)
+        .unwrap();
+    assert!(!more);
+    assert_eq!(
+        rows.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
+        vec!["urn:c1"]
+    );
+    drop(reads);
+    drop(held);
+    drop(snap);
+    drop(s);
+
+    // 2. Restore valid reifiers.bin, tamper meta.json reifiers.entries independently.
+    std::fs::write(&reif_path, &orig_reif).unwrap();
+    let mut meta: serde_json::Value = serde_json::from_slice(&orig_meta).unwrap();
+    meta["reifiers"]["entries"] = serde_json::json!(entries as u64 + 1);
+    std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+
+    // Both quick and full checks report the metadata mismatch.
+    for quick in [true, false] {
+        let r = check(&root, &CheckOptions { quick }).unwrap();
+        assert_eq!(
+            r.get("reifiers").unwrap().status,
+            Status::Error,
+            "quick={quick}: {}",
+            r.to_text()
+        );
+    }
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert!(s.snapshot().generation.reifiers.file.is_none());
+    assert!(!s.snapshot().generation.reifiers.is_indexed());
+    assert!(s.snapshot().generation.reifiers.missing.is_some());
+    drop(s);
+
+    // 3. Missing recorded sidecar: check warns and runtime falls back.
+    std::fs::write(&meta_path, &orig_meta).unwrap();
+    std::fs::remove_file(&reif_path).unwrap();
+    let r = check(&root, &CheckOptions { quick: true }).unwrap();
+    assert_eq!(
+        r.get("reifiers").unwrap().status,
+        Status::Warning,
+        "{}",
+        r.to_text()
+    );
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert!(!s.snapshot().generation.reifiers.is_indexed());
+    assert!(s.snapshot().generation.reifiers.missing.is_some());
+    drop(s);
+
+    // 4. Legacy pre-index metadata (no `reifiers` field, no sidecar): opens with fallback and no warning.
+    let mut legacy: serde_json::Value = serde_json::from_slice(&orig_meta).unwrap();
+    legacy.as_object_mut().unwrap().remove("reifiers");
+    std::fs::write(&meta_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+    let r = check(&root, &CheckOptions { quick: true }).unwrap();
+    assert_eq!(
+        r.get("reifiers").unwrap().status,
+        Status::Ok,
+        "{}",
+        r.to_text()
+    );
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert!(!s.snapshot().generation.reifiers.is_indexed());
+    assert!(s.snapshot().generation.reifiers.missing.is_none());
 }
 
 // ---------------------------------------------------------- refused datasets ------

@@ -296,3 +296,77 @@ fn cold_mapped_giant_base_key_is_not_reconstructed_during_preparation() {
     );
     assert_eq!(before, bytes(root.path()));
 }
+
+#[test]
+fn cold_replay_with_giant_base_triple_term_respects_allowance() {
+    let root = tempfile::tempdir().unwrap();
+    let options = StoreOptions {
+        build: sparkles_core::builder::BuildOptions {
+            threads: 1,
+            vocab_codec: Some(sparkles_core::builder::VocabCodec::Front),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let store = Store::open(root.path(), options.clone()).unwrap();
+    let reifies = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
+    let long_iri = format!("urn:long:{}", "a".repeat(350_000));
+    let base_data =
+        format!("<urn:c0> <{reifies}> <<( <{long_iri}> <urn:p> <urn:o> )>> <urn:g> .\n");
+    store
+        .load(&[Source::from_bytes(
+            base_data.into_bytes(),
+            RdfFormat::NQuads,
+            None,
+        )])
+        .unwrap();
+    // Small WAL transaction inserting a new reifier referencing the giant base triple term.
+    update(
+        &store,
+        &format!(
+            "INSERT DATA {{ GRAPH <urn:g> {{ <urn:c1> <{reifies}> <<( <{long_iri}> <urn:p> <urn:o> )>> }} }}"
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let target = store.head_commit().seq;
+    store
+        .create_snapshot("retained", &At::Commit(target), None)
+        .unwrap();
+    update(
+        &store,
+        "INSERT DATA { <urn:later> <urn:p> 2 }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    store.compact().unwrap();
+    store.flush_change_log().unwrap();
+    drop(store);
+
+    let store = Store::open(root.path(), options).unwrap();
+    store.flush_change_log().unwrap();
+    let before = bytes(root.path());
+    // 256 KiB is enough to open the generation metadata and WAL cursor, but smaller than
+    // reconstructing the 350 KiB base triple-term key during replay.
+    let (result, counts, _outside) = measure(|| {
+        store.snapshot_at_limited(&At::Commit(target), &HistoryOptions::default(), 256 << 10)
+    });
+    assert!(
+        matches!(result, Err(Error::BudgetExceeded(_))),
+        "expected budget refusal when replaying giant base triple term, got {:?}",
+        result.err()
+    );
+    assert!(
+        counts.largest <= 256 << 10,
+        "giant base triple term was reconstructed beyond allowance: largest={}",
+        counts.largest
+    );
+    assert_eq!(before, bytes(root.path()));
+
+    // With sufficient allowance, the cold replay succeeds and populates reifiers_ins.
+    let (view, _) = store
+        .snapshot_at_limited(&At::Commit(target), &HistoryOptions::default(), 16 << 20)
+        .unwrap();
+    assert_eq!(view.commit, target);
+    assert!(!view.delta.reifiers_ins.is_empty());
+}

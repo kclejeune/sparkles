@@ -1034,6 +1034,62 @@ fn write_permutation(
     preparation.check()
 }
 
+/// Remove hidden inserted `rdf:reifies` quads from `delta.reifiers_ins`, admitting
+/// every copied path under `preparation` before mutating the persistent tree.
+fn write_reifiers(
+    generation: &crate::store::Generation,
+    reifiers_ins: &mut KeySet,
+    hidden: &[Key],
+    inserted: &[bool],
+    preparation: &Preparation,
+    owned: &mut Reservation,
+) -> Result<()> {
+    if reifiers_ins.is_empty() {
+        return Ok(());
+    }
+    let mut at = 0;
+    while at < hidden.len() {
+        // Each quad can remove up to two keys (IRI subject and IRI object).
+        let bound = reifiers_ins
+            .mutation_bound()
+            .saturating_add(KeySet::level_bound())
+            .saturating_mul(2);
+        let share = (owned.bytes() / 4).max(preparation.room() / 8);
+        let batch = usize::try_from(share / bound.max(1))
+            .unwrap_or(usize::MAX)
+            .clamp(1, 4096)
+            .min(hidden.len() - at);
+        let mut headroom = preparation.reserve(bound.saturating_mul(batch as u64))?;
+        let mut allocated = 0u64;
+        let written = (at..at + batch).try_for_each(|index| {
+            if index.is_multiple_of(64) {
+                preparation.check()?;
+            }
+            if !inserted[index] {
+                return Ok(());
+            }
+            let quad = Perm::Spo.to_quad(&hidden[index]);
+            if let Some((hs, ho)) =
+                generation.is_rdf_reifies_triple_prepared(quad[1], quad[2], preparation)?
+            {
+                for h in [hs, ho].into_iter().flatten() {
+                    reifiers_ins
+                        .remove_metered(&[quad[3].0, h, quad[0].0, quad[2].0], &mut allocated);
+                }
+            }
+            Ok(())
+        });
+        let grown = written.and_then(|()| headroom.grow_to(allocated));
+        if grown.is_ok() {
+            headroom.release_to(allocated);
+        }
+        owned.merge(headroom);
+        grown?;
+        at += batch;
+    }
+    preparation.check()
+}
+
 fn apply_controlled(
     snap: &Snapshot,
     hidden: Buffer<Key>,
@@ -1060,6 +1116,7 @@ fn apply_controlled(
         .iter()
         .map(|_| preparation.reserve(0))
         .collect::<Result<Vec<_>>>()?;
+    let mut reifiers_owned = preparation.reserve(0)?;
     // Declared after the reservations, so an early return drops the copied nodes
     // before it releases their admission.
     let mut delta = snap.delta.clone();
@@ -1077,6 +1134,14 @@ fn apply_controlled(
             })
             .collect::<Result<()>>()?
     };
+    write_reifiers(
+        &snap.generation,
+        &mut delta.reifiers_ins,
+        &hidden,
+        &inserted,
+        preparation,
+        &mut reifiers_owned,
+    )?;
     forget_removed(&mut delta, &hidden, &inserted, preparation, &mut || {
         preparation.check()
     })?;
@@ -1084,6 +1149,7 @@ fn apply_controlled(
     for copy in copies {
         held.merge(copy);
     }
+    held.merge(reifiers_owned);
     held.merge(predicates);
     let retained = held.bytes().saturating_sub(SNAPSHOT_HEADERS);
     let mut text = Text::new(preparation)?;

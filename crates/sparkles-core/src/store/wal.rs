@@ -1204,17 +1204,31 @@ pub(crate) fn apply_forward<C: Control>(
                 continue;
             }
             let q = record_quad(rec);
-            let in_base = if C::ACCOUNTS {
-                // Each changed quad can add one key to every permutation. Check before
-                // mutation, while the validated transaction remains in memory.
+            let held = if C::ACCOUNTS {
+                // Each changed quad can add one key to every permutation plus up to two
+                // keys to `reifiers_ins`. Check before mutation, while the validated
+                // transaction remains in memory.
                 let held = super::history_limited::preparation_mutation_bytes(delta)
                     .saturating_add(buffers);
                 limit.check(held)?;
+                held
+            } else {
+                0
+            };
+            let in_base = if C::ACCOUNTS {
                 spo.contains_limited(cache, &Perm::Spo.to_key(&q), &limit.read_limit(), held)?
             } else {
                 spo.contains(cache, &Perm::Spo.to_key(&q))?
             };
-            apply(generation, delta, &q, rec[0] == WAL_INSERT, in_base);
+            apply_with(
+                generation,
+                delta,
+                &q,
+                rec[0] == WAL_INSERT,
+                in_base,
+                limit,
+                held,
+            )?;
             records += 1;
             if Stride::<0x1_0000>::due::<C>(records) {
                 limit.check_delta(delta)?;
@@ -1345,16 +1359,29 @@ pub(crate) fn apply_backward<C: Control>(
                 continue;
             }
             let q = record_quad(r);
-            let in_base = if C::ACCOUNTS {
+            let held = if C::ACCOUNTS {
                 let held = super::history_limited::preparation_mutation_bytes(delta)
                     .saturating_add(held_buffers)
                     .saturating_add(fwd.capacity() as u64);
                 limit.check(held)?;
+                held
+            } else {
+                0
+            };
+            let in_base = if C::ACCOUNTS {
                 spo.contains_limited(cache, &Perm::Spo.to_key(&q), &limit.read_limit(), held)?
             } else {
                 spo.contains(cache, &Perm::Spo.to_key(&q))?
             };
-            apply(generation, delta, &q, r[0] != WAL_INSERT, in_base);
+            apply_with(
+                generation,
+                delta,
+                &q,
+                r[0] != WAL_INSERT,
+                in_base,
+                limit,
+                held,
+            )?;
             records += 1;
             if Stride::<0x1_0000>::due::<C>(records) {
                 limit.check_delta(delta)?;

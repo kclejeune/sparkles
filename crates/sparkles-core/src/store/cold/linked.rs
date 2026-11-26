@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     index::{BlockCache, Perm},
     store::{
-        Delta, Generation, WAL_DELETE, WAL_INSERT, WAL_REC, apply, history_limited, link, wal,
+        Delta, Generation, WAL_DELETE, WAL_INSERT, WAL_REC, apply_with, history_limited, link, wal,
     },
     vocab::DeltaVocab,
 };
@@ -300,7 +300,15 @@ fn apply_overlay_controlled(
             &limit,
             mutation,
         )?;
-        apply(generation, delta, &quad, record[0] == WAL_INSERT, in_base);
+        apply_with(
+            generation,
+            delta,
+            &quad,
+            record[0] == WAL_INSERT,
+            in_base,
+            &limit,
+            mutation,
+        )?;
         *delta_charge = history_limited::preparation_delta_bytes(delta);
         budget.charge(*delta_charge)?;
     }

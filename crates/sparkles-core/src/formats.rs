@@ -248,12 +248,12 @@ pub const PATTERNS: FileKind = FileKind {
 
 /// A generation's reifier proposition-term index (roadmap item 766). Derived from the
 /// generation's POS permutation and vocabulary: a version this build does not read is
-/// left unused, claim lookups fall back to scanning, and the next full compaction
-/// writes the current version.
+/// left unused, claim lookups fall back to scanning, and the next compaction writes the
+/// current version.
 pub const REIFIERS: FileKind = FileKind {
     id: "reifiers",
     files: "gen-*/reifiers.bin",
-    marker: "the u32 after the `SPKREIF\\0` magic; another version is not used and is rebuilt at the next full compaction",
+    marker: "the u32 after the `SPKREIF\\0` magic; another version is not used and is rebuilt at the next compaction",
     class: Class::Derived,
     writes: crate::reifiers::VERSION,
     reads: &[1],

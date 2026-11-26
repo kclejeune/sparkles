@@ -622,14 +622,23 @@ impl super::Generation {
             + dir.as_os_str().len() as u64 * 3;
         budget.charge(reifier_allowance)?;
         budget.check()?;
-        let reifiers = crate::reifiers::Loaded::open(dir, meta.reifiers.as_ref(), meta.quads);
+        let reifiers = crate::reifiers::Loaded::open_controlled(
+            dir,
+            meta.reifiers.as_ref(),
+            meta.quads,
+            || budget.check(),
+        )?;
         budget.check()?;
         let reifier_retained = if reifiers.file.is_some() {
             std::mem::size_of::<crate::reifiers::ReifierFile>() as u64 + 64
         } else {
             reifiers.missing.as_ref().map_or(0, |s| s.len() as u64 + 64)
         };
-        budget.release(reifier_allowance - reifier_retained);
+        if reifier_retained > reifier_allowance {
+            budget.charge(reifier_retained - reifier_allowance)?;
+        } else {
+            budget.release(reifier_allowance - reifier_retained);
+        }
         let charge = budget.used() - start;
         let value = Self {
             uid: crate::index::next_uid(),
@@ -1143,6 +1152,14 @@ mod tests {
                 loaded.value.patterns.file.is_some(),
                 normal.patterns.file.is_some()
             );
+            assert_eq!(
+                loaded.value.reifiers.file.is_some(),
+                normal.reifiers.file.is_some()
+            );
+            assert_eq!(
+                loaded.value.reifiers.is_indexed(),
+                normal.reifiers.is_indexed()
+            );
             for perm in crate::index::Perm::ALL {
                 assert_eq!(loaded.value.perm(perm).rows, normal.perm(perm).rows);
             }
@@ -1199,6 +1216,137 @@ mod tests {
             Err(Error::Unsupported(_))
         ));
         assert_eq!(before, durable_bytes(dir.path()));
+    }
+
+    #[test]
+    fn cold_reifiers_parity_fallback_and_non_reifies_sentinel_resolution() {
+        use crate::{
+            builder::{BuildOptions, Builder},
+            io::{RdfFormat, Source},
+            reifiers::{FILE as REIFIERS_FILE, RDF_REIFIES},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let builder = Builder::new(
+            dir.path(),
+            BuildOptions {
+                threads: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let data = format!(
+            "<urn:c1> <{RDF_REIFIES}> <<( <urn:e1> <urn:p> <urn:o1> )>> <urn:g> .\n\
+             <urn:a1> <urn:ev:expectedTriple> <<( <urn:e2> <urn:p> <urn:o2> )>> <urn:g> .\n"
+        );
+        builder
+            .add_source(&Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::NQuads,
+                None,
+            ))
+            .unwrap();
+        builder.finish().unwrap();
+
+        let normal = super::super::Generation::open_sealed(dir.path(), "gen-0001").unwrap();
+        assert!(normal.reifiers.file.is_some());
+        assert!(normal.reifiers.is_indexed());
+
+        let options = HistoryOptions::default();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(16 << 20),
+            held: 0,
+        })
+        .unwrap();
+        let loaded = super::super::Generation::open_sealed_controlled(
+            dir.path(),
+            "gen-0001",
+            None,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(loaded.value.reifiers.file.is_some());
+        assert!(loaded.value.reifiers.is_indexed());
+        assert_eq!(
+            loaded.value.rdf_reifies.load(Ordering::Acquire),
+            crate::store::RDF_REIFIES_UNRESOLVED
+        );
+
+        // Encountering a non-rdf:reifies triple term resolves the sentinel once instead of
+        // leaving it unresolved and re-decoding on every subsequent triple-term quad.
+        let expected_pred =
+            crate::id::Id::vocab(loaded.value.vocab.find(b"<urn:ev:expectedTriple").unwrap());
+        let tt_id = (0..loaded.value.vocab.len())
+            .find(|&id| loaded.value.vocab.is_triple(id))
+            .map(crate::id::Id::vocab)
+            .unwrap();
+        let limit = budget.owned_limit().unwrap();
+        assert!(
+            loaded
+                .value
+                .is_rdf_reifies_triple_with(expected_pred, tt_id, &limit, 0)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            loaded.value.rdf_reifies.load(Ordering::Acquire),
+            normal.rdf_reifies.load(Ordering::Acquire),
+            "cold generation should cache rdf:reifies on first triple-term encounter"
+        );
+        drop(loaded.value);
+        budget.release(loaded.charge);
+
+        // Cold unsupported-version fallback: opens without error and marks reifiers unindexed.
+        let path = dir.path().join(REIFIERS_FILE);
+        let orig = std::fs::read(&path).unwrap();
+        let mut future = orig.clone();
+        future[8..12].copy_from_slice(&99u32.to_le_bytes());
+        std::fs::write(&path, &future).unwrap();
+        let loaded = super::super::Generation::open_sealed_controlled(
+            dir.path(),
+            "gen-0001",
+            None,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(loaded.value.reifiers.file.is_none());
+        assert!(!loaded.value.reifiers.is_indexed());
+        assert!(
+            loaded
+                .value
+                .reifiers
+                .missing
+                .as_deref()
+                .unwrap()
+                .contains("version 99")
+        );
+        drop(loaded.value);
+        budget.release(loaded.charge);
+
+        // Cold checksum-mismatch fallback: payload tamper is caught and routed to fallback.
+        let mut damaged = orig;
+        damaged[32 + 16] ^= 1;
+        std::fs::write(&path, &damaged).unwrap();
+        let loaded = super::super::Generation::open_sealed_controlled(
+            dir.path(),
+            "gen-0001",
+            None,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(loaded.value.reifiers.file.is_none());
+        assert!(!loaded.value.reifiers.is_indexed());
+        assert!(
+            loaded
+                .value
+                .reifiers
+                .missing
+                .as_deref()
+                .unwrap()
+                .contains("checksum")
+        );
+        drop(loaded.value);
+        budget.release(loaded.charge);
     }
 
     #[test]

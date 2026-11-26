@@ -794,6 +794,19 @@ impl DeltaVocab {
         Ok(limit.read_lock(&self.inner)?.len())
     }
 
+    pub(crate) fn with_limited<R>(
+        &self,
+        limit: &crate::history::ReadLimit<'_>,
+        held: u64,
+        f: impl FnOnce(&AppendVocab) -> Result<R>,
+    ) -> Result<R> {
+        limit.check(held)?;
+        let guard = limit.read_lock(&self.inner)?;
+        let result = f(&guard)?;
+        limit.check(held)?;
+        Ok(result)
+    }
+
     /// Borrow dictionary bytes only after controlled lock acquisition. The callback
     /// must admit any owned copies against its own request budget before allocation.
     pub fn with_controlled<R>(
