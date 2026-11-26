@@ -4746,6 +4746,17 @@ summary and the usage of each model call, and `--events` prints each step as a J
 as it happens. `--no-run` stops after the check, and `--no-summary` leaves the summary
 out.
 
+`--review-policy POLICY` and `--matching-policy POLICY` pass evidence claim policies to
+the asking pipeline, with the same checks and JSON output as `POST /{ds}/ask`
+([C25](specs/C25-evidence-and-assessments.md#recall-and-ask-with-claims)). Both options
+require a database whose configuration history is activated and refuse `--mode global`,
+unknown policies or wrong policy kinds before any model call. With `--review-policy`,
+the summary step sees claim occurrences about the linked entities and may cite them as
+`[c1]`, and the human output prints a `# claims` section below the summary. With
+`--matching-policy`, linked entities expand across the policy's resolution map and the
+human output prints a `# resolution` line. `--json`, `--events` and `--questions` emit
+the same `claims`, `resolution` and `summary.claimCitations` members as HTTP Ask.
+
 `--questions FILE` asks every question of a JSON-lines file in place of the question
 argument, or of standard input with `-`. Each line is `{"id", "question",
 "clarification"?, "tryHarder"?, "modelSecrets"?}`, and the command prints one JSON

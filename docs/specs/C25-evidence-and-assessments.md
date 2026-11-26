@@ -1485,7 +1485,8 @@ preparation. Guarded Dataset queries and U02 readers still adopt them under item
 
 Roadmap item 650 delivers this contract in `recall`, `POST /{ds}/recall` and
 `POST /{ds}/ask`, with `sparkles::evidence::claim_states`, `with_policy_claims` and
-`resolve_entities_at` for Rust callers. Each decision states the adopted behaviour and
+`resolve_entities_at` for Rust callers, and roadmap item 767 delivers the same two
+options in `sparkles ask`. Each decision states the adopted behaviour and
 the strongest alternative that was rejected. Every choice keeps the current output
 of `recall` and Ask unchanged unless the caller names a policy, and a state that cannot
 be represented faithfully is refused with a stable code rather than reported in a
@@ -1663,7 +1664,12 @@ the view selects.
 #### Ask
 
 `POST /{ds}/ask` accepts the same two arguments and passes them to a new grounding
-stage, which calls `recall` with the policies for the linked entities at hop 0. MCP has
+stage, which calls `recall` with the policies for the linked entities at hop 0.
+`sparkles ask` accepts `--review-policy` and `--matching-policy` with the same
+preflight checks, summary grounding, JSON output and event stream, and prints recall's
+`# claims` and `# resolution` sections in its human output. Passing `matchingPolicy`
+without `reviewPolicy` reports `resolution` and keeps the pre-publication recheck
+without emitting `claims` or `claimCitations`. MCP has
 no Ask tool, and an MCP client reads claims through `recall` itself. An ask that names
 a policy answers from the data, so `mode` `global` is refused with `400` and `auto`
 answers locally. Its policies and the store's configuration history are checked before

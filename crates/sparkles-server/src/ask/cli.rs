@@ -71,6 +71,12 @@ pub struct AskArgs {
     /// Use only community reports that a person marked reviewed
     #[arg(long)]
     pub reviewed_only: bool,
+    /// Cite claim occurrences under this review policy in the summary (spec C25)
+    #[arg(long, value_name = "POLICY")]
+    pub review_policy: Option<String>,
+    /// Resolve linked entities through this matching policy's map (spec C25)
+    #[arg(long, value_name = "POLICY")]
+    pub matching_policy: Option<String>,
     /// Stop after the check and print the checked query without running it
     #[arg(long)]
     pub no_run: bool,
@@ -154,6 +160,20 @@ fn parse_pairs(flags: &[String]) -> Result<Vec<(Role, Pair)>> {
 }
 
 pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
+    let mut stdout = std::io::stdout();
+    let mut stderr = std::io::stderr();
+    if !run_cli_with(args, store_opts, &mut stdout, &mut stderr)? {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+fn run_cli_with(
+    args: AskArgs,
+    store_opts: StoreOptions,
+    stdout: &mut (dyn Write + Send),
+    stderr: &mut (dyn Write + Send),
+) -> Result<bool> {
     if !(args.timeout.is_finite() && args.timeout > 0.0) {
         bail!("--timeout expects a positive number of seconds");
     }
@@ -200,16 +220,16 @@ pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
             ))
         };
         let line_models = |own: &[String]| line_view(&models, &args.models.model_secret, own);
-        let mut stdout = std::io::stdout();
-        return batch(
+        batch(
             input,
-            &mut stdout,
+            stdout,
             args.jobs,
             &server,
             &models,
             &line_models,
             &base,
-        );
+        )?;
+        return Ok(true);
     }
     let mut o = base(&models, args.question.clone().unwrap_or_default());
     o.clarification = args.clarification.clone();
@@ -218,21 +238,24 @@ pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
         None => None,
     };
     let events = args.events;
-    let mut on = |event: &str, v: &Value| {
-        if events {
-            println!("{}", serde_json::json!({ "event": event, "data": v }));
-        }
+    let out = {
+        let mut on = |event: &str, v: &Value| {
+            if events {
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::json!({ "event": event, "data": v })
+                );
+            }
+        };
+        ask(&server, &models, &Principal::local(), &o, &mut on)
     };
-    let out = ask(&server, &models, &Principal::local(), &o, &mut on);
     if args.json || args.events {
-        println!("{out}");
+        writeln!(stdout, "{out}")?;
     } else {
-        print_human(&out);
+        write_human(&out, stdout, stderr)?;
     }
-    if out["outcome"] == "error" {
-        std::process::exit(2);
-    }
-    Ok(())
+    Ok(out["outcome"] != "error")
 }
 
 /// Refuse a forced pair whose provider is missing or does not allow its model.
@@ -334,6 +357,8 @@ fn options(
         mode: args.mode,
         reviewed_only: args.reviewed_only,
         report_context,
+        review_policy: args.review_policy.clone(),
+        matching_policy: args.matching_policy.clone(),
         complexity_threshold: routing
             .complexity_threshold
             .or(model_routing.complexity_threshold)
@@ -540,38 +565,43 @@ fn batch(
     }
 }
 
-fn print_human(out: &Value) {
+fn write_human(
+    out: &Value,
+    stdout: &mut (dyn Write + Send),
+    stderr: &mut (dyn Write + Send),
+) -> std::io::Result<()> {
     let s = |v: &Value| v.as_str().unwrap_or("").to_string();
     let outcome = s(&out["outcome"]);
     if let Some(e) = out.get("error") {
-        eprintln!("error: {}: {}", s(&e["code"]), s(&e["message"]));
+        writeln!(stderr, "error: {}: {}", s(&e["code"]), s(&e["message"]))?;
     }
     if let Some(c) = out.get("clarify") {
-        println!("{}", s(&c["question"]));
+        writeln!(stdout, "{}", s(&c["question"]))?;
         for ch in c["choices"].as_array().into_iter().flatten() {
-            println!(
+            writeln!(
+                stdout,
                 "  {}  (--clarification {})",
                 s(&ch["label"]),
                 s(&ch["value"])
-            );
+            )?;
         }
     }
     let r = &out["result"];
     if r.is_object() {
         if let Some(q) = r["query"].as_str() {
-            println!("{q}\n");
+            writeln!(stdout, "{q}\n")?;
         }
         if let Some(e) = r["explanation"].as_str()
             && !e.is_empty()
         {
-            println!("{e}");
+            writeln!(stdout, "{e}")?;
         }
         for a in r["assumptions"].as_array().into_iter().flatten() {
-            println!("assumption: {}", s(a));
+            writeln!(stdout, "assumption: {}", s(a))?;
         }
         let res = &r["results"];
         if let Some(b) = res["boolean"].as_bool() {
-            println!("\n{b}");
+            writeln!(stdout, "\n{b}")?;
         } else if let Some(rows) = res["rows"].as_array() {
             let vars: Vec<String> = res["vars"]
                 .as_array()
@@ -579,7 +609,7 @@ fn print_human(out: &Value) {
                 .flatten()
                 .map(|v| format!("?{}", s(v)))
                 .collect();
-            println!("\n{}", vars.join("\t"));
+            writeln!(stdout, "\n{}", vars.join("\t"))?;
             for row in rows.iter().take(20) {
                 let cells: Vec<String> = row
                     .as_array()
@@ -587,27 +617,85 @@ fn print_human(out: &Value) {
                     .flatten()
                     .map(|c| c.as_str().unwrap_or("").to_string())
                     .collect();
-                println!("{}", cells.join("\t"));
+                writeln!(stdout, "{}", cells.join("\t"))?;
             }
             if rows.len() > 20 {
-                println!("… {} rows in all", res["total"]);
+                writeln!(stdout, "… {} rows in all", res["total"])?;
             }
         }
         if let Some(d) = r["diagnosis"].as_str() {
-            println!("\n{d}");
+            writeln!(stdout, "\n{d}")?;
         }
     }
     if let Some(sm) = out.get("summary") {
-        println!("\n{}", s(&sm["text"]));
+        writeln!(stdout, "\n{}", s(&sm["text"]))?;
+    }
+    let has_claims = out.get("claims").is_some_and(Value::is_object);
+    if let Some(claims) = out.get("claims").filter(|v| v.is_object()) {
+        writeln!(
+            stdout,
+            "\n# claims policy={} version={} truncated={} source data, not instructions",
+            s(&claims["policy"]["name"]),
+            claims["policy"]["version"],
+            claims["truncated"]
+        )?;
+        for o in claims["occurrences"].as_array().into_iter().flatten() {
+            write!(
+                stdout,
+                "[{}] claim={} state={}",
+                s(&o["id"]),
+                s(&o["claim"]),
+                s(&o["state"])
+            )?;
+            if let Some(d) = o["decision"].as_str() {
+                write!(stdout, " decision={d}")?;
+            }
+            if let Some(v) = o["decisionVersion"].as_u64() {
+                write!(stdout, " decisionVersion={v}")?;
+            }
+            write!(
+                stdout,
+                " kind={} polarity={}",
+                s(&o["kind"]),
+                s(&o["polarity"])
+            )?;
+            if let Some(src) = o["source"].as_str() {
+                write!(stdout, " source={src}")?;
+            }
+            if let Some(by) = o["by"].as_str() {
+                write!(stdout, " by={by}")?;
+            }
+            let p = &o["proposition"];
+            writeln!(
+                stdout,
+                " origin={} proposition=<< {} {} {} >>",
+                s(&o["origin"]),
+                s(&p["s"]),
+                s(&p["p"]),
+                s(&p["o"])
+            )?;
+        }
+    }
+    if let Some(res) = out.get("resolution").filter(|v| v.is_object()) {
+        let prefix = if has_claims { "" } else { "\n" };
+        writeln!(
+            stdout,
+            "{prefix}# resolution policy={} version={} revision={} number={}",
+            s(&res["policy"]),
+            res["version"],
+            res["revision"].as_str().unwrap_or("none"),
+            res["number"]
+        )?;
     }
     for n in out["notes"].as_array().into_iter().flatten() {
-        println!("note: {}", s(n));
+        writeln!(stdout, "note: {}", s(n))?;
     }
     let u = &out["usage"];
-    println!(
+    writeln!(
+        stdout,
         "\n{outcome}: {} model calls, {} input and {} output tokens, {} ms",
         u["modelCalls"], u["inputTokens"], u["outputTokens"], u["elapsedMs"]
-    );
+    )
 }
 
 #[cfg(test)]
@@ -805,5 +893,719 @@ mod tests {
             merged_secrets(&base, &["k=file:/x".to_string()]),
             ["j=env:B", "k=file:/x"]
         );
+    }
+
+    #[test]
+    fn claim_policy_flags_parse_and_reach_options() {
+        use clap::Parser;
+        let parsed = |flags: &[&str]| {
+            let mut argv = vec![
+                "ask",
+                "org",
+                "Which teams does Acme have?",
+                "--data",
+                "x.ttl",
+            ];
+            argv.extend(flags);
+            Cmd::try_parse_from(argv).unwrap().ask
+        };
+        let plain = parsed(&[]);
+        assert_eq!(plain.review_policy, None);
+        assert_eq!(plain.matching_policy, None);
+
+        let both = parsed(&["--review-policy", "main", "--matching-policy", "people"]);
+        assert_eq!(both.review_policy.as_deref(), Some("main"));
+        assert_eq!(both.matching_policy.as_deref(), Some("people"));
+
+        let cfg = json!({
+            "providers": {"p": {"kind": "openai", "endpoint": "http://127.0.0.1:9", "requestTimeoutSecs": 5}},
+            "roles": {"draft": [{"provider": "p", "model": "m"}], "summarize": [{"provider": "p", "model": "m"}]}
+        });
+        let m = Models::new(
+            ModelsConfig::parse(&cfg.to_string()).unwrap(),
+            Default::default(),
+            sparkles::outbound::OutboundPolicy {
+                allow_private: true,
+                ..Default::default()
+            },
+        );
+        let o = options(
+            &both,
+            &crate::assistant::AssistantSettings::default(),
+            &m,
+            Vec::new(),
+            "Which teams does Acme have?".into(),
+        );
+        assert_eq!(o.review_policy.as_deref(), Some("main"));
+        assert_eq!(o.matching_policy.as_deref(), Some("people"));
+    }
+
+    fn evidence_settings() -> sparkles::evidence::Settings {
+        use sparkles::evidence::{ClaimKind, ConflictMode, MatchingPolicy, Policy, Settings};
+        Settings {
+            enabled: true,
+            source_records: vec!["urn:ev:sources".into()],
+            proposals: vec!["urn:ev:claims".into()],
+            decisions: vec!["urn:ev:decisions".into()],
+            supports: vec!["urn:ev:supports".into()],
+            identity: vec!["urn:ev:identities".into(), "urn:ev:maps".into()],
+            projections: vec!["urn:ev:accepted".into(), "urn:ev:map".into()],
+            policies: [(
+                "main".into(),
+                Policy {
+                    version: 1,
+                    admitted_kinds: vec![ClaimKind::Reported],
+                    required_scope: vec![],
+                    conflicts: ConflictMode::AdmitLabelled,
+                    boundary: vec!["urn:ev:sources".into(), "urn:ev:claims".into()],
+                    decisions: "urn:ev:decisions".into(),
+                    supports: "urn:ev:supports".into(),
+                    output: "urn:ev:accepted".into(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            matching_policies: [(
+                "people".into(),
+                MatchingPolicy {
+                    version: 1,
+                    boundary: vec!["urn:ev:identities".into()],
+                    decisions: "urn:ev:decisions".into(),
+                    maps: "urn:ev:maps".into(),
+                    output: "urn:ev:map".into(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Build a persistent database with activated configuration history, ORG data,
+    /// an accepted claim on `acme`, and optionally a matching decision linking `acme`
+    /// with `acme-alias` plus an accepted claim on `acme-alias`.
+    fn setup_evidence_db(with_match: bool) -> (tempfile::TempDir, PathBuf) {
+        use oxrdf::{NamedNode, Triple};
+        use sparkles::evidence::{
+            self, ClaimInput, ClaimKind, DecisionInput, Disposition, EvidenceInput, IdentityInput,
+            IdentityRelation, MethodRef, Polarity, ProposeOptions, RecordKey, RecordRef,
+            RecordVersion, ReviewOptions, Sha256Digest, SourceContent, SourceRevisionInput,
+        };
+        use sparkles::task::Control;
+
+        let iri = |s: &str| NamedNode::new(s).unwrap();
+        let key = |k: &str| RecordKey::new(k).unwrap();
+        let all = || Some(Arc::new(sparkles::access::GraphAccess::all()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("org");
+        {
+            let ds = sparkles::Dataset::open(&db).unwrap();
+            ds.store()
+                .load(&[Source::from_bytes(
+                    ORG.as_bytes().to_vec(),
+                    sparkles::io::RdfFormat::Turtle,
+                    None,
+                )])
+                .unwrap();
+        }
+        let prep = sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+        sparkles::migrate::activate_configuration_history(&db, false, &prep).unwrap();
+        {
+            let ds = sparkles::Dataset::open(&db).unwrap();
+            evidence::configure(&ds, &evidence_settings(), &Control::none()).unwrap();
+
+            let mut po = ProposeOptions::new(iri("urn:principal:importer"));
+            po.proposal_graph = Some(iri("urn:ev:claims"));
+            let p = evidence::propose(
+                None,
+                &ds,
+                &ds,
+                &EvidenceInput {
+                    revisions: vec![SourceRevisionInput {
+                        version: RecordVersion::V1,
+                        key: key("rev"),
+                        source: iri("urn:source:registry"),
+                        source_key: key("registry"),
+                        upstream_version: None,
+                        content: SourceContent::MetadataOnly {
+                            digest: Sha256Digest::of_bytes(b"registry", &Control::none()).unwrap(),
+                        },
+                        metadata: Default::default(),
+                        times: Default::default(),
+                        lineage: Default::default(),
+                    }],
+                    claims: vec![ClaimInput {
+                        version: RecordVersion::V1,
+                        key: key("claim"),
+                        occurrence_key: key("c"),
+                        revision: RecordRef::Local(key("rev")),
+                        proposition: Triple::new(
+                            iri("http://example.org/resource/acme"),
+                            iri("http://example.org/ontology#basedIn"),
+                            iri("http://example.org/resource/lisbon"),
+                        ),
+                        kind: ClaimKind::Reported,
+                        polarity: Polarity::Positive,
+                        attributed_author: iri("urn:registry"),
+                        scope: Default::default(),
+                        confidence: Default::default(),
+                        validity: None,
+                    }],
+                    ..Default::default()
+                },
+                &po,
+                &mut |_, _| all(),
+                &Control::none(),
+            )
+            .unwrap();
+            let rec = p.records.iter().find(|r| r.key == "claim").unwrap();
+            let mut ro = ReviewOptions::new(iri("urn:principal:reviewer"));
+            ro.if_head = Some(ds.store().head_commit().seq);
+            evidence::review(
+                None,
+                &ds,
+                &ds,
+                "main",
+                1,
+                &[DecisionInput {
+                    key: "d1".into(),
+                    target: rec.iri.clone(),
+                    target_digest: rec.digest,
+                    disposition: Disposition::Accepted,
+                    supersedes: None,
+                }],
+                &ro,
+                &mut |_, _| all(),
+                &Control::none(),
+            )
+            .unwrap();
+
+            if with_match {
+                let alias = iri("http://example.org/resource/acme-alias");
+                let mut io = ProposeOptions::new(iri("urn:principal:matcher"));
+                io.identity_graph = Some(iri("urn:ev:identities"));
+                let ip = evidence::propose(
+                    None,
+                    &ds,
+                    &ds,
+                    &EvidenceInput {
+                        identities: vec![IdentityInput {
+                            version: RecordVersion::V1,
+                            key: key("id"),
+                            occurrence_key: key("m1"),
+                            entities: vec![iri("http://example.org/resource/acme"), alias.clone()],
+                            relation: IdentityRelation::PossibleMatch,
+                            preferred: Some(iri("http://example.org/resource/acme")),
+                            attributed_author: iri("urn:matcher"),
+                            method: Some(MethodRef {
+                                method: iri("urn:method:names"),
+                                version: key("1"),
+                            }),
+                        }],
+                        ..Default::default()
+                    },
+                    &io,
+                    &mut |_, _| all(),
+                    &Control::none(),
+                )
+                .unwrap();
+                let id_rec = ip.records.iter().find(|r| r.key == "id").unwrap();
+                let mut mro = ReviewOptions::new(iri("urn:principal:reviewer"));
+                mro.if_head = Some(ds.store().head_commit().seq);
+                evidence::review(
+                    None,
+                    &ds,
+                    &ds,
+                    "people",
+                    1,
+                    &[DecisionInput {
+                        key: "dm".into(),
+                        target: id_rec.iri.clone(),
+                        target_digest: id_rec.digest,
+                        disposition: Disposition::Accepted,
+                        supersedes: None,
+                    }],
+                    &mro,
+                    &mut |_, _| all(),
+                    &Control::none(),
+                )
+                .unwrap();
+
+                let mut co = ProposeOptions::new(iri("urn:principal:importer"));
+                co.proposal_graph = Some(iri("urn:ev:claims"));
+                let ap = evidence::propose(
+                    None,
+                    &ds,
+                    &ds,
+                    &EvidenceInput {
+                        revisions: vec![SourceRevisionInput {
+                            version: RecordVersion::V1,
+                            key: key("rev-alias"),
+                            source: iri("urn:source:alias-reg"),
+                            source_key: key("alias-reg"),
+                            upstream_version: None,
+                            content: SourceContent::MetadataOnly {
+                                digest: Sha256Digest::of_bytes(b"alias-reg", &Control::none())
+                                    .unwrap(),
+                            },
+                            metadata: Default::default(),
+                            times: Default::default(),
+                            lineage: Default::default(),
+                        }],
+                        claims: vec![ClaimInput {
+                            version: RecordVersion::V1,
+                            key: key("claim-alias"),
+                            occurrence_key: key("ca"),
+                            revision: RecordRef::Local(key("rev-alias")),
+                            proposition: Triple::new(
+                                alias,
+                                iri("http://example.org/ontology#basedIn"),
+                                iri("http://example.org/resource/porto"),
+                            ),
+                            kind: ClaimKind::Reported,
+                            polarity: Polarity::Positive,
+                            attributed_author: iri("urn:registry"),
+                            scope: Default::default(),
+                            confidence: Default::default(),
+                            validity: None,
+                        }],
+                        ..Default::default()
+                    },
+                    &co,
+                    &mut |_, _| all(),
+                    &Control::none(),
+                )
+                .unwrap();
+                let ar = ap.records.iter().find(|r| r.key == "claim-alias").unwrap();
+                let mut aro = ReviewOptions::new(iri("urn:principal:reviewer"));
+                aro.if_head = Some(ds.store().head_commit().seq);
+                evidence::review(
+                    None,
+                    &ds,
+                    &ds,
+                    "main",
+                    1,
+                    &[DecisionInput {
+                        key: "da".into(),
+                        target: ar.iri.clone(),
+                        target_digest: ar.digest,
+                        disposition: Disposition::Accepted,
+                        supersedes: None,
+                    }],
+                    &aro,
+                    &mut |_, _| all(),
+                    &Control::none(),
+                )
+                .unwrap();
+            }
+        }
+        (dir, db)
+    }
+
+    fn write_model_config(dir: &std::path::Path, url: &str) -> PathBuf {
+        let path = dir.join("models.json");
+        let cfg = json!({
+            "providers": {
+                "p": {
+                    "kind": "openai",
+                    "endpoint": url,
+                    "requestTimeoutSecs": 5,
+                    "allowedModels": ["m"]
+                }
+            },
+            "roles": {
+                "draft": [{"provider": "p", "model": "m"}],
+                "repair": [{"provider": "p", "model": "m"}],
+                "summarize": [{"provider": "p", "model": "m"}]
+            }
+        });
+        std::fs::write(&path, cfg.to_string()).unwrap();
+        path
+    }
+
+    fn claims_mock() -> MockModel {
+        MockModel::start(|r, _| {
+            if is_summary(r) {
+                let body = r.body.to_string();
+                if body.contains("Claim occurrences") {
+                    let text = if body.contains("porto") {
+                        "Acme has two teams [1] [2] and claims Lisbon [c1] and Porto [c2]. Drop [c9]."
+                    } else {
+                        "Acme has two teams [1] [2] and is based in Lisbon [c1]. Drop [c9]."
+                    };
+                    let cites = if body.contains("porto") {
+                        json!(["c1", "c2", "c9"])
+                    } else {
+                        json!(["c1", "c9"])
+                    };
+                    return (
+                        200,
+                        mock::openai(
+                            &json!({ "text": text, "citations": [1, 2], "claimCitations": cites })
+                                .to_string(),
+                        ),
+                    );
+                }
+                return (
+                    200,
+                    mock::openai(
+                        &json!({ "text": "Acme has two teams [1] [2].", "citations": [1, 2] })
+                            .to_string(),
+                    ),
+                );
+            }
+            (
+                200,
+                mock::openai(&draft("SELECT ?t WHERE { ?t a ex:Team }")),
+            )
+        })
+    }
+
+    fn invoke_cli(argv: &[String]) -> (bool, String, String) {
+        use clap::Parser;
+        let parsed = Cmd::try_parse_from(argv).unwrap().ask;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let ok = run_cli_with(parsed, StoreOptions::default(), &mut stdout, &mut stderr).unwrap();
+        (
+            ok,
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap(),
+        )
+    }
+
+    #[test]
+    fn cli_claim_policies_end_to_end_and_http_parity() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let mock = claims_mock();
+        let (dir, db) = setup_evidence_db(true);
+        let cfg_path = write_model_config(dir.path(), &mock.url());
+        let db_str = db.to_str().unwrap().to_string();
+        let cfg_str = cfg_path.to_str().unwrap().to_string();
+        let question = "Which teams does Acme have?".to_string();
+
+        let run_args = |extra: &[&str]| {
+            let mut argv = vec![
+                "ask".to_string(),
+                "--loc".to_string(),
+                db_str.clone(),
+                "--model-config".to_string(),
+                cfg_str.clone(),
+                "org".to_string(),
+                question.clone(),
+            ];
+            argv.extend(extra.iter().map(|s| s.to_string()));
+            invoke_cli(&argv)
+        };
+
+        // 0. Without assistant.json (default send=schema), summary is skipped but claims
+        //    and resolution still appear in the response (C25).
+        let (ok, out, err) = run_args(&["--review-policy", "main", "--json"]);
+        assert!(ok && err.is_empty(), "{out}\n{err}");
+        let j_schema: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(j_schema["outcome"], "answered", "{j_schema}");
+        assert!(j_schema.get("summary").is_none(), "{j_schema}");
+        assert_eq!(j_schema["claims"]["policy"]["name"], "main", "{j_schema}");
+        assert_eq!(
+            j_schema["claims"]["occurrences"].as_array().unwrap().len(),
+            1,
+            "{j_schema}"
+        );
+
+        // Allow rows to reach the summary provider, as `PUT /$/assistant/org` does.
+        std::fs::write(
+            db.join("assistant.json"),
+            json!({ "enabled": true, "send": "rows" }).to_string(),
+        )
+        .unwrap();
+
+        // 1. --review-policy alone in JSON
+        let (ok, out, err) = run_args(&["--review-policy", "main", "--json"]);
+        assert!(ok && err.is_empty(), "{out}\n{err}");
+        let j_rev: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(j_rev["outcome"], "answered", "{j_rev}");
+        assert_eq!(j_rev["claims"]["version"], 1);
+        assert_eq!(j_rev["claims"]["policy"]["name"], "main");
+        assert_eq!(j_rev["claims"]["occurrences"].as_array().unwrap().len(), 1);
+        assert_eq!(j_rev["summary"]["claimCitations"], json!(["c1"]), "{j_rev}");
+        assert!(!j_rev["summary"]["text"].as_str().unwrap().contains("[c9]"));
+        assert!(j_rev.get("resolution").is_none());
+
+        // 2. --matching-policy alone in JSON
+        let (ok, out, err) = run_args(&["--matching-policy", "people", "--json"]);
+        assert!(ok && err.is_empty(), "{out}\n{err}");
+        let j_match: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(j_match["outcome"], "answered", "{j_match}");
+        assert_eq!(j_match["resolution"]["policy"], "people");
+        assert_eq!(j_match["resolution"]["version"], 1);
+        assert_eq!(j_match["resolution"]["number"], 1);
+        assert!(j_match["resolution"]["revision"].is_string());
+        assert!(j_match.get("claims").is_none(), "{j_match}");
+        assert!(
+            j_match["summary"].get("claimCitations").is_none(),
+            "{j_match}"
+        );
+
+        // 3. Combined --review-policy + --matching-policy in JSON
+        let (ok, out, err) = run_args(&[
+            "--review-policy",
+            "main",
+            "--matching-policy",
+            "people",
+            "--json",
+        ]);
+        assert!(ok && err.is_empty(), "{out}\n{err}");
+        let j_both: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(j_both["outcome"], "answered", "{j_both}");
+        assert_eq!(j_both["claims"]["policy"]["name"], "main");
+        assert_eq!(j_both["resolution"]["policy"], "people");
+        assert_eq!(j_both["resolution"]["number"], 1);
+        let occs = j_both["claims"]["occurrences"].as_array().unwrap();
+        assert_eq!(occs.len(), 2, "{j_both}");
+        assert_eq!(j_both["summary"]["claimCitations"], json!(["c1", "c2"]));
+
+        // 4. Parity with POST /{ds}/ask on the same persistent store
+        let http_both: Value = {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut st = AppState::standalone(Default::default(), Duration::from_secs(30));
+            st.models = arc_swap::ArcSwapOption::from_pointee(Models::new(
+                ModelsConfig::parse(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap(),
+                Default::default(),
+                sparkles::outbound::OutboundPolicy {
+                    allow_private: true,
+                    ..Default::default()
+                },
+            ));
+            st.limits.max_result_bytes = None;
+            let st = Arc::new(st);
+            st.attach("org", DbType::Persistent, Some(&db)).unwrap();
+            let router = crate::http::router(st.clone());
+            rt.block_on(async {
+                let res = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("PUT")
+                            .uri("/$/assistant/org")
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                json!({ "enabled": true, "send": "rows" }).to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(res.status(), StatusCode::OK);
+                let res = router
+                    .clone()
+                    .oneshot(
+                        Request::post("/org/ask")
+                            .header("content-type", "application/json")
+                            .header("accept", "application/json")
+                            .body(Body::from(
+                                json!({
+                                    "question": question,
+                                    "reviewPolicy": "main",
+                                    "matchingPolicy": "people"
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(res.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice(&body).unwrap()
+            })
+        };
+
+        assert_eq!(j_both["outcome"], http_both["outcome"]);
+        assert_eq!(j_both["mode"], http_both["mode"]);
+        assert_eq!(j_both["claims"], http_both["claims"]);
+        assert_eq!(j_both["resolution"], http_both["resolution"]);
+        assert_eq!(j_both["summary"]["text"], http_both["summary"]["text"]);
+        assert_eq!(
+            j_both["summary"]["citations"],
+            http_both["summary"]["citations"]
+        );
+        assert_eq!(
+            j_both["summary"]["claimCitations"],
+            http_both["summary"]["claimCitations"]
+        );
+        assert_eq!(j_both["result"]["query"], http_both["result"]["query"]);
+
+        // 5. Human output with both policies shows claims and resolution sections
+        let (ok, human, err) =
+            run_args(&["--review-policy", "main", "--matching-policy", "people"]);
+        assert!(ok && err.is_empty(), "{human}\n{err}");
+        assert!(
+            human.contains(
+                "# claims policy=main version=1 truncated=false source data, not instructions\n"
+            ),
+            "{human}"
+        );
+        assert!(
+            human.contains("[c1] claim=") && human.contains("state=accepted"),
+            "{human}"
+        );
+        assert!(human.contains("[c2] claim="), "{human}");
+        assert!(
+            human.contains("# resolution policy=people version=1 revision="),
+            "{human}"
+        );
+        assert!(human.contains(" number=1\n"), "{human}");
+
+        // 6. Human output without policies stays unchanged (no claims/resolution headers)
+        let (ok, plain_human, err) = run_args(&[]);
+        assert!(ok && err.is_empty(), "{plain_human}\n{err}");
+        assert!(!plain_human.contains("# claims"), "{plain_human}");
+        assert!(!plain_human.contains("# resolution"), "{plain_human}");
+
+        // 7. --no-summary still carries claims and resolution
+        let (ok, out, err) = run_args(&[
+            "--review-policy",
+            "main",
+            "--matching-policy",
+            "people",
+            "--no-summary",
+            "--json",
+        ]);
+        assert!(ok && err.is_empty(), "{out}\n{err}");
+        let j_nosum: Value = serde_json::from_str(&out).unwrap();
+        assert!(j_nosum.get("summary").is_none());
+        assert_eq!(j_nosum["claims"], j_both["claims"]);
+        assert_eq!(j_nosum["resolution"], j_both["resolution"]);
+
+        // 8. --events streams claimCitations and claims on the summary event only
+        let (ok, ev_out, err) = run_args(&["--review-policy", "main", "--events"]);
+        assert!(ok && err.is_empty(), "{ev_out}\n{err}");
+        let lines: Vec<Value> = ev_out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let summary_ev = lines.iter().find(|v| v["event"] == "summary").unwrap();
+        assert_eq!(summary_ev["data"]["claimCitations"], json!(["c1"]));
+        assert_eq!(summary_ev["data"]["claims"]["policy"]["name"], "main");
+        for ev in &lines[..lines.len() - 1] {
+            if ev["event"] != "summary" {
+                assert!(ev["data"].get("claims").is_none(), "{ev}");
+            }
+        }
+        assert_eq!(lines.last().unwrap()["claims"]["policy"]["name"], "main");
+
+        // 9. --questions batch mode applies CLI policies to every line
+        let qfile = dir.path().join("questions.jsonl");
+        std::fs::write(
+            &qfile,
+            format!(
+                "{}\n",
+                json!({"id": "q1", "question": "Which teams does Acme have?"})
+            ),
+        )
+        .unwrap();
+        let (ok, batch_out, err) = invoke_cli(&[
+            "ask".into(),
+            "--loc".into(),
+            db_str,
+            "--model-config".into(),
+            cfg_str,
+            "--questions".into(),
+            qfile.to_str().unwrap().into(),
+            "--review-policy".into(),
+            "main".into(),
+            "--matching-policy".into(),
+            "people".into(),
+            "org".into(),
+        ]);
+        assert!(ok && err.is_empty(), "{batch_out}\n{err}");
+        let b_line: Value = serde_json::from_str(batch_out.trim()).unwrap();
+        assert_eq!(b_line["id"], "q1");
+        assert_eq!(b_line["claims"], j_both["claims"]);
+        assert_eq!(b_line["resolution"], j_both["resolution"]);
+    }
+
+    #[test]
+    fn cli_claim_policy_refusals_and_empty_map() {
+        let mock = claims_mock();
+        let (dir, db) = setup_evidence_db(false);
+        let cfg_path = write_model_config(dir.path(), &mock.url());
+        let db_str = db.to_str().unwrap().to_string();
+        let cfg_str = cfg_path.to_str().unwrap().to_string();
+        let ttl_path = dir.path().join("org.ttl");
+        std::fs::write(&ttl_path, ORG).unwrap();
+
+        let run_loc = |extra: &[&str]| {
+            let mut argv = vec![
+                "ask".to_string(),
+                "--loc".to_string(),
+                db_str.clone(),
+                "--model-config".to_string(),
+                cfg_str.clone(),
+                "org".to_string(),
+                "Which teams does Acme have?".to_string(),
+            ];
+            argv.extend(extra.iter().map(|s| s.to_string()));
+            invoke_cli(&argv)
+        };
+
+        // Invalid/missing policies, wrong policy kinds, and global mode refuse with 0 model calls
+        for flags in [
+            vec!["--review-policy", "nothing", "--json"],
+            vec!["--matching-policy", "nothing", "--json"],
+            vec!["--review-policy", "people", "--json"],
+            vec!["--matching-policy", "main", "--json"],
+            vec!["--review-policy", "main", "--mode", "global", "--json"],
+            vec!["--matching-policy", "people", "--mode", "global", "--json"],
+        ] {
+            let (ok, out, _) = run_loc(&flags);
+            assert!(!ok, "{flags:?}: {out}");
+            let v: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(v["outcome"], "error", "{flags:?}: {v}");
+            assert_eq!(v["error"]["code"], "bad-argument", "{flags:?}: {v}");
+        }
+
+        // Human refusal writes error to stderr and exits non-zero
+        let (ok, out, err) = run_loc(&["--review-policy", "nothing"]);
+        assert!(!ok, "{out}\n{err}");
+        assert!(err.contains("error: bad-argument:"), "{err}");
+        assert!(!out.contains("# claims"), "{out}");
+
+        // Unactivated store (--data) refuses with configuration-history-inactive
+        let (ok, out, _) = invoke_cli(&[
+            "ask".into(),
+            "--data".into(),
+            ttl_path.to_str().unwrap().into(),
+            "--model-config".into(),
+            cfg_str.clone(),
+            "--review-policy".into(),
+            "main".into(),
+            "--json".into(),
+            "org".into(),
+            "Which teams does Acme have?".into(),
+        ]);
+        assert!(!ok, "{out}");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["outcome"], "error", "{v}");
+        assert_eq!(v["error"]["code"], "configuration-history-inactive", "{v}");
+        assert!(mock.requests().is_empty(), "refusals cost no model calls");
+
+        // Matching policy with no map revision yet succeeds and prints revision=none number=0
+        let (ok, human, err) = run_loc(&["--matching-policy", "people"]);
+        assert!(ok && err.is_empty(), "{human}\n{err}");
+        assert!(
+            human.contains("# resolution policy=people version=1 revision=none number=0\n"),
+            "{human}"
+        );
+        assert!(!human.contains("# claims"), "{human}");
     }
 }
