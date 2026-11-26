@@ -36,7 +36,7 @@ pub const FC_BLOCK: usize = 16;
 /// The room past a key that a checked decode reserves for an FSST suffix.
 const FSST_ROOM: usize = 64;
 
-/// Every key of a front-coded block, as a mask of [`Vocab::decode_block`].
+/// Every key of a front-coded block, as a mask of [`Vocab::decode_block_with`].
 const ALL_KEYS: u32 = (1 << FC_BLOCK) - 1;
 
 /// How many bytes of key `i` of a front-coded block a decode of the keys in `wanted`
@@ -570,24 +570,52 @@ where
 
 /// Compile-time policy for admitting hint scratch vectors before read-ahead prefetching.
 trait HintAdmit {
+    type Error;
     const CHECKED: bool;
-    fn admit(&mut self, _bytes: usize) -> crate::error::Result<()> {
+    fn admit(&mut self, _bytes: usize) -> std::result::Result<(), Self::Error> {
         Ok(())
     }
+    fn invalid_err(&self, msg: &'static str) -> Self::Error;
 }
 
 impl HintAdmit for Unlimited {
+    type Error = crate::error::Error;
     const CHECKED: bool = false;
+
+    fn invalid_err(&self, msg: &'static str) -> crate::error::Error {
+        crate::error::Error::invalid(msg)
+    }
 }
 
 struct CheckedHint<F>(F);
 
 impl<F: FnMut(usize) -> crate::error::Result<()>> HintAdmit for CheckedHint<F> {
+    type Error = crate::error::Error;
     const CHECKED: bool = true;
 
     #[inline(always)]
     fn admit(&mut self, bytes: usize) -> crate::error::Result<()> {
         (self.0)(bytes)
+    }
+
+    fn invalid_err(&self, msg: &'static str) -> crate::error::Error {
+        crate::error::Error::invalid(msg)
+    }
+}
+
+struct ScratchHint<'a, S, E>(&'a mut S, std::marker::PhantomData<fn() -> E>);
+
+impl<S: BlockScratch<E>, E> HintAdmit for ScratchHint<'_, S, E> {
+    type Error = E;
+    const CHECKED: bool = true;
+
+    #[inline(always)]
+    fn admit(&mut self, bytes: usize) -> std::result::Result<(), E> {
+        self.0.admit_growth(0, bytes)
+    }
+
+    fn invalid_err(&self, msg: &'static str) -> E {
+        self.0.invalid_err(msg)
     }
 }
 
@@ -1650,7 +1678,10 @@ impl Vocab {
             // scattered ids: ask for their blocks at once, so that a cold vocabulary
             // reads them in parallel instead of faulting on one after another
             if S::ADMIT_PREFETCH {
-                self.prefetch_sorted_with_scratch(ids, scratch)?;
+                self.prefetch_sorted_with(
+                    ids,
+                    &mut ScratchHint(scratch, std::marker::PhantomData),
+                )?;
             } else {
                 self.prefetch_sorted(ids);
             }
@@ -1999,7 +2030,7 @@ impl Vocab {
         &self,
         ids: &[u64],
         admit: &mut A,
-    ) -> crate::error::Result<()> {
+    ) -> std::result::Result<(), A::Error> {
         if !crate::index::io_hints()
             || !matches!((&self.data, &self.offsets), (Bytes::Map(_), Bytes::Map(_)))
         {
@@ -2009,16 +2040,14 @@ impl Vocab {
             let count = ids.iter().take_while(|&&id| id < self.len).count();
             let bytes = count
                 .checked_mul(std::mem::size_of::<usize>())
-                .ok_or_else(|| crate::error::Error::invalid("vocabulary hint size overflow"))?;
+                .ok_or_else(|| admit.invalid_err("vocabulary hint size overflow"))?;
             admit.admit(bytes)?;
             let mut blocks = Vec::new();
             blocks
                 .try_reserve_exact(count)
-                .map_err(|_| crate::error::Error::invalid("vocabulary hint allocation failed"))?;
+                .map_err(|_| admit.invalid_err("vocabulary hint allocation failed"))?;
             if blocks.capacity() != count {
-                return Err(crate::error::Error::invalid(
-                    "vocabulary hint capacity exceeds admission",
-                ));
+                return Err(admit.invalid_err("vocabulary hint capacity exceeds admission"));
             }
             blocks.extend(
                 ids.iter()
@@ -2032,37 +2061,6 @@ impl Vocab {
                 .map(|&id| id as usize / FC_BLOCK)
                 .collect()
         };
-        self.prefetch_blocks(blocks);
-        Ok(())
-    }
-
-    fn prefetch_sorted_with_scratch<S: BlockScratch<E>, E>(
-        &self,
-        ids: &[u64],
-        scratch: &mut S,
-    ) -> std::result::Result<(), E> {
-        if !crate::index::io_hints()
-            || !matches!((&self.data, &self.offsets), (Bytes::Map(_), Bytes::Map(_)))
-        {
-            return Ok(());
-        }
-        let count = ids.iter().take_while(|&&id| id < self.len).count();
-        let bytes = count
-            .checked_mul(std::mem::size_of::<usize>())
-            .ok_or_else(|| scratch.invalid_err("vocabulary hint size overflow"))?;
-        scratch.admit_growth(0, bytes)?;
-        let mut blocks = Vec::new();
-        blocks
-            .try_reserve_exact(count)
-            .map_err(|_| scratch.invalid_err("vocabulary hint allocation failed"))?;
-        if blocks.capacity() != count {
-            return Err(scratch.invalid_err("vocabulary hint capacity exceeds admission"));
-        }
-        blocks.extend(
-            ids.iter()
-                .take_while(|&&id| id < self.len)
-                .map(|&id| id as usize / FC_BLOCK),
-        );
         self.prefetch_blocks(blocks);
         Ok(())
     }
@@ -2228,7 +2226,7 @@ impl Vocab {
         self.prefetch_value_pages_with(ids, &mut CheckedHint(reserve))
     }
 
-    fn prefetch_value_pages_with<A: HintAdmit>(
+    fn prefetch_value_pages_with<A: HintAdmit<Error = crate::error::Error>>(
         &self,
         ids: &[u64],
         admit: &mut A,
@@ -2259,7 +2257,7 @@ impl Vocab {
         self.prefetch_terms_with(ids, count, &mut CheckedHint(reserve))
     }
 
-    fn prefetch_terms_with<A: HintAdmit>(
+    fn prefetch_terms_with<A: HintAdmit<Error = crate::error::Error>>(
         &self,
         ids: impl Iterator<Item = u64>,
         count: usize,
@@ -5848,30 +5846,43 @@ mod tests {
             assert_eq!(budget.used(), 0);
 
             // Uncapped ReadLimit still honours cancellation and deadline on open_with.
+            let cancel = Arc::new(AtomicBool::new(false));
             let cancelled_opts = HistoryOptions {
-                cancel: Some(Arc::new(AtomicBool::new(true))),
+                cancel: Some(cancel.clone()),
                 deadline: None,
             };
+            let mut uncapped_cancel = ColdBudget::new(ReadLimit {
+                options: &cancelled_opts,
+                memory: None,
+                held: 0,
+            })
+            .unwrap();
+            cancel.store(true, AtomicOrdering::Relaxed);
             assert!(matches!(
-                ColdBudget::new(ReadLimit {
-                    options: &cancelled_opts,
-                    memory: None,
-                    held: 0,
-                }),
+                Vocab::open_with(dir.path(), fsst, &mut uncapped_cancel),
                 Err(Error::Cancelled)
             ));
+            assert_eq!(uncapped_cancel.used(), 0);
+
+            let deadline = Instant::now() + Duration::from_millis(20);
             let expired_opts = HistoryOptions {
                 cancel: None,
-                deadline: Some(Instant::now() - Duration::from_secs(1)),
+                deadline: Some(deadline),
             };
+            let mut uncapped_timeout = ColdBudget::new(ReadLimit {
+                options: &expired_opts,
+                memory: None,
+                held: 0,
+            })
+            .unwrap();
+            while Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             assert!(matches!(
-                ColdBudget::new(ReadLimit {
-                    options: &expired_opts,
-                    memory: None,
-                    held: 0,
-                }),
+                Vocab::open_with(dir.path(), fsst, &mut uncapped_timeout),
                 Err(Error::Timeout)
             ));
+            assert_eq!(uncapped_timeout.used(), 0);
 
             // Tight budget refuses open_with cleanly.
             let mut tiny = ColdBudget::new(ReadLimit {

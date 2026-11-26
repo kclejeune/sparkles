@@ -140,7 +140,7 @@ impl CapturedSegment {
     /// The caller never scans past the captured file extent. Owned record memory
     /// belongs to query execution, not the earlier view-preparation allowance.
     fn body_at<C: Control>(&self, offset: u64, control: &C) -> Result<Option<Vec<u8>>> {
-        read_file_frame_with(
+        read_file_frame_with::<true, _>(
             &self.file,
             offset,
             Some(self.extent),
@@ -159,7 +159,7 @@ impl CapturedSegment {
         control: &C,
         admit: &mut impl FnMut(u64) -> Result<()>,
     ) -> Result<Option<Vec<u8>>> {
-        read_file_frame_with(
+        read_file_frame_with::<true, _>(
             &self.file,
             offset,
             Some(self.extent),
@@ -1066,6 +1066,125 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn readonly_status_reports_refused_frame_allocation_instead_of_aborting() {
+        let root = tempfile::tempdir().unwrap();
+        let rec = timestamp_changes(1, 100, 1);
+        let segment = timestamp_segment(root.path(), 1, &[&rec]);
+        let reader = ReadOnlyLog {
+            segments: vec![segment],
+            through: 1,
+            head: 1,
+        };
+        let log = ChangeLog::new(
+            uuid::Uuid::nil(),
+            None,
+            LogLimits {
+                segment_bytes: 64 << 20,
+                default_max_bytes: 256 << 20,
+                default_on: true,
+                bulk_max_quads: 100_000,
+            },
+            ChangeLogSettings {
+                enabled: Some(true),
+                ..Default::default()
+            },
+            Inner::empty(),
+            Some(reader),
+        );
+
+        // Under Unlimited, status() walks captured segments through fallible frame
+        // reservation and maps refusal into ChangeLogStatus.error instead of aborting.
+        {
+            let _refuse = RefuseFrameAlloc::new(1);
+            let status = log.status();
+            assert_eq!(status.first, None);
+            assert_eq!(status.last, None);
+            let err = status
+                .error
+                .as_deref()
+                .expect("refused frame allocation must surface in ChangeLogStatus.error");
+            assert!(
+                err.contains("history-log record allocation was refused"),
+                "unexpected status error: {err}"
+            );
+        }
+
+        // Normal status succeeds once allocation is allowed.
+        let ok = log.status();
+        assert_eq!(ok.first, Some(1));
+        assert_eq!(ok.last, Some(1));
+        assert_eq!(ok.error, None);
+
+        // A bad-CRC frame within the captured extent still hits fallible reservation
+        // before CRC verification or decoding.
+        let mut bad_crc = rec;
+        bad_crc[4] ^= 1;
+        let bad_seg = timestamp_segment(root.path(), 2, &[&bad_crc]);
+        let _refuse = RefuseFrameAlloc::new(1);
+        assert!(matches!(
+            bad_seg.body_at(SEG_HEADER as u64, &Unlimited),
+            Err(Error::HistoryUnsupported(_))
+        ));
+    }
+
+    #[test]
+    fn readonly_scan_preserves_from_only_hole_sort_on_same_start_overlap() {
+        let root = tempfile::tempdir().unwrap();
+        let gap_a = encode(&Record::Gap {
+            from: 10,
+            through: 12,
+        });
+        let gap_b = encode(&Record::Gap {
+            from: 10,
+            through: 12,
+        });
+        let bulk = encode(&Record::Summary(timestamp_meta(10, 100)));
+        let ch11 = timestamp_changes(11, 110, 1);
+        let ch12 = timestamp_changes(12, 120, 1);
+        let log = ReadOnlyLog {
+            segments: vec![
+                timestamp_segment(root.path(), 10, &[&gap_a]),
+                timestamp_segment(root.path(), 11, &[&gap_b]),
+                timestamp_segment(root.path(), 12, &[&bulk, &ch11, &ch12]),
+            ],
+            through: 12,
+            head: 12,
+        };
+        let holes = log
+            .scan(
+                10,
+                12,
+                &LogFilter {
+                    keys: [None, None, None, None],
+                },
+                false,
+                &mut || Ok(()),
+                &mut |_, _, _| Ok(true),
+            )
+            .unwrap();
+        assert_eq!(
+            holes,
+            vec![
+                Unrecorded {
+                    from: 10,
+                    to: 12,
+                    reason: UnrecordedReason::Gap,
+                },
+                Unrecorded {
+                    from: 10,
+                    to: 10,
+                    reason: UnrecordedReason::Bulk,
+                },
+                Unrecorded {
+                    from: 10,
+                    to: 12,
+                    reason: UnrecordedReason::Gap,
+                },
+            ]
+        );
+    }
 }
 
 /// A record's table is required for positional term references. Changes remain
@@ -1558,7 +1677,7 @@ impl ReadOnlyLog {
                 push_with(&mut holes, hole, &control)?;
             }
         }
-        sort_holes_with::<true, _>(&mut holes, &control)?;
+        sort_holes_with::<true, _, _>(&mut holes, &control, |h| h.from)?;
         dedup_holes_with::<true, _>(&mut holes, &control)?;
         Ok(holes)
     }

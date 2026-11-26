@@ -775,9 +775,10 @@ and `BudgetControl` helpers (`read_settings_with`, `crc32_with`, `frame_with`,
 `ChangeLog::read_with`, `SegIndex::decode_with`, `ChangeLog::index_with`,
 `ChangeLog::read_index_with` and the hole sorting and deduplication helpers shared by
 `HoleCollector::finish_with` and `ReadOnlyLog::scan`) replace the `_checked` twins and
-the duplicate decoders and hole normalizers in `changelog/readonly.rs`. Stage 2 and
-Stage 3 `bench:insn`, `sparkles-core` binary size, compile time and spill matrix
-measurements remain to be recorded on a quiet Intel host before the batch pushes.
+the duplicate decoders and hole normalizers in `changelog/readonly.rs`. The quiet-Intel
+`bench:insn`, `sparkles-core` binary size, compile time and spill matrix acceptance
+measurements for Stage 2 and Stage 3 run at the batch gate before push and are appended
+here once recorded.
 
 Phase 4 is built. `LoadPlan::choose` in `store/load_plan.rs` takes a `LoadInputs` and a
 `Sizes` that reads a source's estimate or probes its streams only when the plan depends

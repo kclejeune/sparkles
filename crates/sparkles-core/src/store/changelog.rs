@@ -773,8 +773,8 @@ pub(super) trait RecordSink<'a> {
 }
 
 /// Builds an owned [`Record`], either unchecked (`Unlimited`) or admitted/checked.
+#[derive(Default)]
 struct OwnedRecordSink {
-    exact: bool,
     bytes_since_check: usize,
 }
 
@@ -785,12 +785,7 @@ impl<'a> RecordSink<'a> for OwnedRecordSink {
     #[inline]
     fn make_terms<C: Control>(&mut self, count: usize, _control: &C) -> Result<Self::Terms> {
         if !C::CHECKS {
-            let cap = if self.exact {
-                count
-            } else {
-                count.min(1 << 16)
-            };
-            return Ok(Vec::with_capacity(cap));
+            return Ok(Vec::with_capacity(count.min(1 << 16)));
         }
         let mut terms = Vec::new();
         terms.try_reserve_exact(count).map_err(|_| {
@@ -843,12 +838,7 @@ impl<'a> RecordSink<'a> for OwnedRecordSink {
             control.check(0)?;
         }
         let mut changes = if !C::CHECKS {
-            let cap = if self.exact {
-                count
-            } else {
-                count.min(1 << 16)
-            };
-            Vec::with_capacity(cap)
+            Vec::with_capacity(count.min(1 << 16))
         } else {
             let mut changes = Vec::new();
             changes.try_reserve_exact(count).map_err(|_| {
@@ -957,15 +947,8 @@ pub(super) fn decode_record_with<'a, C: Control, S: RecordSink<'a>>(
 
 /// Decode a record body (its CRC already checked).
 fn decode(body: &[u8]) -> Option<Record> {
-    decode_record_with(
-        body,
-        &Unlimited,
-        OwnedRecordSink {
-            exact: false,
-            bytes_since_check: 0,
-        },
-    )
-    .expect("unlimited record decode cannot fail")
+    decode_record_with(body, &Unlimited, OwnedRecordSink::default())
+        .expect("unlimited record decode cannot fail")
 }
 
 /// The bytes an `Arc<[u8]>` or `Arc<str>` of `len` bytes allocates.
@@ -1072,14 +1055,7 @@ fn decode_admitted_checked(
     body: &[u8],
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Option<Record>> {
-    decode_record_with(
-        body,
-        &FnMutControl::new(check),
-        OwnedRecordSink {
-            exact: true,
-            bytes_since_check: 0,
-        },
-    )
+    decode_record_with(body, &FnMutControl::new(check), OwnedRecordSink::default())
 }
 
 #[cfg(test)]
@@ -1125,11 +1101,52 @@ fn frame(buf: &[u8], at: usize) -> Option<(&[u8], usize)> {
     frame_with(buf, at, &Unlimited).expect("unlimited frame read cannot fail")
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static FRAME_ALLOC_REFUSAL_MIN: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) struct RefuseFrameAlloc {
+    prev: Option<usize>,
+}
+
+#[cfg(test)]
+impl RefuseFrameAlloc {
+    pub(super) fn new(min_len: usize) -> Self {
+        let prev = FRAME_ALLOC_REFUSAL_MIN.with(|cell| cell.replace(Some(min_len)));
+        Self { prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RefuseFrameAlloc {
+    fn drop(&mut self) {
+        FRAME_ALLOC_REFUSAL_MIN.with(|cell| cell.set(self.prev));
+    }
+}
+
+#[inline]
+fn reserve_frame_body(len: usize) -> Result<Vec<u8>> {
+    #[cfg(test)]
+    if FRAME_ALLOC_REFUSAL_MIN.with(|cell| cell.get().is_some_and(|min| len >= min)) {
+        return Err(Error::HistoryUnsupported(
+            "history-log record allocation was refused".into(),
+        ));
+    }
+    let mut body = Vec::new();
+    body.try_reserve_exact(len).map_err(|_| {
+        Error::HistoryUnsupported("history-log record allocation was refused".into())
+    })?;
+    Ok(body)
+}
+
 /// Read one framed record body from `file` at `offset` under `control`, verifying its
 /// CRC-32 and admitting its allocation before reserving. Returns `Ok(None)` when `offset`
 /// or the declared frame extends past `max_end`, when the length is zero, or when the
-/// CRC does not match.
-pub(super) fn read_file_frame_with<C: Control>(
+/// CRC does not match. When `FALLIBLE_ALLOC` is true, even `!C::CHECKS` callers reserve
+/// the frame body fallibly instead of aborting on allocator refusal.
+pub(super) fn read_file_frame_with<const FALLIBLE_ALLOC: bool, C: Control>(
     file: &File,
     offset: u64,
     max_end: Option<u64>,
@@ -1160,7 +1177,13 @@ pub(super) fn read_file_frame_with<C: Control>(
         return Ok(None);
     }
     if !C::CHECKS {
-        let mut body = vec![0u8; len];
+        let mut body = if FALLIBLE_ALLOC {
+            let mut body = reserve_frame_body(len)?;
+            body.resize(len, 0);
+            body
+        } else {
+            vec![0u8; len]
+        };
         read_exact_at_with(file, &mut body, offset + 8, control)?;
         if observe_chunk {
             #[cfg(feature = "failpoints")]
@@ -1172,10 +1195,7 @@ pub(super) fn read_file_frame_with<C: Control>(
     control.check(0)?;
     admit(header_bytes + len as u64)?;
     control.check(0)?;
-    let mut body = Vec::new();
-    body.try_reserve_exact(len).map_err(|_| {
-        Error::HistoryUnsupported("history-log record allocation was refused".into())
-    })?;
+    let mut body = reserve_frame_body(len)?;
     if header_in_admit && body.capacity() > len {
         admit(header_bytes + body.capacity() as u64)?;
         control.check(0)?;
@@ -1383,9 +1403,10 @@ fn reverse_holes_with<C: Control>(holes: &mut [Unrecorded], control: &C) -> Resu
     Ok(())
 }
 
-pub(super) fn sort_holes_with<const PER_STEP: bool, C: Control>(
+pub(super) fn sort_holes_with<const PER_STEP: bool, C: Control, K: Ord>(
     holes: &mut [Unrecorded],
     control: &C,
+    key: impl Fn(&Unrecorded) -> K,
 ) -> Result<()> {
     let len = holes.len();
     if len <= 1 {
@@ -1403,11 +1424,11 @@ pub(super) fn sort_holes_with<const PER_STEP: bool, C: Control>(
                 break;
             }
             let mut swap = root;
-            if hole_key(&slice[swap]) < hole_key(&slice[left]) {
+            if key(&slice[swap]) < key(&slice[left]) {
                 swap = left;
             }
             let right = left + 1;
-            if right < end && hole_key(&slice[swap]) < hole_key(&slice[right]) {
+            if right < end && key(&slice[swap]) < key(&slice[right]) {
                 swap = right;
             }
             if swap == root {
@@ -1482,9 +1503,9 @@ fn sort_holes_checked(
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<()> {
     if checked {
-        sort_holes_with::<false, _>(holes, &FnMutControl::new(check))
+        sort_holes_with::<false, _, _>(holes, &FnMutControl::new(check), hole_key)
     } else {
-        sort_holes_with::<false, _>(holes, &Unlimited)
+        sort_holes_with::<false, _, _>(holes, &Unlimited, hole_key)
     }
 }
 
@@ -1586,7 +1607,7 @@ impl<'a> HoleCollector<'a> {
                 reverse_holes_with(&mut self.holes, control)?;
             }
         } else {
-            sort_holes_with::<false, _>(&mut self.holes, control)?;
+            sort_holes_with::<false, _, _>(&mut self.holes, control, hole_key)?;
             dedup_holes_with::<false, _>(&mut self.holes, control)?;
         }
         control.check(0)?;
@@ -2563,15 +2584,8 @@ impl ChangeLog {
                 };
                 #[cfg(feature = "failpoints")]
                 observe_changelog_read(ChangeLogReadEvent::RecordDecode);
-                let r = decode_record_with(
-                    body,
-                    control,
-                    OwnedRecordSink {
-                        exact: C::CHECKS,
-                        bytes_since_check: 0,
-                    },
-                )?
-                .ok_or_else(damaged)?;
+                let r = decode_record_with(body, control, OwnedRecordSink::default())?
+                    .ok_or_else(damaged)?;
                 Ok((r, held))
             };
         if seg.path.is_none() {
@@ -2584,7 +2598,10 @@ impl ChangeLog {
         }
         let path = seg.path.as_ref().expect("checked");
         let f = File::open(path)?;
-        let body = read_file_frame_with(&f, offset, None, true, true, control, &mut |b| admit(b))?
+        let body =
+            read_file_frame_with::<false, _>(&f, offset, None, true, true, control, &mut |b| {
+                admit(b)
+            })?
             .ok_or_else(damaged)?;
         let frame_bytes = if C::CHECKS {
             8 + body.capacity() as u64
@@ -4206,7 +4223,7 @@ mod settings_format_tests {
     fn admitted_history_reads_check_between_chunks() {
         use std::cell::Cell;
 
-        // 1. Direct chunk-size, offset-stride and EINTR retry test via `read_exact_at_checked_with`.
+        // 1. Direct chunk-size, offset-stride and EINTR retry test via `read_exact_at_loop_with`.
         let src: Vec<u8> = (0..(256 << 10)).map(|i| (i % 251) as u8).collect();
         let mut dst = vec![0u8; src.len()];
         let mut calls = 0usize;
@@ -6002,30 +6019,43 @@ mod settings_format_tests {
         ));
         assert_eq!(tiny.used(), 0);
 
+        let cancel = Arc::new(AtomicBool::new(false));
         let cancel_opts = HistoryOptions {
-            cancel: Some(Arc::new(AtomicBool::new(true))),
+            cancel: Some(cancel.clone()),
             deadline: None,
         };
+        let mut uncapped_cancel = ColdBudget::new(ReadLimit {
+            options: &cancel_opts,
+            memory: None,
+            held: 0,
+        })
+        .unwrap();
+        cancel.store(true, Ordering::Relaxed);
         assert!(matches!(
-            ColdBudget::new(ReadLimit {
-                options: &cancel_opts,
-                memory: None,
-                held: 0,
-            }),
+            read_settings_with(dir.path(), &mut uncapped_cancel),
             Err(Error::Cancelled)
         ));
+        assert_eq!(uncapped_cancel.used(), 0);
+
+        let deadline = Instant::now() + Duration::from_millis(20);
         let expired_opts = HistoryOptions {
             cancel: None,
-            deadline: Some(Instant::now() - Duration::from_secs(1)),
+            deadline: Some(deadline),
         };
+        let mut uncapped_timeout = ColdBudget::new(ReadLimit {
+            options: &expired_opts,
+            memory: None,
+            held: 0,
+        })
+        .unwrap();
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(matches!(
-            ColdBudget::new(ReadLimit {
-                options: &expired_opts,
-                memory: None,
-                held: 0,
-            }),
+            read_settings_with(dir.path(), &mut uncapped_timeout),
             Err(Error::Timeout)
         ));
+        assert_eq!(uncapped_timeout.used(), 0);
 
         // 2. Unified record decoder, framing, payload, and hole helpers agree between
         //    Unlimited and checked Control carriers and honour cancellation/timeouts.
@@ -6049,24 +6079,14 @@ mod settings_format_tests {
             .unwrap();
         assert_eq!((u_body, u_next), (c_body, c_next));
 
-        let u_rec = decode_record_with(
-            u_body,
-            &Unlimited,
-            OwnedRecordSink {
-                exact: false,
-                bytes_since_check: 0,
-            },
-        )
-        .unwrap()
-        .unwrap();
+        let u_rec = decode_record_with(u_body, &Unlimited, OwnedRecordSink::default())
+            .unwrap()
+            .unwrap();
         let mut ok = || Ok(());
         let c_rec = decode_record_with(
             c_body,
             &FnMutControl::new(&mut ok),
-            OwnedRecordSink {
-                exact: true,
-                bytes_since_check: 0,
-            },
+            OwnedRecordSink::default(),
         )
         .unwrap()
         .unwrap();
@@ -6088,10 +6108,7 @@ mod settings_format_tests {
             decode_record_with(
                 u_body,
                 &FnMutControl::new(&mut timeout_fn),
-                OwnedRecordSink {
-                    exact: true,
-                    bytes_since_check: 0,
-                }
+                OwnedRecordSink::default(),
             ),
             Err(Error::Timeout)
         ));
