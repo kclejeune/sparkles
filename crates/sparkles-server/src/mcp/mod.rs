@@ -469,6 +469,22 @@ impl McpServer {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_with_task_ttl_and_clock(
+        state: Arc<AppState>,
+        cfg: McpConfig,
+        task_ttl: Duration,
+        clock: tasks::ManualClock,
+    ) -> McpServer {
+        Self::new_with_parts(
+            state,
+            cfg,
+            Arc::new(pins::Pins::default()),
+            tasks::Tasks::with_ttl_and_clock(task_ttl, clock),
+            None,
+        )
+    }
+
     fn new_with_parts(
         state: Arc<AppState>,
         cfg: McpConfig,
