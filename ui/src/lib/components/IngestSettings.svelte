@@ -6,6 +6,7 @@
   import { toasts } from '$lib/app.svelte';
   import * as review from '$lib/review-api';
   import { LatestRun } from '$lib/supersede';
+  import ServerIngestStatus from './ServerIngestStatus.svelte';
 
   let { ds, canAdmin = false }: { ds: string; canAdmin?: boolean } = $props();
 
@@ -108,6 +109,7 @@
 <section class="panel" aria-label="Ingest settings">
   <div class="panel-head"><h2>Ingest</h2></div>
   <div class="panel-body card-body">
+    <ServerIngestStatus {ds} {canAdmin} />
     {#if error}
       <p class="faint">{error}</p>
     {:else if !data}

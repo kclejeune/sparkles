@@ -221,7 +221,7 @@ export async function deleteSuggestion(ds: string, id: string): Promise<void> {
 /** A provider and model. */
 export type Pair = { provider: string; model: string };
 
-/** What `GET /$/assistant/{ds}` says about asking. */
+/** What `GET /$/assistant/{ds}` says about asking and server ingestion. */
 export type AssistantStatus = {
   models: boolean;
   historyDays: number;
@@ -230,13 +230,19 @@ export type AssistantStatus = {
   draft?: Pair[];
   /** Whether an answer can carry a summary. */
   summary?: boolean;
+  /** Whether server-side document ingestion can extract facts with an extract provider. */
+  ingest?: boolean;
+  /** The effective extract role list for this dataset. */
+  extract?: Pair[];
 };
 
 /** A dataset's `assistant.json` with the server's `status`. */
 export type AssistantSettings = {
   enabled?: boolean;
   ask?: boolean;
+  ingest?: boolean;
   send?: 'schema' | 'rows' | 'documents';
+  sendByProvider?: Record<string, 'schema' | 'rows' | 'documents'>;
   historyDays?: number;
   status?: AssistantStatus;
   [k: string]: unknown;

@@ -349,6 +349,19 @@ async function handleTasks(
           pages: [{ page: 3, reasons: ['scanned'] }],
         },
       });
+    } else if (fields.extract === 'false') {
+      t = newTask(name, input, 'done', {
+        result: {
+          outcome: 'registered',
+          mode,
+          format: lower.endsWith('.pdf') ? 'pdf' : 'markdown',
+          source: `https://example.org/sources/${st.tasks.length + 1}`,
+          graph: `https://example.org/sources/${st.tasks.length + 1}`,
+          rendition: `urn:x-sparkles:rendition:${st.tasks.length + 1}`,
+          length: file.size,
+          chunks: 1,
+        },
+      });
     } else if (lower.includes('big') && fields.confirm !== 'true') {
       t = newTask(name, input, 'awaiting-confirmation', {
         message: "the estimate is above the dataset's threshold: confirm to go on",

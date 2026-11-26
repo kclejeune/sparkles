@@ -4,6 +4,8 @@
   // file gets a mapping draft, which a dry run and then an upload apply. A workbook gets one
   // draft for each sheet, and uploads the sheet as CSV.
   import Icon from './Icon.svelte';
+  import Modal from './Modal.svelte';
+  import ServerIngestStatus from './ServerIngestStatus.svelte';
   import { base } from '$app/paths';
   import * as api from '$lib/api';
   import { toasts } from '$lib/app.svelte';
@@ -28,6 +30,8 @@
   let mode = $state<review.IngestMode>('branch');
   let allowPartial = $state(false);
   let busy = $state(false);
+  let ingestStatus = $state({ on: true, loading: true });
+  let storeOnlyConfirm = $state(false);
   /** The task this panel follows. */
   let task = $state<review.IngestTask | null>(null);
   /** The mapping draft as editable JSON, and what its dry run said. */
@@ -97,13 +101,26 @@
     }
   }
 
-  async function start(partial = allowPartial) {
+  const isTableFile = (f: File | null) => f != null && /\.(csv|tsv|xlsx|ods)$/i.test(f.name);
+
+  function requestStart() {
+    if (!file) return;
+    if (!ingestStatus.loading && !ingestStatus.on && !isTableFile(file)) {
+      storeOnlyConfirm = true;
+      return;
+    }
+    void start(allowPartial);
+  }
+
+  async function start(partial = allowPartial, extract?: boolean) {
     if (!file) return;
     busy = true;
+    storeOnlyConfirm = false;
     try {
       const t = await review.startIngest(ds, file, {
         mode,
         allowPartial: partial || undefined,
+        extract,
       });
       void follow(t);
     } catch (e) {
@@ -189,14 +206,14 @@
   <section class="panel" aria-label="Ingest" hidden={!canWrite}>
     <div class="panel-head"><h2>Ingest a document</h2></div>
     <div class="panel-body ingest">
+      <ServerIngestStatus {ds} {canAdmin} onstate={(s) => (ingestStatus = s)} />
       <p class="faint small">
         Markdown, HTML, text{caps.pdf ? ', PDF' : ''}{caps.office
           ? ', Word, PowerPoint, OpenDocument'
-          : ''}, CSV, TSV{caps.office ? ' or Excel' : ''}. Documents are registered as sources, and
-        the model proposes facts from them. Tables and sheets get a draft mapping instead.{caps.pdf &&
-        !caps.ocr
-          ? ' Scanned PDF pages are not read.'
-          : ''}
+          : ''}, CSV, TSV{caps.office ? ' or Excel' : ''}. {#if !ingestStatus.loading && !ingestStatus.on}Documents
+          are registered as sources without extracting facts while server ingestion is off.{:else}Documents
+          are registered as sources, and the model proposes facts from them.{/if} Tables and sheets get
+        a draft mapping instead.{caps.pdf && !caps.ocr ? ' Scanned PDF pages are not read.' : ''}
       </p>
       <div class="row">
         <label class="btn file-btn">
@@ -223,7 +240,7 @@
           <label><input type="checkbox" bind:checked={allowPartial} /> Skip unreadable pages</label>
         {/if}
         <span class="spacer"></span>
-        <button class="btn primary sm" disabled={!file || busy} onclick={() => start()}
+        <button class="btn primary sm" disabled={!file || busy} onclick={requestStart}
           >Ingest</button
         >
       </div>
@@ -403,6 +420,13 @@
               </p>
             {/if}
             {#if r.autoFallback}<p class="msg">Kept for review: {r.autoFallback}.</p>{/if}
+            {#if r.redactions && Object.keys(r.redactions).length}
+              <p class="msg">
+                Redacted before storage and extraction: {Object.entries(r.redactions)
+                  .map(([k, n]) => `${k} (${n})`)
+                  .join(', ')}.
+              </p>
+            {/if}
             {#each r.notes ?? [] as n (n)}<p class="msg">{n}</p>{/each}
             <div class="row">
               {#if r.branch}
@@ -437,6 +461,26 @@
       {/if}
     </div>
   </section>
+
+  <Modal
+    bind:open={storeOnlyConfirm}
+    title="Store this document as a source without facts?"
+    width={440}
+    closeDisabled={busy}
+  >
+    <p class="small">
+      Server ingestion is off for this dataset. Uploading <code class="mono">{file?.name}</code> will
+      store it as a source without running a model or extracting facts.
+    </p>
+    {#snippet actions()}
+      <button class="btn sm" disabled={busy} onclick={() => (storeOnlyConfirm = false)}
+        >Cancel</button
+      >
+      <button class="btn primary sm" disabled={busy} onclick={() => start(allowPartial, false)}
+        >Store without facts</button
+      >
+    {/snippet}
+  </Modal>
 {/if}
 
 <style>

@@ -64,3 +64,74 @@ test('a table gets a mapping draft', async ({ page }) => {
   await expect(task).toContainText('Mapping draft (by the model): 3 rows become 6 triples');
   await expect(task.getByLabel('Mapping')).toHaveValue(/tableSchema/);
 });
+
+test('when server ingestion is off, panel states so and asks before storing without facts', async ({
+  page,
+}) => {
+  await page.goto('/ui/datasets/foaf');
+  const panel = page.getByRole('region', { name: 'Ingest' });
+  const status = panel.getByTestId('server-ingest-status');
+  await expect(status).toContainText(
+    'Server ingestion is off: uploaded documents are stored as sources without facts',
+  );
+  // Uploading a document asks for confirmation and sends extract=false
+  let extractField: string | null = null;
+  await page.route('**/$/ingest/foaf', async (route) => {
+    if (route.request().method() === 'POST') {
+      const body = route.request().postData() ?? '';
+      const m = body.match(/name="extract"\r?\n\r?\n([^\r\n]+)/);
+      extractField = m ? m[1] : null;
+    }
+    await route.continue();
+  });
+  await panel.getByLabel('Document to ingest').setInputFiles({
+    name: 'memo.md',
+    mimeType: 'text/markdown',
+    buffer: Buffer.from('# Memo\n\nJust notes.\n'),
+  });
+  await panel.getByRole('button', { name: 'Ingest', exact: true }).click();
+  const dialog = page.getByRole('dialog', {
+    name: 'Store this document as a source without facts?',
+  });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole('button', { name: 'Store without facts' }).click();
+  const task = panel.getByRole('group', { name: 'Ingestion task' });
+  await expect(task).toContainText('Registered as a source');
+  expect(extractField).toBe('false');
+
+  // Admin can turn server ingestion on from the panel after seeing what changes and which providers receive documents
+  await status.getByRole('button', { name: 'Turn on server ingestion' }).click();
+  const enableDialog = page.getByRole('dialog', { name: 'Turn on server ingestion' });
+  await expect(enableDialog).toContainText('enabled');
+  await expect(enableDialog).toContainText('ingest');
+  await expect(enableDialog).toContainText('send');
+  await expect(enableDialog).toContainText('mock/small');
+  await expect(enableDialog).toContainText('query result rows');
+  await enableDialog.getByRole('button', { name: 'Turn on server ingestion' }).click();
+  await expect(status).toContainText(
+    'Server ingestion is on: documents go to mock/small, mock/large',
+  );
+
+  // Turning it off patches ingest=false and links back to Settings
+  await status.getByRole('button', { name: 'Turn off server ingestion' }).click();
+  await expect(status).toContainText('Server ingestion is off');
+  await expect(status.getByRole('link', { name: 'Open ingest in Settings' })).toHaveAttribute(
+    'href',
+    /\/datasets\/foaf\?tab=settings#setting-assistant-ingest$/,
+  );
+});
+
+test('a locked send setting explains why server ingestion is off and links to Settings', async ({
+  page,
+}) => {
+  await page.goto('/ui/datasets/scratch');
+  const panel = page.getByRole('region', { name: 'Ingest' });
+  const status = panel.getByTestId('server-ingest-status');
+  await expect(status).toContainText('Server ingestion is off');
+  await expect(status).toContainText("locked in the server's settings file");
+  await expect(status.getByRole('button', { name: 'Turn on server ingestion' })).toHaveCount(0);
+  await expect(status.getByRole('link', { name: 'Open send in Settings' })).toHaveAttribute(
+    'href',
+    /\/datasets\/scratch\?tab=settings#setting-assistant-send$/,
+  );
+});

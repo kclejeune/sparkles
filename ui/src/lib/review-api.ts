@@ -309,6 +309,7 @@ export type IngestResult = {
   ocrPages?: number[];
   omittedPages?: number[];
   notes?: string[];
+  redactions?: Record<string, number>;
   autoFallback?: string;
   // a table's mapping draft (§7.8)
   file?: string;
@@ -401,6 +402,7 @@ export type IngestOptions = {
   profile?: string;
   title?: string;
   allowPartial?: boolean;
+  extract?: boolean;
   confirm?: boolean;
   base?: string;
 };

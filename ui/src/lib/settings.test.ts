@@ -1,11 +1,17 @@
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from './api';
 import {
   conflicts,
   covers,
   datasetKindUrl,
+  describeIngestState,
   diffPatch,
   dirtyFields,
+  disableIngest,
+  enableIngest,
   fieldInfo,
   formOf,
   formPatch,
@@ -15,6 +21,7 @@ import {
   parsePath,
   patchKind,
   pathString,
+  planEnableIngest,
   readKind,
   resetFields,
   resetKind,
@@ -584,5 +591,144 @@ describe('the form and the JSON editor share one change', () => {
       message: 'models: temperature must be between 0 and 2',
       field: 'providers.p.models.m.temperature',
     });
+  });
+});
+
+describe('assistant server ingestion (C19 §8.1 / item 77)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('matches the shared Rust/UI enable-ingest fixture for every case', () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const raw = readFileSync(
+      resolve(here, '../../../testsuite/settings/enable-ingest.json'),
+      'utf8',
+    );
+    const fixture = JSON.parse(raw) as {
+      cases: Array<{
+        name: string;
+        assistant: Pick<SettingsKind, 'effective' | 'sources' | 'locked'>;
+        expectedPatch: Record<string, unknown>;
+        wouldEnable: boolean;
+      }>;
+    };
+    expect(fixture.cases.length).toBeGreaterThan(0);
+    for (const c of fixture.cases) {
+      const plan = planEnableIngest(c.assistant);
+      expect(plan.patch, `case ${c.name}: patch`).toEqual(c.expectedPatch);
+      expect(plan.wouldEnable, `case ${c.name}: wouldEnable`).toBe(c.wouldEnable);
+    }
+  });
+
+  it('describes on, default-off, locked-off and no-model states', () => {
+    const extract = [{ provider: 'local', model: 'qwen3:14b' }];
+    const offDefault = describeIngestState(
+      kind({
+        effective: { enabled: false, ingest: false, send: 'schema' },
+        sources: { enabled: 'default', ingest: 'default', send: 'default' },
+        locked: [],
+        overridden: [],
+      }),
+      { models: true, ingest: false, extract },
+    );
+    expect(offDefault.on).toBe(false);
+    expect(offDefault.canEnableDirectly).toBe(true);
+    expect(offDefault.blockingField?.field).toBe('enabled');
+
+    const lockedSend = describeIngestState(
+      kind({
+        effective: { enabled: false, ingest: false, send: 'rows' },
+        sources: { enabled: 'default', ingest: 'default', send: 'locked' },
+        locked: ['send'],
+        overridden: [],
+      }),
+      { models: true, ingest: false, extract },
+    );
+    expect(lockedSend.on).toBe(false);
+    expect(lockedSend.canEnableDirectly).toBe(false);
+    expect(lockedSend.blockingField).toEqual({ field: 'send', source: 'locked', value: 'rows' });
+    expect(lockedSend.reason).toContain('locked');
+
+    const active = describeIngestState(
+      kind({
+        effective: { enabled: true, ingest: true, send: 'documents' },
+        sources: { enabled: 'runtime', ingest: 'runtime', send: 'runtime' },
+        locked: [],
+        overridden: [],
+      }),
+      { models: true, ingest: true, extract },
+    );
+    expect(active.on).toBe(true);
+    expect(active.activeProviders).toEqual([
+      { provider: 'local', model: 'qwen3:14b', send: 'documents', receivesDocuments: true },
+    ]);
+  });
+
+  it('retries on 412 in enableIngest and disables ingest via PATCH', async () => {
+    const baseKind = kind({
+      effective: { enabled: false, ingest: false, send: 'schema' },
+      sources: { enabled: 'default', ingest: 'default', send: 'default' },
+      locked: [],
+      overridden: [],
+      etag: '"v1"',
+    });
+    const enabledKind = kind({
+      effective: { enabled: true, ingest: true, send: 'documents' },
+      sources: { enabled: 'runtime', ingest: 'runtime', send: 'runtime' },
+      locked: [],
+      overridden: [],
+      etag: '"v2"',
+    });
+    const disabledKind = kind({
+      effective: { enabled: true, ingest: false, send: 'documents' },
+      sources: { enabled: 'runtime', ingest: 'runtime', send: 'runtime' },
+      locked: [],
+      overridden: [],
+      etag: '"v3"',
+    });
+    const calls: Array<{ method: string; url: string; ifMatch: string | null; body?: unknown }> =
+      [];
+    let patchCount = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        const headers = new Headers(init?.headers);
+        const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+        calls.push({ method, url, ifMatch: headers.get('If-Match'), body });
+        if (method === 'GET') {
+          const payload = patchCount >= 2 ? enabledKind : baseKind;
+          return new Response(JSON.stringify(payload), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        patchCount++;
+        if (patchCount === 1) {
+          return new Response(JSON.stringify({ message: 'stale' }), {
+            status: 412,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        const payload = body?.ingest === false ? disabledKind : enabledKind;
+        return new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }),
+    );
+
+    const res = await enableIngest('org');
+    expect(res.changed).toBe(true);
+    expect(res.kind.etag).toBe('"v2"');
+    expect(calls.filter((c) => c.method === 'PATCH')).toHaveLength(2);
+    expect(calls[1].ifMatch).toBe('"v1"');
+    expect(calls[1].body).toEqual({ enabled: true, ingest: true, send: 'documents' });
+
+    const off = await disableIngest('org');
+    expect(off.effective.ingest).toBe(false);
+    expect(calls.at(-1)?.body).toEqual({ ingest: false });
   });
 });
