@@ -37,6 +37,7 @@ mod fmt;
 mod fuseki_config;
 mod geo;
 mod geo_index_cmd;
+mod git_cmd;
 #[cfg(feature = "graphql")]
 mod graphql;
 mod graphrag;
@@ -1915,6 +1916,11 @@ enum Cmd {
     Branch {
         #[command(subcommand)]
         cmd: branch_cmd::BranchCmd,
+    },
+    /// Canonical git serialization and branch export
+    Git {
+        #[command(subcommand)]
+        cmd: git_cmd::GitCmd,
     },
     /// Merge a branch into another (main by default); exits 2 when conflicts stopped it
     Merge(branch_cmd::MergeArgs),
@@ -4507,6 +4513,7 @@ fn run() -> Result<()> {
         } => check_cmd::run(loc, data, &format, quick),
         Cmd::Migrate(a) => migrate_cmd::run(a),
         Cmd::Branch { cmd } => branch_cmd::run_branch(cmd, opts),
+        Cmd::Git { cmd } => git_cmd::run(cmd, opts),
         Cmd::Merge(a) => {
             let code = branch_cmd::run_merge(a, opts)?;
             if code != 0 {

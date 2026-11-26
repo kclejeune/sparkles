@@ -90,6 +90,10 @@ Branches provide git-like isolated workspaces over the quad store ([F09](../spec
 
 Text and binary (Thrift) RDF Patches apply atomically as a single `patch` commit through `POST`/`PATCH /{ds}/patch`, `POST /{ds}`, `sparkles patch`, `Store::apply_patch`, and Python `Dataset.apply_patch` ([F10](../specs/F10-replication.md), [API.md](../API.md#applying-rdf-patch)). `TA` aborts the entire patch, `PA` and `PD` update prefixes, and a `prev` header enforces optimistic head checking. Write guards, quotas, graph grants, dry runs, and receipts apply identically to other writes.
 
+### Git serialization and export
+
+Datasets serialize to a versioned canonical directory layout (`format_version = 1`) through `sparkles::git` and `sparkles git write-tree`, writing `.sparkles-git/manifest.json` and one sorted, subject-grouped Turtle or sorted N-Quads file per non-empty graph with stable prefixes and dataset-wide RDFC-1.0 blank-node labels ([F25](../specs/F25-git-sync-and-remotes/SPEC.md)). `sparkles::git::read_git_tree`, `sparkles::git::import_git_tree`, and `sparkles git verify` reproduce exact quads and cross-graph blank-node structure while refusing unknown format versions, unsafe paths, symlinks, and checksum mismatches. `Dataset::export_git` and `sparkles git export` export a branch to a Git repository commit-by-commit or squashed with preserved authors, UTC timestamps, messages, RFC 822 commit trailers, and a versioned bidirectional Sparkles-commit to Git-SHA mapping (`format_version = 1`). Git ref import, webhook-driven sync, and server-to-server remotes remain tracked in roadmap [item 460](../ROADMAP.md).
+
 ## Configuration and usage
 
 | Topic | Reference |
