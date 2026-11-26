@@ -188,6 +188,10 @@ pub struct ClassifyStep {
     /// Classify the assertions too: the types of each individual
     #[arg(long)]
     pub assertions: bool,
+    /// Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom
+    /// outside OWL 2 EL
+    #[arg(long)]
+    pub el_only: bool,
     /// Describe this class
     #[arg(long)]
     pub about: Option<String>,
@@ -393,6 +397,7 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
             let c = ClassifyRequest {
                 about: about.clone(),
                 assertions: a.assertions,
+                el_only: a.el_only,
                 strict: a.strict,
                 ..c.clone()
             };

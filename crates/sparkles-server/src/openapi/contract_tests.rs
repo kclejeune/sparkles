@@ -189,6 +189,27 @@ async fn kept_classification_and_projection_responses_match_typed_schemas() {
     assert_eq!(full["class"]["incomplete"], false);
     assert!(full["nodes"].is_array());
     assert!(full["stats"]["unmapped"].is_u64());
+    let elk = checked(
+        &doc,
+        &app,
+        "POST",
+        "/$/ontology/{ds}/classify",
+        "/$/ontology/kept/classify",
+        Some(json!({"about":"urn:A","elOnly":true})),
+    )
+    .await;
+    assert_eq!(elk["classificationSource"]["producer"]["elOnly"], true);
+    let kept_elk = checked(
+        &doc,
+        &app,
+        "GET",
+        path,
+        "/$/ontology/kept/classification?elOnly=true",
+        None,
+    )
+    .await;
+    assert_eq!(kept_elk["status"], "available");
+    assert_eq!(kept_elk["result"]["elOnly"], true);
     let receipt_schema = &doc["paths"]["/$/ontology/{ds}/classify"]["post"]["responses"]["200"]["content"]
         ["application/x-sparkles+json"]["schema"];
     for (uri, accept, target) in [

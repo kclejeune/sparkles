@@ -803,6 +803,7 @@ fn ontology(p: &mut Paths) {
             .query("offset", json!({"type":"integer","minimum":0}), "The first row, zero by default. Nonzero offsets require an exact commit and resultId.")
             .query("limit", json!({"type":"integer","minimum":1,"maximum":1000}), "At most this many rows, 100 by default.")
             .query("lang", s(), "Comma-separated preferred label languages, otherwise Accept-Language.")
+            .query("elOnly", boolean(), "Read the kept EL-only classification instead of the default classification (false by default).")
             .query("timeout", json!({"type":"number","minimum":0}), "The read deadline in milliseconds.")
             .resp("200", "Availability and an optional bounded page from one immutable result.", Some(json!({"application/json":{"schema":sref("KeptClassification")}})))
             .errors(&[400,403,404,408,410]),
@@ -823,6 +824,7 @@ fn ontology(p: &mut Paths) {
                         "imports": selection["imports"],
                         "mode": selection["mode"],
                         "assertions": { "type": "boolean", "description": "Also classify the assertions the store holds, so that they can make the ontology inconsistent. Such a run is not kept." },
+                        "elOnly": { "type": "boolean", "description": "Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL. The dataset keeps EL-only classifications separately from default runs." },
                         "target": { "type": "string", "description": "A named graph outside the graphs read that takes the direct taxonomy." },
                         "message": { "type": "string", "description": "The commit message of the write, also kept as a comment on the header." },
                         "about": { "type": "string", "description": "A class IRI to describe." },
@@ -893,6 +895,7 @@ fn ontology(p: &mut Paths) {
                         "expression": { "description": "The class expression: Manchester or functional-style text, or the JSON form." },
                         "syntax": { "type": "string", "enum": ["manchester", "functional"], "description": "The syntax of a text expression (`manchester` by default). An object is read as the JSON form." },
                         "reasoning": { "type": "string", "enum": ["auto", "el", "rl"], "description": "The engine (`auto` by default)." },
+                        "elOnly": { "type": "boolean", "description": "Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL and using the dataset's EL-only kept saturation. Refused with `reasoning: \"rl\"` or an expression outside OWL 2 EL." },
                         "answers": { "type": "array", "items": { "type": "string", "enum": ["equivalents", "superclasses", "directSuperclasses", "subclasses", "directSubclasses", "instances"] } },
                         "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "The most IRIs each answer and the gaps list (1,000 by default)." },
                         "threads": { "type": "integer", "minimum": 0, "maximum": 1024, "description": "The worker threads of the EL classifier, within the algorithm pool's grant (0 for the grant)." },

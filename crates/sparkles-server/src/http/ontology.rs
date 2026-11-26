@@ -626,6 +626,7 @@ pub(super) async fn dl_query(
             "expression",
             "syntax",
             "reasoning",
+            "elOnly",
             "answers",
             "limit",
             "threads",
@@ -1317,7 +1318,7 @@ pub(super) async fn kept_classification(
         let params = Params::from_query(&uri);
         let allowed = [
             "graph", "imports", "mode", "at", "part", "about", "offset", "limit", "resultId",
-            "lang", "timeout", "branch",
+            "lang", "timeout", "branch", "elOnly",
         ];
         for (key, _) in &params.0 {
             if !allowed.contains(&key.as_str()) {
@@ -1327,12 +1328,17 @@ pub(super) async fn kept_classification(
                 return Err(bad(format!("duplicate selector '{key}'")));
             }
         }
+        if let Some(value) = params.get("elOnly")
+            && !matches!(value, "true" | "false")
+        {
+            return Err(bad("elOnly: true or false"));
+        }
         let req = request_of(&st, &ds, &params)?;
         let mut a = browse_args(
             &params,
             &headers,
             &["part", "about", "offset", "limit", "resultId"],
-            &[],
+            &["elOnly"],
         );
         numbers(&mut a, &["offset", "limit"])?;
         let query = onto::wire::kept_query_of(&a).map_err(ontology_error)?;
@@ -1533,6 +1539,7 @@ pub(super) async fn classify(
             "mode",
             "inferences",
             "assertions",
+            "elOnly",
             "target",
             "message",
             "about",
@@ -1581,7 +1588,7 @@ pub(super) async fn classify(
         target: text("target")?.map(|g| graph_ref(&g)).transpose()?,
         message: text("message")?,
         about: about.clone(),
-        el_only: false,
+        el_only: flag("elOnly")?,
         partial: flag("partial")?,
         strict: flag("strict")?,
         skip_coverage: false,
@@ -1609,6 +1616,7 @@ pub(super) async fn classify(
             "mode",
             "inferences",
             "assertions",
+            "elOnly",
             "at",
             "timeout",
             "branch",
@@ -1624,7 +1632,14 @@ pub(super) async fn classify(
                 return Err(bad(format!("'{key}' appears in both query and body")));
             }
         }
-        for key in ["inferences", "assertions", "nodes", "partial", "strict"] {
+        for key in [
+            "inferences",
+            "assertions",
+            "elOnly",
+            "nodes",
+            "partial",
+            "strict",
+        ] {
             if params
                 .get(key)
                 .is_some_and(|value| !matches!(value, "true" | "false"))
