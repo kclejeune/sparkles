@@ -521,6 +521,7 @@ pub(crate) fn write_git_tree_tracked(
     cleanup_stale_staging_files(&staging_dir)?;
     let graphs_dir = ensure_child_dir_no_symlink(&clean_dir, GRAPHS_DIR)?;
     let graph_local_staging_candidate = graphs_dir.join(GRAPH_STAGING_SUBDIR);
+    let mut graph_local_staging_existed = false;
     match fs::symlink_metadata(&graph_local_staging_candidate) {
         Ok(meta) => {
             if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
@@ -530,17 +531,34 @@ pub(crate) fn write_git_tree_tracked(
                 });
             }
             cleanup_stale_staging_files(&graph_local_staging_candidate)?;
+            graph_local_staging_existed = true;
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(GitError::io(&graph_local_staging_candidate, e)),
     }
-    let graphs_same_fs = same_filesystem(&staging_dir, &graphs_dir)?;
-    let mut used_graph_local_staging = !graphs_same_fs;
-    let graph_staging_dir = if graphs_same_fs {
-        let _ = fs::remove_dir(&graph_local_staging_candidate);
-        staging_dir.clone()
+    #[cfg(test)]
+    let force_split = profile_test_hooks::force_split_mount_graphs();
+    #[cfg(not(test))]
+    let force_split = false;
+    let graphs_same_fs = !force_split && same_filesystem(&staging_dir, &graphs_dir)?;
+    let mut graphs_dir_dirty = false;
+    let (graph_staging_dir, mut graph_staging_guard) = if graphs_same_fs {
+        if remove_empty_graph_staging_dir(&graph_local_staging_candidate)? {
+            graphs_dir_dirty = true;
+        }
+        (
+            staging_dir.clone(),
+            GraphLocalStagingGuard::new(graphs_dir.clone(), None),
+        )
     } else {
-        ensure_child_dir_no_symlink(&graphs_dir, GRAPH_STAGING_SUBDIR)?
+        if graph_local_staging_existed {
+            ensure_graph_staging_dir_empty(&graph_local_staging_candidate)?;
+        }
+        let local_dir = ensure_child_dir_no_symlink(&graphs_dir, GRAPH_STAGING_SUBDIR)?;
+        (
+            local_dir.clone(),
+            GraphLocalStagingGuard::new(graphs_dir.clone(), Some(local_dir)),
+        )
     };
     let manifest_path = resolve_safe_path(&clean_dir, MANIFEST_REL_PATH)?;
 
@@ -701,7 +719,7 @@ pub(crate) fn write_git_tree_tracked(
                 // inside `graphs/.sparkles-staging/` so the rename stays same-filesystem and
                 // retry cleanup can reclaim any temporary left by an abrupt crash.
                 let local_staging = ensure_child_dir_no_symlink(&graphs_dir, GRAPH_STAGING_SUBDIR)?;
-                used_graph_local_staging = true;
+                graph_staging_guard.arm(local_staging.clone());
                 let mut src = File::open(&e.path).map_err(|err| GitError::io(&e.path, err))?;
                 let (local_tmp, _, _) = stage_atomic_stream_hashed_in(
                     &local_staging,
@@ -758,10 +776,10 @@ pub(crate) fn write_git_tree_tracked(
             }
         }
     }
-    if used_graph_local_staging {
-        let _ = fs::remove_dir(graphs_dir.join(GRAPH_STAGING_SUBDIR));
-    }
-    if wrote_graphs || !pruned_paths.is_empty() || used_graph_local_staging {
+    #[cfg(test)]
+    profile_test_hooks::before_remove_graph_local_staging(&graphs_dir);
+    let removed_graph_local_staging = graph_staging_guard.finish()?;
+    if wrote_graphs || !pruned_paths.is_empty() || removed_graph_local_staging || graphs_dir_dirty {
         fsutil::sync_dir(&graphs_dir).map_err(|e| GitError::io(&graphs_dir, e))?;
     }
 
@@ -806,6 +824,71 @@ struct PendingTreeWrite {
     target_graphs: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     in_flight_graphs: BTreeMap<String, String>,
+}
+
+fn remove_empty_graph_staging_dir(dir: &Path) -> GitResult<bool> {
+    match fs::remove_dir(dir) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {
+            Err(GitError::InvalidManifest(format!(
+                "cannot remove reserved staging directory {GRAPHS_DIR}/{GRAPH_STAGING_SUBDIR}: \
+                 directory still contains unrecognized entries (preserved untouched)"
+            )))
+        }
+        Err(e) => Err(GitError::io(dir, e)),
+    }
+}
+
+fn ensure_graph_staging_dir_empty(dir: &Path) -> GitResult<()> {
+    let mut rd = fs::read_dir(dir).map_err(|e| GitError::io(dir, e))?;
+    if rd
+        .next()
+        .transpose()
+        .map_err(|e| GitError::io(dir, e))?
+        .is_some()
+    {
+        return Err(GitError::InvalidManifest(format!(
+            "cannot proceed while reserved staging directory {GRAPHS_DIR}/{GRAPH_STAGING_SUBDIR} \
+             contains unrecognized entries (preserved untouched)"
+        )));
+    }
+    Ok(())
+}
+
+struct GraphLocalStagingGuard {
+    graphs_dir: PathBuf,
+    staging_dir: Option<PathBuf>,
+}
+
+impl GraphLocalStagingGuard {
+    fn new(graphs_dir: PathBuf, staging_dir: Option<PathBuf>) -> Self {
+        Self {
+            graphs_dir,
+            staging_dir,
+        }
+    }
+
+    fn arm(&mut self, staging_dir: PathBuf) {
+        self.staging_dir = Some(staging_dir);
+    }
+
+    fn finish(mut self) -> GitResult<bool> {
+        let Some(dir) = self.staging_dir.take() else {
+            return Ok(false);
+        };
+        remove_empty_graph_staging_dir(&dir)
+    }
+}
+
+impl Drop for GraphLocalStagingGuard {
+    fn drop(&mut self) {
+        if let Some(ref dir) = self.staging_dir
+            && fs::remove_dir(dir).is_ok()
+        {
+            let _ = fsutil::sync_dir(&self.graphs_dir);
+        }
+    }
 }
 
 fn same_filesystem(a: &Path, b: &Path) -> GitResult<bool> {
@@ -3732,6 +3815,8 @@ mod profile_test_hooks {
     use super::*;
     use std::cell::RefCell;
 
+    type PathHook = Box<dyn FnOnce(&Path)>;
+
     #[derive(Default)]
     pub(super) struct FaultState {
         pub fail_after_pending_write: bool,
@@ -3740,6 +3825,8 @@ mod profile_test_hooks {
         pub fail_after_first_graph_prune: bool,
         pub fail_after_manifest_persist: bool,
         pub inject_graph_persist_exdev: bool,
+        pub force_split_mount_graphs: bool,
+        pub before_remove_graph_local_staging_action: Option<PathHook>,
     }
 
     thread_local! {
@@ -3823,6 +3910,21 @@ mod profile_test_hooks {
             let mut s = f.borrow_mut();
             std::mem::take(&mut s.inject_graph_persist_exdev)
         })
+    }
+
+    pub(super) fn force_split_mount_graphs() -> bool {
+        FAULTS.with(|f| f.borrow().force_split_mount_graphs)
+    }
+
+    pub(super) fn before_remove_graph_local_staging(graphs_dir: &Path) {
+        let action = FAULTS.with(|f| {
+            f.borrow_mut()
+                .before_remove_graph_local_staging_action
+                .take()
+        });
+        if let Some(cb) = action {
+            cb(graphs_dir);
+        }
     }
 }
 
@@ -4518,13 +4620,125 @@ mod tests {
         fs::create_dir(&local_staging).unwrap();
         fs::write(local_staging.join(".sparkles-tmp-orphan"), b"partial").unwrap();
         write_git_tree(
-            vec![q1, q2],
+            vec![q1.clone(), q2.clone()],
             &BTreeMap::new(),
             dir.path(),
             &WriteOptions::default(),
         )
         .unwrap();
         assert!(!local_staging.exists());
+        verify_git_tree(dir.path()).unwrap();
+
+        // 3. Unrecognized regular file obstructing `graphs/.sparkles-staging/` must be
+        //    preserved untouched AND cause `write_git_tree` to refuse rather than reporting
+        //    success with an invalid layout (R6-6).
+        let user_file = local_staging.join("user-note.txt");
+        fs::create_dir(&local_staging).unwrap();
+        fs::write(&user_file, b"keep-me").unwrap();
+        let err = write_git_tree(
+            vec![q1.clone(), q2.clone()],
+            &BTreeMap::new(),
+            dir.path(),
+            &WriteOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, GitError::InvalidManifest(_)),
+            "obstructed graph staging dir must refuse with InvalidManifest, got {err:?}"
+        );
+        assert_eq!(
+            fs::read(&user_file).unwrap(),
+            b"keep-me",
+            "unrecognized file inside graphs/.sparkles-staging must be preserved untouched"
+        );
+        fs::remove_file(&user_file).unwrap();
+        fs::remove_dir(&local_staging).unwrap();
+
+        // 4. Unrecognized regular file appearing inside `graphs/.sparkles-staging/` before
+        //    final cleanup during EXDEV fallback must block manifest publication and pending
+        //    journal removal while preserving the unrecognized file (R6-6).
+        let q3 = Quad::new(
+            NamedNode::new_unchecked("http://example.org/s3"),
+            NamedNode::new_unchecked("http://example.org/p"),
+            Literal::from(3i64),
+            GraphName::DefaultGraph,
+        );
+        {
+            let _g = profile_test_hooks::install(profile_test_hooks::FaultState {
+                inject_graph_persist_exdev: true,
+                before_remove_graph_local_staging_action: Some(Box::new(|graphs_dir| {
+                    let staging = graphs_dir.join(GRAPH_STAGING_SUBDIR);
+                    fs::write(staging.join("concurrent-note.txt"), b"keep-concurrent").unwrap();
+                })),
+                ..Default::default()
+            });
+            let err = write_git_tree(
+                vec![q1.clone(), q2.clone(), q3.clone()],
+                &BTreeMap::new(),
+                dir.path(),
+                &WriteOptions::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GitError::InvalidManifest(_)),
+                "obstructed final graph staging cleanup must refuse, got {err:?}"
+            );
+        }
+        assert_eq!(
+            fs::read(local_staging.join("concurrent-note.txt")).unwrap(),
+            b"keep-concurrent"
+        );
+        assert!(
+            dir.path().join(PENDING_WRITE_REL_PATH).exists(),
+            "pending journal must remain on disk when final staging cleanup fails"
+        );
+        fs::remove_file(local_staging.join("concurrent-note.txt")).unwrap();
+        write_git_tree(
+            vec![q1.clone(), q2.clone(), q3.clone()],
+            &BTreeMap::new(),
+            dir.path(),
+            &WriteOptions::default(),
+        )
+        .unwrap();
+        assert!(!local_staging.exists());
+        verify_git_tree(dir.path()).unwrap();
+
+        // 5. Pre-publication size-limit refusal on a split-mount tree must clean up the empty
+        //    `graphs/.sparkles-staging/` directory via RAII drop guard so the existing valid
+        //    tree continues to pass strict verification (Neon P3-1).
+        let q4_big = Quad::new(
+            NamedNode::new_unchecked("http://example.org/s4"),
+            NamedNode::new_unchecked("http://example.org/p"),
+            Literal::from("x".repeat(400)),
+            GraphName::DefaultGraph,
+        );
+        {
+            let _g = profile_test_hooks::install(profile_test_hooks::FaultState {
+                force_split_mount_graphs: true,
+                ..Default::default()
+            });
+            // Large enough for existing graphs in Step 5 preflight, but smaller than the new
+            // graph staged in Step 7 so Step 6 creates `graphs/.sparkles-staging/` first.
+            let tight_opts = WriteOptions {
+                max_graph_file_bytes: 300,
+                ..Default::default()
+            };
+            let err = write_git_tree(
+                vec![q1, q2, q3, q4_big],
+                &BTreeMap::new(),
+                dir.path(),
+                &tight_opts,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GitError::Format(_)),
+                "expected GitError::Format on Step 7 byte-limit refusal, got {err:?}"
+            );
+        }
+        assert!(
+            !local_staging.exists(),
+            "pre-publication refusal on split mount must not leave empty graphs/.sparkles-staging/"
+        );
         verify_git_tree(dir.path()).unwrap();
     }
 }
