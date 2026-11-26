@@ -2880,6 +2880,45 @@ fn manchester_builtin_punning_nested_restriction_lookahead_and_left_boolean_dept
             manchester::parse_document(&dr_doc_129).is_err(),
             "parser must reject depth-129 left-nested data {kw}"
         );
+
+        // Duplicate-operand collapse at depth 128 (`E or E` and `E and E` collapse back
+        // to the original height-128 expression); adding `not (...)` raises height to 129
+        // and must still be rejected.
+        for outer_kw in ["or", "and"] {
+            let ce_dup = format!(
+                "{ce_prefix}Class: :C\n  SubClassOf: {ce_src_128} {outer_kw} {ce_src_128}\n"
+            );
+            let parsed_ce_dup = manchester::parse_document(&ce_dup).unwrap_or_else(|e| {
+                panic!(
+                    "parser must accept collapsed depth-128 class `{kw}` under `{outer_kw}`: {e}"
+                )
+            });
+            assert!(parsed_ce_dup.axioms.contains(&axioms[2]));
+
+            let ce_dup_not = format!(
+                "{ce_prefix}Class: :C\n  SubClassOf: not ({ce_src_128} {outer_kw} {ce_src_128})\n"
+            );
+            assert!(
+                manchester::parse_document(&ce_dup_not).is_err(),
+                "parser must reject height-129 `not (E {outer_kw} E)` for class {kw}"
+            );
+
+            let dr_dup = format!(
+                "{dr_prefix}DataProperty: :d\n  Range: {dr_src_128} {outer_kw} {dr_src_128}\n"
+            );
+            let parsed_dr_dup = manchester::parse_document(&dr_dup).unwrap_or_else(|e| {
+                panic!("parser must accept collapsed depth-128 data `{kw}` under `{outer_kw}`: {e}")
+            });
+            assert!(parsed_dr_dup.axioms.contains(&axioms[3]));
+
+            let dr_dup_not = format!(
+                "{dr_prefix}DataProperty: :d\n  Range: not ({dr_src_128} {outer_kw} {dr_src_128})\n"
+            );
+            assert!(
+                manchester::parse_document(&dr_dup_not).is_err(),
+                "parser must reject height-129 `not (E {outer_kw} E)` for data {kw}"
+            );
+        }
     }
 }
 

@@ -404,26 +404,25 @@ impl<'v> Parser<'v> {
         if !self.eat_word("or") {
             return Ok((first, first_h));
         }
-        self.nest()?;
+        // Do not charge `self.depth` provisionally for booleans: recursion back into
+        // nested booleans is already bounded early by `nest_paren` (`MAX_SYNTAX_DEPTH`)
+        // and non-collapsing primaries (`nest` at `MAX_DEPTH`), while the exact semantic
+        // limit is enforced below after deduplication so `E or E` at height `MAX_DEPTH`
+        // still collapses cleanly.
         let mut all = vec![first];
         let mut max_h = first_h;
-        let res = (|| {
-            loop {
-                let (next, h) = self.conjunction_depth()?;
-                max_h = max_h.max(h);
-                all.push(next);
-                if !self.eat_word("or") {
-                    break;
-                }
+        loop {
+            let (next, h) = self.conjunction_depth()?;
+            max_h = max_h.max(h);
+            all.push(next);
+            if !self.eat_word("or") {
+                break;
             }
-            let set: BTreeSet<Ce> = all.into_iter().collect();
-            let collapsed = set.len() == 1;
-            let ce = collapse(set, Ce::ObjectUnionOf);
-            let h = if collapsed { max_h } else { max_h + 1 };
-            Ok((ce, h))
-        })();
-        self.depth -= 1;
-        let (ce, h) = res?;
+        }
+        let set: BTreeSet<Ce> = all.into_iter().collect();
+        let collapsed = set.len() == 1;
+        let ce = collapse(set, Ce::ObjectUnionOf);
+        let h = if collapsed { max_h } else { max_h + 1 };
         if self.depth + h > MAX_DEPTH {
             return Err(Error::syntax(
                 self.here(),
@@ -439,26 +438,20 @@ impl<'v> Parser<'v> {
         if !(self.eat_word("and") || self.eat_word("that")) {
             return Ok((first, first_h));
         }
-        self.nest()?;
         let mut all = vec![first];
         let mut max_h = first_h;
-        let res = (|| {
-            loop {
-                let (next, h) = self.primary_depth()?;
-                max_h = max_h.max(h);
-                all.push(next);
-                if !(self.eat_word("and") || self.eat_word("that")) {
-                    break;
-                }
+        loop {
+            let (next, h) = self.primary_depth()?;
+            max_h = max_h.max(h);
+            all.push(next);
+            if !(self.eat_word("and") || self.eat_word("that")) {
+                break;
             }
-            let set: BTreeSet<Ce> = all.into_iter().collect();
-            let collapsed = set.len() == 1;
-            let ce = collapse(set, Ce::ObjectIntersectionOf);
-            let h = if collapsed { max_h } else { max_h + 1 };
-            Ok((ce, h))
-        })();
-        self.depth -= 1;
-        let (ce, h) = res?;
+        }
+        let set: BTreeSet<Ce> = all.into_iter().collect();
+        let collapsed = set.len() == 1;
+        let ce = collapse(set, Ce::ObjectIntersectionOf);
+        let h = if collapsed { max_h } else { max_h + 1 };
         if self.depth + h > MAX_DEPTH {
             return Err(Error::syntax(
                 self.here(),
@@ -697,26 +690,20 @@ impl<'v> Parser<'v> {
         if !self.eat_word("or") {
             return Ok((first, first_h));
         }
-        self.nest()?;
         let mut all = vec![first];
         let mut max_h = first_h;
-        let res = (|| {
-            loop {
-                let (next, h) = self.data_conjunction_depth()?;
-                max_h = max_h.max(h);
-                all.push(next);
-                if !self.eat_word("or") {
-                    break;
-                }
+        loop {
+            let (next, h) = self.data_conjunction_depth()?;
+            max_h = max_h.max(h);
+            all.push(next);
+            if !self.eat_word("or") {
+                break;
             }
-            let set: BTreeSet<DataRange> = all.into_iter().collect();
-            let collapsed = set.len() == 1;
-            let dr = collapse(set, DataRange::UnionOf);
-            let h = if collapsed { max_h } else { max_h + 1 };
-            Ok((dr, h))
-        })();
-        self.depth -= 1;
-        let (dr, h) = res?;
+        }
+        let set: BTreeSet<DataRange> = all.into_iter().collect();
+        let collapsed = set.len() == 1;
+        let dr = collapse(set, DataRange::UnionOf);
+        let h = if collapsed { max_h } else { max_h + 1 };
         if self.depth + h > MAX_DEPTH {
             return Err(Error::syntax(
                 self.here(),
@@ -731,26 +718,20 @@ impl<'v> Parser<'v> {
         if !self.eat_word("and") {
             return Ok((first, first_h));
         }
-        self.nest()?;
         let mut all = vec![first];
         let mut max_h = first_h;
-        let res = (|| {
-            loop {
-                let (next, h) = self.data_primary_depth()?;
-                max_h = max_h.max(h);
-                all.push(next);
-                if !self.eat_word("and") {
-                    break;
-                }
+        loop {
+            let (next, h) = self.data_primary_depth()?;
+            max_h = max_h.max(h);
+            all.push(next);
+            if !self.eat_word("and") {
+                break;
             }
-            let set: BTreeSet<DataRange> = all.into_iter().collect();
-            let collapsed = set.len() == 1;
-            let dr = collapse(set, DataRange::IntersectionOf);
-            let h = if collapsed { max_h } else { max_h + 1 };
-            Ok((dr, h))
-        })();
-        self.depth -= 1;
-        let (dr, h) = res?;
+        }
+        let set: BTreeSet<DataRange> = all.into_iter().collect();
+        let collapsed = set.len() == 1;
+        let dr = collapse(set, DataRange::IntersectionOf);
+        let h = if collapsed { max_h } else { max_h + 1 };
         if self.depth + h > MAX_DEPTH {
             return Err(Error::syntax(
                 self.here(),

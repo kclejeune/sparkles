@@ -326,6 +326,40 @@ fn resolve_atomic_target(path: &Path) -> std::io::Result<std::path::PathBuf> {
     ))
 }
 
+/// Create a private (`0o700` on Unix) temporary staging directory inside `parent` so
+/// neither partial writes nor fresh umask-masked files are visible to other users or
+/// group members before atomic publication.
+fn create_private_stage_dir(parent: &Path) -> std::io::Result<tempfile::TempDir> {
+    let mut stage_builder = tempfile::Builder::new();
+    stage_builder.prefix(".sparkles-owl-stage-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        stage_builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    stage_builder.tempdir_in(parent)
+}
+
+/// Create a staged output file inside the private `stage_dir`.
+///
+/// Fresh outputs (`!preserve_existing`) request mode `0o666` so the kernel applies the
+/// process umask (matching `File::create`) while `stage_dir`'s `0o700` keeps the file
+/// private until publication. Overwrites of existing files stay `0o600` during
+/// serialization and receive their preserved mode only after serialization and flush.
+fn create_staged_file(
+    stage_dir: &Path,
+    preserve_existing: bool,
+) -> std::io::Result<tempfile::NamedTempFile> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("out-").suffix(".tmp");
+    #[cfg(unix)]
+    if !preserve_existing {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    builder.tempfile_in(stage_dir)
+}
+
 /// Write a header and axioms to `path` in `format`, returning the writer's report of
 /// written and any skipped axioms.
 pub fn write_axioms_reported<'a>(
@@ -358,25 +392,8 @@ pub fn write_axioms_reported<'a>(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(io(e)),
     };
-    // Stage inside a private (0o700 on Unix) temporary directory in `parent` (same
-    // filesystem as `target`) so neither partial writes nor final permissions are
-    // exposed to other users or group members before atomic publication.
-    let stage_dir = tempfile::Builder::new()
-        .prefix(".sparkles-owl-stage-")
-        .tempdir_in(parent)
-        .map_err(io)?;
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("out-").suffix(".tmp");
-    // New files derive the standard 0o666 mode masked by the process umask (matching
-    // File::create) while isolated inside the private staging directory; existing files
-    // stay private (0o600) during serialization and receive their preserved mode only
-    // after serialization and gzip completion.
-    #[cfg(unix)]
-    if existing_perms.is_none() {
-        use std::os::unix::fs::PermissionsExt;
-        builder.permissions(std::fs::Permissions::from_mode(0o666));
-    }
-    let mut tmp = builder.tempfile_in(stage_dir.path()).map_err(io)?;
+    let stage_dir = create_private_stage_dir(parent).map_err(io)?;
+    let mut tmp = create_staged_file(stage_dir.path(), existing_perms.is_some()).map_err(io)?;
     // Stage output beside the resolved destination so a writer or gzip error never
     // truncates or overwrites an existing file. Each layer is finished and flushed by
     // hand so an error writing the gzip trailer or final buffer fails the command.
@@ -872,5 +889,139 @@ EquivalentClasses(:D ObjectIntersectionOf(:C ObjectSomeValuesFrom(:p :B)))
             })
             .collect();
         assert!(leftover.is_empty(), "leftover staging dirs: {leftover:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_staging_private_dir_and_fresh_mode_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD_ENV: &str = "SPARKLES_TEST_STAGE_UMASK_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let exe = std::env::current_exe().unwrap();
+            let output = std::process::Command::new("sh")
+                .args(["-c", "umask 002 && exec \"$@\"", "--"])
+                .arg(&exe)
+                .args([
+                    "--exact",
+                    "handles::ontology::transform::tests::atomic_staging_private_dir_and_fresh_mode_under_permissive_umask",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "permissive-umask child failed ({:?}):\nstdout:\n{}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let d = tempfile::tempdir().unwrap();
+
+        // Confirm the child process actually runs under permissive umask 002 (default
+        // tempfile::Builder tempdir inherits 0o777 & !0o002 == 0o775), so a runner
+        // umask of 077 cannot mask a regression.
+        let default_dir = tempfile::Builder::new().tempdir_in(d.path()).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(default_dir.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o775,
+            "expected permissive umask 002 in child process"
+        );
+        drop(default_dir);
+
+        // Staging directory must still be strictly private (0o700) under umask 002.
+        let stage_dir = create_private_stage_dir(d.path()).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(stage_dir.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "staging directory must be mode 0o700 even under permissive umask"
+        );
+
+        // Fresh staged file takes 0o666 & !0o002 == 0o664 inside the 0o700 directory;
+        // existing-file staged file stays private 0o600 before serialization finishes.
+        let fresh_tmp = create_staged_file(stage_dir.path(), false).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(fresh_tmp.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o664
+        );
+        let existing_tmp = create_staged_file(stage_dir.path(), true).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(existing_tmp.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(fresh_tmp);
+        drop(existing_tmp);
+        drop(stage_dir);
+
+        // End-to-end fresh write publishes with umask-masked mode 0o664.
+        let input = d.path().join("in.ofn");
+        std::fs::write(&input, ONTO).unwrap();
+        let w = read(&input);
+        let fresh_out = d.path().join("fresh.owx");
+        w.write(&fresh_out).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(&fresh_out)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o664
+        );
+
+        // Serialization failure preserves existing destination and leaves no stage dir.
+        let bad_target = d.path().join("keep.owx");
+        std::fs::write(&bad_target, "SENTINEL").unwrap();
+        let bad_ax = Axiom::new(AxiomKind::AnnotationAssertion(
+            sparkles_owl::AnnotationProperty::new(sparkles_owl::vocab::RDFS_LABEL),
+            sparkles_owl::AnnotationSubject::Iri(
+                sparkles_owl::Iri::new("http://ex.org/A").unwrap(),
+            ),
+            sparkles_owl::AnnotationValue::Literal(sparkles_owl::Literal::simple("bad\0nul")),
+        ));
+        let err = write_axioms_reported(
+            &bad_target,
+            OutputFormat::OwlXml,
+            false,
+            &BTreeMap::new(),
+            &sparkles_owl::Header::default(),
+            [&bad_ax],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("U+0000"), "{err}");
+        assert_eq!(std::fs::read_to_string(&bad_target).unwrap(), "SENTINEL");
+
+        let leftover: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".sparkles-owl-stage-")
+            })
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "leftover staging dirs after serialization error: {leftover:?}"
+        );
     }
 }

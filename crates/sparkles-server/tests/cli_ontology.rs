@@ -1080,6 +1080,35 @@ TransitiveObjectProperty(obo:BFO_0000050)
 )
 "#;
 
+fn parse_and_assert_writer_onto_stdout(label: &str, fmt: &str, body: &str) {
+    let doc =
+        match fmt {
+            "owx" => sparkles::owl::owx::parse(body)
+                .unwrap_or_else(|e| panic!("{label} owx: {e}\n{body}")),
+            "omn" => sparkles::owl::manchester::parse_document(body)
+                .unwrap_or_else(|e| panic!("{label} omn: {e}\n{body}")),
+            "obo" => sparkles::owl::obo::parse(body)
+                .unwrap_or_else(|e| panic!("{label} obo: {e}\n{body}")),
+            "obographs" => sparkles::owl::obographs::parse(body)
+                .unwrap_or_else(|e| panic!("{label} obographs: {e}\n{body}")),
+            _ => unreachable!(),
+        };
+    let go1 = sparkles::owl::Class::new("http://purl.obolibrary.org/obo/GO_0000001");
+    let go2 = sparkles::owl::Class::new("http://purl.obolibrary.org/obo/GO_0000002");
+    let go3 = sparkles::owl::Class::new("http://purl.obolibrary.org/obo/GO_0000003");
+    let go4 = sparkles::owl::Class::new("http://purl.obolibrary.org/obo/GO_0000004");
+    let expected_sub_1_3 = sparkles::owl::AxiomKind::SubClassOf(go1.into(), go3.into());
+    let expected_sub_4_2 = sparkles::owl::AxiomKind::SubClassOf(go4.into(), go2.into());
+    assert!(
+        doc.axioms.iter().any(|a| a.kind == expected_sub_1_3),
+        "{label} {fmt} missing expected SubClassOf(GO_0000001, GO_0000003):\n{body}"
+    );
+    assert!(
+        doc.axioms.iter().any(|a| a.kind == expected_sub_4_2),
+        "{label} {fmt} missing expected SubClassOf(GO_0000004, GO_0000002):\n{body}"
+    );
+}
+
 #[test]
 fn ontology_writers_owx_omn_obo_and_obographs_cli() {
     use sparkles::owl::{
@@ -1253,16 +1282,7 @@ fn ontology_writers_owx_omn_obo_and_obographs_cli() {
         let o = sparkles(dir, &["ontology", "classify", "demo.ofn", "--format", fmt]);
         assert_eq!(o.status.code(), Some(0), "{fmt}: {}", err(&o));
         let body = out(&o);
-        match fmt {
-            "owx" => assert!(sparkles::owl::owx::parse(&body).is_ok(), "{body}"),
-            "omn" => assert!(
-                sparkles::owl::manchester::parse_document(&body).is_ok(),
-                "{body}"
-            ),
-            "obo" => assert!(sparkles::owl::obo::parse(&body).is_ok(), "{body}"),
-            "obographs" => assert!(sparkles::owl::obographs::parse(&body).is_ok(), "{body}"),
-            _ => unreachable!(),
-        }
+        parse_and_assert_writer_onto_stdout("local classify", fmt, &body);
         // --partial refuses every document syntax format
         let p = sparkles(
             dir,
@@ -1286,16 +1306,7 @@ fn ontology_writers_owx_omn_obo_and_obographs_cli() {
         let o = sparkles(dir, &["ontology", "axioms", "--loc", "db", "--format", fmt]);
         assert_eq!(o.status.code(), Some(0), "{fmt}: {}", err(&o));
         let body = out(&o);
-        match fmt {
-            "owx" => assert!(sparkles::owl::owx::parse(&body).is_ok(), "{body}"),
-            "omn" => assert!(
-                sparkles::owl::manchester::parse_document(&body).is_ok(),
-                "{body}"
-            ),
-            "obo" => assert!(sparkles::owl::obo::parse(&body).is_ok(), "{body}"),
-            "obographs" => assert!(sparkles::owl::obographs::parse(&body).is_ok(), "{body}"),
-            _ => unreachable!(),
-        }
+        parse_and_assert_writer_onto_stdout("local axioms", fmt, &body);
     }
 }
 
@@ -1339,16 +1350,7 @@ fn ontology_writers_atomic_error_omn_gz_chained_classify_and_header_loss_cli() {
         );
         assert_eq!(o.status.code(), Some(0), "{fmt}: {}", err(&o));
         let body = out(&o);
-        match fmt {
-            "owx" => assert!(sparkles::owl::owx::parse(&body).is_ok(), "{body}"),
-            "omn" => assert!(
-                sparkles::owl::manchester::parse_document(&body).is_ok(),
-                "{body}"
-            ),
-            "obo" => assert!(sparkles::owl::obo::parse(&body).is_ok(), "{body}"),
-            "obographs" => assert!(sparkles::owl::obographs::parse(&body).is_ok(), "{body}"),
-            _ => unreachable!(),
-        }
+        parse_and_assert_writer_onto_stdout("chained classify", fmt, &body);
     }
 
     // 3. Chained `classify --format bogus` fails fast before writing `-o`
@@ -1391,6 +1393,19 @@ fn ontology_writers_atomic_error_omn_gz_chained_classify_and_header_loss_cli() {
         std::fs::read_to_string(&existing).unwrap(),
         "SENTINEL_KEEP_ME",
         "writer error must not truncate or corrupt existing destination file"
+    );
+    let leftover_stage_dirs: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".sparkles-owl-stage-")
+        })
+        .collect();
+    assert!(
+        leftover_stage_dirs.is_empty(),
+        "serialization error must not leave staging dirs behind: {leftover_stage_dirs:?}"
     );
 
     // 4b. Atomic success preserves permissions on existing regular file and updates symlink target
@@ -1544,13 +1559,6 @@ fn ontology_writers_remote_server_stdout_formats() {
     );
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
 
-    let go1 = sparkles::owl::Class::new("http://purl.obolibrary.org/obo/GO_0000001");
-    let go2 = sparkles::owl::Class::new("http://purl.obolibrary.org/obo/GO_0000002");
-    let go3 = sparkles::owl::Class::new("http://purl.obolibrary.org/obo/GO_0000003");
-    let go4 = sparkles::owl::Class::new("http://purl.obolibrary.org/obo/GO_0000004");
-    let expected_sub_1_3 = sparkles::owl::AxiomKind::SubClassOf(go1.into(), go3.into());
-    let expected_sub_4_2 = sparkles::owl::AxiomKind::SubClassOf(go4.into(), go2.into());
-
     for cmd in ["axioms", "classify"] {
         for fmt in ["owx", "omn", "obo", "obographs"] {
             let o = sparkles(
@@ -1568,25 +1576,7 @@ fn ontology_writers_remote_server_stdout_formats() {
             );
             assert_eq!(o.status.code(), Some(0), "{cmd} {fmt}: {}", err(&o));
             let body = out(&o);
-            let doc = match fmt {
-                "owx" => sparkles::owl::owx::parse(&body)
-                    .unwrap_or_else(|e| panic!("{cmd} owx: {e}\n{body}")),
-                "omn" => sparkles::owl::manchester::parse_document(&body)
-                    .unwrap_or_else(|e| panic!("{cmd} omn: {e}\n{body}")),
-                "obo" => sparkles::owl::obo::parse(&body)
-                    .unwrap_or_else(|e| panic!("{cmd} obo: {e}\n{body}")),
-                "obographs" => sparkles::owl::obographs::parse(&body)
-                    .unwrap_or_else(|e| panic!("{cmd} obographs: {e}\n{body}")),
-                _ => unreachable!(),
-            };
-            assert!(
-                doc.axioms.iter().any(|a| a.kind == expected_sub_1_3),
-                "{cmd} {fmt} missing expected SubClassOf(GO_0000001, GO_0000003):\n{body}"
-            );
-            assert!(
-                doc.axioms.iter().any(|a| a.kind == expected_sub_4_2),
-                "{cmd} {fmt} missing expected SubClassOf(GO_0000004, GO_0000002):\n{body}"
-            );
+            parse_and_assert_writer_onto_stdout(&format!("remote {cmd}"), fmt, &body);
         }
     }
 }
