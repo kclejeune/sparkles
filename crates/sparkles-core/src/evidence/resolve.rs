@@ -261,6 +261,41 @@ struct RecordGraphs {
     _held: Reservation,
 }
 
+/// Bounded named-node results from a controlled graph scan, keeping their preparation
+/// memory charge live until dropped.
+pub struct GraphNodes {
+    nodes: Vec<NamedNode>,
+    truncated: bool,
+    _held: Reservation,
+}
+
+impl GraphNodes {
+    /// The decoded named nodes retained by this result.
+    pub fn nodes(&self) -> &[NamedNode] {
+        &self.nodes
+    }
+
+    /// Whether the scan stopped at the caller's result limit before exhausting the match.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Whether no named nodes were collected.
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// Number of named nodes collected.
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Iterate over the retained named nodes without releasing their reservation.
+    pub fn iter(&self) -> std::slice::Iter<'_, NamedNode> {
+        self.nodes.iter()
+    }
+}
+
 /// One operation's resolution state. Views prepared for one reference are reused by
 /// later references to the same commit under the same access, and stay charged to
 /// the operation's allowance until the resolver is dropped.
@@ -270,6 +305,9 @@ pub struct Resolver {
     /// The record graphs of one dataset under one installed registry, charged while
     /// they are kept.
     record_graphs: Option<RecordGraphs>,
+    /// Optional `(dataset_id, branch_id, commit)` pinning `record` and graph helpers to
+    /// one branch commit across the resolution.
+    pinned: Option<(Uuid, Uuid, u64)>,
 }
 
 impl Resolver {
@@ -279,12 +317,20 @@ impl Resolver {
             preparation: Preparation::new(control, memory_bytes)?,
             views: BTreeMap::new(),
             record_graphs: None,
+            pinned: None,
         })
     }
 
     /// The operation's preparation context.
     pub fn preparation(&self) -> &Preparation {
         &self.preparation
+    }
+
+    /// Pin `record`, `has_triple`, `objects_in_graph`, and `subjects_in_graph` reads of
+    /// `(main, logical)` to the exact branch commit `commit`, so every lookup in this
+    /// resolution sees one consistent snapshot even if the branch advances concurrently.
+    pub fn pin_commit(&mut self, main: &Store, logical: &Store, commit: u64) {
+        self.pinned = Some((main.dataset_id(), logical.branch_id(), commit));
     }
 
     /// Verify a stored-fact reference. `main` is the main store of the dataset the
@@ -418,17 +464,7 @@ impl Resolver {
         {
             return Err(unavailable(key));
         }
-        let live = logical.snapshot();
-        let view_key = ViewKey {
-            dataset: main.dataset_id(),
-            branch: logical.branch_id(),
-            commit: live.commit,
-        };
-        let (_, index) = self
-            .view(view_key, access, |_| {
-                Ok((live.clone(), logical.branch_id(), SnapshotCharge::shared()))
-            })
-            .map_err(|e| classify(key, e))?;
+        let (view_key, index) = self.logical_view(key, main, logical, access)?;
         let cached = &self.views[&view_key][index];
         let all_graphs = &self.record_graphs.as_ref().expect("prepared").graphs;
         // The readable record graphs are borrowed from the charged list.
@@ -511,7 +547,55 @@ impl Resolver {
         })
     }
 
-    /// Prepare or reuse the live controlled view of `logical` under `access` for `graph`,
+    /// Prepare or reuse the controlled view of `logical` (at the pinned commit when set,
+    /// or the live snapshot otherwise) under `access`.
+    fn logical_view(
+        &mut self,
+        key: &str,
+        main: &Store,
+        logical: &Store,
+        access: &Arc<GraphAccess>,
+    ) -> Result<(ViewKey, usize)> {
+        let dataset = main.dataset_id();
+        let branch = logical.branch_id();
+        let (commit, live_opt) = match self.pinned {
+            Some((d, b, c)) if d == dataset && b == branch => (c, None),
+            _ => {
+                let live = logical.snapshot();
+                (live.commit, Some(live))
+            }
+        };
+        let view_key = ViewKey {
+            dataset,
+            branch,
+            commit,
+        };
+        let (_, index) = self
+            .view(view_key, access, |preparation| {
+                if let Some(live) = live_opt {
+                    return Ok((live, branch, SnapshotCharge::shared()));
+                }
+                let live = logical.snapshot();
+                if live.commit == commit {
+                    return Ok((live, branch, SnapshotCharge::shared()));
+                }
+                let (snapshot, resolved, served_by, charge) = main
+                    .snapshot_of_branch_limited_charged(
+                        branch,
+                        &At::Commit(commit),
+                        &preparation.history_options(),
+                        preparation.room(),
+                    )?;
+                if resolved.commit.seq != commit {
+                    return Err(Error::NotFound("commit".into()));
+                }
+                Ok((snapshot, served_by, charge))
+            })
+            .map_err(|e| classify(key, e))?;
+        Ok((view_key, index))
+    }
+
+    /// Prepare or reuse the controlled view of `logical` under `access` for `graph`,
     /// returning `Ok(None)` when the caller cannot read `graph` or the store pair does
     /// not match.
     fn graph_view(
@@ -533,17 +617,7 @@ impl Resolver {
         if !access.may_read(Some(&graph_term)) {
             return Ok(None);
         }
-        let live = logical.snapshot();
-        let view_key = ViewKey {
-            dataset: main.dataset_id(),
-            branch: logical.branch_id(),
-            commit: live.commit,
-        };
-        let (_, index) = self
-            .view(view_key, access, |_| {
-                Ok((live.clone(), logical.branch_id(), SnapshotCharge::shared()))
-            })
-            .map_err(|e| classify(key, e))?;
+        let (view_key, index) = self.logical_view(key, main, logical, access)?;
         let cached = &self.views[&view_key][index];
         if !cached.view.access().readable(Some(&graph_term)) {
             return Ok(None);
@@ -551,7 +625,56 @@ impl Resolver {
         Ok(Some((view_key, index)))
     }
 
-    /// Whether `s p o` is visible in `graph` at the current state of `logical` under
+    fn empty_nodes(&self, key: &str) -> Result<GraphNodes> {
+        let held = self.preparation.reserve(0).map_err(|e| classify(key, e))?;
+        Ok(GraphNodes {
+            nodes: Vec::new(),
+            truncated: false,
+            _held: held,
+        })
+    }
+
+    fn decode_named_nodes(
+        &self,
+        key: &str,
+        snap: &Snapshot,
+        ids: &[Id],
+        truncated: bool,
+    ) -> Result<GraphNodes> {
+        let mut out_held = self.preparation.reserve(0).map_err(|e| classify(key, e))?;
+        let mut nodes: Vec<NamedNode> = Vec::new();
+        if !ids.is_empty() {
+            out_held
+                .grow_by((ids.len() as u64).saturating_mul(std::mem::size_of::<NamedNode>() as u64))
+                .map_err(|e| classify(key, e))?;
+            nodes
+                .try_reserve_exact(ids.len())
+                .map_err(|_| classify(key, self.preparation.exhausted()))?;
+        }
+        for &id in ids {
+            self.preparation.check()?;
+            let node = self
+                .preparation
+                .with_term(snap, id, |t| match t {
+                    Some(Term::NamedNode(n)) => {
+                        let s = self.preparation.copy_string(n.as_str(), &mut out_held)?;
+                        Ok(Some(NamedNode::new_unchecked(s)))
+                    }
+                    _ => Ok(None),
+                })
+                .map_err(|e| classify(key, e))?;
+            if let Some(n) = node {
+                nodes.push(n);
+            }
+        }
+        Ok(GraphNodes {
+            nodes,
+            truncated,
+            _held: out_held,
+        })
+    }
+
+    /// Whether `s p o` is visible in `graph` at the resolving state of `logical` under
     /// `access`, bounded by this resolver's preparation allowance and controls.
     #[allow(clippy::too_many_arguments)]
     pub fn has_triple(
@@ -588,9 +711,10 @@ impl Resolver {
         snap.contains(&[s, p, o, g]).map_err(|e| classify(key, e))
     }
 
-    /// Named-node objects of `s p ?o` visible in `graph` at the current state of
+    /// Named-node objects of `s p ?o` visible in `graph` at the resolving state of
     /// `logical`, collecting at most `limit` results and decrementing `remaining_scans`
-    /// for each scanned quad. Returns `(objects, truncated)`.
+    /// for each scanned quad in `graph`. The returned [`GraphNodes`] retains its memory
+    /// reservation until dropped.
     #[allow(clippy::too_many_arguments)]
     pub fn objects_in_graph(
         &mut self,
@@ -603,9 +727,9 @@ impl Resolver {
         p: &NamedNode,
         limit: usize,
         remaining_scans: &mut u64,
-    ) -> Result<(Vec<NamedNode>, bool)> {
+    ) -> Result<GraphNodes> {
         let Some((view_key, index)) = self.graph_view(key, main, logical, access, graph)? else {
-            return Ok((Vec::new(), false));
+            return self.empty_nodes(key);
         };
         let snap = self.views[&view_key][index].view.snapshot();
         let (Some(g), Some(s), Some(p)) = (
@@ -619,9 +743,9 @@ impl Resolver {
                 .lookup_iri(snap, p.as_str())
                 .map_err(|e| classify(key, e))?,
         ) else {
-            return Ok((Vec::new(), false));
+            return self.empty_nodes(key);
         };
-        let mut held = self.preparation.reserve(0).map_err(|e| classify(key, e))?;
+        let mut ids_held = self.preparation.reserve(0).map_err(|e| classify(key, e))?;
         let mut ids: Vec<Id> = Vec::new();
         let mut truncated = false;
         self.preparation
@@ -635,30 +759,22 @@ impl Resolver {
                     truncated = true;
                     return Ok(false);
                 }
-                held.grow_by(8)?;
+                ids_held.grow_by(std::mem::size_of::<Id>() as u64)?;
+                ids.try_reserve(1)
+                    .map_err(|_| self.preparation.exhausted())?;
                 ids.push(q[2]);
                 Ok(true)
             })
             .map_err(|e| classify(key, e))?;
-        let mut out = Vec::new();
-        for id in ids {
-            self.preparation.check()?;
-            if let Some(Term::NamedNode(n)) = self
-                .preparation
-                .with_term(snap, id, |t| Ok(t.cloned()))
-                .map_err(|e| classify(key, e))?
-            {
-                held.grow_by((n.as_str().len() as u64).saturating_add(64))
-                    .map_err(|e| classify(key, e))?;
-                out.push(n);
-            }
-        }
-        Ok((out, truncated))
+        self.decode_named_nodes(key, snap, &ids, truncated)
     }
 
-    /// Named-node subjects of `?s p o` visible in `graph` at the current state of
+    /// Named-node subjects of `?s p o` visible in `graph` at the resolving state of
     /// `logical`, collecting at most `limit` results and decrementing `remaining_scans`
-    /// for each scanned quad. Returns `(subjects, truncated)`.
+    /// only for quads belonging to `graph` (so rows in unreadable graphs cannot alter
+    /// the caller-visible scan-budget outcome while physical traversal stays bounded by
+    /// the preparation's cancellation and deadline). The returned [`GraphNodes`] retains
+    /// its memory reservation until dropped.
     #[allow(clippy::too_many_arguments)]
     pub fn subjects_in_graph(
         &mut self,
@@ -671,9 +787,9 @@ impl Resolver {
         o: &Term,
         limit: usize,
         remaining_scans: &mut u64,
-    ) -> Result<(Vec<NamedNode>, bool)> {
+    ) -> Result<GraphNodes> {
         let Some((view_key, index)) = self.graph_view(key, main, logical, access, graph)? else {
-            return Ok((Vec::new(), false));
+            return self.empty_nodes(key);
         };
         let snap = self.views[&view_key][index].view.snapshot();
         let (Some(g), Some(p), Some(o)) = (
@@ -687,44 +803,33 @@ impl Resolver {
                 .lookup_term(snap, o)
                 .map_err(|e| classify(key, e))?,
         ) else {
-            return Ok((Vec::new(), false));
+            return self.empty_nodes(key);
         };
-        let mut held = self.preparation.reserve(0).map_err(|e| classify(key, e))?;
+        let mut ids_held = self.preparation.reserve(0).map_err(|e| classify(key, e))?;
         let mut ids: Vec<Id> = Vec::new();
         let mut truncated = false;
         self.preparation
             .scan(snap, Perm::Pos, &[p.0, o.0], |q| {
                 self.preparation.check()?;
+                if q[3] != g {
+                    return Ok(true);
+                }
                 if *remaining_scans == 0 {
                     return Err(incomplete(key));
                 }
                 *remaining_scans -= 1;
-                if q[3] != g {
-                    return Ok(true);
-                }
                 if ids.len() >= limit {
                     truncated = true;
                     return Ok(false);
                 }
-                held.grow_by(8)?;
+                ids_held.grow_by(std::mem::size_of::<Id>() as u64)?;
+                ids.try_reserve(1)
+                    .map_err(|_| self.preparation.exhausted())?;
                 ids.push(q[0]);
                 Ok(true)
             })
             .map_err(|e| classify(key, e))?;
-        let mut out = Vec::new();
-        for id in ids {
-            self.preparation.check()?;
-            if let Some(Term::NamedNode(n)) = self
-                .preparation
-                .with_term(snap, id, |t| Ok(t.cloned()))
-                .map_err(|e| classify(key, e))?
-            {
-                held.grow_by((n.as_str().len() as u64).saturating_add(64))
-                    .map_err(|e| classify(key, e))?;
-                out.push(n);
-            }
-        }
-        Ok((out, truncated))
+        self.decode_named_nodes(key, snap, &ids, truncated)
     }
 
     /// Prepare, or reuse, the controlled view of `key` under `access`, and return the

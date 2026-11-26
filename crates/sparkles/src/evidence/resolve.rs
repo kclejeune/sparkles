@@ -12,7 +12,7 @@
 //! capability.
 
 pub use sparkles_core::evidence::resolve::{
-    MAX_REFERENCES, MEMORY_BYTES, Receipt, RecordRequest, VerifiedFact, VerifiedRecord,
+    GraphNodes, MAX_REFERENCES, MEMORY_BYTES, Receipt, RecordRequest, VerifiedFact, VerifiedRecord,
     VerifiedSpan, check_anchor, kind_iri, unavailable,
 };
 pub use sparkles_core::evidence::{BlankAnchor, GraphIdentity, RecordKind, StoredFactRef};
@@ -130,7 +130,14 @@ impl Resolution {
         self.resolver.preparation()
     }
 
-    /// Verify a record reference at the current state of `logical`, which is `main` or
+    /// Pin record and graph lookups on `(main, logical)` to the exact branch commit
+    /// `commit`, so every call in this resolution reads one consistent snapshot.
+    pub fn pin_commit(&mut self, main: &Dataset, logical: &Dataset, commit: u64) {
+        self.resolver
+            .pin_commit(main.store(), logical.store(), commit);
+    }
+
+    /// Verify a record reference at the resolving state of `logical`, which is `main` or
     /// one of its branches, under `access`, what the caller may read there (`None`:
     /// nothing). The record must be an authenticated profile record of the evidence
     /// settings' protected graphs, as [`Resolver`] describes.
@@ -146,7 +153,7 @@ impl Resolution {
             .record(key, main.store(), logical.store(), access.as_ref(), request)
     }
 
-    /// Whether `s p o` is visible in `graph` at the current state of `logical` under
+    /// Whether `s p o` is visible in `graph` at the resolving state of `logical` under
     /// `access`, bounded by this resolution's preparation allowance and controls.
     #[allow(clippy::too_many_arguments)]
     pub fn has_triple(
@@ -165,7 +172,7 @@ impl Resolution {
     }
 
     /// Named-node objects of `s p ?o` visible in `graph`, collecting at most `limit`
-    /// results and decrementing `remaining_scans` for each scanned quad.
+    /// results and decrementing `remaining_scans` for each scanned quad in `graph`.
     #[allow(clippy::too_many_arguments)]
     pub fn objects_in_graph(
         &mut self,
@@ -178,7 +185,7 @@ impl Resolution {
         p: &oxrdf::NamedNode,
         limit: usize,
         remaining_scans: &mut u64,
-    ) -> Result<(Vec<oxrdf::NamedNode>, bool)> {
+    ) -> Result<GraphNodes> {
         self.resolver.objects_in_graph(
             key,
             main.store(),
@@ -193,7 +200,7 @@ impl Resolution {
     }
 
     /// Named-node subjects of `?s p o` visible in `graph`, collecting at most `limit`
-    /// results and decrementing `remaining_scans` for each scanned quad.
+    /// results and decrementing `remaining_scans` only for quads belonging to `graph`.
     #[allow(clippy::too_many_arguments)]
     pub fn subjects_in_graph(
         &mut self,
@@ -206,7 +213,7 @@ impl Resolution {
         o: &oxrdf::Term,
         limit: usize,
         remaining_scans: &mut u64,
-    ) -> Result<(Vec<oxrdf::NamedNode>, bool)> {
+    ) -> Result<GraphNodes> {
         self.resolver.subjects_in_graph(
             key,
             main.store(),

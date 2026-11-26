@@ -3768,3 +3768,1073 @@ async fn claims_predecessor_lookup_enforces_budget_and_cancellation() {
         "candidate row-cap exhaustion writes nothing"
     );
 }
+
+#[tokio::test]
+async fn claims_restored_rendition_with_prior_byte_variant_links_to_latest_predecessor() {
+    use base64::Engine;
+    use std::sync::atomic::AtomicBool;
+
+    let m = proposals_mock();
+    let (st, app) = app(Some([&m.url(), &m.url()]));
+    enable(&app).await;
+    evidence(&app).await;
+    put_org_profile(&app, "default").await;
+    let g = "https://example.org/notes/restored-byte-variant";
+
+    let lf = "# Stand-up\n\nAna Lima moved to the payments team this week.\n";
+    let crlf = "# Stand-up\r\n\r\nAna Lima moved to the payments team this week.\r\n";
+    let text_c = "# Stand-up\n\nAna Lima moved to the platform team this week.\n";
+    let b64_lf = base64::engine::general_purpose::STANDARD.encode(lf.as_bytes());
+    let b64_crlf = base64::engine::general_purpose::STANDARD.encode(crlf.as_bytes());
+
+    // 1. Register and ingest B/LF -> rev_lf.
+    let (s, reg_lf) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g, "iri": g, "format": "text/markdown", "text": lf, "original": b64_lf }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{reg_lf}");
+    let run_lf = ingest(&app, claims(json!({ "source": g }))).await;
+    assert_eq!(run_lf["status"], "done", "{run_lf}");
+    let rev_lf = run_lf["result"]["revision"].as_str().unwrap().to_string();
+
+    // 2. Register and ingest B/CRLF (same rendition B, new byte digest) -> rev_crlf -> rev_lf.
+    let (s, reg_crlf) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g, "iri": g, "format": "text/markdown", "text": lf, "original": b64_crlf }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{reg_crlf}");
+    assert_eq!(reg_crlf["rendition"], reg_lf["rendition"]);
+    let run_crlf = ingest(&app, claims(json!({ "source": g }))).await;
+    assert_eq!(run_crlf["status"], "done", "{run_crlf}");
+    let rev_crlf = run_crlf["result"]["revision"].as_str().unwrap().to_string();
+    assert_eq!(run_crlf["result"]["previousRevision"], rev_lf, "{run_crlf}");
+
+    // 3. Ingest different text on rendition C -> rev_c -> rev_crlf.
+    let run_c = ingest(
+        &app,
+        claims(json!({ "text": text_c, "format": "text/markdown", "graph": g, "iri": g })),
+    )
+    .await;
+    assert_eq!(run_c["status"], "done", "{run_c}");
+    let rev_c = run_c["result"]["revision"].as_str().unwrap().to_string();
+    assert_eq!(run_c["result"]["previousRevision"], rev_crlf, "{run_c}");
+
+    // 4. Restore B/LF via asserted registration: C18 now records B prov:wasRevisionOf C.
+    let (s, reg_restore) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g, "iri": g, "format": "text/markdown", "text": lf, "original": b64_lf }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{reg_restore}");
+    assert_eq!(reg_restore["rendition"], reg_lf["rendition"]);
+
+    // 5. Second principal (bob) uploads restored B/LF (alreadyRegistered=true, no hint):
+    //    must resolve chronologically across both same-rendition variants (rev_crlf) and
+    //    C18 edges (rev_c), linking to rev_c rather than the older byte variant rev_crlf.
+    let bob = user_principal("bob", full_write_grants());
+    let mut req_bob = claims_request(lf);
+    req_bob.graph = Some(g.into());
+    req_bob.iri = Some(g.into());
+    let st2 = st.clone();
+    let v_bob = tokio::task::spawn_blocking(move || {
+        run_direct_as(&st2, &bob, req_bob, Arc::new(AtomicBool::new(false)))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let rev_bob = v_bob["revision"].as_str().unwrap().to_string();
+    assert_ne!(rev_bob, rev_lf);
+    assert_eq!(
+        v_bob["previousRevision"], rev_c,
+        "restored rendition must link to latest predecessor rev_c, not older byte variant rev_crlf: {v_bob}"
+    );
+    assert!(
+        ask(
+            &app,
+            &format!(
+                "ASK {{ GRAPH <{EV_SOURCES}> {{ <{rev_bob}> <http://www.w3.org/ns/prov#wasRevisionOf> <{rev_c}> }} }}"
+            )
+        )
+        .await
+    );
+
+    // 6. Third principal (carol) ingests restored B/LF via registered-source mode:
+    //    must also select rev_c rather than rev_crlf.
+    let carol = user_principal("carol", full_write_grants());
+    let req_carol = super::pipeline::Request {
+        dataset: "org".into(),
+        mode: super::pipeline::Mode::Claims,
+        source: Some(g.into()),
+        ..Default::default()
+    };
+    let st2 = st.clone();
+    let v_carol = tokio::task::spawn_blocking(move || {
+        run_direct_as(&st2, &carol, req_carol, Arc::new(AtomicBool::new(false)))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let rev_carol = v_carol["revision"].as_str().unwrap().to_string();
+    assert_eq!(v_carol["previousRevision"], rev_c, "{v_carol}");
+    assert!(
+        ask(
+            &app,
+            &format!(
+                "ASK {{ GRAPH <{EV_SOURCES}> {{ <{rev_carol}> <http://www.w3.org/ns/prov#wasRevisionOf> <{rev_c}> }} }}"
+            )
+        )
+        .await
+    );
+}
+
+#[tokio::test]
+async fn claims_lineage_treats_unattributable_shared_c18_transition_as_ambiguous() {
+    use crate::auth::{Endpoint, Grants, Level, Protections, Restricted};
+    use std::sync::atomic::AtomicBool;
+
+    let m = proposals_mock();
+    let (st, app) = app(Some([&m.url(), &m.url()]));
+    enable(&app).await;
+    evidence(&app).await;
+    put_org_profile(&app, "default").await;
+
+    let g = "https://example.org/notes/shared-endpoints";
+    let s1 = "https://example.org/notes/source-one";
+    let s2 = "https://example.org/notes/source-two";
+    let text_x = format!("{NOTES}\nShared X.\n");
+    let text_a = format!("{NOTES}\nPrivate A.\n");
+    let text_b = format!("{NOTES}\nShared B.\n");
+    let text_d = format!("{NOTES}\nFinal D.\n");
+
+    // S1: X (claims) -> A (asserted) -> B (asserted).
+    let vx = ingest(
+        &app,
+        claims(json!({ "text": text_x, "format": "text/markdown", "graph": g, "iri": s1 })),
+    )
+    .await;
+    assert_eq!(vx["status"], "done", "{vx}");
+    let (s, reg_a) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g, "iri": s1, "format": "text/markdown", "text": text_a }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{reg_a}");
+    let rend_a = unangle(reg_a["rendition"].as_str().unwrap()).to_string();
+    let (s, reg_b1) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g, "iri": s1, "format": "text/markdown", "text": text_b }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{reg_b1}");
+
+    // S2 in the SAME C18 graph independently transitions X -> B, adding <B> prov:wasRevisionOf <X>
+    // while both B and X carry prov:wasDerivedFrom for both S1 and S2.
+    let (s, _) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g, "iri": s2, "format": "text/markdown", "text": text_x }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g, "iri": s2, "format": "text/markdown", "text": text_b }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Tag A with a Query-protected class so S1's A->X hop is hidden on Endpoint::Query.
+    let upd = Request::post("/org/update")
+        .header(header::CONTENT_TYPE, "application/sparql-update")
+        .body(Body::from(format!(
+            "INSERT DATA {{ GRAPH <{g}> {{ <{rend_a}> a <urn:test:HiddenHop> }} }}"
+        )))
+        .unwrap();
+    let (s, body) = send(&app, upd).await;
+    assert!(s.is_success(), "{s} {body}");
+
+    let hide_a = Arc::new(sparkles::access::Protection {
+        name: "hide_a".into(),
+        predicates: None,
+        classes: Some(vec!["urn:test:HiddenHop".into()]),
+        subclasses: false,
+        graphs: None,
+        pattern: None,
+        prefixes: Default::default(),
+        hide_inferences: false,
+    });
+    let protections = Arc::new(Protections {
+        list: vec![("org".into(), hide_a)],
+        limits: Default::default(),
+    });
+    let caller = user_principal(
+        "s1_caller",
+        Grants {
+            protections: Some(protections),
+            restricted: vec![
+                Restricted {
+                    dataset: "org".into(),
+                    level: Level::Write,
+                    graphs: None,
+                    endpoints: Some(vec![Endpoint::Update]),
+                    lifts: vec!["hide_a".into()],
+                    branches: None,
+                    server_models: false,
+                },
+                Restricted {
+                    dataset: "org".into(),
+                    level: Level::Read,
+                    graphs: None,
+                    endpoints: Some(vec![Endpoint::Query]),
+                    lifts: Vec::new(),
+                    branches: None,
+                    server_models: false,
+                },
+            ],
+            ..Default::default()
+        },
+    );
+
+    // S1 uploads D replacing B: S1's A->X path is hidden, and B->X is shared with S2 on
+    // both endpoints (unattributable), so S1 must omit prov:wasRevisionOf.
+    let mut req_d = claims_request(&text_d);
+    req_d.graph = Some(g.into());
+    req_d.iri = Some(s1.into());
+    let st2 = st.clone();
+    let vd = tokio::task::spawn_blocking(move || {
+        run_direct_as(&st2, &caller, req_d, Arc::new(AtomicBool::new(false)))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let rev_d = vd["revision"].as_str().unwrap().to_string();
+    assert!(
+        vd.get("previousRevision").is_none(),
+        "unattributable shared B->X edge must be treated as ambiguous: {vd}"
+    );
+    assert!(
+        !ask(
+            &app,
+            &format!(
+                "ASK {{ GRAPH <{EV_SOURCES}> {{ <{rev_d}> <http://www.w3.org/ns/prov#wasRevisionOf> ?p }} }}"
+            )
+        )
+        .await,
+        "must not publish prov:wasRevisionOf via another source's shared transition"
+    );
+}
+
+#[tokio::test]
+async fn claims_lineage_omits_link_when_64_rendition_bound_truncates_frontier() {
+    let m = proposals_mock();
+    let (_st, app) = app(Some([&m.url(), &m.url()]));
+    enable(&app).await;
+    evidence(&app).await;
+    let g = "https://example.org/notes/frontier-cutoff";
+
+    // 1. Ingest an older contender P_old (commit 1) and a newer contender P_new (commit 2)
+    //    with claims, plus an asserted intermediate M.
+    let text_old = format!("{NOTES}\nContender old.\n");
+    let text_new = format!("{NOTES}\nContender new.\n");
+    let text_mid = format!("{NOTES}\nAsserted intermediate.\n");
+    let text_final = format!("{NOTES}\nFinal after cutoff.\n");
+
+    let v_old = ingest(
+        &app,
+        claims(json!({ "text": text_old, "format": "text/markdown", "graph": g, "iri": g })),
+    )
+    .await;
+    assert_eq!(v_old["status"], "done", "{v_old}");
+    let rend_old = v_old["result"]["rendition"].as_str().unwrap().to_string();
+
+    let v_new = ingest(
+        &app,
+        claims(json!({ "text": text_new, "format": "text/markdown", "graph": g, "iri": g })),
+    )
+    .await;
+    assert_eq!(v_new["status"], "done", "{v_new}");
+    let rend_new = v_new["result"]["rendition"].as_str().unwrap().to_string();
+
+    let (s, reg_mid) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g, "iri": g, "format": "text/markdown", "text": text_mid }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{reg_mid}");
+    let rend_mid = unangle(reg_mid["rendition"].as_str().unwrap()).to_string();
+
+    // Attach 65 visible source-owned predecessors to rend_mid (all prov:wasDerivedFrom <g>):
+    // rend_old, 63 asserted-only renditions, and rend_new, exceeding the 64-rendition cap
+    // while staying well below the 256-edge scan cap.
+    let mut insert = format!(
+        "INSERT DATA {{ GRAPH <{g}> {{ \
+         <{rend_mid}> <http://www.w3.org/ns/prov#wasRevisionOf> <{rend_old}> , <{rend_new}> .\n"
+    );
+    for i in 0..64 {
+        insert.push_str(&format!(
+            "  <urn:test:filler:{i:02}> a <urn:x-sparkles:TextRendition> ; \
+               <http://www.w3.org/ns/prov#wasDerivedFrom> <{g}> .\n\
+             <{rend_mid}> <http://www.w3.org/ns/prov#wasRevisionOf> <urn:test:filler:{i:02}> .\n"
+        ));
+    }
+    insert.push_str("} }");
+    let upd = Request::post("/org/update")
+        .header(header::CONTENT_TYPE, "application/sparql-update")
+        .body(Body::from(insert))
+        .unwrap();
+    let (s, body) = send(&app, upd).await;
+    assert!(s.is_success(), "{s} {body}");
+
+    // Upload Final replacing M: because unseen eligible predecessors exceed the 64-rendition
+    // walk cap, the walk must decline to choose from the partial frontier.
+    let v_final = ingest(
+        &app,
+        claims(json!({ "text": text_final, "format": "text/markdown", "graph": g, "iri": g })),
+    )
+    .await;
+    assert_eq!(v_final["status"], "done", "{v_final}");
+    assert!(
+        v_final["result"].get("previousRevision").is_none(),
+        "truncated 64-rendition frontier must not publish a partial winner: {v_final}"
+    );
+    let rev_final = v_final["result"]["revision"].as_str().unwrap();
+    assert!(
+        !ask(
+            &app,
+            &format!(
+                "ASK {{ GRAPH <{EV_SOURCES}> {{ <{rev_final}> <http://www.w3.org/ns/prov#wasRevisionOf> ?p }} }}"
+            )
+        )
+        .await,
+        "must not store prov:wasRevisionOf from a truncated frontier"
+    );
+}
+
+#[tokio::test]
+async fn claims_lineage_authenticates_intermediate_ancestry_and_graphs() {
+    let m = proposals_mock();
+    let (_st, app) = app(Some([&m.url(), &m.url()]));
+    enable(&app).await;
+    let ev_sources_2 = "urn:ev:sources-2";
+    let settings_body = || {
+        json!({"format": 1, "profile": 1, "enabled": true,
+            "sourceRecords": [EV_SOURCES, ev_sources_2], "proposals": [EV_CLAIMS],
+            "decisions": ["urn:ev:decisions"], "supports": ["urn:ev:supports"],
+            "projections": [EV_ACCEPTED],
+            "policies": {"main": {"version": 1, "admittedKinds": ["reported"],
+                "requiredScope": [], "conflicts": "refuse",
+                "boundary": [EV_SOURCES, ev_sources_2, EV_CLAIMS],
+                "decisions": "urn:ev:decisions", "supports": "urn:ev:supports",
+                "output": EV_ACCEPTED}}})
+    };
+    let (s, v) = send(
+        &app,
+        req("PUT", "/$/evidence/org/settings", settings_body()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    let compute_sk = |g: &str| {
+        let framed = json!(["ingest-claims-source", 1, g, g, EV_SOURCES, EV_CLAIMS]).to_string();
+        format!(
+            "ingest-claims-source:1:{}",
+            sparkles::evidence::Sha256Digest::of_bytes(
+                framed.as_bytes(),
+                &sparkles::task::Control::none()
+            )
+            .unwrap()
+        )
+    };
+
+    // Subcase A: Two same-commit contenders A and B in EV_SOURCES where B references
+    // authenticated H in EV_SOURCES_2, and EV_SOURCES has a leftover pre-protection
+    // triple <H> prov:wasRevisionOf <A> (with no authenticated H record in EV_SOURCES).
+    // The ancestry walk must authenticate H in EV_SOURCES_2 and ignore the leftover triple.
+    let g_a = "https://example.org/notes/ancestry-leftover";
+    let t_a1 = format!("{NOTES}\nAncestry A1.\n");
+    let t_a2 = format!("{NOTES}\nAncestry A2.\n");
+    let t_amid = format!("{NOTES}\nAncestry Mid A.\n");
+    let t_aend = format!("{NOTES}\nAncestry End A.\n");
+    let (s, ra1_2) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g_a, "iri": g_a, "format": "text/markdown", "text": t_a1 }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{ra1_2}");
+    let (s, ra2_2) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g_a, "iri": g_a, "format": "text/markdown", "text": t_a2 }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{ra2_2}");
+    let (s, ramid_2) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g_a, "iri": g_a, "format": "text/markdown", "text": t_amid }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{ramid_2}");
+    let rend_a1_2 = unangle(ra1_2["rendition"].as_str().unwrap()).to_string();
+    let rend_a2_2 = unangle(ra2_2["rendition"].as_str().unwrap()).to_string();
+    let rend_amid_2 = unangle(ramid_2["rendition"].as_str().unwrap()).to_string();
+    let upd = Request::post("/org/update")
+        .header(header::CONTENT_TYPE, "application/sparql-update")
+        .body(Body::from(format!(
+            "INSERT DATA {{ GRAPH <{g_a}> {{ <{rend_amid_2}> <http://www.w3.org/ns/prov#wasRevisionOf> <{rend_a1_2}> , <{rend_a2_2}> }} }}"
+        )))
+        .unwrap();
+    let (s, body) = send(&app, upd).await;
+    assert!(s.is_success(), "{s} {body}");
+
+    // Publish authenticated H in EV_SOURCES_2 (with NO prov:wasRevisionOf).
+    let (s, ph) = send(
+        &app,
+        req(
+            "POST",
+            "/org/claims",
+            json!({
+                "sourceGraph": ev_sources_2,
+                "revisions": [{ "key": "h", "source": g_a, "sourceKey": "h-sk", "content": { "text": "helper H" } }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{ph}");
+    let rev_h = ph["records"][0]["iri"].as_str().unwrap().to_string();
+
+    // Compute rev_a_iri deterministically, detach EV_SOURCES, plant leftover
+    // <rev_h> prov:wasRevisionOf <rev_a_iri>, re-protect EV_SOURCES, then publish authenticated
+    // A and B (-> H) in one commit under the current protection nonce.
+    let sk_a2 = compute_sk(g_a);
+    let ds_id = _st.get("org").unwrap().dataset.dataset_id();
+    let principal = crate::evidence::principal_iri(&crate::auth::Principal::local());
+    let rev_a2_iri = sparkles::evidence::IdentityNamespace::new(ds_id, principal)
+        .unwrap()
+        .record_id(
+            sparkles::evidence::RecordKind::SourceRevision,
+            &sparkles::evidence::RecordKey::new(&sk_a2).unwrap(),
+            &sparkles::evidence::RecordKey::new(ra1_2["digest"].as_str().unwrap()).unwrap(),
+            &sparkles::task::Control::none(),
+        )
+        .unwrap();
+    let (s, _) = send(
+        &app,
+        req(
+            "POST",
+            "/$/evidence/org/detach",
+            json!({ "graph": EV_SOURCES }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let plant = Request::post("/org/update")
+        .header(header::CONTENT_TYPE, "application/sparql-update")
+        .body(Body::from(format!(
+            "INSERT DATA {{ GRAPH <{EV_SOURCES}> {{ <{rev_h}> <http://www.w3.org/ns/prov#wasRevisionOf> {rev_a2_iri} }} }}"
+        )))
+        .unwrap();
+    let (s, body) = send(&app, plant).await;
+    assert!(s.is_success(), "{s} {body}");
+    let (s, v) = send(
+        &app,
+        req("PUT", "/$/evidence/org/settings", settings_body()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, batch_a2) = send(
+        &app,
+        req(
+            "POST",
+            "/org/claims",
+            json!({
+                "sourceGraph": EV_SOURCES,
+                "revisions": [
+                    { "key": "a", "source": g_a, "sourceKey": sk_a2, "content": { "digest": ra1_2["digest"] } },
+                    { "key": "b", "source": g_a, "sourceKey": sk_a2, "content": { "digest": ra2_2["digest"] }, "wasRevisionOf": { "iri": rev_h } }
+                ],
+                "renditions": [
+                    {
+                        "key": "ra", "revision": { "key": "a" }, "occurrenceKey": rend_a1_2,
+                        "conversion": { "method": "urn:x-sparkles:ingest:convert:markdown", "version": env!("CARGO_PKG_VERSION") },
+                        "mediaType": "text/markdown", "content": { "text": t_a1 }
+                    },
+                    {
+                        "key": "rb", "revision": { "key": "b" }, "occurrenceKey": rend_a2_2,
+                        "conversion": { "method": "urn:x-sparkles:ingest:convert:markdown", "version": env!("CARGO_PKG_VERSION") },
+                        "mediaType": "text/markdown", "content": { "text": t_a2 }
+                    }
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{batch_a2}");
+
+    let v_aend = ingest(
+        &app,
+        claims(json!({ "text": t_aend, "format": "text/markdown", "graph": g_a, "iri": g_a, "sourceGraph": EV_SOURCES })),
+    )
+    .await;
+    assert_eq!(v_aend["status"], "done", "{v_aend}");
+    assert!(
+        v_aend["result"].get("previousRevision").is_none(),
+        "leftover unverified triple in EV_SOURCES must not supersede contender A: {v_aend}"
+    );
+    let rev_aend = v_aend["result"]["revision"].as_str().unwrap();
+    assert!(
+        !ask(
+            &app,
+            &format!(
+                "ASK {{ GRAPH <{EV_SOURCES}> {{ <{rev_aend}> <http://www.w3.org/ns/prov#wasRevisionOf> ?p }} }}"
+            )
+        )
+        .await
+    );
+
+    // Subcase B: Legitimate cross-graph chain B (EV_SOURCES, on branch feat) -> H2 (EV_SOURCES_2,
+    // on main) -> A (EV_SOURCES, on main). Different receipt branches mean commit order cannot
+    // break the tie; only following H2 into its verified graph EV_SOURCES_2 supersedes A.
+    let g_b = "https://example.org/notes/ancestry-cross-graph";
+    let t_b1 = format!("{NOTES}\nCross B1.\n");
+    let t_b2 = format!("{NOTES}\nCross B2.\n");
+    let t_bmid = format!("{NOTES}\nCross Mid.\n");
+    let t_bend = format!("{NOTES}\nCross End.\n");
+    let (s, rb1) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g_b, "iri": g_b, "format": "text/markdown", "text": t_b1 }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{rb1}");
+    let (s, rb2) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g_b, "iri": g_b, "format": "text/markdown", "text": t_b2 }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{rb2}");
+    let (s, rbmid) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g_b, "iri": g_b, "format": "text/markdown", "text": t_bmid }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{rbmid}");
+    let rend_b1 = unangle(rb1["rendition"].as_str().unwrap()).to_string();
+    let rend_b2 = unangle(rb2["rendition"].as_str().unwrap()).to_string();
+    let rend_bmid = unangle(rbmid["rendition"].as_str().unwrap()).to_string();
+    let upd = Request::post("/org/update")
+        .header(header::CONTENT_TYPE, "application/sparql-update")
+        .body(Body::from(format!(
+            "INSERT DATA {{ GRAPH <{g_b}> {{ <{rend_bmid}> <http://www.w3.org/ns/prov#wasRevisionOf> <{rend_b1}> , <{rend_b2}> }} }}"
+        )))
+        .unwrap();
+    let (s, body) = send(&app, upd).await;
+    assert!(s.is_success(), "{s} {body}");
+
+    let sk_b = compute_sk(g_b);
+    let (s, pb_a) = send(
+        &app,
+        req(
+            "POST",
+            "/org/claims",
+            json!({
+                "sourceGraph": EV_SOURCES,
+                "revisions": [{ "key": "a", "source": g_b, "sourceKey": sk_b, "content": { "digest": rb1["digest"] } }],
+                "renditions": [{
+                    "key": "ra", "revision": { "key": "a" }, "occurrenceKey": rend_b1,
+                    "conversion": { "method": "urn:x-sparkles:ingest:convert:markdown", "version": env!("CARGO_PKG_VERSION") },
+                    "mediaType": "text/markdown", "content": { "text": t_b1 }
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{pb_a}");
+    let rev_ba = pb_a["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "a")
+        .unwrap()["iri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (s, ph2) = send(
+        &app,
+        req(
+            "POST",
+            "/org/claims",
+            json!({
+                "sourceGraph": ev_sources_2,
+                "revisions": [{
+                    "key": "h2", "source": g_b, "sourceKey": "h2-sk",
+                    "content": { "text": "helper H2" },
+                    "wasRevisionOf": { "iri": rev_ba }
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{ph2}");
+    let rev_h2 = ph2["records"][0]["iri"].as_str().unwrap().to_string();
+
+    // Branch `feat` from main and publish B (-> H2) on `feat` so A and B have different branches.
+    let (s, br) = send(
+        &app,
+        req("POST", "/$/branches/org", json!({ "name": "feat" })),
+    )
+    .await;
+    assert!(s.is_success(), "{s} {br}");
+    let (s, pb_b) = send(
+        &app,
+        req(
+            "POST",
+            "/org@feat/claims",
+            json!({
+                "sourceGraph": EV_SOURCES,
+                "revisions": [{
+                    "key": "b", "source": g_b, "sourceKey": sk_b,
+                    "content": { "digest": rb2["digest"] },
+                    "wasRevisionOf": { "iri": rev_h2 }
+                }],
+                "renditions": [{
+                    "key": "rb", "revision": { "key": "b" }, "occurrenceKey": rend_b2,
+                    "conversion": { "method": "urn:x-sparkles:ingest:convert:markdown", "version": env!("CARGO_PKG_VERSION") },
+                    "mediaType": "text/markdown", "content": { "text": t_b2 }
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{pb_b}");
+    let rev_bb = pb_b["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "b")
+        .unwrap()["iri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let v_bend = ingest(
+        &app,
+        claims(json!({
+            "text": t_bend, "format": "text/markdown", "graph": g_b, "iri": g_b,
+            "branch": "feat", "sourceGraph": EV_SOURCES
+        })),
+    )
+    .await;
+    assert_eq!(v_bend["status"], "done", "{v_bend}");
+    assert_eq!(
+        v_bend["result"]["previousRevision"], rev_bb,
+        "authenticated cross-graph chain B -> H2 (in EV_SOURCES_2) -> A must supersede A: {v_bend}"
+    );
+}
+
+#[tokio::test]
+async fn claims_predecessor_lookup_ignores_rows_in_query_denied_graph() {
+    use crate::auth::{Endpoint, Grants, Level, Restricted};
+    use std::sync::atomic::AtomicBool;
+
+    let m = proposals_mock();
+    let build_state = || {
+        let mut s = AppState::standalone(Default::default(), Duration::from_secs(30));
+        s.models = arc_swap::ArcSwapOption::from_pointee(Models::new(
+            ModelsConfig::parse(
+                &json!({
+                    "providers": {
+                        "cheap": { "kind": "openai", "endpoint": m.url(), "requestTimeoutSecs": 5,
+                                   "allowedModels": ["m"], "structuredOutput": "json-schema",
+                                   "pricing": { "inputPerMTok": 1.0, "outputPerMTok": 2.0 } }
+                    },
+                    "roles": { "extract": [{ "provider": "cheap", "model": "m" }] }
+                })
+                .to_string(),
+            )
+            .unwrap(),
+            Default::default(),
+            sparkles::outbound::OutboundPolicy {
+                allow_private: true,
+                ..Default::default()
+            },
+        ));
+        s.limits.max_rows_produced = Some(25);
+        let s = Arc::new(s);
+        let ds = s.attach("org", DbType::Mem, None).unwrap();
+        ds.store
+            .load(&[Source::from_bytes(
+                ORG.as_bytes().to_vec(),
+                RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        let router = crate::http::router(s.clone());
+        (s, router)
+    };
+
+    let g = "https://example.org/notes/denied-rows";
+    let secret_g = "https://example.org/secret-denied-graph";
+    let sk_framed = json!(["ingest-claims-source", 1, g, g, EV_SOURCES, EV_CLAIMS]).to_string();
+    let sk = format!(
+        "ingest-claims-source:1:{}",
+        sparkles::evidence::Sha256Digest::of_bytes(
+            sk_framed.as_bytes(),
+            &sparkles::task::Control::none()
+        )
+        .unwrap()
+    );
+
+    let caller = || {
+        user_principal(
+            "scoped_reader",
+            Grants {
+                restricted: vec![
+                    Restricted {
+                        dataset: "org".into(),
+                        level: Level::Write,
+                        graphs: Some(vec![g.into(), EV_SOURCES.into(), EV_CLAIMS.into()]),
+                        endpoints: Some(vec![Endpoint::Update]),
+                        lifts: Vec::new(),
+                        branches: None,
+                        server_models: false,
+                    },
+                    Restricted {
+                        dataset: "org".into(),
+                        level: Level::Read,
+                        graphs: Some(vec![g.into(), EV_SOURCES.into(), EV_CLAIMS.into()]),
+                        endpoints: Some(vec![Endpoint::Query]),
+                        lifts: Vec::new(),
+                        branches: None,
+                        server_models: false,
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+    };
+
+    // Control run without matching rows in the denied graph, vs run with 60 matching rows
+    // (for both ev:sourceKey and prov:wasDerivedFrom) in a Query-denied graph.
+    let mut outcomes = Vec::new();
+    for with_denied_rows in [false, true] {
+        let (st, app) = build_state();
+        enable(&app).await;
+        evidence(&app).await;
+        put_org_profile(&app, "default").await;
+
+        let v1 = ingest(
+            &app,
+            claims(json!({ "text": "# Plain note v1\n", "format": "text/markdown", "graph": g, "iri": g })),
+        )
+        .await;
+        assert_eq!(v1["status"], "done", "{v1}");
+        let rev1 = v1["result"]["revision"].as_str().unwrap().to_string();
+
+        if with_denied_rows {
+            let mut ins = format!("INSERT DATA {{ GRAPH <{secret_g}> {{\n");
+            for i in 0..40 {
+                ins.push_str(&format!(
+                    "  <urn:denied:rev:{i:02}> <urn:x-sparkles:evidence:sourceKey> \"{sk}\" .\n\
+                     <urn:denied:rend:{i:02}> <http://www.w3.org/ns/prov#wasDerivedFrom> <{rev1}> .\n"
+                ));
+            }
+            ins.push_str("} }");
+            let upd = Request::post("/org/update")
+                .header(header::CONTENT_TYPE, "application/sparql-update")
+                .body(Body::from(ins))
+                .unwrap();
+            let (s, body) = send(&app, upd).await;
+            assert!(s.is_success(), "{s} {body}");
+        }
+
+        let mut req_v2 = claims_request("# Plain note v2\n");
+        req_v2.graph = Some(g.into());
+        req_v2.iri = Some(g.into());
+        let st2 = st.clone();
+        let p = caller();
+        let v2 = tokio::task::spawn_blocking(move || {
+            run_direct_as(&st2, &p, req_v2, Arc::new(AtomicBool::new(false)))
+        })
+        .await
+        .unwrap()
+        .unwrap_or_else(|e| panic!("with_denied_rows={with_denied_rows} failed: {e}"));
+        assert_eq!(v2["previousRevision"], rev1, "{v2}");
+        outcomes.push(v2["outcome"].as_str().unwrap().to_string());
+    }
+    assert_eq!(outcomes[0], outcomes[1]);
+}
+
+#[tokio::test]
+async fn claims_source_mode_and_upload_pin_head_across_concurrent_registration() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let m = proposals_mock();
+    let (st, app) = app(Some([&m.url(), &m.url()]));
+    enable(&app).await;
+    evidence(&app).await;
+
+    let run_register = |st_fp: &Arc<AppState>, g_fp: &str, text_fp: &str| {
+        let cfg = crate::mcp::rest::config(st_fp, crate::mcp::rest::Mode::Write);
+        let server = crate::mcp::McpServer::new(st_fp.clone(), cfg);
+        let mut call = crate::mcp::Call {
+            principal: crate::auth::Principal::local(),
+            arrived: std::time::Instant::now(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            request_id: String::new(),
+            headers: None,
+            held: None,
+            grant: None,
+            preparation: None,
+        };
+        let args = json!({
+            "dataset": "org",
+            "graph": g_fp,
+            "iri": g_fp,
+            "format": "text/markdown",
+            "text": text_fp,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        server
+            .run_now("register_converted", args, &mut call)
+            .unwrap();
+    };
+
+    // 1. Registered-source mode: task reads B (whose predecessor A is authenticated and
+    //    query-visible at the read head), and a concurrent registration replaces B with C
+    //    during extraction. Publication must refuse with 409 head-changed and write nothing,
+    //    never committing B without its predecessor.
+    let g1 = "https://example.org/notes/source-moved-head";
+    let text_a = format!("{NOTES}\nSource head A.\n");
+    let text_b = format!("{NOTES}\nSource head B.\n");
+    let text_c = format!("{NOTES}\nSource head C.\n");
+
+    let va = ingest(
+        &app,
+        claims(json!({ "text": text_a, "format": "text/markdown", "graph": g1, "iri": g1 })),
+    )
+    .await;
+    assert_eq!(va["status"], "done", "{va}");
+
+    let (s, reg_b) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g1, "iri": g1, "format": "text/markdown", "text": text_b }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{reg_b}");
+
+    let st_fp = st.clone();
+    let g1_fp = g1.to_string();
+    let text_c_fp = text_c.clone();
+    let fired = Arc::new(AtomicUsize::new(0));
+    let fired_fp = fired.clone();
+    st.get("org").unwrap().store.set_failpoint(
+        "ingest-claims-after-extract",
+        Some(Arc::new(move |_| {
+            if fired_fp.fetch_add(1, Ordering::SeqCst) == 0 {
+                run_register(&st_fp, &g1_fp, &text_c_fp);
+            }
+        })),
+    );
+    let rev_count_query = format!(
+        "SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <{EV_SOURCES}> {{ ?r a <urn:x-sparkles:evidence:SourceRevision> }} }}"
+    );
+    let before_revisions = count(&app, &rev_count_query).await;
+    let req_src = super::pipeline::Request {
+        dataset: "org".into(),
+        mode: super::pipeline::Mode::Claims,
+        source: Some(g1.into()),
+        ..Default::default()
+    };
+    let st2 = st.clone();
+    let err = tokio::task::spawn_blocking(move || run_direct(&st2, req_src))
+        .await
+        .unwrap()
+        .unwrap_err();
+    st.get("org")
+        .unwrap()
+        .store
+        .set_failpoint("ingest-claims-after-extract", None);
+    assert_eq!(fired.load(Ordering::SeqCst), 1);
+    assert_eq!(err["code"], "head-changed", "{err}");
+    assert_eq!(err["status"], 409, "{err}");
+    let after_revisions = count(&app, &rev_count_query).await;
+    assert_eq!(
+        after_revisions, before_revisions,
+        "head-changed source run must not commit B without its predecessor"
+    );
+
+    // 2. Registered-source mode with an UNRELATED concurrent write during extraction:
+    //    B is still current at the new head, so source mode retries and links rev_b2 -> rev_a2.
+    let g2 = "https://example.org/notes/source-unrelated-move";
+    let va2 = ingest(
+        &app,
+        claims(json!({ "text": text_a, "format": "text/markdown", "graph": g2, "iri": g2 })),
+    )
+    .await;
+    assert_eq!(va2["status"], "done", "{va2}");
+    let rev_a2 = va2["result"]["revision"].as_str().unwrap().to_string();
+    let (s, reg_b2) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g2, "iri": g2, "format": "text/markdown", "text": text_b }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{reg_b2}");
+
+    let st_fp = st.clone();
+    let fired2 = Arc::new(AtomicUsize::new(0));
+    let fired2_fp = fired2.clone();
+    st.get("org").unwrap().store.set_failpoint(
+        "ingest-claims-after-extract",
+        Some(Arc::new(move |_| {
+            if fired2_fp.fetch_add(1, Ordering::SeqCst) == 0 {
+                let ds = st_fp.get("org").unwrap();
+                ds.dataset
+                    .update("INSERT DATA { GRAPH <urn:unrelated> { <urn:u:s> <urn:u:p> \"1\" } }")
+                    .unwrap();
+            }
+        })),
+    );
+    let req_src2 = super::pipeline::Request {
+        dataset: "org".into(),
+        mode: super::pipeline::Mode::Claims,
+        source: Some(g2.into()),
+        ..Default::default()
+    };
+    let st2 = st.clone();
+    let ok_src2 = tokio::task::spawn_blocking(move || run_direct(&st2, req_src2))
+        .await
+        .unwrap()
+        .unwrap();
+    st.get("org")
+        .unwrap()
+        .store
+        .set_failpoint("ingest-claims-after-extract", None);
+    assert_eq!(fired2.load(Ordering::SeqCst), 1);
+    let rev_b2 = ok_src2["revision"].as_str().unwrap().to_string();
+    assert_eq!(ok_src2["previousRevision"], rev_a2, "{ok_src2}");
+    assert!(
+        ask(
+            &app,
+            &format!(
+                "ASK {{ GRAPH <{EV_SOURCES}> {{ <{rev_b2}> <http://www.w3.org/ns/prov#wasRevisionOf> <{rev_a2}> }} }}"
+            )
+        )
+        .await
+    );
+
+    // 3. Upload mode with concurrent registration during extraction (before initial
+    //    predecessor_revision): initial lookup stays pinned to planned.head, then publish
+    //    replans at the new head and commits with the authenticated predecessor rev_a3.
+    let g3 = "https://example.org/notes/upload-extract-move";
+    let va3 = ingest(
+        &app,
+        claims(json!({ "text": text_a, "format": "text/markdown", "graph": g3, "iri": g3 })),
+    )
+    .await;
+    assert_eq!(va3["status"], "done", "{va3}");
+    let rev_a3 = va3["result"]["revision"].as_str().unwrap().to_string();
+
+    let st_fp = st.clone();
+    let g3_fp = g3.to_string();
+    let text_b_fp = text_b.clone();
+    let fired3 = Arc::new(AtomicUsize::new(0));
+    let fired3_fp = fired3.clone();
+    st.get("org").unwrap().store.set_failpoint(
+        "ingest-claims-after-extract",
+        Some(Arc::new(move |_| {
+            if fired3_fp.fetch_add(1, Ordering::SeqCst) == 0 {
+                run_register(&st_fp, &g3_fp, &text_b_fp);
+            }
+        })),
+    );
+    let mut req_up = claims_request(&text_c);
+    req_up.graph = Some(g3.into());
+    req_up.iri = Some(g3.into());
+    let st2 = st.clone();
+    let ok_up = tokio::task::spawn_blocking(move || run_direct(&st2, req_up))
+        .await
+        .unwrap()
+        .unwrap();
+    st.get("org")
+        .unwrap()
+        .store
+        .set_failpoint("ingest-claims-after-extract", None);
+    assert_eq!(fired3.load(Ordering::SeqCst), 1);
+    let rev_c3 = ok_up["revision"].as_str().unwrap().to_string();
+    assert_eq!(ok_up["previousRevision"], rev_a3, "{ok_up}");
+    assert!(
+        ask(
+            &app,
+            &format!(
+                "ASK {{ GRAPH <{EV_SOURCES}> {{ <{rev_c3}> <http://www.w3.org/ns/prov#wasRevisionOf> <{rev_a3}> }} }}"
+            )
+        )
+        .await
+    );
+}

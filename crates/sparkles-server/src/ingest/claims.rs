@@ -507,52 +507,145 @@ fn select_from_frontier(
     if hits.is_empty() {
         return Ok(None);
     }
-    // Deduplicate identical revision IRIs.
-    let mut seen_iris: BTreeSet<String> = BTreeSet::new();
-    hits.retain(|m| seen_iris.insert(m.iri.as_str().to_string()));
+    let mut work_held = resolution.preparation().reserve(0).map_err(resolve_err)?;
+    // Deduplicate identical revision IRIs using borrowed slices under work_held.
+    work_held
+        .grow_by((hits.len() as u64).saturating_mul(64))
+        .map_err(resolve_err)?;
+    let keep: Vec<bool> = {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        hits.iter().map(|m| seen.insert(m.iri.as_str())).collect()
+    };
+    let mut keep_iter = keep.into_iter();
+    hits.retain(|_| keep_iter.next().unwrap_or(false));
     if hits.len() == 1 {
         return Ok(Some(hits.remove(0).iri));
     }
-    // Discard any match that is an ancestor of another match via prov:wasRevisionOf
-    // in t.source_graph (bounded walk).
-    let match_iris: BTreeSet<String> = hits.iter().map(|m| m.iri.as_str().to_string()).collect();
-    let mut superseded: BTreeSet<String> = BTreeSet::new();
+    // Discard any match that is an ancestor of another match via authenticated
+    // prov:wasRevisionOf chains across configured evidence graphs (bounded walk).
+    work_held
+        .grow_by((hits.len() as u64).saturating_mul(64))
+        .map_err(resolve_err)?;
+    let match_iris: BTreeSet<&str> = hits.iter().map(|m| m.iri.as_str()).collect();
+    let mut superseded: BTreeSet<&str> = BTreeSet::new();
     for m in &hits {
-        let mut cur = m.iri.clone();
+        let mut chain_held = resolution.preparation().reserve(0).map_err(resolve_err)?;
+        let mut cur_iri = NamedNode::new_unchecked(
+            resolution
+                .preparation()
+                .copy_string(m.iri.as_str(), &mut chain_held)
+                .map_err(resolve_err)?,
+        );
+        let mut cur_graph = NamedNode::new_unchecked(
+            resolution
+                .preparation()
+                .copy_string(t.source_graph.as_str(), &mut chain_held)
+                .map_err(resolve_err)?,
+        );
         let mut chain_seen: BTreeSet<String> = BTreeSet::new();
-        chain_seen.insert(cur.as_str().to_string());
+        let start_key = resolution
+            .preparation()
+            .copy_string(cur_iri.as_str(), &mut chain_held)
+            .map_err(resolve_err)?;
+        chain_held.grow_by(64).map_err(resolve_err)?;
+        chain_seen.insert(start_key);
         for _ in 0..MAX_LINEAGE_HOPS {
             resolution.preparation().check().map_err(resolve_err)?;
-            let (objs, truncated) = resolution
+            let objs = resolution
                 .objects_in_graph(
                     "predecessor",
                     &t.main.dataset,
                     &t.logical.dataset,
                     access,
-                    &t.source_graph,
-                    &cur,
+                    &cur_graph,
+                    &cur_iri,
                     prov_was_revision_of,
                     2,
                     remaining_scans,
                 )
                 .map_err(resolve_err)?;
-            if truncated {
+            if objs.is_truncated() {
                 return Err(incomplete_lineage());
             }
-            let Some(next) = (objs.len() == 1).then(|| objs[0].clone()) else {
+            let [next] = objs.nodes() else {
                 break;
             };
-            if match_iris.contains(next.as_str()) && next != m.iri {
-                superseded.insert(next.as_str().to_string());
-            }
-            if !chain_seen.insert(next.as_str().to_string()) {
+            if *next == cur_iri {
                 break;
             }
-            cur = next;
+            if let Some(&hit_iri) = match_iris.get(next.as_str()) {
+                if hit_iri != m.iri.as_str() {
+                    superseded.insert(hit_iri);
+                }
+                if chain_seen.contains(next.as_str()) {
+                    break;
+                }
+                let next_seen = resolution
+                    .preparation()
+                    .copy_string(next.as_str(), &mut chain_held)
+                    .map_err(resolve_err)?;
+                let next_iri = NamedNode::new_unchecked(
+                    resolution
+                        .preparation()
+                        .copy_string(next.as_str(), &mut chain_held)
+                        .map_err(resolve_err)?,
+                );
+                let next_graph = NamedNode::new_unchecked(
+                    resolution
+                        .preparation()
+                        .copy_string(t.source_graph.as_str(), &mut chain_held)
+                        .map_err(resolve_err)?,
+                );
+                chain_held.grow_by(64).map_err(resolve_err)?;
+                drop(objs);
+                chain_seen.insert(next_seen);
+                cur_iri = next_iri;
+                cur_graph = next_graph;
+            } else {
+                if chain_seen.contains(next.as_str()) {
+                    break;
+                }
+                let next_iri = NamedNode::new_unchecked(
+                    resolution
+                        .preparation()
+                        .copy_string(next.as_str(), &mut chain_held)
+                        .map_err(resolve_err)?,
+                );
+                drop(objs);
+                let Verify::Verified(v_next) =
+                    verify_record(resolution, t, access, &next_iri, RecordKind::SourceRevision)?
+                else {
+                    break;
+                };
+                let next_seen = resolution
+                    .preparation()
+                    .copy_string(next_iri.as_str(), &mut chain_held)
+                    .map_err(resolve_err)?;
+                let next_graph = NamedNode::new_unchecked(
+                    resolution
+                        .preparation()
+                        .copy_string(v_next.graph.as_str(), &mut chain_held)
+                        .map_err(resolve_err)?,
+                );
+                chain_held.grow_by(64).map_err(resolve_err)?;
+                chain_seen.insert(next_seen);
+                cur_iri = next_iri;
+                cur_graph = next_graph;
+            }
         }
     }
     if superseded.len() < hits.len() {
-        hits.retain(|m| !superseded.contains(m.iri.as_str()));
+        let keep: Vec<bool> = hits
+            .iter()
+            .map(|m| !superseded.contains(m.iri.as_str()))
+            .collect();
+        drop(superseded);
+        drop(match_iris);
+        let mut iter = keep.into_iter();
+        hits.retain(|_| iter.next().unwrap_or(false));
+    } else {
+        drop(superseded);
+        drop(match_iris);
     }
     let distinct_renditions = |list: &[MatchedRev]| -> usize {
         list.iter()
@@ -579,19 +672,24 @@ fn select_from_frontier(
     Ok(None)
 }
 
+enum C18Predecessors {
+    List(Vec<NamedNode>, sparkles::access::Reservation),
+    Ambiguous,
+}
+
 /// Resolve the source revision and predecessor link for a claims ingestion of `source` in
-/// `c18_graph`, bounded by the server's query memory and row limits, task deadline, and
-/// cancellation, and strictly enforced under the caller's `Endpoint::Query` policy.
+/// `c18_graph` at the exact branch commit `at_commit`, bounded by the server's query
+/// memory and row limits, task deadline, and cancellation, and strictly enforced under
+/// the caller's `Endpoint::Query` policy.
 ///
-/// - When the revision IRI this batch would mint already exists as an authenticated
-///   `SourceRevision` in `t.source_graph`, returns [`RevisionLink::Existing`] so
-///   multi-profile re-ingestion preserves the immutable revision without disclosing
-///   masked predecessor edges.
-/// - Otherwise verifies the C18 relationship under the caller's query policy, checks for
-///   a prior authenticated revision with a distinct content digest on the same normalized
-///   rendition (for original-byte updates), and walks up to 64 source-scoped C18
-///   `prov:wasRevisionOf` renditions using authenticated `(SourceRevision, Rendition)`
-///   correspondence and chronology recovery.
+/// - When the revision IRI this batch would mint already exists as an authenticated record
+///   in `t.source_graph`, returns [`RevisionLink::Existing`] so multi-profile
+///   re-ingestion preserves the immutable revision without disclosing masked edges.
+/// - Otherwise verifies the C18 relationship under the caller's query policy at
+///   `at_commit`, combines same-rendition prior byte variants with source-attributable
+///   C18 `prov:wasRevisionOf` predecessors across up to 64 visited renditions, and
+///   omits `prov:wasRevisionOf` whenever lineage is ambiguous, includes an
+///   unattributable shared transition, or would require choosing from a partial frontier.
 #[allow(clippy::too_many_arguments)]
 fn predecessor_revision(
     r: &Run,
@@ -603,6 +701,7 @@ fn predecessor_revision(
     c18_graph: &str,
     cur_rendition: &str,
     planned_prev_rendition: Option<&str>,
+    at_commit: u64,
 ) -> Result<RevisionLink, Failed> {
     r.check()?;
     let Some(access) = crate::evidence::policy(
@@ -640,6 +739,7 @@ fn predecessor_revision(
     let mut resolution =
         sparkles::evidence::resolve::Resolution::with_memory(control.clone(), mem_limit)
             .map_err(resolve_err)?;
+    resolution.pin_commit(&t.main.dataset, &t.logical.dataset, at_commit);
     let mut held = resolution.preparation().reserve(0).map_err(resolve_err)?;
 
     let prov_was_revision_of = NamedNode::new_unchecked(PROV_WAS_REVISION_OF);
@@ -655,7 +755,7 @@ fn predecessor_revision(
         RecordKind::SourceRevision,
     )? && v.graph == t.source_graph
     {
-        let (objs, truncated) = resolution
+        let objs = resolution
             .objects_in_graph(
                 "predecessor",
                 &t.main.dataset,
@@ -668,10 +768,10 @@ fn predecessor_revision(
                 &mut remaining_scans,
             )
             .map_err(resolve_err)?;
-        if truncated {
+        if objs.is_truncated() {
             return Err(incomplete_lineage());
         }
-        let previous = if let [prev] = objs.as_slice()
+        let previous = if let [prev] = objs.nodes()
             && *prev != new_rev_iri
             && matches!(
                 verify_record(
@@ -693,7 +793,7 @@ fn predecessor_revision(
         });
     }
 
-    // 2. Verify C18 visibility under the caller's Endpoint::Query policy.
+    // 2. Verify C18 visibility under the caller's Endpoint::Query policy at at_commit.
     let (Ok(c18_g), Ok(cur_rend)) = (NamedNode::new(c18_graph), NamedNode::new(cur_rendition))
     else {
         return Ok(RevisionLink::New { previous: None });
@@ -745,7 +845,7 @@ fn predecessor_revision(
     //    in t.source_graph for this (source, source_key).
     let ev_source_key = NamedNode::new_unchecked(EV_SOURCE_KEY);
     let sk_term = Term::Literal(Literal::new_simple_literal(source_key));
-    let (rev_nodes, truncated) = resolution
+    let rev_nodes = resolution
         .subjects_in_graph(
             "predecessor",
             &t.main.dataset,
@@ -758,7 +858,7 @@ fn predecessor_revision(
             &mut remaining_scans,
         )
         .map_err(resolve_err)?;
-    if truncated {
+    if rev_nodes.is_truncated() {
         return Err(incomplete_lineage());
     }
     if rev_nodes.is_empty() {
@@ -774,12 +874,12 @@ fn predecessor_revision(
     let source_term = Term::NamedNode(source.clone());
 
     let mut candidates: Vec<LineageCandidate> = Vec::new();
-    for rev in rev_nodes {
+    for rev in rev_nodes.iter() {
         resolution.preparation().check().map_err(resolve_err)?;
         #[cfg(test)]
         t.main.store.failpoint("ingest-claims-candidate-enum");
         resolution.preparation().check().map_err(resolve_err)?;
-        if rev == new_rev_iri {
+        if *rev == new_rev_iri {
             continue;
         }
         let is_rev = resolution
@@ -789,7 +889,7 @@ fn predecessor_revision(
                 &t.logical.dataset,
                 &access,
                 &t.source_graph,
-                &rev,
+                rev,
                 &rdf_type,
                 &ev_source_revision_term,
             )
@@ -804,7 +904,7 @@ fn predecessor_revision(
                 &t.logical.dataset,
                 &access,
                 &t.source_graph,
-                &rev,
+                rev,
                 &prov_specialization_of,
                 &source_term,
             )
@@ -812,10 +912,10 @@ fn predecessor_revision(
         if !matches_source {
             continue;
         }
-        let Ok(rev_key) = RecordKey::new(rev.as_str()) else {
+        if RecordKey::new(rev.as_str()).is_err() {
             continue;
-        };
-        let (ev_rends, truncated) = resolution
+        }
+        let ev_rends = resolution
             .subjects_in_graph(
                 "predecessor",
                 &t.main.dataset,
@@ -828,10 +928,10 @@ fn predecessor_revision(
                 &mut remaining_scans,
             )
             .map_err(resolve_err)?;
-        if truncated {
+        if ev_rends.is_truncated() {
             return Err(incomplete_lineage());
         }
-        for ev_rend in ev_rends {
+        for ev_rend in ev_rends.iter() {
             resolution.preparation().check().map_err(resolve_err)?;
             let is_rend = resolution
                 .has_triple(
@@ -840,7 +940,7 @@ fn predecessor_revision(
                     &t.logical.dataset,
                     &access,
                     &t.source_graph,
-                    &ev_rend,
+                    ev_rend,
                     &rdf_type,
                     &ev_rendition_term,
                 )
@@ -848,26 +948,26 @@ fn predecessor_revision(
             if !is_rend {
                 continue;
             }
-            let (ops, truncated) = resolution
+            let ops = resolution
                 .objects_in_graph(
                     "predecessor",
                     &t.main.dataset,
                     &t.logical.dataset,
                     &access,
                     &t.source_graph,
-                    &ev_rend,
+                    ev_rend,
                     &ev_availability_receipt,
                     2,
                     &mut remaining_scans,
                 )
                 .map_err(resolve_err)?;
-            if truncated {
+            if ops.is_truncated() {
                 return Err(incomplete_lineage());
             }
-            let [rend_receipt] = ops.as_slice() else {
+            let [rend_receipt] = ops.nodes() else {
                 continue;
             };
-            let (whos, truncated) = resolution
+            let whos = resolution
                 .objects_in_graph(
                     "predecessor",
                     &t.main.dataset,
@@ -880,30 +980,51 @@ fn predecessor_revision(
                     &mut remaining_scans,
                 )
                 .map_err(resolve_err)?;
-            if truncated {
+            if whos.is_truncated() {
                 return Err(incomplete_lineage());
             }
-            let [rend_who] = whos.as_slice() else {
+            let [rend_who] = whos.nodes() else {
                 continue;
             };
             if candidates.len() >= candidate_limit {
                 return Err(incomplete_lineage());
             }
-            let bytes = (rev.as_str().len()
-                + ev_rend.as_str().len()
-                + rend_receipt.as_str().len()
-                + rend_who.as_str().len()) as u64
-                + 256;
-            held.grow_by(bytes).map_err(resolve_err)?;
+            // Reserve ownership for every retained copy before allocating.
+            let rev_s = resolution
+                .preparation()
+                .copy_string(rev.as_str(), &mut held)
+                .map_err(resolve_err)?;
+            let rev_key_s = resolution
+                .preparation()
+                .copy_string(rev.as_str(), &mut held)
+                .map_err(resolve_err)?;
+            let ev_rend_s = resolution
+                .preparation()
+                .copy_string(ev_rend.as_str(), &mut held)
+                .map_err(resolve_err)?;
+            let rend_receipt_s = resolution
+                .preparation()
+                .copy_string(rend_receipt.as_str(), &mut held)
+                .map_err(resolve_err)?;
+            let rend_who_s = resolution
+                .preparation()
+                .copy_string(rend_who.as_str(), &mut held)
+                .map_err(resolve_err)?;
+            held.grow_by(std::mem::size_of::<LineageCandidate>() as u64)
+                .map_err(resolve_err)?;
+            candidates
+                .try_reserve(1)
+                .map_err(|_| resolve_err(resolution.preparation().exhausted()))?;
             candidates.push(LineageCandidate {
-                rev: rev.clone(),
-                rev_key: rev_key.clone(),
-                ev_rend,
-                rend_receipt: rend_receipt.clone(),
-                rend_who: rend_who.clone(),
+                rev: NamedNode::new_unchecked(rev_s),
+                rev_key: RecordKey::new(rev_key_s).expect("validated non-empty IRI"),
+                ev_rend: NamedNode::new_unchecked(ev_rend_s),
+                rend_receipt: NamedNode::new_unchecked(rend_receipt_s),
+                rend_who: NamedNode::new_unchecked(rend_who_s),
             });
         }
     }
+    drop(rev_nodes);
     if candidates.is_empty() {
         return Ok(RevisionLink::New { previous: None });
     }
@@ -953,7 +1074,7 @@ fn predecessor_revision(
             if exclude_digest.is_some() && v_rev.content_digest == exclude_digest {
                 continue;
             }
-            let (whos, truncated) = resolution
+            let whos = resolution
                 .objects_in_graph(
                     "predecessor",
                     &t.main.dataset,
@@ -966,15 +1087,27 @@ fn predecessor_revision(
                     remaining_scans,
                 )
                 .map_err(resolve_err)?;
-            if truncated {
+            if whos.is_truncated() {
                 return Err(incomplete_lineage());
             }
-            let is_other_principal = !matches!(whos.as_slice(), [w] if w == principal);
-            held.grow_by((cand.rev.as_str().len() + rend_iri.as_str().len()) as u64 + 128)
+            let is_other_principal = !matches!(whos.nodes(), [w] if w == principal);
+            drop(whos);
+            let rend_copy = resolution
+                .preparation()
+                .copy_string(rend_iri.as_str(), held)
                 .map_err(resolve_err)?;
+            let rev_copy = resolution
+                .preparation()
+                .copy_string(cand.rev.as_str(), held)
+                .map_err(resolve_err)?;
+            held.grow_by(std::mem::size_of::<MatchedRev>() as u64)
+                .map_err(resolve_err)?;
+            matched
+                .try_reserve(1)
+                .map_err(|_| resolve_err(resolution.preparation().exhausted()))?;
             matched.push(MatchedRev {
-                c18_rendition: rend_iri.clone(),
-                iri: cand.rev.clone(),
+                c18_rendition: NamedNode::new_unchecked(rend_copy),
+                iri: NamedNode::new_unchecked(rev_copy),
                 is_other_principal,
                 branch: v_rev.receipt.branch,
                 commit: v_rev.receipt.commit,
@@ -983,13 +1116,16 @@ fn predecessor_revision(
         Ok(matched)
     };
 
-    // Read all query-visible, source-scoped C18 prov:wasRevisionOf predecessors of `rend`.
+    // Read all query-visible C18 prov:wasRevisionOf predecessors of `rend` that are
+    // unambiguously attributable to `source` in `c18_g`. If a predecessor belongs to
+    // `source` and shares another visible source with `rend`, C18's unqualified edge
+    // cannot distinguish which source made the transition and is treated as ambiguous.
     let edge_limit = limits.max_rows.min(MAX_C18_EDGES_PER_NODE);
     let c18_predecessors = |resolution: &mut sparkles::evidence::resolve::Resolution,
                             remaining_scans: &mut u64,
                             rend: &NamedNode|
-     -> Result<Vec<NamedNode>, Failed> {
-        let (objs, truncated) = resolution
+     -> Result<C18Predecessors, Failed> {
+        let objs = resolution
             .objects_in_graph(
                 "predecessor",
                 &t.main.dataset,
@@ -1002,38 +1138,85 @@ fn predecessor_revision(
                 remaining_scans,
             )
             .map_err(resolve_err)?;
-        if truncated {
+        if objs.is_truncated() {
             return Err(incomplete_lineage());
         }
+        if objs.is_empty() {
+            let empty_held = resolution.preparation().reserve(0).map_err(resolve_err)?;
+            return Ok(C18Predecessors::List(Vec::new(), empty_held));
+        }
+        let rend_sources = resolution
+            .objects_in_graph(
+                "predecessor",
+                &t.main.dataset,
+                &t.logical.dataset,
+                &access,
+                &c18_g,
+                rend,
+                &prov_was_derived_from,
+                edge_limit,
+                remaining_scans,
+            )
+            .map_err(resolve_err)?;
+        if rend_sources.is_truncated() {
+            return Err(incomplete_lineage());
+        }
+        let rend_has_source = rend_sources.iter().any(|s| s == source);
+        let mut out_held = resolution.preparation().reserve(0).map_err(resolve_err)?;
         let mut out = Vec::new();
-        for prev in objs {
+        for prev in objs.iter() {
             resolution.preparation().check().map_err(resolve_err)?;
-            let derived_from_source = resolution
-                .has_triple(
+            let prev_sources = resolution
+                .objects_in_graph(
                     "predecessor",
                     &t.main.dataset,
                     &t.logical.dataset,
                     &access,
                     &c18_g,
-                    &prev,
+                    prev,
                     &prov_was_derived_from,
-                    &source_term,
+                    edge_limit,
+                    remaining_scans,
                 )
                 .map_err(resolve_err)?;
-            if derived_from_source {
-                out.push(prev);
+            if prev_sources.is_truncated() {
+                return Err(incomplete_lineage());
             }
+            if !prev_sources.iter().any(|s| s == source) {
+                continue;
+            }
+            let shared_with_other = !rend_has_source
+                || prev_sources
+                    .iter()
+                    .any(|ps| ps != source && rend_sources.iter().any(|rs| rs == ps));
+            if shared_with_other {
+                return Ok(C18Predecessors::Ambiguous);
+            }
+            let copy = resolution
+                .preparation()
+                .copy_string(prev.as_str(), &mut out_held)
+                .map_err(resolve_err)?;
+            out_held
+                .grow_by(std::mem::size_of::<NamedNode>() as u64)
+                .map_err(resolve_err)?;
+            out.try_reserve(1)
+                .map_err(|_| resolve_err(resolution.preparation().exhausted()))?;
+            out.push(NamedNode::new_unchecked(copy));
         }
-        Ok(out)
+        Ok(C18Predecessors::List(out, out_held))
     };
 
-    // 4. Check immediate predecessor (or same-rendition changed-original-bytes) first,
-    //    then walk source-scoped C18 lineage with bounded BFS.
+    // 4. Check immediate predecessor (or combine same-rendition byte variants with C18
+    //    predecessors), then walk source-attributable C18 lineage with bounded BFS.
     let mut visited: BTreeSet<String> = BTreeSet::new();
     let mut queue: VecDeque<NamedNode> = VecDeque::new();
-    held.grow_by(cur_rend.as_str().len() as u64 + 64)
+    let mut frontier: Vec<MatchedRev> = Vec::new();
+    let cur_seen = resolution
+        .preparation()
+        .copy_string(cur_rend.as_str(), &mut held)
         .map_err(resolve_err)?;
-    visited.insert(cur_rend.as_str().to_string());
+    held.grow_by(64).map_err(resolve_err)?;
+    visited.insert(cur_seen);
 
     if let Some(prev_node) = immediate_prev {
         let hop0 = match_rendition(
@@ -1054,23 +1237,47 @@ fn predecessor_revision(
             )?;
             return Ok(RevisionLink::New { previous: chosen });
         }
-        if visited.insert(prev_node.as_str().to_string()) {
-            held.grow_by(prev_node.as_str().len() as u64 + 64)
+        if !visited.contains(prev_node.as_str()) {
+            let prev_seen = resolution
+                .preparation()
+                .copy_string(prev_node.as_str(), &mut held)
                 .map_err(resolve_err)?;
+            held.grow_by(64).map_err(resolve_err)?;
+            visited.insert(prev_seen);
         }
-        for pred in c18_predecessors(&mut resolution, &mut remaining_scans, &prev_node)? {
-            if visited.len() >= MAX_LINEAGE_HOPS {
-                break;
+        match c18_predecessors(&mut resolution, &mut remaining_scans, &prev_node)? {
+            C18Predecessors::Ambiguous => {
+                return Ok(RevisionLink::New { previous: None });
             }
-            if visited.insert(pred.as_str().to_string()) {
-                held.grow_by(pred.as_str().len() as u64 + 64)
-                    .map_err(resolve_err)?;
-                queue.push_back(pred);
+            C18Predecessors::List(preds, _preds_held) => {
+                for pred in preds {
+                    if visited.contains(pred.as_str()) {
+                        continue;
+                    }
+                    if visited.len() >= MAX_LINEAGE_HOPS {
+                        return Ok(RevisionLink::New { previous: None });
+                    }
+                    let pred_seen = resolution
+                        .preparation()
+                        .copy_string(pred.as_str(), &mut held)
+                        .map_err(resolve_err)?;
+                    let pred_q = NamedNode::new_unchecked(
+                        resolution
+                            .preparation()
+                            .copy_string(pred.as_str(), &mut held)
+                            .map_err(resolve_err)?,
+                    );
+                    held.grow_by(128).map_err(resolve_err)?;
+                    visited.insert(pred_seen);
+                    queue.push_back(pred_q);
+                }
             }
         }
     } else {
         // Same normalized text with updated original bytes produces a new revision_digest
-        // on the same C18 rendition with no new C18 prov:wasRevisionOf edge.
+        // on the same C18 rendition; a restored rendition also carries C18 edges to the
+        // rendition it replaced. Collect both into the frontier and resolve chronology
+        // across all candidates.
         let same_rend = match_rendition(
             &mut resolution,
             &mut held,
@@ -1078,30 +1285,37 @@ fn predecessor_revision(
             &cur_rend,
             Some(revision_digest),
         )?;
-        if !same_rend.is_empty() {
-            let chosen = select_from_frontier(
-                &mut resolution,
-                t,
-                &access,
-                &prov_was_revision_of,
-                same_rend,
-                &mut remaining_scans,
-            )?;
-            return Ok(RevisionLink::New { previous: chosen });
-        }
-        for pred in c18_predecessors(&mut resolution, &mut remaining_scans, &cur_rend)? {
-            if visited.len() >= MAX_LINEAGE_HOPS {
-                break;
+        frontier.extend(same_rend);
+        match c18_predecessors(&mut resolution, &mut remaining_scans, &cur_rend)? {
+            C18Predecessors::Ambiguous => {
+                return Ok(RevisionLink::New { previous: None });
             }
-            if visited.insert(pred.as_str().to_string()) {
-                held.grow_by(pred.as_str().len() as u64 + 64)
-                    .map_err(resolve_err)?;
-                queue.push_back(pred);
+            C18Predecessors::List(preds, _preds_held) => {
+                for pred in preds {
+                    if visited.contains(pred.as_str()) {
+                        continue;
+                    }
+                    if visited.len() >= MAX_LINEAGE_HOPS {
+                        return Ok(RevisionLink::New { previous: None });
+                    }
+                    let pred_seen = resolution
+                        .preparation()
+                        .copy_string(pred.as_str(), &mut held)
+                        .map_err(resolve_err)?;
+                    let pred_q = NamedNode::new_unchecked(
+                        resolution
+                            .preparation()
+                            .copy_string(pred.as_str(), &mut held)
+                            .map_err(resolve_err)?,
+                    );
+                    held.grow_by(128).map_err(resolve_err)?;
+                    visited.insert(pred_seen);
+                    queue.push_back(pred_q);
+                }
             }
         }
     }
 
-    let mut frontier: Vec<MatchedRev> = Vec::new();
     while let Some(rend) = queue.pop_front() {
         resolution.preparation().check().map_err(resolve_err)?;
         let hits = match_rendition(
@@ -1115,14 +1329,32 @@ fn predecessor_revision(
             frontier.extend(hits);
             continue;
         }
-        for pred in c18_predecessors(&mut resolution, &mut remaining_scans, &rend)? {
-            if visited.len() >= MAX_LINEAGE_HOPS {
-                break;
+        match c18_predecessors(&mut resolution, &mut remaining_scans, &rend)? {
+            C18Predecessors::Ambiguous => {
+                return Ok(RevisionLink::New { previous: None });
             }
-            if visited.insert(pred.as_str().to_string()) {
-                held.grow_by(pred.as_str().len() as u64 + 64)
-                    .map_err(resolve_err)?;
-                queue.push_back(pred);
+            C18Predecessors::List(preds, _preds_held) => {
+                for pred in preds {
+                    if visited.contains(pred.as_str()) {
+                        continue;
+                    }
+                    if visited.len() >= MAX_LINEAGE_HOPS {
+                        return Ok(RevisionLink::New { previous: None });
+                    }
+                    let pred_seen = resolution
+                        .preparation()
+                        .copy_string(pred.as_str(), &mut held)
+                        .map_err(resolve_err)?;
+                    let pred_q = NamedNode::new_unchecked(
+                        resolution
+                            .preparation()
+                            .copy_string(pred.as_str(), &mut held)
+                            .map_err(resolve_err)?,
+                    );
+                    held.grow_by(128).map_err(resolve_err)?;
+                    visited.insert(pred_seen);
+                    queue.push_back(pred_q);
+                }
             }
         }
     }
@@ -1587,8 +1819,22 @@ fn merged(a: &Value, b: &Value) -> Value {
     out
 }
 
+/// How a moved branch head is handled during publication.
+enum ReplanMode<'a> {
+    /// Upload mode: replan the C18 `register_converted` call and recompute lineage at
+    /// the new planned head.
+    Upload { reg: &'a Map<String, Value> },
+    /// Registered-source mode: confirm the source still points to the same live
+    /// rendition and digest at the new head before recomputing lineage; if the source
+    /// changed, refuse with `409 head-changed`.
+    Source {
+        rendition: &'a str,
+        rendition_digest: Sha256Digest,
+    },
+}
+
 /// Context for refreshing the revision's `prov:wasRevisionOf` link when a moved head
-/// forces the C18 registration to be planned again.
+/// requires replanning.
 struct Replan<'a> {
     principal: &'a NamedNode,
     source: &'a NamedNode,
@@ -1596,19 +1842,19 @@ struct Replan<'a> {
     revision_digest: Sha256Digest,
     c18_graph: &'a str,
     revision_template: SourceRevisionInput,
+    mode: ReplanMode<'a>,
 }
 
-/// Publish the batch with the registration planned at `planned.head`, planning again
-/// when the head moved.
+/// Publish the batch fenced at `head` (and carrying `planned.changes` in upload mode),
+/// resolving `prov:wasRevisionOf` at `head` and replanning when the head moved.
 #[allow(clippy::too_many_arguments)]
 fn publish(
     r: &Run,
     t: &Target,
     input: &mut EvidenceInput,
-    reg: Option<&Map<String, Value>>,
+    mut head: u64,
     mut planned: Option<Planned>,
-    replan: Option<&Replan<'_>>,
-    mut link: RevisionLink,
+    replan: &Replan<'_>,
     idempotency_key: &str,
     message: String,
 ) -> Result<(sparkles::evidence::Proposed, Option<Value>, RevisionLink), Failed> {
@@ -1616,8 +1862,122 @@ fn publish(
     let p = r.ctx.principal.clone();
     let control = control_of(r);
     let mut attempt = 0;
+
+    let refresh_for_moved_head =
+        |planned: &mut Option<Planned>, head: &mut u64| -> Result<(), Failed> {
+            match &replan.mode {
+                ReplanMode::Upload { reg } => {
+                    let replanned = plan(r, reg, t)?;
+                    *head = replanned.head;
+                    *planned = Some(replanned);
+                    Ok(())
+                }
+                ReplanMode::Source {
+                    rendition,
+                    rendition_digest,
+                } => {
+                    let branch = (t.branch != sparkles::branch::MAIN).then_some(t.branch.as_str());
+                    let listed = r.tool(
+                        "list_sources",
+                        json!({ "graphs": [format!("<{}>", replan.c18_graph)], "limit": 50 }),
+                        branch,
+                    )?;
+                    let prefixes = &listed["prefixes"];
+                    let still_current = listed["sources"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|s| s.get("invalidatedAt").is_none())
+                        .any(|s| {
+                            let g = expand_iri(s["graph"].as_str().unwrap_or(""), prefixes);
+                            let i = expand_iri(s["source"].as_str().unwrap_or(""), prefixes);
+                            let rd = expand_iri(s["rendition"].as_str().unwrap_or(""), prefixes);
+                            g == replan.c18_graph
+                                && i == replan.source.as_str()
+                                && rd == *rendition
+                                && recorded_digest(&s["digest"], rendition_digest)
+                                    == replan.revision_digest
+                        });
+                    if !still_current {
+                        return Err(failed(
+                            "head-changed",
+                            409,
+                            "the registered source changed while claims were extracted",
+                        ));
+                    }
+                    *head = listed["commit"]
+                        .as_u64()
+                        .unwrap_or_else(|| t.logical.store.snapshot().commit);
+                    Ok(())
+                }
+            }
+        };
+
     loop {
         r.check()?;
+        // If the branch head already moved since planning/reading, refresh before
+        // running predecessor resolution so non-retained commits do not fail early.
+        if t.logical.store.snapshot().commit != head {
+            if attempt >= REPLANS {
+                return Err(failed(
+                    "head-changed",
+                    409,
+                    "the branch head moved before publication",
+                ));
+            }
+            attempt += 1;
+            refresh_for_moved_head(&mut planned, &mut head)?;
+        }
+        let (cur_rend, prev_rend) = match (&replan.mode, &planned) {
+            (ReplanMode::Upload { .. }, Some(pl)) => {
+                let rend = expand_iri(
+                    pl.registered["rendition"].as_str().unwrap_or(""),
+                    &pl.registered["prefixes"],
+                );
+                let prev = pl
+                    .registered
+                    .get("previousRendition")
+                    .and_then(Value::as_str)
+                    .map(|s| expand_iri(s, &pl.registered["prefixes"]));
+                (rend, prev)
+            }
+            (ReplanMode::Source { rendition, .. }, _) => ((*rendition).to_string(), None),
+            (ReplanMode::Upload { .. }, None) => {
+                return Err(failed("error", 500, "upload publication missing C18 plan"));
+            }
+        };
+        let link = match predecessor_revision(
+            r,
+            t,
+            replan.principal,
+            replan.source,
+            replan.source_key,
+            replan.revision_digest,
+            replan.c18_graph,
+            &cur_rend,
+            prev_rend.as_deref(),
+            head,
+        ) {
+            Ok(link) => link,
+            Err(f)
+                if f.0["code"] == "evidence-unavailable"
+                    && t.logical.store.snapshot().commit != head =>
+            {
+                if attempt >= REPLANS {
+                    return Err(failed(
+                        "head-changed",
+                        409,
+                        "the branch head moved before publication",
+                    ));
+                }
+                attempt += 1;
+                refresh_for_moved_head(&mut planned, &mut head)?;
+                continue;
+            }
+            Err(f) => return Err(f),
+        };
+        apply_revision_link(input, &replan.revision_template, &link);
+
         let mut options =
             sparkles::evidence::ProposeOptions::new(crate::evidence::principal_iri(&p));
         options.idempotency_key = Some(idempotency_key.to_string());
@@ -1635,8 +1995,8 @@ fn publish(
             crate::evidence::caller_fence(st.clone(), &t.main, p.clone())
                 .map_err(|e| api(e.into()))?,
         );
+        options.if_head = Some(head);
         if let Some(pl) = &planned {
-            options.if_head = Some(pl.head);
             options.ordinary = Some(pl.changes.clone());
         }
         t.main.store.failpoint("ingest-claims-before-publish");
@@ -1652,36 +2012,9 @@ fn publish(
             Err(e) => {
                 let f = api(e);
                 let moved = f.0["code"] == "head-changed";
-                if moved
-                    && attempt < REPLANS
-                    && let Some(reg) = reg
-                {
+                if moved && attempt < REPLANS {
                     attempt += 1;
-                    let replanned = plan(r, reg, t)?;
-                    if let Some(rp) = replan {
-                        let rend = expand_iri(
-                            replanned.registered["rendition"].as_str().unwrap_or(""),
-                            &replanned.registered["prefixes"],
-                        );
-                        let prev_rend = replanned
-                            .registered
-                            .get("previousRendition")
-                            .and_then(Value::as_str)
-                            .map(|s| expand_iri(s, &replanned.registered["prefixes"]));
-                        link = predecessor_revision(
-                            r,
-                            t,
-                            rp.principal,
-                            rp.source,
-                            rp.source_key,
-                            rp.revision_digest,
-                            rp.c18_graph,
-                            &rend,
-                            prev_rend.as_deref(),
-                        )?;
-                        apply_revision_link(input, &rp.revision_template, &link);
-                    }
-                    planned = Some(replanned);
+                    refresh_for_moved_head(&mut planned, &mut head)?;
                     continue;
                 }
                 return Err(f);
@@ -1917,29 +2250,17 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         &revision_digest,
     )?;
     ctx.progress.status(Status::Writing, 0.9, None);
+    #[cfg(test)]
+    t.main.store.failpoint("ingest-claims-after-extract");
     let source_node =
         NamedNode::new(source.clone()).map_err(|e| failed("error", 500, e.to_string()))?;
     let sk = source_key(&t, &source, &graph)?;
-    let prev_rend = registered
-        .get("previousRendition")
-        .and_then(Value::as_str)
-        .map(|s| expand_iri(s, &prefixes));
-    let revision_link = predecessor_revision(
-        r,
-        &t,
-        &principal,
-        &source_node,
-        &sk,
-        revision_digest,
-        &graph,
-        &rendition,
-        prev_rend.as_deref(),
-    )?;
+    let planned_head = planned.head;
     let src = Source {
         source: source_node.clone(),
         source_key: sk.clone(),
         revision_digest,
-        revision_link: revision_link.clone(),
+        revision_link: RevisionLink::New { previous: None },
         locator: req
             .url
             .as_deref()
@@ -1971,15 +2292,15 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         revision_digest,
         c18_graph: &graph,
         revision_template: rev_template,
+        mode: ReplanMode::Upload { reg: &reg },
     };
     let (proposed, registered, final_link) = publish(
         r,
         &t,
         &mut b.input,
-        Some(&reg),
+        planned_head,
         Some(planned),
-        Some(&replan),
-        revision_link,
+        &replan,
         &key,
         message,
     )?;
@@ -2112,6 +2433,8 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
         &revision_digest,
     )?;
     ctx.progress.status(Status::Writing, 0.9, None);
+    #[cfg(test)]
+    t.main.store.failpoint("ingest-claims-after-extract");
     let media_type = read.found["format"]
         .as_str()
         .unwrap_or("text/markdown")
@@ -2119,28 +2442,21 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
     let source_node =
         NamedNode::new(source_iri.clone()).map_err(|e| failed("error", 500, e.to_string()))?;
     let sk = source_key(&t, &source_iri, &read.graph)?;
-    let revision_link = predecessor_revision(
-        r,
-        &t,
-        &principal,
-        &source_node,
-        &sk,
-        revision_digest,
-        &read.graph,
-        &read.rendition,
-        None,
-    )?;
+    let read_head = read
+        .commit
+        .unwrap_or_else(|| t.logical.store.snapshot().commit);
     let src = Source {
-        source: source_node,
-        source_key: sk,
+        source: source_node.clone(),
+        source_key: sk.clone(),
         revision_digest,
-        revision_link: revision_link.clone(),
+        revision_link: RevisionLink::New { previous: None },
         locator: None,
         rendition_key: read.rendition.clone(),
         media_type: &media_type,
         format: "registered",
         text: &read.text,
     };
+    let rev_template = revision_template(&src);
     let c = claims_of(
         r,
         &vocab,
@@ -2151,17 +2467,20 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
     )?;
     let mut b = batch(&src, c, &control_of(r))?;
     let message = format!("Ingest claims from {source_iri}");
-    let (proposed, _, final_link) = publish(
-        r,
-        &t,
-        &mut b.input,
-        None,
-        None,
-        None,
-        revision_link,
-        &key,
-        message,
-    )?;
+    let replan = Replan {
+        principal: &principal,
+        source: &source_node,
+        source_key: &sk,
+        revision_digest,
+        c18_graph: &read.graph,
+        revision_template: rev_template,
+        mode: ReplanMode::Source {
+            rendition: &read.rendition,
+            rendition_digest,
+        },
+    };
+    let (proposed, _, final_link) =
+        publish(r, &t, &mut b.input, read_head, None, &replan, &key, message)?;
     if let Some(prev) = final_link.previous() {
         out["previousRevision"] = prev.as_str().into();
     }

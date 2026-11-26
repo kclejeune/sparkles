@@ -617,3 +617,178 @@ fn static_graph_denials_hold_under_an_undecided_guard() {
         "incomplete-evidence"
     );
 }
+
+/// `GraphNodes` returned by `objects_in_graph` and `subjects_in_graph` keep their
+/// preparation memory reservation live until dropped, so simultaneously live nested
+/// results cannot exceed the configured allowance in aggregate.
+#[test]
+fn graph_nodes_retain_memory_charge_and_reject_nested_overflow() {
+    let (_dir, s) = setup();
+    let g = iri("urn:mem-g");
+    let p = iri("urn:mem-p");
+    let s1 = iri("urn:mem-s1");
+    let o_shared = iri("urn:mem-shared");
+    // Insert 40 long IRIs (~1 KiB each, ~42 KiB per result set) shared across lookups
+    // so delta-vocabulary overhead stays small relative to multiple live GraphNodes.
+    let pad = "x".repeat(1000);
+    let mut ins = String::from("INSERT DATA { GRAPH <urn:mem-g> {\n");
+    for i in 0..40 {
+        ins.push_str(&format!(
+            "  <urn:mem-s1> <urn:mem-p> <urn:node:{i:02}:{pad}> .\n\
+             <urn:node:{i:02}:{pad}> <urn:mem-p> <urn:mem-shared> .\n"
+        ));
+    }
+    ins.push_str("} }");
+    upd(&s, &ins);
+
+    // 1. Live GraphNodes hold memory until dropped.
+    let mut r = resolver();
+    let mut scans = 10_000;
+    let first = r
+        .objects_in_graph("k", &s, &s, &all(), &g, &s1, &p, 100, &mut scans)
+        .unwrap();
+    assert_eq!(first.len(), 40);
+    let used_with_first = r.preparation().inner_used();
+    let second = r
+        .subjects_in_graph(
+            "k",
+            &s,
+            &s,
+            &all(),
+            &g,
+            &p,
+            &Term::NamedNode(o_shared.clone()),
+            100,
+            &mut scans,
+        )
+        .unwrap();
+    assert_eq!(second.len(), 40);
+    let used_with_both = r.preparation().inner_used();
+    let one_set = used_with_both.saturating_sub(used_with_first);
+    assert!(
+        one_set > 30_000,
+        "second live GraphNodes must add to preparation usage: {used_with_first} -> {used_with_both}"
+    );
+    drop(second);
+    let used_after_second_drop = r.preparation().inner_used();
+    assert!(
+        used_after_second_drop < used_with_both - 30_000,
+        "dropping second GraphNodes must release its reservation: {used_with_both} -> {used_after_second_drop}"
+    );
+    drop(first);
+    let base_used = r.preparation().inner_used();
+    assert!(
+        base_used < used_with_first - 30_000,
+        "dropping first GraphNodes must release its reservation: {used_with_first} -> {base_used}"
+    );
+
+    // 2. Under an aggregate cap that comfortably fits any single lookup (including
+    //    delta-vocabulary workspace) but cannot hold 6 simultaneous live GraphNodes,
+    //    retaining nested results fails with incomplete-evidence, and dropping them
+    //    frees the allowance so a subsequent lookup succeeds.
+    let cap = base_used + one_set * 5;
+    let mut tight = Resolver::new(Control::none(), cap).unwrap();
+    let mut scans = 10_000;
+    let mut live = Vec::new();
+    let mut overflow = None;
+    for _ in 0..8 {
+        match tight.objects_in_graph("k", &s, &s, &all(), &g, &s1, &p, 100, &mut scans) {
+            Ok(nodes) => {
+                assert_eq!(nodes.len(), 40);
+                live.push(nodes);
+            }
+            Err(e) => {
+                overflow = Some(e);
+                break;
+            }
+        }
+    }
+    assert!(
+        !live.is_empty(),
+        "at least one GraphNodes lookup must fit within cap={cap}"
+    );
+    let err = overflow.expect("holding nested GraphNodes live must exceed aggregate cap");
+    assert_eq!(err.code(), "incomplete-evidence");
+    live.clear();
+    let after_drop = tight
+        .subjects_in_graph(
+            "k",
+            &s,
+            &s,
+            &all(),
+            &g,
+            &p,
+            &Term::NamedNode(o_shared),
+            100,
+            &mut scans,
+        )
+        .unwrap();
+    assert_eq!(after_drop.len(), 40);
+}
+
+/// Rows in a graph denied by `GraphAccess` must not decrement `remaining_scans` or alter
+/// the outcome of `subjects_in_graph` on a readable graph.
+#[test]
+fn subjects_in_graph_ignores_denied_graph_rows_for_scan_budget() {
+    let (_dir, s) = setup();
+    let allowed = iri("urn:allowed");
+    let p = iri("urn:p-shared");
+    let obj = Term::Literal(Literal::new_simple_literal("same-key"));
+    let mut ins = String::from("INSERT DATA {\n");
+    ins.push_str("  GRAPH <urn:allowed> { <urn:ok:1> <urn:p-shared> \"same-key\" . <urn:ok:2> <urn:p-shared> \"same-key\" . }\n");
+    ins.push_str("  GRAPH <urn:denied> {\n");
+    for i in 0..40 {
+        ins.push_str(&format!(
+            "    <urn:hidden:{i:02}> <urn:p-shared> \"same-key\" .\n"
+        ));
+    }
+    ins.push_str("  }\n}");
+    upd(&s, &ins);
+
+    let access = Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(["urn:allowed"], &[])),
+        Graphs::none(),
+    ));
+    let mut r = resolver();
+    let mut scans = 5;
+    let found = r
+        .subjects_in_graph("k", &s, &s, &access, &allowed, &p, &obj, 10, &mut scans)
+        .unwrap();
+    assert_eq!(found.len(), 2);
+    assert!(!found.is_truncated());
+    assert_eq!(
+        scans, 3,
+        "only the 2 quads in the readable graph should consume remaining_scans"
+    );
+}
+
+/// `pin_commit` keeps `has_triple`, `objects_in_graph`, and `subjects_in_graph` on one
+/// historical snapshot even after newer commits advance the live branch head.
+#[test]
+fn pin_commit_keeps_graph_lookups_on_one_snapshot_after_head_advances() {
+    let (_dir, s) = setup();
+    // setup() inserted <urn:a> <urn:p> <urn:b> at commit 1 and deleted it at commit 2.
+    upd(
+        &s,
+        &format!("INSERT DATA {{ GRAPH <{G}> {{ <urn:a> <urn:p> <urn:c> }} }}"),
+    );
+    let g = iri(G);
+    let a = iri("urn:a");
+    let p = iri("urn:p");
+    let b = Term::NamedNode(iri("urn:b"));
+    let c = Term::NamedNode(iri("urn:c"));
+
+    let mut r = resolver();
+    r.pin_commit(&s, &s, 1);
+    assert!(r.has_triple("k", &s, &s, &all(), &g, &a, &p, &b).unwrap());
+    assert!(!r.has_triple("k", &s, &s, &all(), &g, &a, &p, &c).unwrap());
+    let mut scans = 100;
+    let objs = r
+        .objects_in_graph("k", &s, &s, &all(), &g, &a, &p, 10, &mut scans)
+        .unwrap();
+    assert_eq!(objs.nodes(), &[iri("urn:b")]);
+    let subjs = r
+        .subjects_in_graph("k", &s, &s, &all(), &g, &p, &b, 10, &mut scans)
+        .unwrap();
+    assert_eq!(subjs.nodes(), &[iri("urn:a")]);
+}

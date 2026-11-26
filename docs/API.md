@@ -13162,8 +13162,8 @@ no conflict. Otherwise it keeps the branch and gives the reason as `autoFallback
 `claims` task publishes an evidence batch and reports the evidence `operation`,
 `revision`, `evidenceRendition`, `records`, `recordCounts` and `previousRevision` (the
 linked prior evidence `SourceRevision` IRI, distinct from the C18 `previousRendition`,
-and omitted when no predecessor evidence revision is linked or when `outcome` is
-`already-proposed`).
+and omitted when no predecessor evidence revision is linked, when the recorded link is
+hidden from the caller or when `outcome` is `already-proposed`).
 
 The review page's sources carry `pages` with each page's number and start, and
 `ocrPages` and `omittedPages`, so the UI shows the page of each fact.

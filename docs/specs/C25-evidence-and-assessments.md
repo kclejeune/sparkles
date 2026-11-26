@@ -1938,15 +1938,23 @@ record and payload digests. Self-links and cycles within a batch are refused, an
 existing predecessor must resolve as an authenticated, caller-readable
 `ev:SourceRevision`. Claims ingestion sets `wasRevisionOf` automatically from the
 replaced C18 rendition's authenticated evidence source revision when the C18 relationship
-is visible under the caller's query policy, walking up to 64 source-scoped C18
+is visible under the caller's query policy, reading C18 edges and authenticating evidence
+records at one pinned branch commit (the registration plan head for uploads or the read
+commit for registered sources). It walks up to 64 source-attributable C18
 `prov:wasRevisionOf` renditions when intermediate renditions had no claims ingestion and
-also linking across original-byte updates that retain the same normalized rendition with a
-new content digest. When a reused rendition has several predecessor edges, chronology is
-recovered from authenticated evidence `prov:wasRevisionOf` ancestry and branch commit
-order, and `wasRevisionOf` is omitted if lineage remains ambiguous. When the same source
-revision already exists as an authenticated record in the target source-record graph,
-re-ingestion under another profile references that existing revision directly so its
-immutable record is preserved without disclosing masked edges.
+also combines prior original-byte variants on the same normalized rendition with C18
+predecessors so restorations and byte-only updates both resolve chronologically. When
+multiple candidates survive, chronology is recovered from authenticated evidence
+`prov:wasRevisionOf` ancestry across configured evidence graphs and branch commit order,
+and `wasRevisionOf` is omitted when lineage remains ambiguous, encounters an
+unattributable transition shared with another source, or would otherwise choose from a
+partial frontier past the 64-rendition walk bound. For registered-source runs whose branch
+head moves before publication, publication retries at the new head only while the source
+still resolves to the same live rendition and digest, and otherwise refuses with
+`head-changed` without writing. When the same source revision already exists as an
+authenticated record in the target source-record graph, re-ingestion under another profile
+references that existing revision directly so its immutable record is preserved without
+disclosing masked edges.
 
 The rejected alternative applies the supersession of C18 §7.9 and withdraws the earlier
 occurrences that the new extraction does not repeat. A model omitting a fact is not
