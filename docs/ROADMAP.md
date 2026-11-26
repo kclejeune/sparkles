@@ -21,8 +21,10 @@ completed items.
 The current priorities are engine correctness, performance and standard features in
 Wave A, followed by embedded agent memory and the ontology platform, including its
 editor, in Waves B and C, which run alongside them. Shared entity representation follows
-memory. Packaging, recovery and the API compatibility contract advance alongside capability
-completion. The [delivery priorities](#delivery-priorities) explain their dependencies.
+memory. Waves D, E and F then close the remaining partially complete capabilities,
+competitive benchmark and scale gaps, binding API parity, web UI completion and
+pre-release backup and encryption work ahead of the first release and API stabilization.
+The [delivery priorities](#delivery-priorities) explain their dependencies.
 The numbered tiers are the detailed backlog, and [Completed](#completed) records finished
 items.
 
@@ -199,10 +201,74 @@ Plan a later GPUI migration once the UI and its interactions have stabilized, wi
 measured performance and parity checks before the cutover. This work does not
 displace correctness repairs or performance recovery.
 
+### Wave D: core database and standards completeness
+
+Wave D completes the remaining partially complete database, reasoning, search, graph,
+validation and server capabilities in the [capability matrix](FEATURES.md#capability-status)
+once Waves A, B and C clear their prerequisites.
+
+* Incremental views and live queries complete F13 through graph and branch views,
+  commit-time maintenance, transports, per-fact provenance, recursion and the remaining
+  access and guard gaps (items 17, 221 to 227, 420 to 430, 528, 530, 531 and 1294 to
+  1298).
+* Reasoning and explanations complete the separate derived layer and canonical equality
+  representatives (items 9 and 941 to 943), OWL 2 QL extensions, per-pattern `auto`
+  selection and demand `DESCRIBE` (items 19, 190, 193, 757, 909, 910, 913, 985 and
+  986), result-cell explanation actions (item 285) and unbound why-not abduction (item
+  286).
+* Search, paths, graph algorithms and GeoSPARQL complete online, uncommitted and
+  historical full-text search, multi-field documents and Lucene analyzer parity (items
+  23, 35, 50, 250 and 251), vector quantization, caching and statistics (items 34 and
+  82), weighted path length bounds (items 275 and 276), Graphalytics acceptance and
+  background progress (item 8) and GeoSPARQL completion (item 24).
+* Storage, history, validation and server integration complete adaptive compaction
+  (item 14), pin rebasing, per-quad periods, graph feeds and settings history (item 52),
+  remote and archive cloning and relink (item 45), GraphQL Phase 2 (item 37), Fuseki
+  and ARQ compatibility leftovers (items 38, 39, 51 and 76), combined ShEx guards (item
+  54), shape-driven form gaps (items 612 to 615), OTLP metrics and degraded-index
+  startup (items 342 and 402), outbound notification bounds (item 785) and branch
+  preallocation quota accounting (items 560 and 561).
+
+### Wave E: competitive benchmarks and scale optimization
+
+Wave E closes the remaining competitive benchmark losses and large-scale performance
+gaps recorded in [BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) before the first
+release.
+
+* Benchmark coverage and large-scale gates complete sustained-write and competitive
+  refreshes (item 1), 100M BSBM and BI-driver reruns with noise controls (items 91, 290
+  to 293, 299, 306, 328 and 575 to 577), and cold-start I/O, counter-cost and 1.01B
+  dense export follow-ups (items 516, 572 to 574, 1273 and 1274).
+* Spill, group-commit and codec optimization settle the remaining spill execution and
+  cache accounting costs (items 40, 88 and 210), the parallel checkpoint reader tail
+  (items 170 and 448), FSST lookup costs (items 160 and 241) and dataset-local codec
+  settings (item 343), which also completes the pre-release format contract.
+
+### Wave F: bindings parity, web UI and operational completion
+
+Wave F finishes the binding APIs ahead of the compatibility policy in item 60 and
+completes the remaining web UI, virtual-graph, backup and encryption phases before
+cutting the first release artifacts of items 58 and 59.
+
+* Binding parity completes dynamic and foreign query callbacks (item 25), reusable
+  plans (item 32) and cross-binding async, progress and administration coverage (items
+  33, 40, 329 and 405) before API stabilization freezes the library contracts.
+* Web UI completion delivers live query profiling (item 27), server-cached large-graph
+  layouts and binary transfer (items 29 and 737 to 739), per-commit data-quality
+  timelines and the schema diagram (items 31, 120 and 121), visual query builder Phase
+  3 (item 101) and the remaining linked-view controls (items 140 to 142).
+* Mappings and virtual graphs complete Phase 1 source, conformance and function gaps
+  (items 43, 230 to 239, 404 and 450) followed by Phase 2 virtual graphs with pushdown.
+* Backup and encryption complete whole-server and multi-dataset backup and retention
+  (items 61 and 401) together with the adopted live-file and derived-index encryption
+  phases (item 65).
+
 ### How the waves share capacity
 
 The waves run in parallel, and each has its own capacity. Waves A and C take the
-capacity first, and Wave B runs when a stream is free of them. When work competes for gate, review or benchmark time, the
+capacity first, Wave B runs alongside them when a stream is free, and Waves D, E and F
+pull in ready items as Waves A, B and C finish so capacity stays saturated ahead of the
+first release. When work competes for gate, review or benchmark time, the
 dependency order and how ready the work is decide which goes first, not the wave it
 belongs to. The goal at the start of this section states what Sparkles optimizes
 for, and it does not order the waves.
