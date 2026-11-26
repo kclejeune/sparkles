@@ -128,6 +128,19 @@ pub(super) const CHUNK_ROWS: usize = 65_536;
 /// The least step by which the retained charge of the group state grows.
 pub(super) const RETAIN_STEP: u64 = 64 << 10;
 
+/// How an eager grouping enforces output limits while groups are inserted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EagerCheck {
+    /// Cursor / non-eager grouping: check `max_rows` only.
+    Off,
+    /// Eager precomputed sequential fallback while `expr_scratch` is held: enforce
+    /// `max_rows` and `max_rows_produced` as groups are inserted, and defer the memory
+    /// half of `check_output` until after expression scratch drops.
+    RowsOnly,
+    /// Full eager grouping: enforce row limits on insert and periodic `check_output`.
+    Full,
+}
+
 pub(crate) struct Grouping {
     keys: Vec<Option<usize>>,
     sources: Vec<Source>,
@@ -151,7 +164,7 @@ pub(crate) struct Grouping {
     /// The state's bytes before its first group.
     base: u64,
     /// Whether the operator checks the output size of an eager grouping as it grows.
-    eager: bool,
+    eager: EagerCheck,
     /// Where rows of groups that do not fit go, when the query may spill.
     query: Option<Arc<QuerySpill>>,
     /// The state's bytes at which a pass takes no new groups, half the room the query
@@ -254,7 +267,7 @@ impl Grouping {
             bytes,
             reserved: bytes,
             base: bytes,
-            eager: false,
+            eager: EagerCheck::Off,
             query: None,
             threshold: 0,
             frozen: false,
@@ -296,7 +309,11 @@ impl Grouping {
     /// Add a group with these keys and return its number.
     fn insert(&mut self, ctx: &Ctx, key: &[Id]) -> Result<u32> {
         let at = self.groups as u32;
-        ctx.check_rows(self.groups.saturating_add(1))?;
+        let next = self.groups.saturating_add(1);
+        match self.eager {
+            EagerCheck::Off => ctx.check_rows(next)?,
+            EagerCheck::RowsOnly | EagerCheck::Full => ctx.check_output_rows(next)?,
+        }
         self.retain(self.per_group)?;
         match &mut self.index {
             Index::One(index) => {
@@ -388,7 +405,7 @@ impl Grouping {
             for (row, &id) in column.iter().enumerate() {
                 if row.is_multiple_of(1024) {
                     ctx.check()?;
-                    if self.eager && row.is_multiple_of(65_536) {
+                    if self.eager == EagerCheck::Full && row.is_multiple_of(65_536) {
                         ctx.check_output(self.groups, width)?;
                     }
                 }
@@ -406,7 +423,7 @@ impl Grouping {
             for row in 0..table.len {
                 if row.is_multiple_of(1024) {
                     ctx.check()?;
-                    if self.eager && row.is_multiple_of(65_536) {
+                    if self.eager == EagerCheck::Full && row.is_multiple_of(65_536) {
                         ctx.check_output(self.groups, width)?;
                     }
                 }
@@ -682,9 +699,17 @@ pub(super) fn whole_sequential_with_computed(
     expr_scratch: Option<Charge<'_>>,
 ) -> Result<Table> {
     let mut grouping = Grouping::new(ctx, keys, aggs, &table.vars, charged, false)?;
-    // While `expr_scratch` is still held, enforce row limits in `slots()` and defer the
-    // memory half of `check_output` until after expression scratch and slots drop.
-    grouping.eager = false;
+    // While `expr_scratch` is still held, enforce row limits (including
+    // `max_rows_produced`) as groups are inserted and defer the memory half of
+    // `check_output` until after expression scratch and slots drop.
+    grouping.eager = if eager {
+        EagerCheck::RowsOnly
+    } else {
+        EagerCheck::Off
+    };
+    if eager {
+        ctx.check_output_rows(grouping.groups)?;
+    }
     if grouping.only_counts_rows() {
         grouping.count_rows(table.len as u64);
     } else {
@@ -729,7 +754,14 @@ pub(crate) fn whole(
     let mut vars = keys.to_vec();
     vars.extend(aggs.iter().map(|(v, _)| *v));
     let mut grouping = Grouping::new(ctx, keys, aggs, &table.vars, charged, false)?;
-    grouping.eager = eager;
+    grouping.eager = if eager {
+        EagerCheck::Full
+    } else {
+        EagerCheck::Off
+    };
+    if eager {
+        ctx.check_output_rows(grouping.groups)?;
+    }
     if grouping.only_counts_rows() {
         grouping.count_rows(table.len as u64);
     } else {

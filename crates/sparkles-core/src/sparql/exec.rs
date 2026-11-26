@@ -7396,6 +7396,30 @@ pub(super) fn stat_aggregate(func: &AggregateFunction) -> Option<super::aggext::
     }
 }
 
+/// Upper bound on bytes [`Ctx::try_intern_value`] can charge to `ctx.retain_bytes()`
+/// for a `Value::Double(x)`. Rust's `f64` `Display` writes fixed-point decimal text
+/// (up to 327 bytes for negative subnormals / `~1e-308`, up to 310 bytes near `f64::MAX`),
+/// plus typed-literal key framing (`"` + `KEY_SEP` + `^` + `xsd:double`, 43 bytes) and
+/// the interner's 96-byte local-vocabulary overhead.
+pub(super) fn double_intern_bytes(x: f64) -> u64 {
+    if Id::from_f64(x).is_some() {
+        return 0;
+    }
+    const OVERHEAD: u64 = 144;
+    if !x.is_finite() {
+        return 4 + OVERHEAD;
+    }
+    let biased = (x.to_bits() >> 52) & 0x7ff;
+    let lex_bound = if biased >= 1023 {
+        let e2 = biased - 1023;
+        ((e2 + 1) * 30_103) / 100_000 + 20
+    } else {
+        let e2_neg = if biased == 0 { 1074 } else { 1023 - biased };
+        (e2_neg * 30_103) / 100_000 + 21
+    };
+    lex_bound + OVERHEAD
+}
+
 /// Heap bytes owned by a `SumAcc::Decimal(Box<DecimalSum>)` allocation.
 pub(super) const DECIMAL_SUM_BYTES: u64 = size_of::<DecimalSum>() as u64;
 
@@ -7540,7 +7564,7 @@ impl AggState {
         )
     }
 
-    /// Upper bound on bytes [`AggState::finish`] can charge to `ctx.retain_bytes()`
+    /// Upper bound on bytes [`AggState::try_finish`] can charge to `ctx.retain_bytes()`
     /// when interning the finalized result value.
     pub(super) fn finish_intern_bytes(&self, agg: &Agg) -> u64 {
         match self {
@@ -7552,8 +7576,11 @@ impl AggState {
                 match acc {
                     SumAcc::HardError | SumAcc::Overflow => 0,
                     SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum) => {
-                        if matches!(agg.func, AggregateFunction::Sum)
-                            && i64::try_from(*sum).ok().and_then(Id::from_i64).is_some()
+                        if matches!(agg.func, AggregateFunction::Avg) {
+                            if *rows == 0 { 0 } else { 256 }
+                        } else if i64::try_from(*sum)
+                            .ok()
+                            .is_none_or(|i| Id::from_i64(i).is_some())
                         {
                             0
                         } else {
@@ -7562,17 +7589,19 @@ impl AggState {
                     }
                     SumAcc::Decimal(_) | SumAcc::Float(_) => 256,
                     SumAcc::Double(d) => {
-                        if matches!(agg.func, AggregateFunction::Sum)
-                            && Id::from_f64(f64::from(*d)).is_some()
-                        {
-                            0
+                        let x = if matches!(agg.func, AggregateFunction::Avg) {
+                            if *rows == 0 {
+                                return 0;
+                            }
+                            f64::from(*d) / (*rows as f64)
                         } else {
-                            256
-                        }
+                            f64::from(*d)
+                        };
+                        double_intern_bytes(x)
                     }
                 }
             }
-            AggState::Stat(..) => 256,
+            AggState::Stat(arq, acc) => acc.finish_value(*arq).map_or(0, double_intern_bytes),
         }
     }
 
@@ -8148,9 +8177,9 @@ impl AggState {
         }
     }
 
-    pub(super) fn finish(self, ctx: &Ctx, agg: &Agg) -> Id {
+    pub(super) fn try_finish(self, ctx: &Ctx, agg: &Agg) -> Result<Id> {
         match self {
-            AggState::Count(n) => Id::from_i64(n as i64).unwrap_or(Id::UNDEF),
+            AggState::Count(n) => Ok(Id::from_i64(n as i64).unwrap_or(Id::UNDEF)),
             AggState::Sum { acc, rows, errs } => {
                 // AVG is Sum over Count, and Count leaves the errors out
                 if rows > 0
@@ -8158,19 +8187,19 @@ impl AggState {
                     && matches!(agg.func, AggregateFunction::Avg)
                     && ctx.aggregate_errors.avg_of_errors_zero()
                 {
-                    return ctx.intern_value(&Value::Integer(0.into()));
+                    return ctx.try_intern_value(&Value::Integer(0.into()));
                 }
                 let sum = match acc {
                     SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum) => {
                         match i64::try_from(sum) {
                             Ok(int) => Value::Integer(int.into()),
-                            Err(_) => return Id::UNDEF,
+                            Err(_) => return Ok(Id::UNDEF),
                         }
                     }
                     SumAcc::Decimal(ds) => Value::Decimal(super::value::decimal_from_raw(ds.val)),
                     SumAcc::Float(f) => Value::Float(f),
                     SumAcc::Double(d) => Value::Double(d),
-                    SumAcc::HardError | SumAcc::Overflow => return Id::UNDEF,
+                    SumAcc::HardError | SumAcc::Overflow => return Ok(Id::UNDEF),
                 };
                 let v = if matches!(agg.func, AggregateFunction::Avg) {
                     if rows == 0 {
@@ -8181,18 +8210,31 @@ impl AggState {
                 } else {
                     Some(sum)
                 };
-                v.map_or(Id::UNDEF, |v| ctx.intern_value(&v))
+                match v {
+                    Some(v) => ctx.try_intern_value(&v),
+                    None => Ok(Id::UNDEF),
+                }
             }
             AggState::Best(best, _, errs, _) => {
                 let min = matches!(agg.func, AggregateFunction::Min);
-                if errs > 0 && ctx.aggregate_errors.best_errs(min) {
+                Ok(if errs > 0 && ctx.aggregate_errors.best_errs(min) {
                     Id::UNDEF
                 } else {
                     best.unwrap_or(Id::UNDEF)
-                }
+                })
             }
-            AggState::Sample(x) => x.unwrap_or(Id::UNDEF),
-            AggState::Stat(arq, acc) => acc.finish(ctx, arq),
+            AggState::Sample(x) => Ok(x.unwrap_or(Id::UNDEF)),
+            AggState::Stat(arq, acc) => acc.try_finish(ctx, arq),
+        }
+    }
+
+    pub(super) fn finish(self, ctx: &Ctx, agg: &Agg) -> Id {
+        match self.try_finish(ctx, agg) {
+            Ok(id) => id,
+            Err(error) => {
+                ctx.fail_memory(&error);
+                Id::UNDEF
+            }
         }
     }
 }

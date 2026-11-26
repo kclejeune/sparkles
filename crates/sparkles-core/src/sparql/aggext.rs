@@ -257,20 +257,36 @@ impl StatAcc {
         }
     }
 
-    pub(crate) fn finish(&self, ctx: &Ctx, arq: Arq) -> Id {
+    pub(crate) fn finish_value(&self, arq: Arq) -> Option<f64> {
         let Arq::Stat { population, root } = arq else {
-            return Id::UNDEF;
+            return None;
         };
         if self.error || self.count == 0 {
-            return Id::UNDEF;
+            return None;
         }
         let n = self.count;
         let n1 = if population { n } else { n - 1 };
         if n1 == 0 {
-            return Id::UNDEF;
+            return None;
         }
         let var = (self.sum_sq - (self.sum * self.sum) / n as f64) / n1 as f64;
-        let x = if root { var.sqrt() } else { var };
-        ctx.intern_value(&Value::Double(x.into()))
+        Some(if root { var.sqrt() } else { var })
+    }
+
+    pub(crate) fn try_finish(&self, ctx: &Ctx, arq: Arq) -> crate::error::Result<Id> {
+        match self.finish_value(arq) {
+            Some(x) => ctx.try_intern_value(&Value::Double(x.into())),
+            None => Ok(Id::UNDEF),
+        }
+    }
+
+    pub(crate) fn finish(&self, ctx: &Ctx, arq: Arq) -> Id {
+        match self.try_finish(ctx, arq) {
+            Ok(id) => id,
+            Err(error) => {
+                ctx.fail_memory(&error);
+                Id::UNDEF
+            }
+        }
     }
 }

@@ -399,20 +399,52 @@ pub(super) fn whole_parallel(
         .collect();
     let sources = sources_of(&agg_list, &table.vars);
 
+    let probe_accs = accumulators(ctx, &agg_list, charged);
+    let all_mergeable = probe_accs.iter().all(|a| a.mergeable());
+    let per_group = group_bytes_per_entry(keys.len(), &probe_accs);
+    let acc_group_bytes: u64 = probe_accs.iter().map(|a| a.group_bytes()).sum();
+    drop(probe_accs);
+
     // Evaluate expression arguments once up front so neither parallel strategy nor any
     // sequential fallback re-evaluates them or duplicates ExprReport entries. Hold the
-    // sequential grouping slot charge during expression evaluation so `exprcache` sees
-    // the same admission headroom as `Grouping::add`, then release it before parallel
-    // workers start.
+    // sequential grouping slot charge (and retained base + first-group charge when
+    // `charged`) during expression evaluation so `exprcache` sees the same admission
+    // headroom as `Grouping::add`, then release them before parallel workers start.
     let expr_count = sources
         .iter()
         .filter(|source| matches!(source, Source::Expr(_)))
         .count();
+    let eval_base = agg_list.len() as u64 * 256 + keys.len() as u64 * 64 + 1024;
+    let mut eval_group = if charged && expr_count > 0 {
+        let mut charge = ctx.retained_charge(eval_base)?;
+        if keys.is_empty()
+            && let Some(c) = &mut charge
+        {
+            let retained = eval_base.saturating_add(per_group);
+            let reserved = retained.saturating_add((retained / 8).max(RETAIN_STEP));
+            if c.resize(reserved).is_err() {
+                c.resize(retained)?;
+            }
+        }
+        charge
+    } else {
+        None
+    };
     let eval_slots = if expr_count > 0 {
         Some(ctx.charge(table.len as u64 * 4 + 64)?)
     } else {
         None
     };
+    if !keys.is_empty()
+        && table.len > 0
+        && let Some(c) = &mut eval_group
+    {
+        let retained = eval_base.saturating_add(per_group);
+        let reserved = retained.saturating_add((retained / 8).max(RETAIN_STEP));
+        if c.resize(reserved).is_err() {
+            c.resize(retained)?;
+        }
+    }
     let expr_scratch = if expr_count > 0 {
         Some(ctx.charge(expr_count as u64 * (table.len as u64 * 8 + 64))?)
     } else {
@@ -426,13 +458,8 @@ pub(super) fn whole_parallel(
         })
         .collect::<Result<Vec<_>>>()?;
     drop(eval_slots);
+    drop(eval_group);
     let mut expr_buf: ExprScratch<'_> = Some((computed, expr_scratch));
-
-    let probe_accs = accumulators(ctx, &agg_list, charged);
-    let all_mergeable = probe_accs.iter().all(|a| a.mergeable());
-    let per_group = group_bytes_per_entry(keys.len(), &probe_accs);
-    let acc_group_bytes: u64 = probe_accs.iter().map(|a| a.group_bytes()).sum();
-    drop(probe_accs);
 
     let threads = rayon::current_num_threads().max(1);
     let workers = threads.min(table.len / PAR_MIN_LEN).max(1);
@@ -1374,11 +1401,13 @@ fn run_hash_partitioned(
         }
         return Err(e);
     }
-    let finish_intern_bytes: u64 = parts
-        .iter()
-        .flat_map(|part| part.accs.iter())
-        .map(|acc| acc.finish_intern_bytes())
-        .fold(0u64, u64::saturating_add);
+    let mut finish_intern_bytes = 0u64;
+    for part in &parts {
+        for acc in &part.accs {
+            ctx.check()?;
+            finish_intern_bytes = finish_intern_bytes.saturating_add(acc.finish_intern_bytes(ctx)?);
+        }
+    }
     let assembly_peak = (if eager {
         table_bytes(total_groups, width)
     } else {

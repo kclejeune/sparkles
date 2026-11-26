@@ -124,9 +124,10 @@ pub(crate) trait Accumulator: Send {
     fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id>;
 
     /// Upper bound on bytes that calling [`Accumulator::finish`] for every group can
-    /// charge to `ctx.retain_bytes()` when interning results.
-    fn finish_intern_bytes(&self) -> u64 {
-        0
+    /// charge to `ctx.retain_bytes()` when interning results. Polls `ctx.check()` in
+    /// bounded chunks so cancellation and deadlines remain responsive.
+    fn finish_intern_bytes(&self, _ctx: &Ctx) -> Result<u64> {
+        Ok(0)
     }
 
     /// Whether [`Accumulator::retract`] can take back every row.
@@ -333,10 +334,10 @@ impl Accumulator for Running {
 
     fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
         let state = std::mem::replace(&mut self.states[group], AggState::Count(0));
-        Ok(state.finish(ctx, &self.agg))
+        state.try_finish(ctx, &self.agg)
     }
 
-    fn finish_intern_bytes(&self) -> u64 {
+    fn finish_intern_bytes(&self, ctx: &Ctx) -> Result<u64> {
         if matches!(
             self.agg.func,
             AggregateFunction::Count
@@ -344,12 +345,16 @@ impl Accumulator for Running {
                 | AggregateFunction::Max
                 | AggregateFunction::Sample
         ) {
-            return 0;
+            return Ok(0);
         }
-        self.states
-            .iter()
-            .map(|state| state.finish_intern_bytes(&self.agg))
-            .fold(0u64, u64::saturating_add)
+        let mut total = 0u64;
+        for (i, state) in self.states.iter().enumerate() {
+            if i.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            total = total.saturating_add(state.finish_intern_bytes(&self.agg));
+        }
+        Ok(total)
     }
 
     fn retractable(&self) -> bool {
@@ -511,20 +516,25 @@ impl Accumulator for Concat {
         let nothing = state.empty
             && self.distinct
             && ctx.aggregate_errors.distinct_concat_of_nothing_unbound();
-        Ok(if state.ok && !nothing {
+        if state.ok && !nothing {
             // SPARQL 1.1: the result is a simple literal
-            ctx.intern_value(&Value::Str(state.text.into()))
+            ctx.try_intern_value(&Value::Str(state.text.into()))
         } else {
-            Id::UNDEF
-        })
+            Ok(Id::UNDEF)
+        }
     }
 
-    fn finish_intern_bytes(&self) -> u64 {
-        self.groups
-            .iter()
-            .filter(|state| state.ok)
-            .map(|state| (state.text.len() as u64).saturating_add(128))
-            .fold(0u64, u64::saturating_add)
+    fn finish_intern_bytes(&self, ctx: &Ctx) -> Result<u64> {
+        let mut total = 0u64;
+        for (i, state) in self.groups.iter().enumerate() {
+            if i.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            if state.ok {
+                total = total.saturating_add((state.text.len() as u64).saturating_add(128));
+            }
+        }
+        Ok(total)
     }
 
     fn group_bytes(&self) -> u64 {
@@ -634,8 +644,8 @@ impl Accumulator for Distinct {
         self.inner.finish(ctx, group)
     }
 
-    fn finish_intern_bytes(&self) -> u64 {
-        self.inner.finish_intern_bytes()
+    fn finish_intern_bytes(&self, ctx: &Ctx) -> Result<u64> {
+        self.inner.finish_intern_bytes(ctx)
     }
 
     fn take_growth(&mut self) -> u64 {

@@ -1372,6 +1372,72 @@ fn range_split_min_max_matches_sequential_on_non_transitive_mixed_and_incomparab
     let (par_dt, _) = run_whole_in_pool(2, &ctx, &dt_table, &[], &min_aggs, false).unwrap();
     assert_tables_exact_eq(&ctx, &par_dt, &seq_dt, "incomparable DateTime MIN");
 
+    // Non-transitive Duration cycle: P30D < P0Y31D < P1M < P30D (P30D and P0Y31D compare
+    // by value, while P1M is incomparable with both and falls back to lexical order:
+    // "P0Y31D" < "P1M" < "P30D"). Without merge refusal, splitting across 2 workers yields
+    // P30D instead of P1M for MIN and P30D instead of P0Y31D for MAX.
+    let dur_30d = ctx.intern_term(&oxrdf::Term::Literal(oxrdf::Literal::new_typed_literal(
+        "P30D",
+        oxrdf::vocab::xsd::DURATION,
+    )));
+    let dur_31d = ctx.intern_term(&oxrdf::Term::Literal(oxrdf::Literal::new_typed_literal(
+        "P0Y31D",
+        oxrdf::vocab::xsd::DURATION,
+    )));
+    let dur_1m = ctx.intern_term(&oxrdf::Term::Literal(oxrdf::Literal::new_typed_literal(
+        "P1M",
+        oxrdf::vocab::xsd::DURATION,
+    )));
+    let mut dur_min_table = Table::new(vec![0]);
+    let mut dur_max_table = Table::new(vec![0]);
+    for i in 0..n {
+        let min_v = if i < half {
+            dur_30d
+        } else if i == half {
+            dur_31d
+        } else {
+            dur_1m
+        };
+        let max_v = if i < half {
+            dur_30d
+        } else if i == half {
+            dur_1m
+        } else {
+            dur_31d
+        };
+        dur_min_table.push_row(&[min_v]);
+        dur_max_table.push_row(&[max_v]);
+    }
+    let (seq_dur_min, _) =
+        run_whole_in_pool(1, &ctx, &dur_min_table, &[], &min_aggs, false).unwrap();
+    let (par_dur_min, _) =
+        run_whole_in_pool(2, &ctx, &dur_min_table, &[], &min_aggs, false).unwrap();
+    assert_tables_exact_eq(
+        &ctx,
+        &par_dur_min,
+        &seq_dur_min,
+        "non-transitive Duration MIN",
+    );
+    assert_eq!(
+        exact_key(&ctx, par_dur_min.cols[0][0]),
+        exact_key(&ctx, dur_1m)
+    );
+
+    let (seq_dur_max, _) =
+        run_whole_in_pool(1, &ctx, &dur_max_table, &[], &max_aggs, false).unwrap();
+    let (par_dur_max, _) =
+        run_whole_in_pool(2, &ctx, &dur_max_table, &[], &max_aggs, false).unwrap();
+    assert_tables_exact_eq(
+        &ctx,
+        &par_dur_max,
+        &seq_dur_max,
+        "non-transitive Duration MAX",
+    );
+    assert_eq!(
+        exact_key(&ctx, par_dur_max.cols[0][0]),
+        exact_key(&ctx, dur_31d)
+    );
+
     // Homogeneous exact numerics (Integer + Decimal) and finite Float + Double still merge.
     let ag_min = agg(AggregateFunction::Min, true, false);
     let (mut l, mut r) = (Running::new(&ag_min, false), Running::new(&ag_min, false));
@@ -1580,7 +1646,13 @@ fn hash_path_admits_bucket_capacities_and_combined_assembly_peak() {
     let mut tight = ctx();
     tight.mem_limit = 600_000;
     let (par, _) = run_whole_in_pool(2, &tight, &skewed, &[0], &non_mergeable_aggs, false).unwrap();
-    assert_tables_exact_eq(&base_ctx, &par, &seq, "skewed radix bucket admission");
+    assert_tables_exact_eq_cross_ctx(
+        &tight,
+        &par,
+        &base_ctx,
+        &seq,
+        "skewed radix bucket admission",
+    );
     assert!(tight.mem_peak() <= 600_000);
 
     // 2. Hash assembly combined peak: 100,000 unique keys, width 2 -> Pass 1 (~1.34 MB)
@@ -1597,7 +1669,13 @@ fn hash_path_admits_bucket_capacities_and_combined_assembly_peak() {
     let mut asm_ctx = ctx();
     asm_ctx.mem_limit = 2_700_000;
     let (par_w, _) = run_whole_in_pool(2, &asm_ctx, &wide, &[0], &count_aggs, false).unwrap();
-    assert_tables_exact_eq(&base_ctx, &par_w, &seq_w, "hash assembly combined peak");
+    assert_tables_exact_eq_cross_ctx(
+        &asm_ctx,
+        &par_w,
+        &base_ctx,
+        &seq_w,
+        "hash assembly combined peak",
+    );
     // `check_output` records the attempted combined peak (`order_map + output = 2,800,064`)
     // before refusing and triggering the sequential fallback, proving Pass 3 admitted
     // `order_map + output` together rather than checking output before `order_map`.
@@ -1741,7 +1819,8 @@ fn merge_refuses_repeated_and_out_of_bounds_destinations_atomically() {
 
 #[test]
 fn hash_assembly_sort_and_key_only_group_poll_cancellation_and_timeout() {
-    // 1. Direct verification of cancellable in-place sort_order_map correctness & cancel.
+    // 1. Direct verification of cancellable in-place sort_order_map correctness, mid-sort
+    // polling, and immediate cancellation.
     let ctx_ok = ctx();
     let mut map: Vec<(u32, u16, u32)> = (0..25_000u32)
         .map(|i| ((i.wrapping_mul(2654435761)) % 100_003, (i % 16) as u16, i))
@@ -1752,8 +1831,22 @@ fn hash_assembly_sort_and_key_only_group_poll_cancellation_and_timeout() {
     let mut expected = map.clone();
     expected.sort_unstable_by_key(|&(r, _, _)| r);
     let max_row = map.iter().map(|&(r, _, _)| r).max().unwrap_or(0);
-    super::group::par::sort_order_map(&ctx_ok, &mut map, max_row).unwrap();
+    let sort_checks = {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let before = super::ctx::CHECKS.with(std::cell::Cell::get);
+            super::group::par::sort_order_map(&ctx_ok, &mut map, max_row).unwrap();
+            super::ctx::CHECKS.with(std::cell::Cell::get) - before
+        })
+    };
     assert_eq!(map, expected);
+    assert!(
+        sort_checks >= 10,
+        "expected mid-sort polling across partitions and leaves, got {sort_checks} checks"
+    );
 
     // Cancelled context aborts sort_order_map immediately.
     let mut cancel_ctx = ctx();
@@ -1761,15 +1854,72 @@ fn hash_assembly_sort_and_key_only_group_poll_cancellation_and_timeout() {
     let err = super::group::par::sort_order_map(&cancel_ctx, &mut map, max_row).unwrap_err();
     assert!(matches!(err, crate::error::Error::Cancelled));
 
-    // 2. Key-only GROUP BY (no aggregate columns) with expired deadline reports Timeout.
+    // 2. `finish_intern_bytes` scans poll in bounded chunks and abort on cancellation.
+    let groups = 20_000usize;
+    let avg_agg = agg(AggregateFunction::Avg, true, false);
+    let mut run_acc = Running::new(&avg_agg, false);
+    run_acc.init(groups);
+    let before = super::ctx::CHECKS.with(std::cell::Cell::get);
+    let _ = run_acc.finish_intern_bytes(&ctx_ok).unwrap();
+    let run_checks = super::ctx::CHECKS.with(std::cell::Cell::get) - before;
+    assert!(
+        run_checks >= groups / 1024,
+        "expected Running::finish_intern_bytes to poll in chunks, got {run_checks}"
+    );
+    assert!(matches!(
+        run_acc.finish_intern_bytes(&cancel_ctx),
+        Err(crate::error::Error::Cancelled)
+    ));
+
+    let concat_agg = agg(
+        AggregateFunction::GroupConcat {
+            separator: Some(",".into()),
+        },
+        true,
+        false,
+    );
+    let mut concat_acc = Concat::new(&concat_agg);
+    concat_acc.init(groups);
+    let before = super::ctx::CHECKS.with(std::cell::Cell::get);
+    let _ = concat_acc.finish_intern_bytes(&ctx_ok).unwrap();
+    let concat_checks = super::ctx::CHECKS.with(std::cell::Cell::get) - before;
+    assert!(
+        concat_checks >= groups / 1024,
+        "expected Concat::finish_intern_bytes to poll in chunks, got {concat_checks}"
+    );
+    assert!(matches!(
+        concat_acc.finish_intern_bytes(&cancel_ctx),
+        Err(crate::error::Error::Cancelled)
+    ));
+
+    // 3. Key-only GROUP BY and AVG hash assembly poll proportionally in Pass 3 and respect
+    // expired deadlines.
     let n = 20_000usize;
-    let mut table = Table::new(vec![0]);
+    let mut table = Table::new(vec![0, 1]);
     for i in 0..n {
-        table.push_row(&[int(&ctx_ok, i as i64)]);
+        table.push_row(&[int(&ctx_ok, i as i64), int(&ctx_ok, (i % 17) as i64)]);
     }
     let (seq, _) = run_whole_in_pool(1, &ctx_ok, &table, &[0], &[], false).unwrap();
     let (par, _) = run_whole_in_pool(4, &ctx_ok, &table, &[0], &[], false).unwrap();
     assert_tables_exact_eq(&ctx_ok, &par, &seq, "key-only parallel GROUP BY");
+
+    let avg_aggs = vec![(10, avg_agg)];
+    let par_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let asm_checks = par_pool.install(|| {
+        let before = super::ctx::CHECKS.with(std::cell::Cell::get);
+        let mut rep = super::exprcache::Report::default();
+        let _ =
+            super::group::whole(&ctx_ok, &table, &[0], &avg_aggs, false, true, &mut rep).unwrap();
+        super::ctx::CHECKS.with(std::cell::Cell::get) - before
+    });
+    // Coordinator thread runs Pass 3 (finish_intern_bytes + order_map build + gather + finish).
+    assert!(
+        asm_checks >= (n / 1024) * 3,
+        "expected Pass 3 coordinator polling across estimate, build, gather, and finish, got {asm_checks}"
+    );
 
     let mut timeout_ctx = ctx();
     timeout_ctx.deadline = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
@@ -1806,8 +1956,8 @@ fn parallel_expr_cache_report_matches_sequential_at_threshold_boundary() {
         },
     )];
 
-    // Enough headroom for expr_scratch + exprcache (128 * n + 1024), but less than
-    // expr_scratch + exprcache + sequential slot charge (4 * n + 64).
+    // 1. Uncharged (`charged = false`): enough headroom for expr_scratch + exprcache
+    // (128 * n + 1024), but less than expr_scratch + exprcache + sequential slot charge.
     let expr_scratch = n as u64 * 8 + 64;
     let cache_res = n as u64 * 128 + 1024;
     let slots = n as u64 * 4 + 64;
@@ -1822,7 +1972,13 @@ fn parallel_expr_cache_report_matches_sequential_at_threshold_boundary() {
 
     let (seq, seq_rep) = run_whole_in_pool(1, &seq_ctx, &table, &[], &aggs, false).unwrap();
     let (par, par_rep) = run_whole_in_pool(4, &par_ctx, &table, &[], &aggs, false).unwrap();
-    assert_tables_exact_eq(&base_ctx, &par, &seq, "expr-cache threshold parity");
+    assert_tables_exact_eq_cross_ctx(
+        &par_ctx,
+        &par,
+        &seq_ctx,
+        &seq,
+        "expr-cache threshold parity",
+    );
     assert_eq!(seq_rep.note(), None, "sequential declines cache admission");
     assert_eq!(
         par_rep.note(),
@@ -1841,6 +1997,54 @@ fn parallel_expr_cache_report_matches_sequential_at_threshold_boundary() {
     let (_, par_rep_ok) = run_whole_in_pool(4, &par_ok, &table, &[], &aggs, false).unwrap();
     assert!(seq_rep_ok.note().is_some());
     assert_eq!(par_rep_ok.note(), seq_rep_ok.note());
+
+    // 2. Charged (`charged = true` on shared `Ctx`): at exact `slots + expr_scratch + cache_res`
+    // (2,294,912 B for n = 16,384), sequential Grouping::new's retained base + ungrouped group
+    // state pushes cache admission past the limit, so both sequential and parallel must decline.
+    let exact_limit = slots + expr_scratch + cache_res;
+    assert_eq!(exact_limit, 2_294_912);
+    let mut seq_charged = ctx();
+    assert_eq!(seq_charged.var("v"), v_id);
+    seq_charged.mem_limit = exact_limit;
+    let seq_charged = seq_charged.into_shared();
+    let mut par_charged = ctx();
+    assert_eq!(par_charged.var("v"), v_id);
+    par_charged.mem_limit = exact_limit;
+    let par_charged = par_charged.into_shared();
+
+    let (seq_c, seq_rep_c) = run_whole_in_pool(1, &seq_charged, &table, &[], &aggs, true).unwrap();
+    let (par_c, par_rep_c) = run_whole_in_pool(4, &par_charged, &table, &[], &aggs, true).unwrap();
+    assert_tables_exact_eq_cross_ctx(
+        &par_charged,
+        &par_c,
+        &seq_charged,
+        &seq_c,
+        "charged expr-cache threshold parity",
+    );
+    assert_eq!(
+        seq_rep_c.note(),
+        None,
+        "charged sequential declines cache admission at exact_limit"
+    );
+    assert_eq!(
+        par_rep_c.note(),
+        seq_rep_c.note(),
+        "charged parallel and sequential ExprReport must match"
+    );
+
+    // With headroom for the retained base + first-group step, both admit reuse.
+    let mut seq_charged_ok = ctx();
+    assert_eq!(seq_charged_ok.var("v"), v_id);
+    seq_charged_ok.mem_limit = exact_limit + 100_000;
+    let seq_charged_ok = seq_charged_ok.into_shared();
+    let mut par_charged_ok = ctx();
+    assert_eq!(par_charged_ok.var("v"), v_id);
+    par_charged_ok.mem_limit = exact_limit + 100_000;
+    let par_charged_ok = par_charged_ok.into_shared();
+    let (_, seq_rep_cok) = run_whole_in_pool(1, &seq_charged_ok, &table, &[], &aggs, true).unwrap();
+    let (_, par_rep_cok) = run_whole_in_pool(4, &par_charged_ok, &table, &[], &aggs, true).unwrap();
+    assert!(seq_rep_cok.note().is_some());
+    assert_eq!(par_rep_cok.note(), seq_rep_cok.note());
 }
 
 #[test]
@@ -1902,7 +2106,13 @@ fn parallel_range_split_row_limits_and_charged_fallback() {
     fit_shared
         .check()
         .expect("charged fallback must not latch memory_failure");
-    assert_tables_exact_eq(&base_ctx, &par_fit, &seq, "charged=true fallback");
+    assert_tables_exact_eq_cross_ctx(
+        &fit_shared,
+        &par_fit,
+        &base_ctx,
+        &seq,
+        "charged=true fallback",
+    );
 
     let mut spill_ctx = ctx();
     spill_ctx.mem_limit = 32_000;
@@ -1918,4 +2128,230 @@ fn parallel_range_split_row_limits_and_charged_fallback() {
     spill_shared
         .check()
         .expect("refused charged grouping must not latch sticky memory_failure");
+
+    // 4. Precomputed sequential fallback enforces `max_rows_produced` during `slots()` /
+    // `insert()` rather than deferring through the fold or hitting retained memory first.
+    let mut fb_ctx = ctx();
+    let vk = fb_ctx.var("k");
+    let vv = fb_ctx.var("v");
+    // 16,384 unique keys with SUM(?v + 1): expr_scratch (131 KiB) + eval_slots (65 KiB)
+    // + eval_group (67 KiB) fits under 320 KiB, hash radix admission (>260 KiB on top of
+    // expr_scratch) refuses and falls back to `whole_sequential_with_computed`, and
+    // retaining all 16,384 groups would exceed 320 KiB — yet `max_rows_produced = 10`
+    // must fail first inside `insert()`.
+    fb_ctx.mem_limit = 320_000;
+    fb_ctx.max_rows_produced = 10;
+    let fb_shared = fb_ctx.into_shared();
+    let mut uniq_table = Table::new(vec![vk, vv]);
+    for i in 0..n {
+        uniq_table.push_row(&[int(&fb_shared, i as i64), int(&fb_shared, 1)]);
+    }
+    let expr_aggs = vec![(
+        10,
+        Agg {
+            func: AggregateFunction::Sum,
+            expr: Some(super::expr::Expr::Arith(
+                Box::new(super::expr::Expr::Var(vv)),
+                Box::new(super::expr::Expr::Const(int(&fb_shared, 1))),
+                super::expr::ArithOp::Add,
+            )),
+            distinct: false,
+            fold: None,
+            registered: None,
+        },
+    )];
+    let err = run_whole_in_pool(4, &fb_shared, &uniq_table, &[vk], &expr_aggs, true).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::error::Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::RowsProduced
+        ),
+        "expected BudgetKind::RowsProduced before fold/memory refusal, got {err:?}"
+    );
+}
+
+#[test]
+fn non_inline_double_finalization_admission_and_fallible_interning() {
+    // 1. Verify `double_intern_bytes` upper-bounds actual `intern_key` charges across all
+    // IEEE-754 categories, including tiny subnormals and ~1e-250 / ~1e-308 fixed-point forms.
+    let samples = [
+        0.0_f64,
+        -0.0_f64,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(1),
+        f64::from_bits(0x8000_0000_0000_0001),
+        f64::MIN_POSITIVE,
+        -f64::MIN_POSITIVE,
+        f64::from_bits(f64::MIN_POSITIVE.to_bits() | 1),
+        -f64::from_bits(f64::MIN_POSITIVE.to_bits() | 1),
+        f64::from_bits((1e-250_f64).to_bits() | 1),
+        -f64::from_bits((1e-250_f64).to_bits() | 1),
+        f64::MAX,
+        -f64::MAX,
+        1.0 + f64::EPSILON,
+        -(1.0 + f64::EPSILON),
+        1.1,
+        -0.999_999_999_999_999_9,
+    ];
+    for x in samples {
+        let bound = super::exec::double_intern_bytes(x);
+        let term = Value::Double(x.into()).to_term();
+        let actual = if crate::id::inline_id(&term).is_some() {
+            0
+        } else {
+            crate::id::term_key(&term).len() as u64 + 96
+        };
+        assert!(
+            bound >= actual,
+            "double_intern_bytes({x:?}) = {bound} < actual {actual}"
+        );
+    }
+
+    // 2. Hash-partitioned AVG(?v) over 8,192 keys × 2 rows (one distinct tiny ~1e-250 double
+    // with nonzero low mantissa bit + one 0.0 double, so every finalized AVG is a fresh
+    // non-inline double with >250-byte lexical form and ~400-byte intern charge).
+    let keys_n = 8_192usize;
+    let tiny_base = (1e-250_f64).to_bits();
+    let intern_cost = |x: f64| -> u64 {
+        let term = Value::Double(x.into()).to_term();
+        if crate::id::inline_id(&term).is_some() {
+            0
+        } else {
+            crate::id::term_key(&term).len() as u64 + 96
+        }
+    };
+    let mut input_retained = 0u64;
+    let mut output_retained = 0u64;
+    for k in 0..keys_n {
+        let x = f64::from_bits(tiny_base + ((k as u64) << 4) + 1);
+        input_retained += intern_cost(x);
+        output_retained += intern_cost(x / 2.0);
+    }
+    assert!(
+        output_retained > keys_n as u64 * 350,
+        "expected >350 B per distinct tiny double, got {output_retained}"
+    );
+    let build_tiny_table = |c: &Ctx| {
+        let zero = dbl(c, 0.0);
+        let mut t = Table::new(vec![0, 1]);
+        for k in 0..keys_n {
+            let x = f64::from_bits(tiny_base + ((k as u64) << 4) + 1);
+            let k_id = int(c, k as i64);
+            t.push_row(&[k_id, dbl(c, x)]);
+            t.push_row(&[k_id, zero]);
+        }
+        t
+    };
+    let avg_aggs = vec![(
+        10,
+        Agg {
+            func: AggregateFunction::Avg,
+            expr: Some(super::expr::Expr::Var(1)),
+            distinct: false,
+            fold: None,
+            registered: None,
+        },
+    )];
+
+    // Measure sequential's exact peak requirement (including decoded ValueCache and
+    // retained-term growth) with a bounded budget so `reservation_step()` matches
+    // `EAGER_STEP` identically across sequential and parallel runs.
+    let mut seq_ctx = ctx();
+    seq_ctx.mem_limit = input_retained + output_retained + 2_000_000;
+    let seq_table = build_tiny_table(&seq_ctx);
+    let (seq_out, _) = run_whole_in_pool(1, &seq_ctx, &seq_table, &[0], &avg_aggs, false).unwrap();
+    assert_eq!(
+        seq_out.cols[1][0].tag(),
+        crate::id::Tag::Local,
+        "AVG of tiny non-inline double must produce a query-local term"
+    );
+    let seq_peak = seq_ctx.mem_peak();
+    assert!(
+        seq_ctx.live_bytes() >= input_retained + output_retained,
+        "expected retained bytes >= {}, got {}",
+        input_retained + output_retained,
+        seq_ctx.live_bytes()
+    );
+
+    // Budget strictly above sequential's peak and strictly below sequential's retained
+    // requirement plus the 98,368-byte order_map: hash Pass 3 probe must refuse BEFORE
+    // committing (with the old 256 B/double underestimate it passed and then latched
+    // `memory_failure` during finish) and fall back cleanly to sequential.
+    let budget = seq_peak + 40_000;
+
+    let mut hq_ctx = ctx();
+    hq_ctx.mem_limit = budget;
+    let hq_table = build_tiny_table(&hq_ctx);
+    let (par_hq, _) = run_whole_in_pool(4, &hq_ctx, &hq_table, &[0], &avg_aggs, false).unwrap();
+    hq_ctx
+        .check()
+        .expect("tiny-double hash fallback must not latch query memory_failure");
+    assert_tables_exact_eq_cross_ctx(
+        &hq_ctx,
+        &par_hq,
+        &seq_ctx,
+        &seq_out,
+        "tiny-double AVG hash query budget boundary",
+    );
+
+    // Same boundary under a server QueryPool grant.
+    let pool = super::pool::QueryPool::new(budget);
+    let grant = std::sync::Arc::new(pool.empty_grant());
+    let mut hp_ctx = ctx();
+    hp_ctx.mem_limit = budget;
+    hp_ctx.set_grant(Some(grant));
+    let hp_table = build_tiny_table(&hp_ctx);
+    let (par_hp, _) = run_whole_in_pool(4, &hp_ctx, &hp_table, &[0], &avg_aggs, false).unwrap();
+    hp_ctx
+        .check()
+        .expect("tiny-double hash fallback must not latch server memory_failure");
+    assert_tables_exact_eq_cross_ctx(
+        &hp_ctx,
+        &par_hp,
+        &seq_ctx,
+        &seq_out,
+        "tiny-double AVG hash pool budget boundary",
+    );
+
+    // 3. Range-split finalization refusal under tight memory must return an unlatched
+    // BudgetKind::Memory error (leaving `ctx.check()` clean for spill retry).
+    let range_keys = 256usize;
+    let range_rows = 16_384usize;
+    let r_input_retained: u64 = (0..range_keys)
+        .map(|k| intern_cost(f64::from_bits(tiny_base + ((k as u64) << 4) + 1)))
+        .sum();
+    let mut r_ctx = ctx();
+    // 2 workers × (8,192 * 4 + 64 = 32,832 B) = 65,664 B + ~15 KiB ValueCache fits in
+    // +95,000 B headroom, while interning 256 distinct halved tiny doubles (~104 KiB)
+    // exceeds it during finish().
+    r_ctx.mem_limit = r_input_retained + 95_000;
+    let zero = dbl(&r_ctx, 0.0);
+    let mut r_table = Table::new(vec![0, 1]);
+    for i in 0..range_rows {
+        let k = i % range_keys;
+        let v = if i < range_keys {
+            dbl(&r_ctx, f64::from_bits(tiny_base + ((k as u64) << 4) + 1))
+        } else {
+            zero
+        };
+        r_table.push_row(&[int(&r_ctx, k as i64), v]);
+    }
+    let r_before = r_ctx.live_bytes();
+    let err = run_whole_in_pool(2, &r_ctx, &r_table, &[0], &avg_aggs, false).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::error::Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
+        ),
+        "expected BudgetKind::Memory during range-split double finalization, got {err:?}"
+    );
+    assert!(
+        r_ctx.live_bytes() > r_before,
+        "expected refusal to occur during finish() interning after Pass 1 succeeded"
+    );
+    r_ctx
+        .check()
+        .expect("range-split finalization refusal must not latch sticky memory_failure");
 }
