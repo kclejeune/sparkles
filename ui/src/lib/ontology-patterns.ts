@@ -2,6 +2,7 @@
 // docs/specs/U12-ontology-workbench/SPEC.md): `POST /$/ontology/{ds}/patterns/preview`
 // and `POST /$/ontology/{ds}/patterns/apply`.
 import { receiptOf, request, type Receipt } from './api';
+import { fmtInt } from './format';
 import type { AxiomJson, EntityKind, Selection } from './ontology';
 import type { WritePreview } from './validation-overlay';
 
@@ -551,4 +552,86 @@ export async function applyPatterns(
   const data = (await res.json()) as PatternApplyResponse & Record<string, unknown>;
   const receipt = receiptOf(data);
   return receipt ? { ...data, receipt } : data;
+}
+
+/** Format a concise human-readable summary of a completed pattern apply response. */
+export function formatPatternCommitNotice(res: PatternApplyResponse): string {
+  return res.committed
+    ? `Committed ${fmtInt(res.added)} new axiom${res.added === 1 ? '' : 's'} (${fmtInt(res.inserted)} triple${res.inserted === 1 ? '' : 's'}) from ${fmtInt(res.pattern.rowsProcessed)} row${res.pattern.rowsProcessed === 1 ? '' : 's'}.`
+    : `No new axioms to commit (${fmtInt(res.present)} already present).`;
+}
+
+export type PatternCommitHooks = {
+  /** Called by the owning workbench whenever a commit finishes, even after the Patterns tab unmounts. */
+  onCommitted: (
+    target: string,
+    seq: number | null,
+    notice: string,
+    res: PatternApplyResponse,
+  ) => void;
+  /** Called by the owning workbench when a commit fails after the Patterns tab unmounted. */
+  onDetachedError?: (target: string, error: unknown) => void;
+  /** Called whenever the set of targets with an in-flight commit changes. */
+  onPendingChange?: (pendingTargets: ReadonlySet<string>) => void;
+};
+
+export type PatternTabCommitCallbacks = {
+  isMounted: () => boolean;
+  onSuccess: (notice: string, res: PatternApplyResponse) => void;
+  onError: (error: unknown) => void;
+  onSettled: () => void;
+};
+
+/**
+ * Workbench-scoped coordinator for in-flight pattern commits keyed by `target`.
+ * Keeps commits reconciled with the mounted workbench page (refreshing views and surfacing
+ * completion notices or errors) even when the user switches away from the Patterns tab
+ * before the HTTP request finishes.
+ */
+export class PatternCommitCoordinator {
+  private pending = new Set<string>();
+  private hooks: PatternCommitHooks;
+
+  constructor(hooks: PatternCommitHooks) {
+    this.hooks = hooks;
+  }
+
+  isPending(target: string): boolean {
+    return this.pending.has(target);
+  }
+
+  async submit(
+    target: string,
+    sel: Selection,
+    req: PatternApplyRequest,
+    opts: { etag?: string | null } = {},
+    tab?: PatternTabCommitCallbacks,
+  ): Promise<boolean> {
+    if (this.pending.has(target)) return false;
+    this.pending.add(target);
+    this.hooks.onPendingChange?.(new Set(this.pending));
+    try {
+      const res = await applyPatterns(target, sel, req, { etag: opts.etag });
+      const notice = formatPatternCommitNotice(res);
+      const seq = res.receipt?.commit?.seq ?? null;
+      this.hooks.onCommitted(target, seq, notice, res);
+      if (tab?.isMounted()) {
+        tab.onSuccess(notice, res);
+      }
+      return true;
+    } catch (e) {
+      if (tab?.isMounted()) {
+        tab.onError(e);
+      } else {
+        this.hooks.onDetachedError?.(target, e);
+      }
+      return false;
+    } finally {
+      this.pending.delete(target);
+      this.hooks.onPendingChange?.(new Set(this.pending));
+      if (tab?.isMounted()) {
+        tab.onSettled();
+      }
+    }
+  }
 }

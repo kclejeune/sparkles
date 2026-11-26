@@ -106,6 +106,7 @@
   import WatchButton from '$components/WatchButton.svelte';
   import BulkEdit from '$components/BulkEdit.svelte';
   import OntoPatterns from '$components/OntoPatterns.svelte';
+  import { PatternCommitCoordinator } from '$lib/ontology-patterns';
   import OntoImports from '$components/OntoImports.svelte';
   import { isDiscussionGraph } from '$lib/discussions';
   import TreeCrumbs from '$components/TreeCrumbs.svelte';
@@ -1159,6 +1160,32 @@
     if (seq != null) session.own.add(seq);
     void loadAll();
   };
+
+  let pageMounted = true;
+  onMount(() => () => {
+    pageMounted = false;
+  });
+  let patternPendingTargets = $state<ReadonlySet<string>>(new Set());
+  const patternCommit = new PatternCommitCoordinator({
+    onCommitted: (submittedTarget, seq, notice, res) => {
+      if (!pageMounted || submittedTarget !== target) return;
+      discussed(seq);
+      if (tab !== 'patterns') {
+        toasts.push(
+          res.committed ? 'success' : 'info',
+          res.committed ? 'Pattern axioms committed' : 'Pattern apply finished',
+          notice,
+        );
+      }
+    },
+    onDetachedError: (submittedTarget, e) => {
+      if (!pageMounted || submittedTarget !== target) return;
+      toasts.push('error', 'Pattern apply failed', api.errorMessage(e));
+    },
+    onPendingChange: (pending) => {
+      if (pageMounted) patternPendingTargets = pending;
+    },
+  });
   /**
    * Preview `op`. `selection` is the graphs the edit reads and writes, the page's own unless
    * the edit was planned from another reading, as a bulk edit is from the graph alone.
@@ -1628,6 +1655,8 @@
               {etag}
               {readonly}
               oncommitted={discussed}
+              commitCoordinator={patternCommit}
+              externalApplying={patternPendingTargets.has(target)}
             />{/key}
         </div>
       </section>

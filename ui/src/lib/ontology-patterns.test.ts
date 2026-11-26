@@ -7,6 +7,7 @@ import {
   parsePrefixLines,
   parsePreviewHeaders,
   PATTERN_PRESETS,
+  PatternCommitCoordinator,
   patternInputSignature,
   previewPatterns,
 } from './ontology-patterns';
@@ -257,5 +258,124 @@ describe('ontology-patterns HTTP client', () => {
     const [applyUrl, applyInit] = fetchMock.mock.calls[1] as [string, RequestInit];
     expect(applyUrl).toBe('/$/ontology/bio/patterns/apply?receipt=true');
     expect((applyInit.headers as Record<string, string>)['If-Match']).toBe('W/"bio:5:owl"');
+  });
+
+  it('reconciles committed writes and surfaces detached errors when Patterns tab unmounts', async () => {
+    let resolveFetch!: (res: Response) => void;
+    const pendingFetch = new Promise<Response>((resolve) => {
+      resolveFetch = resolve;
+    });
+    const fetchMock = vi.fn().mockReturnValueOnce(pendingFetch);
+    vi.stubGlobal('fetch', fetchMock);
+
+    const committed: { target: string; seq: number | null; notice: string }[] = [];
+    const detachedErrors: { target: string; error: unknown }[] = [];
+    const pendingSnapshots: string[][] = [];
+    const coordinator = new PatternCommitCoordinator({
+      onCommitted: (t, seq, notice) => committed.push({ target: t, seq, notice }),
+      onDetachedError: (t, error) => detachedErrors.push({ target: t, error }),
+      onPendingChange: (set) => pendingSnapshots.push([...set]),
+    });
+
+    let mounted = true;
+    const tabSuccess = vi.fn();
+    const tabSettled = vi.fn();
+    const req = {
+      table: { data: 'ID\nID\nex:A\n' },
+      spec: { mode: 'robot' as const, headerTemplateRow: true },
+      message: 'Load A',
+    };
+
+    const submitPromise = coordinator.submit(
+      'bio',
+      { graph: null, imports: true },
+      req,
+      { etag: 'W/"bio:5:owl-patterns.abc"' },
+      {
+        isMounted: () => mounted,
+        onSuccess: tabSuccess,
+        onError: vi.fn(),
+        onSettled: tabSettled,
+      },
+    );
+
+    // While pending, duplicate submits on the same target are suppressed (e.g. if user
+    // navigates away and back to Patterns before the commit finishes).
+    expect(coordinator.isPending('bio')).toBe(true);
+    const dup = await coordinator.submit('bio', { graph: null, imports: true }, req);
+    expect(dup).toBe(false);
+
+    // Simulate switching from Patterns to Tree tab while commit is still in flight.
+    mounted = false;
+
+    resolveFetch(
+      new Response(
+        JSON.stringify({
+          added: 2,
+          present: 0,
+          removed: 0,
+          absent: [],
+          declared: [],
+          addedAxioms: [],
+          removedAxioms: [],
+          axiomsTruncated: false,
+          inserted: 3,
+          deleted: 0,
+          kept: 0,
+          committed: true,
+          commit: { seq: 11 },
+          pattern: {
+            delimiter: 'csv',
+            headers: ['ID'],
+            rowsProcessed: 1,
+            rowsSkipped: 0,
+            rowsWithErrors: 0,
+            generated: 2,
+            valid: true,
+            diagnostics: [],
+            diagnosticsTruncated: false,
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    expect(await submitPromise).toBe(true);
+    expect(coordinator.isPending('bio')).toBe(false);
+    expect(committed).toHaveLength(1);
+    expect(committed[0]).toEqual({
+      target: 'bio',
+      seq: 11,
+      notice: 'Committed 2 new axioms (3 triples) from 1 row.',
+    });
+    // Unmounted tab callbacks were NOT invoked, while workbench reconciliation WAS.
+    expect(tabSuccess).not.toHaveBeenCalled();
+    expect(tabSettled).not.toHaveBeenCalled();
+    expect(pendingSnapshots).toEqual([['bio'], []]);
+
+    // Detached failure also notifies the parent workbench after unmount.
+    let rejectFetch!: (err: unknown) => void;
+    const failingFetch = new Promise<Response>((_, reject) => {
+      rejectFetch = reject;
+    });
+    fetchMock.mockReturnValueOnce(failingFetch);
+    let mounted2 = true;
+    const failPromise = coordinator.submit(
+      'bio',
+      { graph: null, imports: true },
+      req,
+      {},
+      {
+        isMounted: () => mounted2,
+        onSuccess: vi.fn(),
+        onError: vi.fn(),
+        onSettled: vi.fn(),
+      },
+    );
+    mounted2 = false;
+    rejectFetch(new Error('network down'));
+    expect(await failPromise).toBe(false);
+    expect(detachedErrors).toHaveLength(1);
+    expect(detachedErrors[0].target).toBe('bio');
   });
 });

@@ -12,10 +12,12 @@
     applyPatterns,
     buildPatternSpec,
     dryRunPatterns,
+    formatPatternCommitNotice,
     formatPrefixLines,
     parsePrefixLines,
     parsePreviewHeaders,
     PATTERN_PRESETS,
+    type PatternCommitCoordinator,
     patternInputSignature,
     previewPatterns,
     type PatternDeclarationSpec,
@@ -39,6 +41,8 @@
     etag = null,
     readonly = true,
     oncommitted,
+    commitCoordinator,
+    externalApplying = false,
   }: {
     /** The dataset on its branch (`ds@branch`). */
     target: string;
@@ -50,6 +54,10 @@
     readonly?: boolean;
     /** Called after a commit succeeds, with its commit sequence number. */
     oncommitted?: (seq: number | null) => void;
+    /** Workbench-scoped coordinator that reconciles commits even if this tab unmounts. */
+    commitCoordinator?: PatternCommitCoordinator;
+    /** True while the workbench coordinator has an in-flight commit for this target. */
+    externalApplying?: boolean;
   } = $props();
 
   const ENTITY_KINDS: EntityKind[] = [
@@ -98,10 +106,11 @@
   let statusFilter = $state<'all' | 'new' | 'existing'>('all');
   let searchFilter = $state('');
   let readBusy = $state<'preview' | 'dry' | null>(null);
-  let applying = $state(false);
+  let localApplying = $state(false);
   let error = $state<unknown>(null);
   let notice = $state<string | null>(null);
 
+  const applying = $derived(localApplying || externalApplying);
   const anyBusy = $derived(applying || readBusy != null);
   const run = new LatestRun();
   let destroyed = false;
@@ -377,41 +386,58 @@
     const submittedPolicy = onError;
     const submittedMessage = commitMessage.trim() || 'Generate axioms from pattern';
     // Cancel any in-flight read-only preview/dry-run before committing, but keep the
-    // commit itself un-aborted so authoring edits cannot hide its outcome.
+    // commit itself un-aborted and parent-coordinated so authoring edits or tab switches
+    // never hide its outcome or drop the workbench refresh.
     run.claim('preview');
     run.claim('dry');
     readBusy = null;
-    applying = true;
+    localApplying = true;
     error = null;
     notice = null;
-    try {
-      const res = await applyPatterns(
-        pinned.target,
-        pinned.sel,
-        {
-          table: pinned.req.table,
-          spec: pinned.req.spec,
-          declare: pinned.req.declare,
-          message: submittedMessage,
-          onError: submittedPolicy,
-        },
-        { etag: pinnedEtag },
-      );
-      if (destroyed) return;
+    const applyReq = {
+      table: pinned.req.table,
+      spec: pinned.req.spec,
+      declare: pinned.req.declare,
+      message: submittedMessage,
+      onError: submittedPolicy,
+    };
+    const onSuccess = (msg: string) => {
       dryPreview = null;
-      notice = res.committed
-        ? `Committed ${fmtInt(res.added)} new axiom${res.added === 1 ? '' : 's'} (${fmtInt(res.inserted)} triple${res.inserted === 1 ? '' : 's'}) from ${fmtInt(res.pattern.rowsProcessed)} row${res.pattern.rowsProcessed === 1 ? '' : 's'}.`
-        : `No new axioms to commit (${fmtInt(res.present)} already present).`;
-      const seq = res.receipt?.commit?.seq ?? null;
-      oncommitted?.(seq);
+      notice = msg;
       // Clear preview against the old head so the user previews again if re-applying.
       preview = null;
       previewSignature = null;
       previewPinned = null;
+    };
+    if (commitCoordinator) {
+      await commitCoordinator.submit(
+        pinned.target,
+        pinned.sel,
+        applyReq,
+        { etag: pinnedEtag },
+        {
+          isMounted: () => !destroyed,
+          onSuccess,
+          onError: (e) => {
+            if (!handlePreconditionError(e)) error = e;
+          },
+          onSettled: () => {
+            localApplying = false;
+          },
+        },
+      );
+      return;
+    }
+    try {
+      const res = await applyPatterns(pinned.target, pinned.sel, applyReq, { etag: pinnedEtag });
+      const seq = res.receipt?.commit?.seq ?? null;
+      oncommitted?.(seq);
+      if (destroyed) return;
+      onSuccess(formatPatternCommitNotice(res));
     } catch (e) {
       if (!destroyed && !handlePreconditionError(e)) error = e;
     } finally {
-      if (!destroyed) applying = false;
+      if (!destroyed) localApplying = false;
     }
   }
 
