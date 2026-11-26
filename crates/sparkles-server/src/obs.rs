@@ -22,7 +22,7 @@ use serde_json::{Value as J, json};
 use sparkles::BudgetKind;
 use sparkles::sparql::Timing;
 use sparkles::store::{REBUILD_BUCKETS, RebuildHistogram, RebuildReason};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -101,67 +101,155 @@ fn any_rebuild(hs: &[RebuildHistogram; 2]) -> bool {
         .any(|h| h.buckets.iter().any(|&c| c > 0) || h.sum_seconds > 0.0)
 }
 
+/// Per-store monotonic counters carried in `$other` across deletion, promotion, and
+/// persistent store reopen so shared overflow series never drop or emit negative deltas.
 #[derive(Default)]
-struct OtherRebuildState {
-    /// Highest rebuild counts observed while this dataset was aggregated under `$other`.
-    seen_under_other: [RebuildHistogram; 2],
-    /// Rebuild counts retired to `$other` when this dataset was promoted to a named slot,
-    /// subtracted from its named slot to prevent both `$other` shrinkage and double counting.
-    promoted_offset: [RebuildHistogram; 2],
+pub(crate) struct StoreCounters {
+    rebuilds: [RebuildHistogram; 2],
+    cache_hits: u64,
+    cache_misses: u64,
+    rcache_hits: u64,
+    rcache_misses: u64,
 }
 
-/// Per-dataset rebuild accounting across `$other` promotion and deletion, plus a
-/// server-local monotonic instance id for OTLP reset detection.
-pub struct DatasetMetricsState {
-    pub(crate) instance_id: u64,
-    other_rebuilds: Mutex<OtherRebuildState>,
-}
-
-impl Default for DatasetMetricsState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DatasetMetricsState {
-    pub fn new() -> Self {
+impl StoreCounters {
+    pub(crate) fn read(store: &sparkles::store::Store) -> Self {
+        let (c, r) = (store.cache(), store.result_cache());
         Self {
-            instance_id: next_metrics_id(),
-            other_rebuilds: Mutex::new(OtherRebuildState::default()),
+            rebuilds: RebuildReason::ALL.map(|reason| store.rebuilds(reason)),
+            cache_hits: c.hits(),
+            cache_misses: c.misses(),
+            rcache_hits: r.hits(),
+            rcache_misses: r.misses(),
         }
     }
 
-    /// Rebuilds to retire into `$other` when this dataset is deleted while aggregated there.
-    pub(crate) fn rebuilds_for_other_retirement(
-        &self,
-        raw: [RebuildHistogram; 2],
-    ) -> [RebuildHistogram; 2] {
-        let g = self.other_rebuilds.lock();
-        [
-            max_rebuild(
-                &sub_rebuild(&raw[0], &g.promoted_offset[0]),
-                &g.seen_under_other[0],
-            ),
-            max_rebuild(
-                &sub_rebuild(&raw[1], &g.promoted_offset[1]),
-                &g.seen_under_other[1],
-            ),
-        ]
+    fn clone_counters(&self) -> Self {
+        Self {
+            rebuilds: [
+                clone_rebuild(&self.rebuilds[0]),
+                clone_rebuild(&self.rebuilds[1]),
+            ],
+            cache_hits: self.cache_hits,
+            cache_misses: self.cache_misses,
+            rcache_hits: self.rcache_hits,
+            rcache_misses: self.rcache_misses,
+        }
     }
 
-    /// Preserve `$other` promotion accounting across a dataset rename.
-    pub(crate) fn copy_other_rebuilds_from(&self, prev: &DatasetMetricsState) {
-        let src = prev.other_rebuilds.lock();
-        let mut dst = self.other_rebuilds.lock();
-        dst.seen_under_other = [
-            clone_rebuild(&src.seen_under_other[0]),
-            clone_rebuild(&src.seen_under_other[1]),
-        ];
-        dst.promoted_offset = [
-            clone_rebuild(&src.promoted_offset[0]),
-            clone_rebuild(&src.promoted_offset[1]),
-        ];
+    fn add_assign(&mut self, src: &Self) {
+        add_rebuild(&mut self.rebuilds[0], &src.rebuilds[0]);
+        add_rebuild(&mut self.rebuilds[1], &src.rebuilds[1]);
+        self.cache_hits = self.cache_hits.saturating_add(src.cache_hits);
+        self.cache_misses = self.cache_misses.saturating_add(src.cache_misses);
+        self.rcache_hits = self.rcache_hits.saturating_add(src.rcache_hits);
+        self.rcache_misses = self.rcache_misses.saturating_add(src.rcache_misses);
     }
+
+    fn sub(&self, b: &Self) -> Self {
+        Self {
+            rebuilds: [
+                sub_rebuild(&self.rebuilds[0], &b.rebuilds[0]),
+                sub_rebuild(&self.rebuilds[1], &b.rebuilds[1]),
+            ],
+            cache_hits: self.cache_hits.saturating_sub(b.cache_hits),
+            cache_misses: self.cache_misses.saturating_sub(b.cache_misses),
+            rcache_hits: self.rcache_hits.saturating_sub(b.rcache_hits),
+            rcache_misses: self.rcache_misses.saturating_sub(b.rcache_misses),
+        }
+    }
+
+    fn max_with(&self, b: &Self) -> Self {
+        Self {
+            rebuilds: [
+                max_rebuild(&self.rebuilds[0], &b.rebuilds[0]),
+                max_rebuild(&self.rebuilds[1], &b.rebuilds[1]),
+            ],
+            cache_hits: self.cache_hits.max(b.cache_hits),
+            cache_misses: self.cache_misses.max(b.cache_misses),
+            rcache_hits: self.rcache_hits.max(b.rcache_hits),
+            rcache_misses: self.rcache_misses.max(b.rcache_misses),
+        }
+    }
+
+    fn any(&self) -> bool {
+        any_rebuild(&self.rebuilds)
+            || self.cache_hits > 0
+            || self.cache_misses > 0
+            || self.rcache_hits > 0
+            || self.rcache_misses > 0
+    }
+}
+
+#[derive(Default)]
+struct StoreOtherState {
+    /// Highest live-store counters observed while this open store was aggregated under `$other`.
+    seen_under_other: StoreCounters,
+    /// Counters retired to `$other` when this open store was promoted to a named slot,
+    /// subtracted from its named slot to prevent both `$other` shrinkage and double counting.
+    promoted_offset: StoreCounters,
+}
+
+#[derive(Default)]
+struct OtherStoreLedger {
+    /// Permanently retired live-store counters from deleted, promoted, or reopened overflow stores.
+    retired: StoreCounters,
+    /// Counters temporarily held for stores currently in `AppState::leaving` (delete/rename),
+    /// keyed by `DatasetState::open_id`.
+    pending: BTreeMap<u64, Option<StoreCounters>>,
+    /// Counters of stores whose `leaving` ended without retiring (failed delete/rename or
+    /// memory rename) while a scrape was in flight (`active_scrapes > 0`). Added to `$other`
+    /// only for scrapes whose live sample set missed the store. Cleared when `active_scrapes == 0`.
+    restored_during_scrape: BTreeMap<u64, StoreCounters>,
+    /// `open_id`s finalized (deleted or closed/reopened) while `active_scrapes > 0`, so a
+    /// stale `Arc<Dataset>` held by a concurrent scrape is skipped rather than doubled or
+    /// resurrecting a deleted named slot. Cleared when `active_scrapes == 0`.
+    retired_ids: BTreeSet<u64>,
+    /// Number of `gauges()` scrapes currently in flight.
+    active_scrapes: usize,
+    /// Per-open-store `$other` tracking, keyed by `DatasetState::open_id`.
+    stores: BTreeMap<u64, StoreOtherState>,
+}
+
+fn other_contribution(
+    max_datasets: usize,
+    name: &str,
+    open_id: u64,
+    raw: &StoreCounters,
+    datasets: &BTreeMap<String, Arc<DsMetrics>>,
+    ledger: &OtherStoreLedger,
+) -> Option<StoreCounters> {
+    let st_entry = ledger.stores.get(&open_id);
+    let seen = st_entry
+        .map(|s| s.seen_under_other.clone_counters())
+        .unwrap_or_default();
+    let named = datasets.keys().filter(|k| !k.starts_with('$')).count();
+    let in_overflow =
+        !datasets.contains_key(name) && named >= max_datasets && datasets.contains_key(OTHER);
+    let contrib = if in_overflow {
+        let eff = match st_entry {
+            Some(s) => raw.sub(&s.promoted_offset),
+            None => raw.clone_counters(),
+        };
+        eff.max_with(&seen)
+    } else {
+        seen
+    };
+    contrib.any().then_some(contrib)
+}
+
+#[cfg(all(test, feature = "otel"))]
+type GaugesHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(all(test, feature = "otel"))]
+thread_local! {
+    static GAUGES_AFTER_DATASETS_HOOK: std::cell::RefCell<Option<GaugesHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, feature = "otel"))]
+pub(crate) fn set_gauges_after_datasets_hook(f: impl FnOnce() + Send + 'static) {
+    GAUGES_AFTER_DATASETS_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(f)));
 }
 
 // ---------------------------------------------------------------- request ids ------
@@ -790,9 +878,6 @@ pub struct DsMetrics {
     /// queries by their estimated memory peak, by [`MEMORY_BUCKETS`], not cumulative
     mem_peak: [AtomicU64; MEMORY_BUCKETS.len() + 1],
     mem_peak_sum: AtomicU64,
-    /// retired rebuild histograms preserved under `$other` when overflow datasets are
-    /// deleted or promoted to a named slot, keeping `$other` monotonic
-    retired_rebuilds: Mutex<[RebuildHistogram; 2]>,
 }
 
 /// Upper bounds in bytes of the `sparkles_query_memory_peak_bytes` histogram, without
@@ -865,6 +950,8 @@ pub struct Metrics {
     pub fuseki_names: bool,
     max_datasets: usize,
     datasets: RwLock<BTreeMap<String, Arc<DsMetrics>>>,
+    /// Coordinated `$other` live-store counter ledger (always locked before `datasets`).
+    other_store: Mutex<OtherStoreLedger>,
     /// in-flight requests per operation of the matched route (kept even when metrics
     /// are off)
     active: [AtomicI64; Op::ALL.len()],
@@ -877,6 +964,7 @@ impl Metrics {
             fuseki_names: false,
             max_datasets,
             datasets: RwLock::new(BTreeMap::new()),
+            other_store: Mutex::new(OtherStoreLedger::default()),
             active: Default::default(),
         }
     }
@@ -987,43 +1075,113 @@ impl Metrics {
     /// Drop a deleted dataset's series (a recreated name starts again at zero).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn forget(&self, dataset: &str) {
-        self.forget_with_rebuilds(dataset, None);
+        self.commit_delete(dataset, None);
     }
 
-    /// Drop a deleted dataset's named series, or retire its rebuilds into `$other` when
-    /// it was aggregated under `$other` so shared overflow counters stay monotonic.
-    pub(crate) fn forget_with_rebuilds(
-        &self,
-        dataset: &str,
-        rebuilds: Option<[RebuildHistogram; 2]>,
-    ) {
-        let mut w = self.datasets.write();
-        if w.remove(dataset).is_some() {
+    /// Record a leaving store's pending `$other` counters so concurrent scrapes during
+    /// delete or rename never observe a transient drop.
+    pub(crate) fn begin_leaving(&self, name: &str, open_id: u64, raw: StoreCounters) {
+        if !self.enabled {
             return;
         }
-        if let Some(rebuilds) = rebuilds
-            && let Some(other) = w.get(OTHER)
+        let mut ledger = self.other_store.lock();
+        let r = self.datasets.read();
+        let contrib = other_contribution(self.max_datasets, name, open_id, &raw, &r, &ledger);
+        ledger.pending.insert(open_id, contrib);
+    }
+
+    /// Clear a leaving store's pending entry when delete or rename did not close the store.
+    pub(crate) fn cancel_leaving(&self, open_id: u64) {
+        if !self.enabled {
+            return;
+        }
+        let mut ledger = self.other_store.lock();
+        if let Some(Some(contrib)) = ledger.pending.remove(&open_id)
+            && ledger.active_scrapes > 0
         {
-            let mut dst = other.retired_rebuilds.lock();
-            add_rebuild(&mut dst[0], &rebuilds[0]);
-            add_rebuild(&mut dst[1], &rebuilds[1]);
+            ledger.restored_during_scrape.insert(open_id, contrib);
         }
     }
 
-    fn retire_other_rebuilds(&self, rebuilds: &[RebuildHistogram; 2]) {
+    /// Commit a completed dataset deletion: drop any named series and retire any pending
+    /// `$other` counters atomically under `other_store -> datasets`.
+    pub(crate) fn commit_delete(&self, dataset: &str, open_id: Option<u64>) {
+        let mut ledger = self.other_store.lock();
         let mut w = self.datasets.write();
-        let other = w.entry(OTHER.to_string()).or_default().clone();
-        drop(w);
-        let mut dst = other.retired_rebuilds.lock();
-        add_rebuild(&mut dst[0], &rebuilds[0]);
-        add_rebuild(&mut dst[1], &rebuilds[1]);
+        w.remove(dataset);
+        if let Some(id) = open_id {
+            if let Some(Some(contrib)) = ledger.pending.remove(&id) {
+                ledger.retired.add_assign(&contrib);
+                w.entry(OTHER.to_string()).or_default();
+            }
+            ledger.stores.remove(&id);
+            if ledger.active_scrapes > 0 {
+                ledger.retired_ids.insert(id);
+            }
+        }
     }
 
-    fn other_retired_rebuilds(&self) -> Option<[RebuildHistogram; 2]> {
-        let r = self.datasets.read();
-        let other = r.get(OTHER)?;
-        let g = other.retired_rebuilds.lock();
-        Some([clone_rebuild(&g[0]), clone_rebuild(&g[1])])
+    /// Retire a leaving store whose underlying store was closed and either reopened at zero
+    /// or left closed after a failed delete or rename.
+    pub(crate) fn retire_reopened(&self, open_id: u64) {
+        if !self.enabled {
+            return;
+        }
+        let mut ledger = self.other_store.lock();
+        let mut w = self.datasets.write();
+        if let Some(Some(contrib)) = ledger.pending.remove(&open_id) {
+            ledger.retired.add_assign(&contrib);
+            w.entry(OTHER.to_string()).or_default();
+        }
+        ledger.stores.remove(&open_id);
+        if ledger.active_scrapes > 0 {
+            ledger.retired_ids.insert(open_id);
+        }
+    }
+
+    /// Commit a completed rename: move any named series from `from` to `to`, keeping the
+    /// store's `$other` state intact when the same open store survived (memory rename) or
+    /// retiring old `$other` counters and dropping old promotion offsets when the store
+    /// reopened at zero (persistent rename).
+    pub(crate) fn commit_rename(
+        &self,
+        from: &str,
+        to: &str,
+        old_open_id: Option<u64>,
+        new_open_id: u64,
+    ) {
+        let mut ledger = self.other_store.lock();
+        let mut w = self.datasets.write();
+        if let Some(series) = w.remove(from) {
+            w.insert(to.to_string(), series);
+        }
+        if let Some(old_id) = old_open_id {
+            let contrib = ledger.pending.remove(&old_id).flatten();
+            if old_id == new_open_id {
+                if let Some(c) = contrib
+                    && ledger.active_scrapes > 0
+                {
+                    ledger.restored_during_scrape.insert(old_id, c);
+                }
+            } else {
+                if let Some(c) = contrib {
+                    ledger.retired.add_assign(&c);
+                    w.entry(OTHER.to_string()).or_default();
+                }
+                ledger.stores.remove(&old_id);
+                if ledger.active_scrapes > 0 {
+                    ledger.retired_ids.insert(old_id);
+                }
+            }
+        }
+    }
+
+    fn ensure_other_slot(&self) {
+        self.datasets.write().entry(OTHER.to_string()).or_default();
+    }
+
+    fn has_other_slot(&self) -> bool {
+        self.datasets.read().contains_key(OTHER)
     }
 
     #[cfg(all(test, feature = "otel"))]
@@ -1039,11 +1197,9 @@ impl Metrics {
     }
 
     /// Carry a renamed dataset's series over to its new name.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn rename(&self, from: &str, to: &str) {
-        let mut m = self.datasets.write();
-        if let Some(series) = m.remove(from) {
-            m.insert(to.to_string(), series);
-        }
+        self.commit_rename(from, to, None, 0);
     }
 
     pub fn active(&self, op: Op) -> i64 {
@@ -1321,99 +1477,192 @@ struct DsGauges {
     commit: sparkles::store::CommitMetrics,
 }
 
+struct ActiveScrapeGuard<'a>(&'a Metrics);
+
+impl Drop for ActiveScrapeGuard<'_> {
+    fn drop(&mut self) {
+        let mut ledger = self.0.other_store.lock();
+        ledger.active_scrapes = ledger.active_scrapes.saturating_sub(1);
+        if ledger.active_scrapes == 0 {
+            ledger.retired_ids.clear();
+            ledger.restored_during_scrape.clear();
+        }
+    }
+}
+
+fn add_store_counters(g: &mut DsGauges, c: &StoreCounters) {
+    g.cache_hits = g.cache_hits.saturating_add(c.cache_hits);
+    g.cache_misses = g.cache_misses.saturating_add(c.cache_misses);
+    g.rcache_hits = g.rcache_hits.saturating_add(c.rcache_hits);
+    g.rcache_misses = g.rcache_misses.saturating_add(c.rcache_misses);
+    for (h, eff) in g.rebuilds.iter_mut().zip(&c.rebuilds) {
+        add_rebuild(h, eff);
+    }
+}
+
 fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
+    let _scrape_guard = if st.metrics.enabled {
+        st.metrics.other_store.lock().active_scrapes += 1;
+        Some(ActiveScrapeGuard(&st.metrics))
+    } else {
+        None
+    };
     let datasets: Vec<_> = st.datasets().values().cloned().collect();
-    let mut out: BTreeMap<String, DsGauges> = BTreeMap::new();
     // the caches are shared, so one pass over each gives every dataset's bytes
     let (block_usage, result_usage) = match st.catalog.caches() {
         Some(c) => (Some(c.blocks().usage()), Some(c.results().usage())),
         None => (None, None),
     };
-    for d in datasets {
-        let label = if st.metrics.enabled {
-            st.metrics.series(Some(&d.name)).0
-        } else {
-            d.name.clone()
-        };
-        let is_other = label == OTHER;
-        let g = out.entry(label).or_default();
-        if !is_other {
-            g.instance_id = d.metrics_state.instance_id;
-        }
-        let snap = d.store.snapshot();
-        let (c, r) = (d.store.cache(), d.store.result_cache());
-        g.quads += snap.len();
-        g.delta_inserts += snap.delta.inserts() as u64;
-        g.delta_deletes += snap.delta.deletes() as u64;
-        g.wal_bytes += d.store.wal_bytes();
-        // measured at most once a second, like the quota checks of commits
-        let quota = d.dataset.settings().quota().get();
-        g.disk_bytes += quota.used_bytes;
-        g.quota_bytes += quota.max_bytes.unwrap_or(0);
-        let cu = match &block_usage {
-            Some(u) => u.get(&c.namespace()).copied().unwrap_or_default(),
-            None => sparkles::index::NamespaceUsage {
-                bytes: c.bytes(),
-                entries: c.entries() as u64,
-            },
-        };
-        g.cache_bytes += cu.bytes;
-        g.cache_capacity = c.capacity();
-        g.cache_entries += cu.entries;
-        g.cache_hits += c.hits();
-        g.cache_misses += c.misses();
-        g.rcache_enabled |= r.enabled();
-        let ru = match &result_usage {
-            Some(u) => u.get(&r.namespace()).copied().unwrap_or_default(),
-            None => sparkles::index::NamespaceUsage {
-                bytes: r.bytes(),
-                entries: r.entries() as u64,
-            },
-        };
-        g.rcache_bytes += ru.bytes;
-        g.rcache_capacity = r.capacity();
-        g.rcache_entries += ru.entries;
-        g.rcache_hits += r.hits();
-        g.rcache_misses += r.misses();
-        g.commit.merge(&d.store.commit_metrics());
-        let raw = RebuildReason::ALL.map(|reason| d.store.rebuilds(reason));
-        let effective = {
-            let mut st_other = d.metrics_state.other_rebuilds.lock();
-            if is_other {
-                let eff = [
-                    sub_rebuild(&raw[0], &st_other.promoted_offset[0]),
-                    sub_rebuild(&raw[1], &st_other.promoted_offset[1]),
-                ];
-                st_other.seen_under_other[0] = max_rebuild(&st_other.seen_under_other[0], &eff[0]);
-                st_other.seen_under_other[1] = max_rebuild(&st_other.seen_under_other[1], &eff[1]);
-                eff
-            } else {
-                if any_rebuild(&st_other.seen_under_other) {
-                    let retired = [
-                        clone_rebuild(&st_other.seen_under_other[0]),
-                        clone_rebuild(&st_other.seen_under_other[1]),
-                    ];
-                    st.metrics.retire_other_rebuilds(&retired);
-                    add_rebuild(&mut st_other.promoted_offset[0], &retired[0]);
-                    add_rebuild(&mut st_other.promoted_offset[1], &retired[1]);
-                    st_other.seen_under_other = Default::default();
-                }
-                [
-                    sub_rebuild(&raw[0], &st_other.promoted_offset[0]),
-                    sub_rebuild(&raw[1], &st_other.promoted_offset[1]),
-                ]
-            }
-        };
-        for (h, eff) in g.rebuilds.iter_mut().zip(&effective) {
-            add_rebuild(h, eff);
-        }
+    struct LiveSample {
+        name: String,
+        open_id: u64,
+        quads: u64,
+        delta_inserts: u64,
+        delta_deletes: u64,
+        wal_bytes: u64,
+        disk_bytes: u64,
+        quota_bytes: u64,
+        cache_bytes: u64,
+        cache_capacity: u64,
+        cache_entries: u64,
+        rcache_enabled: bool,
+        rcache_bytes: u64,
+        rcache_capacity: u64,
+        rcache_entries: u64,
+        commit: sparkles::store::CommitMetrics,
+        counters: StoreCounters,
     }
-    if st.metrics.enabled
-        && let Some(retired) = st.metrics.other_retired_rebuilds()
+    let samples: Vec<LiveSample> = datasets
+        .into_iter()
+        .map(|d| {
+            let snap = d.store.snapshot();
+            let (c, r) = (d.store.cache(), d.store.result_cache());
+            // measured at most once a second, like the quota checks of commits
+            let quota = d.dataset.settings().quota().get();
+            let cu = match &block_usage {
+                Some(u) => u.get(&c.namespace()).copied().unwrap_or_default(),
+                None => sparkles::index::NamespaceUsage {
+                    bytes: c.bytes(),
+                    entries: c.entries() as u64,
+                },
+            };
+            let ru = match &result_usage {
+                Some(u) => u.get(&r.namespace()).copied().unwrap_or_default(),
+                None => sparkles::index::NamespaceUsage {
+                    bytes: r.bytes(),
+                    entries: r.entries() as u64,
+                },
+            };
+            LiveSample {
+                name: d.name.clone(),
+                open_id: d.open_id,
+                quads: snap.len(),
+                delta_inserts: snap.delta.inserts() as u64,
+                delta_deletes: snap.delta.deletes() as u64,
+                wal_bytes: d.store.wal_bytes(),
+                disk_bytes: quota.used_bytes,
+                quota_bytes: quota.max_bytes.unwrap_or(0),
+                cache_bytes: cu.bytes,
+                cache_capacity: c.capacity(),
+                cache_entries: cu.entries,
+                rcache_enabled: r.enabled(),
+                rcache_bytes: ru.bytes,
+                rcache_capacity: r.capacity(),
+                rcache_entries: ru.entries,
+                commit: d.store.commit_metrics(),
+                counters: StoreCounters::read(&d.store),
+            }
+        })
+        .collect();
+    #[cfg(all(test, feature = "otel"))]
+    if let Some(hook) = GAUGES_AFTER_DATASETS_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+    let mut out: BTreeMap<String, DsGauges> = BTreeMap::new();
+    if !st.metrics.enabled {
+        for s in samples {
+            let g = out.entry(s.name).or_default();
+            g.instance_id = s.open_id;
+            g.quads += s.quads;
+            g.delta_inserts += s.delta_inserts;
+            g.delta_deletes += s.delta_deletes;
+            g.wal_bytes += s.wal_bytes;
+            g.disk_bytes += s.disk_bytes;
+            g.quota_bytes += s.quota_bytes;
+            g.cache_bytes += s.cache_bytes;
+            g.cache_capacity = s.cache_capacity;
+            g.cache_entries += s.cache_entries;
+            g.rcache_enabled |= s.rcache_enabled;
+            g.rcache_bytes += s.rcache_bytes;
+            g.rcache_capacity = s.rcache_capacity;
+            g.rcache_entries += s.rcache_entries;
+            g.commit.merge(&s.commit);
+            add_store_counters(g, &s.counters);
+        }
+        return out;
+    }
+    // Hold `other_store` across slot resolution, promotion retirement, and pending/retired
+    // `$other` aggregation so concurrent scrapes never double-count or drop an overflow store.
     {
-        let g = out.entry(OTHER.to_string()).or_default();
-        for (h, r) in g.rebuilds.iter_mut().zip(&retired) {
-            add_rebuild(h, r);
+        let mut ledger_guard = st.metrics.other_store.lock();
+        let ledger = &mut *ledger_guard;
+        let mut live_ids = BTreeSet::new();
+        for s in samples {
+            if ledger.retired_ids.contains(&s.open_id) || ledger.pending.contains_key(&s.open_id) {
+                continue;
+            }
+            live_ids.insert(s.open_id);
+            let label = st.metrics.series(Some(&s.name)).0;
+            let is_other = label == OTHER;
+            let effective = if is_other {
+                let entry = ledger.stores.entry(s.open_id).or_default();
+                let eff = s.counters.sub(&entry.promoted_offset);
+                entry.seen_under_other = entry.seen_under_other.max_with(&eff);
+                eff
+            } else if let Some(entry) = ledger.stores.get_mut(&s.open_id) {
+                if entry.seen_under_other.any() {
+                    let retired = entry.seen_under_other.clone_counters();
+                    ledger.retired.add_assign(&retired);
+                    st.metrics.ensure_other_slot();
+                    entry.promoted_offset.add_assign(&retired);
+                    entry.seen_under_other = StoreCounters::default();
+                }
+                s.counters.sub(&entry.promoted_offset)
+            } else {
+                s.counters
+            };
+            let g = out.entry(label).or_default();
+            if !is_other {
+                g.instance_id = s.open_id;
+            }
+            g.quads += s.quads;
+            g.delta_inserts += s.delta_inserts;
+            g.delta_deletes += s.delta_deletes;
+            g.wal_bytes += s.wal_bytes;
+            g.disk_bytes += s.disk_bytes;
+            g.quota_bytes += s.quota_bytes;
+            g.cache_bytes += s.cache_bytes;
+            g.cache_capacity = s.cache_capacity;
+            g.cache_entries += s.cache_entries;
+            g.rcache_enabled |= s.rcache_enabled;
+            g.rcache_bytes += s.rcache_bytes;
+            g.rcache_capacity = s.rcache_capacity;
+            g.rcache_entries += s.rcache_entries;
+            g.commit.merge(&s.commit);
+            add_store_counters(g, &effective);
+        }
+        let mut carried = ledger.retired.clone_counters();
+        for c in ledger.pending.values().flatten() {
+            carried.add_assign(c);
+        }
+        for (id, c) in &ledger.restored_during_scrape {
+            if !live_ids.contains(id) {
+                carried.add_assign(c);
+            }
+        }
+        if carried.any() || st.metrics.has_other_slot() {
+            let g = out.entry(OTHER.to_string()).or_default();
+            add_store_counters(g, &carried);
         }
     }
     out

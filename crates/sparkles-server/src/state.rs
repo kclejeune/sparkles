@@ -154,8 +154,6 @@ pub struct Dataset {
     pub ephemeral: bool,
     /// write-time validation counters (the store's guard observer)
     pub validation_metrics: Arc<crate::obs::ValidationMetrics>,
-    /// per-dataset rebuild accounting and generation id for metrics parity
-    pub metrics_state: crate::obs::DatasetMetricsState,
     /// taken offline by `POST /$/datasets/{ds}?state=offline` (Fuseki): its services
     /// answer `503` until `?state=active`; not persisted
     pub offline: AtomicBool,
@@ -348,13 +346,27 @@ fn rooted_in_cancel(e: &anyhow::Error) -> bool {
 struct Leaving<'a> {
     st: &'a AppState,
     name: String,
+    pending_open_id: Option<u64>,
+}
+
+impl Leaving<'_> {
+    /// Disarm automatic pending-metrics cancellation once the caller has committed or
+    /// retired the leaving store's `$other` accounting.
+    fn disarm_metrics(&mut self) {
+        self.pending_open_id = None;
+    }
 }
 
 impl Drop for Leaving<'_> {
     fn drop(&mut self) {
-        let mut l = self.st.leaving.lock();
-        l.remove(&self.name);
-        self.st.lifecycle.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut l = self.st.leaving.lock();
+            l.remove(&self.name);
+            self.st.lifecycle.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Some(id) = self.pending_open_id.take() {
+            self.st.metrics.cancel_leaving(id);
+        }
     }
 }
 
@@ -1013,7 +1025,6 @@ impl AppState {
             branches: Mutex::new(BTreeMap::new()),
             ephemeral,
             validation_metrics,
-            metrics_state: crate::obs::DatasetMetricsState::new(),
             offline: AtomicBool::new(false),
             dataset,
         })
@@ -1298,6 +1309,7 @@ impl AppState {
 
     /// Mark `name` as leaving until the guard drops. A second delete or rename of the
     /// same dataset is refused meanwhile.
+    #[cfg(all(test, feature = "auth"))]
     fn leave(&self, name: &str) -> Result<Leaving<'_>> {
         let mut l = self.leaving.lock();
         if !l.insert(name.to_string()) {
@@ -1311,7 +1323,39 @@ impl AppState {
         Ok(Leaving {
             st: self,
             name: name.to_string(),
+            pending_open_id: None,
         })
+    }
+
+    /// Atomically mark `name` as leaving, detach its cached routing object, and register
+    /// any `$other` live-store counters as pending under `routing -> leaving -> other_store`
+    /// lock order so concurrent scrapes never observe a gap during deletion or rename.
+    fn leave_and_take_cached(&self, name: &str) -> Result<(Leaving<'_>, Option<Arc<Dataset>>)> {
+        let mut routing = self.routing.lock();
+        let mut leaving = self.leaving.lock();
+        if !leaving.insert(name.to_string()) {
+            return Err(sparkles::Error::Conflict(format!(
+                "dataset /{name} is already being deleted or renamed"
+            ))
+            .into());
+        }
+        self.lifecycle.fetch_add(1, Ordering::SeqCst);
+        let cached = routing.remove(name);
+        let pending_open_id = cached.as_ref().map(|ds| {
+            let counters = crate::obs::StoreCounters::read(&ds.store);
+            self.metrics.begin_leaving(name, ds.open_id, counters);
+            ds.open_id
+        });
+        drop(leaving);
+        drop(routing);
+        Ok((
+            Leaving {
+                st: self,
+                name: name.to_string(),
+                pending_open_id,
+            },
+            cached,
+        ))
     }
 
     /// Delete a dataset. Lookups stop finding it first, then its cached routing object
@@ -1329,9 +1373,8 @@ impl AppState {
         &self,
         name: &str,
     ) -> Result<(bool, Option<uuid::Uuid>)> {
-        let leaving = self.leave(name)?;
+        let (mut leaving, cached) = self.leave_and_take_cached(name)?;
         let end = Instant::now() + LEAVE_DRAIN;
-        let cached = self.routing.lock().remove(name);
         // Only a managed persistent dataset has files that an old handle could write.
         let managed = match cached.as_ref() {
             Some(ds) => ds.kind == DbType::Persistent && !ds.ephemeral,
@@ -1353,10 +1396,7 @@ impl AppState {
             .as_ref()
             .map(|ds| ds.store.dataset_id())
             .or_else(|| self.catalog.info(name).map(|info| info.id));
-        let delete_rebuilds = cached.as_ref().map(|ds| {
-            let raw = sparkles::store::RebuildReason::ALL.map(|r| ds.store.rebuilds(r));
-            ds.metrics_state.rebuilds_for_other_retirement(raw)
-        });
+        let old_open_id = cached.as_ref().map(|ds| ds.open_id);
         drop(cached);
         if managed {
             // Other holders of the dataset itself, not this server's wrapper, get the
@@ -1367,16 +1407,35 @@ impl AppState {
         #[cfg(test)]
         tests::delete_hook(name);
         let deleted = self.catalog.delete(name);
-        drop(leaving);
         match deleted {
             Ok(deleted) => {
                 if deleted {
-                    self.metrics.forget_with_rebuilds(name, delete_rebuilds);
+                    self.metrics.commit_delete(name, old_open_id);
+                    leaving.disarm_metrics();
+                    drop(leaving);
                     self.volatile.forget(name);
+                } else {
+                    drop(leaving);
                 }
                 Ok((deleted, deleted.then_some(identity).flatten()))
             }
             Err(e) => {
+                // If catalog deletion closed the store and either reopened a new one or
+                // left it closed for recovery, retire the old store's `$other` counters
+                // before exposing the reopened store; if the same store survived intact,
+                // `drop(leaving)` cancels the pending entry while preserving its state.
+                let same_store = old_open_id.is_some()
+                    && self
+                        .catalog
+                        .get(name)
+                        .is_some_and(|cur| Some(cur.state().open_id) == old_open_id);
+                if let Some(old_id) = old_open_id
+                    && !same_store
+                {
+                    self.metrics.retire_reopened(old_id);
+                    leaving.disarm_metrics();
+                }
+                drop(leaving);
                 if let Some(ds) = self.get(name) {
                     ds.offline.store(offline, Ordering::Relaxed);
                 }
@@ -1420,9 +1479,8 @@ impl AppState {
             ))
             .into());
         }
-        let leaving = self.leave(from)?;
+        let (mut leaving, cached) = self.leave_and_take_cached(from)?;
         let end = Instant::now() + LEAVE_DRAIN;
-        let cached = self.routing.lock().remove(from);
         if cached.as_ref().is_some_and(|ds| !drained(ds, end)) {
             self.routing
                 .lock()
@@ -1435,11 +1493,7 @@ impl AppState {
         let offline = cached
             .as_ref()
             .is_some_and(|ds| ds.offline.load(Ordering::Relaxed));
-        let prev_metrics_state = cached.as_ref().map(|ds| {
-            let s = crate::obs::DatasetMetricsState::new();
-            s.copy_other_rebuilds_from(&ds.metrics_state);
-            s
-        });
+        let old_open_id = cached.as_ref().map(|ds| ds.open_id);
         drop(cached);
         // As in delete, wait for the workers that hold the dataset itself. The catalog
         // refuses a rename for those handles only on a persistent dataset.
@@ -1447,11 +1501,14 @@ impl AppState {
             wait_until(end, || !self.catalog.in_use(from));
         }
         let result = self.catalog.rename(from, to);
-        drop(leaving);
         match result {
             Ok(ds) => {
+                let new_open_id = ds.state().open_id;
+                self.metrics
+                    .commit_rename(from, to, old_open_id, new_open_id);
+                leaving.disarm_metrics();
                 drop(ds);
-                self.metrics.rename(from, to);
+                drop(leaving);
                 self.volatile.rename(from, to);
                 self.compaction.rename(from, to);
                 if let Some(auto) = &self.auto_reason {
@@ -1464,14 +1521,23 @@ impl AppState {
                     tracing::warn!("backup policies still name /{from}: {e:#}");
                 }
                 if let Some(ds) = self.get(to) {
-                    if let Some(prev) = &prev_metrics_state {
-                        ds.metrics_state.copy_other_rebuilds_from(prev);
-                    }
                     ds.offline.store(offline, Ordering::Relaxed);
                 }
                 Ok(())
             }
             Err(e) => {
+                let same_store = old_open_id.is_some()
+                    && self
+                        .catalog
+                        .get(from)
+                        .is_some_and(|cur| Some(cur.state().open_id) == old_open_id);
+                if let Some(old_id) = old_open_id
+                    && !same_store
+                {
+                    self.metrics.retire_reopened(old_id);
+                    leaving.disarm_metrics();
+                }
+                drop(leaving);
                 if let Some(ds) = self.get(from) {
                     ds.offline.store(offline, Ordering::Relaxed);
                 }
@@ -1955,11 +2021,14 @@ pub(crate) mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    type Hook = (String, Box<dyn FnOnce() + Send>);
-    static DELETE_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
     type TaskHooks = Mutex<BTreeMap<String, Box<dyn FnOnce() + Send>>>;
+    static DELETE_HOOK: TaskHooks = Mutex::new(BTreeMap::new());
     static TASK_RETIREMENT_HOOK: TaskHooks = Mutex::new(BTreeMap::new());
     static TASK_START_HOOK: TaskHooks = Mutex::new(BTreeMap::new());
+
+    pub(crate) fn set_delete_hook(name: &str, f: impl FnOnce() + Send + 'static) {
+        DELETE_HOOK.lock().insert(name.to_string(), Box::new(f));
+    }
 
     pub(crate) fn task_retirement_hook(kind: &str) {
         run_task_hook(&TASK_RETIREMENT_HOOK, kind);
@@ -2037,17 +2106,7 @@ pub(crate) mod tests {
     /// Runs the hook installed for dataset `name`, where a delete starts its catalog
     /// work.
     pub(crate) fn delete_hook(name: &str) {
-        let hook = {
-            let mut h = DELETE_HOOK.lock();
-            if h.as_ref().is_some_and(|(n, _)| n == name) {
-                h.take()
-            } else {
-                None
-            }
-        };
-        if let Some((_, f)) = hook {
-            f();
-        }
+        run_task_hook(&DELETE_HOOK, name);
     }
 
     #[test]
@@ -2200,13 +2259,10 @@ pub(crate) mod tests {
         drop(st.create("bystander", DbType::Persistent).unwrap());
         let (entered, entered_rx) = mpsc::channel();
         let (release, release_rx) = mpsc::channel::<()>();
-        *DELETE_HOOK.lock() = Some((
-            target.to_string(),
-            Box::new(move || {
-                entered.send(()).unwrap();
-                release_rx.recv().unwrap();
-            }),
-        ));
+        set_delete_hook(target, move || {
+            entered.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
         let deleter = {
             let st = st.clone();
             std::thread::spawn(move || st.delete(target).unwrap())

@@ -543,8 +543,16 @@ twice and `/$/metrics` does not change. These instruments are
 `sparkles.memory.review.pending` and `sparkles.memory.review.oldest` (`dataset`, `kind`),
 `sparkles.ready`, `process.uptime` and `process.memory.usage`. Integer counters for
 produced rows, query memory peaks, and rebuild counts export as exact 64-bit integers up
-to the signed 64-bit OTLP wire limit, and per-stream cardinality limits scale with
-`--metrics-max-datasets`.
+to the signed 64-bit OTLP wire limit. Per-stream cardinality limits scale with
+`--metrics-max-datasets` up to a ceiling of 250,000 attribute sets per stream, so a
+sufficiently large `--metrics-max-datasets` can still overflow individual multi-label
+streams such as `sparkles.rebuild.duration.bucket`. Deleting and recreating a named
+dataset between two consecutive OTLP collections carries prior emitted Phase 2 totals
+forward so neither cumulative nor delta counters decrease. When an intervening collection
+observes the dataset absent, a later recreation restarts at zero to match Prometheus and
+JSON. Under delta temporality the recreated series begins a fresh accumulation interval,
+while under cumulative temporality the OpenTelemetry Rust SDK retains the instrument
+start timestamp without emitting an explicit gap marker.
 
 **Logs.** With `--otel-logs` or `OTEL_LOGS_EXPORTER=otlp`, every log event that passes
 `RUST_LOG` is also exported as an OTLP log record, with the trace and span id of its

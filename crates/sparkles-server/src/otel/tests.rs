@@ -597,6 +597,8 @@ struct OtlpMetric {
     unit: String,
     monotonic: bool,
     temporality: Temporality,
+    start_time: std::time::SystemTime,
+    time: std::time::SystemTime,
     points: Vec<(Vec<(String, String)>, OtlpValue)>,
 }
 
@@ -661,6 +663,8 @@ impl MetricsHarness {
                                 unit: m.unit().to_string(),
                                 monotonic: sum.is_monotonic(),
                                 temporality: sum.temporality(),
+                                start_time: sum.start_time(),
+                                time: sum.time(),
                                 points,
                             },
                         );
@@ -685,6 +689,8 @@ impl MetricsHarness {
                                 unit: m.unit().to_string(),
                                 monotonic: sum.is_monotonic(),
                                 temporality: sum.temporality(),
+                                start_time: sum.start_time(),
+                                time: sum.time(),
                                 points,
                             },
                         );
@@ -2008,10 +2014,19 @@ async fn phase2_otlp_delta_and_cumulative_monotonic_on_other_delete_and_same_cyc
             > c1_rows
     );
 
-    // Delete `tmp`, collect its absence, then recreate: both Delta and Cumulative restart at 0.
+    // Delete `tmp`, collect its absence, then recreate: both Delta and Cumulative restart
+    // at 0 to match Prometheus and JSON. Delta starts a fresh accumulation interval while
+    // Cumulative retains the SDK's instrument-level start time.
+    let c1_start = c1.get("sparkles.rebuilds").unwrap().start_time;
+    assert_eq!(c2.get("sparkles.rebuilds").unwrap().start_time, c1_start);
+    assert_eq!(c3.get("sparkles.rebuilds").unwrap().start_time, c1_start);
     assert!(st2.delete("tmp").unwrap());
     let c4 = cum2.collect();
     let dl4 = delta2.collect();
+    let dl4_time = dl4
+        .get("sparkles.rebuilds")
+        .map(|m| m.time)
+        .unwrap_or_else(|| dl3.get("sparkles.rebuilds").unwrap().time);
     assert_eq!(
         otel_u64(
             &c4,
@@ -2051,22 +2066,57 @@ async fn phase2_otlp_delta_and_cumulative_monotonic_on_other_delete_and_same_cyc
         ),
         Some(0)
     );
+    assert_eq!(c5.get("sparkles.rebuilds").unwrap().start_time, c1_start);
+    assert!(dl5.get("sparkles.rebuilds").unwrap().start_time >= dl4_time);
+    // Subsequent work after the observed-absence reset increments cleanly from 0.
+    {
+        let tmp = st2.get("tmp").unwrap();
+        tmp.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+    }
+    let c6 = cum2.collect();
+    let dl6 = delta2.collect();
+    assert_eq!(
+        otel_u64(
+            &c6,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "tmp"), ("reason", "bulk")]
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        otel_u64(
+            &dl6,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "tmp"), ("reason", "bulk")]
+        ),
+        Some(1)
+    );
 }
 
 #[tokio::test]
 async fn phase2_otlp_snapshot_refreshes_when_index_zero_dropped_and_out_of_order() {
     let dir = tempfile::tempdir().unwrap();
-    let st = Arc::new(
-        AppState::new(
-            dir.path(),
-            StoreOptions {
-                bulk_threshold: 1,
-                ..Default::default()
-            },
-            Duration::from_secs(30),
-        )
-        .unwrap(),
-    );
+    let mut st = AppState::new(
+        dir.path(),
+        StoreOptions {
+            bulk_threshold: 1,
+            ..Default::default()
+        },
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    // Keep `max_datasets` below the `sparkles.requests` cardinality-view threshold
+    // (`3 * 108 = 324 <= 2000`) so the Drop view is the sole view matching index 0.
+    st.metrics = crate::obs::Metrics::new(true, 1);
+    let st = Arc::new(st);
     let ds = st.attach("ds", DbType::Mem, None).unwrap();
     ds.store
         .load(&[Source::from_bytes(
@@ -2103,7 +2153,8 @@ async fn phase2_otlp_snapshot_refreshes_when_index_zero_dropped_and_out_of_order
         Some(0)
     );
 
-    // Mutate state and verify the next collection still refreshes despite index 0 being dropped.
+    // Mutate state and record a real HTTP request; `sparkles.requests` must stay absent
+    // (confirming callback index 0 was truly dropped) while later callbacks refresh.
     ds.store.compact().unwrap();
     let (status, _, _) = call(
         &app,
@@ -2114,6 +2165,14 @@ async fn phase2_otlp_snapshot_refreshes_when_index_zero_dropped_and_out_of_order
     .await;
     assert_eq!(status, StatusCode::OK);
     let o2 = harness.collect();
+    assert!(
+        !o2.contains_key("sparkles.requests"),
+        "sparkles.requests callback was not actually dropped"
+    );
+    assert!(
+        o2.contains_key("sparkles.response.size"),
+        "expected HTTP request to record non-dropped request metrics"
+    );
     assert_eq!(
         otel_u64(
             &o2,
@@ -2191,5 +2250,926 @@ async fn phase2_otlp_preserves_u64_precision_above_f64_limit() {
             &[("dataset", "ds")]
         ),
         Some(two_to_53 + 1)
+    );
+}
+
+#[test]
+fn phase2_otlp_monotonic_continuation_clamps_dips_without_gen_change() {
+    use std::collections::BTreeMap;
+    let mut monotonic: BTreeMap<String, sdk::DatasetMonotonic> = BTreeMap::new();
+    let make_snap = |rows: u64,
+                     peak_cnt: u64,
+                     peak_sum: u64,
+                     bulk_cnt: u64,
+                     bulk_sum: f64|
+     -> crate::obs::OtelMetricsSnapshot {
+        let mut gens = BTreeMap::new();
+        gens.insert("$other".to_string(), (1, 0));
+        crate::obs::OtelMetricsSnapshot {
+            json: serde_json::json!({
+                "datasets": [{
+                    "name": "$other",
+                    "rowsProduced": rows,
+                    "queryMemoryPeak": {
+                        "count": peak_cnt,
+                        "sumBytes": peak_sum,
+                        "buckets": [peak_cnt, peak_cnt]
+                    },
+                    "rebuilds": {
+                        "compact": { "count": 0, "duration": null },
+                        "bulk": {
+                            "count": bulk_cnt,
+                            "duration": {
+                                "count": bulk_cnt,
+                                "sumSeconds": bulk_sum,
+                                "buckets": [bulk_cnt, bulk_cnt]
+                            }
+                        }
+                    }
+                }]
+            }),
+            dataset_gens: gens,
+        }
+    };
+
+    let mut snap1 = make_snap(10, 2, 2048, 2, 0.5);
+    sdk::apply_monotonic_continuation(&mut snap1, &mut monotonic);
+
+    // Same `(series_id, instance_id)` with dipped `raw_peak` and `raw_rebuilds`
+    // (including a 1-ULP floating-point reassociation dip on `sumSeconds`).
+    let dipped_sum = f64::from_bits(0.5f64.to_bits() - 1);
+    assert!(dipped_sum < 0.5);
+    let mut snap2 = make_snap(10, 1, 1024, 1, dipped_sum);
+    sdk::apply_monotonic_continuation(&mut snap2, &mut monotonic);
+
+    let d = &snap2.json["datasets"][0];
+    assert_eq!(d["rowsProduced"], 10);
+    assert_eq!(d["queryMemoryPeak"]["count"], 2);
+    assert_eq!(d["queryMemoryPeak"]["sumBytes"], 2048);
+    assert_eq!(d["queryMemoryPeak"]["buckets"], serde_json::json!([2, 2]));
+    assert_eq!(d["rebuilds"]["bulk"]["count"], 2);
+    assert_eq!(d["rebuilds"]["bulk"]["duration"]["count"], 2);
+    assert_eq!(
+        d["rebuilds"]["bulk"]["duration"]["buckets"],
+        serde_json::json!([2, 2])
+    );
+    assert_eq!(
+        d["rebuilds"]["bulk"]["duration"]["sumSeconds"].as_f64(),
+        Some(0.5)
+    );
+}
+
+#[tokio::test]
+async fn phase2_otlp_concurrent_delete_and_promotion_never_drop_or_double_count() {
+    use std::sync::mpsc;
+
+    // Part A: Collection paused inside `delete`'s `leaving` window via `delete_hook`.
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = AppState::new(
+        dir.path(),
+        StoreOptions {
+            bulk_threshold: 1,
+            ..Default::default()
+        },
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    st.metrics = crate::obs::Metrics::new(true, 1);
+    let st = Arc::new(st);
+    st.create("a", DbType::Mem).unwrap();
+    {
+        let b = st.create("b", DbType::Persistent).unwrap();
+        b.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+    }
+    st.set_phase(Phase::Ready);
+    let app = router(st.clone());
+    let (status, _, _) = call(
+        &app,
+        HttpRequest::get("/a/sparql?query=ASK%7B%7D")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cum_h = MetricsHarness::with_temporality(&st, Temporality::Cumulative);
+    let delta_h = MetricsHarness::with_temporality(&st, Temporality::Delta);
+
+    assert_all_three_phase2_parity(&st, &cum_h, "$other");
+    let c1 = cum_h.collect();
+    let d1 = delta_h.collect();
+    let sum_before = otel_f64(
+        &c1,
+        "sparkles.rebuild.duration.sum",
+        "s",
+        &[("dataset", "$other"), ("reason", "bulk")],
+    )
+    .unwrap();
+    assert_eq!(
+        otel_u64(
+            &d1,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(1)
+    );
+
+    let (entered, entered_rx) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel::<()>();
+    crate::state::tests::set_delete_hook("b", move || {
+        entered.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    });
+    let deleter = {
+        let st = st.clone();
+        std::thread::spawn(move || st.delete("b").unwrap())
+    };
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(st.get("b").is_none(), "b must be hidden while leaving");
+
+    // Scrape Prometheus, JSON, OTLP Cumulative, and OTLP Delta while `b` is leaving.
+    assert_all_three_phase2_parity(&st, &cum_h, "$other");
+    let c_mid = cum_h.collect();
+    let d_mid = delta_h.collect();
+    assert_eq!(
+        otel_u64(
+            &c_mid,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        otel_u64(
+            &c_mid,
+            "sparkles.rebuild.duration.count",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        otel_u64(
+            &c_mid,
+            "sparkles.rebuild.duration.bucket",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk"), ("le", "+Inf")]
+        ),
+        Some(1)
+    );
+    assert!(
+        (otel_f64(
+            &c_mid,
+            "sparkles.rebuild.duration.sum",
+            "s",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        )
+        .unwrap()
+            - sum_before)
+            .abs()
+            < 1e-12
+    );
+    assert_eq!(
+        otel_u64(
+            &d_mid,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        otel_u64(
+            &d_mid,
+            "sparkles.rebuild.duration.count",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        otel_u64(
+            &d_mid,
+            "sparkles.rebuild.duration.bucket",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk"), ("le", "+Inf")]
+        ),
+        Some(0)
+    );
+    assert!(
+        otel_f64(
+            &d_mid,
+            "sparkles.rebuild.duration.sum",
+            "s",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        )
+        .unwrap()
+            >= 0.0
+    );
+
+    release.send(()).unwrap();
+    assert!(deleter.join().unwrap());
+    assert_all_three_phase2_parity(&st, &cum_h, "$other");
+    let d_after = delta_h.collect();
+    assert_eq!(
+        otel_u64(
+            &d_after,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(0)
+    );
+
+    // Part B: Overlapping scrape during promotion of overflow dataset `c` after `a` is deleted.
+    {
+        let c = st.create("c", DbType::Mem).unwrap();
+        c.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+    }
+    assert_all_three_phase2_parity(&st, &cum_h, "$other");
+    let c_pre = cum_h.collect();
+    let d_pre = delta_h.collect();
+    assert_eq!(
+        otel_u64(
+            &c_pre,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(2)
+    );
+    assert_eq!(
+        otel_u64(
+            &d_pre,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(1)
+    );
+
+    let (s1_entered, s1_entered_rx) = mpsc::channel();
+    let (s1_release, s1_release_rx) = mpsc::channel::<()>();
+    let scrape1 = {
+        let st = st.clone();
+        std::thread::spawn(move || {
+            crate::obs::set_gauges_after_datasets_hook(move || {
+                s1_entered.send(()).unwrap();
+                s1_release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+            });
+            crate::obs::metrics_json(&st)
+        })
+    };
+    s1_entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    // While Scrape 1 holds `[a, c]` from `st.datasets()`, delete `a` and run Scrape 2
+    // to promote `c` into the freed named slot and retire `c`'s rebuilds into `$other`.
+    assert!(st.delete("a").unwrap());
+    assert_all_three_phase2_parity(&st, &cum_h, "c");
+    assert_all_three_phase2_parity(&st, &cum_h, "$other");
+    let d_promo = delta_h.collect();
+    assert_eq!(
+        otel_u64(
+            &d_promo,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(0)
+    );
+
+    s1_release.send(()).unwrap();
+    let j1 = scrape1.join().unwrap();
+    let j1_other = j1["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "$other")
+        .unwrap();
+    assert_eq!(
+        j1_other["rebuilds"]["bulk"]["count"], 2,
+        "overlapping scrape double-counted promoted overflow rebuilds: {j1_other}"
+    );
+    assert_eq!(j1_other["rebuilds"]["bulk"]["duration"]["count"], 2);
+    assert_eq!(
+        j1_other["rebuilds"]["bulk"]["duration"]["buckets"]
+            .as_array()
+            .unwrap()
+            .last()
+            .and_then(|v| v.as_u64()),
+        Some(2)
+    );
+    let j1_c = j1["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "c")
+        .unwrap();
+    assert_eq!(j1_c["rebuilds"]["bulk"]["count"], 0);
+}
+
+#[tokio::test]
+async fn phase2_otlp_persistent_rename_failed_rename_and_memory_roundtrip() {
+    // Part A: Persistent overflow dataset rename (`b -> c`) conserves `$other` rebuilds.
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = AppState::new(
+        dir.path(),
+        StoreOptions {
+            bulk_threshold: 1,
+            ..Default::default()
+        },
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    st.metrics = crate::obs::Metrics::new(true, 1);
+    let st = Arc::new(st);
+    st.create("a", DbType::Mem).unwrap();
+    {
+        let b = st.create("b", DbType::Persistent).unwrap();
+        b.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+    }
+    st.set_phase(Phase::Ready);
+    let app = router(st.clone());
+    let (status, _, _) = call(
+        &app,
+        HttpRequest::get("/a/sparql?query=ASK%7B%7D")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cum_h = MetricsHarness::with_temporality(&st, Temporality::Cumulative);
+    let delta_h = MetricsHarness::with_temporality(&st, Temporality::Delta);
+
+    assert_all_three_phase2_parity(&st, &cum_h, "$other");
+    let d1 = delta_h.collect();
+    assert_eq!(
+        otel_u64(
+            &d1,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(1)
+    );
+
+    // Rename persistent overflow `b -> c` (reopens store at 0). `$other` must stay 1.
+    st.rename("b", "c").unwrap();
+    assert_all_three_phase2_parity(&st, &cum_h, "$other");
+    let c2 = cum_h.collect();
+    let d2 = delta_h.collect();
+    assert_eq!(
+        otel_u64(
+            &c2,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        otel_u64(
+            &d2,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(0)
+    );
+
+    // A new rebuild on reopened `c` increments `$other` cleanly from 1 to 2.
+    {
+        let c = st.get("c").unwrap();
+        let nt: String = (0..5)
+            .map(|i| format!("<http://ex/c{i}> <http://ex/p> \"{i}\" .\n"))
+            .collect();
+        c.store
+            .load(&[Source::from_bytes(
+                nt.into_bytes(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+    }
+    assert_all_three_phase2_parity(&st, &cum_h, "$other");
+    let d3 = delta_h.collect();
+    assert_eq!(
+        otel_u64(
+            &d3,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(1)
+    );
+
+    // Part B: Promote persistent `c` to named slot (sets `promoted_offset = 1`), then
+    // rename persistent `c -> d`. Reopened `d` must NOT inherit stale `promoted_offset`.
+    assert!(st.delete("a").unwrap());
+    assert_all_three_phase2_parity(&st, &cum_h, "c");
+    assert_all_three_phase2_parity(&st, &cum_h, "$other");
+    let _ = delta_h.collect();
+    st.rename("c", "d").unwrap();
+    assert_all_three_phase2_parity(&st, &cum_h, "d");
+    assert_all_three_phase2_parity(&st, &cum_h, "$other");
+    let _ = delta_h.collect();
+    {
+        let d = st.get("d").unwrap();
+        let nt: String = (0..5)
+            .map(|i| format!("<http://ex/d{i}> <http://ex/p> \"{i}\" .\n"))
+            .collect();
+        d.store
+            .load(&[Source::from_bytes(
+                nt.into_bytes(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+    }
+    assert_all_three_phase2_parity(&st, &cum_h, "d");
+    let c4 = cum_h.collect();
+    let d4 = delta_h.collect();
+    assert_eq!(
+        otel_u64(
+            &c4,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "d"), ("reason", "bulk")]
+        ),
+        Some(1),
+        "persistent rename must not subtract stale promoted_offset from reopened store"
+    );
+    assert_eq!(
+        otel_u64(
+            &d4,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "d"), ("reason", "bulk")]
+        ),
+        Some(1)
+    );
+
+    // Part C: Failed rename (409 Conflict target exists) and memory `m1 -> m2 -> m1`
+    // roundtrip must preserve `open_id` and never double-count OTLP rebuilds.
+    let dir2 = tempfile::tempdir().unwrap();
+    let st2 = Arc::new(
+        AppState::new(
+            dir2.path(),
+            StoreOptions {
+                bulk_threshold: 1,
+                ..Default::default()
+            },
+            Duration::from_secs(30),
+        )
+        .unwrap(),
+    );
+    {
+        let m1 = st2.create("m1", DbType::Mem).unwrap();
+        for batch in 0..2 {
+            let nt: String = (0..5)
+                .map(|i| format!("<http://ex/m{batch}_{i}> <http://ex/p> \"{i}\" .\n"))
+                .collect();
+            m1.store
+                .load(&[Source::from_bytes(
+                    nt.into_bytes(),
+                    oxrdfio::RdfFormat::NTriples,
+                    None,
+                )])
+                .unwrap();
+        }
+    }
+    st2.create("m2", DbType::Mem).unwrap();
+    st2.set_phase(Phase::Ready);
+    let cum2 = MetricsHarness::with_temporality(&st2, Temporality::Cumulative);
+    let delta2 = MetricsHarness::with_temporality(&st2, Temporality::Delta);
+
+    assert_all_three_phase2_parity(&st2, &cum2, "m1");
+    let dl1 = delta2.collect();
+    assert_eq!(
+        otel_u64(
+            &dl1,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "m1"), ("reason", "bulk")]
+        ),
+        Some(2)
+    );
+
+    // Failed rename to existing `m2`.
+    assert!(st2.rename("m1", "m2").is_err());
+    assert_all_three_phase2_parity(&st2, &cum2, "m1");
+    let c_fail = cum2.collect();
+    let dl_fail = delta2.collect();
+    assert_eq!(
+        otel_u64(
+            &c_fail,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "m1"), ("reason", "bulk")]
+        ),
+        Some(2)
+    );
+    assert_eq!(
+        otel_u64(
+            &dl_fail,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "m1"), ("reason", "bulk")]
+        ),
+        Some(0)
+    );
+
+    // Memory `m1 -> m2 -> m1` between two OTLP collections.
+    assert!(st2.delete("m2").unwrap());
+    st2.rename("m1", "m2").unwrap();
+    st2.rename("m2", "m1").unwrap();
+    assert_all_three_phase2_parity(&st2, &cum2, "m1");
+    let c_rt = cum2.collect();
+    let dl_rt = delta2.collect();
+    assert_eq!(
+        otel_u64(
+            &c_rt,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "m1"), ("reason", "bulk")]
+        ),
+        Some(2)
+    );
+    assert_eq!(
+        otel_u64(
+            &dl_rt,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "m1"), ("reason", "bulk")]
+        ),
+        Some(0)
+    );
+
+    // Part D: Failed rename on a promoted memory dataset preserves `promoted_offset`.
+    let dir3 = tempfile::tempdir().unwrap();
+    let mut st3 = AppState::new(
+        dir3.path(),
+        StoreOptions {
+            bulk_threshold: 1,
+            ..Default::default()
+        },
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    st3.metrics = crate::obs::Metrics::new(true, 1);
+    let st3 = Arc::new(st3);
+    st3.create("slot", DbType::Mem).unwrap();
+    {
+        let p = st3.create("p", DbType::Mem).unwrap();
+        p.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+    }
+    st3.set_phase(Phase::Ready);
+    let app3 = router(st3.clone());
+    assert_eq!(
+        call(
+            &app3,
+            HttpRequest::get("/slot/sparql?query=ASK%7B%7D")
+                .body(Body::empty())
+                .unwrap()
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let cum3 = MetricsHarness::with_temporality(&st3, Temporality::Cumulative);
+    let delta3 = MetricsHarness::with_temporality(&st3, Temporality::Delta);
+    assert_all_three_phase2_parity(&st3, &cum3, "$other");
+    let _ = delta3.collect();
+    assert!(st3.delete("slot").unwrap());
+    assert_all_three_phase2_parity(&st3, &cum3, "p");
+    assert_all_three_phase2_parity(&st3, &cum3, "$other");
+    let _ = delta3.collect();
+    st3.create("blocker", DbType::Mem).unwrap();
+    assert!(st3.rename("p", "blocker").is_err());
+    assert_all_three_phase2_parity(&st3, &cum3, "p");
+    assert_all_three_phase2_parity(&st3, &cum3, "$other");
+    let c_prom = cum3.collect();
+    let d_prom = delta3.collect();
+    assert_eq!(
+        otel_u64(
+            &c_prom,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "p"), ("reason", "bulk")]
+        ),
+        Some(0),
+        "failed rename must preserve promoted_offset on promoted dataset"
+    );
+    assert_eq!(
+        otel_u64(
+            &d_prom,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "p"), ("reason", "bulk")]
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        otel_u64(
+            &c_prom,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn phase2_otlp_unscraped_named_eligible_delete_and_final_other_cache_counters() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = AppState::new(
+        dir.path(),
+        StoreOptions {
+            bulk_threshold: 1,
+            result_cache_min_ms: 0.0,
+            ..Default::default()
+        },
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    st.metrics = crate::obs::Metrics::new(true, 1);
+    let st = Arc::new(st);
+    st.create("a", DbType::Mem).unwrap();
+    {
+        let b = st.create("b", DbType::Mem).unwrap();
+        b.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        b.store.compact().unwrap();
+    }
+    st.set_phase(Phase::Ready);
+    let app = router(st.clone());
+    // Claim named slot with `a`, then exercise `b`'s result cache twice (miss + hit).
+    assert_eq!(
+        call(
+            &app,
+            HttpRequest::get("/a/sparql?query=ASK%7B%7D")
+                .body(Body::empty())
+                .unwrap()
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    // Use an ordered query so the first run materializes into the result cache (miss)
+    // and the second run serves from the result cache (hit).
+    let cached_query =
+        "SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D%20ORDER%20BY%20%3Fs%20%3Fp%20%3Fo";
+    for _ in 0..2 {
+        assert_eq!(
+            call(
+                &app,
+                HttpRequest::get(format!("/b/sparql?query={cached_query}"))
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+
+    let cum_h = MetricsHarness::with_temporality(&st, Temporality::Cumulative);
+    let delta_h = MetricsHarness::with_temporality(&st, Temporality::Delta);
+
+    assert_all_three_phase2_parity(&st, &cum_h, "$other");
+    let c1 = cum_h.collect();
+    let _d1 = delta_h.collect();
+    let rcache_hits_before = otel_f64(
+        &c1,
+        "sparkles.result_cache.hits",
+        "{hit}",
+        &[("dataset", "$other")],
+    )
+    .unwrap();
+    let rcache_misses_before = otel_f64(
+        &c1,
+        "sparkles.result_cache.misses",
+        "{miss}",
+        &[("dataset", "$other")],
+    )
+    .unwrap();
+    assert!(
+        rcache_hits_before >= 1.0 && rcache_misses_before >= 1.0,
+        "expected positive result cache counters on $other: hits={rcache_hits_before}, misses={rcache_misses_before}"
+    );
+
+    // Part A: Deleting the final overflow dataset `b` preserves positive `$other` cache
+    // counters across Prometheus, JSON, OTLP Cumulative, and OTLP Delta (no zero drop).
+    assert!(st.delete("b").unwrap());
+    let prom = crate::obs::render_prometheus(&st);
+    let j = crate::obs::metrics_json(&st);
+    let c2 = cum_h.collect();
+    let d2 = delta_h.collect();
+    let j_other = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "$other")
+        .unwrap();
+    assert_eq!(
+        j_other["resultCache"]["hits"].as_u64(),
+        Some(rcache_hits_before as u64)
+    );
+    assert_eq!(
+        j_other["resultCache"]["misses"].as_u64(),
+        Some(rcache_misses_before as u64)
+    );
+    assert!(
+        prom.contains(&format!(
+            "sparkles_result_cache_hits_total{{dataset=\"$other\"}} {}",
+            rcache_hits_before as u64
+        )),
+        "{prom}"
+    );
+    assert_eq!(
+        otel_f64(
+            &c2,
+            "sparkles.result_cache.hits",
+            "{hit}",
+            &[("dataset", "$other")]
+        ),
+        Some(rcache_hits_before)
+    );
+    assert_eq!(
+        otel_f64(
+            &c2,
+            "sparkles.result_cache.misses",
+            "{miss}",
+            &[("dataset", "$other")]
+        ),
+        Some(rcache_misses_before)
+    );
+    for (metric, unit) in [
+        ("sparkles.block_cache.hits", "{hit}"),
+        ("sparkles.block_cache.misses", "{miss}"),
+        ("sparkles.result_cache.hits", "{hit}"),
+        ("sparkles.result_cache.misses", "{miss}"),
+    ] {
+        assert_eq!(
+            otel_f64(&d2, metric, unit, &[("dataset", "$other")]),
+            Some(0.0),
+            "expected zero delta on {metric} after final overflow delete"
+        );
+    }
+
+    // Part B: Create new overflow `c`, exercise its result cache, then delete named `a`
+    // so `c` promotes to named `"c"`. `$other` cache counters stay monotonic (Delta = 0)
+    // and `"c"` starts cleanly at 0 without double counting.
+    {
+        let c = st.create("c", DbType::Mem).unwrap();
+        c.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            call(
+                &app,
+                HttpRequest::get(format!("/c/sparql?query={cached_query}"))
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    let c3 = cum_h.collect();
+    let d3 = delta_h.collect();
+    let rcache_hits_with_c = otel_f64(
+        &c3,
+        "sparkles.result_cache.hits",
+        "{hit}",
+        &[("dataset", "$other")],
+    )
+    .unwrap();
+    assert!(rcache_hits_with_c > rcache_hits_before);
+    assert!(
+        otel_f64(
+            &d3,
+            "sparkles.result_cache.hits",
+            "{hit}",
+            &[("dataset", "$other")]
+        )
+        .unwrap()
+            > 0.0
+    );
+
+    assert!(st.delete("a").unwrap());
+    let c4 = cum_h.collect();
+    let d4 = delta_h.collect();
+    assert_eq!(
+        otel_f64(
+            &c4,
+            "sparkles.result_cache.hits",
+            "{hit}",
+            &[("dataset", "$other")]
+        ),
+        Some(rcache_hits_with_c)
+    );
+    assert_eq!(
+        otel_f64(
+            &d4,
+            "sparkles.result_cache.hits",
+            "{hit}",
+            &[("dataset", "$other")]
+        ),
+        Some(0.0)
+    );
+    assert_eq!(
+        otel_f64(
+            &c4,
+            "sparkles.result_cache.hits",
+            "{hit}",
+            &[("dataset", "c")]
+        ),
+        Some(0.0)
+    );
+
+    // Part C: Delete `c` so `named = 0 < max_datasets = 1` while `$other` still exists.
+    // Create unscraped named-eligible `x`, run a bulk load, and delete `x` without scraping:
+    // `$other` rebuild count must NOT increase.
+    assert!(st.delete("c").unwrap());
+    let c5 = cum_h.collect();
+    let _d5 = delta_h.collect();
+    let other_bulk_before = otel_u64(
+        &c5,
+        "sparkles.rebuilds",
+        "{rebuild}",
+        &[("dataset", "$other"), ("reason", "bulk")],
+    )
+    .unwrap();
+    {
+        let x = st.create("x", DbType::Mem).unwrap();
+        x.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+    }
+    assert!(st.delete("x").unwrap());
+    assert_all_three_phase2_parity(&st, &cum_h, "$other");
+    let c6 = cum_h.collect();
+    let d6 = delta_h.collect();
+    assert_eq!(
+        otel_u64(
+            &c6,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(other_bulk_before),
+        "unscraped named-eligible dataset leaked rebuilds into $other"
+    );
+    assert_eq!(
+        otel_u64(
+            &d6,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(0)
     );
 }

@@ -941,6 +941,130 @@ async fn metrics_parity_dataset_cap_reset_reopen_and_auth() {
         assert!(disk["rebuilds"]["compact"]["duration"].is_null());
     }
 
+    // 3b. Persistent overflow rename conserves `$other` rebuilds, promoted persistent
+    //     rename drops stale `promoted_offset`, and unscraped named-eligible delete does
+    //     not leak into `$other`.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = AppState::new(
+            dir.path(),
+            StoreOptions {
+                bulk_threshold: 1,
+                ..Default::default()
+            },
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        st.metrics = crate::obs::Metrics::new(true, 1);
+        let st = Arc::new(st);
+        st.create("a", DbType::Mem).unwrap();
+        {
+            let b = st.create("b", DbType::Persistent).unwrap();
+            b.store
+                .load(&[Source::from_bytes(
+                    DATA.as_bytes().to_vec(),
+                    oxrdfio::RdfFormat::TriG,
+                    None,
+                )])
+                .unwrap();
+        }
+        st.set_phase(Phase::Ready);
+        let app = router(st.clone());
+        assert_eq!(
+            get(&app, "/a/sparql?query=ASK%7B%7D").await.status,
+            StatusCode::OK
+        );
+        let m1 = metrics(&app).await;
+        let j1 = metrics_json_resp(&app).await;
+        assert_prom_json_phase2_parity(&m1, &j1, "$other");
+        // Persistent overflow rename `b -> c` keeps `$other` at 1.
+        st.rename("b", "c").unwrap();
+        let m2 = metrics(&app).await;
+        let j2 = metrics_json_resp(&app).await;
+        assert_prom_json_phase2_parity(&m2, &j2, "$other");
+        let other2 = j2["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "$other")
+            .unwrap();
+        assert_eq!(other2["rebuilds"]["bulk"]["count"], 1);
+        // Promote `c` after deleting `a`, then persistent rename `c -> d`: fresh `d`
+        // reports its first post-rename rebuild as 1 without stale `promoted_offset`.
+        {
+            let c = st.get("c").unwrap();
+            let nt: String = (0..5)
+                .map(|i| format!("<http://example.org/n1_{i}> <http://example.org/p> \"{i}\" .\n"))
+                .collect();
+            c.store
+                .load(&[Source::from_bytes(
+                    nt.into_bytes(),
+                    oxrdfio::RdfFormat::NTriples,
+                    None,
+                )])
+                .unwrap();
+        }
+        let _ = metrics_json_resp(&app).await;
+        assert!(st.delete("a").unwrap());
+        let _ = metrics_json_resp(&app).await;
+        st.rename("c", "d").unwrap();
+        {
+            let d = st.get("d").unwrap();
+            let nt: String = (0..5)
+                .map(|i| format!("<http://example.org/n2_{i}> <http://example.org/p> \"{i}\" .\n"))
+                .collect();
+            d.store
+                .load(&[Source::from_bytes(
+                    nt.into_bytes(),
+                    oxrdfio::RdfFormat::NTriples,
+                    None,
+                )])
+                .unwrap();
+        }
+        let m3 = metrics(&app).await;
+        let j3 = metrics_json_resp(&app).await;
+        assert_prom_json_phase2_parity(&m3, &j3, "d");
+        let d3 = j3["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "d")
+            .unwrap();
+        assert_eq!(d3["rebuilds"]["bulk"]["count"], 1);
+        // Delete `d` so `named = 0 < 1` while `$other` exists; unscraped `x` must not leak.
+        assert!(st.delete("d").unwrap());
+        let j4 = metrics_json_resp(&app).await;
+        let before = j4["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "$other")
+            .unwrap()["rebuilds"]["bulk"]["count"]
+            .as_u64()
+            .unwrap();
+        {
+            let x = st.create("x", DbType::Mem).unwrap();
+            x.store
+                .load(&[Source::from_bytes(
+                    DATA.as_bytes().to_vec(),
+                    oxrdfio::RdfFormat::TriG,
+                    None,
+                )])
+                .unwrap();
+        }
+        assert!(st.delete("x").unwrap());
+        let j5 = metrics_json_resp(&app).await;
+        let after = j5["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "$other")
+            .unwrap()["rebuilds"]["bulk"]["count"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
     // 4. Access policy: both Prometheus and JSON require `metrics` permission and never
     //    leak unauthorized or nonexistent dataset names.
     #[cfg(feature = "auth")]

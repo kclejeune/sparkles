@@ -128,7 +128,6 @@ async fn run_warm_up(st: Arc<AppState>) -> Result<(), String> {
         branches: Default::default(),
         ephemeral: true,
         validation_metrics: Arc::new(crate::obs::ValidationMetrics::new(WARM_UP_DATASET)),
-        metrics_state: crate::obs::DatasetMetricsState::new(),
         offline: AtomicBool::new(false),
         dataset: sparkles::Dataset::memory(),
     });

@@ -815,27 +815,27 @@ pub(super) fn meter_provider_builder(max_datasets: usize) -> MeterProviderBuilde
     })
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 struct PeakMonotonic {
     count: u64,
     sum_bytes: u64,
     buckets: Vec<u64>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 struct RebuildDurMonotonic {
     count: u64,
     sum_seconds: f64,
     buckets: Vec<u64>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 struct RebuildMonotonic {
     count: u64,
     duration: Option<RebuildDurMonotonic>,
 }
 
-struct DatasetMonotonic {
+pub(super) struct DatasetMonotonic {
     series_id: u64,
     instance_id: u64,
     rows_offset: u64,
@@ -980,10 +980,14 @@ fn combine_rebuild(
 }
 
 /// Preserve monotonic OTLP Phase 2 counters when a dataset name is deleted and recreated
-/// between two consecutive collections without an intervening absent collection. When a
-/// dataset is absent from a collection, its tracker entry is dropped (matching the SDK's
-/// delta `reported` map eviction) so a later recreation restarts cleanly at zero.
-fn apply_monotonic_continuation(
+/// between two consecutive collections without an intervening absent collection, or when
+/// a transient dip (such as floating-point reassociation) occurs without a generation
+/// change. When a dataset is absent from a collection, its tracker entry is dropped
+/// (matching the SDK's delta `reported` map eviction) so a later recreation restarts at
+/// zero to match Prometheus and JSON; under Cumulative temporality `opentelemetry_sdk`
+/// retains the instrument-level start time without emitting a `NO_RECORDED_VALUE` gap
+/// point, while Delta starts a fresh accumulation interval.
+pub(super) fn apply_monotonic_continuation(
     snap: &mut crate::obs::OtelMetricsSnapshot,
     monotonic: &mut BTreeMap<String, DatasetMonotonic>,
 ) {
@@ -1048,8 +1052,13 @@ fn apply_monotonic_continuation(
         ];
         let needs_rewrite = entry.rows_offset > 0
             || entry.peak_offset.is_some()
-            || entry.rebuilds_offset.iter().any(|r| r.count > 0)
-            || adj_rows != raw_rows;
+            || entry
+                .rebuilds_offset
+                .iter()
+                .any(|r| r.count > 0 || r.duration.is_some())
+            || adj_rows != raw_rows
+            || adj_peak != raw_peak
+            || adj_rebuilds != raw_rebuilds;
         entry.last_rows = adj_rows;
         entry.last_peak = adj_peak.clone();
         entry.last_rebuilds = adj_rebuilds.clone();

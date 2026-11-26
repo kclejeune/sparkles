@@ -1027,23 +1027,31 @@ Prometheus.
   before taking the counter snapshot, matching `render_prometheus`.
 - Label lifetime matches across all three formats. Requests that name no existing dataset
   record `$none` only on request series, while dataset work, peak memory, and rebuild
-  series cover existing datasets and `$other`. Deleting an overflow dataset or promoting
-  one to a freed named slot retires its rebuild counts into `$other`, and `$other` stays
-  present across all three formats once used so shared counters remain monotonic and never
-  disappear when the last overflow dataset is deleted. Deleting a named dataset removes its
-  series completely.
+  series cover existing datasets and `$other`. Deleting an overflow dataset, reopening a
+  persistent overflow dataset on rename, or promoting an overflow dataset to a freed named
+  slot retires its rebuild counts and live-store cache hit and miss counters into `$other`.
+  Pending leaving entries keep `$other` monotonic during concurrent deletion or rename,
+  and `$other` stays present across all three formats once used so shared counters never
+  drop or disappear when the last overflow dataset leaves. Deleting a named dataset
+  removes its series completely.
 - The OTLP observer in `otel/sdk.rs` exports `sparkles.rows.produced` (`{row}`),
   `sparkles.query.memory.peak.{bucket,sum,count}` (`{query}` and `By`, with `le` on
   `.bucket`), `sparkles.rebuilds` (`{rebuild}`, labelled by `dataset` and `reason`), and
   `sparkles.rebuild.duration.{bucket,count}` (`{rebuild}`, labelled by `dataset`, `reason`,
   and `le` on `.bucket`) as monotonic 64-bit integer observable counters, and
   `sparkles.rebuild.duration.sum` (`s`) as a monotonic floating-point observable counter.
-  `SdkMeterProvider` installs cardinality views sized from `--metrics-max-datasets` so
-  multi-label bucket streams stay below the SDK overflow threshold. A per-cycle seen
-  bitmask refreshes the shared snapshot once per collection regardless of callback order or
-  dropped views, and per-dataset generation tracking preserves monotonic continuation if a
-  dataset name is deleted and recreated between two consecutive OTLP collections under
-  either cumulative or delta temporality.
+  `SdkMeterProvider` installs cardinality views sized from `--metrics-max-datasets` up to
+  a 250,000 attribute-set per-stream ceiling, keeping multi-label bucket streams below the
+  SDK overflow threshold at default and moderate caps while noting that a sufficiently
+  large configured cap can still overflow individual streams. A per-cycle seen bitmask
+  refreshes the shared snapshot once per collection regardless of callback order or
+  dropped views, and per-dataset generation tracking keyed by each store's monotonic
+  `open_id` preserves monotonic continuation if a dataset name is deleted and recreated
+  between two consecutive OTLP collections under either cumulative or delta temporality.
+  When an intervening collection observes a deleted dataset absent, a later recreation
+  restarts at zero to match Prometheus and JSON, starting a fresh accumulation interval
+  under delta temporality and retaining the SDK's instrument-level start timestamp without
+  an explicit gap marker under cumulative temporality.
 - `obs_tests::metrics_count_work_memory_peaks_and_rebuilds`,
   `obs_tests::metrics_parity_dataset_cap_reset_reopen_and_auth`, and the tests in
   `otel::tests` verify cross-format parity across unseen datasets, queries, updates, failed
