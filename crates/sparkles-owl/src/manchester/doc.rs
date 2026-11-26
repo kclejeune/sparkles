@@ -26,7 +26,10 @@ use crate::ofn::{Renderer as OfnRenderer, STANDARD_PREFIXES};
 use crate::ofn_read::{Document, ParseError};
 use crate::read::MAX_NESTING;
 use crate::validate;
-use crate::write_common::{WriteError, WriteOptions, WriteReport};
+use crate::vocab;
+use crate::write_common::{
+    WriteError, WriteOptions, WriteReport, check_axiom_depth, check_header_depth,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 
@@ -162,85 +165,369 @@ fn axiom_has_nary_data(ax: &AxiomKind) -> bool {
     }
 }
 
-fn max_ce_depth(c: &ClassExpression, d: usize) -> usize {
+/// Whether `s` is a valid Manchester prefix name (`""` or a `PN_PREFIX` starting with a
+/// letter so it never lexes as a number).
+fn is_manchester_prefix(s: &str) -> bool {
+    s.is_empty()
+        || (s.chars().next().is_some_and(char::is_alphabetic)
+            && !s.ends_with('.')
+            && s.chars().all(|c| c.is_alphanumeric() || "_-.".contains(c)))
+}
+
+fn is_valid_anon_label(label: &str) -> bool {
+    !label.is_empty() && !label.contains(lex::ends_word)
+}
+
+fn ind_has_invalid_anon(i: &Individual) -> bool {
+    matches!(i, Individual::Anonymous(a) if !is_valid_anon_label(a.label()))
+}
+
+fn ann_has_invalid_anon(a: &Annotation) -> bool {
+    let val_bad =
+        matches!(&a.value, AnnotationValue::Anonymous(an) if !is_valid_anon_label(an.label()));
+    val_bad || a.annotations.iter().any(ann_has_invalid_anon)
+}
+
+fn ce_has_invalid_anon(c: &ClassExpression) -> bool {
     use ClassExpression as C;
-    if d > MAX_NESTING {
-        return d;
+    match c {
+        C::Class(_)
+        | C::ObjectHasSelf(_)
+        | C::DataSomeValuesFrom(..)
+        | C::DataAllValuesFrom(..)
+        | C::DataHasValue(..)
+        | C::DataMinCardinality(..)
+        | C::DataMaxCardinality(..)
+        | C::DataExactCardinality(..) => false,
+        C::ObjectOneOf(is) => is.iter().any(ind_has_invalid_anon),
+        C::ObjectHasValue(_, i) => ind_has_invalid_anon(i),
+        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => cs.iter().any(ce_has_invalid_anon),
+        C::ObjectComplementOf(x) | C::ObjectSomeValuesFrom(_, x) | C::ObjectAllValuesFrom(_, x) => {
+            ce_has_invalid_anon(x)
+        }
+        C::ObjectMinCardinality(_, _, f)
+        | C::ObjectMaxCardinality(_, _, f)
+        | C::ObjectExactCardinality(_, _, f) => f.as_deref().is_some_and(ce_has_invalid_anon),
     }
+}
+
+fn axiom_has_invalid_anon(ax: &Axiom) -> bool {
+    if ax.annotations.iter().any(ann_has_invalid_anon) {
+        return true;
+    }
+    use AxiomKind as K;
+    match &ax.kind {
+        K::SubClassOf(a, b) => ce_has_invalid_anon(a) || ce_has_invalid_anon(b),
+        K::EquivalentClasses(cs) => cs.iter().any(ce_has_invalid_anon),
+        K::DisjointClasses(cs) => cs.iter().any(ce_has_invalid_anon),
+        K::DisjointUnion(_, cs) => cs.iter().any(ce_has_invalid_anon),
+        K::ObjectPropertyDomain(_, c)
+        | K::ObjectPropertyRange(_, c)
+        | K::DataPropertyDomain(_, c)
+        | K::HasKey(c, _, _) => ce_has_invalid_anon(c),
+        K::ClassAssertion(c, i) => ce_has_invalid_anon(c) || ind_has_invalid_anon(i),
+        K::SameIndividual(is) => is.iter().any(ind_has_invalid_anon),
+        K::DifferentIndividuals(is) => is.iter().any(ind_has_invalid_anon),
+        K::ObjectPropertyAssertion(_, a, b) | K::NegativeObjectPropertyAssertion(_, a, b) => {
+            ind_has_invalid_anon(a) || ind_has_invalid_anon(b)
+        }
+        K::DataPropertyAssertion(_, a, _) | K::NegativeDataPropertyAssertion(_, a, _) => {
+            ind_has_invalid_anon(a)
+        }
+        K::AnnotationAssertion(_, s, v) => {
+            matches!(s, AnnotationSubject::Anonymous(a) if !is_valid_anon_label(a.label()))
+                || matches!(v, AnnotationValue::Anonymous(a) if !is_valid_anon_label(a.label()))
+        }
+        _ => false,
+    }
+}
+
+fn is_builtin_manchester_datatype(iri: &str) -> bool {
+    iri.starts_with(vocab::XSD)
+        || matches!(
+            iri,
+            vocab::RDFS_LITERAL
+                | vocab::RDF_PLAIN_LITERAL
+                | vocab::RDF_XML_LITERAL
+                | vocab::RDF_LANG_STRING
+                | vocab::OWL_REAL
+                | vocab::OWL_RATIONAL
+        )
+}
+
+fn collect_dr_datatypes(r: &DataRange, dts: &mut BTreeSet<Datatype>) {
+    match r {
+        DataRange::Datatype(d) | DataRange::DatatypeRestriction(d, _) => {
+            if !is_builtin_manchester_datatype(d.as_str()) {
+                dts.insert(d.clone());
+            }
+        }
+        DataRange::IntersectionOf(rs) | DataRange::UnionOf(rs) => {
+            for sub in rs {
+                collect_dr_datatypes(sub, dts);
+            }
+        }
+        DataRange::ComplementOf(sub) => collect_dr_datatypes(sub, dts),
+        DataRange::OneOf(_) => {}
+    }
+}
+
+fn collect_ce_refs(
+    c: &ClassExpression,
+    ops: &mut BTreeSet<Iri>,
+    dps: &mut BTreeSet<DataProperty>,
+    dts: &mut BTreeSet<Datatype>,
+) {
+    use ClassExpression as C;
+    match c {
+        C::Class(_) | C::ObjectOneOf(_) => {}
+        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
+            for x in cs {
+                collect_ce_refs(x, ops, dps, dts);
+            }
+        }
+        C::ObjectComplementOf(x) => collect_ce_refs(x, ops, dps, dts),
+        C::ObjectSomeValuesFrom(p, f) | C::ObjectAllValuesFrom(p, f) => {
+            ops.insert(p.named().0.clone());
+            collect_ce_refs(f, ops, dps, dts);
+        }
+        C::ObjectHasValue(p, _) | C::ObjectHasSelf(p) => {
+            ops.insert(p.named().0.clone());
+        }
+        C::ObjectMinCardinality(_, p, f)
+        | C::ObjectMaxCardinality(_, p, f)
+        | C::ObjectExactCardinality(_, p, f) => {
+            ops.insert(p.named().0.clone());
+            if let Some(f) = f {
+                collect_ce_refs(f, ops, dps, dts);
+            }
+        }
+        C::DataSomeValuesFrom(ps, r) | C::DataAllValuesFrom(ps, r) => {
+            for p in ps {
+                dps.insert(p.clone());
+            }
+            collect_dr_datatypes(r, dts);
+        }
+        C::DataHasValue(p, _) => {
+            dps.insert(p.clone());
+        }
+        C::DataMinCardinality(_, p, r)
+        | C::DataMaxCardinality(_, p, r)
+        | C::DataExactCardinality(_, p, r) => {
+            dps.insert(p.clone());
+            if let Some(r) = r {
+                collect_dr_datatypes(r, dts);
+            }
+        }
+    }
+}
+
+fn ce_has_punned_unqualified_data_card(c: &ClassExpression, obj_iris: &BTreeSet<Iri>) -> bool {
+    use ClassExpression as C;
     match c {
         C::Class(_)
         | C::ObjectOneOf(_)
         | C::ObjectHasValue(..)
         | C::ObjectHasSelf(_)
-        | C::DataHasValue(..) => d,
-        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
-            cs.iter().map(|x| max_ce_depth(x, d + 1)).max().unwrap_or(d)
-        }
+        | C::DataSomeValuesFrom(..)
+        | C::DataAllValuesFrom(..)
+        | C::DataHasValue(..) => false,
+        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => cs
+            .iter()
+            .any(|x| ce_has_punned_unqualified_data_card(x, obj_iris)),
         C::ObjectComplementOf(x) | C::ObjectSomeValuesFrom(_, x) | C::ObjectAllValuesFrom(_, x) => {
-            max_ce_depth(x, d + 1)
+            ce_has_punned_unqualified_data_card(x, obj_iris)
         }
         C::ObjectMinCardinality(_, _, f)
         | C::ObjectMaxCardinality(_, _, f)
-        | C::ObjectExactCardinality(_, _, f) => f.as_deref().map_or(d, |x| max_ce_depth(x, d + 1)),
-        C::DataSomeValuesFrom(_, r) | C::DataAllValuesFrom(_, r) => max_dr_depth(r, d + 1),
-        C::DataMinCardinality(_, _, r)
-        | C::DataMaxCardinality(_, _, r)
-        | C::DataExactCardinality(_, _, r) => r.as_ref().map_or(d, |x| max_dr_depth(x, d + 1)),
+        | C::ObjectExactCardinality(_, _, f) => f
+            .as_deref()
+            .is_some_and(|x| ce_has_punned_unqualified_data_card(x, obj_iris)),
+        C::DataMinCardinality(_, p, None)
+        | C::DataMaxCardinality(_, p, None)
+        | C::DataExactCardinality(_, p, None) => obj_iris.contains(&p.0),
+        C::DataMinCardinality(_, _, Some(_))
+        | C::DataMaxCardinality(_, _, Some(_))
+        | C::DataExactCardinality(_, _, Some(_)) => false,
     }
 }
 
-fn max_dr_depth(r: &DataRange, d: usize) -> usize {
-    if d > MAX_NESTING {
-        return d;
-    }
-    match r {
-        DataRange::Datatype(_) | DataRange::OneOf(_) | DataRange::DatatypeRestriction(..) => d,
-        DataRange::IntersectionOf(rs) | DataRange::UnionOf(rs) => {
-            rs.iter().map(|x| max_dr_depth(x, d + 1)).max().unwrap_or(d)
-        }
-        DataRange::ComplementOf(x) => max_dr_depth(x, d + 1),
-    }
-}
-
-fn max_ann_depth(a: &Annotation, d: usize) -> usize {
-    if d > MAX_NESTING {
-        return d;
-    }
-    a.annotations
-        .iter()
-        .map(|n| max_ann_depth(n, d + 1))
-        .max()
-        .unwrap_or(d)
-}
-
-fn check_axiom_depth(ax: &Axiom) -> Result<(), WriteError> {
-    for a in &ax.annotations {
-        if max_ann_depth(a, 1) > MAX_NESTING {
-            return Err(WriteError::Unsupported(format!(
-                "Manchester annotation nests deeper than {MAX_NESTING} levels"
-            )));
-        }
-    }
+fn collect_axiom_obj_props(ax: &AxiomKind, ops: &mut BTreeSet<Iri>) {
     use AxiomKind as K;
-    let d = match &ax.kind {
-        K::SubClassOf(a, b) => max_ce_depth(a, 1).max(max_ce_depth(b, 1)),
-        K::EquivalentClasses(cs) => cs.iter().map(|c| max_ce_depth(c, 1)).max().unwrap_or(1),
-        K::DisjointClasses(cs) => cs.iter().map(|c| max_ce_depth(c, 1)).max().unwrap_or(1),
-        K::DisjointUnion(_, cs) => cs.iter().map(|c| max_ce_depth(c, 1)).max().unwrap_or(1),
+    let mut dummy_dp = BTreeSet::new();
+    let mut dummy_dt = BTreeSet::new();
+    match ax {
+        K::Declaration(Entity::ObjectProperty(p)) => {
+            ops.insert(p.0.clone());
+        }
+        K::SubClassOf(a, b) => {
+            collect_ce_refs(a, ops, &mut dummy_dp, &mut dummy_dt);
+            collect_ce_refs(b, ops, &mut dummy_dp, &mut dummy_dt);
+        }
+        K::EquivalentClasses(cs) => {
+            for c in cs {
+                collect_ce_refs(c, ops, &mut dummy_dp, &mut dummy_dt);
+            }
+        }
+        K::DisjointClasses(cs) => {
+            for c in cs {
+                collect_ce_refs(c, ops, &mut dummy_dp, &mut dummy_dt);
+            }
+        }
+        K::DisjointUnion(_, cs) => {
+            for c in cs {
+                collect_ce_refs(c, ops, &mut dummy_dp, &mut dummy_dt);
+            }
+        }
+        K::SubObjectPropertyOf(sub, sup) => {
+            match sub {
+                SubObjectPropertyExpression::Expression(p) => {
+                    ops.insert(p.named().0.clone());
+                }
+                SubObjectPropertyExpression::Chain(chain) => {
+                    for p in chain {
+                        ops.insert(p.named().0.clone());
+                    }
+                }
+            }
+            ops.insert(sup.named().0.clone());
+        }
+        K::EquivalentObjectProperties(ps) => {
+            for p in ps {
+                ops.insert(p.named().0.clone());
+            }
+        }
+        K::DisjointObjectProperties(ps) => {
+            for p in ps {
+                ops.insert(p.named().0.clone());
+            }
+        }
+        K::InverseObjectProperties(a, b) => {
+            ops.insert(a.named().0.clone());
+            ops.insert(b.named().0.clone());
+        }
+        K::ObjectPropertyDomain(p, c) | K::ObjectPropertyRange(p, c) => {
+            ops.insert(p.named().0.clone());
+            collect_ce_refs(c, ops, &mut dummy_dp, &mut dummy_dt);
+        }
+        K::FunctionalObjectProperty(p)
+        | K::InverseFunctionalObjectProperty(p)
+        | K::ReflexiveObjectProperty(p)
+        | K::IrreflexiveObjectProperty(p)
+        | K::SymmetricObjectProperty(p)
+        | K::AsymmetricObjectProperty(p)
+        | K::TransitiveObjectProperty(p) => {
+            ops.insert(p.named().0.clone());
+        }
+        K::DataPropertyDomain(_, c) | K::ClassAssertion(c, _) => {
+            collect_ce_refs(c, ops, &mut dummy_dp, &mut dummy_dt);
+        }
+        K::HasKey(c, key_ops, _) => {
+            collect_ce_refs(c, ops, &mut dummy_dp, &mut dummy_dt);
+            for p in key_ops {
+                ops.insert(p.named().0.clone());
+            }
+        }
+        K::ObjectPropertyAssertion(p, _, _) | K::NegativeObjectPropertyAssertion(p, _, _) => {
+            ops.insert(p.named().0.clone());
+        }
+        _ => {}
+    }
+}
+
+fn axiom_has_punned_data_ambiguity(ax: &AxiomKind, obj_iris: &BTreeSet<Iri>) -> bool {
+    use AxiomKind as K;
+    match ax {
+        K::SubClassOf(a, b) => {
+            ce_has_punned_unqualified_data_card(a, obj_iris)
+                || ce_has_punned_unqualified_data_card(b, obj_iris)
+        }
+        K::EquivalentClasses(cs) => cs
+            .iter()
+            .any(|c| ce_has_punned_unqualified_data_card(c, obj_iris)),
+        K::DisjointClasses(cs) => cs
+            .iter()
+            .any(|c| ce_has_punned_unqualified_data_card(c, obj_iris)),
+        K::DisjointUnion(_, cs) => cs
+            .iter()
+            .any(|c| ce_has_punned_unqualified_data_card(c, obj_iris)),
         K::ObjectPropertyDomain(_, c)
         | K::ObjectPropertyRange(_, c)
         | K::DataPropertyDomain(_, c)
-        | K::HasKey(c, _, _)
-        | K::ClassAssertion(c, _) => max_ce_depth(c, 1),
-        K::DataPropertyRange(_, r) | K::DatatypeDefinition(_, r) => max_dr_depth(r, 1),
-        _ => 1,
-    };
-    if d > MAX_NESTING {
-        return Err(WriteError::Unsupported(format!(
-            "Manchester expression nests deeper than {MAX_NESTING} levels"
-        )));
+        | K::ClassAssertion(c, _) => ce_has_punned_unqualified_data_card(c, obj_iris),
+        K::HasKey(c, _, dps) => {
+            ce_has_punned_unqualified_data_card(c, obj_iris)
+                || dps.iter().any(|dp| obj_iris.contains(&dp.0))
+        }
+        K::EquivalentDataProperties(ps) if ps.len() > 2 => {
+            ps.iter().any(|dp| obj_iris.contains(&dp.0))
+        }
+        K::DisjointDataProperties(ps) if ps.len() > 2 || ps.has_duplicates() => {
+            ps.iter().any(|dp| obj_iris.contains(&dp.0))
+        }
+        _ => false,
     }
-    Ok(())
+}
+
+fn collect_axiom_data_refs(
+    ax: &AxiomKind,
+    dps: &mut BTreeSet<DataProperty>,
+    dts: &mut BTreeSet<Datatype>,
+) {
+    use AxiomKind as K;
+    let mut dummy_ops = BTreeSet::new();
+    match ax {
+        K::SubClassOf(a, b) => {
+            collect_ce_refs(a, &mut dummy_ops, dps, dts);
+            collect_ce_refs(b, &mut dummy_ops, dps, dts);
+        }
+        K::EquivalentClasses(cs) => {
+            for c in cs {
+                collect_ce_refs(c, &mut dummy_ops, dps, dts);
+            }
+        }
+        K::DisjointClasses(cs) => {
+            for c in cs {
+                collect_ce_refs(c, &mut dummy_ops, dps, dts);
+            }
+        }
+        K::DisjointUnion(_, cs) => {
+            for c in cs {
+                collect_ce_refs(c, &mut dummy_ops, dps, dts);
+            }
+        }
+        K::ObjectPropertyDomain(_, c)
+        | K::ObjectPropertyRange(_, c)
+        | K::DataPropertyDomain(_, c)
+        | K::ClassAssertion(c, _) => {
+            collect_ce_refs(c, &mut dummy_ops, dps, dts);
+        }
+        K::DataPropertyRange(p, dr) => {
+            dps.insert(p.clone());
+            collect_dr_datatypes(dr, dts);
+        }
+        K::DatatypeDefinition(_, dr) => collect_dr_datatypes(dr, dts),
+        K::HasKey(c, _, key_dps) => {
+            collect_ce_refs(c, &mut dummy_ops, dps, dts);
+            for p in key_dps {
+                dps.insert(p.clone());
+            }
+        }
+        K::EquivalentDataProperties(ps) => {
+            for p in ps {
+                dps.insert(p.clone());
+            }
+        }
+        K::DisjointDataProperties(ps) => {
+            for p in ps {
+                dps.insert(p.clone());
+            }
+        }
+        K::DataPropertyAssertion(p, _, _) | K::NegativeDataPropertyAssertion(p, _, _) => {
+            dps.insert(p.clone());
+        }
+        _ => {}
+    }
 }
 
 /// Write an ontology header and axioms as a Manchester OWL Syntax (`.omn`) document.
@@ -252,19 +539,26 @@ pub fn write_document<'a>(
     options: WriteOptions,
 ) -> Result<WriteReport, WriteError> {
     let axioms: Vec<&'a Axiom> = axioms.into_iter().collect();
+    check_header_depth(header, "Manchester")?;
     for a in &header.annotations {
-        if max_ann_depth(a, 1) > MAX_NESTING {
-            return Err(WriteError::Unsupported(format!(
-                "Manchester header annotation nests deeper than {MAX_NESTING} levels"
-            )));
+        if ann_has_invalid_anon(a) {
+            return Err(WriteError::Unsupported(
+                "Manchester syntax cannot represent empty or delimiter-containing anonymous individual labels in header annotations".into(),
+            ));
         }
     }
 
-    let r = Renderer::new(
-        ofn.prefixes()
-            .into_iter()
-            .map(|(p, n)| (p.to_string(), n.to_string())),
-    );
+    // Filter and deduplicate prefix declarations to valid Manchester prefix names so
+    // prefix headers and emitted contractions stay 1-to-1 and never lex as numbers.
+    let mut valid_prefixes: BTreeMap<String, String> = BTreeMap::new();
+    for (p, n) in ofn.prefixes() {
+        if is_manchester_prefix(p) && !n.is_empty() {
+            valid_prefixes.insert(p.to_string(), n.to_string());
+        }
+    }
+    let clean_ofn = OfnRenderer::new(valid_prefixes.iter().map(|(p, n)| (p.as_str(), n.as_str())));
+    let r = Renderer::new(valid_prefixes.iter().map(|(p, n)| (p.as_str(), n.as_str())));
+    let ofn = &clean_ofn;
     let mut report = WriteReport::default();
 
     let mut classes: BTreeMap<Class, ClassFrame<'a>> = BTreeMap::new();
@@ -275,10 +569,12 @@ pub fn write_document<'a>(
     let mut individuals: BTreeMap<Individual, IndividualFrame<'a>> = BTreeMap::new();
     let mut misc: Vec<MiscFrame<'a>> = Vec::new();
     let mut pending_ann_assertions: Vec<&'a Axiom> = Vec::new();
+    let mut all_obj_prop_iris: BTreeSet<Iri> = BTreeSet::new();
 
-    // First pass: collect declarations so we know which IRIs have entity frames.
+    // First pass: check depth, record all object-property IRIs, and collect declarations.
     for &ax in &axioms {
-        check_axiom_depth(ax)?;
+        check_axiom_depth(ax, "Manchester")?;
+        collect_axiom_obj_props(&ax.kind, &mut all_obj_prop_iris);
         if let AxiomKind::Declaration(e) = &ax.kind {
             if !ax.annotations.is_empty() {
                 if options.strict {
@@ -319,8 +615,19 @@ pub fn write_document<'a>(
     }
 
     // Second pass: classify remaining axioms into entity frames or misc frames.
+    let mut referenced_data_props: BTreeSet<DataProperty> = BTreeSet::new();
+    let mut referenced_datatypes: BTreeSet<Datatype> = BTreeSet::new();
     for &ax in &axioms {
         if matches!(ax.kind, AxiomKind::Declaration(_)) {
+            continue;
+        }
+        if axiom_has_invalid_anon(ax) {
+            report.skip_or_err(
+                options,
+                ofn,
+                ax,
+                "Manchester syntax cannot represent empty or delimiter-containing anonymous individual labels",
+            )?;
             continue;
         }
         if axiom_has_nary_data(&ax.kind) {
@@ -332,6 +639,16 @@ pub fn write_document<'a>(
             )?;
             continue;
         }
+        if axiom_has_punned_data_ambiguity(&ax.kind, &all_obj_prop_iris) {
+            report.skip_or_err(
+                options,
+                ofn,
+                ax,
+                "Manchester syntax cannot disambiguate an IRI punned as both ObjectProperty and DataProperty in this axiom",
+            )?;
+            continue;
+        }
+        let written_before = report.written_axioms;
         use AxiomKind as K;
         match &ax.kind {
             K::Declaration(_) => unreachable!(),
@@ -825,6 +1142,23 @@ pub fn write_document<'a>(
                 report.written_axioms += 1;
             }
         }
+        if report.written_axioms > written_before {
+            collect_axiom_data_refs(
+                &ax.kind,
+                &mut referenced_data_props,
+                &mut referenced_datatypes,
+            );
+        }
+    }
+
+    // Ensure every referenced DataProperty and non-builtin Datatype has an entity frame
+    // so Manchester consumers never misclassify undeclared data properties as object
+    // properties (e.g. in unqualified data cardinalities, HasKey, or n-ary misc frames).
+    for dp in referenced_data_props {
+        data_props.entry(dp).or_default();
+    }
+    for dt in referenced_datatypes {
+        datatypes.entry(dt).or_default();
     }
 
     // Attach AnnotationAssertions to an existing frame for their subject, or to an
@@ -1011,7 +1345,7 @@ pub fn write_document<'a>(
         for (anns, ops, dps) in &f.has_key {
             let mut parts: Vec<String> = ops.iter().map(|p| r.ope(p)).collect();
             parts.extend(dps.iter().map(|p| ofn.iri(p.as_str())));
-            write_section_item(w, ofn, &r, "HasKey:", anns, &parts.join(", "))?;
+            write_section_item(w, ofn, &r, "HasKey:", anns, &parts.join(" "))?;
         }
     }
 
@@ -2015,10 +2349,19 @@ impl<'a> DocParser<'a> {
                 "SubPropertyChain:" => {
                     let anns = self.maybe_annotations()?;
                     let toks = self.collect_item_tokens();
+                    if toks.is_empty() {
+                        return Err(
+                            self.err_here("expected property chain after SubPropertyChain:")
+                        );
+                    }
                     let mut chain = Vec::new();
                     let mut part = Vec::new();
                     for (t, s) in toks {
                         if t.word() == Some("o") {
+                            if part.is_empty() {
+                                return Err(self
+                                    .err_at(s, "expected object property expression before 'o'"));
+                            }
                             let ope = Parser::from_tokens(
                                 std::mem::take(&mut part),
                                 self.text.len(),
@@ -2031,12 +2374,15 @@ impl<'a> DocParser<'a> {
                             part.push((t, s));
                         }
                     }
-                    if !part.is_empty() {
-                        let ope = Parser::from_tokens(part, self.text.len(), &self.vocab)
-                            .whole(Parser::ope)
-                            .map_err(|e| self.err_at(e.span, e.message))?;
-                        chain.push(ope);
+                    if part.is_empty() {
+                        return Err(self.err_here(
+                            "expected object property expression after trailing 'o' in SubPropertyChain:",
+                        ));
                     }
+                    let ope = Parser::from_tokens(part, self.text.len(), &self.vocab)
+                        .whole(Parser::ope)
+                        .map_err(|e| self.err_at(e.span, e.message))?;
+                    chain.push(ope);
                     axioms.push(Axiom {
                         kind: AxiomKind::SubObjectPropertyOf(
                             SubObjectPropertyExpression::Chain(chain),
@@ -2221,33 +2567,70 @@ impl<'a> DocParser<'a> {
                     let anns = self.maybe_annotations()?;
                     let mut ops = BTreeSet::new();
                     let mut dps = BTreeSet::new();
-                    loop {
-                        let toks = self.collect_item_tokens();
-                        if toks.is_empty() {
-                            return Err(self.err_here("expected property in HasKey:"));
-                        }
-                        let is_dp = toks.len() == 1
-                            && self.try_token_iri(&toks[0].0).is_some_and(|iri| {
-                                let kinds = self.vocab.kinds(&iri);
-                                kinds.contains(&EntityKind::DataProperty)
-                                    && !kinds.contains(&EntityKind::ObjectProperty)
-                            });
-                        if is_dp {
-                            let dp = Parser::from_tokens(toks, self.text.len(), &self.vocab)
-                                .whole(Parser::data_property)
-                                .map_err(|e| self.err_at(e.span, e.message))?;
-                            dps.insert(dp);
-                        } else {
-                            let ope = Parser::from_tokens(toks, self.text.len(), &self.vocab)
-                                .whole(Parser::ope)
-                                .map_err(|e| self.err_at(e.span, e.message))?;
-                            ops.insert(ope);
-                        }
+                    while self.pos < self.toks.len() && !self.is_section_or_frame(self.pos) {
                         if self.peek() == Some(&Tok::Comma) {
                             self.bump();
                             continue;
                         }
-                        break;
+                        if self.peek_word() == Some("inverse") {
+                            let inv = self.bump().expect("peeked");
+                            let mut toks = vec![inv];
+                            if self.peek() == Some(&Tok::LParen) {
+                                toks.push(self.bump().expect("peeked"));
+                                let Some(prop_tok) = self.bump() else {
+                                    return Err(
+                                        self.err_here("expected property after 'inverse ('")
+                                    );
+                                };
+                                toks.push(prop_tok);
+                                let Some(rp) = self.bump() else {
+                                    return Err(
+                                        self.err_here("expected ')' after inverse property")
+                                    );
+                                };
+                                toks.push(rp);
+                            } else {
+                                let Some(prop_tok) = self.bump() else {
+                                    return Err(self.err_here("expected property after 'inverse'"));
+                                };
+                                toks.push(prop_tok);
+                            }
+                            let ope = Parser::from_tokens(toks, self.text.len(), &self.vocab)
+                                .whole(Parser::ope)
+                                .map_err(|e| self.err_at(e.span, e.message))?;
+                            ops.insert(ope);
+                        } else {
+                            let Some((tok, span)) = self.bump() else {
+                                break;
+                            };
+                            let is_dp = self.try_token_iri(&tok).is_some_and(|iri| {
+                                let kinds = self.vocab.kinds(&iri);
+                                kinds.contains(&EntityKind::DataProperty)
+                                    && !kinds.contains(&EntityKind::ObjectProperty)
+                            });
+                            if is_dp {
+                                let dp = Parser::from_tokens(
+                                    vec![(tok, span)],
+                                    self.text.len(),
+                                    &self.vocab,
+                                )
+                                .whole(Parser::data_property)
+                                .map_err(|e| self.err_at(e.span, e.message))?;
+                                dps.insert(dp);
+                            } else {
+                                let ope = Parser::from_tokens(
+                                    vec![(tok, span)],
+                                    self.text.len(),
+                                    &self.vocab,
+                                )
+                                .whole(Parser::ope)
+                                .map_err(|e| self.err_at(e.span, e.message))?;
+                                ops.insert(ope);
+                            }
+                        }
+                    }
+                    if ops.is_empty() && dps.is_empty() {
+                        return Err(self.err_here("expected property in HasKey:"));
                     }
                     axioms.push(Axiom {
                         kind: AxiomKind::HasKey(ClassExpression::Class(c.clone()), ops, dps),

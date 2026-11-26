@@ -106,8 +106,75 @@ fn is_local_name(s: &str) -> bool {
         && s.chars().all(|c| c.is_alphanumeric() || "_-.".contains(c))
 }
 
+/// Whether `s` is a valid OWL/XML `<Prefix name="..."/>` name (`""` or a `PN_PREFIX`
+/// starting with a letter and not ending with `.`).
+fn is_owx_prefix(s: &str) -> bool {
+    s.is_empty()
+        || (s.chars().next().is_some_and(char::is_alphabetic)
+            && !s.ends_with('.')
+            && s.chars().all(|c| c.is_alphanumeric() || "_-.".contains(c)))
+}
+
+/// XML 1.0 Namespaces `NCNameStartChar` (`NameStartChar - ':'`).
+fn is_ncname_start(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x41..=0x5A
+            | 0x5F
+            | 0x61..=0x7A
+            | 0xC0..=0xD6
+            | 0xD8..=0xF6
+            | 0xF8..=0x2FF
+            | 0x370..=0x37D
+            | 0x37F..=0x1FFF
+            | 0x200C..=0x200D
+            | 0x2070..=0x218F
+            | 0x2C00..=0x2FEF
+            | 0x3001..=0xD7FF
+            | 0xF900..=0xFDCF
+            | 0xFDF0..=0xFFFD
+            | 0x10000..=0xEFFFF
+    )
+}
+
+/// XML 1.0 Namespaces `NCNameChar` (`NameChar - ':'`).
+fn is_ncname_char(c: char) -> bool {
+    is_ncname_start(c)
+        || matches!(
+            c as u32,
+            0x2D | 0x2E | 0x30..=0x39 | 0xB7 | 0x0300..=0x036F | 0x203F..=0x2040
+        )
+}
+
+/// Whether `s` is a valid XML 1.0 `xsd:NCName` (required for `AnonymousIndividual/@nodeID`).
+pub(crate) fn is_xml_ncname(s: &str) -> bool {
+    let mut cs = s.chars();
+    cs.next().is_some_and(is_ncname_start) && cs.all(is_ncname_char)
+}
+
+const OWX_BNODE_ESC_PREFIX: &str = "__owx_";
+
+/// Map any anonymous individual label deterministically and injectively to a valid XML
+/// `NCName`, preserving ordinary `NCName` labels verbatim.
+fn encode_owx_node_id(label: &str) -> Result<String, WriteError> {
+    check_xml_text(label, "nodeID")?;
+    if is_xml_ncname(label) && !label.starts_with(OWX_BNODE_ESC_PREFIX) {
+        return Ok(label.to_string());
+    }
+    let mut out = String::with_capacity(OWX_BNODE_ESC_PREFIX.len() + label.len() * 2);
+    out.push_str(OWX_BNODE_ESC_PREFIX);
+    for b in label.as_bytes() {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    Ok(out)
+}
+
 struct OwxWriter<'a> {
     w: &'a mut dyn Write,
+    /// `(prefix, namespace)` sorted by prefix name for `<Prefix>` declarations
+    declared_prefixes: Vec<(String, String)>,
     /// `(prefix, namespace)` longest namespace first for deterministic contraction
     prefixes: Vec<(String, String)>,
     depth: usize,
@@ -129,14 +196,19 @@ fn abbreviate<'p, 'i>(
 
 impl<'a> OwxWriter<'a> {
     fn new(w: &'a mut dyn Write, renderer: &Renderer) -> Self {
-        let mut prefixes: Vec<(String, String)> = renderer
-            .prefixes()
-            .into_iter()
-            .map(|(p, n)| (p.to_string(), n.to_string()))
-            .collect();
+        let mut by_name: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for (p, n) in renderer.prefixes() {
+            if is_owx_prefix(p) && !n.is_empty() {
+                by_name.insert(p.to_string(), n.to_string());
+            }
+        }
+        let declared_prefixes: Vec<(String, String)> = by_name.into_iter().collect();
+        let mut prefixes = declared_prefixes.clone();
         prefixes.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
         OwxWriter {
             w,
+            declared_prefixes,
             prefixes,
             depth: 0,
         }
@@ -201,9 +273,10 @@ impl<'a> OwxWriter<'a> {
         indent: usize,
         a: &AnonymousIndividual,
     ) -> Result<(), WriteError> {
+        let node_id = encode_owx_node_id(a.label())?;
         self.indent(indent)?;
         self.w.write_all(b"<AnonymousIndividual nodeID=\"")?;
-        write_xml_attr(self.w, a.label())?;
+        write_xml_attr(self.w, &node_id)?;
         self.w.write_all(b"\"/>\n")?;
         Ok(())
     }
@@ -472,8 +545,14 @@ impl<'a> OwxWriter<'a> {
                 self.write_class_expression(2, b)?;
             }
             K::EquivalentClasses(cs) => {
-                for c in cs {
+                if cs.len() == 1 {
+                    let c = cs.iter().next().expect("len 1");
                     self.write_class_expression(2, c)?;
+                    self.write_class_expression(2, c)?;
+                } else {
+                    for c in cs {
+                        self.write_class_expression(2, c)?;
+                    }
                 }
             }
             K::DisjointClasses(cs) => {
@@ -503,8 +582,14 @@ impl<'a> OwxWriter<'a> {
                 self.write_ope(2, sup)?;
             }
             K::EquivalentObjectProperties(ps) => {
-                for p in ps {
+                if ps.len() == 1 {
+                    let p = ps.iter().next().expect("len 1");
                     self.write_ope(2, p)?;
+                    self.write_ope(2, p)?;
+                } else {
+                    for p in ps {
+                        self.write_ope(2, p)?;
+                    }
                 }
             }
             K::DisjointObjectProperties(ps) => {
@@ -532,8 +617,14 @@ impl<'a> OwxWriter<'a> {
                 self.write_entity_tag(2, "DataProperty", b.as_str())?;
             }
             K::EquivalentDataProperties(ps) => {
-                for p in ps {
+                if ps.len() == 1 {
+                    let p = ps.iter().next().expect("len 1");
                     self.write_entity_tag(2, "DataProperty", p.as_str())?;
+                    self.write_entity_tag(2, "DataProperty", p.as_str())?;
+                } else {
+                    for p in ps {
+                        self.write_entity_tag(2, "DataProperty", p.as_str())?;
+                    }
                 }
             }
             K::DisjointDataProperties(ps) => {
@@ -566,8 +657,14 @@ impl<'a> OwxWriter<'a> {
                 }
             }
             K::SameIndividual(is) => {
-                for i in is {
+                if is.len() == 1 {
+                    let i = is.iter().next().expect("len 1");
                     self.write_individual(2, i)?;
+                    self.write_individual(2, i)?;
+                } else {
+                    for i in is {
+                        self.write_individual(2, i)?;
+                    }
                 }
             }
             K::DifferentIndividuals(is) => {
@@ -651,7 +748,8 @@ pub fn write_document<'a>(
     w.write_all(b">\n")?;
 
     let mut out = OwxWriter::new(w, renderer);
-    for (p, n) in renderer.prefixes() {
+    let declared = out.declared_prefixes.clone();
+    for (p, n) in &declared {
         out.indent(1)?;
         out.w.write_all(b"<Prefix name=\"")?;
         write_xml_attr(out.w, p)?;
@@ -913,13 +1011,28 @@ impl<'a> XmlReader<'a> {
             if self.starts_with("<!DOCTYPE") {
                 self.eat("<!DOCTYPE");
                 let mut depth = 0usize;
+                let mut in_quote: Option<char> = None;
+                let mut closed = false;
                 while let Some(c) = self.bump() {
+                    if let Some(q) = in_quote {
+                        if c == q {
+                            in_quote = None;
+                        }
+                        continue;
+                    }
                     match c {
+                        '\'' | '"' => in_quote = Some(c),
                         '[' => depth += 1,
                         ']' => depth = depth.saturating_sub(1),
-                        '>' if depth == 0 => break,
+                        '>' if depth == 0 => {
+                            closed = true;
+                            break;
+                        }
                         _ => {}
                     }
+                }
+                if !closed {
+                    return Err(self.err("unterminated <!DOCTYPE> declaration"));
                 }
                 continue;
             }
@@ -1105,6 +1218,14 @@ impl<'a> XmlReader<'a> {
                     },
                     ev => return Err(self.err(format!("unexpected event in <Ontology>: {ev:?}"))),
                 }
+            }
+        }
+        match self.next_non_ws_event()? {
+            Event::Eof => {}
+            ev => {
+                return Err(self.err(format!(
+                    "unexpected trailing content after </Ontology>: {ev:?}"
+                )));
             }
         }
         Ok(Document {

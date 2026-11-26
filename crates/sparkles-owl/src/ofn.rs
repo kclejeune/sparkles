@@ -104,18 +104,21 @@ impl Renderer {
     pub fn new<P: Into<String>, N: Into<String>>(
         prefixes: impl IntoIterator<Item = (P, N)>,
     ) -> Renderer {
-        let mut v: Vec<(String, String)> = prefixes
-            .into_iter()
-            .map(|(p, n)| (p.into(), n.into()))
-            .collect();
-        for (p, n) in STANDARD_PREFIXES {
-            if !v.iter().any(|(q, _)| q == p) {
-                v.push((p.to_string(), n.to_string()));
+        let mut by_name: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for (p, n) in prefixes {
+            let p = p.into();
+            let n = n.into();
+            if !n.is_empty() && p.chars().all(|c| c.is_alphanumeric() || "_-.".contains(c)) {
+                by_name.insert(p, n);
             }
         }
-        v.retain(|(p, n)| {
-            !n.is_empty() && p.chars().all(|c| c.is_alphanumeric() || "_-.".contains(c))
-        });
+        for (p, n) in STANDARD_PREFIXES {
+            by_name
+                .entry(p.to_string())
+                .or_insert_with(|| n.to_string());
+        }
+        let mut v: Vec<(String, String)> = by_name.into_iter().collect();
         v.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
         Renderer { prefixes: v }
     }

@@ -19,7 +19,9 @@ use crate::ofn::{Renderer, STANDARD_PREFIXES};
 use crate::ofn_read::{Document, ParseError};
 use crate::validate;
 use crate::vocab;
-use crate::write_common::{WriteError, WriteOptions, WriteReport};
+use crate::write_common::{
+    WriteError, WriteOptions, WriteReport, check_axiom_depth, check_header_depth,
+};
 use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -74,8 +76,25 @@ fn is_obo_local(s: &str) -> bool {
         })
 }
 
+/// Well-known non-hierarchical URI schemes (without `://`) treated as full IRIs rather
+/// than OBO `PREFIX:LOCAL` abbreviations when not declared in `idspaces`.
+fn is_non_hierarchical_iri_scheme(prefix: &str) -> bool {
+    matches!(
+        prefix,
+        "urn" | "mailto" | "tag" | "doi" | "uuid" | "info" | "geo" | "tel" | "data"
+    )
+}
+
+fn is_full_iri_str(id: &str, idspaces: &FxHashMap<String, String>) -> bool {
+    id.contains("://")
+        || id
+            .split_once(':')
+            .is_some_and(|(p, _)| !idspaces.contains_key(p) && is_non_hierarchical_iri_scheme(p))
+}
+
 /// Convert an IRI to an OBO 1.4 identifier using standard OBO PURL contraction and
-/// declared `idspace` prefixes.
+/// declared `idspace` prefixes. Avoids OBO PURL contraction whenever the resulting prefix
+/// is shadowed by a declared `idspace` or a standard OWL/RDF/RDFS/XSD prefix.
 pub fn iri_to_obo_id(iri: &str, idspaces: &[(String, String)]) -> String {
     if let Some(rest) = iri.strip_prefix(OBO_PURL)
         && !rest.contains(['#', '/'])
@@ -84,6 +103,8 @@ pub fn iri_to_obo_id(iri: &str, idspaces: &[(String, String)]) -> String {
         && !local.is_empty()
         && !local.contains('_')
         && is_obo_local(local)
+        && !idspaces.iter().any(|(p, _)| p == prefix)
+        && !STANDARD_PREFIXES.iter().any(|(sp, _)| *sp == prefix)
     {
         return format!("{prefix}:{local}");
     }
@@ -100,7 +121,7 @@ pub fn iri_to_obo_id(iri: &str, idspaces: &[(String, String)]) -> String {
 /// Expand an OBO 1.4 identifier to an IRI using declared `idspace` prefixes and the
 /// standard OBO PURL convention.
 pub fn obo_id_to_iri(id: &str, idspaces: &FxHashMap<String, String>) -> Result<Iri, String> {
-    if id.starts_with("http://") || id.starts_with("https://") || id.starts_with("urn:") {
+    if id.contains("://") {
         return parse_iri(id).map_err(|e| e.0);
     }
     if let Some((prefix, local)) = id.split_once(':') {
@@ -112,6 +133,9 @@ pub fn obo_id_to_iri(id: &str, idspaces: &FxHashMap<String, String>) -> Result<I
                 return parse_iri(&format!("{sns}{local}")).map_err(|e| e.0);
             }
         }
+        if is_non_hierarchical_iri_scheme(prefix) {
+            return parse_iri(id).map_err(|e| e.0);
+        }
         if is_obo_prefix(prefix) && !local.is_empty() {
             return parse_iri(&format!("{OBO_PURL}{prefix}_{local}")).map_err(|e| e.0);
         }
@@ -119,22 +143,29 @@ pub fn obo_id_to_iri(id: &str, idspaces: &FxHashMap<String, String>) -> Result<I
     parse_iri(&format!("{OBO_PURL}{id}")).map_err(|e| e.0)
 }
 
-/// Derive the OBO `ontology:` short identifier from an ontology IRI, if possible.
+fn obo_id_roundtrips(iri: &str, obo_id: &str, idspaces: &FxHashMap<String, String>) -> bool {
+    obo_id_to_iri(obo_id, idspaces)
+        .ok()
+        .is_some_and(|back| back.as_str() == iri)
+}
+
+/// Derive the OBO `ontology:` short identifier from an ontology IRI only when the IRI
+/// follows the canonical `http://purl.obolibrary.org/obo/<id>.owl` form so it expands
+/// back without losing identity.
 fn ontology_short_id(iri: &str) -> String {
-    if let Some(rest) = iri.strip_prefix(OBO_PURL) {
-        let trimmed = rest
-            .strip_suffix(".owl")
-            .or_else(|| rest.strip_suffix(".obo"))
-            .unwrap_or(rest);
-        if !trimmed.is_empty() && !trimmed.contains(['/', '#', ' ']) {
-            return trimmed.to_string();
-        }
+    if let Some(rest) = iri.strip_prefix(OBO_PURL)
+        && let Some(trimmed) = rest.strip_suffix(".owl")
+        && !trimmed.is_empty()
+        && !trimmed.contains(['/', '#', ' ', ':'])
+    {
+        return trimmed.to_string();
     }
     iri.to_string()
 }
 
 fn expand_ontology_id(raw: &str) -> Result<Iri, String> {
-    if raw.starts_with("http://") || raw.starts_with("https://") || raw.starts_with("urn:") {
+    let empty = FxHashMap::default();
+    if is_full_iri_str(raw, &empty) {
         parse_iri(raw).map_err(|e| e.0)
     } else {
         parse_iri(&format!("{OBO_PURL}{raw}.owl")).map_err(|e| e.0)
@@ -143,10 +174,19 @@ fn expand_ontology_id(raw: &str) -> Result<Iri, String> {
 
 // ------------------------------------------------------------------ escaping -----
 
-/// Escape an unquoted OBO 1.4 tag value (OBO 1.4 §1.5).
+/// Escape an unquoted OBO 1.4 tag value (OBO 1.4 §1.5), preserving leading and trailing
+/// spaces with `\W` and escaping `"` so unbalanced quotes cannot hide comments or
+/// trailing qualifiers.
 fn escape_obo_text(s: &str) -> Result<String, WriteError> {
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
+    let chars: Vec<char> = s.chars().collect();
+    let first_non_space = chars.iter().position(|&c| c != ' ').unwrap_or(chars.len());
+    let last_non_space = chars.iter().rposition(|&c| c != ' ').map_or(0, |i| i + 1);
+    for (idx, c) in chars.into_iter().enumerate() {
+        if c == ' ' && (idx < first_non_space || idx >= last_non_space) {
+            out.push_str("\\W");
+            continue;
+        }
         match c {
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
@@ -156,6 +196,7 @@ fn escape_obo_text(s: &str) -> Result<String, WriteError> {
                     "OBO 1.4 cannot represent raw carriage return (U+000D) in tag text".into(),
                 ));
             }
+            '"' => out.push_str("\\\""),
             '!' => out.push_str("\\!"),
             '{' => out.push_str("\\{"),
             '}' => out.push_str("\\}"),
@@ -165,6 +206,101 @@ fn escape_obo_text(s: &str) -> Result<String, WriteError> {
         }
     }
     Ok(out)
+}
+
+/// Escape an OBO 1.4 identifier or IRI token so embedded delimiters (`!`, `{`, `}`, `[`,
+/// `]`, `"`, whitespace, `\`) cannot truncate the line or split tokens.
+fn escape_obo_id(s: &str) -> Result<String, WriteError> {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            ' ' => out.push_str("\\W"),
+            '\t' => out.push_str("\\t"),
+            '\r' | '\n' => {
+                return Err(WriteError::Unsupported(
+                    "OBO 1.4 cannot represent newline or carriage return in an identifier or IRI"
+                        .into(),
+                ));
+            }
+            '"' => out.push_str("\\\""),
+            '!' => out.push_str("\\!"),
+            '{' => out.push_str("\\{"),
+            '}' => out.push_str("\\}"),
+            '[' => out.push_str("\\["),
+            ']' => out.push_str("\\]"),
+            c => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
+/// Escape an OBO 1.4 trailing-qualifier key (also escaping `=` and `,`).
+fn escape_obo_qual_key(s: &str) -> Result<String, WriteError> {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '=' => out.push_str("\\="),
+            ',' => out.push_str("\\,"),
+            '\\' => out.push_str("\\\\"),
+            ' ' => out.push_str("\\W"),
+            '\t' => out.push_str("\\t"),
+            '\r' | '\n' => {
+                return Err(WriteError::Unsupported(
+                    "OBO 1.4 cannot represent newline or carriage return in a qualifier key".into(),
+                ));
+            }
+            '"' => out.push_str("\\\""),
+            '!' => out.push_str("\\!"),
+            '{' => out.push_str("\\{"),
+            '}' => out.push_str("\\}"),
+            '[' => out.push_str("\\["),
+            ']' => out.push_str("\\]"),
+            c => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
+/// Escape an entry inside a `[xref1, xref2]` dbxref list on `def:` or `synonym:`.
+fn escape_obo_xref(s: &str) -> Result<String, WriteError> {
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let first_non_space = chars.iter().position(|&c| c != ' ').unwrap_or(chars.len());
+    let last_non_space = chars.iter().rposition(|&c| c != ' ').map_or(0, |i| i + 1);
+    for (idx, c) in chars.into_iter().enumerate() {
+        if c == ' ' && (idx < first_non_space || idx >= last_non_space) {
+            out.push_str("\\W");
+            continue;
+        }
+        match c {
+            '\\' => out.push_str("\\\\"),
+            ',' => out.push_str("\\,"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => {
+                return Err(WriteError::Unsupported(
+                    "OBO 1.4 cannot represent raw carriage return (U+000D) in dbxref".into(),
+                ));
+            }
+            '"' => out.push_str("\\\""),
+            '!' => out.push_str("\\!"),
+            '{' => out.push_str("\\{"),
+            '}' => out.push_str("\\}"),
+            '[' => out.push_str("\\["),
+            ']' => out.push_str("\\]"),
+            c => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
+fn format_xref_list(xrefs: &[String]) -> Result<String, WriteError> {
+    let mut escaped = Vec::with_capacity(xrefs.len());
+    for x in xrefs {
+        escaped.push(escape_obo_xref(x)?);
+    }
+    Ok(escaped.join(", "))
 }
 
 /// Escape a double-quoted OBO 1.4 string (`"..."`).
@@ -246,11 +382,11 @@ struct DefEntry {
 #[derive(Default)]
 struct TermStanza {
     id: String,
-    names: Vec<String>,
-    namespaces: Vec<String>,
+    name: Option<String>,
+    namespace: Option<String>,
     alt_ids: Vec<String>,
-    defs: Vec<DefEntry>,
-    comments: Vec<String>,
+    def: Option<DefEntry>,
+    comment: Option<String>,
     subsets: Vec<String>,
     synonyms: Vec<SynonymEntry>,
     xrefs: Vec<String>,
@@ -266,25 +402,25 @@ struct TermStanza {
     replaced_by: Vec<String>,
     consider: Vec<String>,
     property_values: Vec<PropertyValue>,
-    created_by: Vec<String>,
-    creation_date: Vec<String>,
+    created_by: Option<String>,
+    creation_date: Option<String>,
 }
 
 #[derive(Default)]
 struct TypedefStanza {
     id: String,
     is_metadata_tag: bool,
-    names: Vec<String>,
-    namespaces: Vec<String>,
+    name: Option<String>,
+    namespace: Option<String>,
     alt_ids: Vec<String>,
-    defs: Vec<DefEntry>,
-    comments: Vec<String>,
+    def: Option<DefEntry>,
+    comment: Option<String>,
     subsets: Vec<String>,
     synonyms: Vec<SynonymEntry>,
     xrefs: Vec<String>,
     domains: Vec<String>,
     ranges: Vec<String>,
-    is_anti_symmetric: bool,
+    is_asymmetric: bool,
     is_reflexive: bool,
     is_symmetric: bool,
     is_transitive: bool,
@@ -299,18 +435,18 @@ struct TypedefStanza {
     replaced_by: Vec<String>,
     consider: Vec<String>,
     property_values: Vec<PropertyValue>,
-    created_by: Vec<String>,
-    creation_date: Vec<String>,
+    created_by: Option<String>,
+    creation_date: Option<String>,
 }
 
 #[derive(Default)]
 struct InstanceStanza {
     id: String,
-    names: Vec<String>,
-    namespaces: Vec<String>,
-    comments: Vec<String>,
+    name: Option<String>,
+    namespace: Option<String>,
+    comment: Option<String>,
     xrefs: Vec<String>,
-    instance_of: Vec<(String, Vec<Qualifier>)>,
+    instance_of: Option<(String, Vec<Qualifier>)>,
     relationships: Vec<(String, String, Vec<Qualifier>)>,
     property_values: Vec<PropertyValue>,
     is_obsolete: bool,
@@ -319,6 +455,7 @@ struct InstanceStanza {
 fn annotations_to_qualifiers(
     anns: &BTreeSet<Annotation>,
     idspaces: &[(String, String)],
+    idspace_map: &FxHashMap<String, String>,
 ) -> Option<Vec<Qualifier>> {
     let mut out = Vec::new();
     for a in anns {
@@ -328,20 +465,15 @@ fn annotations_to_qualifiers(
         let key = if a.property.as_str() == OIO_IS_INFERRED {
             "is_inferred".to_string()
         } else {
-            iri_to_obo_id(a.property.as_str(), idspaces)
-        };
-        let value = match &a.value {
-            AnnotationValue::Literal(l) => {
-                if l.language().is_some()
-                    || (l.datatype() != vocab::XSD_STRING && l.datatype() != vocab::XSD_BOOLEAN)
-                {
-                    return None;
-                }
-                l.value().to_string()
+            let k = iri_to_obo_id(a.property.as_str(), idspaces);
+            if !obo_id_roundtrips(a.property.as_str(), &k, idspace_map) {
+                return None;
             }
-            AnnotationValue::Iri(i) => iri_to_obo_id(i.as_str(), idspaces),
-            AnnotationValue::Anonymous(_) => return None,
+            k
         };
+        // OBO 1.4 trailing qualifiers carry quoted string values with no datatype or IRI
+        // tag, so only plain xsd:string literals round-trip without losing value kind.
+        let value = plain_string(&a.value)?.to_string();
         out.push(Qualifier { key, value });
     }
     out.sort();
@@ -354,19 +486,24 @@ fn format_qualifiers(qs: &[Qualifier]) -> Result<String, WriteError> {
     }
     let mut parts = Vec::with_capacity(qs.len());
     for q in qs {
-        parts.push(format!("{}={}", q.key, escape_obo_quoted(&q.value)?));
+        parts.push(format!(
+            "{}={}",
+            escape_obo_qual_key(&q.key)?,
+            escape_obo_quoted(&q.value)?
+        ));
     }
     Ok(format!(" {{{}}}", parts.join(", ")))
 }
 
 fn format_pv(pv: &PropertyValue) -> Result<String, WriteError> {
     let q = format_qualifiers(&pv.qualifiers)?;
+    let prop = escape_obo_id(&pv.prop)?;
     match &pv.val {
-        PvValue::Iri(i) => Ok(format!("property_value: {} {}{q}", pv.prop, i)),
+        PvValue::Iri(i) => Ok(format!("property_value: {prop} {}{q}", escape_obo_id(i)?)),
         PvValue::Literal(v, dt) => Ok(format!(
-            "property_value: {} {} {dt}{q}",
-            pv.prop,
-            escape_obo_quoted(v)?
+            "property_value: {prop} {} {}{q}",
+            escape_obo_quoted(v)?,
+            escape_obo_id(dt)?
         )),
     }
 }
@@ -376,16 +513,29 @@ fn annotation_to_pv(
     v: &AnnotationValue,
     anns: &BTreeSet<Annotation>,
     idspaces: &[(String, String)],
+    idspace_map: &FxHashMap<String, String>,
 ) -> Option<PropertyValue> {
-    let qualifiers = annotations_to_qualifiers(anns, idspaces)?;
+    let qualifiers = annotations_to_qualifiers(anns, idspaces, idspace_map)?;
     let prop = iri_to_obo_id(p.as_str(), idspaces);
+    if !obo_id_roundtrips(p.as_str(), &prop, idspace_map) {
+        return None;
+    }
     let val = match v {
-        AnnotationValue::Iri(i) => PvValue::Iri(iri_to_obo_id(i.as_str(), idspaces)),
+        AnnotationValue::Iri(i) => {
+            let id = iri_to_obo_id(i.as_str(), idspaces);
+            if !obo_id_roundtrips(i.as_str(), &id, idspace_map) {
+                return None;
+            }
+            PvValue::Iri(id)
+        }
         AnnotationValue::Literal(l) => {
             if l.language().is_some() {
                 return None;
             }
             let dt = iri_to_obo_id(l.datatype(), idspaces);
+            if !obo_id_roundtrips(l.datatype(), &dt, idspace_map) {
+                return None;
+            }
             PvValue::Literal(l.value().to_string(), dt)
         }
         AnnotationValue::Anonymous(_) => return None,
@@ -405,27 +555,33 @@ pub fn write_document<'a>(
     axioms: impl IntoIterator<Item = &'a Axiom>,
     options: WriteOptions,
 ) -> Result<WriteReport, WriteError> {
-    let axioms: Vec<&'a Axiom> = axioms.into_iter().collect();
+    check_header_depth(header, "OBO 1.4")?;
+    let mut axioms: Vec<&'a Axiom> = axioms.into_iter().collect();
+    for &ax in &axioms {
+        check_axiom_depth(ax, "OBO 1.4")?;
+    }
+    axioms.sort();
 
-    // Build custom idspace list (non-empty prefixes, longest namespace first for matching).
-    let mut idspaces: Vec<(String, String)> = renderer
-        .prefixes()
-        .into_iter()
-        .filter(|(p, ns)| {
-            !p.is_empty()
-                && is_obo_prefix(p)
-                && !STANDARD_PREFIXES.iter().any(|(sp, _)| sp == p)
-                && *ns != OBO_PURL
-        })
-        .map(|(p, ns)| (p.to_string(), ns.to_string()))
-        .collect();
+    // Build deduplicated custom idspace list (non-empty prefixes, excluding standard
+    // prefixes and OBO_PURL).
+    let mut idspace_by_name: BTreeMap<String, String> = BTreeMap::new();
+    for (p, ns) in renderer.prefixes() {
+        if !p.is_empty()
+            && is_obo_prefix(p)
+            && !STANDARD_PREFIXES.iter().any(|(sp, _)| *sp == p)
+            && ns != OBO_PURL
+        {
+            idspace_by_name.insert(p.to_string(), ns.to_string());
+        }
+    }
+    let idspaces: Vec<(String, String)> = idspace_by_name.into_iter().collect();
+    let idspace_map: FxHashMap<String, String> = idspaces.iter().cloned().collect();
     // Standard prefixes are kept for iri_to_obo_id contraction of xsd:/owl:/rdfs:/rdf:
     let mut match_spaces = idspaces.clone();
     for (p, ns) in STANDARD_PREFIXES {
         match_spaces.push((p.to_string(), ns.to_string()));
     }
     match_spaces.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
-    idspaces.sort();
 
     let mut report = WriteReport::default();
     let mut terms: BTreeMap<String, TermStanza> = BTreeMap::new();
@@ -433,27 +589,34 @@ pub fn write_document<'a>(
     let mut instances: BTreeMap<String, InstanceStanza> = BTreeMap::new();
     let mut pending_annotations: Vec<&'a Axiom> = Vec::new();
 
-    let id_of = |iri: &str| iri_to_obo_id(iri, &match_spaces);
+    let checked_id = |iri: &str| -> Option<String> {
+        let id = iri_to_obo_id(iri, &match_spaces);
+        obo_id_roundtrips(iri, &id, &idspace_map).then_some(id)
+    };
 
     // First pass: register declared entities.
     for &ax in &axioms {
         if let AxiomKind::Declaration(e) = &ax.kind {
             if !ax.annotations.is_empty() {
-                if options.strict {
-                    return Err(WriteError::Unsupported(format!(
-                        "OBO 1.4 cannot attach annotations to Declaration: {}",
-                        renderer.axiom(ax)
-                    )));
-                }
-                report.record_skipped(
+                report.skip_or_err(
+                    options,
+                    renderer,
                     ax,
                     "OBO 1.4 cannot attach annotations to Declaration axioms",
-                );
+                )?;
                 continue;
             }
             match e {
                 Entity::Class(c) => {
-                    let id = id_of(c.as_str());
+                    let Some(id) = checked_id(c.as_str()) else {
+                        report.skip_or_err(
+                            options,
+                            renderer,
+                            ax,
+                            "OBO 1.4 cannot preserve this class IRI without changing identity",
+                        )?;
+                        continue;
+                    };
                     terms.entry(id.clone()).or_insert_with(|| TermStanza {
                         id,
                         ..Default::default()
@@ -461,24 +624,40 @@ pub fn write_document<'a>(
                     report.written_axioms += 1;
                 }
                 Entity::ObjectProperty(p) => {
-                    let id = id_of(p.as_str());
+                    let Some(id) = checked_id(p.as_str()) else {
+                        report.skip_or_err(
+                            options,
+                            renderer,
+                            ax,
+                            "OBO 1.4 cannot preserve this object property IRI without changing identity",
+                        )?;
+                        continue;
+                    };
                     typedefs.entry(id.clone()).or_insert_with(|| TypedefStanza {
                         id,
                         ..Default::default()
                     });
                     report.written_axioms += 1;
                 }
-                Entity::DataProperty(p) => {
-                    let id = id_of(p.as_str());
-                    typedefs.entry(id.clone()).or_insert_with(|| TypedefStanza {
-                        id,
-                        ..Default::default()
-                    });
-                    report.written_axioms += 1;
+                Entity::DataProperty(_) => {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 has no stanza for DataProperty declarations",
+                    )?;
                 }
                 Entity::AnnotationProperty(p) => {
                     if !vocab::is_builtin_annotation_property(p.as_str()) {
-                        let id = id_of(p.as_str());
+                        let Some(id) = checked_id(p.as_str()) else {
+                            report.skip_or_err(
+                                options,
+                                renderer,
+                                ax,
+                                "OBO 1.4 cannot preserve this annotation property IRI without changing identity",
+                            )?;
+                            continue;
+                        };
                         let td = typedefs.entry(id.clone()).or_insert_with(|| TypedefStanza {
                             id,
                             ..Default::default()
@@ -488,7 +667,15 @@ pub fn write_document<'a>(
                     report.written_axioms += 1;
                 }
                 Entity::NamedIndividual(i) => {
-                    let id = id_of(i.as_str());
+                    let Some(id) = checked_id(i.as_str()) else {
+                        report.skip_or_err(
+                            options,
+                            renderer,
+                            ax,
+                            "OBO 1.4 cannot preserve this individual IRI without changing identity",
+                        )?;
+                        continue;
+                    };
                     instances
                         .entry(id.clone())
                         .or_insert_with(|| InstanceStanza {
@@ -498,13 +685,12 @@ pub fn write_document<'a>(
                     report.written_axioms += 1;
                 }
                 Entity::Datatype(_) => {
-                    if options.strict {
-                        return Err(WriteError::Unsupported(format!(
-                            "OBO 1.4 has no Datatype declaration stanza: {}",
-                            renderer.axiom(ax)
-                        )));
-                    }
-                    report.record_skipped(ax, "OBO 1.4 has no stanza for Datatype declarations");
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 has no stanza for Datatype declarations",
+                    )?;
                 }
             }
         }
@@ -516,15 +702,26 @@ pub fn write_document<'a>(
         match &ax.kind {
             K::Declaration(_) => continue,
             K::SubClassOf(ClassExpression::Class(sub), ClassExpression::Class(sup)) => {
-                let Some(qs) = annotations_to_qualifiers(&ax.annotations, &match_spaces) else {
+                let Some(qs) =
+                    annotations_to_qualifiers(&ax.annotations, &match_spaces, &idspace_map)
+                else {
                     report.skip_or_err(options, renderer,
                         ax,
-                        "OBO 1.4 cannot represent nested or typed/language-tagged axiom annotations on is_a",
+                        "OBO 1.4 cannot represent nested or typed/IRI/language-tagged axiom annotations on is_a",
                     )?;
                     continue;
                 };
-                let sid = id_of(sub.as_str());
-                let sup_id = id_of(sup.as_str());
+                let (Some(sid), Some(sup_id)) =
+                    (checked_id(sub.as_str()), checked_id(sup.as_str()))
+                else {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 cannot preserve class IRI in is_a without changing identity",
+                    )?;
+                    continue;
+                };
                 terms
                     .entry(sid.clone())
                     .or_insert_with(|| TermStanza {
@@ -545,14 +742,28 @@ pub fn write_document<'a>(
                 let ClassExpression::Class(target) = filler.as_ref() else {
                     unreachable!()
                 };
-                let Some(qs) = annotations_to_qualifiers(&ax.annotations, &match_spaces) else {
+                let Some(qs) =
+                    annotations_to_qualifiers(&ax.annotations, &match_spaces, &idspace_map)
+                else {
                     report.skip_or_err(options, renderer,
                         ax,
-                        "OBO 1.4 cannot represent nested or typed/language-tagged axiom annotations on relationship",
+                        "OBO 1.4 cannot represent nested or typed/IRI/language-tagged axiom annotations on relationship",
                     )?;
                     continue;
                 };
-                let sid = id_of(sub.as_str());
+                let (Some(sid), Some(pid), Some(tid)) = (
+                    checked_id(sub.as_str()),
+                    checked_id(p.as_str()),
+                    checked_id(target.as_str()),
+                ) else {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 cannot preserve IRI in relationship without changing identity",
+                    )?;
+                    continue;
+                };
                 terms
                     .entry(sid.clone())
                     .or_insert_with(|| TermStanza {
@@ -560,7 +771,7 @@ pub fn write_document<'a>(
                         ..Default::default()
                     })
                     .relationships
-                    .push((id_of(p.as_str()), id_of(target.as_str()), qs));
+                    .push((pid, tid, qs));
                 report.written_axioms += 1;
             }
             K::SubClassOf(_, _) => {
@@ -573,7 +784,8 @@ pub fn write_document<'a>(
                 let items: Vec<&ClassExpression> = cs.iter().collect();
                 match (items[0], items[1]) {
                     (ClassExpression::Class(a), ClassExpression::Class(b)) => {
-                        let Some(qs) = annotations_to_qualifiers(&ax.annotations, &match_spaces)
+                        let Some(qs) =
+                            annotations_to_qualifiers(&ax.annotations, &match_spaces, &idspace_map)
                         else {
                             report.skip_or_err(
                                 options,
@@ -583,7 +795,17 @@ pub fn write_document<'a>(
                             )?;
                             continue;
                         };
-                        let aid = id_of(a.as_str());
+                        let (Some(aid), Some(bid)) =
+                            (checked_id(a.as_str()), checked_id(b.as_str()))
+                        else {
+                            report.skip_or_err(
+                                options,
+                                renderer,
+                                ax,
+                                "OBO 1.4 cannot preserve IRI in equivalent_to without changing identity",
+                            )?;
+                            continue;
+                        };
                         terms
                             .entry(aid.clone())
                             .or_insert_with(|| TermStanza {
@@ -591,7 +813,7 @@ pub fn write_document<'a>(
                                 ..Default::default()
                             })
                             .equivalent_to
-                            .push((id_of(b.as_str()), qs));
+                            .push((bid, qs));
                         report.written_axioms += 1;
                     }
                     (ClassExpression::Class(c), other) | (other, ClassExpression::Class(c)) => {
@@ -609,17 +831,24 @@ pub fn write_document<'a>(
                                 for m in members {
                                     match m {
                                         ClassExpression::Class(mc) => {
-                                            parsed.push((None, id_of(mc.as_str())))
+                                            if let Some(id) = checked_id(mc.as_str()) {
+                                                parsed.push((None, id));
+                                            } else {
+                                                ok = false;
+                                                break;
+                                            }
                                         }
                                         ClassExpression::ObjectSomeValuesFrom(
                                             ObjectPropertyExpression::Property(p),
                                             f,
                                         ) => {
-                                            if let ClassExpression::Class(fc) = f.as_ref() {
-                                                parsed.push((
-                                                    Some(id_of(p.as_str())),
-                                                    id_of(fc.as_str()),
-                                                ));
+                                            if let ClassExpression::Class(fc) = f.as_ref()
+                                                && let (Some(pid), Some(fid)) = (
+                                                    checked_id(p.as_str()),
+                                                    checked_id(fc.as_str()),
+                                                )
+                                            {
+                                                parsed.push((Some(pid), fid));
                                             } else {
                                                 ok = false;
                                                 break;
@@ -631,6 +860,15 @@ pub fn write_document<'a>(
                                         }
                                     }
                                 }
+                                let Some(cid) = checked_id(c.as_str()) else {
+                                    report.skip_or_err(
+                                        options,
+                                        renderer,
+                                        ax,
+                                        "OBO 1.4 cannot preserve class IRI in intersection_of without changing identity",
+                                    )?;
+                                    continue;
+                                };
                                 if !ok || parsed.len() < 2 {
                                     report.skip_or_err(options, renderer,
                                         ax,
@@ -638,7 +876,6 @@ pub fn write_document<'a>(
                                     )?;
                                     continue;
                                 }
-                                let cid = id_of(c.as_str());
                                 let entry =
                                     terms.entry(cid.clone()).or_insert_with(|| TermStanza {
                                         id: cid,
@@ -660,13 +897,24 @@ pub fn write_document<'a>(
                                 let mut parsed = Vec::new();
                                 let mut ok = true;
                                 for m in members {
-                                    if let ClassExpression::Class(mc) = m {
-                                        parsed.push(id_of(mc.as_str()));
+                                    if let ClassExpression::Class(mc) = m
+                                        && let Some(id) = checked_id(mc.as_str())
+                                    {
+                                        parsed.push(id);
                                     } else {
                                         ok = false;
                                         break;
                                     }
                                 }
+                                let Some(cid) = checked_id(c.as_str()) else {
+                                    report.skip_or_err(
+                                        options,
+                                        renderer,
+                                        ax,
+                                        "OBO 1.4 cannot preserve class IRI in union_of without changing identity",
+                                    )?;
+                                    continue;
+                                };
                                 if !ok || parsed.len() < 2 {
                                     report.skip_or_err(
                                         options,
@@ -676,7 +924,6 @@ pub fn write_document<'a>(
                                     )?;
                                     continue;
                                 }
-                                let cid = id_of(c.as_str());
                                 let entry =
                                     terms.entry(cid.clone()).or_insert_with(|| TermStanza {
                                         id: cid,
@@ -726,7 +973,9 @@ pub fn write_document<'a>(
                 let items: Vec<&ClassExpression> = cs.iter().collect();
                 if let (ClassExpression::Class(a), ClassExpression::Class(b)) = (items[0], items[1])
                 {
-                    let Some(qs) = annotations_to_qualifiers(&ax.annotations, &match_spaces) else {
+                    let Some(qs) =
+                        annotations_to_qualifiers(&ax.annotations, &match_spaces, &idspace_map)
+                    else {
                         report.skip_or_err(
                             options,
                             renderer,
@@ -735,7 +984,16 @@ pub fn write_document<'a>(
                         )?;
                         continue;
                     };
-                    let aid = id_of(a.as_str());
+                    let (Some(aid), Some(bid)) = (checked_id(a.as_str()), checked_id(b.as_str()))
+                    else {
+                        report.skip_or_err(
+                            options,
+                            renderer,
+                            ax,
+                            "OBO 1.4 cannot preserve IRI in disjoint_from without changing identity",
+                        )?;
+                        continue;
+                    };
                     terms
                         .entry(aid.clone())
                         .or_insert_with(|| TermStanza {
@@ -743,7 +1001,7 @@ pub fn write_document<'a>(
                             ..Default::default()
                         })
                         .disjoint_from
-                        .push((id_of(b.as_str()), qs));
+                        .push((bid, qs));
                     report.written_axioms += 1;
                 } else {
                     report.skip_or_err(
@@ -764,7 +1022,9 @@ pub fn write_document<'a>(
                 SubObjectPropertyExpression::Expression(ObjectPropertyExpression::Property(a)),
                 ObjectPropertyExpression::Property(b),
             ) => {
-                let Some(qs) = annotations_to_qualifiers(&ax.annotations, &match_spaces) else {
+                let Some(qs) =
+                    annotations_to_qualifiers(&ax.annotations, &match_spaces, &idspace_map)
+                else {
                     report.skip_or_err(
                         options,
                         renderer,
@@ -773,7 +1033,16 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                let aid = id_of(a.as_str());
+                let (Some(aid), Some(bid)) = (checked_id(a.as_str()), checked_id(b.as_str()))
+                else {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 cannot preserve IRI in Typedef is_a without changing identity",
+                    )?;
+                    continue;
+                };
                 typedefs
                     .entry(aid.clone())
                     .or_insert_with(|| TypedefStanza {
@@ -781,7 +1050,7 @@ pub fn write_document<'a>(
                         ..Default::default()
                     })
                     .is_a
-                    .push((id_of(b.as_str()), qs));
+                    .push((bid, qs));
                 report.written_axioms += 1;
             }
             K::SubObjectPropertyOf(
@@ -793,7 +1062,9 @@ pub fn write_document<'a>(
                     ObjectPropertyExpression::Property(p2),
                 ) = (&chain[0], &chain[1])
                 {
-                    let Some(qs) = annotations_to_qualifiers(&ax.annotations, &match_spaces) else {
+                    let Some(qs) =
+                        annotations_to_qualifiers(&ax.annotations, &match_spaces, &idspace_map)
+                    else {
                         report.skip_or_err(
                             options,
                             renderer,
@@ -802,7 +1073,19 @@ pub fn write_document<'a>(
                         )?;
                         continue;
                     };
-                    let sid = id_of(sup.as_str());
+                    let (Some(sid), Some(p1id), Some(p2id)) = (
+                        checked_id(sup.as_str()),
+                        checked_id(p1.as_str()),
+                        checked_id(p2.as_str()),
+                    ) else {
+                        report.skip_or_err(
+                            options,
+                            renderer,
+                            ax,
+                            "OBO 1.4 cannot preserve IRI in holds_over_chain without changing identity",
+                        )?;
+                        continue;
+                    };
                     typedefs
                         .entry(sid.clone())
                         .or_insert_with(|| TypedefStanza {
@@ -810,7 +1093,7 @@ pub fn write_document<'a>(
                             ..Default::default()
                         })
                         .holds_over_chain
-                        .push((id_of(p1.as_str()), id_of(p2.as_str()), qs));
+                        .push((p1id, p2id, qs));
                     report.written_axioms += 1;
                 } else {
                     report.skip_or_err(
@@ -836,7 +1119,9 @@ pub fn write_document<'a>(
                     ObjectPropertyExpression::Property(b),
                 ) = (items[0], items[1])
                 {
-                    let Some(qs) = annotations_to_qualifiers(&ax.annotations, &match_spaces) else {
+                    let Some(qs) =
+                        annotations_to_qualifiers(&ax.annotations, &match_spaces, &idspace_map)
+                    else {
                         report.skip_or_err(
                             options,
                             renderer,
@@ -845,7 +1130,16 @@ pub fn write_document<'a>(
                         )?;
                         continue;
                     };
-                    let aid = id_of(a.as_str());
+                    let (Some(aid), Some(bid)) = (checked_id(a.as_str()), checked_id(b.as_str()))
+                    else {
+                        report.skip_or_err(
+                            options,
+                            renderer,
+                            ax,
+                            "OBO 1.4 cannot preserve IRI in Typedef equivalent_to without changing identity",
+                        )?;
+                        continue;
+                    };
                     typedefs
                         .entry(aid.clone())
                         .or_insert_with(|| TypedefStanza {
@@ -853,7 +1147,7 @@ pub fn write_document<'a>(
                             ..Default::default()
                         })
                         .equivalent_to
-                        .push((id_of(b.as_str()), qs));
+                        .push((bid, qs));
                     report.written_axioms += 1;
                 } else {
                     report.skip_or_err(
@@ -871,7 +1165,9 @@ pub fn write_document<'a>(
                     ObjectPropertyExpression::Property(b),
                 ) = (items[0], items[1])
                 {
-                    let Some(qs) = annotations_to_qualifiers(&ax.annotations, &match_spaces) else {
+                    let Some(qs) =
+                        annotations_to_qualifiers(&ax.annotations, &match_spaces, &idspace_map)
+                    else {
                         report.skip_or_err(
                             options,
                             renderer,
@@ -880,7 +1176,16 @@ pub fn write_document<'a>(
                         )?;
                         continue;
                     };
-                    let aid = id_of(a.as_str());
+                    let (Some(aid), Some(bid)) = (checked_id(a.as_str()), checked_id(b.as_str()))
+                    else {
+                        report.skip_or_err(
+                            options,
+                            renderer,
+                            ax,
+                            "OBO 1.4 cannot preserve IRI in Typedef disjoint_from without changing identity",
+                        )?;
+                        continue;
+                    };
                     typedefs
                         .entry(aid.clone())
                         .or_insert_with(|| TypedefStanza {
@@ -888,7 +1193,7 @@ pub fn write_document<'a>(
                             ..Default::default()
                         })
                         .disjoint_from
-                        .push((id_of(b.as_str()), qs));
+                        .push((bid, qs));
                     report.written_axioms += 1;
                 } else {
                     report.skip_or_err(
@@ -903,7 +1208,9 @@ pub fn write_document<'a>(
                 ObjectPropertyExpression::Property(a),
                 ObjectPropertyExpression::Property(b),
             ) => {
-                let Some(qs) = annotations_to_qualifiers(&ax.annotations, &match_spaces) else {
+                let Some(qs) =
+                    annotations_to_qualifiers(&ax.annotations, &match_spaces, &idspace_map)
+                else {
                     report.skip_or_err(
                         options,
                         renderer,
@@ -912,7 +1219,16 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                let aid = id_of(a.as_str());
+                let (Some(aid), Some(bid)) = (checked_id(a.as_str()), checked_id(b.as_str()))
+                else {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 cannot preserve IRI in inverse_of without changing identity",
+                    )?;
+                    continue;
+                };
                 typedefs
                     .entry(aid.clone())
                     .or_insert_with(|| TypedefStanza {
@@ -920,14 +1236,23 @@ pub fn write_document<'a>(
                         ..Default::default()
                     })
                     .inverse_of
-                    .push((id_of(b.as_str()), qs));
+                    .push((bid, qs));
                 report.written_axioms += 1;
             }
             K::ObjectPropertyDomain(
                 ObjectPropertyExpression::Property(p),
                 ClassExpression::Class(c),
             ) if ax.annotations.is_empty() => {
-                let pid = id_of(p.as_str());
+                let (Some(pid), Some(cid)) = (checked_id(p.as_str()), checked_id(c.as_str()))
+                else {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 cannot preserve IRI in domain without changing identity",
+                    )?;
+                    continue;
+                };
                 typedefs
                     .entry(pid.clone())
                     .or_insert_with(|| TypedefStanza {
@@ -935,14 +1260,23 @@ pub fn write_document<'a>(
                         ..Default::default()
                     })
                     .domains
-                    .push(id_of(c.as_str()));
+                    .push(cid);
                 report.written_axioms += 1;
             }
             K::ObjectPropertyRange(
                 ObjectPropertyExpression::Property(p),
                 ClassExpression::Class(c),
             ) if ax.annotations.is_empty() => {
-                let pid = id_of(p.as_str());
+                let (Some(pid), Some(cid)) = (checked_id(p.as_str()), checked_id(c.as_str()))
+                else {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 cannot preserve IRI in range without changing identity",
+                    )?;
+                    continue;
+                };
                 typedefs
                     .entry(pid.clone())
                     .or_insert_with(|| TypedefStanza {
@@ -950,7 +1284,7 @@ pub fn write_document<'a>(
                         ..Default::default()
                     })
                     .ranges
-                    .push(id_of(c.as_str()));
+                    .push(cid);
                 report.written_axioms += 1;
             }
             K::FunctionalObjectProperty(ObjectPropertyExpression::Property(p))
@@ -961,7 +1295,15 @@ pub fn write_document<'a>(
             | K::TransitiveObjectProperty(ObjectPropertyExpression::Property(p))
                 if ax.annotations.is_empty() =>
             {
-                let pid = id_of(p.as_str());
+                let Some(pid) = checked_id(p.as_str()) else {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 cannot preserve IRI in property characteristic without changing identity",
+                    )?;
+                    continue;
+                };
                 let td = typedefs
                     .entry(pid.clone())
                     .or_insert_with(|| TypedefStanza {
@@ -973,14 +1315,16 @@ pub fn write_document<'a>(
                     K::InverseFunctionalObjectProperty(_) => td.is_inverse_functional = true,
                     K::ReflexiveObjectProperty(_) => td.is_reflexive = true,
                     K::SymmetricObjectProperty(_) => td.is_symmetric = true,
-                    K::AsymmetricObjectProperty(_) => td.is_anti_symmetric = true,
+                    K::AsymmetricObjectProperty(_) => td.is_asymmetric = true,
                     K::TransitiveObjectProperty(_) => td.is_transitive = true,
                     _ => unreachable!(),
                 }
                 report.written_axioms += 1;
             }
             K::SubAnnotationPropertyOf(a, b) => {
-                let Some(qs) = annotations_to_qualifiers(&ax.annotations, &match_spaces) else {
+                let Some(qs) =
+                    annotations_to_qualifiers(&ax.annotations, &match_spaces, &idspace_map)
+                else {
                     report.skip_or_err(
                         options,
                         renderer,
@@ -989,7 +1333,16 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                let aid = id_of(a.as_str());
+                let (Some(aid), Some(bid)) = (checked_id(a.as_str()), checked_id(b.as_str()))
+                else {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 cannot preserve IRI in metadata is_a without changing identity",
+                    )?;
+                    continue;
+                };
                 let td = typedefs
                     .entry(aid.clone())
                     .or_insert_with(|| TypedefStanza {
@@ -998,11 +1351,20 @@ pub fn write_document<'a>(
                         ..Default::default()
                     });
                 td.is_metadata_tag = true;
-                td.is_a.push((id_of(b.as_str()), qs));
+                td.is_a.push((bid, qs));
                 report.written_axioms += 1;
             }
             K::AnnotationPropertyDomain(p, d) if ax.annotations.is_empty() => {
-                let pid = id_of(p.as_str());
+                let (Some(pid), Some(did)) = (checked_id(p.as_str()), checked_id(d.as_str()))
+                else {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 cannot preserve IRI in metadata domain without changing identity",
+                    )?;
+                    continue;
+                };
                 let td = typedefs
                     .entry(pid.clone())
                     .or_insert_with(|| TypedefStanza {
@@ -1011,11 +1373,20 @@ pub fn write_document<'a>(
                         ..Default::default()
                     });
                 td.is_metadata_tag = true;
-                td.domains.push(id_of(d.as_str()));
+                td.domains.push(did);
                 report.written_axioms += 1;
             }
             K::AnnotationPropertyRange(p, r) if ax.annotations.is_empty() => {
-                let pid = id_of(p.as_str());
+                let (Some(pid), Some(rid)) = (checked_id(p.as_str()), checked_id(r.as_str()))
+                else {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 cannot preserve IRI in metadata range without changing identity",
+                    )?;
+                    continue;
+                };
                 let td = typedefs
                     .entry(pid.clone())
                     .or_insert_with(|| TypedefStanza {
@@ -1024,11 +1395,13 @@ pub fn write_document<'a>(
                         ..Default::default()
                     });
                 td.is_metadata_tag = true;
-                td.ranges.push(id_of(r.as_str()));
+                td.ranges.push(rid);
                 report.written_axioms += 1;
             }
             K::ClassAssertion(ClassExpression::Class(c), Individual::Named(i)) => {
-                let Some(qs) = annotations_to_qualifiers(&ax.annotations, &match_spaces) else {
+                let Some(qs) =
+                    annotations_to_qualifiers(&ax.annotations, &match_spaces, &idspace_map)
+                else {
                     report.skip_or_err(
                         options,
                         renderer,
@@ -1037,15 +1410,32 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                let iid = id_of(i.as_str());
-                instances
+                let (Some(iid), Some(cid)) = (checked_id(i.as_str()), checked_id(c.as_str()))
+                else {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 cannot preserve IRI in instance_of without changing identity",
+                    )?;
+                    continue;
+                };
+                let inst = instances
                     .entry(iid.clone())
                     .or_insert_with(|| InstanceStanza {
                         id: iid,
                         ..Default::default()
-                    })
-                    .instance_of
-                    .push((id_of(c.as_str()), qs));
+                    });
+                if inst.instance_of.is_some() {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 [Instance] supports at most one instance_of tag",
+                    )?;
+                    continue;
+                }
+                inst.instance_of = Some((cid, qs));
                 report.written_axioms += 1;
             }
             K::ObjectPropertyAssertion(
@@ -1053,7 +1443,9 @@ pub fn write_document<'a>(
                 Individual::Named(a),
                 Individual::Named(b),
             ) => {
-                let Some(qs) = annotations_to_qualifiers(&ax.annotations, &match_spaces) else {
+                let Some(qs) =
+                    annotations_to_qualifiers(&ax.annotations, &match_spaces, &idspace_map)
+                else {
                     report.skip_or_err(
                         options,
                         renderer,
@@ -1062,7 +1454,19 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                let aid = id_of(a.as_str());
+                let (Some(aid), Some(pid), Some(bid)) = (
+                    checked_id(a.as_str()),
+                    checked_id(p.as_str()),
+                    checked_id(b.as_str()),
+                ) else {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 cannot preserve IRI in instance relationship without changing identity",
+                    )?;
+                    continue;
+                };
                 instances
                     .entry(aid.clone())
                     .or_insert_with(|| InstanceStanza {
@@ -1070,41 +1474,7 @@ pub fn write_document<'a>(
                         ..Default::default()
                     })
                     .relationships
-                    .push((id_of(p.as_str()), id_of(b.as_str()), qs));
-                report.written_axioms += 1;
-            }
-            K::DataPropertyAssertion(p, Individual::Named(a), l) => {
-                if l.language().is_some() {
-                    report.skip_or_err(
-                        options,
-                        renderer,
-                        ax,
-                        "OBO 1.4 property_value does not support language-tagged data literals",
-                    )?;
-                    continue;
-                }
-                let Some(qs) = annotations_to_qualifiers(&ax.annotations, &match_spaces) else {
-                    report.skip_or_err(
-                        options,
-                        renderer,
-                        ax,
-                        "OBO 1.4 cannot represent these annotations on instance property_value",
-                    )?;
-                    continue;
-                };
-                let aid = id_of(a.as_str());
-                instances
-                    .entry(aid.clone())
-                    .or_insert_with(|| InstanceStanza {
-                        id: aid,
-                        ..Default::default()
-                    })
-                    .property_values
-                    .push(PropertyValue {
-                        prop: id_of(p.as_str()),
-                        val: PvValue::Literal(l.value().to_string(), id_of(l.datatype())),
-                        qualifiers: qs,
-                    });
+                    .push((pid, bid, qs));
                 report.written_axioms += 1;
             }
             K::AnnotationAssertion(..) => pending_annotations.push(ax),
@@ -1136,9 +1506,17 @@ pub fn write_document<'a>(
             )?;
             continue;
         };
-        let sid = id_of(siri.as_str());
+        let Some(sid) = checked_id(siri.as_str()) else {
+            report.skip_or_err(
+                options,
+                renderer,
+                ax,
+                "OBO 1.4 cannot preserve annotation subject IRI without changing identity",
+            )?;
+            continue;
+        };
         if let Some(term) = terms.get_mut(&sid) {
-            if apply_term_annotation(term, p, val, &ax.annotations, &match_spaces) {
+            if apply_term_annotation(term, p, val, &ax.annotations, &match_spaces, &idspace_map) {
                 report.written_axioms += 1;
             } else {
                 report.skip_or_err(
@@ -1149,7 +1527,7 @@ pub fn write_document<'a>(
                 )?;
             }
         } else if let Some(td) = typedefs.get_mut(&sid) {
-            if apply_typedef_annotation(td, p, val, &ax.annotations, &match_spaces) {
+            if apply_typedef_annotation(td, p, val, &ax.annotations, &match_spaces, &idspace_map) {
                 report.written_axioms += 1;
             } else {
                 report.skip_or_err(
@@ -1160,7 +1538,8 @@ pub fn write_document<'a>(
                 )?;
             }
         } else if let Some(inst) = instances.get_mut(&sid) {
-            if apply_instance_annotation(inst, p, val, &ax.annotations, &match_spaces) {
+            if apply_instance_annotation(inst, p, val, &ax.annotations, &match_spaces, &idspace_map)
+            {
                 report.written_axioms += 1;
             } else {
                 report.skip_or_err(
@@ -1178,49 +1557,86 @@ pub fn write_document<'a>(
         }
     }
 
+    // Collect subsetdef and synonymtypedef declarations required by stanza references.
+    let mut declared_subsets: BTreeSet<String> = BTreeSet::new();
+    let mut declared_syn_types: BTreeSet<String> = BTreeSet::new();
+    for t in terms.values() {
+        declared_subsets.extend(t.subsets.iter().cloned());
+        for s in &t.synonyms {
+            if let Some(ty) = &s.synonym_type {
+                declared_syn_types.insert(ty.clone());
+            }
+        }
+    }
+    for td in typedefs.values() {
+        declared_subsets.extend(td.subsets.iter().cloned());
+        for s in &td.synonyms {
+            if let Some(ty) = &s.synonym_type {
+                declared_syn_types.insert(ty.clone());
+            }
+        }
+    }
+
     // --- Stream header ---
     writeln!(w, "format-version: 1.4")?;
     let mut header_data_version: Option<String> =
         header.version_iri.as_ref().map(|v| v.as_str().to_string());
-    let mut header_date = None;
-    let mut header_saved_by = None;
-    let mut header_auto_gen = None;
-    let mut header_default_ns = None;
+    let mut header_date: Option<String> = None;
+    let mut header_saved_by: Option<String> = None;
+    let mut header_auto_gen: Option<String> = None;
+    let mut header_default_ns: Option<String> = None;
     let mut header_remarks = Vec::new();
     let mut header_pvs = Vec::new();
 
     for ann in &header.annotations {
-        match (ann.property.as_str(), &ann.value) {
-            (OIO_HAS_OBO_FORMAT_VERSION, _) => {}
-            (vocab::OWL_VERSION_INFO, AnnotationValue::Literal(l))
-                if header_data_version.is_none() =>
-            {
-                header_data_version = Some(l.value().to_string());
-            }
-            (OIO_DATE, AnnotationValue::Literal(l)) => header_date = Some(l.value().to_string()),
-            (OIO_SAVED_BY, AnnotationValue::Literal(l)) => {
-                header_saved_by = Some(l.value().to_string())
-            }
-            (OIO_AUTO_GENERATED_BY, AnnotationValue::Literal(l)) => {
-                header_auto_gen = Some(l.value().to_string())
-            }
-            (OIO_DEFAULT_NAMESPACE, AnnotationValue::Literal(l)) => {
-                header_default_ns = Some(l.value().to_string())
-            }
-            (vocab::RDFS_COMMENT, AnnotationValue::Literal(l)) if l.language().is_none() => {
-                header_remarks.push(l.value().to_string());
-            }
-            _ => {
-                if let Some(pv) =
-                    annotation_to_pv(&ann.property, &ann.value, &ann.annotations, &match_spaces)
-                {
-                    header_pvs.push(pv);
-                } else if options.strict {
-                    return Err(WriteError::Unsupported(format!(
-                        "OBO 1.4 cannot represent header annotation {}",
-                        renderer.annotation(ann)
-                    )));
+        let handled = if ann.annotations.is_empty() {
+            match (ann.property.as_str(), plain_string(&ann.value)) {
+                (OIO_HAS_OBO_FORMAT_VERSION, Some("1.4")) => true,
+                (vocab::OWL_VERSION_INFO, Some(s)) if header_data_version.is_none() => {
+                    header_data_version = Some(s.to_string());
+                    true
                 }
+                (OIO_DATE, Some(s)) if header_date.is_none() => {
+                    header_date = Some(s.to_string());
+                    true
+                }
+                (OIO_SAVED_BY, Some(s)) if header_saved_by.is_none() => {
+                    header_saved_by = Some(s.to_string());
+                    true
+                }
+                (OIO_AUTO_GENERATED_BY, Some(s)) if header_auto_gen.is_none() => {
+                    header_auto_gen = Some(s.to_string());
+                    true
+                }
+                (OIO_DEFAULT_NAMESPACE, Some(s)) if header_default_ns.is_none() => {
+                    header_default_ns = Some(s.to_string());
+                    true
+                }
+                (vocab::RDFS_COMMENT, Some(s)) => {
+                    header_remarks.push(s.to_string());
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        if !handled {
+            if let Some(pv) = annotation_to_pv(
+                &ann.property,
+                &ann.value,
+                &ann.annotations,
+                &match_spaces,
+                &idspace_map,
+            ) {
+                header_pvs.push(pv);
+            } else {
+                report.skip_header_or_err(
+                    options,
+                    renderer,
+                    ann,
+                    "OBO 1.4 cannot represent header annotation",
+                )?;
             }
         }
     }
@@ -1236,21 +1652,31 @@ pub fn write_document<'a>(
     if let Some(a) = &header_auto_gen {
         writeln!(w, "auto-generated-by: {}", escape_obo_text(a)?)?;
     }
+    for sub in &declared_subsets {
+        writeln!(w, "subsetdef: {} \"\"", escape_obo_id(sub)?)?;
+    }
+    for st in &declared_syn_types {
+        writeln!(w, "synonymtypedef: {} \"\"", escape_obo_id(st)?)?;
+    }
     if let Some(ns) = &header_default_ns {
         writeln!(w, "default-namespace: {}", escape_obo_text(ns)?)?;
     }
     for (p, ns) in &idspaces {
-        writeln!(w, "idspace: {p} {ns}")?;
+        writeln!(w, "idspace: {} {}", escape_obo_id(p)?, escape_obo_id(ns)?)?;
     }
     for imp in &header.imports {
-        writeln!(w, "import: {}", imp.as_str())?;
+        writeln!(w, "import: {}", escape_obo_id(imp.as_str())?)?;
     }
     header_remarks.sort();
     for r in &header_remarks {
         writeln!(w, "remark: {}", escape_obo_text(r)?)?;
     }
     if let Some(iri) = &header.iri {
-        writeln!(w, "ontology: {}", ontology_short_id(iri.as_str()))?;
+        writeln!(
+            w,
+            "ontology: {}",
+            escape_obo_id(&ontology_short_id(iri.as_str()))?
+        )?;
     }
     header_pvs.sort();
     for pv in &header_pvs {
@@ -1260,49 +1686,44 @@ pub fn write_document<'a>(
     // --- Stream [Term] stanzas ---
     for mut t in terms.into_values() {
         writeln!(w, "\n[Term]")?;
-        writeln!(w, "id: {}", t.id)?;
-        t.names.sort();
-        for n in &t.names {
+        writeln!(w, "id: {}", escape_obo_id(&t.id)?)?;
+        if let Some(n) = &t.name {
             writeln!(w, "name: {}", escape_obo_text(n)?)?;
         }
-        t.namespaces.sort();
-        for ns in &t.namespaces {
+        if let Some(ns) = &t.namespace {
             writeln!(w, "namespace: {}", escape_obo_text(ns)?)?;
         }
         t.alt_ids.sort();
         for a in &t.alt_ids {
             writeln!(w, "alt_id: {}", escape_obo_text(a)?)?;
         }
-        t.defs.sort();
-        for d in &t.defs {
+        if let Some(d) = &t.def {
             writeln!(
                 w,
                 "def: {} [{}]",
                 escape_obo_quoted(&d.text)?,
-                d.xrefs.join(", ")
+                format_xref_list(&d.xrefs)?
             )?;
         }
-        t.comments.sort();
-        for c in &t.comments {
+        if let Some(c) = &t.comment {
             writeln!(w, "comment: {}", escape_obo_text(c)?)?;
         }
         t.subsets.sort();
         for s in &t.subsets {
-            writeln!(w, "subset: {}", escape_obo_text(s)?)?;
+            writeln!(w, "subset: {}", escape_obo_id(s)?)?;
         }
         t.synonyms.sort();
         for syn in &t.synonyms {
-            let ty = syn
-                .synonym_type
-                .as_ref()
-                .map(|s| format!(" {s}"))
-                .unwrap_or_default();
+            let ty = match &syn.synonym_type {
+                Some(s) => format!(" {}", escape_obo_id(s)?),
+                None => String::new(),
+            };
             writeln!(
                 w,
                 "synonym: {} {}{ty} [{}]",
                 escape_obo_quoted(&syn.text)?,
                 syn.scope,
-                syn.xrefs.join(", ")
+                format_xref_list(&syn.xrefs)?
             )?;
         }
         t.xrefs.sort();
@@ -1311,50 +1732,69 @@ pub fn write_document<'a>(
         }
         t.is_a.sort();
         for (sup, qs) in &t.is_a {
-            writeln!(w, "is_a: {sup}{}", format_qualifiers(qs)?)?;
+            writeln!(w, "is_a: {}{}", escape_obo_id(sup)?, format_qualifiers(qs)?)?;
         }
         for (rel, target) in &t.intersection_of {
             match rel {
-                Some(r) => writeln!(w, "intersection_of: {r} {target}")?,
-                None => writeln!(w, "intersection_of: {target}")?,
+                Some(r) => writeln!(
+                    w,
+                    "intersection_of: {} {}",
+                    escape_obo_id(r)?,
+                    escape_obo_id(target)?
+                )?,
+                None => writeln!(w, "intersection_of: {}", escape_obo_id(target)?)?,
             }
         }
         for u in &t.union_of {
-            writeln!(w, "union_of: {u}")?;
+            writeln!(w, "union_of: {}", escape_obo_id(u)?)?;
         }
         t.equivalent_to.sort();
         for (eq, qs) in &t.equivalent_to {
-            writeln!(w, "equivalent_to: {eq}{}", format_qualifiers(qs)?)?;
+            writeln!(
+                w,
+                "equivalent_to: {}{}",
+                escape_obo_id(eq)?,
+                format_qualifiers(qs)?
+            )?;
         }
         t.disjoint_from.sort();
         for (dj, qs) in &t.disjoint_from {
-            writeln!(w, "disjoint_from: {dj}{}", format_qualifiers(qs)?)?;
+            writeln!(
+                w,
+                "disjoint_from: {}{}",
+                escape_obo_id(dj)?,
+                format_qualifiers(qs)?
+            )?;
         }
         t.relationships.sort();
         for (rel, target, qs) in &t.relationships {
-            writeln!(w, "relationship: {rel} {target}{}", format_qualifiers(qs)?)?;
+            writeln!(
+                w,
+                "relationship: {} {}{}",
+                escape_obo_id(rel)?,
+                escape_obo_id(target)?,
+                format_qualifiers(qs)?
+            )?;
         }
         if t.is_obsolete {
             writeln!(w, "is_obsolete: true")?;
         }
         t.replaced_by.sort();
         for r in &t.replaced_by {
-            writeln!(w, "replaced_by: {r}")?;
+            writeln!(w, "replaced_by: {}", escape_obo_id(r)?)?;
         }
         t.consider.sort();
         for c in &t.consider {
-            writeln!(w, "consider: {c}")?;
+            writeln!(w, "consider: {}", escape_obo_id(c)?)?;
         }
         t.property_values.sort();
         for pv in &t.property_values {
             writeln!(w, "{}", format_pv(pv)?)?;
         }
-        t.created_by.sort();
-        for cb in &t.created_by {
+        if let Some(cb) = &t.created_by {
             writeln!(w, "created_by: {}", escape_obo_text(cb)?)?;
         }
-        t.creation_date.sort();
-        for cd in &t.creation_date {
+        if let Some(cd) = &t.creation_date {
             writeln!(w, "creation_date: {}", escape_obo_text(cd)?)?;
         }
     }
@@ -1362,49 +1802,44 @@ pub fn write_document<'a>(
     // --- Stream [Typedef] stanzas ---
     for mut td in typedefs.into_values() {
         writeln!(w, "\n[Typedef]")?;
-        writeln!(w, "id: {}", td.id)?;
-        td.names.sort();
-        for n in &td.names {
+        writeln!(w, "id: {}", escape_obo_id(&td.id)?)?;
+        if let Some(n) = &td.name {
             writeln!(w, "name: {}", escape_obo_text(n)?)?;
         }
-        td.namespaces.sort();
-        for ns in &td.namespaces {
+        if let Some(ns) = &td.namespace {
             writeln!(w, "namespace: {}", escape_obo_text(ns)?)?;
         }
         td.alt_ids.sort();
         for a in &td.alt_ids {
             writeln!(w, "alt_id: {}", escape_obo_text(a)?)?;
         }
-        td.defs.sort();
-        for d in &td.defs {
+        if let Some(d) = &td.def {
             writeln!(
                 w,
                 "def: {} [{}]",
                 escape_obo_quoted(&d.text)?,
-                d.xrefs.join(", ")
+                format_xref_list(&d.xrefs)?
             )?;
         }
-        td.comments.sort();
-        for c in &td.comments {
+        if let Some(c) = &td.comment {
             writeln!(w, "comment: {}", escape_obo_text(c)?)?;
         }
         td.subsets.sort();
         for s in &td.subsets {
-            writeln!(w, "subset: {}", escape_obo_text(s)?)?;
+            writeln!(w, "subset: {}", escape_obo_id(s)?)?;
         }
         td.synonyms.sort();
         for syn in &td.synonyms {
-            let ty = syn
-                .synonym_type
-                .as_ref()
-                .map(|s| format!(" {s}"))
-                .unwrap_or_default();
+            let ty = match &syn.synonym_type {
+                Some(s) => format!(" {}", escape_obo_id(s)?),
+                None => String::new(),
+            };
             writeln!(
                 w,
                 "synonym: {} {}{ty} [{}]",
                 escape_obo_quoted(&syn.text)?,
                 syn.scope,
-                syn.xrefs.join(", ")
+                format_xref_list(&syn.xrefs)?
             )?;
         }
         td.xrefs.sort();
@@ -1413,14 +1848,14 @@ pub fn write_document<'a>(
         }
         td.domains.sort();
         for d in &td.domains {
-            writeln!(w, "domain: {d}")?;
+            writeln!(w, "domain: {}", escape_obo_id(d)?)?;
         }
         td.ranges.sort();
         for r in &td.ranges {
-            writeln!(w, "range: {r}")?;
+            writeln!(w, "range: {}", escape_obo_id(r)?)?;
         }
-        if td.is_anti_symmetric {
-            writeln!(w, "is_anti_symmetric: true")?;
+        if td.is_asymmetric {
+            writeln!(w, "is_asymmetric: true")?;
         }
         if td.is_reflexive {
             writeln!(w, "is_reflexive: true")?;
@@ -1439,23 +1874,44 @@ pub fn write_document<'a>(
         }
         td.is_a.sort();
         for (sup, qs) in &td.is_a {
-            writeln!(w, "is_a: {sup}{}", format_qualifiers(qs)?)?;
+            writeln!(w, "is_a: {}{}", escape_obo_id(sup)?, format_qualifiers(qs)?)?;
         }
         td.equivalent_to.sort();
         for (eq, qs) in &td.equivalent_to {
-            writeln!(w, "equivalent_to: {eq}{}", format_qualifiers(qs)?)?;
+            writeln!(
+                w,
+                "equivalent_to: {}{}",
+                escape_obo_id(eq)?,
+                format_qualifiers(qs)?
+            )?;
         }
         td.disjoint_from.sort();
         for (dj, qs) in &td.disjoint_from {
-            writeln!(w, "disjoint_from: {dj}{}", format_qualifiers(qs)?)?;
+            writeln!(
+                w,
+                "disjoint_from: {}{}",
+                escape_obo_id(dj)?,
+                format_qualifiers(qs)?
+            )?;
         }
         td.inverse_of.sort();
         for (inv, qs) in &td.inverse_of {
-            writeln!(w, "inverse_of: {inv}{}", format_qualifiers(qs)?)?;
+            writeln!(
+                w,
+                "inverse_of: {}{}",
+                escape_obo_id(inv)?,
+                format_qualifiers(qs)?
+            )?;
         }
         td.holds_over_chain.sort();
         for (p1, p2, qs) in &td.holds_over_chain {
-            writeln!(w, "holds_over_chain: {p1} {p2}{}", format_qualifiers(qs)?)?;
+            writeln!(
+                w,
+                "holds_over_chain: {} {}{}",
+                escape_obo_id(p1)?,
+                escape_obo_id(p2)?,
+                format_qualifiers(qs)?
+            )?;
         }
         if td.is_metadata_tag {
             writeln!(w, "is_metadata_tag: true")?;
@@ -1465,22 +1921,20 @@ pub fn write_document<'a>(
         }
         td.replaced_by.sort();
         for r in &td.replaced_by {
-            writeln!(w, "replaced_by: {r}")?;
+            writeln!(w, "replaced_by: {}", escape_obo_id(r)?)?;
         }
         td.consider.sort();
         for c in &td.consider {
-            writeln!(w, "consider: {c}")?;
+            writeln!(w, "consider: {}", escape_obo_id(c)?)?;
         }
         td.property_values.sort();
         for pv in &td.property_values {
             writeln!(w, "{}", format_pv(pv)?)?;
         }
-        td.created_by.sort();
-        for cb in &td.created_by {
+        if let Some(cb) = &td.created_by {
             writeln!(w, "created_by: {}", escape_obo_text(cb)?)?;
         }
-        td.creation_date.sort();
-        for cd in &td.creation_date {
+        if let Some(cd) = &td.creation_date {
             writeln!(w, "creation_date: {}", escape_obo_text(cd)?)?;
         }
     }
@@ -1488,30 +1942,37 @@ pub fn write_document<'a>(
     // --- Stream [Instance] stanzas ---
     for mut inst in instances.into_values() {
         writeln!(w, "\n[Instance]")?;
-        writeln!(w, "id: {}", inst.id)?;
-        inst.names.sort();
-        for n in &inst.names {
+        writeln!(w, "id: {}", escape_obo_id(&inst.id)?)?;
+        if let Some(n) = &inst.name {
             writeln!(w, "name: {}", escape_obo_text(n)?)?;
         }
-        inst.namespaces.sort();
-        for ns in &inst.namespaces {
+        if let Some(ns) = &inst.namespace {
             writeln!(w, "namespace: {}", escape_obo_text(ns)?)?;
         }
-        inst.comments.sort();
-        for c in &inst.comments {
+        if let Some(c) = &inst.comment {
             writeln!(w, "comment: {}", escape_obo_text(c)?)?;
         }
         inst.xrefs.sort();
         for x in &inst.xrefs {
             writeln!(w, "xref: {}", escape_obo_text(x)?)?;
         }
-        inst.instance_of.sort();
-        for (cls, qs) in &inst.instance_of {
-            writeln!(w, "instance_of: {cls}{}", format_qualifiers(qs)?)?;
+        if let Some((cls, qs)) = &inst.instance_of {
+            writeln!(
+                w,
+                "instance_of: {}{}",
+                escape_obo_id(cls)?,
+                format_qualifiers(qs)?
+            )?;
         }
         inst.relationships.sort();
         for (rel, target, qs) in &inst.relationships {
-            writeln!(w, "relationship: {rel} {target}{}", format_qualifiers(qs)?)?;
+            writeln!(
+                w,
+                "relationship: {} {}{}",
+                escape_obo_id(rel)?,
+                escape_obo_id(target)?,
+                format_qualifiers(qs)?
+            )?;
         }
         inst.property_values.sort();
         for pv in &inst.property_values {
@@ -1575,56 +2036,67 @@ fn synonym_scope(prop: &str) -> Option<&'static str> {
     }
 }
 
+fn parse_synonym_annotations(
+    anns: &BTreeSet<Annotation>,
+    idspaces: &[(String, String)],
+    idspace_map: &FxHashMap<String, String>,
+) -> Option<(Vec<String>, Option<String>)> {
+    let mut xrefs = Vec::new();
+    let mut syn_type = None;
+    for a in anns {
+        if !a.annotations.is_empty() {
+            return None;
+        }
+        if a.property.as_str() == OIO_HAS_DBXREF
+            && let Some(x) = plain_string(&a.value)
+        {
+            xrefs.push(x.to_string());
+        } else if a.property.as_str() == OIO_HAS_SYNONYM_TYPE
+            && syn_type.is_none()
+            && let AnnotationValue::Iri(i) = &a.value
+        {
+            let id = iri_to_obo_id(i.as_str(), idspaces);
+            if !obo_id_roundtrips(i.as_str(), &id, idspace_map) {
+                return None;
+            }
+            syn_type = Some(id);
+        } else {
+            return None;
+        }
+    }
+    xrefs.sort();
+    Some((xrefs, syn_type))
+}
+
 fn apply_term_annotation(
     t: &mut TermStanza,
     p: &AnnotationProperty,
     v: &AnnotationValue,
     anns: &BTreeSet<Annotation>,
     idspaces: &[(String, String)],
+    idspace_map: &FxHashMap<String, String>,
 ) -> bool {
     if p.as_str() == OIO_ID && anns.is_empty() && plain_string(v) == Some(t.id.as_str()) {
         return true;
     }
     if let Some(scope) = synonym_scope(p.as_str())
         && let Some(text) = plain_string(v)
+        && let Some((xrefs, syn_type)) = parse_synonym_annotations(anns, idspaces, idspace_map)
     {
-        let mut xrefs = Vec::new();
-        let mut syn_type = None;
-        let mut ok = true;
-        for a in anns {
-            if !a.annotations.is_empty() {
-                ok = false;
-                break;
-            }
-            if a.property.as_str() == OIO_HAS_DBXREF
-                && let Some(x) = plain_string(&a.value)
-            {
-                xrefs.push(x.to_string());
-            } else if a.property.as_str() == OIO_HAS_SYNONYM_TYPE
-                && let AnnotationValue::Iri(i) = &a.value
-            {
-                syn_type = Some(iri_to_obo_id(i.as_str(), idspaces));
-            } else {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
-            xrefs.sort();
-            t.synonyms.push(SynonymEntry {
-                text: text.to_string(),
-                scope,
-                synonym_type: syn_type,
-                xrefs,
-            });
-            return true;
-        }
+        t.synonyms.push(SynonymEntry {
+            text: text.to_string(),
+            scope,
+            synonym_type: syn_type,
+            xrefs,
+        });
+        return true;
     }
     if p.as_str() == IAO_DEFINITION
+        && t.def.is_none()
         && let Some(text) = plain_string(v)
         && let Some(xrefs) = extract_xrefs(anns)
     {
-        t.defs.push(DefEntry {
+        t.def = Some(DefEntry {
             text: text.to_string(),
             xrefs,
         });
@@ -1632,25 +2104,28 @@ fn apply_term_annotation(
     }
     if anns.is_empty() {
         match (p.as_str(), v) {
-            (vocab::RDFS_LABEL, _) if plain_string(v).is_some() => {
-                t.names.push(plain_string(v).unwrap().to_string());
+            (vocab::RDFS_LABEL, _) if t.name.is_none() && plain_string(v).is_some() => {
+                t.name = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
-            (OIO_HAS_OBO_NAMESPACE, _) if plain_string(v).is_some() => {
-                t.namespaces.push(plain_string(v).unwrap().to_string());
+            (OIO_HAS_OBO_NAMESPACE, _) if t.namespace.is_none() && plain_string(v).is_some() => {
+                t.namespace = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
             (OIO_HAS_ALT_ID, _) if plain_string(v).is_some() => {
                 t.alt_ids.push(plain_string(v).unwrap().to_string());
                 return true;
             }
-            (vocab::RDFS_COMMENT, _) if plain_string(v).is_some() => {
-                t.comments.push(plain_string(v).unwrap().to_string());
+            (vocab::RDFS_COMMENT, _) if t.comment.is_none() && plain_string(v).is_some() => {
+                t.comment = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
             (OIO_IN_SUBSET, AnnotationValue::Iri(i)) => {
-                t.subsets.push(iri_to_obo_id(i.as_str(), idspaces));
-                return true;
+                let id = iri_to_obo_id(i.as_str(), idspaces);
+                if obo_id_roundtrips(i.as_str(), &id, idspace_map) {
+                    t.subsets.push(id);
+                    return true;
+                }
             }
             (OIO_HAS_DBXREF, _) if plain_string(v).is_some() => {
                 t.xrefs.push(plain_string(v).unwrap().to_string());
@@ -1663,25 +2138,31 @@ fn apply_term_annotation(
                 return true;
             }
             (IAO_REPLACED_BY, AnnotationValue::Iri(i)) => {
-                t.replaced_by.push(iri_to_obo_id(i.as_str(), idspaces));
-                return true;
+                let id = iri_to_obo_id(i.as_str(), idspaces);
+                if obo_id_roundtrips(i.as_str(), &id, idspace_map) {
+                    t.replaced_by.push(id);
+                    return true;
+                }
             }
             (OIO_CONSIDER, AnnotationValue::Iri(i)) => {
-                t.consider.push(iri_to_obo_id(i.as_str(), idspaces));
+                let id = iri_to_obo_id(i.as_str(), idspaces);
+                if obo_id_roundtrips(i.as_str(), &id, idspace_map) {
+                    t.consider.push(id);
+                    return true;
+                }
+            }
+            (OIO_CREATED_BY, _) if t.created_by.is_none() && plain_string(v).is_some() => {
+                t.created_by = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
-            (OIO_CREATED_BY, _) if plain_string(v).is_some() => {
-                t.created_by.push(plain_string(v).unwrap().to_string());
-                return true;
-            }
-            (OIO_CREATION_DATE, _) if plain_string(v).is_some() => {
-                t.creation_date.push(plain_string(v).unwrap().to_string());
+            (OIO_CREATION_DATE, _) if t.creation_date.is_none() && plain_string(v).is_some() => {
+                t.creation_date = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
             _ => {}
         }
     }
-    if let Some(pv) = annotation_to_pv(p, v, anns, idspaces) {
+    if let Some(pv) = annotation_to_pv(p, v, anns, idspaces, idspace_map) {
         t.property_values.push(pv);
         return true;
     }
@@ -1694,15 +2175,29 @@ fn apply_typedef_annotation(
     v: &AnnotationValue,
     anns: &BTreeSet<Annotation>,
     idspaces: &[(String, String)],
+    idspace_map: &FxHashMap<String, String>,
 ) -> bool {
     if p.as_str() == OIO_ID && anns.is_empty() && plain_string(v) == Some(td.id.as_str()) {
         return true;
     }
+    if let Some(scope) = synonym_scope(p.as_str())
+        && let Some(text) = plain_string(v)
+        && let Some((xrefs, syn_type)) = parse_synonym_annotations(anns, idspaces, idspace_map)
+    {
+        td.synonyms.push(SynonymEntry {
+            text: text.to_string(),
+            scope,
+            synonym_type: syn_type,
+            xrefs,
+        });
+        return true;
+    }
     if p.as_str() == IAO_DEFINITION
+        && td.def.is_none()
         && let Some(text) = plain_string(v)
         && let Some(xrefs) = extract_xrefs(anns)
     {
-        td.defs.push(DefEntry {
+        td.def = Some(DefEntry {
             text: text.to_string(),
             xrefs,
         });
@@ -1710,17 +2205,28 @@ fn apply_typedef_annotation(
     }
     if anns.is_empty() {
         match (p.as_str(), v) {
-            (vocab::RDFS_LABEL, _) if plain_string(v).is_some() => {
-                td.names.push(plain_string(v).unwrap().to_string());
+            (vocab::RDFS_LABEL, _) if td.name.is_none() && plain_string(v).is_some() => {
+                td.name = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
-            (OIO_HAS_OBO_NAMESPACE, _) if plain_string(v).is_some() => {
-                td.namespaces.push(plain_string(v).unwrap().to_string());
+            (OIO_HAS_OBO_NAMESPACE, _) if td.namespace.is_none() && plain_string(v).is_some() => {
+                td.namespace = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
-            (vocab::RDFS_COMMENT, _) if plain_string(v).is_some() => {
-                td.comments.push(plain_string(v).unwrap().to_string());
+            (OIO_HAS_ALT_ID, _) if plain_string(v).is_some() => {
+                td.alt_ids.push(plain_string(v).unwrap().to_string());
                 return true;
+            }
+            (vocab::RDFS_COMMENT, _) if td.comment.is_none() && plain_string(v).is_some() => {
+                td.comment = Some(plain_string(v).unwrap().to_string());
+                return true;
+            }
+            (OIO_IN_SUBSET, AnnotationValue::Iri(i)) => {
+                let id = iri_to_obo_id(i.as_str(), idspaces);
+                if obo_id_roundtrips(i.as_str(), &id, idspace_map) {
+                    td.subsets.push(id);
+                    return true;
+                }
             }
             (OIO_HAS_DBXREF, _) if plain_string(v).is_some() => {
                 td.xrefs.push(plain_string(v).unwrap().to_string());
@@ -1733,17 +2239,31 @@ fn apply_typedef_annotation(
                 return true;
             }
             (IAO_REPLACED_BY, AnnotationValue::Iri(i)) => {
-                td.replaced_by.push(iri_to_obo_id(i.as_str(), idspaces));
-                return true;
+                let id = iri_to_obo_id(i.as_str(), idspaces);
+                if obo_id_roundtrips(i.as_str(), &id, idspace_map) {
+                    td.replaced_by.push(id);
+                    return true;
+                }
             }
             (OIO_CONSIDER, AnnotationValue::Iri(i)) => {
-                td.consider.push(iri_to_obo_id(i.as_str(), idspaces));
+                let id = iri_to_obo_id(i.as_str(), idspaces);
+                if obo_id_roundtrips(i.as_str(), &id, idspace_map) {
+                    td.consider.push(id);
+                    return true;
+                }
+            }
+            (OIO_CREATED_BY, _) if td.created_by.is_none() && plain_string(v).is_some() => {
+                td.created_by = Some(plain_string(v).unwrap().to_string());
+                return true;
+            }
+            (OIO_CREATION_DATE, _) if td.creation_date.is_none() && plain_string(v).is_some() => {
+                td.creation_date = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
             _ => {}
         }
     }
-    if let Some(pv) = annotation_to_pv(p, v, anns, idspaces) {
+    if let Some(pv) = annotation_to_pv(p, v, anns, idspaces, idspace_map) {
         td.property_values.push(pv);
         return true;
     }
@@ -1756,22 +2276,23 @@ fn apply_instance_annotation(
     v: &AnnotationValue,
     anns: &BTreeSet<Annotation>,
     idspaces: &[(String, String)],
+    idspace_map: &FxHashMap<String, String>,
 ) -> bool {
     if p.as_str() == OIO_ID && anns.is_empty() && plain_string(v) == Some(inst.id.as_str()) {
         return true;
     }
     if anns.is_empty() {
         match (p.as_str(), v) {
-            (vocab::RDFS_LABEL, _) if plain_string(v).is_some() => {
-                inst.names.push(plain_string(v).unwrap().to_string());
+            (vocab::RDFS_LABEL, _) if inst.name.is_none() && plain_string(v).is_some() => {
+                inst.name = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
-            (OIO_HAS_OBO_NAMESPACE, _) if plain_string(v).is_some() => {
-                inst.namespaces.push(plain_string(v).unwrap().to_string());
+            (OIO_HAS_OBO_NAMESPACE, _) if inst.namespace.is_none() && plain_string(v).is_some() => {
+                inst.namespace = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
-            (vocab::RDFS_COMMENT, _) if plain_string(v).is_some() => {
-                inst.comments.push(plain_string(v).unwrap().to_string());
+            (vocab::RDFS_COMMENT, _) if inst.comment.is_none() && plain_string(v).is_some() => {
+                inst.comment = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
             (OIO_HAS_DBXREF, _) if plain_string(v).is_some() => {
@@ -1787,7 +2308,7 @@ fn apply_instance_annotation(
             _ => {}
         }
     }
-    if let Some(pv) = annotation_to_pv(p, v, anns, idspaces) {
+    if let Some(pv) = annotation_to_pv(p, v, anns, idspaces, idspace_map) {
         inst.property_values.push(pv);
         return true;
     }
@@ -1834,34 +2355,39 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
         } else {
             // Header tag
             match tag.as_str() {
-                "format-version" => {}
+                "format-version" | "subsetdef" | "synonymtypedef" => {}
                 "idspace" => {
-                    let mut parts = val.split_whitespace();
-                    let Some(p) = parts.next() else {
+                    let parts = split_obo_tokens(&val);
+                    let Some(p) = parts.first() else {
                         return Err(perr(line_no, "idspace missing prefix"));
                     };
-                    let Some(ns) = parts.next() else {
+                    let Some(ns) = parts.get(1) else {
                         return Err(perr(line_no, "idspace missing namespace IRI"));
                     };
-                    idspaces.insert(p.to_string(), ns.to_string());
-                    declared_prefixes.push((p.to_string(), ns.to_string()));
+                    idspaces.insert(p.clone(), ns.clone());
+                    declared_prefixes.push((p.clone(), ns.clone()));
                 }
                 "ontology" => {
-                    let iri = expand_ontology_id(&val).map_err(|e| perr(line_no, e))?;
+                    let unesc = unescape_obo(&val);
+                    let iri = expand_ontology_id(&unesc).map_err(|e| perr(line_no, e))?;
                     header.iri = Some(iri);
                 }
                 "data-version" => {
-                    if let Ok(iri) = parse_iri(&val) {
+                    let unesc = unescape_obo(&val);
+                    if is_full_iri_str(&unesc, &idspaces)
+                        && let Ok(iri) = parse_iri(&unesc)
+                    {
                         header.version_iri = Some(iri);
                     } else {
                         header.annotations.insert(Annotation::new(
                             AnnotationProperty::new(vocab::OWL_VERSION_INFO),
-                            AnnotationValue::Literal(Literal::simple(unescape_obo(&val))),
+                            AnnotationValue::Literal(Literal::simple(unesc)),
                         ));
                     }
                 }
                 "import" => {
-                    let iri = parse_iri(&val).map_err(|e| perr(line_no, e.0))?;
+                    let unesc = unescape_obo(&val);
+                    let iri = parse_iri(&unesc).map_err(|e| perr(line_no, e.0))?;
                     header.imports.insert(iri);
                 }
                 "date" => {
@@ -1915,7 +2441,8 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
         let Some((_, _, raw_id)) = tags.iter().find(|(_, t, _)| t == "id") else {
             return Err(perr(sline, format!("[{kind}] stanza missing id:")));
         };
-        let iri = obo_id_to_iri(raw_id, &idspaces).map_err(|e| perr(sline, e))?;
+        let iri =
+            obo_id_to_iri(&unescape_obo(raw_id.trim()), &idspaces).map_err(|e| perr(sline, e))?;
         match kind.as_str() {
             "Term" => {
                 let c = Class(iri.clone());
@@ -1948,8 +2475,8 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                             AnnotationValue::Literal(Literal::simple(unescape_obo(&body))),
                         ))),
                         "subset" => {
-                            let sub_iri =
-                                obo_id_to_iri(body.trim(), &idspaces).map_err(|e| perr(lno, e))?;
+                            let sub_iri = obo_id_to_iri(&unescape_obo(body.trim()), &idspaces)
+                                .map_err(|e| perr(lno, e))?;
                             axioms.push(Axiom::new(AxiomKind::AnnotationAssertion(
                                 AnnotationProperty::new(OIO_IN_SUBSET),
                                 AnnotationSubject::Iri(iri.clone()),
@@ -2018,8 +2545,8 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                             });
                         }
                         "is_a" => {
-                            let sup =
-                                obo_id_to_iri(body.trim(), &idspaces).map_err(|e| perr(lno, e))?;
+                            let sup = obo_id_to_iri(&unescape_obo(body.trim()), &idspaces)
+                                .map_err(|e| perr(lno, e))?;
                             axioms.push(Axiom {
                                 kind: AxiomKind::SubClassOf(
                                     ClassExpression::Class(c.clone()),
@@ -2029,7 +2556,7 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                             });
                         }
                         "intersection_of" => {
-                            let parts: Vec<&str> = body.split_whitespace().collect();
+                            let parts = split_obo_tokens(&body);
                             match parts.as_slice() {
                                 [cls] => {
                                     let ci =
@@ -2055,13 +2582,13 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                             }
                         }
                         "union_of" => {
-                            let ci =
-                                obo_id_to_iri(body.trim(), &idspaces).map_err(|e| perr(lno, e))?;
+                            let ci = obo_id_to_iri(&unescape_obo(body.trim()), &idspaces)
+                                .map_err(|e| perr(lno, e))?;
                             unions.insert(ClassExpression::Class(Class(ci)));
                         }
                         "equivalent_to" => {
-                            let other =
-                                obo_id_to_iri(body.trim(), &idspaces).map_err(|e| perr(lno, e))?;
+                            let other = obo_id_to_iri(&unescape_obo(body.trim()), &idspaces)
+                                .map_err(|e| perr(lno, e))?;
                             let mut set = BTreeSet::new();
                             set.insert(ClassExpression::Class(c.clone()));
                             set.insert(ClassExpression::Class(Class(other)));
@@ -2071,8 +2598,8 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                             });
                         }
                         "disjoint_from" => {
-                            let other =
-                                obo_id_to_iri(body.trim(), &idspaces).map_err(|e| perr(lno, e))?;
+                            let other = obo_id_to_iri(&unescape_obo(body.trim()), &idspaces)
+                                .map_err(|e| perr(lno, e))?;
                             axioms.push(Axiom {
                                 kind: AxiomKind::DisjointClasses(
                                     vec![
@@ -2085,8 +2612,8 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                             });
                         }
                         "relationship" => {
-                            let mut parts = body.split_whitespace();
-                            let (Some(rel), Some(target)) = (parts.next(), parts.next()) else {
+                            let parts = split_obo_tokens(&body);
+                            let [rel, target] = parts.as_slice() else {
                                 return Err(perr(lno, format!("invalid relationship '{body}'")));
                             };
                             let ri = obo_id_to_iri(rel, &idspaces).map_err(|e| perr(lno, e))?;
@@ -2110,8 +2637,8 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                             )));
                         }
                         "replaced_by" => {
-                            let ti =
-                                obo_id_to_iri(body.trim(), &idspaces).map_err(|e| perr(lno, e))?;
+                            let ti = obo_id_to_iri(&unescape_obo(body.trim()), &idspaces)
+                                .map_err(|e| perr(lno, e))?;
                             axioms.push(Axiom::new(AxiomKind::AnnotationAssertion(
                                 AnnotationProperty::new(IAO_REPLACED_BY),
                                 AnnotationSubject::Iri(iri.clone()),
@@ -2119,8 +2646,8 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                             )));
                         }
                         "consider" => {
-                            let ti =
-                                obo_id_to_iri(body.trim(), &idspaces).map_err(|e| perr(lno, e))?;
+                            let ti = obo_id_to_iri(&unescape_obo(body.trim()), &idspaces)
+                                .map_err(|e| perr(lno, e))?;
                             axioms.push(Axiom::new(AxiomKind::AnnotationAssertion(
                                 AnnotationProperty::new(OIO_CONSIDER),
                                 AnnotationSubject::Iri(iri.clone()),
@@ -2193,11 +2720,25 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                             AnnotationSubject::Iri(iri.clone()),
                             AnnotationValue::Literal(Literal::simple(unescape_obo(&body))),
                         ))),
+                        "alt_id" => axioms.push(Axiom::new(AxiomKind::AnnotationAssertion(
+                            AnnotationProperty::new(OIO_HAS_ALT_ID),
+                            AnnotationSubject::Iri(iri.clone()),
+                            AnnotationValue::Literal(Literal::simple(unescape_obo(&body))),
+                        ))),
                         "comment" => axioms.push(Axiom::new(AxiomKind::AnnotationAssertion(
                             AnnotationProperty::new(vocab::RDFS_COMMENT),
                             AnnotationSubject::Iri(iri.clone()),
                             AnnotationValue::Literal(Literal::simple(unescape_obo(&body))),
                         ))),
+                        "subset" => {
+                            let sub_iri = obo_id_to_iri(&unescape_obo(body.trim()), &idspaces)
+                                .map_err(|e| perr(lno, e))?;
+                            axioms.push(Axiom::new(AxiomKind::AnnotationAssertion(
+                                AnnotationProperty::new(OIO_IN_SUBSET),
+                                AnnotationSubject::Iri(iri.clone()),
+                                AnnotationValue::Iri(sub_iri),
+                            )));
+                        }
                         "def" => {
                             let (txt, xrefs) =
                                 parse_quoted_and_xrefs(&body).map_err(|e| perr(lno, e))?;
@@ -2217,14 +2758,51 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                                 annotations: a,
                             });
                         }
+                        "synonym" => {
+                            let (txt, scope, syn_ty, xrefs) =
+                                parse_synonym(&body, &idspaces).map_err(|e| perr(lno, e))?;
+                            let prop = match scope.as_str() {
+                                "EXACT" => OIO_HAS_EXACT_SYNONYM,
+                                "BROAD" => OIO_HAS_BROAD_SYNONYM,
+                                "NARROW" => OIO_HAS_NARROW_SYNONYM,
+                                "RELATED" => OIO_HAS_RELATED_SYNONYM,
+                                other => {
+                                    return Err(perr(
+                                        lno,
+                                        format!("unknown synonym scope '{other}'"),
+                                    ));
+                                }
+                            };
+                            let mut a = BTreeSet::new();
+                            for x in xrefs {
+                                a.insert(Annotation::new(
+                                    AnnotationProperty::new(OIO_HAS_DBXREF),
+                                    AnnotationValue::Literal(Literal::simple(x)),
+                                ));
+                            }
+                            if let Some(ty) = syn_ty {
+                                a.insert(Annotation::new(
+                                    AnnotationProperty::new(OIO_HAS_SYNONYM_TYPE),
+                                    AnnotationValue::Iri(ty),
+                                ));
+                            }
+                            axioms.push(Axiom {
+                                kind: AxiomKind::AnnotationAssertion(
+                                    AnnotationProperty::new(prop),
+                                    AnnotationSubject::Iri(iri.clone()),
+                                    AnnotationValue::Literal(Literal::simple(txt)),
+                                ),
+                                annotations: a,
+                            });
+                        }
                         "xref" => axioms.push(Axiom::new(AxiomKind::AnnotationAssertion(
                             AnnotationProperty::new(OIO_HAS_DBXREF),
                             AnnotationSubject::Iri(iri.clone()),
                             AnnotationValue::Literal(Literal::simple(unescape_obo(&body))),
                         ))),
                         "domain" => {
-                            let d =
-                                obo_id_to_iri(body.trim(), &idspaces).map_err(|e| perr(lno, e))?;
+                            let d = obo_id_to_iri(&unescape_obo(body.trim()), &idspaces)
+                                .map_err(|e| perr(lno, e))?;
                             if is_meta {
                                 axioms.push(Axiom::new(AxiomKind::AnnotationPropertyDomain(
                                     AnnotationProperty(iri.clone()),
@@ -2238,8 +2816,8 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                             }
                         }
                         "range" => {
-                            let r =
-                                obo_id_to_iri(body.trim(), &idspaces).map_err(|e| perr(lno, e))?;
+                            let r = obo_id_to_iri(&unescape_obo(body.trim()), &idspaces)
+                                .map_err(|e| perr(lno, e))?;
                             if is_meta {
                                 axioms.push(Axiom::new(AxiomKind::AnnotationPropertyRange(
                                     AnnotationProperty(iri.clone()),
@@ -2252,9 +2830,19 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                                 )));
                             }
                         }
-                        "is_anti_symmetric" if body.trim() == "true" => {
+                        "is_asymmetric" if body.trim() == "true" => {
                             axioms.push(Axiom::new(AxiomKind::AsymmetricObjectProperty(
                                 ObjectProperty(iri.clone()).into(),
+                            )));
+                        }
+                        "is_anti_symmetric" if body.trim() == "true" => {
+                            axioms.push(Axiom::new(AxiomKind::AnnotationAssertion(
+                                AnnotationProperty::new(format!("{OBO_IN_OWL}is_anti_symmetric")),
+                                AnnotationSubject::Iri(iri.clone()),
+                                AnnotationValue::Literal(Literal::typed(
+                                    "true",
+                                    vocab::XSD_BOOLEAN,
+                                )),
                             )));
                         }
                         "is_reflexive" if body.trim() == "true" => {
@@ -2283,8 +2871,8 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                             )));
                         }
                         "is_a" => {
-                            let sup =
-                                obo_id_to_iri(body.trim(), &idspaces).map_err(|e| perr(lno, e))?;
+                            let sup = obo_id_to_iri(&unescape_obo(body.trim()), &idspaces)
+                                .map_err(|e| perr(lno, e))?;
                             let kind = if is_meta {
                                 AxiomKind::SubAnnotationPropertyOf(
                                     AnnotationProperty(iri.clone()),
@@ -2304,8 +2892,8 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                             });
                         }
                         "equivalent_to" => {
-                            let other =
-                                obo_id_to_iri(body.trim(), &idspaces).map_err(|e| perr(lno, e))?;
+                            let other = obo_id_to_iri(&unescape_obo(body.trim()), &idspaces)
+                                .map_err(|e| perr(lno, e))?;
                             let mut set = BTreeSet::new();
                             set.insert(ObjectPropertyExpression::Property(ObjectProperty(
                                 iri.clone(),
@@ -2317,8 +2905,8 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                             });
                         }
                         "disjoint_from" => {
-                            let other =
-                                obo_id_to_iri(body.trim(), &idspaces).map_err(|e| perr(lno, e))?;
+                            let other = obo_id_to_iri(&unescape_obo(body.trim()), &idspaces)
+                                .map_err(|e| perr(lno, e))?;
                             axioms.push(Axiom {
                                 kind: AxiomKind::DisjointObjectProperties(
                                     vec![
@@ -2333,8 +2921,8 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                             });
                         }
                         "inverse_of" => {
-                            let other =
-                                obo_id_to_iri(body.trim(), &idspaces).map_err(|e| perr(lno, e))?;
+                            let other = obo_id_to_iri(&unescape_obo(body.trim()), &idspaces)
+                                .map_err(|e| perr(lno, e))?;
                             axioms.push(Axiom {
                                 kind: AxiomKind::InverseObjectProperties(
                                     ObjectProperty(iri.clone()).into(),
@@ -2344,7 +2932,7 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                             });
                         }
                         "holds_over_chain" => {
-                            let parts: Vec<&str> = body.split_whitespace().collect();
+                            let parts = split_obo_tokens(&body);
                             if parts.len() != 2 {
                                 return Err(perr(
                                     lno,
@@ -2352,9 +2940,9 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                                 ));
                             }
                             let p1 =
-                                obo_id_to_iri(parts[0], &idspaces).map_err(|e| perr(lno, e))?;
+                                obo_id_to_iri(&parts[0], &idspaces).map_err(|e| perr(lno, e))?;
                             let p2 =
-                                obo_id_to_iri(parts[1], &idspaces).map_err(|e| perr(lno, e))?;
+                                obo_id_to_iri(&parts[1], &idspaces).map_err(|e| perr(lno, e))?;
                             axioms.push(Axiom {
                                 kind: AxiomKind::SubObjectPropertyOf(
                                     SubObjectPropertyExpression::Chain(vec![
@@ -2376,6 +2964,34 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                                 )),
                             )));
                         }
+                        "replaced_by" => {
+                            let ti = obo_id_to_iri(&unescape_obo(body.trim()), &idspaces)
+                                .map_err(|e| perr(lno, e))?;
+                            axioms.push(Axiom::new(AxiomKind::AnnotationAssertion(
+                                AnnotationProperty::new(IAO_REPLACED_BY),
+                                AnnotationSubject::Iri(iri.clone()),
+                                AnnotationValue::Iri(ti),
+                            )));
+                        }
+                        "consider" => {
+                            let ti = obo_id_to_iri(&unescape_obo(body.trim()), &idspaces)
+                                .map_err(|e| perr(lno, e))?;
+                            axioms.push(Axiom::new(AxiomKind::AnnotationAssertion(
+                                AnnotationProperty::new(OIO_CONSIDER),
+                                AnnotationSubject::Iri(iri.clone()),
+                                AnnotationValue::Iri(ti),
+                            )));
+                        }
+                        "created_by" => axioms.push(Axiom::new(AxiomKind::AnnotationAssertion(
+                            AnnotationProperty::new(OIO_CREATED_BY),
+                            AnnotationSubject::Iri(iri.clone()),
+                            AnnotationValue::Literal(Literal::simple(unescape_obo(&body))),
+                        ))),
+                        "creation_date" => axioms.push(Axiom::new(AxiomKind::AnnotationAssertion(
+                            AnnotationProperty::new(OIO_CREATION_DATE),
+                            AnnotationSubject::Iri(iri.clone()),
+                            AnnotationValue::Literal(Literal::simple(unescape_obo(&body))),
+                        ))),
                         "property_value" => {
                             let (prop, aval, pv_anns) =
                                 parse_property_value(&val, &idspaces).map_err(|e| perr(lno, e))?;
@@ -2421,8 +3037,8 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                             AnnotationValue::Literal(Literal::simple(unescape_obo(&body))),
                         ))),
                         "instance_of" => {
-                            let ci =
-                                obo_id_to_iri(body.trim(), &idspaces).map_err(|e| perr(lno, e))?;
+                            let ci = obo_id_to_iri(&unescape_obo(body.trim()), &idspaces)
+                                .map_err(|e| perr(lno, e))?;
                             axioms.push(Axiom {
                                 kind: AxiomKind::ClassAssertion(
                                     ClassExpression::Class(Class(ci)),
@@ -2432,8 +3048,8 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                             });
                         }
                         "relationship" => {
-                            let mut parts = body.split_whitespace();
-                            let (Some(rel), Some(target)) = (parts.next(), parts.next()) else {
+                            let parts = split_obo_tokens(&body);
+                            let [rel, target] = parts.as_slice() else {
                                 return Err(perr(lno, format!("invalid relationship '{body}'")));
                             };
                             let ri = obo_id_to_iri(rel, &idspaces).map_err(|e| perr(lno, e))?;
@@ -2546,6 +3162,77 @@ fn split_qualifiers(val: &str) -> Result<(String, Option<String>), String> {
     Ok((before, Some(inside)))
 }
 
+/// Split an OBO value on unescaped whitespace, unescaping each resulting token.
+fn split_obo_tokens(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => cur.push('\n'),
+                Some('t') => cur.push('\t'),
+                Some('W') => cur.push(' '),
+                Some(other) => cur.push(other),
+                None => cur.push('\\'),
+            }
+        } else if c.is_whitespace() {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Split off the first whitespace-delimited OBO token (respecting backslash escapes) and
+/// return `(unescaped_first_token, remaining_raw_slice)`.
+fn split_first_obo_token(s: &str) -> Option<(String, &str)> {
+    let trimmed = s.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut first = String::new();
+    let mut it = trimmed.char_indices();
+    while let Some((i, c)) = it.next() {
+        if c == '\\' {
+            match it.next() {
+                Some((_, 'n')) => first.push('\n'),
+                Some((_, 't')) => first.push('\t'),
+                Some((_, 'W')) => first.push(' '),
+                Some((_, other)) => first.push(other),
+                None => first.push('\\'),
+            }
+        } else if c.is_whitespace() {
+            return Some((first, trimmed[i..].trim_start()));
+        } else {
+            first.push(c);
+        }
+    }
+    Some((first, ""))
+}
+
+fn find_unescaped_char(s: &str, target: char) -> Option<usize> {
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+        } else if c == target {
+            return Some(i);
+        }
+    }
+    None
+}
+
 fn parse_qualifiers(
     raw: &Option<String>,
     idspaces: &FxHashMap<String, String>,
@@ -2556,16 +3243,15 @@ fn parse_qualifiers(
     };
     let mut rest = s.trim();
     while !rest.is_empty() {
-        let eq = rest
-            .find('=')
+        let eq = find_unescaped_char(rest, '=')
             .ok_or_else(|| format!("expected '=' in OBO qualifier '{rest}'"))?;
-        let key = rest[..eq].trim();
+        let key = unescape_obo(rest[..eq].trim());
         let after_eq = rest[eq + 1..].trim_start();
         let (val, consumed) = parse_obo_quoted(after_eq)?;
         let prop = if key == "is_inferred" {
             AnnotationProperty::new(OIO_IS_INFERRED)
         } else {
-            AnnotationProperty(obo_id_to_iri(key, idspaces)?)
+            AnnotationProperty(obo_id_to_iri(&key, idspaces)?)
         };
         out.insert(Annotation::new(
             prop,
@@ -2593,6 +3279,7 @@ fn parse_obo_quoted(s: &str) -> Result<(String, usize), String> {
             match chars.next() {
                 Some((_, 'n')) => out.push('\n'),
                 Some((_, 't')) => out.push('\t'),
+                Some((_, 'W')) => out.push(' '),
                 Some((_, other)) => out.push(other),
                 None => return Err("unterminated escape in quoted string".into()),
             }
@@ -2613,8 +3300,29 @@ fn parse_xref_list(s: &str) -> Result<Vec<String>, String> {
     if inner.is_empty() {
         return Ok(Vec::new());
     }
-    Ok(inner
-        .split(',')
+    // Split on unescaped commas outside quotes so escaped commas (`\,`) stay inside one xref.
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut escaped = false;
+    let mut in_quote = false;
+    for (i, c) in inner.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '"' => in_quote = !in_quote,
+            ',' if !in_quote => {
+                parts.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&inner[start..]);
+    Ok(parts
+        .into_iter()
         .map(|x| unescape_obo(x.trim()))
         .filter(|x| !x.is_empty())
         .collect())
@@ -2638,21 +3346,19 @@ fn parse_synonym(
     let trimmed = s.trim_start();
     let (txt, consumed) = parse_obo_quoted(trimmed)?;
     let rest = trimmed[consumed..].trim();
-    let bracket = rest
-        .find('[')
+    let bracket = find_unescaped_char(rest, '[')
         .ok_or_else(|| format!("synonym missing [...] xref list: '{s}'"))?;
     let middle = rest[..bracket].trim();
     let xrefs = parse_xref_list(&rest[bracket..])?;
-    let mut parts = middle.split_whitespace();
-    let scope = parts
-        .next()
-        .ok_or_else(|| format!("synonym missing scope: '{s}'"))?
-        .to_string();
-    let syn_ty = match parts.next() {
+    let parts = split_obo_tokens(middle);
+    let Some(scope) = parts.first() else {
+        return Err(format!("synonym missing scope: '{s}'"));
+    };
+    let syn_ty = match parts.get(1) {
         Some(t) => Some(obo_id_to_iri(t, idspaces)?),
         None => None,
     };
-    Ok((txt, scope, syn_ty, xrefs))
+    Ok((txt, scope.clone(), syn_ty, xrefs))
 }
 
 fn parse_property_value(
@@ -2662,23 +3368,25 @@ fn parse_property_value(
     let (body, quals) = split_qualifiers(val)?;
     let anns = parse_qualifiers(&quals, idspaces)?;
     let body = body.trim();
-    let Some((prop_str, rest)) = body.split_once(char::is_whitespace) else {
+    let Some((prop_str, rest)) = split_first_obo_token(body) else {
         return Err(format!("invalid property_value '{body}'"));
     };
-    let prop = AnnotationProperty(obo_id_to_iri(prop_str.trim(), idspaces)?);
-    let rest = rest.trim();
+    if rest.is_empty() {
+        return Err(format!("invalid property_value '{body}'"));
+    }
+    let prop = AnnotationProperty(obo_id_to_iri(&prop_str, idspaces)?);
     if rest.starts_with('"') {
         let (lex, consumed) = parse_obo_quoted(rest)?;
-        let dt_str = rest[consumed..].trim();
+        let dt_str = unescape_obo(rest[consumed..].trim());
         let lit = if dt_str.is_empty() {
             Literal::simple(lex)
         } else {
-            let dt = obo_id_to_iri(dt_str, idspaces)?;
+            let dt = obo_id_to_iri(&dt_str, idspaces)?;
             Literal::typed(lex, dt.as_str())
         };
         Ok((prop, AnnotationValue::Literal(lit), anns))
     } else {
-        let iri = obo_id_to_iri(rest, idspaces)?;
+        let iri = obo_id_to_iri(&unescape_obo(rest), idspaces)?;
         Ok((prop, AnnotationValue::Iri(iri), anns))
     }
 }

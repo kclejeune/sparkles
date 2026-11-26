@@ -23,7 +23,9 @@ use crate::ofn::Renderer;
 use crate::ofn_read::{Document, ParseError};
 use crate::validate;
 use crate::vocab;
-use crate::write_common::{WriteError, WriteOptions, WriteReport};
+use crate::write_common::{
+    WriteError, WriteOptions, WriteReport, check_axiom_depth, check_header_depth,
+};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -93,11 +95,29 @@ impl NodeType {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PropertyType {
+    Object,
+    Data,
+    Annotation,
+}
+
+impl PropertyType {
+    fn as_str(self) -> &'static str {
+        match self {
+            PropertyType::Object => "OBJECT",
+            PropertyType::Data => "DATA",
+            PropertyType::Annotation => "ANNOTATION",
+        }
+    }
+}
+
 #[derive(Default)]
 struct NodeEntry {
     id: String,
     lbl: Option<String>,
     node_type: Option<NodeType>,
+    property_type: Option<PropertyType>,
     meta: Meta,
 }
 
@@ -141,21 +161,15 @@ struct PropertyChainEntry {
 
 // ------------------------------------------------------------------ writing ------
 
-fn ann_value_to_string(v: &AnnotationValue) -> Option<String> {
-    match v {
-        AnnotationValue::Iri(i) => Some(i.as_str().to_string()),
-        AnnotationValue::Literal(l) if l.language().is_none() => Some(l.value().to_string()),
-        _ => None,
-    }
-}
-
 fn annotations_to_meta(anns: &BTreeSet<Annotation>) -> Option<Meta> {
     let mut meta = Meta::default();
     for a in anns {
         if !a.annotations.is_empty() {
             return None;
         }
-        let val = ann_value_to_string(&a.value)?;
+        // OBO Graphs JSON basicPropertyValues stores only a string `val` with no datatype
+        // or IRI flag, so only plain xsd:string literals round-trip without losing type.
+        let val = plain_str(&a.value)?.to_string();
         meta.basic_property_values.push(BasicPv {
             pred: a.property.as_str().to_string(),
             val,
@@ -275,6 +289,7 @@ fn apply_node_annotation(
             {
                 xrefs.push(x.to_string());
             } else if a.property.as_str() == OIO_HAS_SYNONYM_TYPE
+                && syn_ty.is_none()
                 && let AnnotationValue::Iri(i) = &a.value
             {
                 syn_ty = Some(i.as_str().to_string());
@@ -294,17 +309,57 @@ fn apply_node_annotation(
             return true;
         }
     }
-    if let Some(val) = ann_value_to_string(v)
+    if let Some(val) = plain_str(v)
         && let Some(xrefs) = extract_xref_strings(anns)
     {
         node.meta.basic_property_values.push(BasicPv {
             pred: pstr.to_string(),
-            val,
+            val: val.to_string(),
             xrefs,
         });
         return true;
     }
     false
+}
+
+fn node_compatible(
+    nodes: &BTreeMap<String, NodeEntry>,
+    id: &str,
+    ty: NodeType,
+    prop_ty: Option<PropertyType>,
+) -> bool {
+    let Some(existing) = nodes.get(id) else {
+        return true;
+    };
+    if let Some(et) = existing.node_type
+        && et != ty
+    {
+        return false;
+    }
+    if let (Some(ep), Some(np)) = (existing.property_type, prop_ty)
+        && ep != np
+    {
+        return false;
+    }
+    true
+}
+
+fn ensure_node_typed(
+    nodes: &mut BTreeMap<String, NodeEntry>,
+    id: &str,
+    ty: NodeType,
+    prop_ty: Option<PropertyType>,
+) {
+    let e = nodes.entry(id.to_string()).or_insert_with(|| NodeEntry {
+        id: id.to_string(),
+        ..Default::default()
+    });
+    if e.node_type.is_none() {
+        e.node_type = Some(ty);
+    }
+    if e.property_type.is_none() {
+        e.property_type = prop_ty;
+    }
 }
 
 /// Write an ontology header and axioms as an OBO Graphs JSON (`.json`) document.
@@ -315,7 +370,12 @@ pub fn write_document<'a>(
     axioms: impl IntoIterator<Item = &'a Axiom>,
     options: WriteOptions,
 ) -> Result<WriteReport, WriteError> {
-    let axioms: Vec<&'a Axiom> = axioms.into_iter().collect();
+    check_header_depth(header, "OBO Graphs JSON")?;
+    let mut axioms: Vec<&'a Axiom> = axioms.into_iter().collect();
+    for &ax in &axioms {
+        check_axiom_depth(ax, "OBO Graphs JSON")?;
+    }
+    axioms.sort();
     let mut report = WriteReport::default();
 
     let mut nodes: BTreeMap<String, NodeEntry> = BTreeMap::new();
@@ -326,65 +386,54 @@ pub fn write_document<'a>(
     let mut chains: Vec<PropertyChainEntry> = Vec::new();
     let mut pending_anns: Vec<&'a Axiom> = Vec::new();
 
-    let ensure_node = |nodes: &mut BTreeMap<String, NodeEntry>, id: &str, ty: Option<NodeType>| {
-        let e = nodes.entry(id.to_string()).or_insert_with(|| NodeEntry {
-            id: id.to_string(),
-            ..Default::default()
-        });
-        if e.node_type.is_none() {
-            e.node_type = ty;
-        }
-    };
-
     // First pass: declarations.
     for &ax in &axioms {
         if let AxiomKind::Declaration(e) = &ax.kind {
             if !ax.annotations.is_empty() {
-                if options.strict {
-                    return Err(WriteError::Unsupported(format!(
-                        "OBO Graphs JSON cannot attach annotations to Declaration: {}",
-                        renderer.axiom(ax)
-                    )));
-                }
-                report.record_skipped(
+                report.skip_or_err(
+                    options,
+                    renderer,
                     ax,
                     "OBO Graphs JSON cannot attach annotations to Declaration axioms",
-                );
+                )?;
                 continue;
             }
-            match e {
-                Entity::Class(c) => {
-                    ensure_node(&mut nodes, c.as_str(), Some(NodeType::Class));
-                    report.written_axioms += 1;
-                }
+            let target = match e {
+                Entity::Class(c) => Some((c.as_str(), NodeType::Class, None)),
                 Entity::ObjectProperty(p) => {
-                    ensure_node(&mut nodes, p.as_str(), Some(NodeType::Property));
-                    report.written_axioms += 1;
+                    Some((p.as_str(), NodeType::Property, Some(PropertyType::Object)))
                 }
                 Entity::DataProperty(p) => {
-                    ensure_node(&mut nodes, p.as_str(), Some(NodeType::Property));
-                    report.written_axioms += 1;
+                    Some((p.as_str(), NodeType::Property, Some(PropertyType::Data)))
                 }
-                Entity::AnnotationProperty(p) => {
-                    if !vocab::is_builtin_annotation_property(p.as_str()) {
-                        ensure_node(&mut nodes, p.as_str(), Some(NodeType::Property));
-                    }
-                    report.written_axioms += 1;
-                }
-                Entity::NamedIndividual(i) => {
-                    ensure_node(&mut nodes, i.as_str(), Some(NodeType::Individual));
-                    report.written_axioms += 1;
-                }
-                Entity::Datatype(_) => {
-                    if options.strict {
-                        return Err(WriteError::Unsupported(format!(
-                            "OBO Graphs JSON has no node type for Datatype declarations: {}",
-                            renderer.axiom(ax)
-                        )));
-                    }
-                    report.record_skipped(ax, "OBO Graphs JSON has no Datatype node type");
-                }
+                Entity::AnnotationProperty(p) => Some((
+                    p.as_str(),
+                    NodeType::Property,
+                    Some(PropertyType::Annotation),
+                )),
+                Entity::NamedIndividual(i) => Some((i.as_str(), NodeType::Individual, None)),
+                Entity::Datatype(_) => None,
+            };
+            let Some((id, ty, pt)) = target else {
+                report.skip_or_err(
+                    options,
+                    renderer,
+                    ax,
+                    "OBO Graphs JSON has no node type for Datatype declarations",
+                )?;
+                continue;
+            };
+            if !node_compatible(&nodes, id, ty, pt) {
+                report.skip_or_err(
+                    options,
+                    renderer,
+                    ax,
+                    "OBO Graphs JSON cannot represent punned entity kinds on the same node IRI",
+                )?;
+                continue;
             }
+            ensure_node_typed(&mut nodes, id, ty, pt);
+            report.written_axioms += 1;
         }
     }
 
@@ -403,8 +452,19 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                ensure_node(&mut nodes, sub.as_str(), Some(NodeType::Class));
-                ensure_node(&mut nodes, sup.as_str(), Some(NodeType::Class));
+                if !node_compatible(&nodes, sub.as_str(), NodeType::Class, None)
+                    || !node_compatible(&nodes, sup.as_str(), NodeType::Class, None)
+                {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO Graphs JSON cannot represent SubClassOf on a node punned with a non-class kind",
+                    )?;
+                    continue;
+                }
+                ensure_node_typed(&mut nodes, sub.as_str(), NodeType::Class, None);
+                ensure_node_typed(&mut nodes, sup.as_str(), NodeType::Class, None);
                 edges.push(EdgeEntry {
                     sub: sub.as_str().to_string(),
                     pred: "is_a".to_string(),
@@ -432,9 +492,31 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                ensure_node(&mut nodes, sub.as_str(), Some(NodeType::Class));
-                ensure_node(&mut nodes, p.as_str(), Some(NodeType::Property));
-                ensure_node(&mut nodes, target.as_str(), Some(NodeType::Class));
+                if !node_compatible(&nodes, sub.as_str(), NodeType::Class, None)
+                    || !node_compatible(
+                        &nodes,
+                        p.as_str(),
+                        NodeType::Property,
+                        Some(PropertyType::Object),
+                    )
+                    || !node_compatible(&nodes, target.as_str(), NodeType::Class, None)
+                {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO Graphs JSON cannot represent existential restriction on a punned node IRI",
+                    )?;
+                    continue;
+                }
+                ensure_node_typed(&mut nodes, sub.as_str(), NodeType::Class, None);
+                ensure_node_typed(
+                    &mut nodes,
+                    p.as_str(),
+                    NodeType::Property,
+                    Some(PropertyType::Object),
+                );
+                ensure_node_typed(&mut nodes, target.as_str(), NodeType::Class, None);
                 edges.push(EdgeEntry {
                     sub: sub.as_str().to_string(),
                     pred: p.as_str().to_string(),
@@ -458,8 +540,20 @@ pub fn write_document<'a>(
                         .iter()
                         .map(|c| c.as_class().expect("checked").as_str().to_string())
                         .collect();
+                    if !ids
+                        .iter()
+                        .all(|id| node_compatible(&nodes, id, NodeType::Class, None))
+                    {
+                        report.skip_or_err(
+                            options,
+                            renderer,
+                            ax,
+                            "OBO Graphs JSON cannot represent EquivalentClasses on a punned non-class node",
+                        )?;
+                        continue;
+                    }
                     for id in &ids {
-                        ensure_node(&mut nodes, id, Some(NodeType::Class));
+                        ensure_node_typed(&mut nodes, id, NodeType::Class, None);
                     }
                     let representative = ids[0].clone();
                     equivs.push(EquivNodesSet {
@@ -522,15 +616,42 @@ pub fn write_document<'a>(
                             _ => ok = false,
                         }
                         if ok && (!genus_ids.is_empty() || !restrictions.is_empty()) {
+                            let kinds_ok =
+                                node_compatible(&nodes, c.as_str(), NodeType::Class, None)
+                                    && genus_ids
+                                        .iter()
+                                        .all(|g| node_compatible(&nodes, g, NodeType::Class, None))
+                                    && restrictions.iter().all(|(p, f)| {
+                                        node_compatible(
+                                            &nodes,
+                                            p,
+                                            NodeType::Property,
+                                            Some(PropertyType::Object),
+                                        ) && node_compatible(&nodes, f, NodeType::Class, None)
+                                    });
+                            if !kinds_ok {
+                                report.skip_or_err(
+                                    options,
+                                    renderer,
+                                    ax,
+                                    "OBO Graphs JSON cannot represent logicalDefinitionAxioms on a punned node",
+                                )?;
+                                continue;
+                            }
                             genus_ids.sort();
                             restrictions.sort();
-                            ensure_node(&mut nodes, c.as_str(), Some(NodeType::Class));
+                            ensure_node_typed(&mut nodes, c.as_str(), NodeType::Class, None);
                             for g in &genus_ids {
-                                ensure_node(&mut nodes, g, Some(NodeType::Class));
+                                ensure_node_typed(&mut nodes, g, NodeType::Class, None);
                             }
                             for (p, f) in &restrictions {
-                                ensure_node(&mut nodes, p, Some(NodeType::Property));
-                                ensure_node(&mut nodes, f, Some(NodeType::Class));
+                                ensure_node_typed(
+                                    &mut nodes,
+                                    p,
+                                    NodeType::Property,
+                                    Some(PropertyType::Object),
+                                );
+                                ensure_node_typed(&mut nodes, f, NodeType::Class, None);
                             }
                             logical_defs.push(LogicalDef {
                                 defined_class_id: c.as_str().to_string(),
@@ -575,8 +696,37 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                ensure_node(&mut nodes, a.as_str(), Some(NodeType::Property));
-                ensure_node(&mut nodes, b.as_str(), Some(NodeType::Property));
+                if !node_compatible(
+                    &nodes,
+                    a.as_str(),
+                    NodeType::Property,
+                    Some(PropertyType::Object),
+                ) || !node_compatible(
+                    &nodes,
+                    b.as_str(),
+                    NodeType::Property,
+                    Some(PropertyType::Object),
+                ) {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO Graphs JSON cannot represent SubObjectPropertyOf on a punned node",
+                    )?;
+                    continue;
+                }
+                ensure_node_typed(
+                    &mut nodes,
+                    a.as_str(),
+                    NodeType::Property,
+                    Some(PropertyType::Object),
+                );
+                ensure_node_typed(
+                    &mut nodes,
+                    b.as_str(),
+                    NodeType::Property,
+                    Some(PropertyType::Object),
+                );
                 edges.push(EdgeEntry {
                     sub: a.as_str().to_string(),
                     pred: "subPropertyOf".to_string(),
@@ -609,9 +759,36 @@ pub fn write_document<'a>(
                     }
                 }
                 if ok {
-                    ensure_node(&mut nodes, sup.as_str(), Some(NodeType::Property));
+                    let kinds_ok = node_compatible(
+                        &nodes,
+                        sup.as_str(),
+                        NodeType::Property,
+                        Some(PropertyType::Object),
+                    ) && ids.iter().all(|id| {
+                        node_compatible(&nodes, id, NodeType::Property, Some(PropertyType::Object))
+                    });
+                    if !kinds_ok {
+                        report.skip_or_err(
+                            options,
+                            renderer,
+                            ax,
+                            "OBO Graphs JSON cannot represent propertyChainAxioms on a punned node",
+                        )?;
+                        continue;
+                    }
+                    ensure_node_typed(
+                        &mut nodes,
+                        sup.as_str(),
+                        NodeType::Property,
+                        Some(PropertyType::Object),
+                    );
                     for id in &ids {
-                        ensure_node(&mut nodes, id, Some(NodeType::Property));
+                        ensure_node_typed(
+                            &mut nodes,
+                            id,
+                            NodeType::Property,
+                            Some(PropertyType::Object),
+                        );
                     }
                     chains.push(PropertyChainEntry {
                         predicate_id: sup.as_str().to_string(),
@@ -641,8 +818,37 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                ensure_node(&mut nodes, a.as_str(), Some(NodeType::Property));
-                ensure_node(&mut nodes, b.as_str(), Some(NodeType::Property));
+                if !node_compatible(
+                    &nodes,
+                    a.as_str(),
+                    NodeType::Property,
+                    Some(PropertyType::Object),
+                ) || !node_compatible(
+                    &nodes,
+                    b.as_str(),
+                    NodeType::Property,
+                    Some(PropertyType::Object),
+                ) {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO Graphs JSON cannot represent InverseObjectProperties on a punned node",
+                    )?;
+                    continue;
+                }
+                ensure_node_typed(
+                    &mut nodes,
+                    a.as_str(),
+                    NodeType::Property,
+                    Some(PropertyType::Object),
+                );
+                ensure_node_typed(
+                    &mut nodes,
+                    b.as_str(),
+                    NodeType::Property,
+                    Some(PropertyType::Object),
+                );
                 edges.push(EdgeEntry {
                     sub: a.as_str().to_string(),
                     pred: "inverseOf".to_string(),
@@ -664,8 +870,28 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                ensure_node(&mut nodes, p.as_str(), Some(NodeType::Property));
-                ensure_node(&mut nodes, c.as_str(), Some(NodeType::Class));
+                if !node_compatible(
+                    &nodes,
+                    p.as_str(),
+                    NodeType::Property,
+                    Some(PropertyType::Object),
+                ) || !node_compatible(&nodes, c.as_str(), NodeType::Class, None)
+                {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO Graphs JSON cannot represent ObjectPropertyDomain on a punned node",
+                    )?;
+                    continue;
+                }
+                ensure_node_typed(
+                    &mut nodes,
+                    p.as_str(),
+                    NodeType::Property,
+                    Some(PropertyType::Object),
+                );
+                ensure_node_typed(&mut nodes, c.as_str(), NodeType::Class, None);
                 domain_ranges.push(DomainRangeEntry {
                     predicate_id: p.as_str().to_string(),
                     domain_class_ids: vec![c.as_str().to_string()],
@@ -687,8 +913,28 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                ensure_node(&mut nodes, p.as_str(), Some(NodeType::Property));
-                ensure_node(&mut nodes, c.as_str(), Some(NodeType::Class));
+                if !node_compatible(
+                    &nodes,
+                    p.as_str(),
+                    NodeType::Property,
+                    Some(PropertyType::Object),
+                ) || !node_compatible(&nodes, c.as_str(), NodeType::Class, None)
+                {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO Graphs JSON cannot represent ObjectPropertyRange on a punned node",
+                    )?;
+                    continue;
+                }
+                ensure_node_typed(
+                    &mut nodes,
+                    p.as_str(),
+                    NodeType::Property,
+                    Some(PropertyType::Object),
+                );
+                ensure_node_typed(&mut nodes, c.as_str(), NodeType::Class, None);
                 domain_ranges.push(DomainRangeEntry {
                     predicate_id: p.as_str().to_string(),
                     domain_class_ids: Vec::new(),
@@ -707,8 +953,19 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                ensure_node(&mut nodes, i.as_str(), Some(NodeType::Individual));
-                ensure_node(&mut nodes, c.as_str(), Some(NodeType::Class));
+                if !node_compatible(&nodes, i.as_str(), NodeType::Individual, None)
+                    || !node_compatible(&nodes, c.as_str(), NodeType::Class, None)
+                {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO Graphs JSON cannot represent ClassAssertion on a punned node",
+                    )?;
+                    continue;
+                }
+                ensure_node_typed(&mut nodes, i.as_str(), NodeType::Individual, None);
+                ensure_node_typed(&mut nodes, c.as_str(), NodeType::Class, None);
                 edges.push(EdgeEntry {
                     sub: i.as_str().to_string(),
                     pred: "type".to_string(),
@@ -731,9 +988,31 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                ensure_node(&mut nodes, a.as_str(), Some(NodeType::Individual));
-                ensure_node(&mut nodes, p.as_str(), Some(NodeType::Property));
-                ensure_node(&mut nodes, b.as_str(), Some(NodeType::Individual));
+                if !node_compatible(&nodes, a.as_str(), NodeType::Individual, None)
+                    || !node_compatible(
+                        &nodes,
+                        p.as_str(),
+                        NodeType::Property,
+                        Some(PropertyType::Object),
+                    )
+                    || !node_compatible(&nodes, b.as_str(), NodeType::Individual, None)
+                {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO Graphs JSON cannot represent ObjectPropertyAssertion on a punned node IRI",
+                    )?;
+                    continue;
+                }
+                ensure_node_typed(&mut nodes, a.as_str(), NodeType::Individual, None);
+                ensure_node_typed(
+                    &mut nodes,
+                    p.as_str(),
+                    NodeType::Property,
+                    Some(PropertyType::Object),
+                );
+                ensure_node_typed(&mut nodes, b.as_str(), NodeType::Individual, None);
                 edges.push(EdgeEntry {
                     sub: a.as_str().to_string(),
                     pred: p.as_str().to_string(),
@@ -806,19 +1085,21 @@ pub fn write_document<'a>(
             && let Some(s) = plain_str(&ann.value)
         {
             graph_meta.comments.push(s.to_string());
-        } else if let Some(val) = ann_value_to_string(&ann.value)
+        } else if let Some(val) = plain_str(&ann.value)
             && let Some(xrefs) = extract_xref_strings(&ann.annotations)
         {
             graph_meta.basic_property_values.push(BasicPv {
                 pred: ann.property.as_str().to_string(),
-                val,
+                val: val.to_string(),
                 xrefs,
             });
-        } else if options.strict {
-            return Err(WriteError::Unsupported(format!(
-                "OBO Graphs JSON cannot represent header annotation {}",
-                renderer.annotation(ann)
-            )));
+        } else {
+            report.skip_header_or_err(
+                options,
+                renderer,
+                ann,
+                "OBO Graphs JSON cannot represent header annotation",
+            )?;
         }
     }
     graph_meta.comments.sort();
@@ -870,6 +1151,10 @@ pub fn write_document<'a>(
         if let Some(ty) = node.node_type {
             w.write_all(b",\n      \"type\" : ")?;
             write_json_str(w, ty.as_str())?;
+        }
+        if let Some(pt) = node.property_type {
+            w.write_all(b",\n      \"propertyType\" : ")?;
+            write_json_str(w, pt.as_str())?;
         }
         if !node.meta.is_empty() {
             w.write_all(b",\n      \"meta\" : ")?;
@@ -1012,7 +1297,13 @@ pub fn document<'a>(
 }
 
 fn write_json_str(w: &mut dyn Write, s: &str) -> Result<(), WriteError> {
-    serde_json::to_writer(w, s).map_err(|e| WriteError::Unsupported(e.to_string()))
+    serde_json::to_writer(w, s).map_err(|e| {
+        if e.is_io() {
+            WriteError::Io(e.into())
+        } else {
+            WriteError::Unsupported(e.to_string())
+        }
+    })
 }
 
 fn write_str_array(w: &mut dyn Write, items: &[String]) -> Result<(), WriteError> {
@@ -1236,9 +1527,16 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
             node_types.insert(id.to_string(), ty.to_string());
             match ty {
                 "CLASS" => axioms.push(Axiom::declaration(Entity::Class(Class(iri.clone())))),
-                "PROPERTY" => axioms.push(Axiom::declaration(Entity::ObjectProperty(
-                    ObjectProperty(iri.clone()),
-                ))),
+                "PROPERTY" => {
+                    let entity = match node.get("propertyType").and_then(Value::as_str) {
+                        Some("DATA") => Entity::DataProperty(DataProperty(iri.clone())),
+                        Some("ANNOTATION") => {
+                            Entity::AnnotationProperty(AnnotationProperty(iri.clone()))
+                        }
+                        _ => Entity::ObjectProperty(ObjectProperty(iri.clone())),
+                    };
+                    axioms.push(Axiom::declaration(entity));
+                }
                 "INDIVIDUAL" => axioms.push(Axiom::declaration(Entity::NamedIndividual(
                     NamedIndividual(iri.clone()),
                 ))),

@@ -116,10 +116,11 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// A literal: a quoted string with its language tag or datatype, or a bare integer,
-    /// decimal or boolean when its lexical form reads back as one.
+    /// A literal: a W3C Manchester quoted string (escaping `"` and `\`) with its language
+    /// tag or datatype, or a bare integer or decimal when its lexical form reads back as
+    /// one.
     pub fn literal(&self, l: &Literal) -> String {
-        let v = serde_json::to_string(l.value()).expect("a string serializes");
+        let v = quote_manchester_literal(l.value());
         if let Some(lang) = l.language() {
             return format!("{v}@{lang}");
         }
@@ -154,7 +155,10 @@ impl<'a> Renderer<'a> {
                 wrap(cs.iter().map(m).collect::<Vec<_>>().join(" and "))
             }
             Ce::ObjectUnionOf(cs) => wrap(cs.iter().map(m).collect::<Vec<_>>().join(" or ")),
-            Ce::ObjectComplementOf(c) => format!("not {}", m(c)),
+            Ce::ObjectComplementOf(c) => match c.as_ref() {
+                Ce::ObjectComplementOf(_) => format!("not ({})", self.ce(c, false)),
+                _ => format!("not {}", m(c)),
+            },
             Ce::ObjectOneOf(is) => format!(
                 "{{{}}}",
                 is.iter()
@@ -238,7 +242,10 @@ impl<'a> Renderer<'a> {
                     .collect::<Vec<_>>()
                     .join(" or "),
             ),
-            DataRange::ComplementOf(r) => format!("not {}", self.dr(r, true)),
+            DataRange::ComplementOf(r) => match r.as_ref() {
+                DataRange::ComplementOf(_) => format!("not ({})", self.dr(r, false)),
+                _ => format!("not {}", self.dr(r, true)),
+            },
             DataRange::OneOf(ls) => format!(
                 "{{{}}}",
                 ls.iter()
@@ -427,8 +434,25 @@ impl<'a> Renderer<'a> {
     }
 }
 
-/// Whether a literal of `datatype` is written bare: an integer, a decimal with digits
-/// on both sides of its point, or a boolean, whose lexical form reads back as itself.
+/// Escape a W3C Manchester `quotedString`, escaping only `"` and `\` and preserving
+/// literal newlines and tabs inside the quotes.
+fn quote_manchester_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Whether a literal of `datatype` is written bare: an integer or a decimal with digits
+/// on both sides of its point, whose lexical form reads back as itself under W3C
+/// Manchester syntax.
 pub fn bare_literal(value: &str, datatype: &str) -> bool {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
@@ -437,7 +461,6 @@ pub fn bare_literal(value: &str, datatype: &str) -> bool {
         vocab::XSD_DECIMAL => unsigned
             .split_once('.')
             .is_some_and(|(a, b)| digits(a) && digits(b)),
-        vocab::XSD_BOOLEAN => value == "true" || value == "false",
         _ => false,
     }
 }

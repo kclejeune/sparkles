@@ -1006,3 +1006,931 @@ fn obographs_lossy_reporting_and_strict_refusal() {
     .unwrap_err();
     assert!(matches!(err, WriteError::Unsupported(_)), "{err:?}");
 }
+
+// ================================================== Round 1 Regression Tests ===
+
+fn is_valid_xml_ncname(s: &str) -> bool {
+    let mut cs = s.chars();
+    let Some(first) = cs.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && cs.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+#[test]
+fn owx_schema_conformance_blank_nodes_prefixes_single_operand_and_parser_edge_cases() {
+    // 1. Non-NCName blank nodes + potential escape collision stay valid NCNames & distinct
+    let labels = ["1", "", "a:b", "foo bar", "__owx_31", "normal_bnode"];
+    let axioms: Vec<Axiom> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, lbl)| Axiom::class_assertion(cls(&format!("C{i}")), Individual::anonymous(*lbl)))
+        .collect();
+    // Include digit-prefixed, dash-prefixed, and duplicate prefix names
+    let r = Renderer::new([
+        ("1ex", "http://bad-digit.example/"),
+        ("-ex", "http://bad-dash.example/"),
+        ("ex", "http://first.example/"),
+        ("ex", EX),
+    ]);
+    let mut all_axioms = axioms;
+    all_axioms.push(Axiom::declaration(Entity::Class(Class::new(
+        "http://bad-digit.example/Thing",
+    ))));
+    all_axioms.push(Axiom::declaration(Entity::Class(Class::new(ex("A")))));
+
+    // Single-operand EquivalentClasses / EquivalentObjectProperties / EquivalentDataProperties / SameIndividual
+    all_axioms.push(Axiom::equivalent_classes([cls("A").into()]));
+    all_axioms.push(Axiom::new(AxiomKind::EquivalentObjectProperties(
+        [op("p").into()].into_iter().collect(),
+    )));
+    all_axioms.push(Axiom::new(AxiomKind::EquivalentDataProperties(
+        [dp("age")].into_iter().collect(),
+    )));
+    all_axioms.push(Axiom::new(AxiomKind::SameIndividual(
+        [ind("i1")].into_iter().collect(),
+    )));
+
+    let xml = owx::document(&r, &Header::default(), all_axioms.iter()).unwrap();
+
+    // Verify no invalid <Prefix> names and no duplicate <Prefix name="ex">
+    assert!(!xml.contains("name=\"1ex\""), "{xml}");
+    assert!(!xml.contains("name=\"-ex\""), "{xml}");
+    assert_eq!(xml.matches("<Prefix name=\"ex\"").count(), 1, "{xml}");
+    assert!(
+        xml.contains("IRI=\"http://bad-digit.example/Thing\""),
+        "{xml}"
+    );
+
+    // Independently check every emitted nodeID="..." is a valid XML NCName and all 6 are distinct
+    let mut seen_ids = BTreeSet::new();
+    for part in xml.split("nodeID=\"").skip(1) {
+        let id = part.split('"').next().unwrap();
+        assert!(is_valid_xml_ncname(id), "invalid NCName nodeID: {id}");
+        seen_ids.insert(id.to_string());
+    }
+    assert_eq!(
+        seen_ids.len(),
+        labels.len(),
+        "collision in nodeIDs: {seen_ids:?}"
+    );
+    assert!(seen_ids.contains("normal_bnode"));
+
+    // Verify XSD minOccurs="2" on single-operand Equivalent* and SameIndividual
+    for tag in [
+        "EquivalentClasses",
+        "EquivalentObjectProperties",
+        "EquivalentDataProperties",
+        "SameIndividual",
+    ] {
+        let open = format!("<{tag}>\n");
+        let close = format!("    </{tag}>");
+        let start = xml.find(&open).unwrap() + open.len();
+        let end = start + xml[start..].find(&close).unwrap();
+        let child_count = xml[start..end]
+            .lines()
+            .filter(|l| l.trim_start().starts_with('<'))
+            .count();
+        assert_eq!(
+            child_count,
+            2,
+            "{tag} must have 2 operands: {}",
+            &xml[start..end]
+        );
+    }
+
+    // Round-trip parses cleanly
+    let back = owx::parse(&xml).unwrap();
+    assert!(
+        back.axioms
+            .contains(&Axiom::equivalent_classes([cls("A").into()]))
+    );
+    assert!(
+        back.axioms
+            .contains(&Axiom::declaration(Entity::Class(Class::new(
+                "http://bad-digit.example/Thing"
+            ))))
+    );
+
+    // 2. Parser edge cases: unterminated <!DOCTYPE>, quoted ']'/'>' inside <!DOCTYPE>, trailing garbage
+    assert!(owx::parse("<!DOCTYPE Ontology [ <!ENTITY a \"1\"").is_err());
+    let with_doctype = r#"<?xml version="1.0"?>
+<!DOCTYPE Ontology [ <!ENTITY x "a]b>"> ]>
+<Ontology xmlns="http://www.w3.org/2002/07/owl#"/>
+<!-- trailing comment ok -->
+"#;
+    assert!(owx::parse(with_doctype).is_ok());
+    let with_trailing = r#"<Ontology xmlns="http://www.w3.org/2002/07/owl#"/> <Extra/>"#;
+    assert!(owx::parse(with_trailing).is_err());
+    let with_trailing_text = r#"<Ontology xmlns="http://www.w3.org/2002/07/owl#"/> junk"#;
+    assert!(owx::parse(with_trailing_text).is_err());
+}
+
+#[test]
+fn manchester_w3c_syntax_undeclared_data_props_prefixes_and_edge_cases() {
+    // 1. Mixed HasKey (whitespace-separated), nested complements, boolean & newline literal
+    let r = Renderer::new([
+        ("1ex", "http://bad-digit.example/"),
+        ("-ex", "http://bad-dash.example/"),
+        ("", EX),
+    ]);
+    let axioms = vec![
+        Axiom::declaration(Entity::Class(cls("C"))),
+        Axiom::declaration(Entity::ObjectProperty(op("p"))),
+        Axiom::declaration(Entity::DataProperty(dp("d"))),
+        Axiom::new(AxiomKind::HasKey(
+            cls("C").into(),
+            [op("p").into()].into_iter().collect(),
+            [dp("d")].into_iter().collect(),
+        )),
+        Axiom::sub_class_of(
+            cls("C"),
+            ClassExpression::not(ClassExpression::not(cls("C"))),
+        ),
+        Axiom::new(AxiomKind::DataPropertyRange(
+            dp("d"),
+            DataRange::ComplementOf(Box::new(DataRange::ComplementOf(Box::new(
+                DataRange::Datatype(Datatype::new(vocab::XSD_INTEGER)),
+            )))),
+        )),
+        Axiom::sub_class_of(
+            cls("C"),
+            ClassExpression::DataHasValue(dp("d"), Literal::typed("true", vocab::XSD_BOOLEAN)),
+        ),
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            AnnotationProperty::new(vocab::RDFS_COMMENT),
+            AnnotationSubject::Iri(iri(ex("C"))),
+            AnnotationValue::Literal(Literal::simple("line1\nline2\"quote\\slash")),
+        )),
+        Axiom::declaration(Entity::Class(Class::new("http://bad-digit.example/X"))),
+    ];
+    let (omn, rep) = manchester::document(
+        &r,
+        &Header::default(),
+        axioms.iter(),
+        WriteOptions { strict: true },
+    )
+    .unwrap();
+    assert!(rep.is_lossless(), "{rep:?}");
+    assert!(!omn.contains("Prefix: 1ex:"), "{omn}");
+    assert!(!omn.contains("Prefix: -ex:"), "{omn}");
+    assert!(
+        omn.contains("HasKey:\n        :p :d\n"),
+        "HasKey must be space-separated: {omn}"
+    );
+    assert!(!omn.contains(":p, :d"), "{omn}");
+    assert!(
+        omn.contains("not (not :C)"),
+        "double complement must be parenthesized: {omn}"
+    );
+    assert!(!omn.contains("not not "), "{omn}");
+    assert!(
+        omn.contains("not (not xsd:integer)"),
+        "double data complement must be parenthesized: {omn}"
+    );
+    assert!(
+        omn.contains("\"true\"^^xsd:boolean"),
+        "booleans must use typed literals: {omn}"
+    );
+    assert!(
+        omn.contains("\"line1\nline2\\\"quote\\\\slash\""),
+        "newlines must stay literal inside Manchester quotedString: {omn}"
+    );
+    let back = manchester::parse_document(&omn).unwrap();
+    assert_eq!(
+        Document::new(back.header, back.axioms),
+        Document::new(Header::default(), axioms)
+    );
+
+    // 2. Undeclared DataProperty in unqualified DataMinCardinality, custom-datatype DataSomeValuesFrom,
+    // HasKey, and n-ary EquivalentDataProperties / DisjointDataProperties must never corrupt to ObjectProperty
+    let undecl_axioms = vec![
+        Axiom::sub_class_of(
+            cls("C"),
+            ClassExpression::DataMinCardinality(1, dp("d1"), None),
+        ),
+        Axiom::sub_class_of(
+            cls("C"),
+            ClassExpression::DataSomeValuesFrom(
+                vec![dp("d2")],
+                DataRange::Datatype(dt("CustomRange")),
+            ),
+        ),
+        Axiom::new(AxiomKind::HasKey(
+            cls("C").into(),
+            BTreeSet::new(),
+            [dp("d3")].into_iter().collect(),
+        )),
+        Axiom::new(AxiomKind::EquivalentDataProperties(
+            [dp("d1"), dp("d2"), dp("d3")].into_iter().collect(),
+        )),
+        Axiom::disjoint_data_properties([dp("d1"), dp("d2"), dp("d3")]),
+    ];
+    let (omn2, rep2) = manchester::document(
+        &renderer(),
+        &Header::default(),
+        undecl_axioms.iter(),
+        WriteOptions { strict: true },
+    )
+    .unwrap();
+    assert!(rep2.is_lossless(), "{rep2:?}");
+    let back2 = manchester::parse_document(&omn2).unwrap();
+    for expected in &undecl_axioms {
+        assert!(
+            back2.axioms.contains(expected),
+            "missing exact axiom {expected:?} after round-trip:\n{omn2}"
+        );
+    }
+
+    // 3. Punned ObjectProperty + DataProperty on ambiguous positions must be refused/skipped
+    let punned = [
+        Axiom::declaration(Entity::ObjectProperty(op("pun"))),
+        Axiom::declaration(Entity::DataProperty(dp("pun"))),
+        Axiom::sub_class_of(
+            cls("C"),
+            ClassExpression::DataMinCardinality(1, dp("pun"), None),
+        ),
+    ];
+    let err = manchester::document(
+        &renderer(),
+        &Header::default(),
+        punned.iter(),
+        WriteOptions { strict: true },
+    )
+    .unwrap_err();
+    assert!(matches!(err, WriteError::Unsupported(_)), "{err:?}");
+    let (_, pun_rep) = manchester::document(
+        &renderer(),
+        &Header::default(),
+        punned.iter(),
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(pun_rep.skipped_count, 1);
+
+    // 4. Invalid AnonymousIndividual labels refused/skipped
+    let bad_anon = [Axiom::class_assertion(
+        cls("C"),
+        Individual::anonymous("bad label"),
+    )];
+    assert!(matches!(
+        manchester::document(
+            &renderer(),
+            &Header::default(),
+            bad_anon.iter(),
+            WriteOptions { strict: true },
+        ),
+        Err(WriteError::Unsupported(_))
+    ));
+    let (_, bad_anon_rep) = manchester::document(
+        &renderer(),
+        &Header::default(),
+        bad_anon.iter(),
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(bad_anon_rep.skipped_count, 1);
+
+    // 5. Trailing 'o' in SubPropertyChain: rejected by parser
+    let trailing_o = "Prefix: : <http://ex.org/>\nOntology:\nObjectProperty: :r\n    SubPropertyChain: :p o :q o\n";
+    assert!(manchester::parse_document(trailing_o).is_err());
+
+    // 6. Nesting depth refusal in Manchester
+    let mut deep = ClassExpression::Class(cls("A"));
+    for _ in 0..140 {
+        deep = ClassExpression::not(deep);
+    }
+    let deep_ax = Axiom::sub_class_of(cls("B"), deep);
+    for strict in [false, true] {
+        let err = manchester::document(
+            &renderer(),
+            &Header::default(),
+            [&deep_ax],
+            WriteOptions { strict },
+        )
+        .unwrap_err();
+        assert!(matches!(err, WriteError::Unsupported(_)), "{err:?}");
+    }
+}
+
+/// Independent validator for OBO 1.4 stanza single-cardinality and header subsetdef/synonymtypedef rules.
+fn assert_valid_obo_structure(obo_text: &str) {
+    let mut header_subsets = BTreeSet::new();
+    let mut header_syn_types = BTreeSet::new();
+    let mut in_stanza = false;
+    let mut single_counts: std::collections::BTreeMap<String, usize> = Default::default();
+    for line in obo_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_stanza = true;
+            single_counts.clear();
+            continue;
+        }
+        let (tag, val) = trimmed.split_once(':').expect("tag: val");
+        let tag = tag.trim();
+        let val = val.trim();
+        if !in_stanza {
+            if tag == "subsetdef" {
+                let id = val.split_whitespace().next().unwrap();
+                header_subsets.insert(id.to_string());
+            } else if tag == "synonymtypedef" {
+                let id = val.split_whitespace().next().unwrap();
+                header_syn_types.insert(id.to_string());
+            }
+        } else {
+            if matches!(
+                tag,
+                "name"
+                    | "namespace"
+                    | "def"
+                    | "comment"
+                    | "created_by"
+                    | "creation_date"
+                    | "instance_of"
+            ) {
+                let c = single_counts.entry(tag.to_string()).or_insert(0);
+                *c += 1;
+                assert!(
+                    *c <= 1,
+                    "OBO 1.4 single-cardinality tag '{tag}:' repeated in stanza:\n{obo_text}"
+                );
+            }
+            if tag == "subset" {
+                assert!(
+                    header_subsets.contains(val),
+                    "OBO 1.4 subset '{val}' missing header subsetdef:\n{obo_text}"
+                );
+            }
+            if tag == "synonym" {
+                // extract optional synonym type between scope and '['
+                if let Some(after_q) = val.rfind('"').map(|i| val[i + 1..].trim())
+                    && let Some(bracket) = after_q.find('[')
+                {
+                    let mid: Vec<&str> = after_q[..bracket].split_whitespace().collect();
+                    if let Some(st) = mid.get(1) {
+                        assert!(
+                            header_syn_types.contains(*st),
+                            "OBO 1.4 synonym type '{st}' missing header synonymtypedef:\n{obo_text}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn obo_asymmetry_shadowing_cardinality_escaping_typedef_and_strictness() {
+    // 1. AsymmetricObjectProperty -> is_asymmetric: true (and external is_anti_symmetric -> annotation)
+    let p_asym = ObjectProperty::new(obo_iri("RO_0000001"));
+    let asym_axioms = vec![
+        Axiom::declaration(Entity::ObjectProperty(p_asym.clone())),
+        Axiom::new(AxiomKind::AsymmetricObjectProperty(p_asym.clone().into())),
+    ];
+    let (obo_asym, rep) = obo::document(
+        &renderer(),
+        &Header::default(),
+        asym_axioms.iter(),
+        WriteOptions { strict: true },
+    )
+    .unwrap();
+    assert!(rep.is_lossless());
+    assert!(obo_asym.contains("is_asymmetric: true\n"), "{obo_asym}");
+    assert!(!obo_asym.contains("is_anti_symmetric: true"), "{obo_asym}");
+    let back_asym = obo::parse(&obo_asym).unwrap();
+    assert_eq!(
+        Document::new(back_asym.header, back_asym.axioms),
+        Document::new(Header::default(), asym_axioms)
+    );
+
+    let ext_anti = "format-version: 1.4\n\n[Typedef]\nid: RO:0000001\nis_anti_symmetric: true\n";
+    let parsed_anti = obo::parse(ext_anti).unwrap();
+    assert!(
+        !parsed_anti
+            .axioms
+            .iter()
+            .any(|a| matches!(a.kind, AxiomKind::AsymmetricObjectProperty(_)))
+    );
+    assert!(
+        parsed_anti
+            .axioms
+            .contains(&Axiom::new(AxiomKind::AnnotationAssertion(
+                AnnotationProperty::new(format!("{}is_anti_symmetric", obo::OBO_IN_OWL)),
+                AnnotationSubject::Iri(p_asym.0.clone()),
+                AnnotationValue::Literal(Literal::typed("true", vocab::XSD_BOOLEAN)),
+            )))
+    );
+
+    // 2. IDSPACE shadowing OBO PURL + standard prefix shadowing + non-http/https/urn IRIs + .obo header IRI
+    let custom_r = Renderer::new([("GO", "https://example.org/go/")]);
+    let mut header = Header {
+        iri: Some(iri(obo_iri("test.obo"))),
+        ..Default::default()
+    };
+    // Duplicate saved-by & annotated comment must not overwrite or drop
+    header.annotations.insert(Annotation::new(
+        AnnotationProperty::new(OIO_SAVED_BY),
+        AnnotationValue::Literal(Literal::simple("alice")),
+    ));
+    header.annotations.insert(Annotation::new(
+        AnnotationProperty::new(OIO_SAVED_BY),
+        AnnotationValue::Literal(Literal::simple("bob")),
+    ));
+    header.annotations.insert(Annotation {
+        property: AnnotationProperty::new(vocab::RDFS_COMMENT),
+        value: AnnotationValue::Literal(Literal::simple("annotated comment")),
+        annotations: [Annotation::new(
+            AnnotationProperty::new(OIO_IS_INFERRED),
+            AnnotationValue::Literal(Literal::simple("true")),
+        )]
+        .into_iter()
+        .collect(),
+    });
+    let go_obo = Class::new(obo_iri("GO_0000001"));
+    let go_custom = Class::new("https://example.org/go/0000001");
+    let rdf_obo = Class::new(obo_iri("rdf_1"));
+    let ftp_cls = Class::new("ftp://example.org/cls/1");
+    let file_cls = Class::new("file:///tmp/onto#C1");
+    let doi_cls = Class::new("doi:10.1234/abc");
+    let bang_cls = Class::new("https://example.org/A!B");
+    let shadow_axioms = vec![
+        Axiom::declaration(Entity::Class(go_obo.clone())),
+        Axiom::declaration(Entity::Class(go_custom.clone())),
+        Axiom::declaration(Entity::Class(rdf_obo.clone())),
+        Axiom::declaration(Entity::Class(ftp_cls.clone())),
+        Axiom::declaration(Entity::Class(file_cls.clone())),
+        Axiom::declaration(Entity::Class(doi_cls.clone())),
+        Axiom::declaration(Entity::Class(bang_cls.clone())),
+        Axiom::sub_class_of(go_obo.clone(), go_custom.clone()),
+        Axiom::sub_class_of(bang_cls.clone(), rdf_obo.clone()),
+        // Multi-label, multi-def, multi-comment, boundary spaces, unbalanced quote, escaped xrefs & subset
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            AnnotationProperty::new(vocab::RDFS_LABEL),
+            AnnotationSubject::Iri(go_obo.0.clone()),
+            AnnotationValue::Literal(Literal::simple(" cell ")),
+        )),
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            AnnotationProperty::new(vocab::RDFS_LABEL),
+            AnnotationSubject::Iri(go_obo.0.clone()),
+            AnnotationValue::Literal(Literal::simple("5\" pipe")),
+        )),
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            AnnotationProperty::new(vocab::RDFS_COMMENT),
+            AnnotationSubject::Iri(go_obo.0.clone()),
+            AnnotationValue::Literal(Literal::simple("first comment")),
+        )),
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            AnnotationProperty::new(vocab::RDFS_COMMENT),
+            AnnotationSubject::Iri(go_obo.0.clone()),
+            AnnotationValue::Literal(Literal::simple("second comment")),
+        )),
+        Axiom {
+            kind: AxiomKind::AnnotationAssertion(
+                AnnotationProperty::new(IAO_DEFINITION),
+                AnnotationSubject::Iri(go_obo.0.clone()),
+                AnnotationValue::Literal(Literal::simple("def one")),
+            ),
+            annotations: [
+                Annotation::new(
+                    AnnotationProperty::new(OIO_HAS_DBXREF),
+                    AnnotationValue::Literal(Literal::simple("DOI:10,20!30[40]\\50")),
+                ),
+                Annotation::new(
+                    AnnotationProperty::new(OIO_HAS_DBXREF),
+                    AnnotationValue::Literal(Literal::simple("PMID:999")),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        },
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            AnnotationProperty::new(IAO_DEFINITION),
+            AnnotationSubject::Iri(go_obo.0.clone()),
+            AnnotationValue::Literal(Literal::simple("def two")),
+        )),
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            AnnotationProperty::new(OIO_IN_SUBSET),
+            AnnotationSubject::Iri(go_obo.0.clone()),
+            AnnotationValue::Iri(iri("https://example.org/sub!set")),
+        )),
+        // Typedef replaced_by, consider, alt_id, subset, synonym, created_by, creation_date
+        Axiom::declaration(Entity::ObjectProperty(p_asym.clone())),
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            AnnotationProperty::new(IAO_REPLACED_BY),
+            AnnotationSubject::Iri(p_asym.0.clone()),
+            AnnotationValue::Iri(iri(obo_iri("RO_0000002"))),
+        )),
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            AnnotationProperty::new(OIO_CONSIDER),
+            AnnotationSubject::Iri(p_asym.0.clone()),
+            AnnotationValue::Iri(iri(obo_iri("RO_0000003"))),
+        )),
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            AnnotationProperty::new(OIO_HAS_ALT_ID),
+            AnnotationSubject::Iri(p_asym.0.clone()),
+            AnnotationValue::Literal(Literal::simple("RO:9999999")),
+        )),
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            AnnotationProperty::new(OIO_CREATED_BY),
+            AnnotationSubject::Iri(p_asym.0.clone()),
+            AnnotationValue::Literal(Literal::simple("curator")),
+        )),
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            AnnotationProperty::new(OIO_CREATION_DATE),
+            AnnotationSubject::Iri(p_asym.0.clone()),
+            AnnotationValue::Literal(Literal::simple("2026-11-26T00:00:00Z")),
+        )),
+    ];
+
+    let (obo_text, rep_shadow) = obo::document(
+        &custom_r,
+        &header,
+        shadow_axioms.iter(),
+        WriteOptions { strict: true },
+    )
+    .unwrap();
+    assert!(rep_shadow.is_lossless(), "{rep_shadow:?}");
+    assert_valid_obo_structure(&obo_text);
+    // Order-independent determinism check
+    let rev: Vec<&Axiom> = shadow_axioms.iter().rev().collect();
+    let (obo_rev, _) =
+        obo::document(&custom_r, &header, rev, WriteOptions { strict: true }).unwrap();
+    assert_eq!(obo_text, obo_rev, "OBO output must be order-independent");
+
+    let back_shadow = obo::parse(&obo_text).unwrap();
+    assert_eq!(
+        Document::new(back_shadow.header, back_shadow.axioms),
+        Document::new(header, shadow_axioms)
+    );
+
+    // 3. DataProperty declaration, DataPropertyAssertion, multiple instance_of, typed/IRI qualifiers,
+    // duplicate hasSynonymType, and header-only loss must be refused in strict mode & reported in lenient mode
+    let lossy_cases: Vec<Vec<Axiom>> = vec![
+        vec![Axiom::declaration(Entity::DataProperty(dp("age")))],
+        vec![Axiom::new(AxiomKind::DataPropertyAssertion(
+            dp("age"),
+            ind("i1"),
+            Literal::typed("5", vocab::XSD_INTEGER),
+        ))],
+        vec![
+            Axiom::declaration(Entity::NamedIndividual(NamedIndividual::new(ex("i1")))),
+            Axiom::class_assertion(cls("A"), ind("i1")),
+            Axiom::class_assertion(cls("B"), ind("i1")),
+        ],
+        vec![
+            Axiom::sub_class_of(cls("A"), cls("B")).annotated(Annotation::new(
+                ap("flag"),
+                AnnotationValue::Literal(Literal::typed("true", vocab::XSD_BOOLEAN)),
+            )),
+        ],
+        vec![
+            Axiom::sub_class_of(cls("A"), cls("B")).annotated(Annotation::new(
+                ap("ref"),
+                AnnotationValue::Iri(iri(ex("Target"))),
+            )),
+        ],
+    ];
+    for case in &lossy_cases {
+        let err = obo::document(
+            &renderer(),
+            &Header::default(),
+            case.iter(),
+            WriteOptions { strict: true },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, WriteError::Unsupported(_)),
+            "{case:?}: {err:?}"
+        );
+        let (_, rep) = obo::document(
+            &renderer(),
+            &Header::default(),
+            case.iter(),
+            WriteOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(rep.skipped_count, 1, "{case:?}: {rep:?}");
+        assert!(!rep.is_lossless());
+    }
+
+    // Header-only loss (language-tagged ontology annotation)
+    let mut lang_hdr = Header::default();
+    lang_hdr.annotations.insert(Annotation::new(
+        AnnotationProperty::new(vocab::RDFS_LABEL),
+        AnnotationValue::Literal(Literal::lang("bonjour", "fr").unwrap()),
+    ));
+    assert!(matches!(
+        obo::document(
+            &renderer(),
+            &lang_hdr,
+            std::iter::empty::<&Axiom>(),
+            WriteOptions { strict: true }
+        ),
+        Err(WriteError::Unsupported(_))
+    ));
+    let (_, hdr_rep) = obo::document(
+        &renderer(),
+        &lang_hdr,
+        std::iter::empty::<&Axiom>(),
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(hdr_rep.skipped_count, 0);
+    assert_eq!(hdr_rep.skipped_header_count, 1);
+    assert!(!hdr_rep.is_lossless());
+
+    // MAX_REPORTED_SKIPPED bound on OBO
+    let many_unsup: Vec<Axiom> = (0..1_200)
+        .map(|i| Axiom::sub_class_of(cls(&format!("A{i}")), ClassExpression::not(cls("B"))))
+        .collect();
+    let (_, rep_many) = obo::document(
+        &renderer(),
+        &Header::default(),
+        many_unsup.iter(),
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(rep_many.skipped_count, 1_200);
+    assert_eq!(rep_many.skipped.len(), MAX_REPORTED_SKIPPED);
+
+    // Deep unsupported axiom bound in both strict and lenient modes
+    let mut deep = ClassExpression::Class(cls("A"));
+    for _ in 0..140 {
+        deep = ClassExpression::not(deep);
+    }
+    let deep_ax = Axiom::sub_class_of(cls("B"), deep);
+    for strict in [false, true] {
+        let err = obo::document(
+            &renderer(),
+            &Header::default(),
+            [&deep_ax],
+            WriteOptions { strict },
+        )
+        .unwrap_err();
+        assert!(matches!(err, WriteError::Unsupported(_)), "{err:?}");
+    }
+}
+
+/// Independent validator for OBO Graphs JSON schema structure.
+fn assert_valid_obographs_schema(json_text: &str) {
+    let val: serde_json::Value = serde_json::from_str(json_text).expect("valid JSON");
+    let graphs = val
+        .get("graphs")
+        .and_then(|v| v.as_array())
+        .expect("graphs array");
+    assert_eq!(graphs.len(), 1);
+    let g = graphs[0].as_object().expect("graph object");
+    for node in g
+        .get("nodes")
+        .and_then(|v| v.as_array())
+        .expect("nodes array")
+    {
+        let obj = node.as_object().expect("node object");
+        assert!(obj.get("id").and_then(|v| v.as_str()).is_some());
+        if let Some(ty) = obj.get("type").and_then(|v| v.as_str()) {
+            assert!(
+                matches!(ty, "CLASS" | "PROPERTY" | "INDIVIDUAL"),
+                "bad type: {ty}"
+            );
+            if let Some(pt) = obj.get("propertyType").and_then(|v| v.as_str()) {
+                assert_eq!(ty, "PROPERTY");
+                assert!(
+                    matches!(pt, "OBJECT" | "DATA" | "ANNOTATION"),
+                    "bad propertyType: {pt}"
+                );
+            }
+        }
+    }
+    for edge in g
+        .get("edges")
+        .and_then(|v| v.as_array())
+        .expect("edges array")
+    {
+        let obj = edge.as_object().expect("edge object");
+        assert!(obj.get("sub").and_then(|v| v.as_str()).is_some());
+        assert!(obj.get("pred").and_then(|v| v.as_str()).is_some());
+        assert!(obj.get("obj").and_then(|v| v.as_str()).is_some());
+    }
+}
+
+#[test]
+fn obographs_property_types_punning_strict_values_io_error_and_bounds() {
+    // 1. All 3 propertyType kinds round-trip distinctly + order-independent lbl/def determinism
+    let prop_axioms = vec![
+        Axiom::declaration(Entity::Class(cls("C"))),
+        Axiom::declaration(Entity::ObjectProperty(op("objp"))),
+        Axiom::declaration(Entity::DataProperty(dp("datap"))),
+        Axiom::declaration(Entity::AnnotationProperty(ap("annp"))),
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            AnnotationProperty::new(vocab::RDFS_LABEL),
+            AnnotationSubject::Iri(iri(ex("C"))),
+            AnnotationValue::Literal(Literal::simple("zeta")),
+        )),
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            AnnotationProperty::new(vocab::RDFS_LABEL),
+            AnnotationSubject::Iri(iri(ex("C"))),
+            AnnotationValue::Literal(Literal::simple("alpha")),
+        )),
+    ];
+    let (j1, rep1) = obographs::document(
+        &renderer(),
+        &Header::default(),
+        prop_axioms.iter(),
+        WriteOptions { strict: true },
+    )
+    .unwrap();
+    assert!(rep1.is_lossless(), "{rep1:?}");
+    assert_valid_obographs_schema(&j1);
+    assert!(j1.contains("\"propertyType\" : \"OBJECT\""), "{j1}");
+    assert!(j1.contains("\"propertyType\" : \"DATA\""), "{j1}");
+    assert!(j1.contains("\"propertyType\" : \"ANNOTATION\""), "{j1}");
+
+    // Reverse order produces identical bytes
+    let rev: Vec<&Axiom> = prop_axioms.iter().rev().collect();
+    let (j2, _) = obographs::document(
+        &renderer(),
+        &Header::default(),
+        rev,
+        WriteOptions { strict: true },
+    )
+    .unwrap();
+    assert_eq!(j1, j2, "OBO Graphs JSON must be order-independent");
+
+    let back = obographs::parse(&j1).unwrap();
+    assert_eq!(
+        Document::new(back.header, back.axioms),
+        Document::new(Header::default(), prop_axioms)
+    );
+
+    // 2. Class / NamedIndividual punning collision refuses/skips and never turns assertion into SubClassOf
+    let punned = [
+        Axiom::declaration(Entity::Class(cls("X"))),
+        Axiom::declaration(Entity::NamedIndividual(NamedIndividual::new(ex("X")))),
+        Axiom::declaration(Entity::NamedIndividual(NamedIndividual::new(ex("Y")))),
+        Axiom::declaration(Entity::ObjectProperty(op("p"))),
+        Axiom::new(AxiomKind::ObjectPropertyAssertion(
+            op("p").into(),
+            ind("X"),
+            ind("Y"),
+        )),
+    ];
+    assert!(matches!(
+        obographs::document(
+            &renderer(),
+            &Header::default(),
+            punned.iter(),
+            WriteOptions { strict: true },
+        ),
+        Err(WriteError::Unsupported(_))
+    ));
+    let (pun_json, pun_rep) = obographs::document(
+        &renderer(),
+        &Header::default(),
+        punned.iter(),
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(pun_rep.skipped_count, 2, "{pun_rep:?}");
+    let pun_back = obographs::parse(&pun_json).unwrap();
+    assert!(
+        !pun_back
+            .axioms
+            .iter()
+            .any(|a| matches!(a.kind, AxiomKind::SubClassOf(..))),
+        "punned assertion must never silently become SubClassOf"
+    );
+
+    // 3. Typed literal & IRI-valued generic annotations (node, edge, header) refused in strict mode & reported in lenient
+    let typed_node_ann = [
+        Axiom::declaration(Entity::Class(cls("A"))),
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            ap("count"),
+            AnnotationSubject::Iri(iri(ex("A"))),
+            AnnotationValue::Literal(Literal::typed("7", vocab::XSD_INTEGER)),
+        )),
+    ];
+    let iri_node_ann = [
+        Axiom::declaration(Entity::Class(cls("A"))),
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            ap("seeRef"),
+            AnnotationSubject::Iri(iri(ex("A"))),
+            AnnotationValue::Iri(iri(ex("Other"))),
+        )),
+    ];
+    let typed_edge_ann = [
+        Axiom::sub_class_of(cls("A"), cls("B")).annotated(Annotation::new(
+            ap("weight"),
+            AnnotationValue::Literal(Literal::typed("7", vocab::XSD_INTEGER)),
+        )),
+    ];
+    for case in [&typed_node_ann[..], &iri_node_ann[..], &typed_edge_ann[..]] {
+        assert!(matches!(
+            obographs::document(
+                &renderer(),
+                &Header::default(),
+                case.iter(),
+                WriteOptions { strict: true },
+            ),
+            Err(WriteError::Unsupported(_))
+        ));
+        let (_, rep) = obographs::document(
+            &renderer(),
+            &Header::default(),
+            case.iter(),
+            WriteOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(rep.skipped_count, 1, "{rep:?}");
+        assert!(!rep.is_lossless());
+    }
+
+    // Header-only loss (language-tagged ontology annotation)
+    let mut lang_hdr = Header::default();
+    lang_hdr.annotations.insert(Annotation::new(
+        AnnotationProperty::new(vocab::RDFS_LABEL),
+        AnnotationValue::Literal(Literal::lang("bonjour", "fr").unwrap()),
+    ));
+    assert!(matches!(
+        obographs::document(
+            &renderer(),
+            &lang_hdr,
+            std::iter::empty::<&Axiom>(),
+            WriteOptions { strict: true },
+        ),
+        Err(WriteError::Unsupported(_))
+    ));
+    let (_, hdr_rep) = obographs::document(
+        &renderer(),
+        &lang_hdr,
+        std::iter::empty::<&Axiom>(),
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(hdr_rep.skipped_count, 0);
+    assert_eq!(hdr_rep.skipped_header_count, 1);
+    assert!(!hdr_rep.is_lossless());
+
+    // 4. WriteError::Io preserved on failing Write sink
+    struct FailWriter;
+    impl Write for FailWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "simulated broken pipe",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut fw = FailWriter;
+    let err = obographs::write_document(
+        &mut fw,
+        &renderer(),
+        &Header {
+            iri: Some(iri(ex("g"))),
+            ..Default::default()
+        },
+        std::iter::empty::<&Axiom>(),
+        WriteOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, WriteError::Io(_)),
+        "expected WriteError::Io, got {err:?}"
+    );
+
+    // 5. MAX_REPORTED_SKIPPED bound & deep unsupported axiom bound
+    let many_unsup: Vec<Axiom> = (0..1_200)
+        .map(|i| Axiom::sub_class_of(cls(&format!("A{i}")), ClassExpression::not(cls("B"))))
+        .collect();
+    let (_, rep_many) = obographs::document(
+        &renderer(),
+        &Header::default(),
+        many_unsup.iter(),
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(rep_many.skipped_count, 1_200);
+    assert_eq!(rep_many.skipped.len(), MAX_REPORTED_SKIPPED);
+
+    let mut deep = ClassExpression::Class(cls("A"));
+    for _ in 0..140 {
+        deep = ClassExpression::not(deep);
+    }
+    let deep_ax = Axiom::sub_class_of(cls("B"), deep);
+    for strict in [false, true] {
+        let err = obographs::document(
+            &renderer(),
+            &Header::default(),
+            [&deep_ax],
+            WriteOptions { strict },
+        )
+        .unwrap_err();
+        assert!(matches!(err, WriteError::Unsupported(_)), "{err:?}");
+    }
+}
