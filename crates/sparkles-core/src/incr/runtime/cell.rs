@@ -18,6 +18,8 @@ pub(super) enum Status {
 #[derive(Clone, Debug)]
 pub(super) struct Info {
     pub(super) status: Status,
+    /// the runtime mode generation this circuit has been compiled for
+    pub(super) mode_gen: u64,
     pub(super) applied: u64,
     pub(super) rows: u64,
     pub(super) bytes: u64,
@@ -86,6 +88,8 @@ pub(crate) struct Slot {
     /// that evaluation publishes leads from one mode to the other, and diffs from before
     /// it must not rewind a view across the switch
     pub(super) rebased: bool,
+    /// the runtime mode generation `circuit` has been compiled for
+    pub(super) mode_gen: u64,
     pub(super) circuit: Circuit,
 }
 
@@ -730,6 +734,7 @@ mod drop_order_tests {
             subs: Vec::new(),
             view_limits,
             rebased: false,
+            mode_gen: 0,
             circuit,
         };
         let rows: Arc<[(Vec<Option<Term>>, i64)]> = Arc::from(vec![(

@@ -1683,3 +1683,174 @@ fn rebuilt_exists_keeps_retained_syntax_and_patterns_charged() {
         );
     }
 }
+
+/// A `SERVICE view:read` query (both streaming cursor and eager execution) honors its
+/// timeout and cancellation across an aggregate-error or inference mode change while
+/// the views worker is busy, never returning stale old-mode rows, and succeeds cleanly
+/// once the worker completes the mode switch (item 1101).
+#[test]
+fn view_cursor_honors_deadline_and_cancel_across_mode_change() {
+    use parking_lot::Mutex;
+    use sparkles_core::incr::Inference;
+    use sparkles_core::sparql::rdfs::{RdfsOnRead, SchemaSource};
+
+    struct SwitchHost {
+        errors: Mutex<AggregateErrors>,
+        inference: Mutex<Option<Inference>>,
+    }
+    impl Host for SwitchHost {
+        fn access(&self, _: Option<&str>) -> Result<Option<Arc<GraphAccess>>> {
+            Ok(None)
+        }
+        fn stored_query(&self, _: &str) -> Result<String> {
+            Err(Error::NotFound("none".into()))
+        }
+        fn inference(&self) -> Option<Inference> {
+            self.inference.lock().clone()
+        }
+        fn aggregate_errors(&self) -> AggregateErrors {
+            *self.errors.lock()
+        }
+    }
+
+    let s = Arc::new(Store::in_memory(StoreOptions::default()));
+    upd(
+        &s,
+        "INSERT DATA { \
+            ex:a ex:g \"x\" ; ex:v 1 . \
+            ex:b ex:g \"x\" . \
+            ex:Student <http://www.w3.org/2000/01/rdf-schema#subClassOf> ex:Person . \
+            ex:alice a ex:Student \
+        }",
+    );
+    let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    let host = Arc::new(SwitchHost {
+        errors: Mutex::new(AggregateErrors::Jena),
+        inference: Mutex::new(None),
+    });
+    rt.set_host(host.clone());
+    rt.put(
+        &s,
+        "agg",
+        ViewDef::table(format!(
+            "{P}SELECT (MIN(?v) AS ?m) WHERE {{ ?s ex:g ?g OPTIONAL {{ ?s ex:v ?v }} }}"
+        )),
+    )
+    .unwrap();
+    rt.put(
+        &s,
+        "people",
+        ViewDef::table(format!("{P}SELECT ?x WHERE {{ ?x a ex:Person }}")),
+    )
+    .unwrap();
+    let worker_store = s.clone();
+    let worker = rt
+        .spawn_worker("cursor-1101".into(), s.subscribe_commits(), move || {
+            Some(worker_store.clone())
+        })
+        .unwrap();
+    rt.wait_built("agg", Duration::from_secs(5)).unwrap();
+    rt.wait_built("people", Duration::from_secs(5)).unwrap();
+
+    // Pause the worker (simulating an in-flight round on another view) and switch both
+    // aggregate_errors and inference.
+    let pause = rt
+        .pause_worker(Instant::now() + Duration::from_secs(5))
+        .expect("worker pause");
+    *host.errors.lock() = AggregateErrors::Sparkles;
+    *host.inference.lock() = Inference::new(
+        Some(Arc::new(RdfsOnRead::new(SchemaSource::Graph(None)))),
+        Vec::new(),
+    );
+
+    let q_agg = format!(
+        "{P}SELECT ?m {{ SERVICE view:read {{ [] view:name 'agg'; view:bind ?m; view:allowStale true }} }}"
+    );
+    let q_people =
+        format!("{P}SELECT ?x {{ SERVICE view:read {{ [] view:name 'people'; view:bind ?x }} }}");
+
+    // 1. Streaming cursor with a short timeout fails promptly with Timeout.
+    for q in [&q_agg, &q_people] {
+        let t0 = Instant::now();
+        let opts = QueryOptions {
+            views: Some(rt.clone()),
+            aggregate_errors: Some(AggregateErrors::Sparkles),
+            timeout: Some(Duration::from_millis(40)),
+            ..Default::default()
+        };
+        let mut cursor = select_cursor(s.snapshot(), q, &opts, &strict(8)).unwrap();
+        let err = cursor.next_batch().err().expect("expected timeout");
+        assert!(matches!(err, Error::Timeout), "got {err:?}");
+        assert!(t0.elapsed() < Duration::from_secs(2));
+    }
+
+    // 2. Streaming cursor cancelled mid-wait fails promptly with Cancelled.
+    {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_bg = cancel.clone();
+        let opts = QueryOptions {
+            views: Some(rt.clone()),
+            aggregate_errors: Some(AggregateErrors::Sparkles),
+            timeout: Some(Duration::from_secs(10)),
+            cancel: Some(cancel),
+            ..Default::default()
+        };
+        let snap = s.snapshot();
+        let q = q_people.clone();
+        let handle = std::thread::spawn(move || {
+            let mut cursor = select_cursor(snap, &q, &opts, &strict(8)).unwrap();
+            cursor.next_batch().err()
+        });
+        std::thread::sleep(Duration::from_millis(25));
+        cancel_bg.store(true, Ordering::Relaxed);
+        let err = handle.join().unwrap().expect("expected cancellation");
+        assert!(matches!(err, Error::Cancelled), "got {err:?}");
+    }
+
+    // 3. Eager query with a short timeout fails promptly with Timeout.
+    {
+        let t0 = Instant::now();
+        let opts = QueryOptions {
+            views: Some(rt.clone()),
+            aggregate_errors: Some(AggregateErrors::Sparkles),
+            timeout: Some(Duration::from_millis(40)),
+            ..Default::default()
+        };
+        let err = query(s.snapshot(), &q_people, &opts)
+            .err()
+            .expect("expected eager timeout");
+        assert!(matches!(err, Error::Timeout), "got {err:?}");
+        assert!(t0.elapsed() < Duration::from_secs(2));
+    }
+
+    // Release the worker and confirm subsequent streaming and eager reads return the
+    // new-mode rows cleanly.
+    drop(pause);
+    rt.kick();
+
+    let ok_opts = QueryOptions {
+        views: Some(rt.clone()),
+        aggregate_errors: Some(AggregateErrors::Sparkles),
+        timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
+    };
+    let (agg_rows, _) = drain(&s.snapshot(), &q_agg, &ok_opts, 8).unwrap();
+    assert_eq!(agg_rows.len(), 1);
+    assert!(
+        agg_rows[0][0]
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .contains("\"1\"")
+    );
+
+    let people_rows = eager_rows(&s.snapshot(), &q_people, &ok_opts);
+    assert_eq!(people_rows.len(), 1);
+    assert_eq!(
+        people_rows[0][0].as_ref().unwrap().to_string(),
+        "<http://example.org/alice>"
+    );
+
+    rt.close(&s);
+    worker.join().unwrap();
+}

@@ -1730,6 +1730,36 @@ the persistent reopen assertion that exposed the directory lock race. The worker
 callback case that reopens through a retained state and the thread-local destruction
 case each pass 100 repetitions.
 
+### View read deadlines across mode changes
+
+Item 1101 separated mode change recording from per-circuit recompilation so a view read
+never holds the registry lock across another view's running pass or waits past its
+deadline or cancellation.
+
+The registry tracks a monotonically increasing mode generation alongside the dataset's
+inference and aggregate-error reading, and each circuit records the mode generation it
+was compiled for in both its slot and its leaf info block. Recording a host mode change
+updates the registry's target mode and generation without locking any circuit state.
+Idle circuits recompile outside the registry lock and drop their replaced operators and
+retired budget leases outside all locks. The worker's round processes idle circuits in
+a first pass before waiting on busy circuits, so a concurrent pass or live-query build
+on one view does not delay switching and rebuilding unrelated views. View reads check
+the registry's mode and the circuit's mode generation in bounded cooperative steps,
+honor deadlines with `Timeout` and cancellation with `Cancelled` even when `allowStale`
+is set, refuse missing views immediately with `view-not-found`, and never return rows
+from an earlier mode. Metadata calls (`get`, `list`, and `wait_built`) report lagging
+busy circuits as `building` without blocking on their running passes, and garbage
+collection preserves the live-query switch boundary when dropping an unswitched dead
+circuit.
+
+Deterministic tests pause the worker inside an unrelated view's pass through the
+`view-pass-applied` failpoint across both aggregate-error and RDFS-on-read mode changes
+and check that `read`, `open_view`, `get`, `list`, and `wait_built` respect deadlines
+and cancellation without returning old-mode rows, while reads succeed once the pass
+ends. Additional tests verify that holding one circuit's state lock outside the worker
+does not block switching and reading unrelated views and that streaming and eager
+`SERVICE view:read` queries honor timeouts and cancellation across mode changes.
+
 ### Scope changes
 
 **RSP-QL windows and complex event processing.** The non-goal in §1 excluded stream reasoning and windows over time, as in RSP-QL or C-SPARQL, so that a commit stayed the only unit of change. RSP-QL windows and complex event processing are now planned under [ROADMAP](../ROADMAP.md) item 467 in this spec's Roadmap follow-ups.

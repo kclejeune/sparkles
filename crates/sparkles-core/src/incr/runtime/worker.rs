@@ -255,8 +255,13 @@ impl Runtime {
 
     /// Wait until a round has finished after this call, at most until `until`.
     pub(super) fn wait_round(&self, until: Instant) -> bool {
+        let start = *self.epoch.lock();
+        self.wait_round_since(start, until)
+    }
+
+    /// Wait until the finished-round counter advances past `start`, at most until `until`.
+    pub(super) fn wait_round_since(&self, start: u64, until: Instant) -> bool {
         let mut e = self.epoch.lock();
-        let start = *e;
         while *e == start {
             if self.cv.wait_until(&mut e, until).timed_out() {
                 return false;

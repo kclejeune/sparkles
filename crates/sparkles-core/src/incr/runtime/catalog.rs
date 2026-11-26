@@ -36,10 +36,10 @@ impl Runtime {
         compile(&q, whole_reason(access.as_ref()))?;
         let mut deferred = DeferredDrops::default();
         let mut need_gc = false;
-        let res = {
+        let (res, target, lagging) = {
             let mut reg = self.reg.lock();
             reg.writable()?;
-            self.sync_inference(&mut reg, host.as_ref(), &mut deferred);
+            let (target, lagging) = self.note_mode(&mut reg, host.as_ref());
             // a new definition is the operator's: it runs, and no longer waits for a check
             if let Some(root) = &self.root {
                 views::write(root, name, &def)?;
@@ -53,9 +53,18 @@ impl Runtime {
             reg.views
                 .insert(name.to_string(), ViewEntry::new(name, def, None));
             *self.defs.write() = reg.defs();
-            self.attach(store, &mut reg, name, &mut deferred.retired)
+            let res = self.attach(store, &mut reg, name, &mut deferred.retired);
+            (res, target, lagging)
+        };
+        let any_busy = if !lagging.is_empty() {
+            self.try_switch_cells(&lagging, &target, &mut deferred)
+        } else {
+            false
         };
         drop(deferred);
+        if !lagging.is_empty() && !any_busy {
+            self.mark_mode_switched(target.generation);
+        }
         if need_gc {
             self.gc();
         }
@@ -115,7 +124,7 @@ impl Runtime {
         Ok(())
     }
 
-    pub(super) fn info(&self, name: &str, e: &ViewEntry, head: u64) -> ViewInfo {
+    pub(super) fn info(&self, name: &str, e: &ViewEntry, head: u64, reg: &Registry) -> ViewInfo {
         let mut v = ViewInfo {
             name: name.to_string(),
             definition: e.def.clone(),
@@ -143,16 +152,24 @@ impl Runtime {
             return v;
         };
         let i = cell.info.lock().clone();
-        if i.status_ready() {
+        let stale_mode = i.mode_gen < reg.mode_gen;
+        if i.status_ready() && !stale_mode {
             v.commit = Some(i.applied);
         }
         v.columns = i.columns;
-        v.evaluation = Some(if i.whole.is_some() {
+        let whole = if stale_mode {
+            whole_reason(e.access.as_ref())
+                .map(str::to_string)
+                .or_else(|| reg.inference.as_ref().map(|inf| inf.reason().to_string()))
+        } else {
+            i.whole
+        };
+        v.evaluation = Some(if whole.is_some() {
             crate::incr::ops::Mode::Recompute
         } else {
             crate::incr::ops::Mode::Incremental
         });
-        v.evaluation_reason = i.whole;
+        v.evaluation_reason = whole;
         v.plan = Some(i.plan);
         v.rows = i.rows;
         v.state_bytes = i.bytes;
@@ -162,6 +179,7 @@ impl Runtime {
         v.recompute_ms = i.recompute_time.as_secs_f64() * 1e3;
         v.state = match i.status {
             Status::Building => ViewState::Building,
+            Status::Ready if stale_mode => ViewState::Building,
             Status::Ready if i.applied >= head => ViewState::Current,
             Status::Ready => ViewState::Behind {
                 commits: head - i.applied,
@@ -187,32 +205,22 @@ impl Runtime {
     pub fn get(&self, store: &Store, name: &str) -> Result<ViewInfo> {
         let _operation = Operation::enter();
         let head = store.snapshot().commit;
-        let mut deferred = DeferredDrops::default();
-        let out = {
-            let mut reg = self.reg.lock();
-            self.sync_for_read(&mut reg, &mut deferred);
-            let e = reg.view(name)?;
-            Ok(self.info(name, e, head))
-        };
-        drop(deferred);
-        out
+        self.sync_mode_nonblocking();
+        let reg = self.reg.lock();
+        let e = reg.view(name)?;
+        Ok(self.info(name, e, head, &reg))
     }
 
     /// Every view with its state, by name.
     pub fn list(&self, store: &Store) -> Vec<ViewInfo> {
         let _operation = Operation::enter();
         let head = store.snapshot().commit;
-        let mut deferred = DeferredDrops::default();
-        let out = {
-            let mut reg = self.reg.lock();
-            self.sync_for_read(&mut reg, &mut deferred);
-            reg.views
-                .iter()
-                .map(|(n, e)| self.info(n, e, head))
-                .collect()
-        };
-        drop(deferred);
-        out
+        self.sync_mode_nonblocking();
+        let reg = self.reg.lock();
+        reg.views
+            .iter()
+            .map(|(n, e)| self.info(n, e, head, &reg))
+            .collect()
     }
 
     /// The names and definitions of the views.
@@ -230,31 +238,35 @@ impl Runtime {
         let _operation = Operation::enter();
         let until = Instant::now() + timeout;
         loop {
-            let mut deferred = DeferredDrops::default();
-            let (cell, err) = {
-                let mut reg = self.reg.lock();
-                self.sync_for_read(&mut reg, &mut deferred);
+            let round_start = *self.epoch.lock();
+            self.sync_mode_nonblocking();
+            let (cell, err, mode_gen) = {
+                let reg = self.reg.lock();
                 let e = reg.view(name)?;
                 (
                     e.cell.clone(),
                     e.suspended.clone().or_else(|| e.error.clone()),
+                    reg.mode_gen,
                 )
             };
-            drop(deferred);
             if err.is_some() {
                 break;
             }
-            if cell.is_some_and(|c| c.info.lock().status != Status::Building) {
+            if cell.is_some_and(|c| {
+                let i = c.info.lock();
+                i.mode_gen >= mode_gen && i.status != Status::Building
+            }) {
                 break;
             }
             self.kick();
-            if !self.wait_round(until) && Instant::now() >= until {
+            let step = (Instant::now() + read::WAIT_STEP).min(until);
+            if !self.wait_round_since(round_start, step) && Instant::now() >= until {
                 break;
             }
         }
         let reg = self.reg.lock();
         let e = reg.view(name)?;
         let head = e.cell.as_ref().map_or(0, |c| c.info.lock().applied);
-        Ok(self.info(name, e, head))
+        Ok(self.info(name, e, head, &reg))
     }
 }

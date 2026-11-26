@@ -29,38 +29,52 @@ impl Runtime {
             return false;
         }
         self.attach_pending(store);
-        let cells: Vec<Arc<Cell>> = self.reg.lock().cells.values().cloned().collect();
+        let (target, cells) = {
+            let reg = self.reg.lock();
+            (
+                reg.target_mode(),
+                reg.cells.values().cloned().collect::<Vec<_>>(),
+            )
+        };
         let mut deltas: FxHashMap<u64, Arc<DeltaSet>> = FxHashMap::default();
         let mut worked = false;
         let mut over: Vec<(Arc<Cell>, u64)> = Vec::new();
+        let mut busy: Vec<Arc<Cell>> = Vec::new();
+        // Process idle cells first so a concurrent pass or live-query build on one
+        // circuit cannot delay unrelated views from switching mode and rebuilding.
         for cell in &cells {
-            // the status is read under the state lock: a switch of the inference replaces
-            // the circuit and marks it `building` under that lock
+            let mut deferred = DeferredDrops::default();
+            let ran = {
+                if let Some(mut st) = cell.state.try_lock() {
+                    if self.round_cell(store, cell, &mut st, &target, &mut deltas, &mut deferred) {
+                        worked = true;
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            drop(deferred);
+            if ran {
+                let bytes = cell.info.lock().bytes;
+                over.push((cell.clone(), bytes));
+            } else {
+                busy.push(cell.clone());
+            }
+        }
+        for cell in &busy {
             let mut deferred = DeferredDrops::default();
             {
                 let mut st = cell.state.lock();
-                // Prune departed or explicitly closed live subscribers before admitting
-                // a build or advance pass so the first pass uses the exact active ceiling.
-                st.prune_dead_subs();
-                let status = cell.info.lock().status.clone();
-                match status {
-                    Status::Building => {
-                        self.build(store, cell, &mut st, &mut deferred);
-                        worked = true;
-                    }
-                    Status::Ready => {
-                        if self.advance(store, cell, &mut st, &mut deltas, &mut deferred) {
-                            worked = true;
-                        }
-                    }
-                    Status::Failed { .. } => {}
+                if self.round_cell(store, cell, &mut st, &target, &mut deltas, &mut deferred) {
+                    worked = true;
                 }
-                deferred.retired.extend(st.circuit.drain_retired());
             }
             drop(deferred);
             let bytes = cell.info.lock().bytes;
             over.push((cell.clone(), bytes));
         }
+        self.mark_mode_switched(target.generation);
         let internal: Vec<Arc<InternalCell>> = self.reg.lock().internal.values().cloned().collect();
         for cell in &internal {
             if cell.handles.load(Ordering::Acquire) > 0 && self.round_internal(store, cell) {
@@ -82,6 +96,36 @@ impl Runtime {
         }
         *self.epoch.lock() += 1;
         self.cv.notify_all();
+        worked
+    }
+
+    fn round_cell(
+        &self,
+        store: &Store,
+        cell: &Cell,
+        st: &mut Slot,
+        target: &TargetMode,
+        deltas: &mut FxHashMap<u64, Arc<DeltaSet>>,
+        deferred: &mut DeferredDrops,
+    ) -> bool {
+        let mut worked = self.switch_cell(cell, st, target, deferred);
+        // Prune departed or explicitly closed live subscribers before admitting
+        // a build or advance pass so the first pass uses the exact active ceiling.
+        st.prune_dead_subs();
+        let status = cell.info.lock().status.clone();
+        match status {
+            Status::Building => {
+                self.build(store, cell, st, deferred);
+                worked = true;
+            }
+            Status::Ready => {
+                if self.advance(store, cell, st, deltas, deferred) {
+                    worked = true;
+                }
+            }
+            Status::Failed { .. } => {}
+        }
+        deferred.retired.extend(st.circuit.drain_retired());
         worked
     }
 
@@ -617,6 +661,7 @@ impl Runtime {
         let mut deferred = DeferredDrops::default();
         {
             let mut reg = self.reg.lock();
+            let mode_gen = reg.mode_gen;
             reg.cells.retain(|_, c| {
                 if c.pending.load(Ordering::Acquire) > 0 {
                     return true;
@@ -624,6 +669,11 @@ impl Runtime {
                 match c.state.try_lock() {
                     Some(mut st) => {
                         let keep = st.alive();
+                        if !keep && st.mode_gen < mode_gen {
+                            let boundary =
+                                self.seen.load(Ordering::Acquire).max(st.circuit.applied);
+                            self.switched.fetch_max(boundary, Ordering::AcqRel);
+                        }
                         deferred.retired.extend(st.circuit.drain_retired());
                         if !keep {
                             deferred.cells.push(c.clone());

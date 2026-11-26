@@ -23,8 +23,7 @@ impl Runtime {
             .max_memory_bytes
             .unwrap_or(self.opts.read().live_memory_bytes);
         let shared = Arc::new(Shared::new(budget));
-        let mut deferred_reg = DeferredDrops::default();
-        let cell = {
+        let (cell, target, has_lagging) = {
             let mut reg = self.reg.lock();
             if self.is_closed() {
                 return Err(crate::incr::error(
@@ -32,7 +31,7 @@ impl Runtime {
                     "the dataset is closing",
                 ));
             }
-            self.sync_inference(&mut reg, host.as_ref(), &mut deferred_reg);
+            let (target, lagging) = self.note_mode(&mut reg, host.as_ref());
             let res = self.cell_for(&mut reg, q, query, access, Some(budget));
             if let Ok((cell, _)) = &res {
                 cell.pending.fetch_add(1, Ordering::AcqRel);
@@ -44,9 +43,11 @@ impl Runtime {
                     queue: Arc::downgrade(&shared),
                 });
             }
-            res
+            (res, target, !lagging.is_empty())
         };
-        drop(deferred_reg);
+        if has_lagging {
+            self.kick();
+        }
         let (cell, _) = cell?;
         let joining = Joining(&cell);
         self.ensure_subscription(store);
@@ -73,6 +74,7 @@ impl Runtime {
                         "the dataset is closing",
                     ));
                 }
+                self.switch_cell(&cell, st, &target, &mut deferred_state);
                 let next_limit = st
                     .circuit
                     .local_limit()
@@ -118,6 +120,9 @@ impl Runtime {
             result
         };
         drop(deferred_state);
+        if has_lagging {
+            self.mark_mode_switched(target.generation);
+        }
         if let Err(e) = subscribe_res {
             drop(joining);
             self.gc();

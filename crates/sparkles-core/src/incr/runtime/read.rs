@@ -6,7 +6,7 @@ use sparkles_budget::sizes::{table_bytes, table_grown};
 
 /// Step duration while waiting for a view to catch up or build so cooperative
 /// cancellation checks run promptly without busy-spinning.
-const WAIT_STEP: Duration = Duration::from_millis(20);
+pub(super) const WAIT_STEP: Duration = Duration::from_millis(20);
 
 /// Fold history diff slices outside the circuit lock while admitting every allocation
 /// through `admit` and polling `check`.
@@ -246,24 +246,32 @@ impl Runtime {
         let wait = Instant::now() + self.opts.read().view_wait;
         let until = r.deadline.map_or(wait, |d| d.min(wait));
         loop {
+            let round_start = *self.epoch.lock();
             check()?;
+            if r.deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(Error::Timeout);
+            }
             let host = self.host.read().clone();
             let mode = host.map(|host| (host.aggregate_errors(), host.inference()));
             let step = (Instant::now() + WAIT_STEP).min(until);
             let entry = if let Some(reg) = self.reg.try_lock_until(step) {
                 check()?;
+                if r.deadline.is_some_and(|d| Instant::now() >= d) {
+                    return Err(Error::Timeout);
+                }
+                let e = reg.view(r.name)?;
                 let mode_ready = mode.as_ref().is_none_or(|(errors, inference)| {
                     reg.aggregate_errors == *errors
                         && Inference::same(reg.inference.as_deref(), inference.as_ref())
                 });
                 if mode_ready {
-                    let e = reg.view(r.name)?;
                     Some((
                         e.cell.clone(),
                         e.access.clone(),
                         e.suspended.clone(),
                         e.error.clone(),
                         reg.aggregate_errors,
+                        reg.mode_gen,
                     ))
                 } else {
                     None
@@ -271,7 +279,7 @@ impl Runtime {
             } else {
                 None
             };
-            if let Some((cell, access, suspended, error, errors)) = entry {
+            if let Some((cell, access, suspended, error, errors, mode_gen)) = entry {
                 if let Some(why) = suspended {
                     return Err(crate::incr::error(
                         "view-suspended",
@@ -291,60 +299,73 @@ impl Runtime {
                             format!("the view {:?} reads data your grants do not cover", r.name),
                         ));
                     }
-                    // The reading and the status are read under the state lock, which a
-                    // switch of the reading takes to replace the circuit and mark it
-                    // `building`, so they describe the circuit whose version is returned. A
-                    // build holds that lock, so wait in short cooperative steps until `until`.
+                    // The mode generation, reading and status are read under the state
+                    // lock, which a mode switch takes to replace the circuit and mark it
+                    // `building`, so they describe the circuit whose version is returned.
+                    // A build holds that lock, so wait in short cooperative steps until
+                    // `until`.
                     let step = (Instant::now() + WAIT_STEP).min(until);
                     if let Some(st) = cell.state.try_lock_until(step) {
                         check()?;
-                        let held = st.circuit.aggregate_errors.unwrap_or(errors);
-                        // another reading of errors than the view's: evaluate the view's query
-                        // at the reader's snapshot without touching the view's state
-                        if let Some(m) = r.aggregate_errors.filter(|m| *m != held) {
-                            return self.open_evaluate_under(st, open, m, admit);
+                        if r.deadline.is_some_and(|d| Instant::now() >= d) {
+                            return Err(Error::Timeout);
                         }
-                        let status = cell.info.lock().status.clone();
-                        match status {
-                            Status::Failed { code, message } => {
-                                let code = if code == "view-failed" {
-                                    "view-failed"
-                                } else {
-                                    "view-suspended"
-                                };
-                                return Err(crate::incr::error(
-                                    code,
-                                    format!("the view {:?}: {message}", r.name),
-                                ));
+                        if st.mode_gen >= mode_gen {
+                            let held = st.circuit.aggregate_errors.unwrap_or(errors);
+                            // another reading of errors than the view's: evaluate the view's query
+                            // at the reader's snapshot without touching the view's state
+                            if let Some(m) = r.aggregate_errors.filter(|m| *m != held) {
+                                return self.open_evaluate_under(st, open, m, admit);
                             }
-                            Status::Ready => {
-                                if st.circuit.applied == r.at || r.allow_stale {
-                                    let version = st.circuit.version.clone().ok_or_else(|| {
-                                        crate::incr::error(
-                                            "view-failed",
-                                            format!(
-                                                "the view {:?} has no materialized result",
-                                                r.name
-                                            ),
-                                        )
-                                    })?;
-                                    drop(st);
-                                    return Ok(OpenedView::Shared(version));
+                            let status = cell.info.lock().status.clone();
+                            match status {
+                                Status::Failed { code, message } => {
+                                    let code = if code == "view-failed" {
+                                        "view-failed"
+                                    } else {
+                                        "view-suspended"
+                                    };
+                                    return Err(crate::incr::error(
+                                        code,
+                                        format!("the view {:?}: {message}", r.name),
+                                    ));
                                 }
-                                if st.circuit.applied > r.at {
-                                    return self.open_read_back(st, open, held, check, admit);
+                                Status::Ready => {
+                                    if st.circuit.applied == r.at || r.allow_stale {
+                                        let version =
+                                            st.circuit.version.clone().ok_or_else(|| {
+                                                crate::incr::error(
+                                                    "view-failed",
+                                                    format!(
+                                                        "the view {:?} has no materialized result",
+                                                        r.name
+                                                    ),
+                                                )
+                                            })?;
+                                        drop(st);
+                                        return Ok(OpenedView::Shared(version));
+                                    }
+                                    if st.circuit.applied > r.at {
+                                        return self.open_read_back(st, open, held, check, admit);
+                                    }
                                 }
+                                Status::Building => {}
                             }
-                            Status::Building => {}
                         }
                     }
                 }
             }
             check()?;
+            if r.deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(Error::Timeout);
+            }
             self.kick();
             let step = (Instant::now() + WAIT_STEP).min(until);
-            let woke = self.wait_round(step);
+            let woke = self.wait_round_since(round_start, step);
             check()?;
+            if r.deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(Error::Timeout);
+            }
             if !woke && Instant::now() >= until {
                 return Err(crate::incr::error(
                     "view-behind",
