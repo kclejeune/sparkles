@@ -1421,6 +1421,8 @@ impl Graph {
         }
         let mut best: Option<(u32, u64)> = None;
         for i in self.cands(Some(s), Some(p), None, 0, hi).iter() {
+            #[cfg(test)]
+            FIRST_OBJECT_CANDS.with(|c| c.set(c.get() + 1));
             if self.alive(i) && (!explicit_only || self.flagged(i)) {
                 let t = self.triple(i);
                 if t[0] == s && t[1] == p && best.is_none_or(|(bi, _)| i < bi) {
@@ -1430,6 +1432,16 @@ impl Graph {
         }
         best.map(|(_, o)| o)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FIRST_OBJECT_CANDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_first_object_cands() -> u64 {
+    FIRST_OBJECT_CANDS.with(|c| c.replace(0))
 }
 
 #[cfg(test)]

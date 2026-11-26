@@ -704,7 +704,7 @@ impl Base {
         let mut cur: Option<(Triple, usize)> = None;
         let mut completed = true;
         let mut meter_err: Option<anyhow::Error> = None;
-        let mut row = |k: [u64; 4], f: &mut dyn FnMut(Triple) -> bool| -> bool {
+        let mut row = |k: [u64; 4], meter: &mut M, f: &mut dyn FnMut(Triple) -> bool| -> bool {
             if M::ENABLED
                 && let Err(e) = meter.tick()
             {
@@ -765,38 +765,87 @@ impl Base {
         };
         let snap = &*self.snap;
         if touched(snap, perm, &lo, &hi) {
-            snap.scan_between(perm, lo, hi, |c| {
-                if entered >= allow {
-                    cut = true;
-                    return Ok(false);
+            if M::ENABLED {
+                let state = std::cell::RefCell::new((&mut *meter, None::<anyhow::Error>));
+                let check = || -> sparkles_core::Result<()> {
+                    let mut guard = state.borrow_mut();
+                    if guard.1.is_some() {
+                        return Err(sparkles_core::Error::Cancelled);
+                    }
+                    if let Err(e) = guard.0.tick() {
+                        guard.1 = Some(e);
+                        return Err(sparkles_core::Error::Cancelled);
+                    }
+                    Ok(())
+                };
+                let scan_res = snap.scan_between_checked(perm, lo, hi, check, |c| {
+                    if entered >= allow {
+                        cut = true;
+                        return Ok(false);
+                    }
+                    let mut guard = state.borrow_mut();
+                    let m = &mut *guard.0;
+                    Ok(match c {
+                        Chunk::Block(b, s, e) => {
+                            entered += (e - s) as u64;
+                            let cols = &b.cols;
+                            (s..e).all(|i| {
+                                row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], m, &mut f)
+                            })
+                        }
+                        Chunk::Row(k) => {
+                            entered += 1;
+                            row(k, m, &mut f)
+                        }
+                    })
+                });
+                let (_, merge_err) = state.into_inner();
+                if let Some(e) = merge_err.or_else(|| meter_err.take()) {
+                    return Err(e);
                 }
-                Ok(match c {
-                    Chunk::Block(b, s, e) => {
-                        entered += (e - s) as u64;
-                        let cols = &b.cols;
-                        (s..e)
-                            .all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], &mut f))
+                scan_res?;
+            } else {
+                snap.scan_between(perm, lo, hi, |c| {
+                    if entered >= allow {
+                        cut = true;
+                        return Ok(false);
                     }
-                    Chunk::Row(k) => {
-                        entered += 1;
-                        row(k, &mut f)
-                    }
-                })
-            })?;
+                    Ok(match c {
+                        Chunk::Block(b, s, e) => {
+                            entered += (e - s) as u64;
+                            let cols = &b.cols;
+                            (s..e).all(|i| {
+                                row(
+                                    [cols[0][i], cols[1][i], cols[2][i], cols[3][i]],
+                                    meter,
+                                    &mut f,
+                                )
+                            })
+                        }
+                        Chunk::Row(k) => {
+                            entered += 1;
+                            row(k, meter, &mut f)
+                        }
+                    })
+                })?;
+            }
         } else {
             let idx = snap.perm(perm);
             let (b0, b1) = idx.key_block_range(&lo, &hi);
-            let mut rows_of =
-                |blk: &Block, whole: bool, entered: &mut u64, f: &mut dyn FnMut(Triple) -> bool| {
-                    let (s, e) = if whole {
-                        (0, blk.len())
-                    } else {
-                        blk.key_range(&lo, &hi)
-                    };
-                    *entered += (e - s) as u64;
-                    let cols = &blk.cols;
-                    (s..e).all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], f))
+            let mut rows_of = |blk: &Block,
+                               whole: bool,
+                               entered: &mut u64,
+                               meter: &mut M,
+                               f: &mut dyn FnMut(Triple) -> bool| {
+                let (s, e) = if whole {
+                    (0, blk.len())
+                } else {
+                    blk.key_range(&lo, &hi)
                 };
+                *entered += (e - s) as u64;
+                let cols = &blk.cols;
+                (s..e).all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], meter, f))
+            };
             'blocks: for b in b0..b1 {
                 if entered >= allow {
                     cut = true;
@@ -805,14 +854,14 @@ impl Base {
                 let m = &idx.blocks[b];
                 let whole = m.first >= lo && m.last <= hi;
                 if whole {
-                    if !rows_of(memo.block(snap, idx, b)?, true, &mut entered, &mut f) {
+                    if !rows_of(memo.block(snap, idx, b)?, true, &mut entered, meter, &mut f) {
                         break;
                     }
                     continue;
                 }
                 match memo.rows(snap, idx, b, &lo, &hi)? {
                     Rows::Whole(blk) => {
-                        if !rows_of(blk, false, &mut entered, &mut f) {
+                        if !rows_of(blk, false, &mut entered, meter, &mut f) {
                             break;
                         }
                     }
@@ -823,7 +872,7 @@ impl Base {
                                 break 'blocks;
                             }
                             let blk = memo.segment(snap, idx, b, s)?;
-                            if !rows_of(blk, false, &mut entered, &mut f) {
+                            if !rows_of(blk, false, &mut entered, meter, &mut f) {
                                 break 'blocks;
                             }
                         }

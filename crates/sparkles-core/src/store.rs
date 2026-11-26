@@ -1127,6 +1127,19 @@ impl Snapshot {
         self.scan_between_cols(perm, lo, hi, crate::index::ALL_COLS, f)
     }
 
+    /// Like [`scan_between`](Self::scan_between), with a fallible control before index
+    /// reads and during the delta merge, including rows removed by deletions.
+    pub fn scan_between_checked(
+        &self,
+        perm: Perm,
+        lo: Key,
+        hi: Key,
+        check: impl Fn() -> Result<()>,
+        f: impl FnMut(Chunk<'_>) -> Result<bool>,
+    ) -> Result<()> {
+        self.scan_between_cols_checked(perm, lo, hi, crate::index::ALL_COLS, check, f)
+    }
+
     /// [`scan_between`](Self::scan_between) for a reader that only looks at the key
     /// columns in `mask` of base blocks: the others may be left undecoded (and read as
     /// 0). A block with delta changes in it, or between it and the block before, has
