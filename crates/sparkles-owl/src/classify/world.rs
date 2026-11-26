@@ -1713,8 +1713,11 @@ impl Drop for World<'_> {
     fn drop(&mut self) {
         match self.debit.reporter {
             Reporter::Callback(bound) => {
-                // Keep the ordinary callback ahead of field destruction, even at zero.
-                bound(-(self.debit.reported.get() as isize));
+                let reported = self.debit.reported.get();
+                if reported != 0 {
+                    // Keep the ordinary callback ahead of field destruction.
+                    bound(-(reported as isize));
+                }
             }
             Reporter::NamedDomain(_) => {}
         }

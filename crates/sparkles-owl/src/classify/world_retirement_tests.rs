@@ -248,7 +248,7 @@ fn ordinary_callback_precedes_private_list_drop() {
 }
 
 #[test]
-fn ordinary_empty_world_calls_bound_with_zero() {
+fn ordinary_empty_world_skips_zero_bound_callback() {
     let sat = saturation(false);
     let calls = Mutex::new(Vec::new());
     let bound = |delta| {
@@ -263,6 +263,145 @@ fn ordinary_empty_world_calls_bound_with_zero() {
         &[],
         &bound,
     ));
-    assert_eq!(*calls.lock(), [0]);
-    eprintln!("retirement physical inactive empty delta=0");
+    assert!(calls.lock().is_empty());
+    eprintln!("retirement physical inactive empty skipped");
+}
+
+#[test]
+fn empty_callback_world_drop_skips_poll_panic_and_active_zero_checkpoint_polls_during_unwind() {
+    use crate::classify::Error;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct PollPanic;
+    #[derive(Debug, PartialEq, Eq)]
+    struct UnrelatedPanic;
+
+    // 1. Dropping an empty callback-backed world during a cancellation-poll panic must
+    //    not re-invoke the callback with zero bytes (avoiding a double-panic abort).
+    {
+        let sat = saturation(false);
+        let arm = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let limits = Limits {
+            cancelled: Some(Arc::new({
+                let arm = arm.clone();
+                let polls = polls.clone();
+                move || {
+                    polls.fetch_add(1, SeqCst);
+                    if arm.load(SeqCst) {
+                        panic_any(PollPanic);
+                    }
+                    false
+                }
+            })),
+            ..Limits::default()
+        };
+        let mut totals = Totals::default();
+        let budget = WorldBudget::start(&limits, None, 4096, &mut totals).unwrap();
+        let drop_calls = AtomicUsize::new(0);
+        let bound = |delta: isize| {
+            drop_calls.fetch_add(1, SeqCst);
+            budget.tell(delta)
+        };
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            let _world = World::new(
+                sat.index.as_ref().unwrap(),
+                &sat.ctx,
+                None,
+                &[],
+                &[],
+                &bound,
+            );
+            arm.store(true, SeqCst);
+            // Trigger a cancellation-poll panic while `_world` is live with `reported == 0`.
+            let _ = budget.tell(0);
+        }))
+        .unwrap_err();
+        assert_eq!(caught.downcast_ref::<PollPanic>(), Some(&PollPanic));
+        assert_eq!(
+            drop_calls.load(SeqCst),
+            0,
+            "World::drop with reported == 0 must not call the bound callback"
+        );
+        assert_eq!(polls.load(SeqCst), 1);
+        assert_eq!(budget.held.load(Relaxed), 0);
+        assert_eq!(budget.stopped(), Ok(()));
+    }
+
+    // 2. An unchanged (delta == 0) checkpoint invoked from a destructor during an
+    //    unrelated panic must still poll cancellation and succeed when limits are clear.
+    struct OnUnwind<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for OnUnwind<F> {
+        fn drop(&mut self) {
+            if let Some(f) = self.0.take() {
+                f();
+            }
+        }
+    }
+
+    for active in [true, false] {
+        let sat = saturation(active);
+        let ix = sat.index.as_ref().unwrap();
+        let ran = AtomicBool::new(false);
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = OnUnwind(Some(|| {
+                assert!(std::thread::panicking());
+                let cancel = Arc::new(AtomicBool::new(false));
+                let polls = Arc::new(AtomicUsize::new(0));
+                let limits = Limits {
+                    cancelled: Some(Arc::new({
+                        let cancel = cancel.clone();
+                        let polls = polls.clone();
+                        move || {
+                            polls.fetch_add(1, SeqCst);
+                            cancel.load(SeqCst)
+                        }
+                    })),
+                    ..Limits::default()
+                };
+                let mut totals = Totals::default();
+                let budget = WorldBudget::start(&limits, None, 4096, &mut totals).unwrap();
+                let bound_calls = AtomicUsize::new(0);
+                let bound = |delta: isize| {
+                    bound_calls.fetch_add(1, SeqCst);
+                    budget.tell(delta)
+                };
+                let mut world =
+                    World::new_with_budget(ix, &sat.ctx, None, &[], &[], &bound, &budget);
+                world.checkpoint(0);
+                assert_eq!(
+                    polls.load(SeqCst),
+                    1,
+                    "active={active}: delta == 0 checkpoint must poll during unrelated unwind"
+                );
+                assert!(
+                    !world.halted,
+                    "active={active}: delta == 0 checkpoint with clear limits must not halt"
+                );
+                assert_eq!(budget.stopped(), Ok(()));
+
+                cancel.store(true, SeqCst);
+                world.checkpoint(0);
+                assert_eq!(polls.load(SeqCst), 2);
+                assert!(world.halted);
+                assert_eq!(budget.stopped(), Err(Error::Cancelled));
+
+                drop(world);
+                assert_eq!(
+                    bound_calls.load(SeqCst),
+                    if active { 0 } else { 2 },
+                    "active={active}: World::drop with reported == 0 must not invoke bound"
+                );
+                ran.store(true, SeqCst);
+            }));
+            panic_any(UnrelatedPanic);
+        }))
+        .unwrap_err();
+        assert_eq!(
+            caught.downcast_ref::<UnrelatedPanic>(),
+            Some(&UnrelatedPanic)
+        );
+        assert!(ran.load(SeqCst));
+    }
 }
