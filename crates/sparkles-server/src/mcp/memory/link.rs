@@ -262,7 +262,7 @@ impl Tools<'_> {
         let prefixes = Prefixes::new(&prefix_map);
         let names = prefixes.names();
         let ctx = self.ctx(&names, timeout.as_secs_f64());
-        let deadline = self.call.arrived + timeout;
+        let deadline = self.deadline(timeout);
         let r = self.reader(&ds, a.at_commit, a.at.as_ref(), a.reasoning, deadline, &ctx)?;
         let mut setup = self.link_setup(&ds, &r, labels, graphs, &ctx)?;
         if a.vectors == Some(false) {

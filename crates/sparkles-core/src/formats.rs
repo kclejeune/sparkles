@@ -828,7 +828,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("assistant.json", 1),
     ds("memory.json", 3),
     ds("ingest.json", 1),
-    ds("asks.json", 2),
+    ds("asks.json", 3),
     ds("query-suggestions.json", 1),
     ds("maintenance.json", 1),
     ds("review.json", 1),

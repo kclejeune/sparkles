@@ -87,7 +87,7 @@ fn bad(m: impl Into<String>) -> crate::http::ApiError {
 }
 
 /// The HTTP status of an error event's code, for the JSON form.
-pub(super) fn status_of(code: &str) -> StatusCode {
+pub(crate) fn status_of(code: &str) -> StatusCode {
     match code {
         "bad-argument" => StatusCode::BAD_REQUEST,
         "unknown-dataset" | "no-model" => StatusCode::NOT_FOUND,
@@ -358,11 +358,6 @@ async fn ask_route(
             st.asks.add_tokens(&ds.name, &me, tokens);
             st.asks
                 .record(&id, assistant::recent_of(&ds.name, &me, out), &out["usage"]);
-            // what the answer could read, from the asker's view of that state
-            let view_name = match branch.as_deref().filter(|b| *b != sparkles::branch::MAIN) {
-                Some(b) => format!("{}@{b}", ds.name),
-                None => ds.name.clone(),
-            };
             // one state for every read: a head that did not move while the ask read it,
             // and the result's commit, if any, is that state's; otherwise the record keeps
             // no footprint
@@ -372,16 +367,8 @@ async fn ask_route(
                         .as_u64()
                         .is_none_or(|c| c == s.commit)
             });
-            let access = assistant::answer_access(
-                read.as_ref(),
-                principal
-                    .view(&view_name, crate::auth::Endpoint::Query)
-                    .as_ref(),
-                &principal.caller(),
-                &ds.name,
-                branch.as_deref(),
-                &me,
-            );
+            let access =
+                assistant::ask_access(read.as_ref(), &principal, &ds.name, branch.as_deref(), &me);
             let rec = assistant::record_of(&id, &me, out).with_answer(
                 &thread,
                 &written,

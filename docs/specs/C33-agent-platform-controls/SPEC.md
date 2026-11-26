@@ -1,6 +1,6 @@
 # C33: Agent platform controls
 
-> **Status:** implemented in part. The tool profiles phase is built.
+> **Status:** implemented in part. Tool profiles and the `ask` MCP tool are built.
 >
 > **Roadmap:** [item 462](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered
@@ -108,5 +108,14 @@ also accepts the `--mcp-` spellings.
   `io.sparkles/toolSet` with the profiles and the tools the server offers.
 * Tests cover the stdio command, the HTTP endpoint's flags, the capability, a tool
   outside the set and the refusals.
+
+### `ask` MCP tool (item 488, 2026-11-26)
+
+The `ask` tool exposes the server's checked, self-repairing question-to-SPARQL pipeline
+over MCP within the `explore` profile, dynamically listed when models are configured and
+a visible dataset enables asking. It enforces caller grants, graph visibility, branch
+isolation, MCP deadlines and cancellation, Ask token budgets, and `serverModels`-gated
+provider and model overrides. [C18 Outcome](../C18-natural-language-questions-and-ingest/OUTCOME.md#an-ask-mcp-tool-item-488)
+records the implementation and offline test coverage.
 
 The other phases are not built, and [item 462](../../ROADMAP.md) tracks them.

@@ -427,7 +427,7 @@ impl Tools<'_> {
         let prefixes = Prefixes::new(&prefix_map);
         let names = prefixes.names();
         let ctx = self.ctx(&names, timeout.as_secs_f64());
-        let deadline = self.call.arrived + timeout;
+        let deadline = self.deadline(timeout);
         let max_claims = match (&a.review_policy, a.max_claims) {
             (None, Some(_)) => {
                 return Err(ToolError::bad_argument("maxClaims needs reviewPolicy"));

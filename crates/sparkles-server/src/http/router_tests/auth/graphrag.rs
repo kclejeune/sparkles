@@ -1047,14 +1047,7 @@ async fn stored_answers_need_the_askers_view() {
     let at = chrono::Utc::now().to_rfc3339();
     let access = |asker: &str| {
         let p = guarded(&s, asker);
-        crate::assistant::answer_access(
-            Some(&snap),
-            p.view("rag", Endpoint::Query).as_ref(),
-            &p.caller(),
-            "rag",
-            None,
-            &p.id(),
-        )
+        crate::assistant::ask_access(Some(&snap), &p, "rag", None, &p.id())
     };
     // (reader, the view the answer was stored under, whether the reader sees it)
     let cases: &[(&str, Option<&str>, bool)] = &[

@@ -77,8 +77,8 @@ graphs and triples, with OIDC and API-token authentication.
 ### AI and agents
 
 Connect agents through [MCP](ai/README.md#mcp-server) with scoped tool profiles
-(`explore`, `memory`, `admin`), semantic search (`search_semantic`) and bounded entity
-linking. Turn [plain-language questions into checked queries](ai/README.md#questions-in-plain-language)
+(`explore`, `memory`, `admin`), the `ask` tool, semantic search (`search_semantic`) and
+bounded entity linking. Turn [plain-language questions into checked queries](ai/README.md#questions-in-plain-language)
 grounded in entity predicate usage, keep [cited agent memory](ai/README.md#agent-memory),
 ingest Markdown, HTML, PDF and Office documents through
 [document ingestion](ai/README.md#document-ingestion), and build
@@ -205,7 +205,7 @@ instruction counts, and the limits of attributing them to layout.
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [Ask, ingestion and agent memory](ai/README.md#ai-and-agents) | Partial | Scoped MCP profiles, checked Ask threads, document ingestion review and cited agent memory are available. Contextual entity linking, multimodal ingestion, approval queues, extra platform controls and broader evaluations remain open. |
+| [Ask, ingestion and agent memory](ai/README.md#ai-and-agents) | Partial | Scoped MCP profiles, the `ask` MCP tool, checked Ask threads, document ingestion review and cited agent memory are available. Contextual entity linking, multimodal ingestion, approval queues, extra platform controls and broader evaluations remain open. |
 | [GraphRAG reports](ai/README.md#ai-and-agents) | Core complete | Hierarchical Leiden community reports, global Ask, memory retrieval and budgeted change-feed refresh are available. View-based refresh, broader corpus evaluation and per-audience report configurations remain planned. |
 | [Web graph, map and editing tools](visualization/README.md#web-ui) | Partial | Explore, WebGL graph rendering, the time slider, path finder, maps, derivation trees and visual query builder are available. Live profiling, data-quality timelines, server-cached layouts and rendering items 737 to 739 remain. |
 | [App shell and design system](visualization/README.md#app-shell) | Complete | Every page shares a top bar with a `Ctrl+K` / `Cmd+K` command palette, a responsive navigation rail and shared components. Light and dark WCAG AA tokens cover desktop through phone layouts. |

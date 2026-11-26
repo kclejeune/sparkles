@@ -3835,8 +3835,17 @@ an MCP host such as Claude Desktop, Claude Code or an IDE agent:
 ```sh
 sparkles mcp --loc /data/books                 # a database directory (name: books)
 sparkles mcp --loc books=/data/books --loc films=/data/films
+sparkles mcp --loc /data/books --model-config models.json --model-secret openai=env:OPENAI_API_KEY
 sparkles mcp --data a.ttl b.nt --name demo     # files, in one in-memory dataset
 ```
+
+To enable the `ask` tool in a standalone stdio session, open a persistent database with
+`--loc` whose `assistant.json` sets `"enabled": true`, and pass `--model-config` (with
+any `--model-secret` sources its providers name). An in-memory `--data` dataset starts
+with its assistant disabled, and `--url` refuses `--model-config` and `--model-secret`
+because a bridged server uses its own model configuration. Without `--allow-update`, the
+session runs read-only and keeps Ask usage and retry state in memory without writing
+`asks.json`.
 
 Configure the host in `claude_desktop_config.json`, or in a project's `.mcp.json` for
 Claude Code. For Claude Code, `claude mcp add sparkles -- sparkles mcp --loc /data/books`
@@ -3902,6 +3911,11 @@ The tools are read-only unless the operator turns on the write tool:
   citation names the fact's graph and, when a reifier records it, the source, time,
   author, confidence and quote. Superseded facts are listed on request, and facts that
   two graphs disagree on are marked.
+* `ask` answers a plain-language question using the server's checked, self-repairing
+  question-to-SPARQL pipeline over the caller's view. It is listed only while model
+  providers are configured and a visible dataset has an enabled assistant with an allowed
+  draft pair, and carries `openWorldHint: true` because prompts go to configured model
+  providers.
 * `validate_shacl` and `validate_shex` check a shapes graph, or a ShEx schema with a
   shape map, against a snapshot. They return counts and the first 20 results with node,
   shape and reason. They do not follow imports. `validate_shacl` takes the shapes in

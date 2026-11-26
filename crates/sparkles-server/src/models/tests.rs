@@ -906,3 +906,1065 @@ fn provider_tls_options() {
     let e = call(&closed, "p").unwrap_err();
     assert_eq!(e.error.code(), "outbound-refused", "{:?}", e.error);
 }
+
+#[test]
+fn delayed_send_past_absolute_deadline_does_not_post() {
+    use super::admission::{Admission, Attempt, Settle, Ticket, Usage};
+
+    struct RecordSettle(Arc<Mutex<Vec<Option<Usage>>>>);
+    impl Settle for RecordSettle {
+        fn reported(self: Box<Self>, usage: Usage) {
+            self.0.lock().push(Some(usage));
+        }
+        fn unknown(self: Box<Self>) {
+            self.0.lock().push(None);
+        }
+    }
+    struct SlowAdmit {
+        delay: Duration,
+        settled: Arc<Mutex<Vec<Option<Usage>>>>,
+    }
+    impl Admission for SlowAdmit {
+        fn admit(&self, _: &Attempt<'_>) -> Result<Ticket, CallError> {
+            std::thread::sleep(self.delay);
+            Ok(Ticket::new(Box::new(RecordSettle(self.settled.clone()))))
+        }
+    }
+
+    let mock = MockModel::start(|_, _| (200, mock::openai(r#"{"query":"ASK {}"}"#)));
+    let m = models(
+        json!({ "p": { "kind": "openai", "endpoint": mock.url(), "requestTimeoutSecs": 5 } }),
+        &[],
+    );
+    let settled = Arc::new(Mutex::new(Vec::new()));
+    let admit = SlowAdmit {
+        delay: Duration::from_millis(80),
+        settled: settled.clone(),
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let err = m
+        .call_prompt_with_cancel(
+            Some(Role::Draft),
+            &Pair::new("p", "m1"),
+            &Prompt::plain("system text", "user text"),
+            &draft_schema(),
+            Instant::now() + Duration::from_millis(30),
+            Some(&admit),
+            Some(&cancel),
+        )
+        .unwrap_err();
+    assert_eq!(err.error.code(), "deadline", "{:?}", err.error);
+    assert_eq!(
+        mock.requests().len(),
+        0,
+        "provider send delayed past absolute deadline must never POST"
+    );
+    assert_eq!(
+        *settled.lock(),
+        vec![Some(Usage::default())],
+        "unsent ticket must settle as not_sent (0 usage)"
+    );
+}
+
+/// RAII guard that opens a condvar gate on drop so an assertion failure cannot leak a
+/// blocked mock handler thread.
+struct GateGuard(Arc<(Mutex<bool>, Condvar)>);
+
+impl GateGuard {
+    fn open(&self) {
+        let mut open = self.0.0.lock();
+        *open = true;
+        self.0.1.notify_all();
+    }
+}
+
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        self.open();
+    }
+}
+
+fn wait_gate(gate: &(Mutex<bool>, Condvar), timeout: Duration) {
+    let mut open = gate.0.lock();
+    let deadline = Instant::now() + timeout;
+    while !*open {
+        if gate.1.wait_until(&mut open, deadline).timed_out() {
+            break;
+        }
+    }
+}
+
+#[test]
+fn cancelled_http_holds_slot_and_settles_admission_ticket() {
+    use super::admission::{Admission, Attempt, Settle, Ticket, Usage};
+
+    struct RecordSettle(Arc<Mutex<Vec<Option<Usage>>>>);
+    impl Settle for RecordSettle {
+        fn reported(self: Box<Self>, usage: Usage) {
+            self.0.lock().push(Some(usage));
+        }
+        fn unknown(self: Box<Self>) {
+            self.0.lock().push(None);
+        }
+    }
+    struct TrackAdmit(Arc<Mutex<Vec<Option<Usage>>>>);
+    impl Admission for TrackAdmit {
+        fn admit(&self, _: &Attempt<'_>) -> Result<Ticket, CallError> {
+            Ok(Ticket::new(Box::new(RecordSettle(self.0.clone()))))
+        }
+    }
+
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel::<()>();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let gate_guard = GateGuard(gate.clone());
+    let mock = {
+        let gate = gate.clone();
+        let arrived_tx = Mutex::new(Some(arrived_tx));
+        MockModel::start(move |_, _| {
+            if let Some(tx) = arrived_tx.lock().take() {
+                let _ = tx.send(());
+                wait_gate(&gate, Duration::from_secs(10));
+            }
+            (
+                200,
+                json!({
+                    "choices": [{
+                        "message": { "content": r#"{"query":"ASK {}"}"# },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 45, "completion_tokens": 15 }
+                }),
+            )
+        })
+    };
+    let m = Arc::new(models(
+        json!({ "p": { "kind": "openai", "endpoint": mock.url(), "concurrency": 1, "requestTimeoutSecs": 5, "budget": { "tokensPerDay": 500 } } }),
+        &[],
+    ));
+    let settled = Arc::new(Mutex::new(Vec::new()));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let h = {
+        let m = m.clone();
+        let settled = settled.clone();
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            let admit = TrackAdmit(settled);
+            m.call_prompt_with_cancel(
+                Some(Role::Draft),
+                &Pair::new("p", "m1"),
+                &Prompt::plain("system text", "user text"),
+                &draft_schema(),
+                Instant::now() + Duration::from_secs(5),
+                Some(&admit),
+                Some(&cancel),
+            )
+        })
+    };
+    arrived_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("request should reach mock");
+    cancel.store(true, Ordering::Relaxed);
+    let err = h.join().unwrap().unwrap_err();
+    assert_eq!(err.error.code(), "cancelled", "{:?}", err.error);
+    assert!(
+        settled.lock().is_empty(),
+        "ticket must remain unsettled while HTTP response is still in flight"
+    );
+
+    // Second call must block on concurrency: 1 and time out without reaching mock.
+    let err2 = m
+        .call_prompt(
+            Some(Role::Draft),
+            &Pair::new("p", "m1"),
+            &Prompt::plain("system text", "user text"),
+            &draft_schema(),
+            Instant::now() + Duration::from_millis(120),
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(err2.error.code(), "deadline", "{:?}", err2.error);
+    assert_eq!(mock.requests().len(), 1);
+
+    // Release the mock response and verify both late ticket settlement and provider accounting.
+    gate_guard.open();
+    let start = Instant::now();
+    while (settled.lock().is_empty() || m.describe()["providers"][0]["budget"]["usedToday"] != 60)
+        && start.elapsed() < Duration::from_secs(3)
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        *settled.lock(),
+        vec![Some(Usage {
+            input: 45,
+            output: 15,
+            ..Default::default()
+        })],
+        "abandoned HTTP response must settle admission ticket with reported usage"
+    );
+    assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 60);
+    // Slot is now free for a subsequent call.
+    call(&m, "p").unwrap();
+    assert_eq!(mock.requests().len(), 2);
+}
+
+#[test]
+fn queued_call_refused_after_late_settlement_exhausts_provider_cap() {
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel::<()>();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let gate_guard = GateGuard(gate.clone());
+    let mock = {
+        let gate = gate.clone();
+        let arrived_tx = Mutex::new(Some(arrived_tx));
+        MockModel::start(move |_, _| {
+            if let Some(tx) = arrived_tx.lock().take() {
+                let _ = tx.send(());
+                wait_gate(&gate, Duration::from_secs(10));
+            }
+            (
+                200,
+                json!({
+                    "choices": [{
+                        "message": { "content": r#"{"query":"ASK {}"}"# },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 45, "completion_tokens": 15 }
+                }),
+            )
+        })
+    };
+    let m = Arc::new(models(
+        json!({ "p": { "kind": "openai", "endpoint": mock.url(), "concurrency": 1, "requestTimeoutSecs": 5, "budget": { "tokensPerDay": 50 } } }),
+        &[],
+    ));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let h1 = {
+        let m = m.clone();
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            m.call_prompt_with_cancel(
+                Some(Role::Draft),
+                &Pair::new("p", "m1"),
+                &Prompt::plain("system text", "user text"),
+                &draft_schema(),
+                Instant::now() + Duration::from_secs(5),
+                None,
+                Some(&cancel),
+            )
+        })
+    };
+    arrived_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("first request should reach mock");
+    cancel.store(true, Ordering::Relaxed);
+    let err1 = h1.join().unwrap().unwrap_err();
+    assert_eq!(err1.error.code(), "cancelled", "{:?}", err1.error);
+
+    // Queue a second call while the first response is still held so it passes the initial
+    // daily-cap read at 0 and parks waiting for the single concurrency slot.
+    let h2 = {
+        let m = m.clone();
+        std::thread::spawn(move || {
+            m.call_prompt(
+                Some(Role::Draft),
+                &Pair::new("p", "m1"),
+                &Prompt::plain("system text", "user text"),
+                &draft_schema(),
+                Instant::now() + Duration::from_secs(5),
+                None,
+            )
+        })
+    };
+    let wait_start = Instant::now();
+    while m.slot_waiters("p") == 0 && wait_start.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        m.slot_waiters("p") >= 1,
+        "second call must be queued on concurrency slot before late settlement"
+    );
+
+    // Release the first response (60 tokens > 50 cap). When the slot frees, the queued
+    // call must re-check the daily cap and refuse without posting.
+    gate_guard.open();
+    let err2 = h2.join().unwrap().unwrap_err();
+    assert_eq!(err2.error.code(), "budget-exceeded", "{:?}", err2.error);
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "queued call must not send a POST after late settlement exhausted the daily cap"
+    );
+    assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 60);
+}
+
+#[test]
+fn paused_worker_during_http_setup_aborts_without_posting() {
+    use super::admission::{Admission, Attempt, Settle, Ticket, Usage};
+
+    struct RecordSettle(Arc<Mutex<Vec<Option<Usage>>>>);
+    impl Settle for RecordSettle {
+        fn reported(self: Box<Self>, usage: Usage) {
+            self.0.lock().push(Some(usage));
+        }
+        fn unknown(self: Box<Self>) {
+            self.0.lock().push(None);
+        }
+    }
+    struct TrackAdmit(Arc<Mutex<Vec<Option<Usage>>>>);
+    impl Admission for TrackAdmit {
+        fn admit(&self, _: &Attempt<'_>) -> Result<Ticket, CallError> {
+            Ok(Ticket::new(Box::new(RecordSettle(self.0.clone()))))
+        }
+    }
+
+    // 1. Cancellation during HTTP setup (after admission, request construction, and header hook).
+    let mock_cancel = MockModel::start(|_, _| (200, mock::openai(r#"{"query":"ASK {}"}"#)));
+    let url_cancel = format!("{}/chat/completions", mock_cancel.url());
+    let (hook_tx, hook_rx) = std::sync::mpsc::channel::<()>();
+    let gate_cancel = Arc::new((Mutex::new(false), Condvar::new()));
+    let gate_cancel_guard = GateGuard(gate_cancel.clone());
+    let _before_send_cancel = {
+        let gate = gate_cancel.clone();
+        let hook_tx = Mutex::new(Some(hook_tx));
+        sparkles::outbound::probe::BeforeSendHook::install(url_cancel, move || {
+            if let Some(tx) = hook_tx.lock().take() {
+                let _ = tx.send(());
+                wait_gate(&gate, Duration::from_secs(10));
+            }
+        })
+    };
+    let m_cancel = Arc::new(models(
+        json!({ "p": { "kind": "openai", "endpoint": mock_cancel.url(), "requestTimeoutSecs": 5 } }),
+        &[],
+    ));
+    let settled_cancel = Arc::new(Mutex::new(Vec::new()));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let h_cancel = {
+        let m = m_cancel.clone();
+        let settled = settled_cancel.clone();
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            let admit = TrackAdmit(settled);
+            m.call_prompt_with_cancel(
+                Some(Role::Draft),
+                &Pair::new("p", "m1"),
+                &Prompt::plain("system text", "user text"),
+                &draft_schema(),
+                Instant::now() + Duration::from_secs(5),
+                Some(&admit),
+                Some(&cancel),
+            )
+        })
+    };
+    hook_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("worker should reach pre-send hook after admission and setup");
+    cancel.store(true, Ordering::Relaxed);
+    let err = h_cancel.join().unwrap().unwrap_err();
+    assert_eq!(err.error.code(), "cancelled", "{:?}", err.error);
+    gate_cancel_guard.open();
+    let start = Instant::now();
+    while settled_cancel.lock().is_empty() && start.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        mock_cancel.requests().len(),
+        0,
+        "cancellation during HTTP setup must prevent POST"
+    );
+    assert_eq!(
+        *settled_cancel.lock(),
+        vec![Some(Usage::default())],
+        "ticket aborted before send must settle as not_sent"
+    );
+
+    // 2. Deadline expiry during HTTP setup (after admission, request construction, and header hook).
+    let mock_dl = MockModel::start(|_, _| (200, mock::openai(r#"{"query":"ASK {}"}"#)));
+    let url_dl = format!("{}/chat/completions", mock_dl.url());
+    let (dl_tx, dl_rx) = std::sync::mpsc::channel::<()>();
+    let gate_dl = Arc::new((Mutex::new(false), Condvar::new()));
+    let gate_dl_guard = GateGuard(gate_dl.clone());
+    let _before_send_dl = {
+        let gate = gate_dl.clone();
+        let dl_tx = Mutex::new(Some(dl_tx));
+        sparkles::outbound::probe::BeforeSendHook::install(url_dl, move || {
+            if let Some(tx) = dl_tx.lock().take() {
+                let _ = tx.send(());
+                wait_gate(&gate, Duration::from_secs(10));
+            }
+        })
+    };
+    let m_dl = Arc::new(models(
+        json!({ "p": { "kind": "openai", "endpoint": mock_dl.url(), "requestTimeoutSecs": 5 } }),
+        &[],
+    ));
+    let settled_dl = Arc::new(Mutex::new(Vec::new()));
+    let cancel_dl = Arc::new(AtomicBool::new(false));
+    let h_dl = {
+        let m = m_dl.clone();
+        let settled = settled_dl.clone();
+        let cancel = cancel_dl.clone();
+        std::thread::spawn(move || {
+            let admit = TrackAdmit(settled);
+            m.call_prompt_with_cancel(
+                Some(Role::Draft),
+                &Pair::new("p", "m1"),
+                &Prompt::plain("system text", "user text"),
+                &draft_schema(),
+                Instant::now() + Duration::from_millis(600),
+                Some(&admit),
+                Some(&cancel),
+            )
+        })
+    };
+    dl_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("worker should reach pre-send hook before deadline expires");
+    let err_dl = h_dl.join().unwrap().unwrap_err();
+    assert_eq!(err_dl.error.code(), "deadline", "{:?}", err_dl.error);
+    gate_dl_guard.open();
+    let start = Instant::now();
+    while settled_dl.lock().is_empty() && start.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        mock_dl.requests().len(),
+        0,
+        "deadline expiry during HTTP setup must prevent POST"
+    );
+    assert_eq!(
+        *settled_dl.lock(),
+        vec![Some(Usage::default())],
+        "ticket expired before send must settle as not_sent"
+    );
+}
+
+#[test]
+fn completed_response_observed_after_deadline_fails_and_settles_usage() {
+    use super::admission::{Admission, Attempt, Settle, Ticket, Usage};
+
+    struct RecordSettle(Arc<Mutex<Vec<Option<Usage>>>>);
+    impl Settle for RecordSettle {
+        fn reported(self: Box<Self>, usage: Usage) {
+            self.0.lock().push(Some(usage));
+        }
+        fn unknown(self: Box<Self>) {
+            self.0.lock().push(None);
+        }
+    }
+    struct TrackAdmit(Arc<Mutex<Vec<Option<Usage>>>>);
+    impl Admission for TrackAdmit {
+        fn admit(&self, _: &Attempt<'_>) -> Result<Ticket, CallError> {
+            Ok(Ticket::new(Box::new(RecordSettle(self.0.clone()))))
+        }
+    }
+
+    let mock = MockModel::start(|_, _| {
+        (
+            200,
+            json!({
+                "choices": [{
+                    "message": { "content": r#"{"query":"ASK {}"}"# },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 45, "completion_tokens": 15 }
+            }),
+        )
+    });
+    let url = format!("{}/chat/completions", mock.url());
+    let deadline = Instant::now() + Duration::from_millis(600);
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let _consume_delay = {
+        let hook_ran = hook_ran.clone();
+        super::client::test_hooks::BeforeConsumeHook::install(url, move || {
+            hook_ran.store(true, Ordering::SeqCst);
+            while Instant::now() < deadline {
+                let rem = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(rem + Duration::from_millis(5));
+            }
+        })
+    };
+    let m = models(
+        json!({ "p": { "kind": "openai", "endpoint": mock.url(), "requestTimeoutSecs": 5, "budget": { "tokensPerDay": 500 } } }),
+        &[],
+    );
+    let settled = Arc::new(Mutex::new(Vec::new()));
+    let admit = TrackAdmit(settled.clone());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let err = m
+        .call_prompt_with_cancel(
+            Some(Role::Draft),
+            &Pair::new("p", "m1"),
+            &Prompt::plain("system text", "user text"),
+            &draft_schema(),
+            deadline,
+            Some(&admit),
+            Some(&cancel),
+        )
+        .unwrap_err();
+    assert!(
+        hook_ran.load(Ordering::SeqCst),
+        "completed response must reach consumer hook before deadline"
+    );
+    assert_eq!(err.error.code(), "deadline", "{:?}", err.error);
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(
+        *settled.lock(),
+        vec![Some(Usage {
+            input: 45,
+            output: 15,
+            ..Default::default()
+        })],
+        "completed response rejected after deadline must still settle admission ticket"
+    );
+    assert_eq!(
+        m.describe()["providers"][0]["budget"]["usedToday"],
+        60,
+        "completed response rejected after deadline must still charge provider daily budget"
+    );
+}
+
+#[test]
+fn late_abandoned_usage_rounds_cache_reads_once_per_step() {
+    use super::admission::Usage;
+
+    let (retry_tx, retry_rx) = std::sync::mpsc::channel::<()>();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let gate_guard = GateGuard(gate.clone());
+    let mock = {
+        let gate = gate.clone();
+        let retry_tx = Mutex::new(Some(retry_tx));
+        MockModel::start(move |_, n| {
+            if n == 0 {
+                return (
+                    500,
+                    json!({
+                        "error": { "message": "temporary failure" },
+                        "usage": {
+                            "prompt_tokens": 5,
+                            "completion_tokens": 0,
+                            "prompt_tokens_details": { "cached_tokens": 5 }
+                        }
+                    }),
+                );
+            }
+            if let Some(tx) = retry_tx.lock().take() {
+                let _ = tx.send(());
+                wait_gate(&gate, Duration::from_secs(10));
+            }
+            (
+                200,
+                json!({
+                    "choices": [{
+                        "message": { "content": r#"{"query":"ASK {}"}"# },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 5,
+                        "completion_tokens": 0,
+                        "prompt_tokens_details": { "cached_tokens": 5 }
+                    }
+                }),
+            )
+        })
+    };
+    let m = Arc::new(models(
+        json!({
+            "p": {
+                "kind": "openai",
+                "endpoint": mock.url(),
+                "requestTimeoutSecs": 5,
+                "budget": { "tokensPerDay": 500 },
+                "pricing": { "inputPerMTok": 10.0, "outputPerMTok": 20.0, "cacheReadPerMTok": 1.0 }
+            }
+        }),
+        &[],
+    ));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (abandoned_tx, abandoned_rx) = std::sync::mpsc::channel::<(Usage, u64, Option<f64>)>();
+    let h = {
+        let m = m.clone();
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            let cb = Arc::new(move |u: Usage, budget: u64, cost: Option<f64>| {
+                let _ = abandoned_tx.send((u, budget, cost));
+            });
+            m.call_prompt_with_cancel_and_abandoned(
+                Some(Role::Draft),
+                &Pair::new("p", "m1"),
+                &Prompt::plain("system text", "user text"),
+                &draft_schema(),
+                Instant::now() + Duration::from_secs(5),
+                None,
+                Some(&cancel),
+                Some(cb),
+            )
+        })
+    };
+    retry_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("retry attempt should reach mock");
+    cancel.store(true, Ordering::Relaxed);
+    let err = h.join().unwrap().unwrap_err();
+    assert_eq!(err.error.code(), "cancelled", "{:?}", err.error);
+    assert_eq!(err.record.cache_read_tokens, 5);
+    assert_eq!(err.record.budget_tokens(), 1);
+    assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 1);
+
+    gate_guard.open();
+    let (late_usage, delta_budget, late_cost) = abandoned_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("abandoned retry should report late usage");
+    assert_eq!(late_usage.cache_read, 5);
+    assert_eq!(
+        delta_budget, 0,
+        "10 cumulative cache-read tokens in one step must round once to 1 budget token"
+    );
+    assert!(
+        late_cost.is_some_and(|c| c > 0.0),
+        "raw cost for abandoned tokens must be preserved: {late_cost:?}"
+    );
+    assert_eq!(
+        m.describe()["providers"][0]["budget"]["usedToday"],
+        1,
+        "provider daily budget must count 1 token, not 2"
+    );
+}
+
+#[test]
+fn large_request_timeout_clamped_to_caller_deadline_without_overflow() {
+    let mock = MockModel::start(|_, _| (200, mock::openai(r#"{"query":"ASK {}"}"#)));
+    let m = models(
+        json!({
+            "p1": { "kind": "openai", "endpoint": mock.url(), "requestTimeoutSecs": 1e19 },
+            "p2": { "kind": "openai", "endpoint": mock.url(), "requestTimeoutSecs": 1e300 }
+        }),
+        &[],
+    );
+    call(&m, "p1").expect("1e19 requestTimeoutSecs must clamp to caller deadline without overflow");
+    call(&m, "p2").expect("1e300 requestTimeoutSecs must clamp to caller deadline without panic");
+    assert_eq!(mock.requests().len(), 2);
+}
+
+#[test]
+fn queued_call_refused_after_abandoned_retry_with_prior_usage_exhausts_cap() {
+    let (retry_tx, retry_rx) = std::sync::mpsc::channel::<()>();
+    let mock_gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let mock_gate_guard = GateGuard(mock_gate.clone());
+    let mock = {
+        let mock_gate = mock_gate.clone();
+        let retry_tx = Mutex::new(Some(retry_tx));
+        MockModel::start(move |_, n| {
+            if n == 0 {
+                // Retryable failure reporting 30 tokens (under the 50/day cap on its own).
+                return (
+                    500,
+                    json!({
+                        "error": { "message": "temporary failure" },
+                        "usage": { "prompt_tokens": 20, "completion_tokens": 10 }
+                    }),
+                );
+            }
+            if let Some(tx) = retry_tx.lock().take() {
+                let _ = tx.send(());
+                wait_gate(&mock_gate, Duration::from_secs(10));
+            }
+            // Retry response reports another 30 tokens, bringing total to 60 > 50 cap.
+            (
+                200,
+                json!({
+                    "choices": [{
+                        "message": { "content": r#"{"query":"ASK {}"}"# },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 20, "completion_tokens": 10 }
+                }),
+            )
+        })
+    };
+    let url = format!("{}/chat/completions", mock.url());
+    let (abandoned_tx, abandoned_rx) = std::sync::mpsc::channel::<()>();
+    let caller_gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let caller_gate_guard = GateGuard(caller_gate.clone());
+    let _after_abandon = {
+        let caller_gate = caller_gate.clone();
+        let abandoned_tx = Mutex::new(Some(abandoned_tx));
+        super::client::test_hooks::AfterAbandonHook::install(url, move || {
+            if let Some(tx) = abandoned_tx.lock().take() {
+                let _ = tx.send(());
+                wait_gate(&caller_gate, Duration::from_secs(10));
+            }
+        })
+    };
+    let m = Arc::new(models(
+        json!({ "p": { "kind": "openai", "endpoint": mock.url(), "concurrency": 1, "requestTimeoutSecs": 5, "budget": { "tokensPerDay": 50 } } }),
+        &[],
+    ));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let h1 = {
+        let m = m.clone();
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            m.call_prompt_with_cancel(
+                Some(Role::Draft),
+                &Pair::new("p", "m1"),
+                &Prompt::plain("system text", "user text"),
+                &draft_schema(),
+                Instant::now() + Duration::from_secs(5),
+                None,
+                Some(&cancel),
+            )
+        })
+    };
+    retry_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("retry attempt should reach mock");
+
+    // Queue a second call while attempt 1 is in flight; usedToday is 30 (< 50 cap), so it
+    // passes the pre-slot check and parks waiting for the single concurrency slot.
+    let h2 = {
+        let m = m.clone();
+        std::thread::spawn(move || {
+            m.call_prompt(
+                Some(Role::Draft),
+                &Pair::new("p", "m1"),
+                &Prompt::plain("system text", "user text"),
+                &draft_schema(),
+                Instant::now() + Duration::from_secs(5),
+                None,
+            )
+        })
+    };
+    let wait_start = Instant::now();
+    while m.slot_waiters("p") == 0 && wait_start.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        m.slot_waiters("p") >= 1,
+        "second call must be queued on concurrency slot before abandon"
+    );
+
+    // Cancel caller 1 and hold it deterministically between Handoff::Abandoned and its
+    // caller-side StepRecord accounting.
+    cancel.store(true, Ordering::Relaxed);
+    abandoned_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("cancelled caller must reach AfterAbandonHook");
+
+    // Release attempt 1's response while caller 1 is still parked before accounting.
+    // The worker publishes attempt 1's 30 tokens on top of attempt 0's already-published
+    // 30 tokens (60 >= 50) BEFORE releasing the slot, so the queued call must refuse
+    // without sending any POST.
+    mock_gate_guard.open();
+    let err2 = h2.join().unwrap().unwrap_err();
+    assert_eq!(err2.error.code(), "budget-exceeded", "{:?}", err2.error);
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "queued call must send zero POSTs when retry + prior usage exceed daily cap"
+    );
+    assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 60);
+
+    // Unblock caller 1 and verify its own StepRecord retains attempt 0's 30 tokens without
+    // double-charging the provider daily counter.
+    caller_gate_guard.open();
+    let err1 = h1.join().unwrap().unwrap_err();
+    assert_eq!(err1.error.code(), "cancelled", "{:?}", err1.error);
+    assert_eq!(err1.record.budget_tokens(), 30);
+    assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 60);
+}
+
+#[test]
+fn queued_call_refused_after_completed_call_exhausts_provider_cap() {
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel::<()>();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let gate_guard = GateGuard(gate.clone());
+    let mock = {
+        let gate = gate.clone();
+        let arrived_tx = Mutex::new(Some(arrived_tx));
+        MockModel::start(move |_, _| {
+            if let Some(tx) = arrived_tx.lock().take() {
+                let _ = tx.send(());
+                wait_gate(&gate, Duration::from_secs(10));
+            }
+            (
+                200,
+                json!({
+                    "choices": [{
+                        "message": { "content": r#"{"query":"ASK {}"}"# },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 45, "completion_tokens": 15 }
+                }),
+            )
+        })
+    };
+    let m = Arc::new(models(
+        json!({ "p": { "kind": "openai", "endpoint": mock.url(), "concurrency": 1, "requestTimeoutSecs": 5, "budget": { "tokensPerDay": 50 } } }),
+        &[],
+    ));
+    let h1 = {
+        let m = m.clone();
+        std::thread::spawn(move || {
+            m.call_prompt(
+                Some(Role::Draft),
+                &Pair::new("p", "m1"),
+                &Prompt::plain("system text", "user text"),
+                &draft_schema(),
+                Instant::now() + Duration::from_secs(5),
+                None,
+            )
+        })
+    };
+    arrived_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("first request should reach mock");
+    let h2 = {
+        let m = m.clone();
+        std::thread::spawn(move || {
+            m.call_prompt(
+                Some(Role::Draft),
+                &Pair::new("p", "m1"),
+                &Prompt::plain("system text", "user text"),
+                &draft_schema(),
+                Instant::now() + Duration::from_secs(5),
+                None,
+            )
+        })
+    };
+    let wait_start = Instant::now();
+    while m.slot_waiters("p") == 0 && wait_start.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        m.slot_waiters("p") >= 1,
+        "second call must be queued on concurrency slot"
+    );
+    gate_guard.open();
+    let ans1 = h1.join().unwrap().expect("first call should succeed");
+    assert_eq!(ans1.record.budget_tokens(), 60);
+    let err2 = h2.join().unwrap().unwrap_err();
+    assert_eq!(err2.error.code(), "budget-exceeded", "{:?}", err2.error);
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 60);
+}
+
+#[test]
+fn dns_deadline_settles_not_sent_on_initial_hop_and_unknown_on_redirect_hop() {
+    use super::admission::{Admission, Attempt, Settle, Ticket, Usage};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+    use std::sync::atomic::AtomicUsize;
+
+    struct RecordSettle(Arc<Mutex<Vec<Option<Usage>>>>);
+    impl Settle for RecordSettle {
+        fn reported(self: Box<Self>, usage: Usage) {
+            self.0.lock().push(Some(usage));
+        }
+        fn unknown(self: Box<Self>) {
+            self.0.lock().push(None);
+        }
+    }
+    // Inherits Admission::follows_redirects() == true, matching GraphRAG BuildAdmission.
+    struct TrackAdmit(Arc<Mutex<Vec<Option<Usage>>>>);
+    impl Admission for TrackAdmit {
+        fn admit(&self, _: &Attempt<'_>) -> Result<Ticket, CallError> {
+            Ok(Ticket::new(Box::new(RecordSettle(self.0.clone()))))
+        }
+    }
+
+    struct RedirectServer {
+        port: u16,
+        hop1_hits: Arc<AtomicUsize>,
+        hop2_hits: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+    }
+    impl Drop for RedirectServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(("127.0.0.1", self.port));
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirect server");
+    let port = listener.local_addr().unwrap().port();
+    let hop1_hits = Arc::new(AtomicUsize::new(0));
+    let hop2_hits = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let hop1_hits = hop1_hits.clone();
+        let hop2_hits = hop2_hits.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Ok(mut stream) = conn else {
+                    continue;
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).is_err() || req_line.is_empty() {
+                    continue;
+                }
+                let mut content_len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err()
+                        || line == "\r\n"
+                        || line == "\n"
+                        || line.is_empty()
+                    {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        content_len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                if content_len > 0 {
+                    let mut body = vec![0u8; content_len];
+                    let _ = reader.read_exact(&mut body);
+                }
+                if req_line.contains("/hop2") {
+                    hop2_hits.fetch_add(1, Ordering::SeqCst);
+                    let body = mock::openai(r#"{"query":"ASK {}"}"#).to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else {
+                    hop1_hits.fetch_add(1, Ordering::SeqCst);
+                    let resp = format!(
+                        "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://redirect.test:{port}/hop2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+                let _ = stream.flush();
+            }
+        });
+    }
+    let server = RedirectServer {
+        port,
+        hop1_hits,
+        hop2_hits,
+        stop,
+    };
+
+    struct ControlledResolver {
+        pause_host: &'static str,
+        deadline: Instant,
+        paused: Arc<AtomicBool>,
+    }
+    impl sparkles::outbound::Resolver for ControlledResolver {
+        fn resolve(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+            if host.eq_ignore_ascii_case(self.pause_host) {
+                self.paused.store(true, Ordering::SeqCst);
+                while Instant::now() < self.deadline {
+                    let rem = self.deadline.saturating_duration_since(Instant::now());
+                    std::thread::sleep(rem + Duration::from_millis(15));
+                }
+            }
+            Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+        }
+    }
+
+    // 1. Deadline expiry during initial DNS settles ticket as not_sent (0 usage).
+    let dl1 = Instant::now() + Duration::from_millis(400);
+    let paused1 = Arc::new(AtomicBool::new(false));
+    let cfg1 = ModelsConfig::parse(
+        &json!({
+            "providers": {
+                "p": { "kind": "openai", "endpoint": format!("http://initial.test:{}", server.port), "requestTimeoutSecs": 5 }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let m1 = Models::new(
+        cfg1,
+        Default::default(),
+        sparkles::outbound::OutboundPolicy {
+            allow_private: true,
+            resolver: Arc::new(ControlledResolver {
+                pause_host: "initial.test",
+                deadline: dl1,
+                paused: paused1.clone(),
+            }),
+            ..Default::default()
+        },
+    );
+    let settled1 = Arc::new(Mutex::new(Vec::new()));
+    let admit1 = TrackAdmit(settled1.clone());
+    let err1 = m1
+        .call_prompt(
+            Some(Role::Draft),
+            &Pair::new("p", "m1"),
+            &Prompt::plain("system text", "user text"),
+            &draft_schema(),
+            dl1,
+            Some(&admit1),
+        )
+        .unwrap_err();
+    assert!(paused1.load(Ordering::SeqCst), "initial resolver must run");
+    assert_eq!(err1.error.code(), "deadline", "{:?}", err1.error);
+    assert_eq!(server.hop1_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(server.hop2_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        *settled1.lock(),
+        vec![Some(Usage::default())],
+        "initial DNS expiry before any POST must settle ticket as not_sent"
+    );
+
+    // 2. Deadline expiry during redirect DNS preserves ticket as unknown because hop 1
+    // already received the POST.
+    let dl2 = Instant::now() + Duration::from_millis(400);
+    let paused2 = Arc::new(AtomicBool::new(false));
+    let cfg2 = ModelsConfig::parse(
+        &json!({
+            "providers": {
+                "p": { "kind": "openai", "endpoint": format!("http://hop1.test:{}", server.port), "requestTimeoutSecs": 5 }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let m2 = Models::new(
+        cfg2,
+        Default::default(),
+        sparkles::outbound::OutboundPolicy {
+            allow_private: true,
+            resolver: Arc::new(ControlledResolver {
+                pause_host: "redirect.test",
+                deadline: dl2,
+                paused: paused2.clone(),
+            }),
+            ..Default::default()
+        },
+    );
+    let settled2 = Arc::new(Mutex::new(Vec::new()));
+    let admit2 = TrackAdmit(settled2.clone());
+    let err2 = m2
+        .call_prompt(
+            Some(Role::Draft),
+            &Pair::new("p", "m1"),
+            &Prompt::plain("system text", "user text"),
+            &draft_schema(),
+            dl2,
+            Some(&admit2),
+        )
+        .unwrap_err();
+    assert!(paused2.load(Ordering::SeqCst), "redirect resolver must run");
+    assert_eq!(err2.error.code(), "deadline", "{:?}", err2.error);
+    assert_eq!(server.hop1_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(server.hop2_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        *settled2.lock(),
+        vec![None],
+        "redirect DNS expiry after sent hop must preserve ticket reservation as unknown"
+    );
+}

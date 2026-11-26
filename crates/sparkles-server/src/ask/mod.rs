@@ -186,6 +186,16 @@ pub struct Turn {
     pub query: String,
 }
 
+/// Wrapper around [`sparkles::access::Preparation`] implementing `Debug` for [`AskOptions`].
+#[derive(Clone)]
+pub struct AskPreparation(pub sparkles::access::Preparation);
+
+impl std::fmt::Debug for AskPreparation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AskPreparation(..)")
+    }
+}
+
 /// What one ask is asked to do.
 #[derive(Clone, Debug)]
 pub struct AskOptions {
@@ -217,6 +227,8 @@ pub struct AskOptions {
     pub rows_for_summary: usize,
     /// the deadline of the whole ask
     pub deadline: Duration,
+    /// optional absolute deadline (takes precedence over `started + deadline`)
+    pub deadline_at: Option<Instant>,
     /// the token budget of the whole ask
     pub max_tokens: u64,
     /// the complexity score from which a stronger pair starts (§5.5)
@@ -237,6 +249,8 @@ pub struct AskOptions {
     /// queries charge. The pipeline runs on a blocking thread, where the request's
     /// task-local grant does not reach, so the route captures it here.
     pub grant: Option<Arc<sparkles::sparql::pool::PoolGrant>>,
+    /// an existing request preparation owner to reuse (e.g. from an MCP tool call)
+    pub preparation: Option<AskPreparation>,
     /// answer from the data, from community reports, or as the question needs
     pub mode: AskMode,
     /// use only reviewed community reports (`reviewedOnly`, C22 A7)
@@ -279,6 +293,7 @@ impl Default for AskOptions {
             max_rows: 1000,
             rows_for_summary: 50,
             deadline: Duration::from_secs(120),
+            deadline_at: None,
             max_tokens: 50_000,
             complexity_threshold: DEFAULT_COMPLEXITY_THRESHOLD,
             example_score: DEFAULT_EXAMPLE_SCORE,
@@ -288,6 +303,7 @@ impl Default for AskOptions {
             full_results: false,
             cancel: None,
             grant: None,
+            preparation: None,
             mode: AskMode::Auto,
             reviewed_only: false,
             report_context: false,
@@ -320,30 +336,31 @@ pub fn ask(
     let pipeline = tracing::debug_span!(target: profile::TARGET, "ask.pipeline", pipeline_id = profile.id(), context_tokens = tracing::field::Empty);
     let _entered = pipeline.enter();
     let cancel = o.cancel.clone().unwrap_or_default();
-    let deadline = started + o.deadline;
-    let preparation = match sparkles::access::Preparation::for_request(
-        &sparkles::sparql::QueryOptions {
+    let deadline = o.deadline_at.unwrap_or_else(|| started + o.deadline);
+    let preparation = match o.preparation.clone() {
+        Some(AskPreparation(preparation)) => preparation,
+        None => match sparkles::access::Preparation::for_request(&sparkles::sparql::QueryOptions {
             max_memory_bytes: server.cfg().query_memory_bytes,
             pool: server.state.catalog.pool().cloned(),
             grant: o.grant.clone(),
             cancel: Some(cancel.clone()),
             deadline: Some(deadline),
             ..Default::default()
-        },
-    ) {
-        Ok(preparation) => preparation,
-        Err(error) => {
-            let error = crate::mcp::errors::ErrorContext {
-                timeout_secs: o.deadline.as_secs_f64(),
-                max_timeout_secs: server.cfg().max_timeout.as_secs_f64(),
-                prefix_names: &[],
-                request_id: "ask",
+        }) {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                let error = crate::mcp::errors::ErrorContext {
+                    timeout_secs: o.deadline.as_secs_f64(),
+                    max_timeout_secs: server.cfg().max_timeout.as_secs_f64(),
+                    prefix_names: &[],
+                    request_id: "ask",
+                }
+                .engine(error);
+                let failure = error.meta();
+                on("error", &failure);
+                return json!({"outcome":"error","error":failure,"dataset":o.dataset,"question":o.question});
             }
-            .engine(error);
-            let failure = error.meta();
-            on("error", &failure);
-            return json!({"outcome":"error","error":failure,"dataset":o.dataset,"question":o.question});
-        }
+        },
     };
     let mut lists = o.lists.clone().unwrap_or_else(|| {
         Role::ALL
@@ -654,6 +671,13 @@ impl Asking<'_, '_> {
             .cloned()
     }
 
+    /// Whether `role` has a next pair it may move to within `MAX_MOVES`.
+    fn can_escalate(&self, role: Role) -> bool {
+        let i = self.pos.get(&role).copied().unwrap_or(0);
+        let list = self.list(role);
+        self.moved.get(&role).copied().unwrap_or(0) < MAX_MOVES && i + 1 < list.len()
+    }
+
     /// Move `role` to its next pair on `signal`, unless the list ends there or the
     /// role moved twice already (§5.5).
     fn escalate(&mut self, role: Role, signal: &'static str) -> bool {
@@ -677,6 +701,31 @@ impl Asking<'_, '_> {
         true
     }
 
+    /// Callback that records late usage reported by an in-flight provider HTTP request
+    /// that completes after this ask was cancelled or timed out.
+    #[allow(clippy::type_complexity)]
+    fn abandoned_usage_cb(
+        &self,
+        pair: &Pair,
+    ) -> Arc<dyn Fn(crate::models::admission::Usage, u64, Option<f64>) + Send + Sync> {
+        let st = self.server.state.clone();
+        let dataset = self.o.dataset.clone();
+        let principal = self.principal.id();
+        let provider = pair.provider.clone();
+        let model = pair.model.clone();
+        Arc::new(move |usage, budget_tokens, cost| {
+            st.asks.charge_abandoned(
+                &dataset,
+                &principal,
+                &provider,
+                &model,
+                usage,
+                budget_tokens,
+                cost,
+            );
+        })
+    }
+
     /// The tokens the ask counts against its budget, each class of input at its price.
     fn tokens(&self) -> u64 {
         self.steps.iter().map(StepRecord::budget_tokens).sum()
@@ -689,7 +738,8 @@ impl Asking<'_, '_> {
 
     /// One answer for `role` from its current pair. A provider failure runs the same
     /// step on the next pair (`provider-failure`), within the two failed calls of an
-    /// ask. The error is the code and message that end the step.
+    /// ask and within the ask's token budget. The error is the code and message that
+    /// end the step.
     fn call(
         &mut self,
         role: Role,
@@ -699,6 +749,12 @@ impl Asking<'_, '_> {
         loop {
             if self.cancelled() {
                 return Err(("cancelled", "the ask was cancelled".into()));
+            }
+            if self.tokens() >= self.o.max_tokens {
+                return Err((
+                    "budget-exceeded",
+                    format!("the ask used its {} tokens", self.o.max_tokens),
+                ));
             }
             let Some(pair) = self.pair(role) else {
                 return Err((
@@ -714,10 +770,17 @@ impl Asking<'_, '_> {
             };
             let admission: Option<&dyn crate::models::admission::Admission> =
                 if self.fenced { Some(&fence) } else { None };
-            match self
-                .models
-                .call_prompt(Some(role), &pair, prompt, out, self.deadline, admission)
-            {
+            let on_abandoned = self.abandoned_usage_cb(&pair);
+            match self.models.call_prompt_with_cancel_and_abandoned(
+                Some(role),
+                &pair,
+                prompt,
+                out,
+                self.deadline,
+                admission,
+                Some(&self.cancel),
+                Some(on_abandoned),
+            ) {
                 Ok(a) => {
                     self.push_step(role, a.record);
                     return Ok((a.value, a.level, pair));
@@ -735,13 +798,21 @@ impl Asking<'_, '_> {
                             return Err((AUTHORITY_CHANGED, message));
                         }
                         StepError::Deadline => return Err(("timeout", message)),
+                        StepError::Cancelled => {
+                            return Err(("cancelled", "the ask was cancelled".into()));
+                        }
                         _ => {
                             self.failed_calls += 1;
-                            if self.failed_calls >= MAX_FAILED_CALLS
-                                || !self.escalate(role, "provider-failure")
-                            {
+                            if self.failed_calls >= MAX_FAILED_CALLS || !self.can_escalate(role) {
                                 return Err(("provider-unavailable", message));
                             }
+                            if self.tokens() >= self.o.max_tokens {
+                                return Err((
+                                    "budget-exceeded",
+                                    format!("the ask used its {} tokens", self.o.max_tokens),
+                                ));
+                            }
+                            self.escalate(role, "provider-failure");
                         }
                     }
                 }
@@ -758,14 +829,15 @@ impl Asking<'_, '_> {
             .is_some_and(|t| t.input["properties"].get(arg).is_some())
     }
 
-    /// A tool's arguments with the dataset, the ask's state and the deadline, and the
-    /// call to run it as the principal.
+    /// A tool's arguments with the dataset, the ask's state and an absolute step deadline
+    /// (tightened to at most `self.deadline`), and the call to run it as the principal.
     fn tool_call(
         &self,
         name: &str,
         args: Value,
         timed: bool,
-    ) -> Result<(Map<String, Value>, Call), ToolError> {
+        step_deadline: Instant,
+    ) -> Result<(Map<String, Value>, Call, Instant), ToolError> {
         let mut m = match args {
             Value::Object(m) => m,
             _ => Map::new(),
@@ -786,16 +858,24 @@ impl Asking<'_, '_> {
         {
             m.insert("reasoning".into(), r.into());
         }
+        if self.cancelled() {
+            return Err(ToolError::new("cancelled", 503, "the ask was cancelled"));
+        }
+        let step_deadline = step_deadline.min(self.deadline);
+        let now = Instant::now();
+        let left = step_deadline.saturating_duration_since(now);
+        if left.is_zero() {
+            return Err(ToolError::new("timeout", 504, "the ask's deadline passed"));
+        }
         if timed {
-            let left = self.deadline.saturating_duration_since(Instant::now());
             let secs = left.min(self.server.cfg().max_timeout).as_secs_f64();
-            if secs < 0.05 {
+            if secs <= 0.0 {
                 return Err(ToolError::new("timeout", 504, "the ask's deadline passed"));
             }
             m.insert("timeoutSeconds".into(), json!(secs));
         }
         let call = Call {
-            arrived: Instant::now(),
+            arrived: now,
             cancel: self.cancel.clone(),
             request_id: "ask".into(),
             principal: self.principal.clone(),
@@ -804,22 +884,29 @@ impl Asking<'_, '_> {
             grant: self.o.grant.clone(),
             preparation: Some(self.preparation.clone()),
         };
-        Ok((m, call))
+        Ok((m, call, step_deadline))
     }
 
     /// Call a tool as the principal, on this thread, under the ask's deadline.
     fn tool(&self, name: &str, args: Value, timed: bool) -> Result<Value, ToolError> {
         if name == "check_query" {
             return profile::tool(profile::Stage::QueryCheck, || {
-                self.tool_unprofiled(name, args, timed)
+                self.tool_with_deadline(name, args, timed, self.deadline)
             });
         }
-        self.tool_unprofiled(name, args, timed)
+        self.tool_with_deadline(name, args, timed, self.deadline)
     }
 
-    fn tool_unprofiled(&self, name: &str, args: Value, timed: bool) -> Result<Value, ToolError> {
-        let (m, mut call) = self.tool_call(name, args, timed)?;
-        Ok(self.server.run_now(name, m, &mut call)?.into_json_value())
+    fn tool_with_deadline(
+        &self,
+        name: &str,
+        args: Value,
+        timed: bool,
+        step_deadline: Instant,
+    ) -> Result<Value, ToolError> {
+        let (m, mut call, cap) = self.tool_call(name, args, timed, step_deadline)?;
+        let bounded = self.server.with_deadline(cap);
+        Ok(bounded.run_now(name, m, &mut call)?.into_json_value())
     }
 
     /// Run a query with `sparql_query`: its compact result, and with `full_results` the
@@ -835,13 +922,14 @@ impl Asking<'_, '_> {
             "maxRows": self.o.max_rows.min(self.server.cfg().max_rows),
             "maxBytes": self.server.cfg().max_bytes,
         });
-        let (m, mut call) = self.tool_call("sparql_query", args, true)?;
+        let (m, mut call, cap) = self.tool_call("sparql_query", args, true, self.deadline)?;
+        let bounded = self.server.with_deadline(cap);
         if self.o.full_results {
-            let (o, full) = crate::mcp::tools::sparql_query_full(self.server, m, &mut call)?;
+            let (o, full) = crate::mcp::tools::sparql_query_full(&bounded, m, &mut call)?;
             Ok((o.into_json_value(), Some(full)))
         } else {
             Ok((
-                self.server
+                bounded
                     .run_now("sparql_query", m, &mut call)?
                     .into_json_value(),
                 None,
@@ -901,12 +989,19 @@ impl Asking<'_, '_> {
                 return self.error(&e.code, e.message);
             }
         }
+        if !self.o.run && self.o.mode == AskMode::Global {
+            return self.error(
+                "bad-argument",
+                "run: false previews a checked SPARQL query and does not apply to mode global",
+            );
+        }
         if let Some(q) = self.o.query.clone() {
             return self.given(&q);
         }
         // C22 §7: the reports a global answer may use, and the explicit global mode.
-        // An ask that cites claims answers from the data.
-        if self.o.mode != AskMode::Local
+        // An ask that cites claims or previews a query without running answers from the data.
+        if self.o.run
+            && self.o.mode != AskMode::Local
             && self.o.review_policy.is_none()
             && self.o.matching_policy.is_none()
         {
@@ -952,6 +1047,12 @@ impl Asking<'_, '_> {
         profile::context_tokens(context_tokens);
         tracing::Span::current().record("context_tokens", context_tokens);
         let ground = self.ground(context_tokens);
+        if self.cancelled() {
+            return self.error("cancelled", "the ask was cancelled");
+        }
+        if Instant::now() >= self.deadline {
+            return self.error("timeout", "the ask's deadline passed");
+        }
         // C22 §7.1: a question that names an entity linked exactly is local
         if ground.exact {
             self.reports = None;
@@ -1497,20 +1598,24 @@ impl Asking<'_, '_> {
     /// the ask's deadline and five seconds. A query that fails or times out gives none.
     fn usage_query(&self, stage: profile::Stage, q: String) -> Option<Value> {
         let cfg = self.server.cfg();
-        let left = self.deadline.saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        let left = self.deadline.saturating_duration_since(now);
+        if left < Duration::from_millis(500) {
+            return None;
+        }
+        let step_deadline = self.deadline.min(now + USAGE_QUERY_TIMEOUT);
         let secs = left
             .min(USAGE_QUERY_TIMEOUT)
             .min(cfg.max_timeout)
             .as_secs_f64();
-        if secs < 0.5 {
-            return None;
-        }
-        self.ground_tool(
-            stage,
-            "sparql_query",
-            json!({"query": q, "format": "json", "maxRows": cfg.max_rows.min(200), "timeoutSeconds": secs}),
-            false,
-        )
+        profile::tool(stage, || {
+            self.tool_with_deadline(
+                "sparql_query",
+                json!({"query": q, "format": "json", "maxRows": cfg.max_rows.min(200), "timeoutSeconds": secs}),
+                false,
+                step_deadline,
+            )
+        })
         .ok()
     }
 
@@ -2447,8 +2552,9 @@ impl Asking<'_, '_> {
         }
         let mut v = if seeds.is_empty() {
             // no entity yet: the policies and the map are checked, and no claim is read
-            let (m, mut call) = self.tool_call("recall", args, true)?;
-            self.server
+            let (m, mut call, cap) = self.tool_call("recall", args, true, self.deadline)?;
+            let bounded = self.server.with_deadline(cap);
+            bounded
                 .run_now(crate::mcp::RECALL_PREFLIGHT, m, &mut call)?
                 .into_json_value()
         } else {

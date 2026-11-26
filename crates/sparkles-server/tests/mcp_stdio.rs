@@ -764,3 +764,307 @@ fn stdio_cli_exits_after_eof_with_stalled_stdout() {
     drop(probe_w);
     drop(stdout_pipe);
 }
+
+#[test]
+fn stdio_ask_model_config_secret_read_only_and_url_refusal() {
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let ttl = dir.path().join("fixture.ttl");
+    let db = dir.path().join("org");
+    std::fs::write(&ttl, FIXTURE).unwrap();
+
+    // Load a persistent database directory via `sparkles load`.
+    let loaded = Command::new(env!("CARGO_BIN_EXE_sparkles"))
+        .args(["load", "--loc"])
+        .arg(&db)
+        .arg(&ttl)
+        .output()
+        .unwrap();
+    assert!(
+        loaded.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+
+    // Enable the assistant with two draft pairs and write a sentinel asks.json.
+    std::fs::write(
+        db.join("assistant.json"),
+        serde_json::to_string_pretty(&json!({
+            "format": 1,
+            "enabled": true,
+            "send": "schema",
+            "historyDays": 30,
+            "roles": {
+                "draft": [
+                    { "provider": "mock", "model": "m1" },
+                    { "provider": "mock", "model": "m2" }
+                ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let sentinel_history = serde_json::to_string_pretty(&json!({
+        "format": 2,
+        "asks": [{
+            "id": "keep-me",
+            "principal": "local",
+            "at": "2026-11-26T00:00:00Z",
+            "question": "Sentinel?",
+            "result": "answered",
+            "outcome": "none",
+            "routing": {}
+        }]
+    }))
+    .unwrap();
+    let asks_path = db.join("asks.json");
+    std::fs::write(&asks_path, &sentinel_history).unwrap();
+
+    // Minimal loopback mock OpenAI server capturing Authorization headers and models.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(Mutex::new(Vec::<(Option<String>, String)>::new()));
+    let stop_srv = stop.clone();
+    let seen_srv = seen.clone();
+    let handle = std::thread::spawn(move || {
+        while !stop_srv.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let mut header_end = None;
+                    let mut content_len = 0usize;
+                    while let Ok(n) = stream.read(&mut chunk) {
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if header_end.is_none()
+                            && let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                        {
+                            header_end = Some(pos + 4);
+                            let hdrs = String::from_utf8_lossy(&buf[..pos]);
+                            for line in hdrs.lines() {
+                                if let Some((k, v)) = line.split_once(':')
+                                    && k.eq_ignore_ascii_case("content-length")
+                                {
+                                    content_len = v.trim().parse().unwrap_or(0);
+                                }
+                            }
+                        }
+                        if let Some(end) = header_end
+                            && buf.len() >= end + content_len
+                        {
+                            break;
+                        }
+                    }
+                    let end = header_end.unwrap_or(buf.len());
+                    let hdrs = String::from_utf8_lossy(&buf[..end]);
+                    let auth = hdrs.lines().find_map(|line| {
+                        let (k, v) = line.split_once(':')?;
+                        k.eq_ignore_ascii_case("authorization")
+                            .then(|| v.trim().to_string())
+                    });
+                    let req_body: Value = serde_json::from_slice(&buf[end..]).unwrap_or_default();
+                    let model = req_body["model"].as_str().unwrap_or("").to_string();
+                    seen_srv.lock().unwrap().push((auth, model));
+
+                    let content = json!({
+                        "query": "SELECT ?p ?name WHERE { ?p a ex:Person ; rdfs:label ?name } ORDER BY ?p",
+                        "explanation": "Lists people and labels.",
+                        "assumptions": [],
+                        "clarify": { "question": "", "choices": [] },
+                        "graph": { "subject": "", "predicate": "", "object": "" }
+                    })
+                    .to_string();
+                    let body = json!({
+                        "choices": [{
+                            "message": { "content": content },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": { "prompt_tokens": 12, "completion_tokens": 8 }
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let secret_file = dir.path().join("api.key");
+    std::fs::write(&secret_file, "sk-stdio-secret-488\n").unwrap();
+    let model_cfg = dir.path().join("models.json");
+    std::fs::write(
+        &model_cfg,
+        serde_json::to_string_pretty(&json!({
+            "providers": {
+                "mock": {
+                    "kind": "openai",
+                    "endpoint": format!("http://{addr}"),
+                    "apiKey": { "secret": "mock_key" },
+                    "requestTimeoutSecs": 5,
+                    "allowedModels": ["m1", "m2"]
+                }
+            },
+            "roles": {
+                "draft": [
+                    { "provider": "mock", "model": "m1" },
+                    { "provider": "mock", "model": "m2" }
+                ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // 1. `--url` refuses `--model-config` and `--model-secret` before connecting.
+    #[cfg(feature = "auth")]
+    {
+        let out = Command::new(env!("CARGO_BIN_EXE_sparkles"))
+            .args(["mcp", "--url", "http://127.0.0.1:9/mcp", "--model-config"])
+            .arg(&model_cfg)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--loc") && stderr.contains("bridged server"),
+            "unexpected stderr: {stderr}"
+        );
+    }
+
+    // 2. Default read-only `sparkles mcp --loc` loads `--model-config` and `--model-secret`,
+    //    lists `ask`, answers an ordinary call and `tryHarder`, and never writes `asks.json`.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sparkles"))
+        .args(["mcp", "--loc"])
+        .arg(&db)
+        .arg("--model-config")
+        .arg(&model_cfg)
+        .arg("--model-secret")
+        .arg(format!("mock_key=file:{}", secret_file.display()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut exchange = |msg: Value| -> Option<Value> {
+        writeln!(stdin, "{msg}").unwrap();
+        stdin.flush().unwrap();
+        msg.get("id")?;
+        let line = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("no stdio response");
+        Some(serde_json::from_str(&line).expect("JSON-RPC line"))
+    };
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+
+    let list = exchange(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": { "_meta": meta }
+    }))
+    .unwrap();
+    let names: Vec<&str> = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"ask"),
+        "ask missing from tools/list: {names:?}"
+    );
+
+    let first = exchange(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "_meta": meta,
+            "name": "ask",
+            "arguments": { "question": "List people" }
+        }
+    }))
+    .unwrap();
+    assert_eq!(first["result"]["isError"], false, "{first}");
+    let sc1 = &first["result"]["structuredContent"];
+    assert_eq!(sc1["outcome"], "answered", "{sc1}");
+    assert_eq!(sc1["usage"]["answeredBy"]["model"], "m1");
+    let ask_id = sc1["usage"]["askId"].as_str().unwrap().to_string();
+
+    // `tryHarder` escalates to m2 using in-memory recent state without mutating asks.json.
+    let second = exchange(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "_meta": meta,
+            "name": "ask",
+            "arguments": { "question": "List people", "tryHarder": ask_id }
+        }
+    }))
+    .unwrap();
+    assert_eq!(second["result"]["isError"], false, "{second}");
+    let sc2 = &second["result"]["structuredContent"];
+    assert_eq!(sc2["outcome"], "answered", "{sc2}");
+    assert_eq!(sc2["usage"]["answeredBy"]["model"], "m2");
+
+    drop(stdin);
+    let status = child.wait().unwrap();
+    stop.store(true, Ordering::Relaxed);
+    let _ = handle.join();
+    assert!(status.success(), "{status}");
+
+    let recorded = seen.lock().unwrap();
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert_eq!(
+        recorded[0],
+        (Some("Bearer sk-stdio-secret-488".into()), "m1".into())
+    );
+    assert_eq!(
+        recorded[1],
+        (Some("Bearer sk-stdio-secret-488".into()), "m2".into())
+    );
+
+    let after_history = std::fs::read_to_string(&asks_path).unwrap();
+    assert_eq!(
+        after_history, sentinel_history,
+        "read-only `sparkles mcp --loc` must not modify asks.json on disk"
+    );
+}

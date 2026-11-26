@@ -107,7 +107,7 @@ impl Tools<'_> {
         let timeout = self.timeout(a.timeout_seconds)?;
         let ds = self.dataset(a.dataset.as_deref())?;
         let ctx = self.ctx(&[], timeout.as_secs_f64());
-        let deadline = self.call.arrived + timeout;
+        let deadline = self.deadline(timeout);
         let r = self.reader(&ds, None, None, Some(false), deadline, &ctx)?;
         let filter = Filter {
             reviewed_only: a.reviewed_only,

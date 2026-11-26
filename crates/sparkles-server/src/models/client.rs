@@ -7,6 +7,8 @@
 use super::admission::Usage;
 use super::config::{CacheTtl, DEFAULT_ANTHROPIC_VERSION, Kind, Level, ProviderConfig};
 use serde_json::{Value, json};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// A run of prompt text. A part marked `cache` ends a prefix that a provider with prompt
@@ -134,6 +136,8 @@ pub enum CallError {
     /// the caller's admission refused an attempt before it was sent (spec C22 §3.5),
     /// with its code, and whether an earlier attempt of the same request was sent
     Admission(&'static str, String, bool),
+    /// the request was cancelled before it finished
+    Cancelled,
 }
 
 impl CallError {
@@ -148,6 +152,7 @@ impl CallError {
             CallError::Secret(_) => "secret-missing",
             CallError::Tls(_) => "tls-config",
             CallError::Admission(code, ..) => code,
+            CallError::Cancelled => "cancelled",
         }
     }
 }
@@ -164,6 +169,7 @@ impl std::fmt::Display for CallError {
             | CallError::Tls(m)
             | CallError::Admission(_, m, _) => f.write_str(m),
             CallError::Rejected(s, m) => write!(f, "{m} (status {s})"),
+            CallError::Cancelled => f.write_str("the request was cancelled"),
         }
     }
 }
@@ -672,9 +678,13 @@ fn provider_count(
     name: &str,
     p: &ProviderConfig,
     req: &ChatRequest,
-    timeout: Duration,
+    deadline: Instant,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<u64, CallError> {
-    if timeout.is_zero() {
+    if is_cancelled(cancel) {
+        return Err(CallError::Cancelled);
+    }
+    if Instant::now() >= deadline {
         return Err(CallError::Unavailable(format!(
             "provider {name}: no time is left to count tokens"
         )));
@@ -688,8 +698,31 @@ fn provider_count(
     let hrefs: Vec<(&str, &str)> = hs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let bytes = body_bytes(&body);
     let key = t.key.as_deref();
-    let posted = sparkles::outbound::post_json(t.outbound, &url, &hrefs, bytes, timeout)
-        .map_err(|f| CallError::Unavailable(scrub(format!("provider {name}: {f}"), key)))?;
+    let abort: Option<sparkles::outbound::AbortCheck> = cancel.map(|c| {
+        let c = c.clone();
+        Arc::new(move || c.load(Ordering::Relaxed).then_some(true))
+            as sparkles::outbound::AbortCheck
+    });
+    let posted = sparkles::outbound::post_json_until_cancellable(
+        t.outbound, &url, &hrefs, bytes, deadline, abort,
+    )
+    .map_err(|e| match e {
+        sparkles::outbound::PostAbort::Cancelled => CallError::Cancelled,
+        sparkles::outbound::PostAbort::TimedOutBeforeSend => {
+            CallError::Unavailable(format!("provider {name}: no time is left to count tokens"))
+        }
+        sparkles::outbound::PostAbort::Failed(f) => {
+            CallError::Unavailable(scrub(format!("provider {name}: {f}"), key))
+        }
+    })?;
+    if is_cancelled(cancel) {
+        return Err(CallError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(CallError::Unavailable(format!(
+            "provider {name}: no time is left to count tokens"
+        )));
+    }
     if !(200..300).contains(&posted.status.as_u16()) {
         return Err(CallError::Unavailable(scrub(
             format!(
@@ -706,33 +739,410 @@ fn provider_count(
         .ok_or_else(|| CallError::Invalid("the token count has no input_tokens".into()))
 }
 
-/// Send one call, retrying a `429` or `5xx` twice within its timeout (with the
+fn is_cancelled(cancel: Option<&Arc<AtomicBool>>) -> bool {
+    cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+}
+
+/// Callback invoked when an HTTP request that was abandoned on cancellation or deadline
+/// finishes later and reports token usage. The second argument is the incremental
+/// rounded budget charge for the step (`prior.plus(usage).budget() - prior.budget()`).
+pub type AbandonedUsageFn = Arc<dyn Fn(Usage, u64) + Send + Sync>;
+
+#[cfg(test)]
+pub(super) mod test_hooks {
+    use parking_lot::Mutex;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, OnceLock};
+
+    type HookFn = Arc<dyn Fn() + Send + Sync>;
+
+    static BEFORE_CONSUME: OnceLock<Mutex<BTreeMap<String, HookFn>>> = OnceLock::new();
+    static AFTER_ABANDON: OnceLock<Mutex<BTreeMap<String, HookFn>>> = OnceLock::new();
+
+    /// Scoped hook invoked on the consumer thread immediately before inspecting
+    /// `Handoff::Finished` (and on the non-cancellable path right after `post_json_until`
+    /// returns `Ok`). Removed automatically on drop.
+    pub(crate) struct BeforeConsumeHook {
+        url: String,
+    }
+
+    impl BeforeConsumeHook {
+        pub(crate) fn install(url: String, hook: impl Fn() + Send + Sync + 'static) -> Self {
+            let mut map = BEFORE_CONSUME.get_or_init(Default::default).lock();
+            map.insert(url.clone(), Arc::new(hook));
+            Self { url }
+        }
+    }
+
+    impl Drop for BeforeConsumeHook {
+        fn drop(&mut self) {
+            if let Some(map) = BEFORE_CONSUME.get() {
+                map.lock().remove(&self.url);
+            }
+        }
+    }
+
+    pub(super) fn run_before_consume(url: &str) {
+        let hook = BEFORE_CONSUME
+            .get()
+            .and_then(|map| map.lock().get(url).cloned());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Scoped hook invoked on the caller thread immediately after marking
+    /// `Handoff::Abandoned` and unlocking the handoff mutex, before returning to
+    /// caller-side accounting. Removed automatically on drop.
+    pub(crate) struct AfterAbandonHook {
+        url: String,
+    }
+
+    impl AfterAbandonHook {
+        pub(crate) fn install(url: String, hook: impl Fn() + Send + Sync + 'static) -> Self {
+            let mut map = AFTER_ABANDON.get_or_init(Default::default).lock();
+            map.insert(url.clone(), Arc::new(hook));
+            Self { url }
+        }
+    }
+
+    impl Drop for AfterAbandonHook {
+        fn drop(&mut self) {
+            if let Some(map) = AFTER_ABANDON.get() {
+                map.lock().remove(&self.url);
+            }
+        }
+    }
+
+    pub(super) fn run_after_abandon(url: &str) {
+        let hook = AFTER_ABANDON
+            .get()
+            .and_then(|map| map.lock().get(url).cloned());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+/// Sleep until `until` or `deadline`, waking periodically to observe `cancel`.
+pub(super) fn sleep_until(
+    until: Instant,
+    deadline: Instant,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<(), bool> {
+    let target = until.min(deadline);
+    loop {
+        if is_cancelled(cancel) {
+            return Err(true);
+        }
+        let now = Instant::now();
+        if now >= target {
+            return if now >= deadline && until > deadline {
+                Err(false)
+            } else {
+                Ok(())
+            };
+        }
+        let step = (target - now).min(Duration::from_millis(20));
+        std::thread::sleep(step);
+    }
+}
+
+enum Handoff {
+    Pending,
+    Abandoned,
+    NotSent(bool, Option<super::SlotGuard>),
+    Finished(
+        Result<sparkles::outbound::Posted, sparkles::outbound::Failure>,
+        Option<super::admission::Ticket>,
+        Option<super::SlotGuard>,
+    ),
+}
+
+enum PostOutcome {
+    Posted(
+        sparkles::outbound::Posted,
+        Option<super::admission::Ticket>,
+        Option<super::SlotGuard>,
+    ),
+    Failed(sparkles::outbound::Failure, Option<super::SlotGuard>),
+    Cancelled(Option<super::SlotGuard>),
+    TimedOut(Option<super::SlotGuard>),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn post_json_cancellable(
+    outbound: &sparkles::outbound::OutboundPolicy,
+    url: &str,
+    headers: &[(String, String)],
+    bytes: Vec<u8>,
+    deadline: Instant,
+    cancel: Option<&Arc<AtomicBool>>,
+    ticket: Option<super::admission::Ticket>,
+    slot: Option<super::SlotGuard>,
+    kind: Kind,
+    ttl: Option<CacheTtl>,
+    prior_usage: Usage,
+    on_abandoned: Option<&AbandonedUsageFn>,
+) -> PostOutcome {
+    let Some(flag) = cancel else {
+        if Instant::now() >= deadline {
+            if let Some(tk) = ticket {
+                tk.not_sent();
+            }
+            return PostOutcome::TimedOut(slot);
+        }
+        let hrefs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        return match sparkles::outbound::post_json_until_cancellable(
+            outbound, url, &hrefs, bytes, deadline, None,
+        ) {
+            Ok(posted) => {
+                #[cfg(test)]
+                test_hooks::run_before_consume(url);
+                PostOutcome::Posted(posted, ticket, slot)
+            }
+            Err(sparkles::outbound::PostAbort::Cancelled) => {
+                if let Some(tk) = ticket {
+                    tk.not_sent();
+                }
+                PostOutcome::Cancelled(slot)
+            }
+            Err(sparkles::outbound::PostAbort::TimedOutBeforeSend) => {
+                if let Some(tk) = ticket {
+                    tk.not_sent();
+                }
+                PostOutcome::TimedOut(slot)
+            }
+            Err(sparkles::outbound::PostAbort::Failed(f)) => {
+                drop(ticket);
+                PostOutcome::Failed(f, slot)
+            }
+        };
+    };
+    if flag.load(Ordering::Relaxed) {
+        if let Some(tk) = ticket {
+            tk.not_sent();
+        }
+        return PostOutcome::Cancelled(slot);
+    }
+    if Instant::now() >= deadline {
+        if let Some(tk) = ticket {
+            tk.not_sent();
+        }
+        return PostOutcome::TimedOut(slot);
+    }
+    let outbound = outbound.clone();
+    let url_str = url.to_string();
+    let headers = headers.to_vec();
+    let flag_worker = flag.clone();
+    let on_abandoned = on_abandoned.cloned();
+    let handoff = Arc::new((
+        parking_lot::Mutex::new(Handoff::Pending),
+        parking_lot::Condvar::new(),
+    ));
+    let handoff_worker = handoff.clone();
+    let payload = Arc::new(parking_lot::Mutex::new(Some((ticket, slot))));
+    let payload_worker = payload.clone();
+    let spawned = std::thread::Builder::new()
+        .name("model-http".into())
+        .spawn(move || {
+            let Some((ticket, slot)) = payload_worker.lock().take() else {
+                return;
+            };
+            let abort: sparkles::outbound::AbortCheck = {
+                let flag = flag_worker.clone();
+                let handoff = handoff_worker.clone();
+                Arc::new(move || {
+                    if flag.load(Ordering::Relaxed) {
+                        return Some(true);
+                    }
+                    if matches!(*handoff.0.lock(), Handoff::Abandoned) {
+                        return Some(false);
+                    }
+                    None
+                })
+            };
+            let hrefs: Vec<(&str, &str)> = headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            let res = match sparkles::outbound::post_json_until_cancellable(
+                &outbound,
+                &url_str,
+                &hrefs,
+                bytes,
+                deadline,
+                Some(abort),
+            ) {
+                Ok(posted) => Ok(posted),
+                Err(
+                    e @ (sparkles::outbound::PostAbort::Cancelled
+                    | sparkles::outbound::PostAbort::TimedOutBeforeSend),
+                ) => {
+                    let cancelled = matches!(e, sparkles::outbound::PostAbort::Cancelled);
+                    if let Some(tk) = ticket {
+                        tk.not_sent();
+                    }
+                    let mut g = handoff_worker.0.lock();
+                    if matches!(*g, Handoff::Pending) {
+                        *g = Handoff::NotSent(cancelled, slot);
+                        handoff_worker.1.notify_one();
+                        return;
+                    }
+                    drop(g);
+                    drop(slot);
+                    return;
+                }
+                Err(sparkles::outbound::PostAbort::Failed(f)) => Err(f),
+            };
+            let mut g = handoff_worker.0.lock();
+            if matches!(*g, Handoff::Pending) {
+                *g = Handoff::Finished(res, ticket, slot);
+                handoff_worker.1.notify_one();
+                return;
+            }
+            drop(g);
+            // Caller already abandoned (cancelled or timed out): settle admission and
+            // record any provider-reported usage BEFORE releasing the provider slot.
+            if let Ok(posted) = res {
+                let body_usage = serde_json::from_slice::<Value>(&posted.body)
+                    .ok()
+                    .map(|v| read_usage(kind, &v, ttl).0)
+                    .unwrap_or_default();
+                if let Some(tk) = ticket {
+                    tk.settle(usage_of(kind, &posted.body, ttl));
+                }
+                if body_usage != Usage::default()
+                    && let Some(cb) = on_abandoned
+                {
+                    let delta_budget = prior_usage
+                        .plus(body_usage)
+                        .budget()
+                        .saturating_sub(prior_usage.budget());
+                    cb(body_usage, delta_budget);
+                }
+            } else {
+                drop(ticket);
+            }
+            drop(slot);
+        });
+    if let Err(e) = spawned {
+        let (ticket, slot) = payload.lock().take().unwrap_or((None, None));
+        if let Some(tk) = ticket {
+            tk.not_sent();
+        }
+        return PostOutcome::Failed(
+            sparkles::outbound::Failure::Failed(format!("failed to start HTTP worker: {e}")),
+            slot,
+        );
+    }
+    let mut g = handoff.0.lock();
+    loop {
+        #[cfg(test)]
+        if matches!(*g, Handoff::Finished(..)) {
+            drop(g);
+            test_hooks::run_before_consume(url);
+            g = handoff.0.lock();
+        }
+        match std::mem::replace(&mut *g, Handoff::Pending) {
+            Handoff::Finished(Ok(posted), tk, s) => return PostOutcome::Posted(posted, tk, s),
+            Handoff::Finished(Err(f), tk, s) => {
+                drop(tk);
+                if flag.load(Ordering::Relaxed) {
+                    return PostOutcome::Cancelled(s);
+                }
+                if Instant::now() >= deadline {
+                    return PostOutcome::TimedOut(s);
+                }
+                return PostOutcome::Failed(f, s);
+            }
+            Handoff::NotSent(true, s) => return PostOutcome::Cancelled(s),
+            Handoff::NotSent(false, s) => return PostOutcome::TimedOut(s),
+            Handoff::Pending => {}
+            Handoff::Abandoned => {
+                *g = Handoff::Abandoned;
+                return if flag.load(Ordering::Relaxed) {
+                    PostOutcome::Cancelled(None)
+                } else {
+                    PostOutcome::TimedOut(None)
+                };
+            }
+        }
+        if flag.load(Ordering::Relaxed) {
+            *g = Handoff::Abandoned;
+            drop(g);
+            #[cfg(test)]
+            test_hooks::run_after_abandon(url);
+            return PostOutcome::Cancelled(None);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            *g = Handoff::Abandoned;
+            drop(g);
+            #[cfg(test)]
+            test_hooks::run_after_abandon(url);
+            return PostOutcome::TimedOut(None);
+        }
+        let wake = deadline.min(now + Duration::from_millis(20));
+        handoff.1.wait_until(&mut g, wake);
+    }
+}
+
+/// Send one call, retrying a `429` or `5xx` twice within its absolute `deadline` (with the
 /// provider's `Retry-After` when it is shorter than the time left). With an
 /// `admission`, every HTTP attempt, retries included, is admitted before it is sent,
 /// and each admitted attempt is settled with the usage its answer reported.
-pub fn send_admitted(
+/// On error, returns any provider-reported token usage from failed or unparseable answers.
+/// Whenever an HTTP response reports usage, `on_budget` is invoked immediately with the
+/// incremental rounded step budget delta while `slot` is still held, before any retry or
+/// return. When cancelled or timed out mid-flight, the worker retains `slot` and settles
+/// any late usage via `on_abandoned` before releasing `slot`; on all other returns `slot`
+/// stays in the caller's `Option` so the caller releases it only after recording usage.
+#[allow(clippy::too_many_arguments)]
+pub fn send_admitted_cancellable(
     t: &Transport<'_>,
     name: &str,
     p: &ProviderConfig,
     req: &ChatRequest,
+    deadline: Instant,
     admission: Option<&dyn super::admission::Admission>,
-) -> Result<ChatResponse, CallError> {
+    cancel: Option<&Arc<AtomicBool>>,
+    slot: &mut Option<super::SlotGuard>,
+    prior_usage: Usage,
+    on_budget: Option<&dyn Fn(u64)>,
+    on_abandoned: Option<AbandonedUsageFn>,
+) -> Result<ChatResponse, (CallError, Usage)> {
+    let started = Instant::now();
+    // Per-step timeout may only tighten the caller's absolute deadline, never widen it.
+    let deadline = started
+        .checked_add(req.timeout)
+        .map_or(deadline, |d| deadline.min(d));
+    let timed_out = || {
+        CallError::Unavailable(format!(
+            "provider {name} did not answer within {:.0} s",
+            req.timeout.as_secs_f64()
+        ))
+    };
+    if is_cancelled(cancel) {
+        return Err((CallError::Cancelled, Usage::default()));
+    }
+    if Instant::now() >= deadline {
+        return Err((timed_out(), Usage::default()));
+    }
     let (url, body) = build(p, req);
     let ttl = cache_ttl(p, req);
     let hs = headers(p, t.key.as_deref());
-    let hrefs: Vec<(&str, &str)> = hs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let bytes = body_bytes(&body);
-    let started = Instant::now();
     let key = t.key.as_deref();
-    // counting spends the request's own time
+    // counting spends the request's own time up to the absolute deadline
     let counter = || {
-        provider_count(
-            t,
-            name,
-            p,
-            req,
-            req.timeout.saturating_sub(started.elapsed()),
-        )
+        if is_cancelled(cancel) {
+            return Err(CallError::Cancelled);
+        }
+        provider_count(t, name, p, req, deadline, cancel)
     };
     let has_counter = count_request(p, req).is_some();
     // an admission that must see every send gets no redirects, each of which would
@@ -748,15 +1158,13 @@ pub fn send_admitted(
         t.outbound
     };
     let mut attempt = 0;
+    let mut failed_usage = Usage::default();
     loop {
-        let timed_out = || {
-            CallError::Unavailable(format!(
-                "provider {name} did not answer within {:.0} s",
-                req.timeout.as_secs_f64()
-            ))
-        };
-        if req.timeout.saturating_sub(started.elapsed()).is_zero() {
-            return Err(timed_out());
+        if is_cancelled(cancel) {
+            return Err((CallError::Cancelled, failed_usage));
+        }
+        if Instant::now() >= deadline {
+            return Err((timed_out(), failed_usage));
         }
         let ticket = match admission {
             None => None,
@@ -771,53 +1179,122 @@ pub fn send_admitted(
                     cache_ttl: ttl,
                     provider_count: if has_counter { Some(&counter) } else { None },
                 })
-                .map_err(|e| match e {
-                    CallError::Admission(c, m, _) => CallError::Admission(c, m, attempt > 0),
-                    e => e,
+                .map_err(|e| {
+                    let err = match e {
+                        CallError::Admission(c, m, _) => CallError::Admission(c, m, attempt > 0),
+                        e => e,
+                    };
+                    (err, failed_usage)
                 })?,
             ),
         };
-        // admission may have spent time counting
-        let left = req.timeout.saturating_sub(started.elapsed());
-        if left.is_zero() {
+        if is_cancelled(cancel) {
             if let Some(tk) = ticket {
                 tk.not_sent();
             }
-            return Err(timed_out());
+            return Err((CallError::Cancelled, failed_usage));
         }
-        // a ticket dropped on any path below leaves its usage unknown
-        let posted =
-            match sparkles::outbound::post_json(outbound, &url, &hrefs, bytes.clone(), left) {
-                Ok(posted) => posted,
-                Err(sparkles::outbound::Failure::Refused(m)) => {
-                    // a refusal can come from a redirect after the request was sent, so
-                    // the reservation stays counted
-                    drop(ticket);
-                    return Err(CallError::Refused(scrub(
+        // admission may have spent time counting
+        if Instant::now() >= deadline {
+            if let Some(tk) = ticket {
+                tk.not_sent();
+            }
+            return Err((timed_out(), failed_usage));
+        }
+        let (posted, ticket) = match post_json_cancellable(
+            outbound,
+            &url,
+            &hs,
+            bytes.clone(),
+            deadline,
+            cancel,
+            ticket,
+            slot.take(),
+            p.kind,
+            ttl,
+            prior_usage.plus(failed_usage),
+            on_abandoned.as_ref(),
+        ) {
+            PostOutcome::Posted(posted, tk, s) => {
+                *slot = s;
+                (posted, tk)
+            }
+            PostOutcome::Cancelled(s) => {
+                *slot = s;
+                return Err((CallError::Cancelled, failed_usage));
+            }
+            PostOutcome::TimedOut(s) => {
+                *slot = s;
+                return Err((timed_out(), failed_usage));
+            }
+            PostOutcome::Failed(sparkles::outbound::Failure::Refused(m), s) => {
+                *slot = s;
+                return Err((
+                    CallError::Refused(scrub(
                         format!("provider {name}: the outbound policy refuses {m}"),
                         key,
-                    )));
-                }
-                Err(f) => {
-                    return Err(CallError::Unavailable(scrub(
-                        format!("provider {name}: {f}"),
-                        key,
-                    )));
-                }
-            };
-        // the usage settles the reservation whatever the content holds
+                    )),
+                    failed_usage,
+                ));
+            }
+            PostOutcome::Failed(f, s) => {
+                *slot = s;
+                return Err((
+                    CallError::Unavailable(scrub(format!("provider {name}: {f}"), key)),
+                    failed_usage,
+                ));
+            }
+        };
+        // the usage settles the reservation whatever the content holds, and publishes its
+        // incremental rounded budget delta to the provider cap immediately while `slot`
+        // is still held (before any retry handoff or return).
+        let body_usage = serde_json::from_slice::<Value>(&posted.body)
+            .ok()
+            .map(|v| read_usage(p.kind, &v, ttl).0)
+            .unwrap_or_default();
         if let Some(tk) = ticket {
             tk.settle(usage_of(p.kind, &posted.body, ttl));
         }
+        if body_usage != Usage::default()
+            && let Some(publish) = on_budget
+        {
+            let prev_step = prior_usage.plus(failed_usage);
+            let delta_budget = prev_step
+                .plus(body_usage)
+                .budget()
+                .saturating_sub(prev_step.budget());
+            if delta_budget > 0 {
+                publish(delta_budget);
+            }
+        }
+        if is_cancelled(cancel) {
+            failed_usage = failed_usage.plus(body_usage);
+            return Err((CallError::Cancelled, failed_usage));
+        }
+        if Instant::now() >= deadline {
+            failed_usage = failed_usage.plus(body_usage);
+            return Err((timed_out(), failed_usage));
+        }
         let status = posted.status.as_u16();
         if (200..300).contains(&status) {
-            let mut r = parse(p.kind, &posted.body, ttl).map_err(|e| match e {
-                CallError::Invalid(m) => CallError::Invalid(format!("provider {name}: {m}")),
-                e => e,
-            })?;
+            let mut r = match parse(p.kind, &posted.body, ttl) {
+                Ok(r) => r,
+                Err(e) => {
+                    failed_usage = failed_usage.plus(body_usage);
+                    let err = match e {
+                        CallError::Invalid(m) => {
+                            CallError::Invalid(format!("provider {name}: {m}"))
+                        }
+                        e => e,
+                    };
+                    return Err((err, failed_usage));
+                }
+            };
+            r.usage = failed_usage.plus(r.usage);
             r.latency = started.elapsed();
             return Ok(r);
         }
+        failed_usage = failed_usage.plus(body_usage);
         let m = scrub(
             format!(
                 "provider {name} answered {}{}",
@@ -827,24 +1304,28 @@ pub fn send_admitted(
             key,
         );
         match status {
-            401 | 403 => return Err(CallError::Auth(m)),
+            401 | 403 => return Err((CallError::Auth(m), failed_usage)),
             408 | 409 | 425 | 429 | 500..=599 => {
                 if attempt >= RETRIES {
-                    return Err(CallError::Unavailable(m));
+                    return Err((CallError::Unavailable(m), failed_usage));
                 }
                 let wait = posted
                     .retry_after
                     .as_deref()
                     .and_then(|v| v.trim().parse::<u64>().ok())
                     .map_or(Duration::from_millis(250 << attempt), Duration::from_secs);
-                if wait >= req.timeout.saturating_sub(started.elapsed()) {
-                    return Err(CallError::Unavailable(m));
+                if wait >= deadline.saturating_duration_since(Instant::now()) {
+                    return Err((CallError::Unavailable(m), failed_usage));
                 }
                 tracing::info!(target: "sparkles::models", "retrying in {wait:?}: {m}");
-                std::thread::sleep(wait);
+                match sleep_until(Instant::now() + wait, deadline, cancel) {
+                    Ok(()) => {}
+                    Err(true) => return Err((CallError::Cancelled, failed_usage)),
+                    Err(false) => return Err((CallError::Unavailable(m), failed_usage)),
+                }
                 attempt += 1;
             }
-            _ => return Err(CallError::Rejected(status, m)),
+            _ => return Err((CallError::Rejected(status, m), failed_usage)),
         }
     }
 }
