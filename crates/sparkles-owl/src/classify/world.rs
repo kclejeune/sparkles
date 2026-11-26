@@ -421,6 +421,12 @@ impl Reporter<'_> {
 pub struct KeyMerges<'a> {
     pairs: KeyStorage<'a, (Ex, Ex)>,
 }
+impl KeyMerges<'_> {
+    /// Take ownership of the already-admitted pair storage without copying.
+    pub fn into_vec(mut self) -> Vec<(Ex, Ex)> {
+        std::mem::take(&mut self.pairs.rows)
+    }
+}
 impl std::ops::Deref for KeyMerges<'_> {
     type Target = [(Ex, Ex)];
     fn deref(&self) -> &Self::Target {
