@@ -1375,3 +1375,141 @@ fn if_head_refuses_stale_head_before_resolving_newly_masked_predecessor() {
     assert_eq!(code(current_res), "evidence-unavailable");
     assert_eq!(ds.store().head_commit().seq, moved_head);
 }
+
+#[test]
+fn record_charged_covers_verified_result_and_skips_unauthenticated_receipt_decode() {
+    let ds = Dataset::memory();
+    configured(&ds);
+
+    let p = propose(&ds, &small("c1", proposition()), &options()).unwrap();
+    let rev = iri_of(&p, "rev");
+
+    // 1. `record_charged` holds memory covering `iri`, `graph`, and `receipt.iri` until
+    //    its returned reservation is dropped.
+    let mut res = Resolution::new(Control::none()).unwrap();
+    let (warm, warm_held) = res
+        .record_charged(
+            "k",
+            &ds,
+            &ds,
+            Some(Arc::new(GraphAccess::all())),
+            &rev,
+            &[RecordKind::SourceRevision],
+            None,
+        )
+        .unwrap();
+    drop(warm);
+    drop(warm_held);
+    let base_used = res.preparation().limit() - res.preparation().available_bytes();
+
+    let (verified, held) = res
+        .record_charged(
+            "k",
+            &ds,
+            &ds,
+            Some(Arc::new(GraphAccess::all())),
+            &rev,
+            &[RecordKind::SourceRevision],
+            None,
+        )
+        .unwrap();
+    let expected_min_bytes = verified.iri.as_str().len() as u64
+        + verified.graph.as_str().len() as u64
+        + verified.receipt.iri.as_str().len() as u64;
+    let used_with_verified = res.preparation().limit() - res.preparation().available_bytes();
+    let one_record = used_with_verified.saturating_sub(base_used);
+    assert!(
+        one_record >= expected_min_bytes,
+        "VerifiedRecord reservation must cover variable-sized strings ({expected_min_bytes} B): {base_used} -> {used_with_verified}"
+    );
+    drop(verified);
+    drop(held);
+    let used_after_drop = res.preparation().limit() - res.preparation().available_bytes();
+    assert_eq!(
+        used_after_drop, base_used,
+        "dropping VerifiedRecord reservation must restore baseline usage"
+    );
+
+    // 2. Under a tight cap where decoding a single ~80 B IRI (~11 KiB) and settings
+    //    decoding (~64 KiB) fit comfortably, holding many live verified results exhausts
+    //    the allowance with `incomplete-evidence`, and dropping them allows reuse.
+    let tight_cap = base_used + 96 * 1024;
+    let mut tight = Resolution::with_memory(Control::none(), tight_cap).unwrap();
+    let mut live = Vec::new();
+    let mut overflow = None;
+    for _ in 0..400 {
+        match tight.record_charged(
+            "k",
+            &ds,
+            &ds,
+            Some(Arc::new(GraphAccess::all())),
+            &rev,
+            &[RecordKind::SourceRevision],
+            None,
+        ) {
+            Ok(pair) => live.push(pair),
+            Err(e) => {
+                overflow = Some(e);
+                break;
+            }
+        }
+    }
+    assert!(
+        !live.is_empty(),
+        "at least one verified record must fit in cap={tight_cap}"
+    );
+    assert_eq!(
+        code::<()>(Err(
+            overflow.expect("retaining verified records must exhaust cap")
+        )),
+        "incomplete-evidence"
+    );
+    live.clear();
+    tight
+        .record_charged(
+            "k",
+            &ds,
+            &ds,
+            Some(Arc::new(GraphAccess::all())),
+            &rev,
+            &[RecordKind::SourceRevision],
+            None,
+        )
+        .unwrap();
+
+    // 3. An unauthenticated record pointing to a 10 KiB receipt IRI (whose `decode_term`
+    //    needs > 1.2 MiB) is rejected as `origin-not-reproduced` under a 256 KiB cap
+    //    because the nonce check runs before decoding or memoizing the receipt IRI.
+    evidence::detach(&ds, SOURCES).unwrap();
+    let huge_receipt = format!("urn:test:huge-receipt:{}", "r".repeat(10_000));
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{SOURCES}> {{ \
+           <urn:planted-huge-receipt> a <urn:x-sparkles:evidence:SourceRevision> ; \
+             <urn:x-sparkles:evidence:availabilityReceipt> <{huge_receipt}> . \
+           <{huge_receipt}> a <urn:x-sparkles:evidence:Operation> ; \
+             <urn:x-sparkles:evidence:datasetId> \"{}\" ; \
+             <urn:x-sparkles:evidence:branchId> \"{}\" ; \
+             <urn:x-sparkles:evidence:commit> 1 . \
+         }} }}",
+        ds.dataset_id(),
+        ds.store().branch_id(),
+    ))
+    .unwrap();
+    configured(&ds);
+
+    let mut capped = Resolution::with_memory(Control::none(), 256 * 1024).unwrap();
+    let err = capped.record_charged(
+        "k",
+        &ds,
+        &ds,
+        Some(Arc::new(GraphAccess::all())),
+        &iri("urn:planted-huge-receipt"),
+        &[RecordKind::SourceRevision],
+        None,
+    );
+    assert_eq!(
+        code(err.map(|(v, _)| v)),
+        "origin-not-reproduced",
+        "nonce check must reject planted record before decoding the 10 KiB receipt IRI"
+    );
+}

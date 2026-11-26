@@ -792,3 +792,146 @@ fn pin_commit_keeps_graph_lookups_on_one_snapshot_after_head_advances() {
         .unwrap();
     assert_eq!(subjs.nodes(), &[iri("urn:a")]);
 }
+
+/// `Lookups::iri` charges every owned memo key to its `Reservation` for the lifetime of
+/// `Lookups`, releases it on drop, and refuses when accumulated memo keys exhaust the
+/// preparation allowance even while individual `lookup_iri` calls fit.
+#[test]
+fn lookups_charges_memoized_iris_and_refuses_when_allowance_exhausted() {
+    let (_dir, s) = setup();
+    let snap = s.snapshot();
+    let prep = Preparation::new(Control::none(), MEMORY_BYTES).unwrap();
+    let view = all().masked_controlled(&snap, &prep).unwrap();
+    let base_used = prep.inner_used();
+
+    let long_iri = format!("urn:memo:{}", "a".repeat(2048));
+    {
+        let mut lookups = Lookups::new(&prep, &view).unwrap();
+        let _ = lookups.iri(&long_iri).unwrap();
+        let after_first = prep.inner_used();
+        assert!(
+            after_first >= base_used + long_iri.len() as u64,
+            "memoized IRI must stay charged while Lookups lives: {base_used} -> {after_first}"
+        );
+        // Repeated lookup hits the memo and adds no further charge.
+        let _ = lookups.iri(&long_iri).unwrap();
+        assert_eq!(prep.inner_used(), after_first);
+    }
+    assert_eq!(
+        prep.inner_used(),
+        base_used,
+        "dropping Lookups must release memo key charges"
+    );
+
+    // Under a tight cap where one `lookup_iri` call (~3.5 KiB for a 1 KiB IRI) fits
+    // comfortably, accumulating 20 distinct 1 KiB memo keys must hit BudgetExceeded.
+    let pad = "b".repeat(1000);
+    let tight_cap = base_used + 12_000;
+    let tight = Preparation::new(Control::none(), tight_cap).unwrap();
+    let tight_view = all().masked_controlled(&snap, &tight).unwrap();
+    let mut lookups = Lookups::new(&tight, &tight_view).unwrap();
+    let mut succeeded = 0usize;
+    let mut overflow = None;
+    for i in 0..20 {
+        let key = format!("urn:memo:{i:02}:{pad}");
+        match lookups.iri(&key) {
+            Ok(_) => succeeded += 1,
+            Err(e) => {
+                overflow = Some(e);
+                break;
+            }
+        }
+    }
+    assert!(
+        succeeded >= 1,
+        "at least one 1 KiB lookup must fit within cap={tight_cap}"
+    );
+    assert!(
+        matches!(overflow, Some(Error::BudgetExceeded(_))),
+        "accumulating memo keys must fail with BudgetExceeded, got {overflow:?}"
+    );
+}
+
+/// `has_any_object_in_graph` and `single_object_in_graph` report exact cardinality under
+/// the caller's access policy, distinguishing absent, unique, and multi-valued objects.
+#[test]
+fn single_object_in_graph_distinguishes_none_one_and_many() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "INSERT DATA { GRAPH <urn:g> { \
+           <urn:s> <urn:one> \"alpha\" . \
+           <urn:s> <urn:two> \"first\" , \"second\" . \
+         } }",
+    );
+    let g = iri("urn:g");
+    let subj = iri("urn:s");
+    let p_none = iri("urn:none");
+    let p_one = iri("urn:one");
+    let p_two = iri("urn:two");
+
+    let mut r = resolver();
+    assert!(
+        !r.has_any_object_in_graph("k", &s, &s, &all(), &g, &subj, &p_none)
+            .unwrap()
+    );
+    assert!(
+        r.has_any_object_in_graph("k", &s, &s, &all(), &g, &subj, &p_one)
+            .unwrap()
+    );
+    let none = r
+        .single_object_in_graph("k", &s, &s, &all(), &g, &subj, &p_none, |t| {
+            Ok(t.map(ToString::to_string))
+        })
+        .unwrap();
+    assert_eq!(none, SingleObject::None);
+    let one = r
+        .single_object_in_graph("k", &s, &s, &all(), &g, &subj, &p_one, |t| {
+            Ok(match t {
+                Some(Term::Literal(l)) => Some(l.value().to_string()),
+                _ => None,
+            })
+        })
+        .unwrap();
+    assert_eq!(one, SingleObject::One(Some("alpha".to_string())));
+    let many = r
+        .single_object_in_graph("k", &s, &s, &all(), &g, &subj, &p_two, |t| {
+            Ok(t.map(ToString::to_string))
+        })
+        .unwrap();
+    assert_eq!(many, SingleObject::Many);
+
+    // A pattern protection hiding one of the two values leaves a unique visible value.
+    let hide_second = Protection {
+        name: "hide_second".into(),
+        predicates: Some(vec!["urn:two".into()]),
+        classes: None,
+        subclasses: false,
+        graphs: None,
+        pattern: Some("?s <urn:two> ?o . FILTER(?o != \"second\")".into()),
+        prefixes: Default::default(),
+        hide_inferences: false,
+    };
+    let masked = Arc::new(GraphAccess::with_triples(
+        Graphs::All,
+        Graphs::All,
+        TripleRules {
+            rules: vec![Rule {
+                protection: Arc::new(hide_second),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Default::default(),
+            limits: Default::default(),
+        },
+    ));
+    let filtered = r
+        .single_object_in_graph("k", &s, &s, &masked, &g, &subj, &p_two, |t| {
+            Ok(match t {
+                Some(Term::Literal(l)) => Some(l.value().to_string()),
+                _ => None,
+            })
+        })
+        .unwrap();
+    assert_eq!(filtered, SingleObject::One(Some("first".to_string())));
+}

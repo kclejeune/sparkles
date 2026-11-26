@@ -5016,9 +5016,10 @@ async fn claims_predecessor_lookup_charges_candidate_and_rendition_keys_to_memor
         (s, router)
     };
 
-    // Subcase A: Multiple ~1 KiB candidate revision IRIs in EV_SOURCES stay well within a
-    // generous 2 MiB lookup cap, while a tight 100 KiB cap rejects decoding and copying
-    // them with 422 incomplete-evidence.
+    // Subcase A: Many moderate-length (~180 B) candidate revisions + renditions stay well
+    // within a 2 MiB lookup cap, while a tight 150 KiB cap fits any single `decode_term`
+    // (~24 KiB) and `record_graphs` (~65 KiB) yet rejects the accumulated retained
+    // candidate/key copies with 422 incomplete-evidence.
     let g_cand = "https://example.org/notes/tight-cap-candidate";
     let sk_framed = json!([
         "ingest-claims-source",
@@ -5037,8 +5038,15 @@ async fn claims_predecessor_lookup_charges_candidate_and_rendition_keys_to_memor
         )
         .unwrap()
     );
-    let cand_pad = "x".repeat(1_000);
-    for (cap, expect_ok) in [(100 * 1024, false), (2 * 1024 * 1024, true)] {
+    let cand_pad = "x".repeat(160);
+    let cand_max_encoded_len = format!("<urn:test:long-rev:999:{cand_pad}").len() as u64;
+    let cand_decode_peak = cand_max_encoded_len * 128 + 1024;
+    let cand_tight_cap = 150 * 1024;
+    assert!(
+        cand_decode_peak < cand_tight_cap / 4,
+        "single-term decode ({cand_decode_peak} B) must stay far below tight cap ({cand_tight_cap} B)"
+    );
+    for (cap, expect_ok) in [(cand_tight_cap, false), (2 * 1024 * 1024, true)] {
         let (st, app) = build_state(cap);
         enable(&app).await;
         evidence(&app).await;
@@ -5055,7 +5063,8 @@ async fn claims_predecessor_lookup_charges_candidate_and_rendition_keys_to_memor
         .await;
         assert_eq!(s, StatusCode::OK);
 
-        // Plant 40 ~1 KiB SourceRevision subjects in EV_SOURCES while detached, then re-protect.
+        // Plant 180 ~180 B candidate (SourceRevision, Rendition, Receipt, Principal) tuples
+        // in EV_SOURCES while detached, then re-protect.
         let (s, _) = send(
             &app,
             req(
@@ -5067,11 +5076,15 @@ async fn claims_predecessor_lookup_charges_candidate_and_rendition_keys_to_memor
         .await;
         assert_eq!(s, StatusCode::OK);
         let mut ins = format!("INSERT DATA {{ GRAPH <{EV_SOURCES}> {{\n");
-        for i in 0..40 {
+        for i in 0..180 {
             ins.push_str(&format!(
-                "  <urn:test:long-rev:{i:02}:{cand_pad}> a <urn:x-sparkles:evidence:SourceRevision> ;\n\
+                "  <urn:test:long-rev:{i:03}:{cand_pad}> a <urn:x-sparkles:evidence:SourceRevision> ;\n\
                    <urn:x-sparkles:evidence:sourceKey> \"{sk}\" ;\n\
-                   <http://www.w3.org/ns/prov#specializationOf> <{g_cand}> .\n"
+                   <http://www.w3.org/ns/prov#specializationOf> <{g_cand}> .\n\
+                 <urn:test:long-rnd:{i:03}:{cand_pad}> a <urn:x-sparkles:evidence:Rendition> ;\n\
+                   <http://www.w3.org/ns/prov#wasDerivedFrom> <urn:test:long-rev:{i:03}:{cand_pad}> ;\n\
+                   <urn:x-sparkles:evidence:availabilityReceipt> <urn:test:long-op:{i:03}:{cand_pad}> .\n\
+                 <urn:test:long-op:{i:03}:{cand_pad}> <http://www.w3.org/ns/prov#wasAssociatedWith> <urn:test:long-who:{i:03}:{cand_pad}> .\n"
             ));
         }
         ins.push_str("} }");
@@ -5100,17 +5113,76 @@ async fn claims_predecessor_lookup_charges_candidate_and_rendition_keys_to_memor
         }
     }
 
-    // Subcase B: A ~4 KiB intermediate C18 rendition IRI encountered during lineage
-    // traversal (never passed through C18's 500-char display truncation) stays within a
-    // 2 MiB lookup cap and links `rev1`, while a tight 400 KiB cap rejects it with 422
-    // incomplete-evidence.
+    // Subcase B: Moderate-length (~180 B) intermediate C18 renditions across a 40-hop
+    // lineage chain with 120 planted candidates stay within a 2 MiB cap and link `rev1`,
+    // while a tight 140 KiB cap fits any single `decode_term` (~24 KiB) and `record_graphs`
+    // (~65 KiB) yet rejects the accumulated rendition/key copies with 422 incomplete-evidence.
     let g_rend = "https://example.org/notes/tight-cap-rendition";
-    let long_rend = format!("urn:test:long-rend:{}", "r".repeat(4_000));
-    for (cap, expect_ok) in [(400 * 1024, false), (2 * 1024 * 1024, true)] {
+    let rend_sk_framed = json!([
+        "ingest-claims-source",
+        1,
+        g_rend,
+        g_rend,
+        EV_SOURCES,
+        EV_CLAIMS
+    ])
+    .to_string();
+    let rend_sk = format!(
+        "ingest-claims-source:1:{}",
+        sparkles::evidence::Sha256Digest::of_bytes(
+            rend_sk_framed.as_bytes(),
+            &sparkles::task::Control::none()
+        )
+        .unwrap()
+    );
+    let rend_pad = "r".repeat(160);
+    let rend_max_encoded_len = format!("<urn:test:long-rend:999:{rend_pad}").len() as u64;
+    let rend_decode_peak = rend_max_encoded_len * 128 + 1024;
+    let rend_tight_cap = 140 * 1024;
+    assert!(
+        rend_decode_peak < rend_tight_cap / 4,
+        "single-term decode ({rend_decode_peak} B) must stay far below tight cap ({rend_tight_cap} B)"
+    );
+    for (cap, expect_ok) in [(rend_tight_cap, false), (2 * 1024 * 1024, true)] {
         let (st, app) = build_state(cap);
         enable(&app).await;
         evidence(&app).await;
         put_org_profile(&app, "default").await;
+
+        // Plant 120 ~180 B candidates in EV_SOURCES *before* ingesting `v1` so that
+        // re-protecting EV_SOURCES rotates the nonce prior to `v1` (leaving `rev1`
+        // authenticated under the current nonce). During `v1`, C18 has no prior
+        // rendition for `g_rend` so `predecessor_revision` returns before step 3.
+        let (s, _) = send(
+            &app,
+            req(
+                "POST",
+                "/$/evidence/org/detach",
+                json!({ "graph": EV_SOURCES }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let mut ev_ins = format!("INSERT DATA {{ GRAPH <{EV_SOURCES}> {{\n");
+        for i in 0..120 {
+            ev_ins.push_str(&format!(
+                "  <urn:test:rcand-rev:{i:03}:{rend_pad}> a <urn:x-sparkles:evidence:SourceRevision> ;\n\
+                   <urn:x-sparkles:evidence:sourceKey> \"{rend_sk}\" ;\n\
+                   <http://www.w3.org/ns/prov#specializationOf> <{g_rend}> .\n\
+                 <urn:test:rcand-rnd:{i:03}:{rend_pad}> a <urn:x-sparkles:evidence:Rendition> ;\n\
+                   <http://www.w3.org/ns/prov#wasDerivedFrom> <urn:test:rcand-rev:{i:03}:{rend_pad}> ;\n\
+                   <urn:x-sparkles:evidence:availabilityReceipt> <urn:test:rcand-op:{i:03}:{rend_pad}> .\n\
+                 <urn:test:rcand-op:{i:03}:{rend_pad}> <http://www.w3.org/ns/prov#wasAssociatedWith> <urn:test:rcand-who:{i:03}:{rend_pad}> .\n"
+            ));
+        }
+        ev_ins.push_str("} }");
+        let upd = Request::post("/org/update")
+            .header(header::CONTENT_TYPE, "application/sparql-update")
+            .body(Body::from(ev_ins))
+            .unwrap();
+        let (s, body) = send(&app, upd).await;
+        assert!(s.is_success(), "{s} {body}");
+        evidence(&app).await;
 
         let v1 = ingest(
             &app,
@@ -5133,18 +5205,26 @@ async fn claims_predecessor_lookup_charges_candidate_and_rendition_keys_to_memor
         assert_eq!(s, StatusCode::OK, "{reg2}");
         let rend2 = unangle(reg2["rendition"].as_str().unwrap()).to_string();
 
-        let upd_q = format!(
-            "DELETE DATA {{ GRAPH <{g_rend}> {{ <{rend2}> <http://www.w3.org/ns/prov#wasRevisionOf> <{rend1}> }} }} ; \
-             INSERT DATA {{ GRAPH <{g_rend}> {{ \
-               <{long_rend}> a <urn:x-sparkles:TextRendition> ; \
-                 <http://www.w3.org/ns/prov#wasDerivedFrom> <{g_rend}> ; \
-                 <http://www.w3.org/ns/prov#wasRevisionOf> <{rend1}> . \
-               <{rend2}> <http://www.w3.org/ns/prov#wasRevisionOf> <{long_rend}> . \
-             }} }}"
+        let mut c18_ins = format!(
+            "DELETE DATA {{ GRAPH <{g_rend}> {{ <{rend2}> <http://www.w3.org/ns/prov#wasRevisionOf> <{rend1}> }} }} ;\n\
+             INSERT DATA {{ GRAPH <{g_rend}> {{\n"
         );
+        let mut prev_node = rend1.clone();
+        for i in 0..40 {
+            let hop = format!("urn:test:long-rend:{i:03}:{rend_pad}");
+            c18_ins.push_str(&format!(
+                "  <{hop}> a <urn:x-sparkles:TextRendition> ;\n\
+                   <http://www.w3.org/ns/prov#wasDerivedFrom> <{g_rend}> ;\n\
+                   <http://www.w3.org/ns/prov#wasRevisionOf> <{prev_node}> .\n"
+            ));
+            prev_node = hop;
+        }
+        c18_ins.push_str(&format!(
+            "  <{rend2}> <http://www.w3.org/ns/prov#wasRevisionOf> <{prev_node}> .\n}} }}"
+        ));
         let upd = Request::post("/org/update")
             .header(header::CONTENT_TYPE, "application/sparql-update")
-            .body(Body::from(upd_q))
+            .body(Body::from(c18_ins))
             .unwrap();
         let (s, body) = send(&app, upd).await;
         assert!(s.is_success(), "{s} {body}");
@@ -5165,6 +5245,96 @@ async fn claims_predecessor_lookup_charges_candidate_and_rendition_keys_to_memor
             assert_eq!(err["status"], 422, "{err}");
         }
     }
+}
+
+/// Focused copy-site budget regression: after controlled graph decoding (`objects_in_graph`)
+/// succeeds within budget, draining the remaining allowance below the copy size causes
+/// `charge_record_key` and `charge_named_node` to fail with `422 incomplete-evidence`, and
+/// freeing just enough room lets both succeed while holding their reservations until drop.
+#[test]
+fn claims_key_copy_charges_exhaust_remaining_allowance_after_decode() {
+    use oxrdf::NamedNode;
+    use sparkles::access::GraphAccess;
+    use sparkles::evidence::resolve::Resolution;
+    use sparkles::task::Control;
+
+    let ds = sparkles::Dataset::memory();
+    let long_iri = format!("urn:test:copy-site:{}", "k".repeat(300));
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <urn:g> {{ <urn:s> <urn:p> <{long_iri}> }} }}"
+    ))
+    .unwrap();
+
+    // 256 KiB easily fits controlled decoding of a ~320 B IRI (~42 KiB peak).
+    let mut resolution = Resolution::with_memory(Control::none(), 256 * 1024).unwrap();
+    let access = Arc::new(GraphAccess::all());
+    let mut scans = 100;
+    let decoded = resolution
+        .objects_in_graph(
+            "predecessor",
+            &ds,
+            &ds,
+            &access,
+            &NamedNode::new_unchecked("urn:g"),
+            &NamedNode::new_unchecked("urn:s"),
+            &NamedNode::new_unchecked("urn:p"),
+            10,
+            &mut scans,
+        )
+        .unwrap();
+    assert_eq!(decoded.len(), 1);
+    let node = &decoded.nodes()[0];
+    assert_eq!(node.as_str(), long_iri);
+
+    // Reserve all but 100 bytes (< 320 + 32 copy charge) so ONLY the copy site exhausts
+    // the allowance after decoding has already succeeded.
+    let avail = resolution.preparation().available_bytes();
+    assert!(avail > 512, "unexpected low headroom after decode: {avail}");
+    let drain = resolution.preparation().reserve(avail - 100).unwrap();
+
+    let key_err = super::claims::charge_record_key(resolution.preparation(), node.as_str())
+        .err()
+        .expect("charge_record_key must fail when remaining room is below IRI copy size");
+    assert_eq!(key_err.0["code"], "incomplete-evidence", "{}", key_err.0);
+    assert_eq!(key_err.0["status"], 422, "{}", key_err.0);
+
+    let node_err = super::claims::charge_named_node(resolution.preparation(), node.as_str())
+        .err()
+        .expect("charge_named_node must fail when remaining room is below IRI copy size");
+    assert_eq!(node_err.0["code"], "incomplete-evidence", "{}", node_err.0);
+    assert_eq!(node_err.0["status"], 422, "{}", node_err.0);
+
+    drop(drain);
+
+    // Leaving 512 bytes (> 320 + 32) allows each copy site to succeed and hold its charge
+    // until dropped.
+    let avail2 = resolution.preparation().available_bytes();
+    let _tight = resolution.preparation().reserve(avail2 - 512).unwrap();
+    let before = resolution.preparation().available_bytes();
+    let (rk, rk_held) = super::claims::charge_record_key(resolution.preparation(), node.as_str())
+        .ok()
+        .unwrap()
+        .unwrap();
+    assert_eq!(rk.as_str(), long_iri);
+    assert!(
+        resolution.preparation().available_bytes() + (long_iri.len() as u64) <= before,
+        "charge_record_key must hold memory while alive"
+    );
+    drop(rk);
+    drop(rk_held);
+    assert_eq!(resolution.preparation().available_bytes(), before);
+
+    let (nn, nn_held) = super::claims::charge_named_node(resolution.preparation(), node.as_str())
+        .ok()
+        .unwrap();
+    assert_eq!(nn.as_str(), long_iri);
+    assert!(
+        resolution.preparation().available_bytes() + (long_iri.len() as u64) <= before,
+        "charge_named_node must hold memory while alive"
+    );
+    drop(nn);
+    drop(nn_held);
+    assert_eq!(resolution.preparation().available_bytes(), before);
 }
 
 #[tokio::test]
@@ -5519,4 +5689,87 @@ async fn claims_before_publish_head_move_masking_predecessor_retries_cleanly() {
         )
         .await
     );
+}
+
+#[tokio::test]
+async fn claims_source_retry_refuses_ambiguous_dual_content_digest() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let m = proposals_mock();
+    let (st, app) = app(Some([&m.url(), &m.url()]));
+    enable(&app).await;
+    evidence(&app).await;
+    put_org_profile(&app, "default").await;
+
+    // Exercise both a lexicographically smaller and larger competing valid digest added
+    // alongside the original digest on the same rendition, so row-collapsing `list_sources`
+    // would have kept the original digest in at least one order.
+    for (idx, extra_digest) in [
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let g = format!("https://example.org/notes/dual-digest-{idx}");
+        let text = format!("{NOTES}\nDual digest check {idx}.\n");
+        let (s, reg) = send(
+            &app,
+            req(
+                "POST",
+                "/org/sources",
+                json!({ "graph": g, "iri": g, "format": "text/markdown", "text": text }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{reg}");
+
+        let st_fp = st.clone();
+        let g_fp = g.clone();
+        let extra = extra_digest.to_string();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let fired_fp = fired.clone();
+        st.get("org").unwrap().store.set_failpoint(
+            "ingest-claims-after-extract",
+            Some(Arc::new(move |_| {
+                if fired_fp.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let ds = st_fp.get("org").unwrap();
+                    ds.dataset
+                        .update(&format!(
+                            "INSERT DATA {{ GRAPH <{g_fp}> {{ <{g_fp}> <urn:x-sparkles:contentDigest> \"{extra}\" }} }}"
+                        ))
+                        .unwrap();
+                }
+            })),
+        );
+
+        let rev_count_query = format!(
+            "SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <{EV_SOURCES}> {{ ?r a <urn:x-sparkles:evidence:SourceRevision> }} }}"
+        );
+        let before_revisions = count(&app, &rev_count_query).await;
+        let req_src = super::pipeline::Request {
+            dataset: "org".into(),
+            mode: super::pipeline::Mode::Claims,
+            source: Some(g.clone()),
+            ..Default::default()
+        };
+        let st2 = st.clone();
+        let err = tokio::task::spawn_blocking(move || run_direct(&st2, req_src))
+            .await
+            .unwrap()
+            .unwrap_err();
+        st.get("org")
+            .unwrap()
+            .store
+            .set_failpoint("ingest-claims-after-extract", None);
+
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        assert_eq!(err["code"], "head-changed", "case {idx}: {err}");
+        assert_eq!(err["status"], 409, "case {idx}: {err}");
+        let after_revisions = count(&app, &rev_count_query).await;
+        assert_eq!(
+            after_revisions, before_revisions,
+            "case {idx}: moved head with two visible digests must not publish a SourceRevision"
+        );
+    }
 }
