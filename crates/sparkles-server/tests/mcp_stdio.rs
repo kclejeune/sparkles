@@ -457,8 +457,9 @@ fn stdio_rapid_sequential_id_reuse() {
     assert!(status.success(), "{status}");
 }
 
-/// Regression: `sparkles mcp` must exit cleanly after stdin EOF even when its stdout pipe
-/// is completely full and stalled (never drained by the reader until after exit).
+/// Regression: `sparkles mcp` must exercise Sparkles' own bounded EOF writer drain and exit
+/// cleanly after stdin EOF even when its stdout pipe is completely full and stalled (never
+/// drained by the reader until after exit).
 #[cfg(unix)]
 #[test]
 fn stdio_cli_exits_after_eof_with_stalled_stdout() {
@@ -515,6 +516,43 @@ fn stdio_cli_exits_after_eof_with_stalled_stdout() {
         }
     }
 
+    fn write_all_before(fd: libc::c_int, mut data: &[u8], deadline: Instant, label: &str) {
+        while !data.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out writing {label} to sparkles mcp"
+            );
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
+            let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("poll(POLLOUT) failed writing {label}: {err}");
+            }
+            assert!(rc > 0, "timed out waiting to write {label} to sparkles mcp");
+            let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted
+                    || err.kind() == std::io::ErrorKind::WouldBlock
+                {
+                    continue;
+                }
+                panic!("write failed for {label}: {err}");
+            }
+            assert!(n > 0, "short zero write for {label}");
+            data = &data[n as usize..];
+        }
+    }
+
     fn pipe_is_writable(fd: libc::c_int) -> bool {
         let mut pfd = libc::pollfd {
             fd,
@@ -542,6 +580,9 @@ fn stdio_cli_exits_after_eof_with_stalled_stdout() {
     let stdout_pipe = unsafe { OwnedFd::from_raw_fd(fds[0]) };
     let child_stdout_w = unsafe { OwnedFd::from_raw_fd(fds[1]) };
     assert!(unsafe { libc::fcntl(stdout_pipe.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } >= 0);
+    assert!(
+        unsafe { libc::fcntl(child_stdout_w.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } >= 0
+    );
     let probe_fd = unsafe { libc::fcntl(child_stdout_w.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     assert!(probe_fd >= 0);
     let probe_w = unsafe { OwnedFd::from_raw_fd(probe_fd) };
@@ -560,116 +601,145 @@ fn stdio_cli_exits_after_eof_with_stalled_stdout() {
             .spawn()
             .unwrap(),
     ));
-    let mut stdin = child.0.as_mut().unwrap().stdin.take().unwrap();
-    let setup_deadline = Instant::now() + Duration::from_secs(15);
+    let stdin = child.0.as_mut().unwrap().stdin.take().unwrap();
+    // Set `O_NONBLOCK` on our write end of the stdin pipe so every send is bounded by the
+    // single outer `test_deadline` via `poll(POLLOUT)`.
+    let stdin_fl = unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_GETFL) };
+    assert!(stdin_fl >= 0);
+    assert!(
+        unsafe {
+            libc::fcntl(
+                stdin.as_raw_fd(),
+                libc::F_SETFL,
+                stdin_fl | libc::O_NONBLOCK,
+            )
+        } >= 0
+    );
+
+    // One outer deadline bounds the entire subprocess interaction (setup, paced fill, and exit).
+    let test_deadline = Instant::now() + Duration::from_secs(20);
 
     // Confirm the CLI process is up and serving before stalling stdout.
-    let init = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-11-25",
-            "capabilities": {},
-            "clientInfo": {"name": "stalled-eof", "version": "1"}
-        }
-    });
-    writeln!(stdin, "{init}").unwrap();
-    stdin.flush().unwrap();
+    let init = format!(
+        "{}\n",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "stalled-eof", "version": "1"}
+            }
+        })
+    );
+    write_all_before(
+        stdin.as_raw_fd(),
+        init.as_bytes(),
+        test_deadline,
+        "initialize request",
+    );
     let first = read_line_before(
         stdout_pipe.as_raw_fd(),
-        setup_deadline,
+        test_deadline,
         "initialize response",
     );
     let v: Value = serde_json::from_str(&first).unwrap();
     assert_eq!(v["id"], 1);
     assert!(v.get("result").is_some(), "{v}");
 
-    writeln!(
-        stdin,
-        "{}",
+    let initialized = format!(
+        "{}\n",
         json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-
-    // Measure a single `tools/list` response so we enqueue enough total bytes to exceed both
-    // Linux and macOS pipe buffers and can verify the pipe genuinely stalls below full volume.
-    writeln!(
-        stdin,
-        "{}",
-        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    let sample = read_line_before(
-        stdout_pipe.as_raw_fd(),
-        setup_deadline,
-        "sample tools/list response",
     );
-    let sample_v: Value = serde_json::from_str(&sample).unwrap();
-    assert_eq!(sample_v["id"], 2);
-    assert!(sample_v.get("result").is_some(), "{sample_v}");
-    let single_response_len = sample.len();
-    assert!(single_response_len > 0);
+    write_all_before(
+        stdin.as_raw_fd(),
+        initialized.as_bytes(),
+        test_deadline,
+        "notifications/initialized",
+    );
+
+    // Measure a single raw protocol-error frame (`{"jsonrpc":"2.0"}\n` -> `-32600`).
+    // `CreditedStdioTransport::receive` enqueues these directly into `StdioWriterHandle`
+    // without ever delivering a request to `rmcp`, so at stdin EOF `rmcp` has zero pending
+    // responses and returns immediately—isolating Sparkles' own 5 s `StdioWriterGuard::drain`.
+    let invalid_line = b"{\"jsonrpc\":\"2.0\"}\n";
+    write_all_before(
+        stdin.as_raw_fd(),
+        invalid_line,
+        test_deadline,
+        "sample invalid request",
+    );
+    let sample_err = read_line_before(
+        stdout_pipe.as_raw_fd(),
+        test_deadline,
+        "sample protocol-error response",
+    );
+    let sample_v: Value = serde_json::from_str(&sample_err).unwrap();
+    assert_eq!(sample_v["error"]["code"], -32600, "{sample_v}");
+    let error_frame_len = sample_err.len();
+    assert!(error_frame_len > 0);
 
     // Stop reading stdout while keeping the read end open so the pipe fills and stalls.
     #[cfg(target_os = "linux")]
     {
-        let _ = unsafe { libc::fcntl(stdout_pipe.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
+        // Use 8 KiB (2 pages) so multiple frames fill > 4 KiB before Linux's `PIPE_BUF`
+        // (4096 B) writability threshold transitions the pipe to `!POLLOUT`.
+        let _ = unsafe { libc::fcntl(stdout_pipe.as_raw_fd(), libc::F_SETPIPE_SZ, 8192) };
     }
 
-    // Enqueue enough `tools/list` responses (>= 256 KiB and >= 40 replies) to exceed Linux
-    // and macOS pipe buffers.
-    let batch_count = ((256 * 1024) / single_response_len).max(40);
-    let total_expected_bytes = batch_count * single_response_len;
-    for offset in 0..batch_count {
-        let id = 3 + offset as u64;
-        writeln!(
-            stdin,
-            "{}",
-            json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"})
-        )
-        .unwrap();
-    }
-    stdin.flush().unwrap();
-
-    // Wait until the kernel directly reports `!POLLOUT` on the write end of stdout AND
-    // `FIONREAD` confirms buffered output strictly below total batch volume, proving true
-    // pipe backpressure rather than a scheduling pause before closing stdin.
-    let fill_deadline = Instant::now() + Duration::from_secs(10);
+    // Pace small bursts of invalid requests so pending queued raw errors stay strictly below
+    // `MAX_PENDING_RAW_ERRORS` (64). That keeps `receive()` unblocked so it immediately reads
+    // stdin EOF while stdout is kernel-confirmed `!POLLOUT` with accepted error frames pending.
+    let burst_payload: Vec<u8> = invalid_line.repeat(4);
+    let max_sent_frames = (512 * 1024) / error_frame_len;
+    let mut sent_frames = 0usize;
     loop {
         let mut readable: libc::c_int = 0;
         let rc = unsafe { libc::ioctl(stdout_pipe.as_raw_fd(), libc::FIONREAD, &mut readable) };
-        if rc == 0 {
-            assert!(
-                (readable as usize) < total_expected_bytes,
-                "all {batch_count} tools/list responses ({total_expected_bytes} B) unexpectedly fit in stdout pipe without stalling (readable={readable})"
-            );
-            if readable >= 4096 && !pipe_is_writable(probe_w.as_raw_fd()) {
-                break;
-            }
+        assert_eq!(rc, 0, "FIONREAD failed during fill");
+        let readable_usize = readable.max(0) as usize;
+        let expected_bytes = sent_frames * error_frame_len;
+        if readable > 0 && !pipe_is_writable(probe_w.as_raw_fd()) && expected_bytes > readable_usize
+        {
+            break;
         }
         assert!(
-            Instant::now() < fill_deadline,
-            "stdout pipe did not reach kernel !POLLOUT backpressure before EOF test (readable={readable})"
+            Instant::now() < test_deadline,
+            "stdout pipe did not reach kernel !POLLOUT backpressure before EOF test (readable={readable}, sent_frames={sent_frames})"
         );
-        std::thread::sleep(Duration::from_millis(10));
+        let written_frames = readable_usize / error_frame_len;
+        let in_flight_frames = sent_frames.saturating_sub(written_frames);
+        if in_flight_frames < 8 {
+            assert!(
+                sent_frames < max_sent_frames,
+                "stdout pipe never reached !POLLOUT after {sent_frames} protocol errors ({expected_bytes} B)"
+            );
+            write_all_before(
+                stdin.as_raw_fd(),
+                &burst_payload,
+                test_deadline,
+                "invalid-request burst",
+            );
+            sent_frames += 4;
+        } else {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
+    let total_expected_bytes = sent_frames * error_frame_len;
 
-    // Close stdin while keeping `stdout_pipe` open and unread; `sparkles mcp` must hit its
-    // 5 s bounded EOF drain timeout under active backpressure and exit cleanly without
-    // hanging on runtime shutdown.
+    // Close stdin while keeping `stdout_pipe` open and unread; `rmcp` has zero pending
+    // requests so it closes immediately and `sparkles mcp` exercises Sparkles' own 5 s
+    // bounded `StdioWriterGuard::drain` before exiting cleanly.
     let eof_at = Instant::now();
     drop(stdin);
-    let exit_deadline = Instant::now() + Duration::from_secs(20);
     let status = loop {
         if let Some(status) = child.0.as_mut().unwrap().try_wait().unwrap() {
             child.0 = None;
             break status;
         }
         assert!(
-            Instant::now() < exit_deadline,
+            Instant::now() < test_deadline,
             "sparkles mcp failed to exit after stdin EOF while stdout stayed stalled"
         );
         std::thread::sleep(Duration::from_millis(25));
@@ -678,7 +748,7 @@ fn stdio_cli_exits_after_eof_with_stalled_stdout() {
     assert!(status.success(), "{status}");
     assert!(
         eof_elapsed >= Duration::from_secs(4),
-        "sparkles mcp exited in {eof_elapsed:?} after EOF instead of exercising the 5 s bounded drain timeout under stdout backpressure"
+        "sparkles mcp exited in {eof_elapsed:?} after EOF instead of exercising Sparkles' 5 s bounded writer drain under stdout backpressure"
     );
     let mut final_readable: libc::c_int = 0;
     assert_eq!(
@@ -687,7 +757,7 @@ fn stdio_cli_exits_after_eof_with_stalled_stdout() {
     );
     assert!(
         (final_readable as usize) < total_expected_bytes && !pipe_is_writable(probe_w.as_raw_fd()),
-        "stdout pipe was not still stalled at process exit (readable={final_readable})"
+        "stdout pipe was not still stalled at process exit (readable={final_readable}, expected={total_expected_bytes})"
     );
 
     // Release the stalled stdout pipe only after verifying process exit.

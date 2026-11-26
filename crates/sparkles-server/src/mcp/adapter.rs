@@ -44,7 +44,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, oneshot};
@@ -1058,8 +1058,10 @@ struct StdioWriteJob {
 ///
 /// On Unix pipes/FIFOs, TTYs, and regular files where stdout's shared open file
 /// description must not be switched to `O_NONBLOCK`, `write(2)` runs on a dedicated
-/// detached OS thread outside `StdioQueue`'s mutex. The transport enforces these
-/// invariants across the offloaded commit boundary:
+/// detached OS thread outside `StdioQueue`'s mutex. The state is packed into an
+/// `AtomicU64` as `(attempt << 2) | state` so each offloaded `write(2)` attempt carries
+/// a monotonically increasing generation. The transport enforces these invariants across
+/// the offloaded commit boundary:
 ///
 /// - **Strict non-overlap**: a matching incoming request ID is never admitted until the
 ///   prior response's terminating `\n` has reached `FINAL_COMMIT_COMMITTED`.
@@ -1067,45 +1069,112 @@ struct StdioWriteJob {
 ///   are still writing, readiness polling is pending, or the offloaded worker has not yet
 ///   entered `write(2)` (including pre-write scheduling delays), matching incoming request
 ///   IDs are rejected immediately with `-32600`.
-/// - **Bounded wait across the unobservable syscall window (`FINAL_COMMIT_IN_SYSCALL`)**:
-///   between storing `IN_SYSCALL` immediately before `libc::write(2)` and observing its
-///   return, userspace cannot distinguish pre-copy preemption from post-copy return
-///   preemption (where a conforming client has already read `\n` and legitimately reused
-///   the ID, even if a shared FIFO writer has since refilled the pipe). Admission waits up
-///   to `STDIO_FINAL_COMMIT_WAIT_TIMEOUT` for `write(2)` to resolve: `COMMITTED` admits
-///   the request strictly after commit, an error/short-write/`WouldBlock` resets to
-///   `NOT_STARTED` and rejects with `-32600`, and an uncommitted timeout rejects with
-///   `-32600`. A non-conforming duplicate that arrives during this narrow syscall window
-///   while `write(2)` finishes before the deadline is serialized strictly after Response 1
-///   commits and admitted, matching a pipelined duplicate buffered in stdin on a
-///   synchronous socket when `write(2)` finishes just before `read(stdin)`.
+/// - **Bounded per-attempt wait across the unobservable syscall window
+///   (`FINAL_COMMIT_IN_SYSCALL`)**: between storing `(attempt, IN_SYSCALL)` immediately
+///   before `libc::write(2)` and observing its return, userspace cannot distinguish
+///   pre-copy preemption from post-copy return preemption (where a conforming client has
+///   already read `\n` and legitimately reused the ID, even if a shared FIFO writer has
+///   since refilled the pipe). Admission binds the parked waiter to the specific `attempt`
+///   it observed and waits up to `STDIO_FINAL_COMMIT_WAIT_TIMEOUT` for that attempt to
+///   resolve: `(attempt, COMMITTED)` admits the request strictly after commit (provided
+///   commit publication becomes observable before the deadline), an error/short-write/
+///   `WouldBlock` resets to `(attempt, NOT_STARTED)` and rejects that parked waiter with
+///   `-32600` even if a later retry (`attempt + 1`) subsequently commits before the waiter
+///   is scheduled, and an uncommitted timeout rejects with `-32600`. A non-conforming
+///   duplicate that arrives during this narrow syscall window while that same `write(2)`
+///   attempt finishes before the deadline is serialized strictly after Response 1 commits
+///   and admitted, matching a pipelined duplicate buffered in stdin on a synchronous socket
+///   when `write(2)` finishes just before `read(stdin)`.
+/// - **Single-owner task retirement across submitted final writes**: before the final `\n`
+///   chunk is submitted to the offloaded worker, the writer task owns the armed
+///   [`CancelHook`] so cancellation, error, or teardown retires the task immediately.
+///   Before submission, ownership of [`CancelHook`] transfers atomically into the submitted
+///   `OffloadedWriteJob`: if teardown cancels the writer before `write(2)` runs, the worker
+///   skips `write(2)` and retires the task; if `write(2)` delivers `\n` (even if the writer
+///   was aborted before `COMMITTED` was published), the worker disarms the hook and keeps
+///   the task alive; if `write(2)` fails (`EPIPE`, `Ok(0)`, etc.) or returns `WouldBlock`
+///   after teardown, the worker retires the task immediately. While a submitted kernel
+///   `write(2)` remains blocked in the OS, teardown (`StdioWriterGuard::drop` and runtime
+///   shutdown) remains bounded without waiting on the worker thread, and the task remains
+///   unretired until that kernel write resolves (disarmed on delivery, retired on failure).
 /// - **Immediate post-write admission (`FINAL_COMMIT_COMMITTED`)**: once `write(2)` returns
 ///   after delivering `\n` to the kernel descriptor, matching incoming request IDs are
-///   admitted immediately and armed task retirement hooks stay disarmed even if post-write
+///   admitted immediately and the armed task retirement hook is disarmed even if post-write
 ///   completion reporting is delayed or the writer task is aborted.
-const FINAL_COMMIT_NOT_STARTED: u8 = 0;
-const FINAL_COMMIT_IN_SYSCALL: u8 = 1;
-const FINAL_COMMIT_COMMITTED: u8 = 2;
+const FINAL_COMMIT_STATE_MASK: u64 = 0b11;
+const FINAL_COMMIT_NOT_STARTED: u64 = 0;
+const FINAL_COMMIT_IN_SYSCALL: u64 = 1;
+const FINAL_COMMIT_COMMITTED: u64 = 2;
 
-#[derive(Clone)]
-struct FinalCommitTracker {
-    state: Arc<AtomicU8>,
-    commit_notify: Arc<Notify>,
+const fn pack_final_commit(attempt: u64, state: u64) -> u64 {
+    (attempt << 2) | (state & FINAL_COMMIT_STATE_MASK)
 }
 
-/// Keeps an active write job's [`CancelHook`] armed until the response commits, while
-/// suppressing task retirement on writer-future abort/drop once `final_commit_state` has
-/// already reached `FINAL_COMMIT_COMMITTED`.
+const fn unpack_final_commit(packed: u64) -> (u64, u64) {
+    (packed >> 2, packed & FINAL_COMMIT_STATE_MASK)
+}
+
+const fn is_final_commit_committed(packed: u64) -> bool {
+    (packed & FINAL_COMMIT_STATE_MASK) == FINAL_COMMIT_COMMITTED
+}
+
+fn begin_final_commit_attempt(state: &AtomicU64) -> u64 {
+    let mut next_attempt = 0;
+    let _ = state.try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+        let (attempt, _) = unpack_final_commit(cur);
+        next_attempt = attempt + 1;
+        Some(pack_final_commit(next_attempt, FINAL_COMMIT_IN_SYSCALL))
+    });
+    next_attempt
+}
+
+fn reset_final_commit_not_started(state: &AtomicU64) {
+    let _ = state.try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+        let (attempt, cur_state) = unpack_final_commit(cur);
+        if cur_state == FINAL_COMMIT_COMMITTED {
+            None
+        } else {
+            Some(pack_final_commit(attempt, FINAL_COMMIT_NOT_STARTED))
+        }
+    });
+}
+
+fn mark_final_commit_committed_preserving_attempt(state: &AtomicU64) {
+    let _ = state.try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+        let (attempt, _) = unpack_final_commit(cur);
+        Some(pack_final_commit(attempt, FINAL_COMMIT_COMMITTED))
+    });
+}
+
+struct FinalCommitTracker {
+    state: Arc<AtomicU64>,
+    commit_notify: Arc<Notify>,
+    cancel_hook: Option<CancelHook>,
+}
+
+/// Keeps an active write job's [`CancelHook`] armed until the response commits or ownership
+/// is explicitly transferred to a submitted offloaded final write, while suppressing task
+/// retirement on drop if `final_commit_state` has already reached `FINAL_COMMIT_COMMITTED`.
 struct ActiveCancelHook {
     hook: Option<CancelHook>,
-    final_commit_state: Arc<AtomicU8>,
+    final_commit_state: Arc<AtomicU64>,
 }
 
 impl ActiveCancelHook {
-    fn new(hook: Option<CancelHook>, final_commit_state: Arc<AtomicU8>) -> Self {
+    fn new(hook: Option<CancelHook>, final_commit_state: Arc<AtomicU64>) -> Self {
         Self {
             hook,
             final_commit_state,
+        }
+    }
+
+    fn take_hook(&mut self) -> Option<CancelHook> {
+        self.hook.take()
+    }
+
+    fn restore_hook(&mut self, hook: Option<CancelHook>) {
+        if let Some(hook) = hook {
+            self.hook = Some(hook);
         }
     }
 
@@ -1116,7 +1185,7 @@ impl ActiveCancelHook {
 
 impl Drop for ActiveCancelHook {
     fn drop(&mut self) {
-        if self.final_commit_state.load(Ordering::SeqCst) == FINAL_COMMIT_COMMITTED {
+        if is_final_commit_committed(self.final_commit_state.load(Ordering::SeqCst)) {
             let disarmed = self.take_disarmed();
             drop(disarmed);
         }
@@ -1129,7 +1198,12 @@ struct StdioActiveJob {
     staged: bool,
     has_cancel_hook: bool,
     cancel: CancellationToken,
-    final_commit_state: Arc<AtomicU8>,
+    final_commit_state: Arc<AtomicU64>,
+}
+
+struct ObservedCommitAttempt {
+    state: Arc<AtomicU64>,
+    attempt: u64,
 }
 
 enum InFlightCheck {
@@ -1197,9 +1271,16 @@ trait StdioWrite: AsyncWrite + Send + Unpin + 'static {
         std::task::Poll::Ready(Ok(()))
     }
 
-    /// Arm or clear the final-commit tracker used by an offloaded worker thread when
-    /// executing `write(2)` for the terminating newline.
+    /// Arm or clear the final-commit tracker (carrying ownership of any armed
+    /// [`CancelHook`]) used by an offloaded worker thread when executing `write(2)` for
+    /// the terminating newline.
     fn set_final_commit_tracker(&mut self, _tracker: Option<FinalCommitTracker>) {}
+
+    /// Reclaim any unsubmitted final-commit tracker (and its armed [`CancelHook`]) from an
+    /// offloaded sink.
+    fn take_final_commit_tracker(&mut self) -> Option<FinalCommitTracker> {
+        None
+    }
 }
 
 #[cfg(any(test, not(unix)))]
@@ -1302,7 +1383,10 @@ impl StdioWriterHandle {
                             drop(job.on_drop);
                             continue;
                         }
-                        let final_commit_state = Arc::new(AtomicU8::new(FINAL_COMMIT_NOT_STARTED));
+                        let final_commit_state = Arc::new(AtomicU64::new(pack_final_commit(
+                            0,
+                            FINAL_COMMIT_NOT_STARTED,
+                        )));
                         q.active = Some(StdioActiveJob {
                             session_id: job.session_id,
                             request_id: job.request_id.clone(),
@@ -1337,7 +1421,7 @@ impl StdioWriterHandle {
                         () = &mut notified => continue,
                     }
                 };
-                output.set_final_commit_tracker(None);
+                drop(output.take_final_commit_tracker());
                 let StdioWriteJob {
                     is_raw_error,
                     raw_len,
@@ -1481,11 +1565,12 @@ impl StdioWriterHandle {
                     // files), run readiness polling, write, and flush completely outside
                     // `queue.lock()` and off async workers: wait for readiness while
                     // `FinalCommitTracker` remains `FINAL_COMMIT_NOT_STARTED` (rejecting
-                    // duplicates immediately), then hand `FinalCommitTracker` to the offloaded
-                    // worker so it publishes `FINAL_COMMIT_IN_SYSCALL` right before `write(2)`
-                    // and `FINAL_COMMIT_COMMITTED` + `commit_notify` immediately once `\n` is
-                    // delivered—allowing valid reuse and suppressing `ActiveCancelHook`
-                    // retirement even if completion reporting stalls or this task is aborted.
+                    // duplicates immediately and retiring the task immediately on teardown),
+                    // then transfer `FinalCommitTracker`—including sole ownership of any armed
+                    // `CancelHook`—to the offloaded worker before submitting `write(2)`. The
+                    // worker stamps `(attempt, FINAL_COMMIT_IN_SYSCALL)` before `write(2)` and
+                    // settles both commit visibility and task retirement from the exact syscall
+                    // outcome, even if this task is aborted while the syscall is in flight.
                     let mut final_commit_marked = false;
                     loop {
                         let sync_commit = output.supports_sync_commit();
@@ -1551,12 +1636,9 @@ impl StdioWriterHandle {
                                                                     q.active.as_mut()
                                                                 {
                                                                     active.request_id = None;
-                                                                    active
-                                                                        .final_commit_state
-                                                                        .store(
-                                                                            FINAL_COMMIT_COMMITTED,
-                                                                            Ordering::SeqCst,
-                                                                        );
+                                                                    mark_final_commit_committed_preserving_attempt(
+                                                                        &active.final_commit_state,
+                                                                    );
                                                                 }
                                                                 disarmed_hook =
                                                                     on_drop.take_disarmed();
@@ -1580,9 +1662,8 @@ impl StdioWriterHandle {
                                                 std::task::Poll::Ready(Ok(())) => {
                                                     if let Some(active) = q.active.as_mut() {
                                                         active.request_id = None;
-                                                        active.final_commit_state.store(
-                                                            FINAL_COMMIT_COMMITTED,
-                                                            Ordering::SeqCst,
+                                                        mark_final_commit_committed_preserving_attempt(
+                                                            &active.final_commit_state,
                                                         );
                                                     }
                                                     disarmed_hook = on_drop.take_disarmed();
@@ -1617,6 +1698,7 @@ impl StdioWriterHandle {
                                                         FinalCommitTracker {
                                                             state: final_commit_state.clone(),
                                                             commit_notify: commit_notify.clone(),
+                                                            cancel_hook: on_drop.take_hook(),
                                                         },
                                                     ));
                                                     final_commit_marked = true;
@@ -1636,10 +1718,14 @@ impl StdioWriterHandle {
                                                     }
                                                 } else {
                                                     if final_commit_marked {
-                                                        output.set_final_commit_tracker(None);
-                                                        final_commit_state.store(
-                                                            FINAL_COMMIT_NOT_STARTED,
-                                                            Ordering::SeqCst,
+                                                        if let Some(tracker) =
+                                                            output.take_final_commit_tracker()
+                                                        {
+                                                            on_drop
+                                                                .restore_hook(tracker.cancel_hook);
+                                                        }
+                                                        reset_final_commit_not_started(
+                                                            &final_commit_state,
                                                         );
                                                         final_commit_marked = false;
                                                         commit_notify.notify_waiters();
@@ -1671,23 +1757,28 @@ impl StdioWriterHandle {
                                                             std::task::Poll::Pending
                                                         }
                                                         std::task::Poll::Ready(Ok(())) => {
-                                                            output.set_final_commit_tracker(None);
+                                                            let returned_tracker =
+                                                                output.take_final_commit_tracker();
                                                             let disarmed_hook = {
                                                                 let mut q = queue.lock();
                                                                 if let Some(active) =
                                                                     q.active.as_mut()
                                                                 {
                                                                     active.request_id = None;
-                                                                    active
-                                                                        .final_commit_state
-                                                                        .store(
-                                                                            FINAL_COMMIT_COMMITTED,
-                                                                            Ordering::SeqCst,
-                                                                        );
+                                                                    mark_final_commit_committed_preserving_attempt(
+                                                                        &active.final_commit_state,
+                                                                    );
                                                                 }
                                                                 on_drop.take_disarmed()
                                                             };
+                                                            let returned_disarmed = returned_tracker
+                                                                .and_then(|mut t| {
+                                                                    t.cancel_hook.as_mut().and_then(
+                                                                        CancelHook::take_disarmed,
+                                                                    )
+                                                                });
                                                             drop(disarmed_hook);
+                                                            drop(returned_disarmed);
                                                             commit_notify.notify_waiters();
                                                             std::task::Poll::Ready(Ok(true))
                                                         }
@@ -1705,19 +1796,27 @@ impl StdioWriterHandle {
                                         match std::pin::Pin::new(&mut output).poll_flush(cx) {
                                             std::task::Poll::Pending => std::task::Poll::Pending,
                                             std::task::Poll::Ready(Ok(())) => {
-                                                output.set_final_commit_tracker(None);
+                                                let returned_tracker =
+                                                    output.take_final_commit_tracker();
                                                 let disarmed_hook = {
                                                     let mut q = queue.lock();
                                                     if let Some(active) = q.active.as_mut() {
                                                         active.request_id = None;
-                                                        active.final_commit_state.store(
-                                                            FINAL_COMMIT_COMMITTED,
-                                                            Ordering::SeqCst,
+                                                        mark_final_commit_committed_preserving_attempt(
+                                                            &active.final_commit_state,
                                                         );
                                                     }
                                                     on_drop.take_disarmed()
                                                 };
+                                                let returned_disarmed = returned_tracker.and_then(
+                                                    |mut t| {
+                                                        t.cancel_hook
+                                                            .as_mut()
+                                                            .and_then(CancelHook::take_disarmed)
+                                                    },
+                                                );
                                                 drop(disarmed_hook);
+                                                drop(returned_disarmed);
                                                 commit_notify.notify_waiters();
                                                 std::task::Poll::Ready(Ok(true))
                                             }
@@ -1738,12 +1837,15 @@ impl StdioWriterHandle {
                             }
                         }
                     }
-                    output.set_final_commit_tracker(None);
+                    if let Some(tracker) = output.take_final_commit_tracker() {
+                        on_drop.restore_hook(tracker.cancel_hook);
+                    }
                 }
-                // Release `Bytes` / `FrameOwner` credit and drop `ActiveCancelHook` outside
-                // `queue.lock()` before waking `send()`. `ActiveCancelHook::drop` suppresses
-                // retirement if `final_commit_state` already reached `FINAL_COMMIT_COMMITTED`,
-                // including when this task is aborted at an `.await` point.
+                // Release `Bytes` / `FrameOwner` credit and drop any still-owned
+                // `ActiveCancelHook` outside `queue.lock()` before waking `send()`. For an
+                // offloaded sink whose final `\n` write was already submitted, ownership of
+                // `CancelHook` moved into `OffloadedWriteJob` so the worker settles retirement
+                // from the syscall outcome even if this task exited on shutdown or was aborted.
                 drop(frame);
                 drop(on_drop);
                 let failed = write_res.is_err();
@@ -1787,7 +1889,7 @@ impl StdioWriterHandle {
         if q.active.as_ref().is_some_and(|a| {
             a.session_id == session_id
                 && a.request_id.as_ref() == Some(request_id)
-                && a.final_commit_state.load(Ordering::SeqCst) != FINAL_COMMIT_COMMITTED
+                && !is_final_commit_committed(a.final_commit_state.load(Ordering::SeqCst))
         }) {
             return true;
         }
@@ -1797,11 +1899,11 @@ impl StdioWriterHandle {
     }
 
     #[cfg(test)]
-    fn active_final_commit_state(&self) -> Option<u8> {
+    fn active_final_commit_state(&self) -> Option<u64> {
         let q = self.queue.lock();
         q.active
             .as_ref()
-            .map(|a| a.final_commit_state.load(Ordering::SeqCst))
+            .map(|a| unpack_final_commit(a.final_commit_state.load(Ordering::SeqCst)).1)
     }
 
     fn commit_wait_timeout(&self) -> std::time::Duration {
@@ -1826,6 +1928,7 @@ impl StdioWriterHandle {
         session_id: u64,
         request_id: &RequestId,
         deadline: &mut Option<Instant>,
+        observed_attempt: &mut Option<ObservedCommitAttempt>,
     ) -> InFlightCheck {
         loop {
             let notified = self.commit_notify.notified();
@@ -1834,7 +1937,26 @@ impl StdioWriterHandle {
             // thread updates `final_commit_state` and calls `commit_notify.notify_waiters()`
             // outside `self.queue.lock()`.
             notified.as_mut().enable();
-            let in_syscall_state = {
+            let (in_syscall_state, attempt) = if let Some(obs) = observed_attempt.as_ref() {
+                if self.shutdown.is_cancelled() || self.queue.lock().closed {
+                    return InFlightCheck::Closed;
+                }
+                let (cur_attempt, cur_state) =
+                    unpack_final_commit(obs.state.load(Ordering::SeqCst));
+                if cur_attempt == obs.attempt {
+                    match cur_state {
+                        FINAL_COMMIT_COMMITTED => return InFlightCheck::Free,
+                        FINAL_COMMIT_NOT_STARTED => return InFlightCheck::Duplicate,
+                        FINAL_COMMIT_IN_SYSCALL => (obs.state.clone(), obs.attempt),
+                        _ => unreachable!("invalid final commit state"),
+                    }
+                } else {
+                    // A subsequent retry attempt started (or committed) after the specific
+                    // attempt this waiter parked on failed (`WouldBlock` / short write);
+                    // reject this request rather than letting the retry mask that failure.
+                    return InFlightCheck::Duplicate;
+                }
+            } else {
                 let q = self.queue.lock();
                 if q.closed || self.shutdown.is_cancelled() {
                     return InFlightCheck::Closed;
@@ -1849,10 +1971,18 @@ impl StdioWriterHandle {
                         if a.session_id == session_id
                             && a.request_id.as_ref() == Some(request_id) =>
                     {
-                        match a.final_commit_state.load(Ordering::SeqCst) {
+                        let (cur_attempt, cur_state) =
+                            unpack_final_commit(a.final_commit_state.load(Ordering::SeqCst));
+                        match cur_state {
                             FINAL_COMMIT_COMMITTED => return InFlightCheck::Free,
                             FINAL_COMMIT_NOT_STARTED => return InFlightCheck::Duplicate,
-                            FINAL_COMMIT_IN_SYSCALL => a.final_commit_state.clone(),
+                            FINAL_COMMIT_IN_SYSCALL => {
+                                *observed_attempt = Some(ObservedCommitAttempt {
+                                    state: a.final_commit_state.clone(),
+                                    attempt: cur_attempt,
+                                });
+                                (a.final_commit_state.clone(), cur_attempt)
+                            }
                             _ => unreachable!("invalid final commit state"),
                         }
                     }
@@ -1862,14 +1992,18 @@ impl StdioWriterHandle {
             // On an offloaded blocking descriptor (pipe/FIFO/TTY/file), the exact kernel
             // copy point inside `libc::write(2)` is unobservable from userspace without
             // mutating `O_NONBLOCK` on stdout's shared open file description. Wait up to
-            // `commit_wait_timeout()` for `write(2)` to resolve so a conforming sequential
-            // client that already read `\n` is never falsely rejected (even if a shared
-            // writer subsequently fills the pipe). Always recheck `FINAL_COMMIT_COMMITTED`
-            // on deadline expiry in case the worker stored `COMMITTED` before notifying.
+            // `commit_wait_timeout()` for this specific `write(2)` attempt to resolve so a
+            // conforming sequential client that already read `\n` is not falsely rejected as
+            // long as commit publication becomes observable before the deadline (even if a
+            // shared writer subsequently fills the pipe). Always recheck the exact
+            // `(attempt, FINAL_COMMIT_COMMITTED)` pair on deadline expiry in case the worker
+            // stored `COMMITTED` before notifying, without allowing a retry's commit to mask
+            // an earlier failed attempt.
+            let expected_committed = pack_final_commit(attempt, FINAL_COMMIT_COMMITTED);
             let dl = *deadline.get_or_insert_with(|| Instant::now() + self.commit_wait_timeout());
             let remaining = dl.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return if in_syscall_state.load(Ordering::SeqCst) == FINAL_COMMIT_COMMITTED {
+                return if in_syscall_state.load(Ordering::SeqCst) == expected_committed {
                     InFlightCheck::Free
                 } else {
                     InFlightCheck::Duplicate
@@ -1880,7 +2014,7 @@ impl StdioWriterHandle {
                 () = self.shutdown.cancelled() => return InFlightCheck::Closed,
                 () = &mut notified => {}
                 () = tokio::time::sleep(remaining) => {
-                    return if in_syscall_state.load(Ordering::SeqCst) == FINAL_COMMIT_COMMITTED {
+                    return if in_syscall_state.load(Ordering::SeqCst) == expected_committed {
                         InFlightCheck::Free
                     } else {
                         InFlightCheck::Duplicate
@@ -2007,7 +2141,7 @@ impl StdioWriterHandle {
             if let Some(active) = &q.active
                 && active.session_id == session_id
                 && active.request_id.as_ref() == Some(request_id)
-                && active.final_commit_state.load(Ordering::SeqCst) != FINAL_COMMIT_COMMITTED
+                && !is_final_commit_committed(active.final_commit_state.load(Ordering::SeqCst))
             {
                 active.cancel.cancel();
             }
@@ -2041,7 +2175,7 @@ impl StdioWriterHandle {
             if let Some(active) = &q.active
                 && active.session_id == session_id
                 && (active.staged || active.has_cancel_hook)
-                && active.final_commit_state.load(Ordering::SeqCst) != FINAL_COMMIT_COMMITTED
+                && !is_final_commit_committed(active.final_commit_state.load(Ordering::SeqCst))
             {
                 active.cancel.cancel();
             }
@@ -2112,11 +2246,12 @@ impl Drop for StdioWriterGuard {
 }
 
 /// Incoming parsed request preserved across `receive()` polls so `rmcp`'s
-/// `tokio::select!` cancellation never drops a request or extends its commit-wait
-/// deadline while awaiting an in-flight terminating-newline syscall.
+/// `tokio::select!` cancellation never drops a request, extends its commit-wait
+/// deadline, or forgets which specific offloaded commit attempt it parked on.
 struct PendingIncomingRequest {
     msg: ClientJsonRpcMessage,
     commit_wait_deadline: Option<Instant>,
+    commit_wait_attempt: Option<ObservedCommitAttempt>,
 }
 
 /// Qualified newline-delimited JSON-RPC transport for `sparkles mcp` over stdio.
@@ -2263,14 +2398,18 @@ where
                 let duplicate = if self.pending.contains_key(&req_id) {
                     true
                 } else {
-                    let deadline = &mut self
+                    let pending_req = self
                         .pending_request
                         .as_mut()
-                        .expect("pending_request checked above")
-                        .commit_wait_deadline;
+                        .expect("pending_request checked above");
                     match self
                         .writer
-                        .check_in_flight_request(self.session_id, &req_id, deadline)
+                        .check_in_flight_request(
+                            self.session_id,
+                            &req_id,
+                            &mut pending_req.commit_wait_deadline,
+                            &mut pending_req.commit_wait_attempt,
+                        )
                         .await
                     {
                         InFlightCheck::Free => false,
@@ -2344,6 +2483,7 @@ where
                             self.pending_request = Some(PendingIncomingRequest {
                                 msg,
                                 commit_wait_deadline: None,
+                                commit_wait_attempt: None,
                             });
                             continue;
                         }
@@ -2498,8 +2638,8 @@ where
 #[cfg(unix)]
 mod unix_stdout {
     use super::{
-        FINAL_COMMIT_COMMITTED, FINAL_COMMIT_IN_SYSCALL, FINAL_COMMIT_NOT_STARTED,
-        FinalCommitTracker, StdioWrite,
+        CancelHook, FINAL_COMMIT_COMMITTED, FINAL_COMMIT_NOT_STARTED, FinalCommitTracker,
+        StdioWrite, begin_final_commit_attempt, pack_final_commit, reset_final_commit_not_started,
     };
     use std::future::Future;
     use std::io;
@@ -2621,9 +2761,14 @@ mod unix_stdout {
         }
     }
 
+    struct OffloadedWriteOutcome {
+        result: io::Result<Option<usize>>,
+        returned_tracker: Option<FinalCommitTracker>,
+    }
+
     struct OffloadedWriteJob {
         data: Vec<u8>,
-        done: oneshot::Sender<io::Result<Option<usize>>>,
+        done: oneshot::Sender<OffloadedWriteOutcome>,
         final_commit: Option<FinalCommitTracker>,
     }
 
@@ -2665,7 +2810,7 @@ mod unix_stdout {
     enum PendingOp {
         Idle,
         Polling(oneshot::Receiver<io::Result<()>>, Arc<AtomicBool>),
-        Writing(oneshot::Receiver<io::Result<Option<usize>>>),
+        Writing(oneshot::Receiver<OffloadedWriteOutcome>),
     }
 
     /// `AsyncWrite` for Unix stdout (and test descriptors) that never sets `O_NONBLOCK`
@@ -2848,21 +2993,49 @@ mod unix_stdout {
                     .name("mcp-stdio-write".into())
                     .spawn(move || {
                         let fd = target.raw_fd();
-                        while let Ok(job) = rx.recv() {
+                        while let Ok(mut job) = rx.recv() {
+                            if job.done.is_closed() {
+                                if let Some(tracker) = job.final_commit.take() {
+                                    reset_final_commit_not_started(&tracker.state);
+                                    tracker.commit_notify.notify_waiters();
+                                    drop(tracker);
+                                }
+                                continue;
+                            }
                             #[cfg(test)]
                             if let Some(ref hook) = hooks.before_write {
                                 hook(&job.data);
                             }
-                            if let Some(ref tracker) = job.final_commit {
-                                tracker
-                                    .state
-                                    .store(FINAL_COMMIT_IN_SYSCALL, Ordering::SeqCst);
+                            if job.done.is_closed() {
+                                if let Some(tracker) = job.final_commit.take() {
+                                    reset_final_commit_not_started(&tracker.state);
+                                    tracker.commit_notify.notify_waiters();
+                                    drop(tracker);
+                                }
+                                continue;
+                            }
+                            let attempt = job.final_commit.as_ref().map(|tracker| {
+                                let attempt = begin_final_commit_attempt(&tracker.state);
                                 #[cfg(test)]
                                 if let Some(ref hook) = hooks.after_in_syscall {
                                     hook(&job.data);
                                 }
+                                attempt
+                            });
+                            if job.done.is_closed() {
+                                if let (Some(attempt), Some(tracker)) =
+                                    (attempt, job.final_commit.take())
+                                {
+                                    tracker.state.store(
+                                        pack_final_commit(attempt, FINAL_COMMIT_NOT_STARTED),
+                                        Ordering::SeqCst,
+                                    );
+                                    tracker.commit_notify.notify_waiters();
+                                    drop(tracker);
+                                }
+                                continue;
                             }
-                            let res = loop {
+                            let outcome = loop {
                                 // SAFETY: `job.data` is valid readable memory and `target`
                                 // keeps `fd` open for the duration of `write(2)`.
                                 let n = unsafe {
@@ -2874,43 +3047,85 @@ mod unix_stdout {
                                     if let Some(ref hook) = hooks.before_commit {
                                         hook(&job.data, n);
                                     }
-                                    if let Some(ref tracker) = job.final_commit {
-                                        let next_state = if n == job.data.len() {
-                                            FINAL_COMMIT_COMMITTED
-                                        } else {
-                                            FINAL_COMMIT_NOT_STARTED
-                                        };
-                                        tracker.state.store(next_state, Ordering::SeqCst);
-                                        #[cfg(test)]
-                                        if next_state == FINAL_COMMIT_COMMITTED
-                                            && let Some(ref hook) = hooks.after_commit_before_notify
+                                    if n == job.data.len() {
+                                        if let (Some(attempt), Some(mut tracker)) =
+                                            (attempt, job.final_commit.take())
                                         {
+                                            let disarmed = tracker
+                                                .cancel_hook
+                                                .as_mut()
+                                                .and_then(CancelHook::take_disarmed);
+                                            drop(disarmed);
+                                            tracker.state.store(
+                                                pack_final_commit(attempt, FINAL_COMMIT_COMMITTED),
+                                                Ordering::SeqCst,
+                                            );
+                                            #[cfg(test)]
+                                            if let Some(ref hook) = hooks.after_commit_before_notify
+                                            {
+                                                hook(&job.data, n);
+                                            }
+                                            tracker.commit_notify.notify_waiters();
+                                        }
+                                        #[cfg(test)]
+                                        if let Some(ref hook) = hooks.after_write {
                                             hook(&job.data, n);
                                         }
+                                        break OffloadedWriteOutcome {
+                                            result: Ok(Some(n)),
+                                            returned_tracker: None,
+                                        };
+                                    }
+                                    if let (Some(attempt), Some(tracker)) =
+                                        (attempt, job.final_commit.as_ref())
+                                    {
+                                        tracker.state.store(
+                                            pack_final_commit(attempt, FINAL_COMMIT_NOT_STARTED),
+                                            Ordering::SeqCst,
+                                        );
                                         tracker.commit_notify.notify_waiters();
                                     }
                                     #[cfg(test)]
                                     if let Some(ref hook) = hooks.after_write {
                                         hook(&job.data, n);
                                     }
-                                    break Ok(Some(n));
+                                    let returned_tracker = if n == 0 {
+                                        drop(job.final_commit.take());
+                                        None
+                                    } else {
+                                        job.final_commit.take()
+                                    };
+                                    break OffloadedWriteOutcome {
+                                        result: Ok(Some(n)),
+                                        returned_tracker,
+                                    };
                                 }
                                 let err = io::Error::last_os_error();
                                 if err.kind() == io::ErrorKind::Interrupted {
                                     continue;
                                 }
-                                if let Some(ref tracker) = job.final_commit {
-                                    tracker
-                                        .state
-                                        .store(FINAL_COMMIT_NOT_STARTED, Ordering::SeqCst);
+                                if let (Some(attempt), Some(tracker)) =
+                                    (attempt, job.final_commit.as_ref())
+                                {
+                                    tracker.state.store(
+                                        pack_final_commit(attempt, FINAL_COMMIT_NOT_STARTED),
+                                        Ordering::SeqCst,
+                                    );
                                     tracker.commit_notify.notify_waiters();
                                 }
                                 if err.kind() == io::ErrorKind::WouldBlock {
-                                    break Ok(None);
+                                    break OffloadedWriteOutcome {
+                                        result: Ok(None),
+                                        returned_tracker: job.final_commit.take(),
+                                    };
                                 }
-                                break Err(err);
+                                drop(job.final_commit.take());
+                                break OffloadedWriteOutcome {
+                                    result: Err(err),
+                                    returned_tracker: None,
+                                };
                             };
-                            let _ = job.done.send(res);
+                            let _ = job.done.send(outcome);
                         }
                     })?;
                 self.write_tx = Some(tx);
@@ -2924,7 +3139,7 @@ mod unix_stdout {
         fn start_offloaded_write(
             &mut self,
             buf: &[u8],
-        ) -> io::Result<&mut oneshot::Receiver<io::Result<Option<usize>>>> {
+        ) -> io::Result<&mut oneshot::Receiver<OffloadedWriteOutcome>> {
             let max_chunk = match self.kind {
                 FdKind::Pipe => libc::PIPE_BUF.clamp(1, 4096),
                 FdKind::Socket | FdKind::Other => 64 << 10,
@@ -2932,7 +3147,7 @@ mod unix_stdout {
             };
             let data = buf[..buf.len().min(max_chunk)].to_vec();
             let final_commit = if data.len() == buf.len() {
-                self.final_commit_tracker.clone()
+                self.final_commit_tracker.take()
             } else {
                 None
             };
@@ -3004,6 +3219,10 @@ mod unix_stdout {
 
         fn set_final_commit_tracker(&mut self, tracker: Option<FinalCommitTracker>) {
             self.final_commit_tracker = tracker;
+        }
+
+        fn take_final_commit_tracker(&mut self) -> Option<FinalCommitTracker> {
+            self.final_commit_tracker.take()
         }
 
         fn poll_ready_for_write(
@@ -3097,12 +3316,24 @@ mod unix_stdout {
                     },
                     PendingOp::Writing(rx) => match Pin::new(rx).poll(cx) {
                         Poll::Pending => return Poll::Pending,
-                        Poll::Ready(Ok(Ok(Some(n)))) => {
+                        Poll::Ready(Ok(OffloadedWriteOutcome {
+                            result: Ok(Some(n)),
+                            returned_tracker,
+                        })) => {
                             self.pending = PendingOp::Idle;
+                            if let Some(tracker) = returned_tracker {
+                                self.final_commit_tracker = Some(tracker);
+                            }
                             return Poll::Ready(Ok(n));
                         }
-                        Poll::Ready(Ok(Ok(None))) => {
+                        Poll::Ready(Ok(OffloadedWriteOutcome {
+                            result: Ok(None),
+                            returned_tracker,
+                        })) => {
                             self.pending = PendingOp::Idle;
+                            if let Some(tracker) = returned_tracker {
+                                self.final_commit_tracker = Some(tracker);
+                            }
                             let rx = self.start_poll_waiter();
                             match Pin::new(rx).poll(cx) {
                                 Poll::Pending => return Poll::Pending,
@@ -3122,8 +3353,12 @@ mod unix_stdout {
                                 }
                             }
                         }
-                        Poll::Ready(Ok(Err(e))) => {
+                        Poll::Ready(Ok(OffloadedWriteOutcome {
+                            result: Err(e),
+                            returned_tracker,
+                        })) => {
                             self.pending = PendingOp::Idle;
+                            drop(returned_tracker);
                             return Poll::Ready(Err(e));
                         }
                         Poll::Ready(Err(_)) => {
@@ -3195,12 +3430,24 @@ mod unix_stdout {
                         };
                         match Pin::new(rx).poll(cx) {
                             Poll::Pending => return Poll::Pending,
-                            Poll::Ready(Ok(Ok(Some(n)))) => {
+                            Poll::Ready(Ok(OffloadedWriteOutcome {
+                                result: Ok(Some(n)),
+                                returned_tracker,
+                            })) => {
                                 self.pending = PendingOp::Idle;
+                                if let Some(tracker) = returned_tracker {
+                                    self.final_commit_tracker = Some(tracker);
+                                }
                                 return Poll::Ready(Ok(n));
                             }
-                            Poll::Ready(Ok(Ok(None))) => {
+                            Poll::Ready(Ok(OffloadedWriteOutcome {
+                                result: Ok(None),
+                                returned_tracker,
+                            })) => {
                                 self.pending = PendingOp::Idle;
+                                if let Some(tracker) = returned_tracker {
+                                    self.final_commit_tracker = Some(tracker);
+                                }
                                 let rx = self.start_poll_waiter();
                                 match Pin::new(rx).poll(cx) {
                                     Poll::Pending => return Poll::Pending,
@@ -3220,8 +3467,12 @@ mod unix_stdout {
                                     }
                                 }
                             }
-                            Poll::Ready(Ok(Err(e))) => {
+                            Poll::Ready(Ok(OffloadedWriteOutcome {
+                                result: Err(e),
+                                returned_tracker,
+                            })) => {
                                 self.pending = PendingOp::Idle;
+                                drop(returned_tracker);
                                 return Poll::Ready(Err(e));
                             }
                             Poll::Ready(Err(_)) => {
@@ -4344,6 +4595,46 @@ mod stdio_writer_tests {
         let _ = sock_reader_thread.join();
     }
 
+    /// Helper to fill a pipe to `!POLLOUT` from a shared writer fd, aligning past any
+    /// partial page first so Linux cannot coalesce a 1-byte `\n` into a partially filled
+    /// final pipe buffer slot.
+    #[cfg(unix)]
+    fn fill_shared_pipe_until_not_writable(
+        shared_fd: std::os::fd::RawFd,
+        already_written_len: usize,
+    ) {
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+        let align_rem = page_size.saturating_sub(already_written_len % page_size);
+        if align_rem > 0 && align_rem < page_size {
+            let mut rem = align_rem;
+            let pad = vec![b'z'; libc::PIPE_BUF.clamp(1, 4096)];
+            while rem > 0 {
+                let step = rem.min(pad.len());
+                let n = unsafe { libc::write(shared_fd, pad.as_ptr().cast(), step) };
+                if n <= 0 {
+                    break;
+                }
+                rem -= n as usize;
+            }
+        }
+        let chunk = vec![b'z'; libc::PIPE_BUF.clamp(1, 4096)];
+        loop {
+            let mut pfd = libc::pollfd {
+                fd: shared_fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+            if rc <= 0 || (pfd.revents & libc::POLLOUT) == 0 {
+                break;
+            }
+            let n = unsafe { libc::write(shared_fd, chunk.as_ptr().cast(), chunk.len()) };
+            if n <= 0 {
+                break;
+            }
+        }
+    }
+
     /// Regression: on the production offloaded Unix pipe path, cover every boundary around
     /// the terminating-newline `write(2)` syscall with controlled gates:
     /// 1. Full pipe before submission (`NOT_STARTED`) -> duplicate rejected (`-32600`).
@@ -4358,49 +4649,16 @@ mod stdio_writer_tests {
     /// 6. Parked waiter reaching its deadline while the worker is paused between storing
     ///    `FINAL_COMMIT_COMMITTED` and calling `notify_waiters()` (`after_commit_before_notify`)
     ///    -> recheck on deadline expiry admits `Free`.
-    /// 7. `after_write` gate holding completion reporting indefinitely after `\n` is readable ->
+    /// 7. Failed `WouldBlock` attempt followed by a successful retry while the parked waiter
+    ///    remains unscheduled -> rejects with `-32600` across notification wakeup, deadline
+    ///    recheck, and `select!` cancellation.
+    /// 8. `after_write` gate holding completion reporting indefinitely after `\n` is readable ->
     ///    valid sequential reuse admitted immediately while the gate is STILL held.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn stdio_offloaded_pipe_delayed_completion_allows_reuse_and_rejects_blocked_duplicate() {
         use std::io::BufRead;
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-
-        // Helper to fill a pipe to `!POLLOUT` from a shared writer fd, aligning past any
-        // partial page first so Linux cannot coalesce a 1-byte `\n` into a partially filled
-        // final pipe buffer slot.
-        fn fill_shared_pipe_until_not_writable(shared_fd: RawFd, already_written_len: usize) {
-            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
-            let align_rem = page_size.saturating_sub(already_written_len % page_size);
-            if align_rem > 0 && align_rem < page_size {
-                let mut rem = align_rem;
-                let pad = vec![b'z'; libc::PIPE_BUF.clamp(1, 4096)];
-                while rem > 0 {
-                    let step = rem.min(pad.len());
-                    let n = unsafe { libc::write(shared_fd, pad.as_ptr().cast(), step) };
-                    if n <= 0 {
-                        break;
-                    }
-                    rem -= n as usize;
-                }
-            }
-            let chunk = vec![b'z'; libc::PIPE_BUF.clamp(1, 4096)];
-            loop {
-                let mut pfd = libc::pollfd {
-                    fd: shared_fd,
-                    events: libc::POLLOUT,
-                    revents: 0,
-                };
-                let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-                if rc <= 0 || (pfd.revents & libc::POLLOUT) == 0 {
-                    break;
-                }
-                let n = unsafe { libc::write(shared_fd, chunk.as_ptr().cast(), chunk.len()) };
-                if n <= 0 {
-                    break;
-                }
-            }
-        }
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
         // Subcase 1: Full pipe before submission AND `after_write` gate holding completion
         // reporting indefinitely after `\n` becomes readable.
@@ -5092,7 +5350,7 @@ mod stdio_writer_tests {
             let writer_fd =
                 unix_stdout::PollableFdWriter::from_owned_fd_with_hooks(pipe_w, hooks).unwrap();
             let (handle, task) = StdioWriterHandle::spawn_sink(writer_fd);
-            let handle = handle.with_commit_wait_timeout(std::time::Duration::from_millis(80));
+            let handle = handle.with_commit_wait_timeout(std::time::Duration::from_millis(200));
             let mut guard = StdioWriterGuard {
                 handle: handle.clone(),
                 task: Some(task),
@@ -5129,7 +5387,7 @@ mod stdio_writer_tests {
                 .unwrap();
             in_writer.flush().await.unwrap();
 
-            // Park `transport.receive()` on `notified` + `sleep(80ms)` while state is still
+            // Park `transport.receive()` on `notified` + `sleep(200ms)` while state is still
             // `IN_SYSCALL`, then let the worker store `COMMITTED` and pause BEFORE calling
             // `commit_notify.notify_waiters()` so the waiter wakes ONLY via timer expiry.
             let mut recv_fut = Box::pin(transport.receive());
@@ -5148,8 +5406,8 @@ mod stdio_writer_tests {
                 Some(FINAL_COMMIT_COMMITTED)
             );
 
-            // While `notify_waiters()` is STILL held, the 80 ms deadline expires; rechecking
-            // `FINAL_COMMIT_COMMITTED` MUST admit id 1 (`Free`) instead of rejecting `-32600`.
+            // While `notify_waiters()` is STILL held, the 200 ms deadline expires; rechecking
+            // `(attempt, FINAL_COMMIT_COMMITTED)` MUST admit id 1 (`Free`) instead of rejecting `-32600`.
             let reused = tokio::time::timeout(std::time::Duration::from_secs(2), recv_fut)
                 .await
                 .expect("deadline expiry must recheck COMMITTED without waiting for notify")
@@ -5164,31 +5422,49 @@ mod stdio_writer_tests {
             guard.drain(STDIO_EOF_DRAIN_TIMEOUT).await;
             drop(guard);
         }
-    }
 
-    /// Regression: aborting `spawn_sink` via `StdioWriterGuard::drop` (either directly or
-    /// when EOF `drain()` expires) while `after_write` holds completion reporting AFTER
-    /// `FINAL_COMMIT_COMMITTED` is stored MUST NOT retire a task whose task ID was already
-    /// written to stdout and read by the client.
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn stdio_abort_after_offloaded_commit_does_not_retire_task() {
-        use std::io::BufRead;
-
-        for drain_before_drop in [false, true] {
+        // Subcase 7: A retry after `WouldBlock` on an inherited `O_NONBLOCK` pipe MUST NOT
+        // mask the failed attempt that a parked request was waiting on—across notification
+        // wakeup, deadline expiry recheck, and `select!` cancellation of `receive()`.
+        #[derive(Clone, Copy, Debug)]
+        enum RetryWaitMode {
+            NotifiedWakeup,
+            DeadlineRecheck,
+            SelectCancelResume,
+        }
+        for mode in [
+            RetryWaitMode::NotifiedWakeup,
+            RetryWaitMode::DeadlineRecheck,
+            RetryWaitMode::SelectCancelResume,
+        ] {
             let (pipe_r, pipe_w) = make_test_pipe();
-            let (after_entered_tx, after_entered_rx) = std::sync::mpsc::channel::<()>();
-            let (after_release_tx, after_release_rx) = std::sync::mpsc::channel::<()>();
-            let after_entered_tx = Arc::new(parking_lot::Mutex::new(Some(after_entered_tx)));
-            let after_release_rx = Arc::new(parking_lot::Mutex::new(after_release_rx));
+            // Do NOT shrink the pipe to 1 page (4096 B): on Linux `poll(POLLOUT)` needs
+            // `>= PIPE_BUF` free bytes, so shrinking to 4096 B would make `poll_ready_for_write`
+            // block right after the 37-byte body write.
+            // Model a pipe/TTY that inherited `O_NONBLOCK` from its parent process.
+            let fl = unsafe { libc::fcntl(pipe_w.as_raw_fd(), libc::F_GETFL) };
+            assert!(fl >= 0);
+            assert!(
+                unsafe { libc::fcntl(pipe_w.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) }
+                    >= 0
+            );
+            let dup_fd = unsafe { libc::dup(pipe_w.as_raw_fd()) };
+            assert!(dup_fd >= 0);
+            let shared_w = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+
+            let (attempt1_entered_tx, attempt1_entered_rx) = std::sync::mpsc::channel::<()>();
+            let (attempt1_release_tx, attempt1_release_rx) = std::sync::mpsc::channel::<()>();
+            let attempt1_entered_tx = Arc::new(parking_lot::Mutex::new(Some(attempt1_entered_tx)));
+            let attempt1_release_rx = Arc::new(parking_lot::Mutex::new(attempt1_release_rx));
+            let attempt_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
             let hooks = unix_stdout::OffloadedWriteTestHooks {
-                after_write: Some(Arc::new(move |data, n| {
-                    if n > 0 && data[..n].contains(&b'\n') {
-                        if let Some(tx) = after_entered_tx.lock().take() {
+                after_in_syscall: Some(Arc::new(move |data| {
+                    if data == b"\n" && attempt_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        if let Some(tx) = attempt1_entered_tx.lock().take() {
                             let _ = tx.send(());
                         }
-                        let _ = after_release_rx.lock().recv();
+                        let _ = attempt1_release_rx.lock().recv();
                     }
                 })),
                 ..Default::default()
@@ -5196,23 +5472,466 @@ mod stdio_writer_tests {
             let writer_fd =
                 unix_stdout::PollableFdWriter::from_owned_fd_with_hooks(pipe_w, hooks).unwrap();
             let (handle, task) = StdioWriterHandle::spawn_sink(writer_fd);
+            let handle = if matches!(mode, RetryWaitMode::DeadlineRecheck) {
+                handle.with_commit_wait_timeout(std::time::Duration::from_millis(80))
+            } else {
+                handle
+            };
             let mut guard = StdioWriterGuard {
                 handle: handle.clone(),
                 task: Some(task),
             };
+            let (mut in_writer, in_reader) = tokio::io::duplex(4096);
+            let mut transport = CreditedStdioTransport::new(
+                1,
+                Arc::new(tokio::sync::Mutex::new(BufReader::new(in_reader))),
+                handle.clone(),
+                30.0,
+            );
 
-            // Register a real task in `Tasks` and arm its retirement hook on `ResponseSlot`.
+            let resp_bytes = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n";
+            let ack1 = handle.enqueue_with_ack(
+                1,
+                Some(RequestId::Number(1)),
+                StdioWritePayload::Raw(axum::body::Bytes::from_static(resp_bytes)),
+                None,
+            );
+            attempt1_entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("attempt 1 after_in_syscall gate did not engage");
+            assert_eq!(
+                handle.active_final_commit_state(),
+                Some(FINAL_COMMIT_IN_SYSCALL)
+            );
+
+            // Fill the pipe via the shared descriptor (aligning past the body bytes already in
+            // the pipe so Linux cannot coalesce `\n`) so Attempt 1's `O_NONBLOCK` `write(2)`
+            // returns `WouldBlock` (`EAGAIN`).
+            fill_shared_pipe_until_not_writable(shared_w.as_raw_fd(), resp_bytes.len() - 1);
+            drop(shared_w);
+
+            // Send duplicate id=1 followed by id=2 and park `receive()` on Attempt 1.
+            in_writer
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n",
+                )
+                .await
+                .unwrap();
+            in_writer.flush().await.unwrap();
+
+            let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            let mut pipe_r_opt = Some(pipe_r);
+            let mut attempt1_release_opt = Some(attempt1_release_tx);
+            let mut ack1_opt = Some(ack1);
+
+            let (next, reader_thread) = if matches!(mode, RetryWaitMode::SelectCancelResume) {
+                let cancelled = tokio::select! {
+                    _ = transport.receive() => false,
+                    () = tokio::time::sleep(std::time::Duration::from_millis(25)) => true,
+                };
+                assert!(cancelled, "{mode:?}: receive() must park on Attempt 1");
+
+                // Release Attempt 1 while leaving the cancelled receive unpolled.
+                drop(attempt1_release_opt.take());
+                let fail_deadline = Instant::now() + std::time::Duration::from_secs(5);
+                while handle.active_final_commit_state() != Some(FINAL_COMMIT_NOT_STARTED) {
+                    assert!(
+                        Instant::now() < fail_deadline,
+                        "{mode:?}: Attempt 1 did not observe WouldBlock and reset to NOT_STARTED"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                let pipe_r = pipe_r_opt.take().unwrap();
+                let reader_thread = std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut f = std::fs::File::from(pipe_r);
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match f.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if out_tx.send(buf[..n].to_vec()).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(5), ack1_opt.take().unwrap())
+                    .await
+                    .expect("Attempt 2 retry must commit after pipe drains")
+                    .unwrap()
+                    .unwrap();
+
+                let next =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), transport.receive())
+                        .await
+                        .unwrap()
+                        .expect(
+                            "expected id 2 after rejecting failed Attempt 1 across select! cancel",
+                        );
+                (next, reader_thread)
+            } else {
+                let mut fut = Box::pin(transport.receive());
+                let parked = tokio::select! {
+                    _ = &mut fut => false,
+                    () = tokio::time::sleep(std::time::Duration::from_millis(25)) => true,
+                };
+                assert!(parked, "{mode:?}: receive() must park on Attempt 1");
+
+                // Release Attempt 1 while leaving the parked waiter unscheduled.
+                drop(attempt1_release_opt.take());
+                let fail_deadline = Instant::now() + std::time::Duration::from_secs(5);
+                while handle.active_final_commit_state() != Some(FINAL_COMMIT_NOT_STARTED) {
+                    assert!(
+                        Instant::now() < fail_deadline,
+                        "{mode:?}: Attempt 1 did not observe WouldBlock and reset to NOT_STARTED"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                let pipe_r = pipe_r_opt.take().unwrap();
+                let reader_thread = std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut f = std::fs::File::from(pipe_r);
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match f.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if out_tx.send(buf[..n].to_vec()).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(5), ack1_opt.take().unwrap())
+                    .await
+                    .expect("Attempt 2 retry must commit after pipe drains")
+                    .unwrap()
+                    .unwrap();
+
+                if matches!(mode, RetryWaitMode::DeadlineRecheck) {
+                    tokio::time::sleep(std::time::Duration::from_millis(90)).await;
+                }
+
+                let next = tokio::time::timeout(std::time::Duration::from_secs(2), fut)
+                    .await
+                    .unwrap()
+                    .expect("expected id 2 after rejecting failed Attempt 1");
+                (next, reader_thread)
+            };
+            match next {
+                ClientJsonRpcMessage::Request(req) => assert_eq!(
+                    req.id,
+                    RequestId::Number(2),
+                    "{mode:?}: Attempt 2 retry must not mask Attempt 1 WouldBlock failure"
+                ),
+                other => panic!("{mode:?}: expected id 2, got {other:?}"),
+            }
+
+            guard.drain(STDIO_EOF_DRAIN_TIMEOUT).await;
+            drop(guard);
+            let _ = reader_thread.join();
+
+            let mut all_out = Vec::new();
+            while let Ok(chunk) = out_rx.try_recv() {
+                all_out.extend_from_slice(&chunk);
+            }
+            let text = String::from_utf8_lossy(&all_out);
+            let err_v: Value = text
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|v| v["id"] == 1 && v.get("error").is_some())
+                .unwrap_or_else(|| {
+                    panic!("{mode:?}: expected -32600 duplicate error for id 1 in output: {text}")
+                });
+            assert_eq!(err_v["error"]["code"], -32600, "{mode:?}: {err_v}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_line_before_fd(fd: std::os::fd::RawFd, deadline: Instant, label: &str) -> String {
+        let mut buf = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for {label}");
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
+            let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("poll failed waiting for {label}: {err}");
+            }
+            assert!(rc > 0, "timed out waiting for {label}");
+            let mut byte = 0u8;
+            let n = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("read failed waiting for {label}: {err}");
+            }
+            assert!(n > 0, "unexpected EOF while waiting for {label}");
+            buf.push(byte);
+            if byte == b'\n' {
+                return String::from_utf8(buf).expect("valid UTF-8 JSON-RPC line");
+            }
+        }
+    }
+
+    /// Regression: aborting `spawn_sink`—whether directly via `JoinHandle::abort()` at its
+    /// `.await` point, via `StdioWriterGuard::drop`, or after an expired EOF `drain()`—MUST
+    /// NOT retire a task whose `taskId` was already written to stdout and read by the client,
+    /// BOTH before `FINAL_COMMIT_COMMITTED` is published (`before_commit` while state is still
+    /// `FINAL_COMMIT_IN_SYSCALL`) and after publication (`after_write`).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stdio_abort_after_offloaded_commit_does_not_retire_task() {
+        use std::os::fd::AsRawFd;
+
+        #[derive(Clone, Copy, Debug)]
+        enum CommitGate {
+            BeforeCommit,
+            AfterWrite,
+        }
+        #[derive(Clone, Copy, Debug)]
+        enum TeardownMode {
+            ExplicitTaskAbort,
+            DirectGuardDrop,
+            DrainTimeoutThenGuardDrop,
+        }
+
+        for gate in [CommitGate::BeforeCommit, CommitGate::AfterWrite] {
+            for mode in [
+                TeardownMode::ExplicitTaskAbort,
+                TeardownMode::DirectGuardDrop,
+                TeardownMode::DrainTimeoutThenGuardDrop,
+            ] {
+                let (pipe_r, pipe_w) = make_test_pipe();
+                let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+                let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                let (settled_tx, settled_rx) = std::sync::mpsc::channel::<()>();
+                let entered_tx = Arc::new(parking_lot::Mutex::new(Some(entered_tx)));
+                let release_rx = Arc::new(parking_lot::Mutex::new(release_rx));
+                let settled_tx = Arc::new(parking_lot::Mutex::new(Some(settled_tx)));
+
+                let hooks = match gate {
+                    CommitGate::BeforeCommit => unix_stdout::OffloadedWriteTestHooks {
+                        before_commit: Some(Arc::new(move |data, n| {
+                            if n > 0 && data[..n].contains(&b'\n') {
+                                if let Some(tx) = entered_tx.lock().take() {
+                                    let _ = tx.send(());
+                                }
+                                let _ = release_rx.lock().recv();
+                            }
+                        })),
+                        after_write: Some(Arc::new(move |data, n| {
+                            if n > 0
+                                && data[..n].contains(&b'\n')
+                                && let Some(tx) = settled_tx.lock().take()
+                            {
+                                let _ = tx.send(());
+                            }
+                        })),
+                        ..Default::default()
+                    },
+                    CommitGate::AfterWrite => unix_stdout::OffloadedWriteTestHooks {
+                        after_write: Some(Arc::new(move |data, n| {
+                            if n > 0 && data[..n].contains(&b'\n') {
+                                if let Some(tx) = entered_tx.lock().take() {
+                                    let _ = tx.send(());
+                                }
+                                let _ = release_rx.lock().recv();
+                                if let Some(tx) = settled_tx.lock().take() {
+                                    let _ = tx.send(());
+                                }
+                            }
+                        })),
+                        ..Default::default()
+                    },
+                };
+                let writer_fd =
+                    unix_stdout::PollableFdWriter::from_owned_fd_with_hooks(pipe_w, hooks).unwrap();
+                let (handle, task) = StdioWriterHandle::spawn_sink(writer_fd);
+                let mut guard = StdioWriterGuard {
+                    handle: handle.clone(),
+                    task: Some(task),
+                };
+
+                // Register a real task in `Tasks` and arm its retirement hook on `ResponseSlot`.
+                let tasks = Arc::new(super::super::tasks::Tasks::default());
+                let cancel_flag = Arc::new(AtomicBool::new(false));
+                let (_work_tx, work_rx) = oneshot::channel::<()>();
+                let work = tokio::spawn(async move {
+                    let _ = work_rx.await;
+                    rmcp::model::CallToolResult::default()
+                });
+                let created = tasks.start("owner-1".into(), work, cancel_flag);
+                let task_id = created.task_id.clone();
+                assert_eq!(tasks.len(), 1);
+
+                let retired = Arc::new(AtomicBool::new(false));
+                let slot = ResponseSlot::open();
+                let tasks_hook = tasks.clone();
+                let id_hook = task_id.clone();
+                let retired_hook = retired.clone();
+                assert!(slot.arm_cancel_hook(move || {
+                    retired_hook.store(true, Ordering::SeqCst);
+                    tasks_hook.retire(&id_hook);
+                }));
+                let (_, hook) = slot.take_with_cancel_hook();
+
+                let resp = format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{{\"task\":{{\"taskId\":\"{task_id}\"}}}}}}\n"
+                );
+                let ack = handle.enqueue_with_ack(
+                    1,
+                    Some(RequestId::Number(7)),
+                    StdioWritePayload::Raw(axum::body::Bytes::from(resp)),
+                    hook,
+                );
+
+                // Wait on the bounded hook gate FIRST so `read_line_before_fd` never blocks on
+                // an undelivered newline, then verify the client reads the complete line with
+                // `taskId` while the worker is still held at `gate`.
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap_or_else(|e| panic!("{gate:?}/{mode:?}: hook gate did not engage: {e}"));
+                let expected_state = match gate {
+                    CommitGate::BeforeCommit => FINAL_COMMIT_IN_SYSCALL,
+                    CommitGate::AfterWrite => FINAL_COMMIT_COMMITTED,
+                };
+                assert_eq!(
+                    handle.active_final_commit_state(),
+                    Some(expected_state),
+                    "{gate:?}/{mode:?}: unexpected commit state at gate"
+                );
+                let line = read_line_before_fd(
+                    pipe_r.as_raw_fd(),
+                    Instant::now() + std::time::Duration::from_secs(5),
+                    "committed task-creation reply",
+                );
+                let v: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(v["result"]["task"]["taskId"], task_id);
+
+                match mode {
+                    TeardownMode::ExplicitTaskAbort => {
+                        // Explicitly abort and join the writer task WITHOUT cancelling `shutdown`
+                        // first, proving the future is destroyed at its `.await` point rather than
+                        // exiting through the normal shutdown epilogue.
+                        let writer_task = guard.task.take().expect("writer task still live");
+                        writer_task.abort();
+                        let join_err =
+                            tokio::time::timeout(std::time::Duration::from_secs(2), writer_task)
+                                .await
+                                .expect("aborted writer task must finish promptly")
+                                .expect_err("explicitly aborted writer task must report JoinError");
+                        assert!(
+                            join_err.is_cancelled(),
+                            "{gate:?}/{mode:?}: expected cancellation JoinError, got {join_err:?}"
+                        );
+                        let ack_res = tokio::time::timeout(std::time::Duration::from_secs(2), ack)
+                            .await
+                            .expect("aborted writer task must drop ack sender promptly");
+                        assert!(
+                            ack_res.is_err(),
+                            "{gate:?}/{mode:?}: explicit abort at await point must drop ack without sending epilogue result: {ack_res:?}"
+                        );
+                    }
+                    TeardownMode::DirectGuardDrop => {
+                        drop(guard);
+                        let ack_res = tokio::time::timeout(std::time::Duration::from_secs(2), ack)
+                            .await
+                            .expect("dropped guard must complete ack promptly");
+                        assert!(
+                            ack_res.is_err() || matches!(ack_res, Ok(Err(_))),
+                            "{gate:?}/{mode:?}: unexpected ack result on drop: {ack_res:?}"
+                        );
+                    }
+                    TeardownMode::DrainTimeoutThenGuardDrop => {
+                        guard.drain(std::time::Duration::from_millis(40)).await;
+                        assert!(
+                            guard.task.is_some(),
+                            "{gate:?}/{mode:?}: drain should time out while gate is held"
+                        );
+                        drop(guard);
+                        let ack_res = tokio::time::timeout(std::time::Duration::from_secs(2), ack)
+                            .await
+                            .expect("dropped guard after drain timeout must complete ack promptly");
+                        assert!(
+                            ack_res.is_err() || matches!(ack_res, Ok(Err(_))),
+                            "{gate:?}/{mode:?}: unexpected ack result on drain+drop: {ack_res:?}"
+                        );
+                    }
+                }
+
+                // Task MUST NOT be retired while the worker is still paused at `gate`.
+                assert!(
+                    !retired.load(Ordering::SeqCst),
+                    "{gate:?}/{mode:?}: aborting writer after kernel newline delivery must not retire task"
+                );
+                assert_eq!(
+                    tasks.len(),
+                    1,
+                    "{gate:?}/{mode:?}: task must remain in Tasks"
+                );
+                assert!(
+                    tasks.get_retained("owner-1", &task_id).is_ok(),
+                    "{gate:?}/{mode:?}: task must remain queryable via tasks/get"
+                );
+
+                // Release the worker and wait for it to finish settling the write; task MUST
+                // STILL remain unretired and queryable.
+                drop(release_tx);
+                settled_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap_or_else(|e| panic!("{gate:?}/{mode:?}: worker did not settle: {e}"));
+                assert!(
+                    !retired.load(Ordering::SeqCst),
+                    "{gate:?}/{mode:?}: worker settling delivered write must disarm retirement hook"
+                );
+                assert_eq!(tasks.len(), 1);
+                assert!(tasks.get_retained("owner-1", &task_id).is_ok());
+
+                drop(pipe_r);
+            }
+        }
+    }
+
+    /// Regression: failed final `\n` writes (`EPIPE`), writer abort prior to `write(2)`
+    /// (`after_in_syscall`), and kernel-blocked `\n` writes that later resolve with either
+    /// `EPIPE` or delivery MUST settle task retirement strictly according to whether `\n` was
+    /// delivered to stdout.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stdio_failed_and_blocked_offloaded_newline_settle_task_retirement() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        fn arm_test_task() -> (
+            Arc<super::super::tasks::Tasks>,
+            String,
+            Arc<AtomicBool>,
+            Option<CancelHook>,
+            oneshot::Sender<()>,
+        ) {
             let tasks = Arc::new(super::super::tasks::Tasks::default());
             let cancel_flag = Arc::new(AtomicBool::new(false));
-            let (_work_tx, work_rx) = oneshot::channel::<()>();
+            let (work_tx, work_rx) = oneshot::channel::<()>();
             let work = tokio::spawn(async move {
                 let _ = work_rx.await;
                 rmcp::model::CallToolResult::default()
             });
             let created = tasks.start("owner-1".into(), work, cancel_flag);
             let task_id = created.task_id.clone();
-            assert_eq!(tasks.len(), 1);
-
             let retired = Arc::new(AtomicBool::new(false));
             let slot = ResponseSlot::open();
             let tasks_hook = tasks.clone();
@@ -5223,71 +5942,252 @@ mod stdio_writer_tests {
                 tasks_hook.retire(&id_hook);
             }));
             let (_, hook) = slot.take_with_cancel_hook();
+            (tasks, task_id, retired, hook, work_tx)
+        }
 
+        // Case 1: `EPIPE` on the final `\n` write during normal execution retires the task
+        // immediately before `ack` reports the write error.
+        {
+            let (pipe_r, pipe_w) = make_test_pipe();
+            let pipe_r = Arc::new(parking_lot::Mutex::new(Some(pipe_r)));
+            let pipe_r_hook = pipe_r.clone();
+            let hooks = unix_stdout::OffloadedWriteTestHooks {
+                before_write: Some(Arc::new(move |data| {
+                    if data == b"\n" {
+                        // Close read end right after body bytes wrote, forcing `EPIPE` on `\n`.
+                        drop(pipe_r_hook.lock().take());
+                    }
+                })),
+                ..Default::default()
+            };
+            let writer_fd = unix_stdout::PollableFdWriter::from_owned_fd_offloaded_with_hooks(
+                pipe_w, false, hooks,
+            )
+            .unwrap();
+            let (handle, task) = StdioWriterHandle::spawn_sink(writer_fd);
+            let _guard = StdioWriterGuard {
+                handle: handle.clone(),
+                task: Some(task),
+            };
+            let (tasks, task_id, retired, hook, _work_tx) = arm_test_task();
             let resp = format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{{\"task\":{{\"taskId\":\"{task_id}\"}}}}}}\n"
+                "{{\"jsonrpc\":\"2.0\",\"id\":11,\"result\":{{\"task\":{{\"taskId\":\"{task_id}\"}}}}}}\n"
             );
             let ack = handle.enqueue_with_ack(
                 1,
-                Some(RequestId::Number(7)),
+                Some(RequestId::Number(11)),
+                StdioWritePayload::Raw(axum::body::Bytes::from(resp)),
+                hook,
+            );
+            let res = tokio::time::timeout(std::time::Duration::from_secs(5), ack)
+                .await
+                .expect("failed final write must complete ack")
+                .expect("ack channel open");
+            assert!(
+                res.is_err(),
+                "EPIPE on final newline must return Err: {res:?}"
+            );
+            assert!(
+                retired.load(Ordering::SeqCst),
+                "EPIPE on final newline must retire the task"
+            );
+            assert_eq!(tasks.len(), 0);
+        }
+
+        // Case 2: Explicit `task.abort()` while worker is paused in `after_in_syscall` (before
+        // `libc::write(2)` runs) with `pipe_r` still open: worker observes closed ack receiver,
+        // skips `write(2)`, retires the task, and never emits `\n`.
+        {
+            let (pipe_r, pipe_w) = make_test_pipe();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let entered_tx = Arc::new(parking_lot::Mutex::new(Some(entered_tx)));
+            let release_rx = Arc::new(parking_lot::Mutex::new(release_rx));
+            let hooks = unix_stdout::OffloadedWriteTestHooks {
+                after_in_syscall: Some(Arc::new(move |data| {
+                    if data == b"\n" {
+                        if let Some(tx) = entered_tx.lock().take() {
+                            let _ = tx.send(());
+                        }
+                        let _ = release_rx.lock().recv();
+                    }
+                })),
+                ..Default::default()
+            };
+            let writer_fd =
+                unix_stdout::PollableFdWriter::from_owned_fd_with_hooks(pipe_w, hooks).unwrap();
+            let (handle, task) = StdioWriterHandle::spawn_sink(writer_fd);
+            let (tasks, task_id, retired, hook, _work_tx) = arm_test_task();
+            let resp = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":12,\"result\":{{\"task\":{{\"taskId\":\"{task_id}\"}}}}}}\n"
+            );
+            let ack = handle.enqueue_with_ack(
+                1,
+                Some(RequestId::Number(12)),
+                StdioWritePayload::Raw(axum::body::Bytes::from(resp)),
+                hook,
+            );
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("after_in_syscall gate did not engage");
+            task.abort();
+            let join_err = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .expect_err("aborted task must report JoinError");
+            assert!(join_err.is_cancelled());
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), ack)
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+
+            // Release worker: it must skip `write(2)` and retire the task.
+            drop(release_tx);
+            let deadline = Instant::now() + std::time::Duration::from_secs(2);
+            while !retired.load(Ordering::SeqCst) {
+                assert!(
+                    Instant::now() < deadline,
+                    "aborted pre-syscall final write must retire task upon waking"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert_eq!(tasks.len(), 0);
+            // Verify the pipe reached EOF without receiving `\n`.
+            let mut rest = Vec::new();
+            std::io::Read::read_to_end(&mut std::fs::File::from(pipe_r), &mut rest).unwrap();
+            assert!(
+                !rest.contains(&b'\n'),
+                "pre-syscall aborted write must not emit newline: {:?}",
+                String::from_utf8_lossy(&rest)
+            );
+        }
+
+        // Case 3: Real kernel-blocked `libc::write(2)` on `b"\n"` when `task.abort()` runs:
+        // task stays unretired while blocked in the kernel; closing `pipe_r` (`EPIPE`) retires
+        // it, while draining `pipe_r` delivers `\n` and preserves the task.
+        for close_reader in [true, false] {
+            let (pipe_r, pipe_w) = make_test_pipe();
+            try_shrink_test_pipe(pipe_w.as_raw_fd());
+            let dup_fd = unsafe { libc::dup(pipe_w.as_raw_fd()) };
+            assert!(dup_fd >= 0);
+            let shared_w = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+
+            let (before_entered_tx, before_entered_rx) = std::sync::mpsc::channel::<()>();
+            let (before_release_tx, before_release_rx) = std::sync::mpsc::channel::<()>();
+            let (settled_tx, settled_rx) = std::sync::mpsc::channel::<()>();
+            let before_entered_tx = Arc::new(parking_lot::Mutex::new(Some(before_entered_tx)));
+            let before_release_rx = Arc::new(parking_lot::Mutex::new(before_release_rx));
+            let settled_tx = Arc::new(parking_lot::Mutex::new(Some(settled_tx)));
+
+            let hooks = unix_stdout::OffloadedWriteTestHooks {
+                before_write: Some(Arc::new(move |data| {
+                    if data == b"\n" {
+                        if let Some(tx) = before_entered_tx.lock().take() {
+                            let _ = tx.send(());
+                        }
+                        let _ = before_release_rx.lock().recv();
+                    }
+                })),
+                after_write: Some(Arc::new(move |data, n| {
+                    if n > 0
+                        && data[..n].contains(&b'\n')
+                        && let Some(tx) = settled_tx.lock().take()
+                    {
+                        let _ = tx.send(());
+                    }
+                })),
+                ..Default::default()
+            };
+            let writer_fd = unix_stdout::PollableFdWriter::from_owned_fd_offloaded_with_hooks(
+                pipe_w, false, hooks,
+            )
+            .unwrap();
+            let (handle, task) = StdioWriterHandle::spawn_sink(writer_fd);
+            let (tasks, task_id, retired, hook, _work_tx) = arm_test_task();
+            let resp = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":13,\"result\":{{\"task\":{{\"taskId\":\"{task_id}\"}}}}}}\n"
+            );
+            let resp_body_len = resp.len() - 1;
+            let ack = handle.enqueue_with_ack(
+                1,
+                Some(RequestId::Number(13)),
                 StdioWritePayload::Raw(axum::body::Bytes::from(resp)),
                 hook,
             );
 
-            // Client reads the complete line containing the task ID while `after_write` holds
-            // worker acknowledgement (`job.done`) indefinitely.
-            let mut pipe_reader = std::io::BufReader::new(std::fs::File::from(pipe_r));
-            let mut line = String::new();
-            pipe_reader.read_line(&mut line).unwrap();
-            let v: Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(v["result"]["task"]["taskId"], task_id);
-
-            after_entered_rx
+            before_entered_rx
                 .recv_timeout(std::time::Duration::from_secs(5))
-                .expect("after_write gate did not engage");
-            assert_eq!(
-                handle.active_final_commit_state(),
-                Some(FINAL_COMMIT_COMMITTED)
-            );
+                .expect("before_write gate did not engage");
+            // Fill the pipe completely via `shared_w` (aligning past the body bytes already
+            // in the pipe so Linux cannot coalesce `\n`), then let `mcp-stdio-write` enter
+            // real blocking kernel `libc::write(2)` on `b"\n"`.
+            fill_shared_pipe_until_not_writable(shared_w.as_raw_fd(), resp_body_len);
+            drop(shared_w);
+            drop(before_release_tx);
 
-            if drain_before_drop {
-                guard.drain(std::time::Duration::from_millis(40)).await;
-                assert!(
-                    guard.task.is_some(),
-                    "drain should time out while after_write is held"
-                );
+            // Wait until the worker enters `FINAL_COMMIT_IN_SYSCALL` (blocking in `write(2)`).
+            let enter_deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while handle.active_final_commit_state() != Some(FINAL_COMMIT_IN_SYSCALL) {
+                assert!(Instant::now() < enter_deadline);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
+            // Give the worker thread a brief window to enter kernel `write(2)` on the full pipe.
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
-            // Dropping `guard` immediately aborts the writer task at its `.await` point
-            // while `after_write` is still holding `job.done`.
-            drop(guard);
-
-            // Waiting for `ack` to close proves the aborted `spawn_sink` future has been
-            // completely dropped (including its local `ActiveCancelHook`).
-            let ack_res = tokio::time::timeout(std::time::Duration::from_secs(2), ack)
+            task.abort();
+            let join_err = tokio::time::timeout(std::time::Duration::from_secs(2), task)
                 .await
-                .expect("aborted writer task must drop ack sender promptly");
+                .unwrap()
+                .expect_err("aborted task must report JoinError");
+            assert!(join_err.is_cancelled());
             assert!(
-                ack_res.is_err() || matches!(ack_res, Ok(Err(_))),
-                "unexpected ack result on abort: {ack_res:?}"
+                tokio::time::timeout(std::time::Duration::from_secs(2), ack)
+                    .await
+                    .unwrap()
+                    .is_err()
             );
 
+            // While kernel `write(2)` remains blocked, the task stays unretired.
             assert!(
                 !retired.load(Ordering::SeqCst),
-                "drain_before_drop={drain_before_drop}: aborting writer after FINAL_COMMIT_COMMITTED must not fire retirement hook"
-            );
-            assert_eq!(
-                tasks.len(),
-                1,
-                "drain_before_drop={drain_before_drop}: task whose ID already reached stdout must remain in Tasks"
-            );
-            assert!(
-                tasks.get_retained("owner-1", &task_id).is_ok(),
-                "drain_before_drop={drain_before_drop}: committed task must remain queryable via tasks/get"
+                "close_reader={close_reader}: task must stay unretired while kernel write(2) is still blocked"
             );
 
-            drop(after_release_tx);
-            drop(pipe_reader);
+            if close_reader {
+                drop(pipe_r);
+                let deadline = Instant::now() + std::time::Duration::from_secs(2);
+                while !retired.load(Ordering::SeqCst) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "closing pipe_r (EPIPE) on blocked newline write must retire task"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                assert_eq!(tasks.len(), 0);
+            } else {
+                // Drain the pipe so kernel `write(2)` delivers `\n`.
+                let mut all = Vec::new();
+                let reader = std::thread::spawn(move || {
+                    let _ = std::io::Read::read_to_end(&mut std::fs::File::from(pipe_r), &mut all);
+                    all
+                });
+                settled_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("draining pipe must let blocked kernel write(2) settle");
+                let drained = reader.join().unwrap();
+                assert!(
+                    drained.ends_with(b"\n"),
+                    "draining pipe must deliver the terminating newline"
+                );
+                assert!(
+                    !retired.load(Ordering::SeqCst),
+                    "delivered blocked newline write must disarm retirement hook"
+                );
+                assert_eq!(tasks.len(), 1);
+                assert!(tasks.get_retained("owner-1", &task_id).is_ok());
+            }
         }
     }
 
@@ -5561,10 +6461,12 @@ mod stdio_writer_tests {
         }
     }
 
-    /// Run `op` on a worker thread under a bounded outer watchdog so a regression (such as
-    /// holding `queue.lock()` across a blocked write or stalling `Runtime::drop`) releases the
-    /// test blocker, waits at most a bounded grace period for cleanup, and panics instead of
-    /// hanging the test runner indefinitely.
+    /// Run `op` (including its `Runtime` and `StdioWriterGuard` lifetimes and failure
+    /// unwinding) on a worker thread under a bounded outer watchdog while the test runner
+    /// thread owns only the separate blocker-release handle. If `op` or its unwind stalls
+    /// past `budget`, the watchdog releases the blocker, waits at most a bounded 500 ms grace
+    /// period, detaches any still-wedged worker thread, and panics cleanly on the runner
+    /// thread without touching `queue.lock()` or `Runtime::drop`.
     #[cfg(unix)]
     fn run_bounded_with_blocker_release<T: Send + 'static>(
         budget: std::time::Duration,
@@ -5572,20 +6474,27 @@ mod stdio_writer_tests {
         op: impl FnOnce() -> T + Send + 'static,
         release_blocker_on_timeout: impl FnOnce(),
     ) -> T {
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<(T, std::time::Duration)>();
+        type WorkerResult<T> = Result<(T, std::time::Duration), Box<dyn std::any::Any + Send>>;
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<WorkerResult<T>>();
         let worker = std::thread::spawn(move || {
             let start = Instant::now();
-            let val = op();
-            let _ = done_tx.send((val, start.elapsed()));
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(op))
+                .map(|val| (val, start.elapsed()));
+            let _ = done_tx.send(res);
         });
         match done_rx.recv_timeout(budget) {
-            Ok((val, elapsed)) => {
+            Ok(Ok((val, elapsed))) => {
                 let _ = worker.join();
                 assert!(
                     elapsed < budget,
                     "{label}: operation took {elapsed:?} (budget {budget:?})"
                 );
                 val
+            }
+            Ok(Err(payload)) => {
+                release_blocker_on_timeout();
+                let _ = worker.join();
+                std::panic::resume_unwind(payload);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 release_blocker_on_timeout();
@@ -5602,43 +6511,16 @@ mod stdio_writer_tests {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 release_blocker_on_timeout();
                 let _ = worker.join();
-                panic!("{label}: worker thread panicked");
+                panic!("{label}: worker thread exited unexpectedly");
             }
-        }
-    }
-
-    /// Drop `rt` on a worker thread under a bounded outer watchdog so a regression that
-    /// stalls runtime shutdown releases the test blocker and fails cleanly without ever
-    /// blocking in an unbounded `join()`.
-    #[cfg(unix)]
-    fn assert_runtime_drops_within(
-        rt: tokio::runtime::Runtime,
-        budget: std::time::Duration,
-        label: &str,
-        release_blocker: impl FnOnce(),
-    ) {
-        let release_slot = Arc::new(parking_lot::Mutex::new(Some(release_blocker)));
-        let release_on_timeout = release_slot.clone();
-        run_bounded_with_blocker_release(
-            budget,
-            label,
-            move || drop(rt),
-            move || {
-                if let Some(release) = release_on_timeout.lock().take() {
-                    release();
-                }
-            },
-        );
-        if let Some(release) = release_slot.lock().take() {
-            release();
         }
     }
 
     /// Regression: when a potentially blocking stdout descriptor blocks inside `write(2)`
     /// (both at the terminating newline boundary and in a real unmocked kernel pipe stall),
     /// `StdioQueue`'s mutex MUST NOT be held, EOF drain timeout completes cleanly, armed
-    /// task retirement hooks fire, and dropping the Tokio runtime MUST NOT hang even while
-    /// the stalled write remains wedged past runtime shutdown.
+    /// task retirement hooks obey the single-owner cleanup contract, and dropping the Tokio
+    /// runtime MUST NOT hang even while the stalled write remains wedged past runtime shutdown.
     #[cfg(unix)]
     #[test]
     fn stdio_blocked_offloaded_newline_write_allows_bounded_eof_teardown() {
@@ -5646,6 +6528,8 @@ mod stdio_writer_tests {
 
         // Subcase 1: Controlled blocking gate at the exact `\n` write boundary on a real OS
         // pipe, independent of platform pipe-resizing watermarks (such as XNU 16 KiB -> 64 KiB).
+        // Keep `rt` and `StdioWriterGuard` strictly on the watched worker thread while the
+        // test runner owns only the separate blocker-release handle.
         {
             let (pipe_r, pipe_w) = make_test_pipe();
             let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
@@ -5653,6 +6537,7 @@ mod stdio_writer_tests {
             let release_rx = Arc::new(parking_lot::Mutex::new(release_rx));
             let entered_tx = Arc::new(parking_lot::Mutex::new(Some(entered_tx)));
             let blocker = Arc::new(parking_lot::Mutex::new(Some((release_tx, pipe_r))));
+            let retired = Arc::new(AtomicBool::new(false));
             let hooks = unix_stdout::OffloadedWriteTestHooks {
                 before_write: Some(Arc::new(move |data| {
                     if data == b"\n" {
@@ -5665,250 +6550,276 @@ mod stdio_writer_tests {
                 ..Default::default()
             };
 
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .unwrap();
-
-            rt.block_on(async {
-                let writer_fd = unix_stdout::PollableFdWriter::from_owned_fd_offloaded_with_hooks(
-                    pipe_w, false, hooks,
-                )
-                .unwrap();
-                assert!(!writer_fd.supports_sync_commit());
-                let (handle, task) = StdioWriterHandle::spawn_sink(writer_fd);
-                let mut guard = StdioWriterGuard {
-                    handle: handle.clone(),
-                    task: Some(task),
-                };
-
-                let mut frame = vec![b'b'; 64];
-                frame.push(b'\n');
-
-                let retired = Arc::new(AtomicBool::new(false));
-                let slot = ResponseSlot::open();
-                let flag = retired.clone();
-                assert!(slot.arm_cancel_hook(move || flag.store(true, Ordering::SeqCst)));
-                let (_, hook) = slot.take_with_cancel_hook();
-                let ack = handle.enqueue_with_ack(
-                    1,
-                    Some(RequestId::Number(42)),
-                    StdioWritePayload::Raw(axum::body::Bytes::from(frame)),
-                    hook,
-                );
-
-                // Wait for the offloaded writer thread to enter the blocked `\n` write.
-                entered_rx
-                    .recv_timeout(std::time::Duration::from_secs(5))
-                    .expect("offloaded writer did not reach terminating newline boundary");
-                let pipe_r_fd = blocker
-                    .lock()
-                    .as_ref()
-                    .expect("pipe_r still held")
-                    .1
-                    .as_raw_fd();
-                let mut readable: libc::c_int = 0;
-                assert_eq!(
-                    unsafe { libc::ioctl(pipe_r_fd, libc::FIONREAD, &mut readable) },
-                    0
-                );
-                assert_eq!(
-                    readable, 64,
-                    "all body bytes must be in the pipe while newline is blocked"
-                );
-
-                // `queue.lock()` MUST NOT be held while the offloaded newline write is stalled;
-                // run the queue-lock probes under the bounded watchdog so a lock regression
-                // releases the gate and fails instead of hanging.
-                let probe_handle = handle.clone();
-                let probe_blocker = blocker.clone();
-                let in_flight = run_bounded_with_blocker_release(
-                    std::time::Duration::from_secs(2),
-                    "controlled before_write queue-lock probes",
-                    move || {
-                        let reserved =
-                            probe_handle.has_in_flight_request(1, &RequestId::Number(42));
-                        probe_handle.cancel_request(1, &RequestId::Number(999));
-                        reserved
-                    },
-                    move || {
-                        drop(probe_blocker.lock().take());
-                    },
-                );
-                assert!(
-                    in_flight,
-                    "request ID must stay reserved while offloaded newline write is stalled"
-                );
-                assert!(
-                    !retired.load(Ordering::SeqCst),
-                    "retirement hook must stay armed while stalled newline write is active"
-                );
-
-                let drain_start = Instant::now();
-                let drain_timeout = std::time::Duration::from_millis(80);
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    guard.drain(drain_timeout),
-                )
-                .await
-                .expect(
-                    "EOF drain must not deadlock on queue.lock() while stdout write is blocked",
-                );
-                assert!(drain_start.elapsed() >= drain_timeout);
-                assert!(guard.task.is_some());
-
-                drop(guard);
-                let err = tokio::time::timeout(std::time::Duration::from_secs(2), ack)
-                    .await
-                    .unwrap();
-                assert!(
-                    err.is_err() || matches!(err, Ok(Err(_))),
-                    "aborted stalled write must not report Ok(()): {err:?}"
-                );
-                let retire_deadline = Instant::now() + std::time::Duration::from_secs(2);
-                while !retired.load(Ordering::SeqCst) {
-                    assert!(
-                        Instant::now() < retire_deadline,
-                        "dropping guard after EOF drain timeout must fire armed retirement hook"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            });
-
-            // Dropping the Tokio runtime MUST return promptly even while the offloaded write
-            // remains blocked (gate NOT yet released); the bounded watchdog releases the
-            // gate and pipe only afterward (or unblocks before failing on regression).
-            assert_runtime_drops_within(
-                rt,
-                std::time::Duration::from_secs(2),
-                "controlled before_write newline gate",
+            let worker_blocker = blocker.clone();
+            let worker_retired = retired.clone();
+            let timeout_blocker = blocker.clone();
+            run_bounded_with_blocker_release(
+                std::time::Duration::from_secs(10),
+                "controlled before_write newline gate fixture",
                 move || {
-                    drop(blocker.lock().take());
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build()
+                        .unwrap();
+
+                    rt.block_on(async {
+                        let writer_fd =
+                            unix_stdout::PollableFdWriter::from_owned_fd_offloaded_with_hooks(
+                                pipe_w, false, hooks,
+                            )
+                            .unwrap();
+                        assert!(!writer_fd.supports_sync_commit());
+                        let (handle, task) = StdioWriterHandle::spawn_sink(writer_fd);
+                        let mut guard = StdioWriterGuard {
+                            handle: handle.clone(),
+                            task: Some(task),
+                        };
+
+                        let mut frame = vec![b'b'; 64];
+                        frame.push(b'\n');
+
+                        let slot = ResponseSlot::open();
+                        let flag = worker_retired.clone();
+                        assert!(slot.arm_cancel_hook(move || flag.store(true, Ordering::SeqCst)));
+                        let (_, hook) = slot.take_with_cancel_hook();
+                        let ack = handle.enqueue_with_ack(
+                            1,
+                            Some(RequestId::Number(42)),
+                            StdioWritePayload::Raw(axum::body::Bytes::from(frame)),
+                            hook,
+                        );
+
+                        // Wait for the offloaded writer thread to enter the blocked `\n` write.
+                        entered_rx
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .expect("offloaded writer did not reach terminating newline boundary");
+                        let readable = {
+                            let guard_b = worker_blocker.lock();
+                            let pipe_r_fd =
+                                guard_b.as_ref().expect("pipe_r still held").1.as_raw_fd();
+                            let mut readable: libc::c_int = 0;
+                            assert_eq!(
+                                unsafe { libc::ioctl(pipe_r_fd, libc::FIONREAD, &mut readable) },
+                                0
+                            );
+                            readable
+                        };
+                        assert_eq!(
+                            readable, 64,
+                            "all body bytes must be in the pipe while newline is blocked"
+                        );
+
+                        // `queue.lock()` MUST NOT be held while the offloaded newline write is
+                        // stalled; both these probes and any unwind through `guard`/`rt` drop
+                        // run under the outer watchdog.
+                        let probe_start = Instant::now();
+                        let in_flight = handle.has_in_flight_request(1, &RequestId::Number(42));
+                        handle.cancel_request(1, &RequestId::Number(999));
+                        assert!(
+                            probe_start.elapsed() < std::time::Duration::from_secs(2),
+                            "queue-lock probes stalled: {:?}",
+                            probe_start.elapsed()
+                        );
+                        assert!(
+                            in_flight,
+                            "request ID must stay reserved while offloaded newline write is stalled"
+                        );
+                        assert!(
+                            !worker_retired.load(Ordering::SeqCst),
+                            "retirement hook must stay armed while stalled newline write is active"
+                        );
+
+                        let drain_start = Instant::now();
+                        let drain_timeout = std::time::Duration::from_millis(80);
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            guard.drain(drain_timeout),
+                        )
+                        .await
+                        .expect(
+                            "EOF drain must not deadlock on queue.lock() while stdout write is blocked",
+                        );
+                        assert!(drain_start.elapsed() >= drain_timeout);
+                        assert!(guard.task.is_some());
+
+                        drop(guard);
+                        let err = tokio::time::timeout(std::time::Duration::from_secs(2), ack)
+                            .await
+                            .unwrap();
+                        assert!(
+                            err.is_err() || matches!(err, Ok(Err(_))),
+                            "aborted stalled write must not report Ok(()): {err:?}"
+                        );
+                        // Because ownership of `CancelHook` transferred to the submitted `\n`
+                        // write job, retirement stays deferred until that pending write resolves.
+                        assert!(
+                            !worker_retired.load(Ordering::SeqCst),
+                            "pending submitted final write must defer retirement until it resolves"
+                        );
+                    });
+
+                    // Dropping the Tokio runtime MUST return promptly even while the offloaded
+                    // write remains blocked (gate NOT yet released).
+                    let drop_start = Instant::now();
+                    drop(rt);
+                    assert!(
+                        drop_start.elapsed() < std::time::Duration::from_secs(2),
+                        "controlled before_write runtime drop stalled: {:?}",
+                        drop_start.elapsed()
+                    );
+                },
+                move || {
+                    drop(timeout_blocker.lock().take());
                 },
             );
+
+            // Release the blocker on the test runner thread: the unblocked worker observes the
+            // closed ack receiver (without writing `\n`) and retires the task promptly.
+            drop(blocker.lock().take());
+            let retire_deadline = Instant::now() + std::time::Duration::from_secs(2);
+            while !retired.load(Ordering::SeqCst) {
+                assert!(
+                    Instant::now() < retire_deadline,
+                    "unblocking aborted submitted final write must settle and fire retirement hook"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
 
         // Subcase 2: Unmocked kernel `libc::write(2)` stall on a real full OS pipe whose frame
         // (256 KiB) exceeds both Linux pipe capacities and XNU's 64 KiB `BIG_PIPE_SIZE`.
+        // Because the stall happens during body bytes BEFORE `\n` is submitted, teardown MUST
+        // retire the task immediately while `pipe_r` is still open and kernel `write(2)` is
+        // still blocked, and dropping `rt` MUST complete within 2 s while `pipe_r` stays open.
         {
             let (pipe_r, pipe_w) = make_test_pipe();
             try_shrink_test_pipe(pipe_w.as_raw_fd());
             let pipe_r_blocker = Arc::new(parking_lot::Mutex::new(Some(pipe_r)));
+            let worker_blocker = pipe_r_blocker.clone();
+            let timeout_blocker = pipe_r_blocker.clone();
 
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .unwrap();
-
-            rt.block_on(async {
-                let writer_fd =
-                    unix_stdout::PollableFdWriter::from_owned_fd_offloaded(pipe_w, false).unwrap();
-                let (handle, task) = StdioWriterHandle::spawn_sink(writer_fd);
-                let mut guard = StdioWriterGuard {
-                    handle: handle.clone(),
-                    task: Some(task),
-                };
-
-                let frame_len = 256 << 10;
-                let mut frame = vec![b'b'; frame_len - 1];
-                frame.push(b'\n');
-
-                let retired = Arc::new(AtomicBool::new(false));
-                let slot = ResponseSlot::open();
-                let flag = retired.clone();
-                assert!(slot.arm_cancel_hook(move || flag.store(true, Ordering::SeqCst)));
-                let (_, hook) = slot.take_with_cancel_hook();
-                let ack = handle.enqueue_with_ack(
-                    1,
-                    Some(RequestId::Number(43)),
-                    StdioWritePayload::Raw(axum::body::Bytes::from(frame)),
-                    hook,
-                );
-
-                // Wait until the real OS pipe fills and stalls inside kernel `libc::write(2)`.
-                let deadline = Instant::now() + std::time::Duration::from_secs(5);
-                let mut last_readable = 0i32;
-                let mut stable_since: Option<Instant> = None;
-                let pipe_r_fd = pipe_r_blocker
-                    .lock()
-                    .as_ref()
-                    .expect("pipe_r still held")
-                    .as_raw_fd();
-                loop {
-                    let mut readable: libc::c_int = 0;
-                    let rc = unsafe { libc::ioctl(pipe_r_fd, libc::FIONREAD, &mut readable) };
-                    assert_eq!(rc, 0);
-                    assert!(
-                        (readable as usize) < frame_len,
-                        "256 KiB frame unexpectedly fit in OS pipe without blocking"
-                    );
-                    if readable > 0 && readable == last_readable {
-                        if stable_since
-                            .is_some_and(|t| t.elapsed() >= std::time::Duration::from_millis(40))
-                        {
-                            break;
-                        }
-                    } else {
-                        last_readable = readable;
-                        stable_since = (readable > 0).then(Instant::now);
-                    }
-                    assert!(
-                        Instant::now() < deadline,
-                        "OS pipe did not stall inside kernel write(2) (readable={readable})"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-
-                let probe_handle = handle.clone();
-                let probe_blocker = pipe_r_blocker.clone();
-                let in_flight = run_bounded_with_blocker_release(
-                    std::time::Duration::from_secs(2),
-                    "unmocked full-pipe queue-lock probe",
-                    move || {
-                        let reserved =
-                            probe_handle.has_in_flight_request(1, &RequestId::Number(43));
-                        probe_handle.cancel_request(1, &RequestId::Number(999));
-                        reserved
-                    },
-                    move || {
-                        drop(probe_blocker.lock().take());
-                    },
-                );
-                assert!(in_flight);
-                let drain_timeout = std::time::Duration::from_millis(80);
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    guard.drain(drain_timeout),
-                )
-                .await
-                .expect("EOF drain must not deadlock while kernel write(2) is blocked");
-                assert!(guard.task.is_some());
-
-                drop(guard);
-                let err = tokio::time::timeout(std::time::Duration::from_secs(2), ack)
-                    .await
-                    .unwrap();
-                assert!(err.is_err() || matches!(err, Ok(Err(_))), "{err:?}");
-                let retire_deadline = Instant::now() + std::time::Duration::from_secs(2);
-                while !retired.load(Ordering::SeqCst) {
-                    assert!(Instant::now() < retire_deadline);
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            });
-
-            // Runtime drop MUST complete while `pipe_r` is STILL open and kernel `write(2)` is
-            // STILL blocked; the watchdog closes `pipe_r` only afterward (or unblocks before
-            // failing on regression).
-            assert_runtime_drops_within(
-                rt,
-                std::time::Duration::from_secs(2),
-                "unmocked full-pipe kernel write(2)",
+            run_bounded_with_blocker_release(
+                std::time::Duration::from_secs(10),
+                "unmocked full-pipe kernel write(2) fixture",
                 move || {
-                    drop(pipe_r_blocker.lock().take());
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build()
+                        .unwrap();
+
+                    rt.block_on(async {
+                        let writer_fd =
+                            unix_stdout::PollableFdWriter::from_owned_fd_offloaded(pipe_w, false)
+                                .unwrap();
+                        let (handle, task) = StdioWriterHandle::spawn_sink(writer_fd);
+                        let mut guard = StdioWriterGuard {
+                            handle: handle.clone(),
+                            task: Some(task),
+                        };
+
+                        let frame_len = 256 << 10;
+                        let mut frame = vec![b'b'; frame_len - 1];
+                        frame.push(b'\n');
+
+                        let retired = Arc::new(AtomicBool::new(false));
+                        let slot = ResponseSlot::open();
+                        let flag = retired.clone();
+                        assert!(slot.arm_cancel_hook(move || flag.store(true, Ordering::SeqCst)));
+                        let (_, hook) = slot.take_with_cancel_hook();
+                        let ack = handle.enqueue_with_ack(
+                            1,
+                            Some(RequestId::Number(43)),
+                            StdioWritePayload::Raw(axum::body::Bytes::from(frame)),
+                            hook,
+                        );
+
+                        // Wait until the real OS pipe fills and stalls inside kernel `libc::write(2)`.
+                        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+                        let mut last_readable = 0i32;
+                        let mut stable_since: Option<Instant> = None;
+                        loop {
+                            let readable = {
+                                let guard_b = worker_blocker.lock();
+                                let pipe_r_fd =
+                                    guard_b.as_ref().expect("pipe_r still held").as_raw_fd();
+                                let mut readable: libc::c_int = 0;
+                                let rc = unsafe {
+                                    libc::ioctl(pipe_r_fd, libc::FIONREAD, &mut readable)
+                                };
+                                assert_eq!(rc, 0);
+                                readable
+                            };
+                            assert!(
+                                (readable as usize) < frame_len,
+                                "256 KiB frame unexpectedly fit in OS pipe without blocking"
+                            );
+                            if readable > 0 && readable == last_readable {
+                                if stable_since.is_some_and(|t| {
+                                    t.elapsed() >= std::time::Duration::from_millis(40)
+                                }) {
+                                    break;
+                                }
+                            } else {
+                                last_readable = readable;
+                                stable_since = (readable > 0).then(Instant::now);
+                            }
+                            assert!(
+                                Instant::now() < deadline,
+                                "OS pipe did not stall inside kernel write(2) (readable={readable})"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        }
+
+                        let probe_start = Instant::now();
+                        let in_flight = handle.has_in_flight_request(1, &RequestId::Number(43));
+                        handle.cancel_request(1, &RequestId::Number(999));
+                        assert!(
+                            probe_start.elapsed() < std::time::Duration::from_secs(2),
+                            "unmocked full-pipe queue-lock probe stalled: {:?}",
+                            probe_start.elapsed()
+                        );
+                        assert!(in_flight);
+
+                        let drain_timeout = std::time::Duration::from_millis(80);
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            guard.drain(drain_timeout),
+                        )
+                        .await
+                        .expect("EOF drain must not deadlock while kernel write(2) is blocked");
+                        assert!(guard.task.is_some());
+
+                        drop(guard);
+                        let err = tokio::time::timeout(std::time::Duration::from_secs(2), ack)
+                            .await
+                            .unwrap();
+                        assert!(err.is_err() || matches!(err, Ok(Err(_))), "{err:?}");
+                        let retire_deadline = Instant::now() + std::time::Duration::from_secs(2);
+                        while !retired.load(Ordering::SeqCst) {
+                            assert!(Instant::now() < retire_deadline);
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        }
+                    });
+
+                    // Runtime drop MUST complete while `pipe_r` is STILL open and kernel
+                    // `write(2)` is STILL blocked.
+                    let drop_start = Instant::now();
+                    drop(rt);
+                    assert!(
+                        drop_start.elapsed() < std::time::Duration::from_secs(2),
+                        "unmocked full-pipe runtime drop stalled: {:?}",
+                        drop_start.elapsed()
+                    );
+                },
+                move || {
+                    drop(timeout_blocker.lock().take());
                 },
             );
+
+            // Release `pipe_r` on the test runner thread only after verifying runtime shutdown.
+            drop(pipe_r_blocker.lock().take());
         }
     }
 }
