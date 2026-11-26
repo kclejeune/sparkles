@@ -132,8 +132,8 @@ The quick-fixes phase is built. Roadmap items 485 and 486 shipped. The planner o
 was measured and not adopted, and item 939 orders rule bodies from sampled bindings
 instead. The reasoner also records witnesses for F18 under item 416.
 The columnar derived tier, the first phase of the core, is built under item 835. The
-SHACL-AF and SPIN frontend of Phase 5 is built under item 838, with its maintenance in
-item 958 and SPIN's RDF syntax in item 959. The rule IR of the n-ary core is built under
+SHACL-AF and SPIN frontend of Phase 5 is built under item 838, with SPIN's RDF syntax and
+template calls built under item 959 and incremental maintenance remaining in item 958. The rule IR of the n-ary core is built under
 item 839, with its evaluation by strata, maintenance, explanations, witnesses, demand and
 the rule frontend, and its restricted chase and planner over relations remain. Phase 2,
 closure operators in demand programs, is built as the first half of item 521. The other core and
@@ -454,8 +454,12 @@ An incremental run of the profile therefore materializes in full and says why, a
 958 holds the compiled form and its maintenance. The SHACL-AF 2017 node expressions map
 onto the SHACL 1.2 expression tree, with a new `SparqlCall` node for `sh:SPARQLFunction`
 calls over the combinations of their arguments. TopBraid's seven rule tests pass and are
-vendored with their licence. SPIN rules run from `sp:text`, and SPIN's RDF syntax and
-template calls are item 959. The Fuseki converter maps `ja:reasonerURL sh:Rules`, a
+vendored with their licence. SPIN rules run from `sp:text`, from SPIN RDF syntax
+(`sp:Construct`, `sp:Select`, `sp:Ask`, `sp:Describe`, graph patterns, property paths,
+expressions, built-ins, aggregates and solution modifiers under depth, node, list and
+output-size bounds), and from SPIN template calls (`spin:Template`,
+`spin:ConstructTemplate`, `spin:body` and `spl:Argument` with defaults, optional
+arguments, value types and `rdfs:subClassOf` inheritance), which item 959 added. The Fuseki converter maps `ja:reasonerURL sh:Rules`, a
 Sparkles convention, with `sh:shapesGraph` and `tosh:maxIterations`.
 
 The example `shacl_af_bench` of the reasoner measures the evaluator. It makes N rectangles,

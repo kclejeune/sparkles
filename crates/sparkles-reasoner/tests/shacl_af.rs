@@ -21,6 +21,7 @@ const PREFIXES: &str = "@prefix ex: <http://example.org/> .
 @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
 @prefix spin: <http://spinrdf.org/spin#> .
 @prefix sp: <http://spinrdf.org/sp#> .
+@prefix spl: <http://spinrdf.org/spl#> .
 @prefix shnex: <http://www.w3.org/ns/shacl-node-expr#> .
 ";
 
@@ -258,13 +259,245 @@ fn spin_rules_with_their_text_run_as_sparql_rules() {
 }
 
 #[test]
-fn spin_rules_in_rdf_syntax_alone_are_refused() {
+fn malformed_spin_rdf_rule_missing_templates_is_refused() {
     let s = store_of(
         "ex:Person spin:rule [ a sp:Construct ; sp:where () ] .
          ex:a a ex:Person .",
     );
     let e = run(&s, ShaclAf::default()).unwrap_err();
-    assert!(format!("{e:#}").contains("sp:text"), "{e:#}");
+    assert!(format!("{e:#}").contains("templates"), "{e:#}");
+}
+
+#[test]
+fn topbraid_spin_rdf_syntax_rules_run_without_sp_text() {
+    // Rectangle area via sp:Construct in pure SPIN RDF syntax: spin:_this, sp:Bind,
+    // arithmetic, sp:Filter, sp:Optional, sp:NotExists, and a template blank node.
+    let s = store_of(
+        r#"
+        ex:Rectangle spin:rule [
+          a sp:Construct ;
+          sp:templates (
+            [ sp:subject spin:_this ; sp:predicate ex:area ; sp:object [ sp:varName "area" ] ]
+            [ sp:subject spin:_this ; sp:predicate ex:summary ; sp:object _:box ]
+            [ sp:subject _:box ; sp:predicate ex:label ; sp:object [ sp:varName "lbl" ] ]
+          ) ;
+          sp:where (
+            [ sp:subject spin:_this ; sp:predicate ex:width ; sp:object [ sp:varName "w" ] ]
+            [ sp:subject spin:_this ; sp:predicate ex:height ; sp:object [ sp:varName "h" ] ]
+            [ a sp:Bind ;
+              sp:expression [ a sp:mul ; sp:arg1 [ sp:varName "w" ] ; sp:arg2 [ sp:varName "h" ] ] ;
+              sp:variable [ sp:varName "area" ] ]
+            [ a sp:Filter ;
+              sp:expression [ a sp:gt ; sp:arg1 [ sp:varName "area" ] ; sp:arg2 0 ] ]
+            [ a sp:NotExists ;
+              sp:elements (
+                [ sp:subject spin:_this ; sp:predicate ex:ignored ; sp:object true ]
+              ) ]
+            [ a sp:Optional ;
+              sp:elements (
+                [ sp:subject spin:_this ; sp:predicate ex:name ; sp:object [ sp:varName "n" ] ]
+              ) ]
+            [ a sp:Bind ;
+              sp:expression [ a sp:coalesce ; sp:arg1 [ sp:varName "n" ] ; sp:arg2 "unnamed" ] ;
+              sp:variable [ sp:varName "lbl" ] ]
+          )
+        ] .
+        ex:r1 a ex:Rectangle ; ex:width 6 ; ex:height 7 ; ex:name "big" .
+        ex:r2 a ex:Rectangle ; ex:width 3 ; ex:height 4 ; ex:ignored true .
+        ex:r3 a ex:Rectangle ; ex:width 0 ; ex:height 5 .
+        "#,
+    );
+    run(&s, ShaclAf::default()).unwrap();
+    let got = inferred(&s);
+    assert!(
+        got.contains("r1 area \"42\"^^http://www.w3.org/2001/XMLSchema#integer"),
+        "{got:?}"
+    );
+    assert!(got.iter().any(|t| t.ends_with("label \"big\"")), "{got:?}");
+    assert!(
+        !got.iter()
+            .any(|t| t.starts_with("r2 ") || t.starts_with("r3 ")),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn spin_rdf_syntax_supports_paths_union_subquery_subproperty_and_global_rules() {
+    let s = store_of(
+        r#"
+        ex:customRule rdfs:subPropertyOf spin:rule .
+        ex:Node ex:customRule [
+          a sp:Construct ;
+          sp:templates (
+            [ sp:subject spin:_this ; sp:predicate ex:reaches ; sp:object [ sp:varName "t" ] ]
+          ) ;
+          sp:where (
+            [ a sp:TriplePath ;
+              sp:subject spin:_this ;
+              sp:path [ a sp:ModPath ;
+                        sp:subPath [ a sp:AltPath ; sp:path1 ex:next ; sp:path2 ex:alt ] ;
+                        sp:modMin 1 ; sp:modMax -2 ] ;
+              sp:object [ sp:varName "t" ] ]
+          )
+        ] .
+        # Global rule (no ?this): counts reachable nodes via SubQuery + Union
+        ex:Registry spin:rule [
+          a sp:Construct ;
+          sp:templates (
+            [ sp:subject [ sp:varName "n" ] ; sp:predicate ex:reachCount ; sp:object [ sp:varName "c" ] ]
+          ) ;
+          sp:where (
+            [ a sp:SubQuery ;
+              sp:query [
+                a sp:Select ;
+                sp:resultVariables (
+                  [ sp:varName "n" ]
+                  [ sp:varName "c" ; sp:expression [ a sp:Count ; sp:distinct true ; sp:expression [ sp:varName "x" ] ] ]
+                ) ;
+                sp:where (
+                  [ a sp:Union ;
+                    sp:elements (
+                      ( [ sp:subject [ sp:varName "n" ] ; sp:predicate ex:reaches ; sp:object [ sp:varName "x" ] ] )
+                      ( [ sp:subject [ sp:varName "n" ] ; sp:predicate ex:direct ; sp:object [ sp:varName "x" ] ] )
+                    ) ]
+                ) ;
+                sp:groupBy ( [ sp:varName "n" ] )
+              ] ]
+          )
+        ] .
+        ex:a a ex:Node ; ex:next ex:b .
+        ex:b ex:alt ex:c .
+        "#,
+    );
+    run(&s, ShaclAf::default()).unwrap();
+    let got = inferred(&s);
+    assert!(got.contains("a reaches b"), "{got:?}");
+    assert!(got.contains("a reaches c"), "{got:?}");
+    assert!(
+        got.contains("a reachCount \"2\"^^http://www.w3.org/2001/XMLSchema#integer"),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn spin_template_calls_work_with_sp_text_rdf_bodies_defaults_optional_and_inheritance() {
+    let s = store_of(
+        r#"
+        # Base template with sp:text body, default value, and optional argument
+        ex:ClassifyByThreshold a spin:ConstructTemplate ;
+          spin:constraint [ a spl:Argument ; spl:predicate ex:measure ; spl:valueType rdf:Property ] ;
+          spin:constraint [ a spl:Argument ; spl:predicate ex:minValue ; spl:valueType xsd:integer ; spl:defaultValue 10 ] ;
+          spin:constraint [ a spl:Argument ; spl:predicate ex:targetClass ; spl:valueType rdfs:Class ] ;
+          spin:constraint [ a spl:Argument ; spl:predicate ex:tag ; spl:optional true ; spl:valueType xsd:string ] ;
+          spin:body [
+            a sp:Construct ;
+            sp:text """
+              CONSTRUCT {
+                ?this a ?targetClass .
+                ?this <http://example.org/badge> ?b .
+              }
+              WHERE {
+                ?this ?measure ?v .
+                FILTER (?v >= ?minValue)
+                BIND (IF(BOUND(?tag), ?tag, "default") AS ?b)
+              }
+            """
+          ] .
+
+        # Inherited template overriding default minValue
+        ex:HighThreshold a spin:ConstructTemplate ;
+          rdfs:subClassOf ex:ClassifyByThreshold ;
+          spin:constraint [ a spl:Argument ; spl:predicate ex:minValue ; spl:defaultValue 100 ] .
+
+        # Template with pure SPIN RDF syntax body (no sp:text)
+        ex:CopyProperty a spin:ConstructTemplate ;
+          spin:constraint [ a spl:Argument ; spl:predicate ex:fromProp ; spl:valueType rdf:Property ] ;
+          spin:constraint [ a spl:Argument ; spl:predicate ex:toProp ; spl:valueType rdf:Property ] ;
+          spin:body [
+            a sp:Construct ;
+            sp:templates (
+              [ sp:subject spin:_this ; sp:predicate [ sp:varName "toProp" ] ; sp:object [ sp:varName "val" ] ]
+            ) ;
+            sp:where (
+              [ sp:subject spin:_this ; sp:predicate [ sp:varName "fromProp" ] ; sp:object [ sp:varName "val" ] ]
+            )
+          ] .
+
+        ex:Item spin:rule [
+          a ex:CopyProperty ;
+          ex:fromProp ex:rawScore ;
+          ex:toProp ex:score
+        ] .
+        ex:Item spin:rule [
+          a ex:HighThreshold ;
+          ex:measure ex:score ;
+          ex:targetClass ex:TopItem ;
+          ex:tag "vip"
+        ] .
+        ex:Item spin:rule [
+          a ex:ClassifyByThreshold ;
+          ex:measure ex:score ;
+          ex:targetClass ex:PassedItem
+        ] .
+
+        ex:i1 a ex:Item ; ex:rawScore 150 .
+        ex:i2 a ex:Item ; ex:rawScore 25 .
+        ex:i3 a ex:Item ; ex:rawScore 5 .
+        "#,
+    );
+    run(&s, ShaclAf::default()).unwrap();
+    let got = inferred(&s);
+    assert!(got.contains("i1 a TopItem"), "{got:?}");
+    assert!(got.contains("i1 badge \"vip\""), "{got:?}");
+    assert!(got.contains("i1 a PassedItem"), "{got:?}");
+    assert!(got.contains("i2 a PassedItem"), "{got:?}");
+    assert!(got.contains("i2 badge \"default\""), "{got:?}");
+    assert!(!got.contains("i2 a TopItem"), "{got:?}");
+    assert!(!got.contains("i3 a PassedItem"), "{got:?}");
+}
+
+#[test]
+fn spin_template_missing_arg_and_cycles_are_refused_end_to_end() {
+    let missing = store_of(
+        r#"
+        ex:T a spin:ConstructTemplate ;
+          spin:constraint [ a spl:Argument ; spl:predicate ex:cls ] ;
+          spin:body [ a sp:Construct ; sp:text "CONSTRUCT { ?this a ?cls } WHERE {}" ] .
+        ex:A spin:rule [ a ex:T ] .
+        ex:x a ex:A .
+        "#,
+    );
+    let err = run(&missing, ShaclAf::default()).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("missing required argument"),
+        "{err:#}"
+    );
+
+    let cyclic_tmpl = store_of(
+        r#"
+        ex:T1 a spin:ConstructTemplate ; rdfs:subClassOf ex:T2 ;
+          spin:body [ a sp:Construct ; sp:text "CONSTRUCT { ?this a <http://example.org/B> } WHERE {}" ] .
+        ex:T2 rdfs:subClassOf ex:T1 .
+        ex:A spin:rule [ a ex:T1 ] .
+        ex:x a ex:A .
+        "#,
+    );
+    let err = run(&cyclic_tmpl, ShaclAf::default()).unwrap_err();
+    assert!(format!("{err:#}").contains("cyclic"), "{err:#}");
+
+    let cyclic_rdf = store_of(
+        r#"
+        ex:A spin:rule [
+          a sp:Construct ;
+          sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:p ; sp:object 1 ] ) ;
+          sp:where ( [ a sp:Filter ; sp:expression ex:e1 ] )
+        ] .
+        ex:e1 a sp:not ; sp:arg1 ex:e1 .
+        ex:x a ex:A .
+        "#,
+    );
+    let err = run(&cyclic_rdf, ShaclAf::default()).unwrap_err();
+    assert!(format!("{err:#}").contains("cyclic"), "{err:#}");
 }
 
 #[test]
