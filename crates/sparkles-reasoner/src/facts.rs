@@ -39,6 +39,55 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// object before a probe of the base tier.
 const FEW_OBJECTS: u64 = 4096;
 
+/// Raw store rows inspected between metered scan callbacks.
+const METER_BATCH: u64 = 1024;
+
+trait RawMeter {
+    const ENABLED: bool;
+    fn tick(&mut self) -> anyhow::Result<()>;
+    fn flush(&mut self) -> anyhow::Result<()>;
+}
+
+struct NoMeter;
+
+impl RawMeter for NoMeter {
+    const ENABLED: bool = false;
+    #[inline(always)]
+    fn tick(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    #[inline(always)]
+    fn flush(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+struct BatchMeter<'a> {
+    pending: u64,
+    cb: &'a mut dyn FnMut(u64) -> anyhow::Result<()>,
+}
+
+impl RawMeter for BatchMeter<'_> {
+    const ENABLED: bool = true;
+    #[inline]
+    fn tick(&mut self) -> anyhow::Result<()> {
+        self.pending += 1;
+        if self.pending >= METER_BATCH {
+            let n = std::mem::take(&mut self.pending);
+            (self.cb)(n)?;
+        }
+        Ok(())
+    }
+    #[inline]
+    fn flush(&mut self) -> anyhow::Result<()> {
+        if self.pending > 0 {
+            let n = std::mem::take(&mut self.pending);
+            (self.cb)(n)?;
+        }
+        Ok(())
+    }
+}
+
 /// What [`Base::classify`] learned: by predicate, whether the store has it and has few
 /// distinct objects for it.
 #[derive(Default)]
@@ -399,6 +448,22 @@ impl Base {
         r
     }
 
+    /// [`for_each`](Self::for_each), metering every raw store row inspected before
+    /// input-graph filtering, bound checks, and multi-graph deduplication.
+    pub(crate) fn for_each_metered(
+        &self,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        meter: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+        f: impl FnMut(Triple) -> bool,
+    ) -> anyhow::Result<bool> {
+        let mut memo = Memo::default();
+        let r = self.for_each_with_metered(&mut memo, s, p, o, meter, f);
+        self.add_scans(memo.scans);
+        r
+    }
+
     /// [`for_each`](Self::for_each), reading blocks through `memo`.
     pub fn for_each_with(
         &self,
@@ -406,6 +471,36 @@ impl Base {
         s: Option<u64>,
         p: Option<u64>,
         o: Option<u64>,
+        f: impl FnMut(Triple) -> bool,
+    ) -> anyhow::Result<bool> {
+        self.for_each_with_impl(memo, s, p, o, &mut NoMeter, f)
+    }
+
+    /// [`for_each_with`](Self::for_each_with), metering every raw store row inspected
+    /// before input-graph filtering, bound checks, and multi-graph deduplication.
+    pub(crate) fn for_each_with_metered(
+        &self,
+        memo: &mut Memo,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        meter: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+        f: impl FnMut(Triple) -> bool,
+    ) -> anyhow::Result<bool> {
+        let mut batch = BatchMeter {
+            pending: 0,
+            cb: meter,
+        };
+        self.for_each_with_impl(memo, s, p, o, &mut batch, f)
+    }
+
+    fn for_each_with_impl<M: RawMeter>(
+        &self,
+        memo: &mut Memo,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        meter: &mut M,
         f: impl FnMut(Triple) -> bool,
     ) -> anyhow::Result<bool> {
         let mut f = f;
@@ -423,13 +518,22 @@ impl Base {
             // count does not depend on what is remembered: exactly with one input graph,
             // and as one scan when the reader stops early with several
             for t in kept {
+                if M::ENABLED {
+                    meter.tick()?;
+                }
                 if !f(*t) {
                     memo.scans += 1;
+                    if M::ENABLED {
+                        meter.flush()?;
+                    }
                     return Ok(false);
                 }
             }
             if complete {
                 memo.scans += self.passes() as u64;
+                if M::ENABLED {
+                    meter.flush()?;
+                }
                 return Ok(true);
             }
             let skip = kept.len();
@@ -441,7 +545,7 @@ impl Base {
             }
             let mut seen = 0;
             let mut many = !keep;
-            let done = self.scan_all(memo, s, p, o, |t| {
+            let done = self.scan_all_impl(memo, s, p, o, meter, |t| {
                 seen += 1;
                 if seen <= skip {
                     return true;
@@ -455,12 +559,19 @@ impl Base {
                 }
                 f(t)
             })?;
+            if M::ENABLED {
+                meter.flush()?;
+            }
             if keep {
                 l.put(k, &few, done && !many);
             }
             return Ok(done);
         }
-        self.scan_all(memo, s, p, o, f)
+        let done = self.scan_all_impl(memo, s, p, o, meter, f)?;
+        if M::ENABLED {
+            meter.flush()?;
+        }
+        Ok(done)
     }
 
     /// Every pass of a pattern's scan, in order.
@@ -470,11 +581,33 @@ impl Base {
         s: Option<u64>,
         p: Option<u64>,
         o: Option<u64>,
+        f: impl FnMut(Triple) -> bool,
+    ) -> anyhow::Result<bool> {
+        self.scan_all_impl(memo, s, p, o, &mut NoMeter, f)
+    }
+
+    fn scan_all_impl<M: RawMeter>(
+        &self,
+        memo: &mut Memo,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        meter: &mut M,
         mut f: impl FnMut(Triple) -> bool,
     ) -> anyhow::Result<bool> {
         let (perm, lo, hi) = self.access(s, p, o);
         for pass in 0..self.passes() {
-            if !self.scan(memo, perm, lo, hi, [s, p, o], Some(pass), None, &mut f)? {
+            if !self.scan_impl(
+                memo,
+                perm,
+                lo,
+                hi,
+                [s, p, o],
+                Some(pass),
+                None,
+                meter,
+                &mut f,
+            )? {
                 return Ok(false);
             }
         }
@@ -539,6 +672,22 @@ impl Base {
         bound: [Option<u64>; 3],
         pass: Option<usize>,
         allow: Option<u64>,
+        f: impl FnMut(Triple) -> bool,
+    ) -> anyhow::Result<bool> {
+        self.scan_impl(memo, perm, lo, hi, bound, pass, allow, &mut NoMeter, f)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_impl<M: RawMeter>(
+        &self,
+        memo: &mut Memo,
+        perm: Perm,
+        lo: Key,
+        hi: Key,
+        bound: [Option<u64>; 3],
+        pass: Option<usize>,
+        allow: Option<u64>,
+        meter: &mut M,
         mut f: impl FnMut(Triple) -> bool,
     ) -> anyhow::Result<bool> {
         memo.scans += 1;
@@ -554,7 +703,16 @@ impl Base {
         // them: its rows are adjacent, so it is emitted once they end
         let mut cur: Option<(Triple, usize)> = None;
         let mut completed = true;
+        let mut meter_err: Option<anyhow::Error> = None;
         let mut row = |k: [u64; 4], f: &mut dyn FnMut(Triple) -> bool| -> bool {
+            if M::ENABLED
+                && let Err(e) = meter.tick()
+            {
+                meter_err = Some(e);
+                completed = false;
+                cur = None;
+                return false;
+            }
             let mut order = 0;
             if check_graph {
                 let g = k[at[3]];
@@ -676,6 +834,9 @@ impl Base {
         #[cfg(test)]
         {
             memo.rows += entered;
+        }
+        if let Some(e) = meter_err {
+            return Err(e);
         }
         Ok(!cut && completed && last(cur, &mut f))
     }

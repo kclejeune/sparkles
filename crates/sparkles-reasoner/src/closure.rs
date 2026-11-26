@@ -272,6 +272,7 @@ fn reserve_one<V>(map: &mut FxHashMap<u64, V>, held: &mut Held) -> Result<(), Bu
 }
 
 /// Make room in `map` for key `k` if absent, charging table growth before reservation.
+/// Only for insert-only maps (where `map.capacity()` matches the live bucket allocation).
 fn reserve_map_one<K: Eq + std::hash::Hash, V>(
     map: &mut FxHashMap<K, V>,
     k: &K,
@@ -290,6 +291,44 @@ fn reserve_map_one<K: Eq + std::hash::Hash, V>(
             held.try_grow(bytes(map.capacity()) - bytes(want))?;
         }
         held.shrink(bytes(before));
+    }
+    Ok(())
+}
+
+/// Make room in `map` for key `k` if absent, rebuilding into a freshly charged table when
+/// `map.len() == map.capacity()` (including after tombstone-producing removals where
+/// `HashMap::capacity()` is lower than the allocated bucket table). `held` must track `map`
+/// exclusively so `held.bytes()` records the exact live bucket allocation.
+fn reserve_map_rehash<K: Eq + std::hash::Hash, V>(
+    map: &mut FxHashMap<K, V>,
+    k: &K,
+    held: &mut Held,
+) -> Result<(), BudgetFailure> {
+    if map.contains_key(k) {
+        return Ok(());
+    }
+    if map.len() == map.capacity() {
+        let elem = size_of::<(K, V)>();
+        let old_bytes = held.bytes();
+        let want_items = map.len().saturating_mul(2).max(14);
+        let new_cap = table_capacity(want_items);
+        let new_bytes = table_bytes(new_cap, elem);
+        held.try_grow(new_bytes)?;
+        let mut next: FxHashMap<K, V> =
+            FxHashMap::with_capacity_and_hasher(new_cap, Default::default());
+        let actual_bytes = table_bytes(next.capacity(), elem);
+        if actual_bytes > new_bytes
+            && let Err(e) = held.try_grow(actual_bytes - new_bytes)
+        {
+            drop(next);
+            held.shrink(new_bytes);
+            return Err(e);
+        }
+        next.extend(map.drain());
+        let old = std::mem::replace(map, next);
+        drop(old);
+        let kept = old_bytes + actual_bytes.max(new_bytes);
+        held.shrink(kept - actual_bytes);
     }
     Ok(())
 }
@@ -883,7 +922,7 @@ impl Closures {
     /// Force every operator covering any predicate in `preds` to re-close that predicate
     /// from row 0 in the next step, even when no new edges arrive after `start`. Used by
     /// incremental saturation after a deletion removed facts from an operator relation.
-    pub(crate) fn reset_predicates(&mut self, preds: &[u64]) {
+    pub(crate) fn reset_predicates(&mut self, preds: &FxHashSet<u64>) {
         for op in &mut self.ops {
             if op.off {
                 continue;
@@ -2364,17 +2403,6 @@ impl BaseReach {
         let mut b = Builder::new(budget);
         let mut loops_held = Held::new(budget);
         let mut self_loops: Vec<u32> = Vec::new();
-        let mut pending: u64 = 0;
-        let mut tick_scan = |pending: &mut u64, poll: &mut Poll<'_>| -> anyhow::Result<()> {
-            *pending += 1;
-            if *pending >= REACH_VISIT_BATCH {
-                visit(std::mem::take(pending))?;
-                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-                    anyhow::bail!("reasoning cancelled");
-                }
-            }
-            poll.tick(1)
-        };
         let mut add = |s: u64, o: u64| -> anyhow::Result<()> {
             let (a, _) = b.node(s)?;
             let (c, _) = b.node(o)?;
@@ -2387,8 +2415,15 @@ impl BaseReach {
         };
         if let Some(base) = g.base() {
             let mut err: Option<anyhow::Error> = None;
-            base.for_each(None, Some(q), None, |t| {
-                if let Err(e) = tick_scan(&mut pending, &mut poll).and_then(|()| add(t[0], t[2])) {
+            let mut base_meter = |n: u64| -> anyhow::Result<()> {
+                visit(n)?;
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+                Ok(())
+            };
+            base.for_each_metered(None, Some(q), None, &mut base_meter, |t| {
+                if let Err(e) = add(t[0], t[2]) {
                     err = Some(e);
                     return false;
                 }
@@ -2398,9 +2433,17 @@ impl BaseReach {
                 return Err(e);
             }
         }
+        let mut pending: u64 = 0;
         let c = g.cands(None, Some(q), None, g.offset(), g.len());
         for r in c.iter() {
-            tick_scan(&mut pending, &mut poll)?;
+            pending += 1;
+            if pending >= REACH_VISIT_BATCH {
+                visit(std::mem::take(&mut pending))?;
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+            }
+            poll.tick(1)?;
             if g.alive(r) && g.flagged(r) {
                 let t = g.triple(r);
                 if t[1] == q {
@@ -2479,17 +2522,6 @@ impl BaseReach {
         }
         let mut poll = Poll::new(cancel);
         let mut b = Builder::new(budget);
-        let mut pending: u64 = 0;
-        let mut tick_scan = |pending: &mut u64, poll: &mut Poll<'_>| -> anyhow::Result<()> {
-            *pending += 1;
-            if *pending >= REACH_VISIT_BATCH {
-                visit(std::mem::take(pending))?;
-                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-                    anyhow::bail!("reasoning cancelled");
-                }
-            }
-            poll.tick(1)
-        };
         let mut add = |s: u64, o: u64| -> anyhow::Result<()> {
             b.edge(s, o)?;
             if add_non_literal_reverse && terms.kind(o) != Kind::Literal {
@@ -2499,8 +2531,15 @@ impl BaseReach {
         };
         if let Some(base) = g.base() {
             let mut err: Option<anyhow::Error> = None;
-            base.for_each(None, Some(q), None, |t| {
-                if let Err(e) = tick_scan(&mut pending, &mut poll).and_then(|()| add(t[0], t[2])) {
+            let mut base_meter = |n: u64| -> anyhow::Result<()> {
+                visit(n)?;
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+                Ok(())
+            };
+            base.for_each_metered(None, Some(q), None, &mut base_meter, |t| {
+                if let Err(e) = add(t[0], t[2]) {
                     err = Some(e);
                     return false;
                 }
@@ -2510,9 +2549,17 @@ impl BaseReach {
                 return Err(e);
             }
         }
+        let mut pending: u64 = 0;
         let c = g.cands(None, Some(q), None, g.offset(), g.len());
         for r in c.iter() {
-            tick_scan(&mut pending, &mut poll)?;
+            pending += 1;
+            if pending >= REACH_VISIT_BATCH {
+                visit(std::mem::take(&mut pending))?;
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+            }
+            poll.tick(1)?;
             if g.alive(r) && g.flagged(r) {
                 let t = g.triple(r);
                 if t[1] == q {
@@ -2639,28 +2686,40 @@ pub(crate) struct DeletionOps {
     /// per predicate `q` materialized on demand: confirmed explicit-edge reachability
     /// structures (empty if all covering operators have derived, non-explicit guards)
     base_graphs: FxHashMap<u64, PredReaches>,
+    /// exact budget charge for `base_graphs`'s hash table allocation (tracks live buckets
+    /// across tombstone-producing removals)
+    base_graphs_held: Held,
     /// guarded triples `(q, gp, go)` that were deleted in a dead-guard batch
     dead_guards: FxHashSet<(u64, u64, u64)>,
     /// predicates whose live derived facts were scanned once for operator consequences
     scanned_all: FxHashSet<u64>,
     /// operator predicates that lost facts during deletion, so saturation resets their marks
     dirty: FxHashSet<u64>,
+    /// budget charge for `dirty`, moved out alongside it into forward saturation
+    dirty_held: Held,
     /// dead edges seen per operator predicate so far
     dead_counts: FxHashMap<u64, usize>,
-    /// budget charge for bookkeeping tables
+    /// budget charge for insert-only bookkeeping tables (`dead_guards`, `scanned_all`,
+    /// `dead_counts`)
     held: Held,
 }
 
 impl DeletionOps {
     /// Detect active closure operators for incremental deletion, disabling any operator
     /// whose predicate currently meets literal value ambiguity so its rules stay with the
-    /// join evaluator.
+    /// join evaluator. All base-tier and derived-tier scans are metered against `visit`
+    /// and poll `cancel`.
     pub(crate) fn detect(
         rules: &[CRule],
         g: &Graph,
         terms: &Terms,
         budget: &Arc<Budget>,
-    ) -> Result<Option<DeletionOps>, BudgetFailure> {
+        cancel: Option<&AtomicBool>,
+        visit: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Option<DeletionOps>> {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            anyhow::bail!("reasoning cancelled");
+        }
         let Some(mut closures) = Closures::detect(rules, terms, None, None)? else {
             return Ok(None);
         };
@@ -2672,13 +2731,13 @@ impl DeletionOps {
                 // a symmetric rule with `notEqual` paired with an unfiltered transitive
                 // rule is also covered.
                 (Over::Fixed(c), Shape::Equivalence) => {
-                    Self::pred_has_ambiguous_literals(g, c, terms)
+                    Self::pred_has_ambiguous_literals(g, c, terms, cancel, visit)?
                 }
                 (Over::Fixed(c), Shape::Transitive) if op.irreflexive => {
-                    Self::pred_has_literal_subject(g, c, terms)
+                    Self::pred_has_literal_subject(g, c, terms, cancel, visit)?
                 }
                 (Over::Guarded(gp, go), Shape::Transitive) if op.irreflexive => {
-                    Self::guarded_has_literal_subject(g, gp, go, terms, budget)?
+                    Self::guarded_has_literal_subject(g, gp, go, terms, budget, cancel, visit)?
                 }
                 _ => false,
             };
@@ -2694,75 +2753,147 @@ impl DeletionOps {
             ops: closures.ops,
             guarded_sym,
             base_graphs: FxHashMap::default(),
+            base_graphs_held: Held::new(budget),
             dead_guards: FxHashSet::default(),
             scanned_all: FxHashSet::default(),
             dirty: FxHashSet::default(),
+            dirty_held: Held::new(budget),
             dead_counts: FxHashMap::default(),
             held: Held::new(budget),
         }))
     }
 
-    fn pred_has_literal_subject(g: &Graph, q: u64, terms: &Terms) -> bool {
+    fn pred_has_literal_subject(
+        g: &Graph,
+        q: u64,
+        terms: &Terms,
+        cancel: Option<&AtomicBool>,
+        visit: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            anyhow::bail!("reasoning cancelled");
+        }
         if let Some(base) = g.base() {
             let mut found = false;
-            let _ = base.for_each(None, Some(q), None, |t| {
+            let mut base_meter = |n: u64| -> anyhow::Result<()> {
+                visit(n)?;
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+                Ok(())
+            };
+            base.for_each_metered(None, Some(q), None, &mut base_meter, |t| {
                 if terms.kind(t[0]) == Kind::Literal {
                     found = true;
                     return false;
                 }
                 true
-            });
+            })?;
             if found {
-                return true;
+                return Ok(true);
             }
         }
+        let mut poll = Poll::new(cancel);
+        let mut pending: u64 = 0;
         let c = g.cands(None, Some(q), None, g.offset(), g.len());
-        c.iter().any(|r| {
-            g.alive(r) && {
-                let t = g.triple(r);
-                t[1] == q && terms.kind(t[0]) == Kind::Literal
+        for r in c.iter() {
+            pending += 1;
+            if pending >= REACH_VISIT_BATCH {
+                visit(std::mem::take(&mut pending))?;
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    anyhow::bail!("reasoning cancelled");
+                }
             }
-        })
+            poll.tick(1)?;
+            if g.alive(r) {
+                let t = g.triple(r);
+                if t[1] == q && terms.kind(t[0]) == Kind::Literal {
+                    if pending > 0 {
+                        visit(pending)?;
+                    }
+                    return Ok(true);
+                }
+            }
+        }
+        if pending > 0 {
+            visit(pending)?;
+        }
+        Ok(false)
     }
 
-    fn pred_has_ambiguous_literals(g: &Graph, q: u64, terms: &Terms) -> bool {
-        let mut lits: Vec<u64> = Vec::new();
+    fn pred_has_ambiguous_literals(
+        g: &Graph,
+        q: u64,
+        terms: &Terms,
+        cancel: Option<&AtomicBool>,
+        visit: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            anyhow::bail!("reasoning cancelled");
+        }
+        let mut lits = [0u64; 64];
+        let mut n_lits = 0usize;
         let mut see = |id: u64| -> bool {
             if terms.kind(id) != Kind::Literal {
                 return false;
             }
-            if lits.contains(&id) {
+            let cur = &lits[..n_lits];
+            if cur.contains(&id) {
                 return false;
             }
-            if lits.len() >= 64 || lits.iter().any(|&other| same_value(terms, id, other)) {
+            if n_lits >= lits.len() || cur.iter().any(|&other| same_value(terms, id, other)) {
                 return true;
             }
-            lits.push(id);
+            lits[n_lits] = id;
+            n_lits += 1;
             false
         };
         if let Some(base) = g.base() {
             let mut bad = false;
-            let _ = base.for_each(None, Some(q), None, |t| {
+            let mut base_meter = |n: u64| -> anyhow::Result<()> {
+                visit(n)?;
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+                Ok(())
+            };
+            base.for_each_metered(None, Some(q), None, &mut base_meter, |t| {
                 if see(t[0]) || see(t[2]) {
                     bad = true;
                     return false;
                 }
                 true
-            });
+            })?;
             if bad {
-                return true;
+                return Ok(true);
             }
         }
+        let mut poll = Poll::new(cancel);
+        let mut pending: u64 = 0;
         let c = g.cands(None, Some(q), None, g.offset(), g.len());
         for r in c.iter() {
+            pending += 1;
+            if pending >= REACH_VISIT_BATCH {
+                visit(std::mem::take(&mut pending))?;
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+            }
+            poll.tick(1)?;
             if g.alive(r) {
                 let t = g.triple(r);
                 if t[1] == q && (see(t[0]) || see(t[2])) {
-                    return true;
+                    if pending > 0 {
+                        visit(pending)?;
+                    }
+                    return Ok(true);
                 }
             }
         }
-        false
+        if pending > 0 {
+            visit(pending)?;
+        }
+        Ok(false)
     }
 
     fn guarded_has_literal_subject(
@@ -2771,24 +2902,46 @@ impl DeletionOps {
         go: u64,
         terms: &Terms,
         budget: &Arc<Budget>,
-    ) -> Result<bool, BudgetFailure> {
+        cancel: Option<&AtomicBool>,
+        visit: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            anyhow::bail!("reasoning cancelled");
+        }
         let mut preds_held = Held::new(budget);
         let mut preds: Vec<u64> = Vec::new();
         if let Some(base) = g.base() {
             let mut err: Option<BudgetFailure> = None;
-            let _ = base.for_each(None, Some(gp), Some(go), |t| {
+            let mut base_meter = |n: u64| -> anyhow::Result<()> {
+                visit(n)?;
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+                Ok(())
+            };
+            base.for_each_metered(None, Some(gp), Some(go), &mut base_meter, |t| {
                 if let Err(e) = push_moved(&mut preds, t[0], &mut preds_held) {
                     err = Some(e);
                     return false;
                 }
                 true
-            });
+            })?;
             if let Some(e) = err {
-                return Err(e);
+                return Err(e.into());
             }
         }
+        let mut poll = Poll::new(cancel);
+        let mut pending: u64 = 0;
         let c = g.cands(None, Some(gp), Some(go), g.offset(), g.len());
         for r in c.iter() {
+            pending += 1;
+            if pending >= REACH_VISIT_BATCH {
+                visit(std::mem::take(&mut pending))?;
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+            }
+            poll.tick(1)?;
             if g.alive(r) {
                 let t = g.triple(r);
                 if t[1] == gp && t[2] == go {
@@ -2796,11 +2949,21 @@ impl DeletionOps {
                 }
             }
         }
+        if pending > 0 {
+            visit(pending)?;
+        }
         preds.sort_unstable();
         preds.dedup();
-        Ok(preds
-            .into_iter()
-            .any(|q| Self::pred_has_literal_subject(g, q, terms)))
+        let mut found = false;
+        for &q in &preds {
+            if Self::pred_has_literal_subject(g, q, terms, cancel, visit)? {
+                found = true;
+                break;
+            }
+        }
+        drop(preds);
+        drop(preds_held);
+        Ok(found)
     }
 
     /// Whether rule `ri` is maintained by an active closure operator.
@@ -3006,7 +3169,7 @@ impl DeletionOps {
             let r = BaseReach::build_directed(q, g, true, false, terms, budget, cancel, visit)?;
             push_moved(&mut reaches, r, &mut reaches_held)?;
         }
-        reserve_map_one(&mut self.base_graphs, &q, &mut self.held)?;
+        reserve_map_rehash(&mut self.base_graphs, &q, &mut self.base_graphs_held)?;
         self.base_graphs.insert(
             q,
             PredReaches {
@@ -3028,45 +3191,38 @@ impl DeletionOps {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             anyhow::bail!("reasoning cancelled");
         }
-        let mut poll = Poll::new(cancel);
-        let mut pending: u64 = 0;
-        let mut tick_scan = |pending: &mut u64, poll: &mut Poll<'_>| -> anyhow::Result<()> {
-            *pending += 1;
-            if *pending >= REACH_VISIT_BATCH {
-                visit(std::mem::take(pending))?;
+        if let Some(base) = g.base() {
+            let mut found = false;
+            let mut base_meter = |n: u64| -> anyhow::Result<()> {
+                visit(n)?;
                 if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                     anyhow::bail!("reasoning cancelled");
                 }
-            }
-            poll.tick(1)
-        };
-        if let Some(base) = g.base() {
-            let mut found = false;
-            let mut err: Option<anyhow::Error> = None;
-            base.for_each(None, Some(q), None, |t| {
-                if let Err(e) = tick_scan(&mut pending, &mut poll) {
-                    err = Some(e);
-                    return false;
-                }
+                Ok(())
+            };
+            base.for_each_metered(None, Some(q), None, &mut base_meter, |t| {
                 if terms.kind(t[2]) == Kind::Literal {
                     found = true;
                     return false;
                 }
                 true
             })?;
-            if let Some(e) = err {
-                return Err(e);
-            }
             if found {
-                if pending > 0 {
-                    visit(pending)?;
-                }
                 return Ok(true);
             }
         }
+        let mut poll = Poll::new(cancel);
+        let mut pending: u64 = 0;
         let c = g.cands(None, Some(q), None, g.offset(), g.len());
         for r in c.iter() {
-            tick_scan(&mut pending, &mut poll)?;
+            pending += 1;
+            if pending >= REACH_VISIT_BATCH {
+                visit(std::mem::take(&mut pending))?;
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+            }
+            poll.tick(1)?;
             if g.alive(r) && g.flagged(r) {
                 let t = g.triple(r);
                 if t[1] == q && terms.kind(t[2]) == Kind::Literal {
@@ -3141,7 +3297,7 @@ impl DeletionOps {
         dead_guards.sort_unstable();
         dead_guards.dedup();
         for q in dead_guards {
-            insert_set_one(&mut self.dirty, q, &mut self.held)?;
+            insert_set_one(&mut self.dirty, q, &mut self.dirty_held)?;
             insert_set_one(&mut self.scanned_all, q, &mut self.held)?;
             visit(0)?;
             let c = g.cands(None, Some(q), None, g.offset(), g.len());
@@ -3178,7 +3334,7 @@ impl DeletionOps {
         // 3. Emit operator consequences for each affected predicate.
         let mut memo = Memo::default();
         for (q, (cov, edges)) in by_pred {
-            insert_set_one(&mut self.dirty, q, &mut self.held)?;
+            insert_set_one(&mut self.dirty, q, &mut self.dirty_held)?;
             if self.scanned_all.contains(&q) {
                 continue;
             }
@@ -3192,10 +3348,18 @@ impl DeletionOps {
             visit(0)?;
             if total_dead <= 32 && edges.len() <= 32 {
                 // Small deletion: 1-step operator consequences via the graph indexes.
+                let visit_cell = std::cell::RefCell::new(&mut *visit);
+                let mut meter = |n: u64| -> anyhow::Result<()> {
+                    (visit_cell.borrow_mut())(n)?;
+                    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                        anyhow::bail!("reasoning cancelled");
+                    }
+                    Ok(())
+                };
                 let mut emit = |cand: Triple| -> anyhow::Result<()> {
                     pending += 1;
                     if pending >= REACH_VISIT_BATCH {
-                        visit(std::mem::take(&mut pending))?;
+                        (visit_cell.borrow_mut())(std::mem::take(&mut pending))?;
                         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                             anyhow::bail!("reasoning cancelled");
                         }
@@ -3203,8 +3367,9 @@ impl DeletionOps {
                     if cov.all_irreflexive && cand[0] == cand[2] {
                         return Ok(());
                     }
+                    let mut v_cb = |n: u64| (visit_cell.borrow_mut())(n);
                     if g.position(&cand).is_some_and(|r| !g.flagged(r))
-                        && !self.proved_by_base(&cand, &mut scratch, cancel, visit)?
+                        && !self.proved_by_base(&cand, &mut scratch, cancel, &mut v_cb)?
                     {
                         out(cand)?;
                     }
@@ -3215,12 +3380,12 @@ impl DeletionOps {
                     if cov.any_equiv {
                         emit([v, q, u])?;
                     }
-                    g.each_subject(&mut memo, q, u, g.len(), |x| {
+                    g.each_subject_metered(&mut memo, q, u, g.len(), &mut meter, |x| {
                         poll.tick(1)?;
                         emit([x, q, v])?;
                         Ok(true)
                     })?;
-                    g.each_object(&mut memo, v, q, g.len(), |z| {
+                    g.each_object_metered(&mut memo, v, q, g.len(), &mut meter, |z| {
                         poll.tick(1)?;
                         emit([u, q, z])?;
                         Ok(true)
@@ -3260,10 +3425,11 @@ impl DeletionOps {
         Ok(())
     }
 
-    /// Operator predicates that lost facts during deletion and need their saturation
-    /// marks reset to row 0.
-    pub(crate) fn dirty_preds(&self) -> Vec<u64> {
-        self.dirty.iter().copied().collect()
+    /// Move out the operator predicates that lost facts during deletion together with
+    /// their budget charge, so forward saturation resets their marks without copying into
+    /// an uncharged buffer.
+    pub(crate) fn take_dirty_preds(self) -> (FxHashSet<u64>, Held) {
+        (self.dirty, self.dirty_held)
     }
 }
 
@@ -3433,27 +3599,47 @@ mod tests {
             g.set_flag_with(r, true, false).unwrap();
         }
 
-        // Tight budget refuses `Vec<BaseReach>` or `base_graphs` before allocating them.
-        let tiny = Budget::new(Some(1));
-        let mut ops_tiny = DeletionOps::detect(&rules, &g, &terms, &tiny)
-            .unwrap()
-            .expect("guarded transitive op");
+        // Test `base_graphs` table reservation directly using a derived (unflagged) guard so
+        // `ensure_pred` builds no `BaseReach` structures and reaches `reserve_map_rehash`
+        // before any other allocation.
+        let q_der = 60_000u64;
+        let mut g_der = Graph::default();
+        g_der.try_add_batch(vec![[q_der, gp, go]]).unwrap();
+        let first_bg_bytes = table_bytes(table_capacity(14), size_of::<(u64, PredReaches)>());
+        let short = Budget::new(Some(first_bg_bytes - 1));
         let mut noop_visit = |_: u64| Ok(());
-        let err = ops_tiny
-            .ensure_pred(q, &g, &terms, &tiny, None, &mut noop_visit)
-            .expect_err("1-byte budget must refuse reachability vector/table");
+        let mut ops_short =
+            DeletionOps::detect(&rules, &g_der, &terms, &short, None, &mut noop_visit)
+                .unwrap()
+                .expect("guarded transitive op");
+        let err = ops_short
+            .ensure_pred(q_der, &g_der, &terms, &short, None, &mut noop_visit)
+            .expect_err("budget 1 byte short of first base_graphs table must refuse reservation");
         assert!(
             crate::budget::BudgetFailure::from_anyhow(&err).is_some(),
             "{err:#}"
         );
-        assert_eq!(ops_tiny.base_graphs.capacity(), 0);
-        drop(ops_tiny);
-        assert_eq!(tiny.used(), 0);
+        assert_eq!(ops_short.base_graphs.capacity(), 0);
+        assert_eq!(ops_short.base_graphs_held.bytes(), 0);
+        drop(ops_short);
+        assert_eq!(short.used(), 0);
+
+        let exact = Budget::new(Some(first_bg_bytes));
+        let mut ops_exact =
+            DeletionOps::detect(&rules, &g_der, &terms, &exact, None, &mut noop_visit)
+                .unwrap()
+                .expect("guarded transitive op");
+        ops_exact
+            .ensure_pred(q_der, &g_der, &terms, &exact, None, &mut noop_visit)
+            .expect("exact first base_graphs table fits");
+        assert_eq!(ops_exact.base_graphs_held.bytes(), first_bg_bytes);
+        drop(ops_exact);
+        assert_eq!(exact.used(), 0);
 
         // Generous budget charges both `base_graphs` and the `Vec<BaseReach>` backing
         // allocation, and removing the guard releases the `PredReaches` buffer charge.
         let budget = Budget::new(Some(256 * 1024));
-        let mut ops = DeletionOps::detect(&rules, &g, &terms, &budget)
+        let mut ops = DeletionOps::detect(&rules, &g, &terms, &budget, None, &mut noop_visit)
             .unwrap()
             .expect("guarded transitive op");
         ops.ensure_pred(q, &g, &terms, &budget, None, &mut noop_visit)
@@ -3462,7 +3648,7 @@ mod tests {
         let reaches_vec_bytes = pred.reaches.capacity() * size_of::<BaseReach>();
         assert!(reaches_vec_bytes > 0);
         assert_eq!(pred._held.bytes(), reaches_vec_bytes);
-        let table_bytes_before = ops.held.bytes();
+        let table_bytes_before = ops.base_graphs_held.bytes();
         assert_eq!(
             table_bytes_before,
             table_bytes(ops.base_graphs.capacity(), size_of::<(u64, PredReaches)>())
@@ -3487,18 +3673,125 @@ mod tests {
         )
         .unwrap();
         assert!(!ops.base_graphs.contains_key(&q));
-        let expected_tables =
-            table_bytes(ops.base_graphs.capacity(), size_of::<(u64, PredReaches)>())
-                + table_bytes(ops.dead_guards.capacity(), size_of::<(u64, u64, u64)>())
-                + table_bytes(ops.dirty.capacity(), size_of::<u64>())
-                + table_bytes(ops.scanned_all.capacity(), size_of::<u64>());
+        assert_eq!(ops.base_graphs_held.bytes(), table_bytes_before);
+        assert_eq!(
+            ops.dirty_held.bytes(),
+            table_bytes(ops.dirty.capacity(), size_of::<u64>())
+        );
+        let expected_tables = table_bytes(ops.dead_guards.capacity(), size_of::<(u64, u64, u64)>())
+            + table_bytes(ops.scanned_all.capacity(), size_of::<u64>());
         assert_eq!(ops.held.bytes(), expected_tables);
         assert!(
             budget.used() < used_with_cache,
             "dropping cached BaseReach must release memory: {} >= {used_with_cache}",
             budget.used()
         );
-        drop(ops);
+
+        // Moving `dirty` out keeps it charged until dropped while releasing the other tables.
+        let (dirty, dirty_held) = ops.take_dirty_preds();
+        assert!(dirty.contains(&q));
+        assert_eq!(
+            dirty_held.bytes(),
+            table_bytes(dirty.capacity(), size_of::<u64>())
+        );
+        assert!(
+            budget.used() >= dirty_held.bytes() && budget.used() < used_with_cache,
+            "dirty_held must remain charged after moving out: used={}, dirty={}",
+            budget.used(),
+            dirty_held.bytes()
+        );
+        drop(dirty);
+        drop(dirty_held);
         assert_eq!(budget.used(), 0);
+    }
+
+    /// Tombstone-producing removals in `base_graphs` lower `HashMap::capacity()` while
+    /// keeping the full bucket table allocated. `reserve_map_rehash` tracks the true old
+    /// allocation, refuses growth when the budget fits the old table but is 1 byte short of
+    /// old + new, and refunds the exact old allocation on success.
+    #[test]
+    fn base_graphs_growth_after_tombstone_removals_charges_full_tables() {
+        let elem = size_of::<(u64, PredReaches)>();
+        let old_64_bytes = table_bytes(56, elem);
+
+        // Construct a 64-bucket table (capacity 56), then perform tombstone-producing
+        // removals (refilling whenever an empty slot is freed) until `len == capacity() <= 28`,
+        // so `HashMap::capacity()` under-reports the live 64-bucket allocation by at least half.
+        let build_tombstoned = |budget: &Arc<Budget>| -> (FxHashMap<u64, PredReaches>, Held, u64) {
+            let mut map: FxHashMap<u64, PredReaches> = FxHashMap::default();
+            let mut held = Held::new(budget);
+            let empty_pred = |b: &Arc<Budget>| PredReaches {
+                reaches: Vec::new(),
+                _held: Held::new(b),
+            };
+            // Fill to 56 entries (64 buckets).
+            for k in 1..=56u64 {
+                reserve_map_rehash(&mut map, &k, &mut held).unwrap();
+                map.insert(k, empty_pred(budget));
+            }
+            assert_eq!(map.capacity(), 56);
+            assert_eq!(held.bytes(), old_64_bytes);
+            // Remove entries while the table stays dense so removals create `DELETED`
+            // tombstones instead of `EMPTY` slots, lowering `capacity()` below 28 while
+            // keeping all 64 buckets allocated.
+            let mut live_keys: Vec<u64> = (1..=56u64).collect();
+            let mut next_k = 1_000u64;
+            let mut idx = 0usize;
+            while map.capacity() > 28 && idx < live_keys.len() {
+                let k = live_keys[idx];
+                idx += 1;
+                map.remove(&k);
+                while map.len() < map.capacity() {
+                    map.insert(next_k, empty_pred(budget));
+                    live_keys.push(next_k);
+                    next_k += 1;
+                }
+            }
+            assert_eq!(map.len(), map.capacity());
+            assert!(
+                map.capacity() <= 28,
+                "expected tombstones to lower capacity to <= 28, got {}",
+                map.capacity()
+            );
+            assert_eq!(held.bytes(), old_64_bytes);
+            (map, held, next_k)
+        };
+
+        // Measure the required new table size for the tombstoned state.
+        let probe_budget = Budget::unlimited();
+        let (probe_map, _probe_held, _) = build_tombstoned(&probe_budget);
+        let want_items = probe_map.len().saturating_mul(2).max(14);
+        let new_cap = table_capacity(want_items);
+        let new_bytes = table_bytes(new_cap, elem);
+        drop(probe_map);
+
+        // 1 byte short of `old_64_bytes + new_bytes`: admits filling the 64-bucket table
+        // (32 + 64 buckets < 64 + new) and refuses the rebuild before allocating.
+        let short_budget = Budget::new(Some(old_64_bytes + new_bytes - 1));
+        let (mut map_short, mut held_short, trigger_k) = build_tombstoned(&short_budget);
+        let cap_before = map_short.capacity();
+        let len_before = map_short.len();
+        let err = reserve_map_rehash(&mut map_short, &trigger_k, &mut held_short)
+            .expect_err("budget 1 byte short of old + new must refuse tombstone rebuild");
+        assert!(anyhow::Error::from(err).is::<crate::budget::MemoryExceeded>());
+        assert_eq!(map_short.capacity(), cap_before);
+        assert_eq!(map_short.len(), len_before);
+        assert_eq!(held_short.bytes(), old_64_bytes);
+        drop(map_short);
+        drop(held_short);
+        assert_eq!(short_budget.used(), 0);
+
+        // Exact `old_64_bytes + new_bytes`: succeeds, clears tombstones, and refunds the
+        // full old 64-bucket allocation.
+        let exact_budget = Budget::new(Some(old_64_bytes + new_bytes));
+        let (mut map_exact, mut held_exact, trigger_k) = build_tombstoned(&exact_budget);
+        reserve_map_rehash(&mut map_exact, &trigger_k, &mut held_exact)
+            .expect("exact old + new budget fits tombstone rebuild");
+        assert_eq!(map_exact.capacity(), new_cap);
+        assert_eq!(held_exact.bytes(), new_bytes);
+        assert_eq!(exact_budget.used(), new_bytes);
+        drop(map_exact);
+        drop(held_exact);
+        assert_eq!(exact_budget.used(), 0);
     }
 }

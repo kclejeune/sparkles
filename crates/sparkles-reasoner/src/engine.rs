@@ -2662,7 +2662,7 @@ pub(crate) fn run_from(
     boundary: Option<&mut dyn FnMut(u32)>,
     origin: Origin,
 ) -> anyhow::Result<Outcome> {
-    run_from_with_dirty(g, rules, terms, limits, start, boundary, origin, &[])
+    run_from_with_dirty(g, rules, terms, limits, start, boundary, origin, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2674,7 +2674,7 @@ pub(crate) fn run_from_with_dirty(
     start: Option<u32>,
     mut boundary: Option<&mut dyn FnMut(u32)>,
     origin: Origin,
-    dirty_preds: &[u64],
+    mut dirty_preds: Option<(FxHashSet<u64>, Held)>,
 ) -> anyhow::Result<Outcome> {
     let here = g.len();
     let base_len = origin.base_len.unwrap_or(here).min(here);
@@ -2701,10 +2701,14 @@ pub(crate) fn run_from_with_dirty(
     } else {
         None
     };
-    if let Some(c) = closures.as_mut()
-        && !dirty_preds.is_empty()
-    {
-        c.reset_predicates(dirty_preds);
+    if let Some((dirty, dirty_held)) = dirty_preds.take() {
+        if let Some(c) = closures.as_mut()
+            && !dirty.is_empty()
+        {
+            c.reset_predicates(&dirty);
+        }
+        drop(dirty);
+        drop(dirty_held);
     }
     if let Some(c) = &closures {
         tracing::debug!(operators = ?c.describe(rules), "closure operators");

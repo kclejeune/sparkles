@@ -1217,6 +1217,86 @@ impl Graph {
         self.each_end(memo, None, p, Some(o), hi, 0, f)
     }
 
+    /// [`Graph::each_object`], metering every raw base-tier row and derived-tier candidate
+    /// inspected before filtering through `meter`.
+    pub(crate) fn each_object_metered(
+        &self,
+        memo: &mut Memo,
+        s: u64,
+        p: u64,
+        hi: u32,
+        meter: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+        f: impl FnMut(u64) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()> {
+        self.each_end_metered(memo, Some(s), p, None, hi, 2, meter, f)
+    }
+
+    /// [`Graph::each_subject`], metering every raw base-tier row and derived-tier candidate
+    /// inspected before filtering through `meter`.
+    pub(crate) fn each_subject_metered(
+        &self,
+        memo: &mut Memo,
+        p: u64,
+        o: u64,
+        hi: u32,
+        meter: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+        f: impl FnMut(u64) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()> {
+        self.each_end_metered(memo, None, p, Some(o), hi, 0, meter, f)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn each_end_metered(
+        &self,
+        memo: &mut Memo,
+        s: Option<u64>,
+        p: u64,
+        o: Option<u64>,
+        hi: u32,
+        at: usize,
+        meter: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+        mut f: impl FnMut(u64) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()> {
+        if let Some(b) = &self.base
+            && self.reads_base(0, hi)
+        {
+            let mut stop: Option<anyhow::Result<()>> = None;
+            b.for_each_with_metered(memo, s, Some(p), o, meter, |t| match f(t[at]) {
+                Ok(true) => true,
+                Ok(false) => {
+                    stop = Some(Ok(()));
+                    false
+                }
+                Err(e) => {
+                    stop = Some(Err(e));
+                    false
+                }
+            })?;
+            if let Some(r) = stop {
+                return r;
+            }
+        }
+        let mut pending: u64 = 0;
+        for r in self.cands(s, Some(p), o, 0, hi).iter() {
+            pending += 1;
+            if pending >= 1024 {
+                meter(std::mem::take(&mut pending))?;
+            }
+            if !self.alive(r) {
+                continue;
+            }
+            let t = self.triple(r);
+            if s.is_none_or(|x| x == t[0]) && t[1] == p && o.is_none_or(|x| x == t[2]) && !f(t[at])?
+            {
+                break;
+            }
+        }
+        if pending > 0 {
+            meter(pending)?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn each_end(
         &self,
