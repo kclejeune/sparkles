@@ -4243,5 +4243,39 @@ mod tests {
         }
         let g_bad_a = wrap_subquery("SELECT ?n WHERE { ?n a . }");
         assert!(serialize_query(&g_bad_a, &ex("q")).is_err());
+
+        // R9-1: Standalone wide synthetic call with a long outer IRI stays bounded under SPIN's
+        // work and retained-byte budgets while still catching later-inferred nested aggregates.
+        let outer_local = "f".repeat(100_000);
+        let width = 1_000usize;
+        let mut wide_args = String::new();
+        for i in 0..width {
+            if i > 0 {
+                wide_args.push_str(", ");
+            }
+            wide_args.push_str(&format!("p:a{i}(?v)"));
+        }
+        let g_wide_ok = wrap_subquery(&format!(
+            "SELECT (p:{outer_local}({wide_args}) AS ?x) WHERE {{ ?s <urn:p> ?v }}"
+        ));
+        let wide_res = serialize_query(&g_wide_ok, &ex("q"));
+        assert!(
+            wide_res.is_ok(),
+            "wide long-IRI synthetic call must fit SPIN budgets: {wide_res:?}"
+        );
+
+        let g_wide_nested = wrap_subquery(&format!(
+            "SELECT ?x WHERE {{ \
+                {{ SELECT (p:{outer_local}({wide_args}) AS ?x) WHERE {{ ?s <urn:p> ?v }} }} \
+                {{ SELECT (p:{outer_local}(DISTINCT ?w) AS ?m) WHERE {{ ?s <urn:q> ?w }} }} \
+                {{ SELECT (p:a{last}(DISTINCT ?z) AS ?k) WHERE {{ ?s <urn:r> ?z }} }} \
+            }}",
+            last = width - 1
+        ));
+        let nested_err = serialize_query(&g_wide_nested, &ex("q")).unwrap_err();
+        assert!(
+            !super::rdf::is_limit_or_cycle_error(&nested_err),
+            "nested inferred aggregate must be rejected as syntax error, not budget limit: {nested_err:#}"
+        );
     }
 }
