@@ -453,7 +453,7 @@ impl Tools<'_> {
             if !hits.is_empty() {
                 let names: Vec<String> = hits.iter().map(|(r, _)| r.clone()).collect();
                 let found = r
-                    .reports_named(&opts, &graph, &names, filter)
+                    .reports_named_at(&opts, &graph, &names, level, filter)
                     .map_err(eng)?;
                 let by: HashMap<&str, &ReportRef> =
                     found.iter().map(|x| (x.iri.as_str(), x)).collect();
@@ -474,13 +474,7 @@ impl Tools<'_> {
         // reports the search did not find follow, best rated first
         if reports.len() < limit {
             let rest = r
-                .reports_at(
-                    &opts,
-                    &graph,
-                    Some(level),
-                    filter,
-                    read::DEFAULT_MAX_REPORTS.max(limit),
-                )
+                .reports_at(&opts, &graph, Some(level), filter, limit)
                 .map_err(eng)?;
             for rep in rest {
                 if reports.len() >= limit {
@@ -640,11 +634,6 @@ impl Tools<'_> {
         if preds.is_empty() {
             return Ok(None);
         }
-        let pred_in = preds
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
         let max_text_bytes = status.config.max_text_bytes;
         let finding = crate::graphrag::guard::gr("finding");
         let candidate_anchors = candidate_anchor_plans(graph, level, filter)?;
@@ -661,6 +650,7 @@ impl Tools<'_> {
 
         const FINDING_BATCH: usize = 32;
         const LITERAL_BATCH_ROWS: usize = 64;
+        const LITERAL_BRANCH_BATCH: usize = 32;
         const K1: f64 = 1.2;
         const B: f64 = 0.75;
 
@@ -670,51 +660,63 @@ impl Tools<'_> {
             fallback: sparkles::sparql::FallbackPolicy::AllowMaterialization,
         };
 
-        let lit_filter = format!(
-            "FILTER(?p IN ({pred_in}) && isLiteral(?lit) && (DATATYPE(?lit) = <http://www.w3.org/2001/XMLSchema#string> || DATATYPE(?lit) = <http://www.w3.org/1999/02/22-rdf-syntax-ns#langString>))"
-        );
+        let lit_filter = "FILTER(isLiteral(?lit) && (DATATYPE(?lit) = <http://www.w3.org/2001/XMLSchema#string> || DATATYPE(?lit) = <http://www.w3.org/1999/02/22-rdf-syntax-ns#langString>))";
 
         type SubjectLitFn<'a> = &'a mut dyn FnMut(&str, &str) -> Result<(), sparkles::error::Error>;
         type BatchLitFn<'a> = &'a mut dyn FnMut(usize, &str) -> Result<(), sparkles::error::Error>;
         type ReportBatchFn<'a> =
             &'a mut dyn FnMut(&[NamedNode]) -> Result<(), sparkles::error::Error>;
 
-        // Ground each subject directly in a balanced UNION (depth <= 5) so every read is
-        // a bounded GSPO point lookup for those subjects rather than a full predicate
-        // scan that could exceed `max_rows` on large graphs.
+        // Pin each `(subject, predicate)` pair directly in a bounded balanced UNION
+        // (depth <= 5) so every read is an exact GSPO(graph, subject, pred) prefix
+        // lookup and never scans unrelated outgoing predicates (`gr:finding`,
+        // `gr:citesReport`, `gr:cites`, `gr:about`).
         let stream_subject_literals = |subjects: &[NamedNode],
                                        on_lit: SubjectLitFn<'_>|
          -> Result<(), sparkles::error::Error> {
             if subjects.is_empty() {
                 return Ok(());
             }
-            let branches: Vec<String> = subjects
-                .iter()
-                .map(|s| format!("{s} ?p ?lit . BIND({s} AS ?s)"))
-                .collect();
-            let sparql = format!(
-                "SELECT ?s ?lit WHERE {{ GRAPH <{graph}> {{ {{ {} }} {lit_filter} }} }}",
-                balanced_union(&branches),
-            );
-            let mut cursor = r.select_cursor(&sparql, &lit_cursor_opts)?;
-            while let Some(batch) = cursor.next_batch()? {
-                for row in 0..batch.len() {
-                    let Some(owned_lit) = batch.term(row, 1)? else {
-                        continue;
-                    };
-                    let Term::Literal(lit) = owned_lit.as_term() else {
-                        continue;
-                    };
-                    let Some(owned_subj) = batch.term(row, 0)? else {
-                        continue;
-                    };
-                    let Term::NamedNode(subj) = owned_subj.as_term() else {
-                        continue;
-                    };
-                    on_lit(subj.as_str(), lit.value())?;
+            let mut branches: Vec<String> = Vec::with_capacity(LITERAL_BRANCH_BATCH);
+            let mut flush_branches =
+                |chunk: &mut Vec<String>| -> Result<(), sparkles::error::Error> {
+                    if chunk.is_empty() {
+                        return Ok(());
+                    }
+                    let sparql = format!(
+                        "SELECT ?s ?lit WHERE {{ GRAPH <{graph}> {{ {{ {} }} {lit_filter} }} }}",
+                        balanced_union(chunk),
+                    );
+                    let mut cursor = r.select_cursor(&sparql, &lit_cursor_opts)?;
+                    while let Some(batch) = cursor.next_batch()? {
+                        for row in 0..batch.len() {
+                            let Some(owned_lit) = batch.term(row, 1)? else {
+                                continue;
+                            };
+                            let Term::Literal(lit) = owned_lit.as_term() else {
+                                continue;
+                            };
+                            let Some(owned_subj) = batch.term(row, 0)? else {
+                                continue;
+                            };
+                            let Term::NamedNode(subj) = owned_subj.as_term() else {
+                                continue;
+                            };
+                            on_lit(subj.as_str(), lit.value())?;
+                        }
+                    }
+                    chunk.clear();
+                    Ok(())
+                };
+            for s in subjects {
+                for p in &preds {
+                    branches.push(format!("{s} {p} ?lit . BIND({s} AS ?s)"));
+                    if branches.len() >= LITERAL_BRANCH_BATCH {
+                        flush_branches(&mut branches)?;
+                    }
                 }
             }
-            Ok(())
+            flush_branches(&mut branches)
         };
 
         let for_each_batch_literals =
@@ -950,6 +952,7 @@ impl Tools<'_> {
 }
 
 const REPORT_BATCH: usize = 16;
+const PROP_LOOKUP_BATCH: usize = 8;
 
 fn report_cursor_opts() -> sparkles::sparql::CursorOptions {
     // RejectMaterialization enforces that candidate anchor scans and grounded
@@ -1166,18 +1169,20 @@ fn literal_equals_level(lit: &Literal, level: u32) -> bool {
     }
 }
 
-/// Build a strictly grounded GSPO lookup of `gr:status` and `gr:reviewPolicy` triples
-/// for up to `REPORT_BATCH` candidate report IRIs (zero joins, zero `DISTINCT`, zero
-/// `EXISTS` decorrelation).
+/// Build a strictly grounded, predicate-pinned GSPO lookup of `gr:status` and
+/// `gr:reviewPolicy` triples for up to `PROP_LOOKUP_BATCH` candidate report IRIs (at
+/// most 16 UNION leaves, zero joins, zero `DISTINCT`, zero `EXISTS` decorrelation, and
+/// never scanning `gr:finding`, `gr:citesReport`, or other outgoing predicates).
 fn build_report_props_lookup_sparql(graph: &str, reps: &[NamedNode]) -> String {
     let status_pred = crate::graphrag::guard::gr("status");
     let policy_pred = crate::graphrag::guard::gr("reviewPolicy");
-    let branches: Vec<String> = reps
-        .iter()
-        .map(|rep| format!("{rep} ?p ?o . BIND({rep} AS ?r)"))
-        .collect();
+    let mut branches = Vec::with_capacity(reps.len() * 2);
+    for rep in reps {
+        branches.push(format!("{rep} <{status_pred}> ?st . BIND({rep} AS ?r)"));
+        branches.push(format!("{rep} <{policy_pred}> ?pol . BIND({rep} AS ?r)"));
+    }
     format!(
-        "SELECT ?r ?p ?o WHERE {{ GRAPH <{graph}> {{ {{ {} }} FILTER(?p IN (<{status_pred}>, <{policy_pred}>)) }} }}",
+        "SELECT ?r ?st ?pol WHERE {{ GRAPH <{graph}> {{ {} }} }}",
         balanced_union(&branches),
     )
 }
@@ -1196,18 +1201,23 @@ fn build_report_communities_lookup_sparql(graph: &str, reps: &[NamedNode]) -> St
     )
 }
 
-/// Build a strictly grounded GSPO lookup of `rdf:type` and `gr:level` triples for up to
-/// `REPORT_BATCH` community IRIs.
+/// Build a strictly grounded, predicate-pinned GSPO lookup of `rdf:type <gr:Community>`
+/// (emits `?o` unbound) and `gr:level` (emits `?o` bound) for up to `PROP_LOOKUP_BATCH`
+/// community IRIs without scanning `gr:member` or other outgoing community predicates.
 fn build_community_props_lookup_sparql(graph: &str, comms: &[NamedNode]) -> String {
+    let community_cls = crate::graphrag::guard::gr("Community");
     let lv = crate::graphrag::guard::gr("level");
-    let branches: Vec<String> = comms
-        .iter()
-        .map(|c| format!("{c} ?p ?o . BIND({c} AS ?c)"))
-        .collect();
+    let mut branches = Vec::with_capacity(comms.len() * 2);
+    for c in comms {
+        branches.push(format!(
+            "{c} <{rdf_type}> <{community_cls}> . BIND({c} AS ?c)",
+            rdf_type = super::RDF_TYPE,
+        ));
+        branches.push(format!("{c} <{lv}> ?o . BIND({c} AS ?c)"));
+    }
     format!(
-        "SELECT ?c ?p ?o WHERE {{ GRAPH <{graph}> {{ {{ {} }} FILTER(?p IN (<{rdf_type}>, <{lv}>)) }} }}",
+        "SELECT ?c ?o WHERE {{ GRAPH <{graph}> {{ {} }} }}",
         balanced_union(&branches),
-        rdf_type = super::RDF_TYPE,
     )
 }
 
@@ -1243,38 +1253,35 @@ fn check_report_props(
     status_scan: Option<(&'static str, &[&'static str])>,
     cursor_opts: &sparkles::sparql::CursorOptions,
 ) -> Result<Vec<bool>, sparkles::error::Error> {
+    const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+
     if reps.is_empty() {
         return Ok(Vec::new());
     }
-    let status_pred = crate::graphrag::guard::gr("status");
-    let policy_pred = crate::graphrag::guard::gr("reviewPolicy");
     let pos: HashMap<&str, usize> = reps
         .iter()
         .enumerate()
         .map(|(i, rep)| (rep.as_str(), i))
         .collect();
     let mut state: Vec<ReportProps> = (0..reps.len()).map(|_| ReportProps::default()).collect();
-    let sparql = build_report_props_lookup_sparql(graph, reps);
-    let mut cursor = r.select_cursor(&sparql, cursor_opts)?;
-    while let Some(batch) = cursor.next_batch()? {
-        for row in 0..batch.len() {
-            let (Some(owned_r), Some(owned_p), Some(owned_o)) = (
-                batch.term(row, 0)?,
-                batch.term(row, 1)?,
-                batch.term(row, 2)?,
-            ) else {
-                continue;
-            };
-            let (Term::NamedNode(rep), Term::NamedNode(pred)) =
-                (owned_r.as_term(), owned_p.as_term())
-            else {
-                continue;
-            };
-            let Some(&idx) = pos.get(rep.as_str()) else {
-                continue;
-            };
-            if pred.as_str() == status_pred {
-                if let Term::Literal(lit) = owned_o.as_term() {
+    for chunk in reps.chunks(PROP_LOOKUP_BATCH) {
+        let sparql = build_report_props_lookup_sparql(graph, chunk);
+        let mut cursor = r.select_cursor(&sparql, cursor_opts)?;
+        while let Some(batch) = cursor.next_batch()? {
+            for row in 0..batch.len() {
+                let Some(owned_r) = batch.term(row, 0)? else {
+                    continue;
+                };
+                let Term::NamedNode(rep) = owned_r.as_term() else {
+                    continue;
+                };
+                let Some(&idx) = pos.get(rep.as_str()) else {
+                    continue;
+                };
+                if let Some(owned_st) = batch.term(row, 1)?
+                    && let Term::Literal(lit) = owned_st.as_term()
+                    && lit.datatype().as_str() == XSD_STRING
+                {
                     if let Some((_, prior)) = status_scan
                         && prior.contains(&lit.value())
                     {
@@ -1286,11 +1293,12 @@ fn check_report_props(
                         state[idx].has_admitted_status = true;
                     }
                 }
-            } else if pred.as_str() == policy_pred
-                && let Term::NamedNode(pol) = owned_o.as_term()
-                && filter.review_policy_iri == Some(pol.as_str())
-            {
-                state[idx].has_policy = true;
+                if let Some(owned_pol) = batch.term(row, 2)?
+                    && let Term::NamedNode(pol) = owned_pol.as_term()
+                    && filter.review_policy_iri == Some(pol.as_str())
+                {
+                    state[idx].has_policy = true;
+                }
             }
         }
     }
@@ -1309,8 +1317,8 @@ struct CommunityProps {
     min_level_key: Option<(String, String)>,
 }
 
-/// Fetch `rdf:type` and `gr:level` for `comms` (`<= REPORT_BATCH`) via a grounded
-/// `RejectMaterialization` GSPO lookup.
+/// Fetch `rdf:type <gr:Community>` and `gr:level` for `comms` via chunked,
+/// predicate-pinned `RejectMaterialization` GSPO lookups.
 fn fetch_community_props(
     r: &Reader,
     graph: &str,
@@ -1321,8 +1329,6 @@ fn fetch_community_props(
     if comms.is_empty() {
         return Ok(Vec::new());
     }
-    let community_cls = crate::graphrag::guard::gr("Community");
-    let lv = crate::graphrag::guard::gr("level");
     let pos: HashMap<&str, usize> = comms
         .iter()
         .enumerate()
@@ -1331,42 +1337,39 @@ fn fetch_community_props(
     let mut state: Vec<CommunityProps> = (0..comms.len())
         .map(|_| CommunityProps::default())
         .collect();
-    let sparql = build_community_props_lookup_sparql(graph, comms);
-    let mut cursor = r.select_cursor(&sparql, cursor_opts)?;
-    while let Some(batch) = cursor.next_batch()? {
-        for row in 0..batch.len() {
-            let (Some(owned_c), Some(owned_p), Some(owned_o)) = (
-                batch.term(row, 0)?,
-                batch.term(row, 1)?,
-                batch.term(row, 2)?,
-            ) else {
-                continue;
-            };
-            let (Term::NamedNode(comm), Term::NamedNode(pred)) =
-                (owned_c.as_term(), owned_p.as_term())
-            else {
-                continue;
-            };
-            let Some(&idx) = pos.get(comm.as_str()) else {
-                continue;
-            };
-            if pred.as_str() == super::RDF_TYPE {
-                if let Term::NamedNode(cls) = owned_o.as_term()
-                    && cls.as_str() == community_cls
-                {
-                    state[idx].is_community = true;
-                }
-            } else if pred.as_str() == lv
-                && let Term::Literal(lit) = owned_o.as_term()
-                && literal_equals_level(lit, level)
-            {
-                let key = (lit.datatype().as_str().to_string(), lit.value().to_string());
-                let replace = match &state[idx].min_level_key {
-                    None => true,
-                    Some(prev) => key < *prev,
+    for chunk in comms.chunks(PROP_LOOKUP_BATCH) {
+        let sparql = build_community_props_lookup_sparql(graph, chunk);
+        let mut cursor = r.select_cursor(&sparql, cursor_opts)?;
+        while let Some(batch) = cursor.next_batch()? {
+            for row in 0..batch.len() {
+                let Some(owned_c) = batch.term(row, 0)? else {
+                    continue;
                 };
-                if replace {
-                    state[idx].min_level_key = Some(key);
+                let Term::NamedNode(comm) = owned_c.as_term() else {
+                    continue;
+                };
+                let Some(&idx) = pos.get(comm.as_str()) else {
+                    continue;
+                };
+                match batch.term(row, 1)? {
+                    None => {
+                        state[idx].is_community = true;
+                    }
+                    Some(owned_o) => {
+                        if let Term::Literal(lit) = owned_o.as_term()
+                            && literal_equals_level(lit, level)
+                        {
+                            let key =
+                                (lit.datatype().as_str().to_string(), lit.value().to_string());
+                            let replace = match &state[idx].min_level_key {
+                                None => true,
+                                Some(prev) => key < *prev,
+                            };
+                            if replace {
+                                state[idx].min_level_key = Some(key);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1928,7 +1931,10 @@ mod tests {
                 for (name, sparql) in [
                     (
                         "report_props",
-                        build_report_props_lookup_sparql(REPORTS, &sample_reps),
+                        build_report_props_lookup_sparql(
+                            REPORTS,
+                            &sample_reps[..PROP_LOOKUP_BATCH],
+                        ),
                     ),
                     (
                         "report_communities",
@@ -1936,7 +1942,10 @@ mod tests {
                     ),
                     (
                         "community_props",
-                        build_community_props_lookup_sparql(REPORTS, &sample_comms),
+                        build_community_props_lookup_sparql(
+                            REPORTS,
+                            &sample_comms[..PROP_LOOKUP_BATCH],
+                        ),
                     ),
                     (
                         "community_reports",
@@ -2042,6 +2051,15 @@ mod tests {
         trig.push_str(&format!(
             "  <urn:c:0002-typed> a <{c_cls}> ; <{lv}> 0, \"0\"^^<http://www.w3.org/2001/XMLSchema#int> ; <{rep}> <urn:r:typed-lv> .\n  <urn:r:typed-lv> <{stat}> \"reviewed\" ; <{rp}> <{main_iri}> ; <{edit_of}> <urn:r:rev-000> .\n"
         ));
+        // Language-tagged status literals: `"unreviewed"@en` must not act as a prior
+        // admitted status on the `"reviewed"` scan, and `"reviewed"@en` alone must not
+        // admit a report under any anchor family.
+        trig.push_str(&format!(
+            "  <urn:c:0003-lang-ok> a <{c_cls}> ; <{lv}> 0 ; <{rep}> <urn:r:lang-plus-plain> .\n  <urn:r:lang-plus-plain> <{stat}> \"unreviewed\"@en, \"reviewed\" ; <{rp}> <{main_iri}> .\n"
+        ));
+        trig.push_str(&format!(
+            "  <urn:c:0004-lang-only> a <{c_cls}> ; <{lv}> 0 ; <{rep}> <urn:r:lang-only> .\n  <urn:r:lang-only> <{stat}> \"reviewed\"@en ; <{rp}> <{main_iri}> .\n"
+        ));
         // 24 filler eligible level-0 communities so dup-a and dup-b span multiple batches.
         for i in 0..24 {
             trig.push_str(&format!(
@@ -2078,6 +2096,7 @@ mod tests {
 
         let mut expected_policied: Vec<String> = vec![
             "urn:r:dup-comm".into(),
+            "urn:r:lang-plus-plain".into(),
             "urn:r:multi-stat".into(),
             "urn:r:typed-lv".into(),
         ];
@@ -2197,6 +2216,155 @@ mod tests {
                 delivered.sort();
                 assert_eq!(&delivered, expected);
             }
+        }
+    }
+
+    #[test]
+    fn select_narrowest_anchor_eliminates_budget_failing_earlier_racer() {
+        const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
+        let gr = crate::graphrag::guard::gr;
+        let (c_cls, lv, mem, rep, stat, rp, cites_rep) = (
+            gr("Community"),
+            gr("level"),
+            gr("member"),
+            gr("report"),
+            gr("status"),
+            gr("reviewPolicy"),
+            gr("citesReport"),
+        );
+        let main_iri = "urn:ev:policy:main";
+        let other_iri = "urn:ev:policy:other";
+
+        let st = crate::state::AppState::standalone(
+            Default::default(),
+            std::time::Duration::from_secs(30),
+        );
+        let ds = st.attach("race", crate::state::DbType::Mem, None).unwrap();
+        let prep =
+            sparkles::access::Preparation::new(sparkles::task::Control::none(), 64 << 20).unwrap();
+        ds.dataset
+            .store()
+            .activate_memory_configuration_history(&prep)
+            .unwrap();
+
+        // 120 level-0 communities (100 under `main`, 20 under `other`, all `"reviewed"`):
+        // under `max_rows = 100` with `REPORT_BATCH = 16`, Turn 7 causes Racer 0 (`Level`,
+        // 120 rows) and Racer 2 (`Status`, 120 rows) to exceed `max_rows` and be
+        // eliminated while Racer 1 (`Policy`, 100 rows) returns rows 97..=100 and needs
+        // Turn 8 to hit EOF. Attach > 100 `gr:member` and `gr:citesReport` triples to
+        // verify predicate-pinned lookups stay within the same 100-row cap.
+        let mut trig = format!("<{REPORTS}> {{\n");
+        let mut expected: Vec<String> = Vec::with_capacity(100);
+        for i in 0..100 {
+            trig.push_str(&format!(
+                "  <urn:c:main-{i:03}> a <{c_cls}> ; <{lv}> 0 ; <{rep}> <urn:r:main-{i:03}> .\n  <urn:r:main-{i:03}> <{stat}> \"reviewed\" ; <{rp}> <{main_iri}> .\n"
+            ));
+            expected.push(format!("urn:r:main-{i:03}"));
+        }
+        for i in 0..150 {
+            trig.push_str(&format!(
+                "  <urn:c:main-000> <{mem}> <urn:ent:m-{i:03}> .\n  <urn:r:main-000> <{cites_rep}> <urn:r:cited-{i:03}> .\n"
+            ));
+        }
+        for i in 0..20 {
+            trig.push_str(&format!(
+                "  <urn:c:other-{i:03}> a <{c_cls}> ; <{lv}> 0 ; <{rep}> <urn:r:other-{i:03}> .\n  <urn:r:other-{i:03}> <{stat}> \"reviewed\" ; <{rp}> <{other_iri}> .\n"
+            ));
+        }
+        trig.push_str("}\n");
+        ds.store
+            .load(&[sparkles::io::Source::from_bytes(
+                trig.into_bytes(),
+                sparkles::io::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        expected.sort();
+
+        let filter = Filter {
+            reviewed_only: false,
+            review_policy_iri: Some(main_iri),
+        };
+        let cursor_opts = report_cursor_opts();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let opts_100 = sparkles::sparql::QueryOptions {
+            max_rows: Some(100),
+            deadline: Some(deadline),
+            ..sparkles::sparql::QueryOptions::default()
+        };
+        let opts_50 = sparkles::sparql::QueryOptions {
+            max_rows: Some(50),
+            deadline: Some(deadline),
+            ..sparkles::sparql::QueryOptions::default()
+        };
+        let timed_prep = sparkles::access::Preparation::new(
+            sparkles::task::Control {
+                deadline: Some(deadline),
+                ..sparkles::task::Control::none()
+            },
+            64 << 20,
+        )
+        .unwrap();
+
+        for bound_source in [false, true] {
+            let make_reader = |opts: sparkles::sparql::QueryOptions| -> Reader {
+                if bound_source {
+                    let view = ds
+                        .dataset
+                        .store()
+                        .evidence_view(&sparkles::history::At::Head, &timed_prep)
+                        .unwrap();
+                    Reader::from_evidence(view, ds.clone(), opts, deadline, false)
+                } else {
+                    Reader::from_snapshot(ds.store.snapshot(), opts, deadline, false)
+                }
+            };
+
+            let r_100 = make_reader(opts_100.clone());
+            let winner = select_narrowest_anchor(
+                &r_100,
+                candidate_anchor_plans(REPORTS, 0, filter).unwrap(),
+                &cursor_opts,
+            )
+            .unwrap()
+            .expect("expected policy anchor to survive elimination of Level and Status");
+            assert!(
+                matches!(
+                    &winner,
+                    AnchorPlan::Report { scans } if scans.len() == 1 && scans[0].status_scan.is_none()
+                ),
+                "expected Policy anchor to win after Level elimination (bound_source={bound_source})"
+            );
+
+            let mut delivered: Vec<String> = Vec::new();
+            enumerate_eligible_reports(
+                &r_100,
+                REPORTS,
+                0,
+                filter,
+                &winner,
+                &cursor_opts,
+                &mut |batch| {
+                    delivered.extend(batch.iter().map(|n| n.as_str().to_string()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(delivered.len(), expected.len());
+            delivered.sort();
+            assert_eq!(&delivered, &expected);
+
+            // When every candidate exceeds `max_rows`, the race returns a row-budget error.
+            let r_50 = make_reader(opts_50.clone());
+            let err = match select_narrowest_anchor(
+                &r_50,
+                candidate_anchor_plans(REPORTS, 0, filter).unwrap(),
+                &cursor_opts,
+            ) {
+                Err(e) => e,
+                Ok(_) => panic!("expected row-budget error when all racers exceed max_rows=50"),
+            };
+            assert!(is_row_budget_error(&err), "unexpected error: {err:?}");
         }
     }
 }

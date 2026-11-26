@@ -210,8 +210,7 @@ pub fn reports_at(
     filter: Filter<'_>,
     limit: usize,
 ) -> Result<Vec<ReportRef>, Error> {
-    let level_filter = level.map_or(String::new(), |l| format!("FILTER(?l = {l})"));
-    reports_where(snap, opts, graph, &level_filter, filter, limit)
+    reports_at_in(ReadInput::Snapshot(snap), opts, graph, level, filter, limit)
 }
 
 /// [`reports_at`] evaluated over a [`BoundReadSource`] without extracting a raw snapshot.
@@ -224,18 +223,130 @@ pub fn reports_at_source(
     filter: Filter<'_>,
     limit: usize,
 ) -> Result<Vec<ReportRef>, Error> {
-    let level_filter = level.map_or(String::new(), |l| format!("FILTER(?l = {l})"));
-    reports_where_in(
+    reports_at_in(
         ReadInput::Source(source, store),
         opts,
         graph,
-        &level_filter,
+        level,
         filter,
         limit,
     )
 }
 
+/// Return up to `limit` distinct usable reports ordered by `DESC(?rating), ?r` using
+/// bounded Top-K pages (`O(limit)` memory, never building a full-graph `GROUP BY` hash
+/// table) and keyset advancement so duplicate community links or statuses on one report
+/// never evict lower-rated reports.
+fn reports_at_in(
+    input: ReadInput<'_>,
+    opts: &QueryOptions,
+    graph: &str,
+    level: Option<u32>,
+    filter: Filter<'_>,
+    limit: usize,
+) -> Result<Vec<ReportRef>, Error> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let page_limit = limit.max(32);
+    let policy_clause = filter.policy_clause()?;
+    let level_filter = level.map_or(String::new(), |l| format!("FILTER(?l = {l})"));
+    let mut out: Vec<ReportRef> = Vec::with_capacity(limit);
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(limit);
+    let mut cursor: Option<(Option<u64>, String)> = None;
+
+    loop {
+        let cursor_filter = match &cursor {
+            None => String::new(),
+            Some((Some(rat), last_iri)) => format!(
+                "FILTER(!BOUND(?rating) || ?rating < {rat} || (?rating = {rat} && STR(?r) > {}))",
+                oxrdf::Literal::new_simple_literal(last_iri),
+            ),
+            Some((None, last_iri)) => format!(
+                "FILTER(!BOUND(?rating) && STR(?r) > {})",
+                oxrdf::Literal::new_simple_literal(last_iri),
+            ),
+        };
+        let q = format!(
+            "SELECT ?r ?c ?l ?title ?summary ?status ?rating ?n ?policy ?version ?configuration WHERE {{ {values} GRAPH <{graph}> {{ ?c a <{community}> ; <{level_pred}> ?l ; <{report}> ?r ; <{count}> ?n . {level_filter} ?r <{status}> ?status ; <{label}> ?title ; <{summary}> ?summary{policy_clause} . OPTIONAL {{ ?r <{rating}> ?rating }} OPTIONAL {{ ?r <{policy}> ?policy }} OPTIONAL {{ ?r <{version}> ?version }} OPTIONAL {{ ?r <{configuration}> ?configuration }} {cursor_filter} }} }} ORDER BY DESC(?rating) ?r ?c ?status LIMIT {page_limit}",
+            values = filter.values(),
+            community = gr("Community"),
+            level_pred = gr("level"),
+            report = gr("report"),
+            count = gr("memberCount"),
+            status = gr("status"),
+            label = store::RDFS_LABEL,
+            summary = gr("summary"),
+            rating = gr("rating"),
+            policy = gr("reviewPolicy"),
+            version = gr("policyVersion"),
+            configuration = gr("evidenceConfiguration"),
+        );
+        let rows = rows_in(input, opts, &q)?;
+        let raw_count = rows.len();
+        let mut last_key: Option<(Option<u64>, String)> = None;
+        for row in rows {
+            let r = row.values();
+            let Some(rep_iri) = iri(&r[0]) else {
+                continue;
+            };
+            let rating = int(&r[6]);
+            last_key = Some((rating, rep_iri.clone()));
+            if seen.contains(&rep_iri) {
+                continue;
+            }
+            let (Some(community), Some(lv), Some(title), Some(summary), Some(st_str)) =
+                (iri(&r[1]), int(&r[2]), lit(&r[3]), lit(&r[4]), lit(&r[5]))
+            else {
+                continue;
+            };
+            let Some(status) = Status::parse(&st_str) else {
+                continue;
+            };
+            let review_policy = match filter.review_policy_iri {
+                Some(req) => Some(ReviewPolicyRef {
+                    iri: req.to_string(),
+                    version: int(&r[9]),
+                    configuration: lit(&r[10]),
+                }),
+                None => iri(&r[8]).map(|p| ReviewPolicyRef {
+                    iri: p,
+                    version: int(&r[9]),
+                    configuration: lit(&r[10]),
+                }),
+            };
+            seen.insert(rep_iri.clone());
+            out.push(ReportRef {
+                iri: rep_iri,
+                community,
+                level: lv as u32,
+                title,
+                summary,
+                status,
+                rating,
+                member_count: int(&r[7]).unwrap_or(0),
+                score: None,
+                findings: Vec::new(),
+                review_policy,
+            });
+            if out.len() >= limit {
+                break;
+            }
+        }
+        if out.len() >= limit || raw_count < page_limit {
+            break;
+        }
+        match last_key {
+            Some(next) if cursor.as_ref() != Some(&next) => cursor = Some(next),
+            _ => break,
+        }
+    }
+    Ok(out)
+}
+
 /// The usable reports among `reports`.
+#[cfg(test)]
 pub fn reports_named(
     snap: &Arc<Snapshot>,
     opts: &QueryOptions,
@@ -243,16 +354,43 @@ pub fn reports_named(
     reports: &[String],
     filter: Filter<'_>,
 ) -> Result<Vec<ReportRef>, Error> {
-    reports_named_in(ReadInput::Snapshot(snap), opts, graph, reports, filter)
+    reports_named_in(
+        ReadInput::Snapshot(snap),
+        opts,
+        graph,
+        reports,
+        None,
+        filter,
+    )
 }
 
-/// [`reports_named`] evaluated over a [`BoundReadSource`] without extracting a raw snapshot.
-pub fn reports_named_source(
+/// The usable reports among `reports` linked from a community at `level`.
+pub fn reports_named_at(
+    snap: &Arc<Snapshot>,
+    opts: &QueryOptions,
+    graph: &str,
+    reports: &[String],
+    level: u32,
+    filter: Filter<'_>,
+) -> Result<Vec<ReportRef>, Error> {
+    reports_named_in(
+        ReadInput::Snapshot(snap),
+        opts,
+        graph,
+        reports,
+        Some(level),
+        filter,
+    )
+}
+
+/// [`reports_named_at`] evaluated over a [`BoundReadSource`] without extracting a raw snapshot.
+pub fn reports_named_at_source(
     source: &BoundReadSource,
     store: &Store,
     opts: &QueryOptions,
     graph: &str,
     reports: &[String],
+    level: u32,
     filter: Filter<'_>,
 ) -> Result<Vec<ReportRef>, Error> {
     reports_named_in(
@@ -260,6 +398,7 @@ pub fn reports_named_source(
         opts,
         graph,
         reports,
+        Some(level),
         filter,
     )
 }
@@ -269,36 +408,21 @@ fn reports_named_in(
     opts: &QueryOptions,
     graph: &str,
     reports: &[String],
+    level: Option<u32>,
     filter: Filter<'_>,
 ) -> Result<Vec<ReportRef>, Error> {
-    let names: Vec<String> = reports
+    let mut names: Vec<String> = reports
         .iter()
         .filter_map(|r| oxrdf::NamedNode::new(r.as_str()).ok())
         .map(|n| n.to_string())
         .collect();
+    names.sort();
+    names.dedup();
     if names.is_empty() {
         return Ok(Vec::new());
     }
     let values = format!("VALUES ?r {{ {} }}", names.join(" "));
-    reports_where_in(
-        input,
-        opts,
-        graph,
-        &values,
-        filter,
-        names.len().saturating_mul(4).max(DEFAULT_MAX_REPORTS),
-    )
-}
-
-fn reports_where(
-    snap: &Arc<Snapshot>,
-    opts: &QueryOptions,
-    graph: &str,
-    extra: &str,
-    filter: Filter<'_>,
-    limit: usize,
-) -> Result<Vec<ReportRef>, Error> {
-    reports_where_in(ReadInput::Snapshot(snap), opts, graph, extra, filter, limit)
+    reports_where_in(input, opts, graph, &values, level, filter, names.len())
 }
 
 fn reports_where_in(
@@ -306,48 +430,226 @@ fn reports_where_in(
     opts: &QueryOptions,
     graph: &str,
     extra: &str,
+    level: Option<u32>,
     filter: Filter<'_>,
     limit: usize,
 ) -> Result<Vec<ReportRef>, Error> {
+    const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+    const PROP_BRANCH_BATCH: usize = 32;
+
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let policy_clause = filter.policy_clause()?;
-    let q = format!(
-        "SELECT ?r ?c ?l ?title ?summary ?status ?rating ?n ?policy ?version ?configuration WHERE {{ {values} {extra} GRAPH <{graph}> {{ ?c a <{community}> ; <{level}> ?l ; <{report}> ?r ; <{count}> ?n . ?r <{status}> ?status ; <{label}> ?title ; <{summary}> ?summary{policy_clause} . OPTIONAL {{ ?r <{rating}> ?rating }} OPTIONAL {{ ?r <{policy}> ?policy }} OPTIONAL {{ ?r <{version}> ?version }} OPTIONAL {{ ?r <{configuration}> ?configuration }} }} }} ORDER BY DESC(?rating) ?r LIMIT {limit}",
-        values = filter.values(),
-        community = gr("Community"),
-        level = gr("level"),
-        report = gr("report"),
-        count = gr("memberCount"),
-        status = gr("status"),
-        label = store::RDFS_LABEL,
-        summary = gr("summary"),
-        rating = gr("rating"),
-        policy = gr("reviewPolicy"),
-        version = gr("policyVersion"),
-        configuration = gr("evidenceConfiguration"),
+    let level_filter = level.map_or(String::new(), |l| format!("FILTER(?l = {l})"));
+    let (community, level_pred, report, count, status_pred, label_pred, summary_pred, rating_pred) = (
+        gr("Community"),
+        gr("level"),
+        gr("report"),
+        gr("memberCount"),
+        gr("status"),
+        store::RDFS_LABEL,
+        gr("summary"),
+        gr("rating"),
     );
-    Ok(rows_in(input, opts, &q)?
-        .into_iter()
-        .filter_map(|r| {
-            let r = r.values();
-            Some(ReportRef {
-                iri: iri(&r[0])?,
-                community: iri(&r[1])?,
-                level: int(&r[2])? as u32,
-                title: lit(&r[3])?,
-                summary: lit(&r[4])?,
-                status: Status::parse(&lit(&r[5])?)?,
-                rating: int(&r[6]),
-                member_count: int(&r[7]).unwrap_or(0),
-                score: None,
-                findings: Vec::new(),
-                review_policy: iri(&r[8]).map(|p| ReviewPolicyRef {
-                    iri: p,
-                    version: int(&r[9]),
-                    configuration: lit(&r[10]),
-                }),
-            })
-        })
-        .collect())
+
+    // Step 1: pick one deterministic canonical community `MIN(?c)` per distinct
+    // eligible report IRI before applying `ORDER BY` and `LIMIT`, so multiple
+    // community links or admitted statuses on one report never evict another report.
+    let q = format!(
+        "SELECT ?r (MIN(?c) AS ?comm) (MAX(?rating) AS ?best_rating) WHERE {{ {values} {extra} GRAPH <{graph}> {{ ?c a <{community}> ; <{level_pred}> ?l ; <{report}> ?r ; <{count}> ?n . {level_filter} ?r <{status_pred}> ?status ; <{label_pred}> ?title ; <{summary_pred}> ?summary{policy_clause} . OPTIONAL {{ ?r <{rating_pred}> ?rating }} }} }} GROUP BY ?r ORDER BY DESC(?best_rating) ?r LIMIT {limit}",
+        values = filter.values(),
+    );
+    let mut selected: Vec<(oxrdf::NamedNode, oxrdf::NamedNode)> = Vec::new();
+    for row in rows_in(input, opts, &q)? {
+        let row = row.values();
+        if let (Some(Term::NamedNode(r)), Some(Term::NamedNode(c))) = (&row[0], &row[1]) {
+            selected.push((r.clone(), c.clone()));
+        }
+    }
+    if selected.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Step 2a: hydrate the chosen community's `gr:memberCount` (and `gr:level` when
+    // unfiltered) via predicate-pinned GSPO lookups, avoiding `gr:member` scans.
+    let mut uniq_comms: Vec<oxrdf::NamedNode> = Vec::with_capacity(selected.len());
+    let mut seen_comms: std::collections::HashSet<&str> =
+        std::collections::HashSet::with_capacity(selected.len());
+    for (_, c) in &selected {
+        if seen_comms.insert(c.as_str()) {
+            uniq_comms.push(c.clone());
+        }
+    }
+    #[derive(Default)]
+    struct CommMeta {
+        level: Option<u32>,
+        member_count: Option<u64>,
+    }
+    let mut comm_meta: HashMap<String, CommMeta> = HashMap::with_capacity(uniq_comms.len());
+    let comm_preds: Vec<&str> = if level.is_some() {
+        vec![count.as_str()]
+    } else {
+        vec![count.as_str(), level_pred.as_str()]
+    };
+    let comm_chunk_size = (PROP_BRANCH_BATCH / comm_preds.len()).max(1);
+    for chunk in uniq_comms.chunks(comm_chunk_size) {
+        let mut branches = Vec::with_capacity(chunk.len() * comm_preds.len());
+        for c in chunk {
+            for &p in &comm_preds {
+                branches.push(format!("{c} <{p}> ?o . BIND({c} AS ?c) BIND(<{p}> AS ?p)"));
+            }
+        }
+        let cq = format!(
+            "SELECT ?c ?p ?o WHERE {{ GRAPH <{graph}> {{ {} }} }}",
+            balanced_union(&branches),
+        );
+        for row in rows_in(input, opts, &cq)? {
+            let row = row.values();
+            let (Some(c_iri), Some(p)) = (iri(&row[0]), iri(&row[1])) else {
+                continue;
+            };
+            let entry = comm_meta.entry(c_iri).or_default();
+            if p == count {
+                if let Some(n) = int(&row[2]) {
+                    entry.member_count = Some(entry.member_count.map_or(n, |cur| cur.min(n)));
+                }
+            } else if p == level_pred
+                && let Some(lv) = int(&row[2])
+            {
+                let lv = lv as u32;
+                entry.level = Some(entry.level.map_or(lv, |cur| cur.min(lv)));
+            }
+        }
+    }
+
+    // Step 2b: hydrate report metadata via predicate-pinned GSPO lookups so unrelated
+    // predicates (`gr:finding`, `gr:citesReport`, `gr:editOf`) are never scanned.
+    #[derive(Default)]
+    struct RepMeta {
+        title: Option<String>,
+        summary: Option<String>,
+        status: Option<Status>,
+        rating: Option<u64>,
+        policy: Option<String>,
+        version: Option<u64>,
+        configuration: Option<String>,
+    }
+    let (policy_pred, version_pred, config_pred) = (
+        gr("reviewPolicy"),
+        gr("policyVersion"),
+        gr("evidenceConfiguration"),
+    );
+    let rep_preds = [
+        label_pred,
+        summary_pred.as_str(),
+        status_pred.as_str(),
+        rating_pred.as_str(),
+        policy_pred.as_str(),
+        version_pred.as_str(),
+        config_pred.as_str(),
+    ];
+    let rep_chunk_size = (PROP_BRANCH_BATCH / rep_preds.len()).max(1);
+    let mut rep_meta: HashMap<String, RepMeta> = HashMap::with_capacity(selected.len());
+    for chunk in selected.chunks(rep_chunk_size) {
+        let mut branches = Vec::with_capacity(chunk.len() * rep_preds.len());
+        for (r, _) in chunk {
+            for &p in &rep_preds {
+                branches.push(format!("{r} <{p}> ?o . BIND({r} AS ?r) BIND(<{p}> AS ?p)"));
+            }
+        }
+        let rq = format!(
+            "SELECT ?r ?p ?o WHERE {{ GRAPH <{graph}> {{ {} }} }}",
+            balanced_union(&branches),
+        );
+        for row in rows_in(input, opts, &rq)? {
+            let row = row.values();
+            let (Some(r_iri), Some(p)) = (iri(&row[0]), iri(&row[1])) else {
+                continue;
+            };
+            let entry = rep_meta.entry(r_iri).or_default();
+            if p == label_pred {
+                if let Some(v) = lit(&row[2])
+                    && entry.title.as_ref().is_none_or(|cur| v < *cur)
+                {
+                    entry.title = Some(v);
+                }
+            } else if p == summary_pred {
+                if let Some(v) = lit(&row[2])
+                    && entry.summary.as_ref().is_none_or(|cur| v < *cur)
+                {
+                    entry.summary = Some(v);
+                }
+            } else if p == status_pred {
+                if let Some(Term::Literal(l)) = &row[2]
+                    && l.datatype().as_str() == XSD_STRING
+                    && let Some(st) = Status::parse(l.value()).filter(|st| filter.admits(*st))
+                    && entry.status.is_none_or(|cur| st.as_str() < cur.as_str())
+                {
+                    entry.status = Some(st);
+                }
+            } else if p == rating_pred {
+                if let Some(v) = int(&row[2]) {
+                    entry.rating = Some(entry.rating.map_or(v, |cur| cur.max(v)));
+                }
+            } else if p == policy_pred {
+                if let Some(pol) = iri(&row[2]) {
+                    match filter.review_policy_iri {
+                        Some(req) if pol == req => entry.policy = Some(pol),
+                        Some(_) => {}
+                        None if entry.policy.as_ref().is_none_or(|cur| pol < *cur) => {
+                            entry.policy = Some(pol);
+                        }
+                        None => {}
+                    }
+                }
+            } else if p == version_pred {
+                if let Some(v) = int(&row[2]) {
+                    entry.version = Some(entry.version.map_or(v, |cur| cur.min(v)));
+                }
+            } else if p == config_pred
+                && let Some(v) = lit(&row[2])
+                && entry.configuration.as_ref().is_none_or(|cur| v < *cur)
+            {
+                entry.configuration = Some(v);
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(selected.len());
+    for (r, c) in selected {
+        let Some(rm) = rep_meta.remove(r.as_str()) else {
+            continue;
+        };
+        let cm = comm_meta.get(c.as_str());
+        let Some(lv) = level.or_else(|| cm.and_then(|m| m.level)) else {
+            continue;
+        };
+        let (Some(title), Some(summary), Some(status)) = (rm.title, rm.summary, rm.status) else {
+            continue;
+        };
+        if filter.review_policy_iri.is_some() && rm.policy.is_none() {
+            continue;
+        }
+        out.push(ReportRef {
+            iri: r.as_str().to_string(),
+            community: c.as_str().to_string(),
+            level: lv,
+            title,
+            summary,
+            status,
+            rating: rm.rating,
+            member_count: cm.and_then(|m| m.member_count).unwrap_or(0),
+            score: None,
+            findings: Vec::new(),
+            review_policy: rm.policy.map(|p| ReviewPolicyRef {
+                iri: p,
+                version: rm.version,
+                configuration: rm.configuration,
+            }),
+        });
+    }
+    Ok(out)
 }
 
 /// Fill in the findings of `reports`, in their order, with their citations.
@@ -632,7 +934,7 @@ fn reports_of_members_in(
     let mut wanted: Vec<String> = pairs.iter().map(|(_, r, _)| r.clone()).collect();
     wanted.sort();
     wanted.dedup();
-    let found = reports_named_in(input, opts, graph, &wanted, filter)?;
+    let found = reports_named_in(input, opts, graph, &wanted, level, filter)?;
     let by: HashMap<&str, &ReportRef> = found.iter().map(|r| (r.iri.as_str(), r)).collect();
     let mut out = Vec::new();
     for m in members {

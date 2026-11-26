@@ -253,24 +253,26 @@ impl Reader {
         }
     }
 
-    /// Read usable reports among `reports` at this reader's state.
-    pub(crate) fn reports_named(
+    /// Read usable reports among `reports` at `level` at this reader's state.
+    pub(crate) fn reports_named_at(
         &self,
         opts: &QueryOptions,
         graph: &str,
         reports: &[String],
+        level: u32,
         filter: crate::graphrag::read::Filter<'_>,
     ) -> Result<Vec<crate::graphrag::read::ReportRef>, Error> {
         match &self.source {
             ReaderSource::Snapshot(snap) => {
-                crate::graphrag::read::reports_named(snap, opts, graph, reports, filter)
+                crate::graphrag::read::reports_named_at(snap, opts, graph, reports, level, filter)
             }
-            ReaderSource::Evidence { view, ds } => crate::graphrag::read::reports_named_source(
+            ReaderSource::Evidence { view, ds } => crate::graphrag::read::reports_named_at_source(
                 &view.read_source(),
                 ds.dataset.store(),
                 opts,
                 graph,
                 reports,
+                level,
                 filter,
             ),
         }

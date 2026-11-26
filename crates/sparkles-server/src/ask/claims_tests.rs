@@ -2647,19 +2647,32 @@ async fn policy_scoped_text_search_enumerates_many_small_reports_and_deduplicate
     );
 
     let mut trig = format!("<{REPORTS}> {{\n");
-    // 1) Duplicate community links pointing to the same report at level 0, separated by
-    //    > REPORT_BATCH (16) filler communities so they land in different anchor batches,
-    //    paired with an equal-length single-link peer (`urn:r:dup-peer`) so double-counting
-    //    `marigold` would lower its IDF and flip the tie/ranking.
+    // 1) Duplicate community links pointing to the same report at level 0: 105 distinct
+    //    communities (exceeding `DEFAULT_MAX_REPORTS = 100` and spanning multiple anchor
+    //    batches), paired with an equal-length single-level-0-link peer (`urn:r:dup-peer`)
+    //    that also carries a level-1 community link (`urn:c:zzzz-dup-peer-l1`).
+    //    - Double-counting `marigold` in BM25 corpus stats lowers its IDF and flips the
+    //      tie/ranking.
+    //    - Applying a raw-row `LIMIT 100` in `reports_named` or `reports_at` before
+    //      per-report deduplication lets `urn:r:dup-comm` (rating 9) fill all 100 rows
+    //      and evict `urn:r:dup-peer` (rating 8).
+    //    - Mapping `reports_named` without filtering by `level` lets the level-1 row
+    //      overwrite the level-0 row for `urn:r:dup-peer`.
     trig.push_str(&format!(
         r#"  <urn:c:0000-dup-a> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:dup-comm> .
   <urn:c:zzzz-dup-b> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:dup-comm> .
-  <urn:r:dup-comm> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Dup" ; <{sum}> "Unique marigold summary." ; <{stat}> "reviewed" ; <{rat}> 2 ; <{rp}> <{main}> ; <{pv}> 1 .
+  <urn:r:dup-comm> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Dup" ; <{sum}> "Unique marigold summary." ; <{stat}> "reviewed" ; <{rat}> 9 ; <{rp}> <{main}> ; <{pv}> 1 .
   <urn:c:0001-dup-peer> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:dup-peer> .
-  <urn:r:dup-peer> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Peer" ; <{sum}> "Unique verbena summary." ; <{stat}> "reviewed" ; <{rat}> 2 ; <{rp}> <{main}> ; <{pv}> 1 .
+  <urn:c:zzzz-dup-peer-l1> a <{c_cls}> ; <{lv}> 1 ; <{cnt}> 2 ; <{rep}> <urn:r:dup-peer> .
+  <urn:r:dup-peer> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Peer" ; <{sum}> "Unique verbena summary." ; <{stat}> "reviewed" ; <{rat}> 8 ; <{rp}> <{main}> ; <{pv}> 1 .
 "#,
         main = main_iri.as_str(),
     ));
+    for i in 0..103 {
+        trig.push_str(&format!(
+            "  <urn:c:0005-dup-extra-{i:03}> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:dup-comm> .\n"
+        ));
+    }
     // 2) Report carrying two admitted statuses ("reviewed" and "stale"), paired with an
     //    equal-length single-status peer (`urn:r:multi-peer`) so double-counting `saffron`
     //    across status scans would lower its IDF and break the exact tie.
@@ -2726,9 +2739,10 @@ async fn policy_scoped_text_search_enumerates_many_small_reports_and_deduplicate
         assert_eq!(res["reports"][0]["score"], res["reports"][1]["score"]);
     }
 
-    // R5-2: Duplicate community link must not double-count `marigold` in Pass 1 corpus
-    // stats; otherwise `df(marigold) = 2 > df(verbena) = 1`, lowering `idf(marigold)` and
-    // letting `urn:r:dup-peer` strictly outscore `urn:r:dup-comm`.
+    // R5-2 & R6-2: 105 duplicate level-0 community links on `urn:r:dup-comm` (rating 9)
+    // must neither double-count `marigold` in Pass 1 corpus stats nor evict
+    // `urn:r:dup-peer` (rating 8) during named retrieval, and `urn:r:dup-peer`'s level-1
+    // link must not overwrite its level-0 community row.
     let dup = mcp_tool_with_cfg(
         &st,
         tight_mcp.clone(),
@@ -2738,12 +2752,46 @@ async fn policy_scoped_text_search_enumerates_many_small_reports_and_deduplicate
     .unwrap();
     assert_eq!(dup["ranking"], "search", "{dup}");
     assert_eq!(dup["reports"][0]["iri"], "urn:r:dup-comm", "{dup}");
+    assert_eq!(dup["reports"][0]["community"], "urn:c:0000-dup-a", "{dup}");
     assert_eq!(dup["reports"][1]["iri"], "urn:r:dup-peer", "{dup}");
+    assert_eq!(
+        dup["reports"][1]["community"], "urn:c:0001-dup-peer",
+        "{dup}"
+    );
+    assert_eq!(dup["reports"][1]["level"], 0, "{dup}");
     assert_eq!(
         dup["reports"][0]["score"], dup["reports"][1]["score"],
         "duplicate community link altered BM25 corpus statistics: {dup}"
     );
     assert!(dup["reports"][2]["score"].is_null(), "{dup}");
+
+    // R6-2: Rating-ranked retrieval (`reports_at`) must also deduplicate per report IRI
+    // before `LIMIT` so 105 community links on `urn:r:dup-comm` do not evict
+    // `urn:r:dup-peer`.
+    let by_rating = mcp_tool_with_cfg(
+        &st,
+        tight_mcp.clone(),
+        "community_reports",
+        json!({ "reviewPolicy": "main", "level": 0, "limit": 2 }),
+    )
+    .unwrap();
+    assert_eq!(by_rating["ranking"], "rating", "{by_rating}");
+    assert_eq!(
+        by_rating["reports"][0]["iri"], "urn:r:dup-comm",
+        "{by_rating}"
+    );
+    assert_eq!(
+        by_rating["reports"][0]["community"], "urn:c:0000-dup-a",
+        "{by_rating}"
+    );
+    assert_eq!(
+        by_rating["reports"][1]["iri"], "urn:r:dup-peer",
+        "{by_rating}"
+    );
+    assert_eq!(
+        by_rating["reports"][1]["community"], "urn:c:0001-dup-peer",
+        "{by_rating}"
+    );
 
     // R5-2: Multi-status report must not double-count `saffron` across status scans;
     // otherwise `df(saffron) = 2 > df(ochre) = 1`, letting `urn:r:multi-peer` strictly
@@ -2800,10 +2848,11 @@ async fn policy_scoped_text_search_ignores_retained_revisions_under_tight_row_bu
 
     let gr = crate::graphrag::guard::gr;
     let main_iri = sparkles::evidence::review::policy_iri("main");
-    let (c_cls, lv, cnt, rep, r_cls, sum, stat, rat, rp, pv, edit_of) = (
+    let (c_cls, lv, cnt, mem, rep, r_cls, sum, stat, rat, rp, pv, edit_of, cites_rep) = (
         gr("Community"),
         gr("level"),
         gr("memberCount"),
+        gr("member"),
         gr("report"),
         gr("Report"),
         gr("summary"),
@@ -2812,18 +2861,26 @@ async fn policy_scoped_text_search_ignores_retained_revisions_under_tight_row_bu
         gr("reviewPolicy"),
         gr("policyVersion"),
         gr("editOf"),
+        gr("citesReport"),
     );
 
-    // 1 linked reviewed level-0 report under `main`, plus 1,050 retained non-current
-    // revisions under `main` (exceeding `max_rows = 1_000`), plus 200 rejected/failed
-    // same-policy reports and 10 level-1 same-policy reports.
+    // 1 linked reviewed level-0 report under `main` (whose community carries 1,050
+    // `gr:member` triples and whose report carries 1,050 `gr:citesReport` triples, both
+    // exceeding `max_rows = 1_000`), plus 1,050 retained non-current revisions under
+    // `main`, plus 200 rejected/failed same-policy reports and 10 level-1 same-policy
+    // reports.
     let mut trig = format!("<{REPORTS}> {{\n");
     trig.push_str(&format!(
-        r#"  <urn:c:live-0> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:main-live> .
+        r#"  <urn:c:live-0> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 1050 ; <{rep}> <urn:r:main-live> .
   <urn:r:main-live> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Live Main" ; <{sum}> "Current zephyr summary." ; <{stat}> "reviewed" ; <{rat}> 5 ; <{rp}> <{main}> ; <{pv}> 1 ; <{edit_of}> <urn:r:rev-0000> .
 "#,
         main = main_iri.as_str(),
     ));
+    for i in 0..1_050 {
+        trig.push_str(&format!(
+            "  <urn:c:live-0> <{mem}> <urn:ent:member-{i:04}> .\n  <urn:r:main-live> <{cites_rep}> <urn:r:cited-{i:04}> .\n"
+        ));
+    }
     for i in 0..1_050 {
         let next_edit = if i + 1 < 1_050 {
             format!(" ; <{edit_of}> <urn:r:rev-{:04}>", i + 1)
