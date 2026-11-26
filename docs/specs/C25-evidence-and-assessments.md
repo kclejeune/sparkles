@@ -1517,18 +1517,27 @@ The claims section is bounded by a new `maxClaims` argument, 50 by default and a
 200, and its lines count toward `maxBytes`. Recall sets the section's own truncated flag
 when either bound cuts it. Its reads use the call's snapshot, graph view and query
 budgets, with the evidence resolver's shared preparation allowance. Finding the claims
-about the result reads every quad of each boundary proposal graph and refuses with
-`incomplete-evidence` past one million quads, and roadmap item 766 adds an index that
-avoids the scan. That bound counts every quad of the graph, hidden ones included, so a
-caller can learn only that a readable graph is that large. Each candidate passes the
-visibility check of the claim states below before it counts toward the bound of
-10,000 claims, so a hidden claim takes no place in it. A claim whose own decisions,
-withdrawals or supports exceed the record bound of 10,000 that review applies is read
-as a hidden occurrence, and a projected fact whose supports exceed it cites no claim.
-A support whose own records exceed it is left out while the fact keeps its other
-citations. Hidden records therefore never surface as a refusal. The identities the scan
-finds, and every identity the read looks up, stay charged to the read's preparation
-until the read ends.
+about the result looks them up through the reifier proposition-term index by each
+requested entity's subject or object position in each readable boundary proposal graph,
+reading only the matching claims. Each generation stores its sorted base index in the
+derived file `reifiers.bin` at format version 1, checksummed and verified by
+`sparkles check`, and omits the file when the generation holds no indexed reifiers.
+`Delta::reifiers_ins` tracks inserted `rdf:reifies` triple-term quads in a persistent
+`KeySet` across live writes, branches, overlays and WAL-replayed historical views, while
+base deletions filter against `Delta::del`. Lookups hash each requested IRI with the
+first 8 little-endian bytes of SHA-256 and verify the exact triple-term subject or object
+so a hash collision can never produce a false positive. Legacy generations written before
+this index existed, and a `reifiers.bin` of an unknown version, fall back to the bounded
+scan of up to one million quads, returning `incomplete-evidence` past that limit, until
+the next compaction writes the index.
+Each candidate passes the visibility check of the claim states below before it counts
+toward the bound of 10,000 claims, so a hidden claim takes no place in it. A claim whose
+own decisions, withdrawals or supports exceed the record bound of 10,000 that review
+applies is read as a hidden occurrence, and a projected fact whose supports exceed it
+cites no claim. A support whose own records exceed it is left out while the fact keeps its
+other citations. Hidden records therefore never surface as a refusal. The identities the
+lookup finds, and every identity the read looks up, stay charged to the read's
+preparation until the read ends.
 
 The rejected alternative cites only the supports of accepted projected facts. That
 cannot show unreviewed observations, hypotheses, denials or conflicting occurrences,

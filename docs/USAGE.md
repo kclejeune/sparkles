@@ -2192,6 +2192,7 @@ and 2 when there are warnings only.
 | `text` | `text.json` parses. The index opens read-only, and every committed segment file exists and matches its checksum. The index's commit is compared with the WAL. An index that is behind is a warning, because open catches it up or rebuilds it. |
 | `geo` | `geo.json` parses and is a valid configuration. The current generation's index files (`geo/rtree.spkg`, `geo/column.spkg`) have a valid header and footer, belong to this generation and configuration, and match their index checksums. In full mode, the data checksums are checked too. A damaged file is a warning, because open rebuilds it. |
 | `patterns` | `patterns.bin` has a valid layout, and in full mode its checksum matches and every subject's pattern, the subjects of each pattern and the predicate totals match SPO. A pattern file of a version this release does not read is a warning, because queries then read the permutations. A missing file that `meta.json` records is a warning too. |
+| `reifiers` | `reifiers.bin` has a valid layout, and in full mode its checksum matches, its keys strictly increase and its entries match POS. A reifier index of a version this release does not read is a warning, because claim lookups then fall back to scanning until the next compaction. A missing file that `meta.json` records is a warning too. |
 | `reasoning` | `reasoning.json` parses and names an existing commit. |
 
 Errors are states that `Store::open` refuses, that lose acknowledged data or history, or
