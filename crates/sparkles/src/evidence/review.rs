@@ -676,170 +676,39 @@ impl State<'_> {
         Ok(!self.projection_matches_policy(r, p)?)
     }
 
-    /// The subset of `records` superseded through `prov:wasRevisionOf` by a currently
-    /// authenticated projection record in `records` within supports graph `g`.
-    fn superseded_in_graph(
-        &mut self,
-        records: &[&NamedNode],
-        g: &G,
-        held: &mut crate::access::Reservation,
-    ) -> Result<BTreeSet<NamedNode>> {
-        let mut superseded = BTreeSet::new();
-        for r in records {
-            if !self.reads.authenticated(r.as_str(), g.0.as_str(), g.1)? {
-                continue;
-            }
-            let mut priors_held = self.reads.preparation().reserve(0)?;
-            let (priors, more) = self.reads.objects_up_to_held(
-                r.as_str(),
-                PROV_WAS_REVISION_OF,
-                g.0.as_str(),
-                MAX_EVIDENCE,
-                &mut priors_held,
-            )?;
-            if more {
-                return Err(incomplete("projections"));
-            }
-            for prior in priors {
-                if let Term::NamedNode(n) = prior
-                    && !superseded.contains(&n)
-                {
-                    held.grow_by((n.as_str().len() as u64).saturating_add(96))?;
-                    superseded.insert(n);
-                }
-            }
-        }
-        Ok(superseded)
-    }
-
-    /// Refuse when any continuously protected supports graph in `support_graphs` holds an
-    /// active authenticated projection record at `policy_version` showing same-version
-    /// drift for `p` (either `p` moved supports without raising its version, or another
-    /// currently configured review policy at its current version still owns `p.output`
-    /// under unchanged protections).
-    fn check_same_version_drift_across_supports(
-        &mut self,
+    /// Refuse when any continuously protected managed graph holds an active,
+    /// authenticated `ev:Projection` record showing same-version drift for `p`
+    /// (either `p` moved supports without raising its version, including across
+    /// graph role changes that retain protection, or another currently configured
+    /// review policy at its current version still owns `p.output` under unchanged
+    /// protections).
+    fn check_same_version_drift(
+        &self,
         p: &PolicyGraphs,
         policy_version: u32,
         settings: &Settings,
-        support_graphs: &[G],
+        managed_graphs: &[(&str, Uuid)],
     ) -> Result<()> {
-        let class = Term::NamedNode(NamedNode::new_unchecked(ev("Projection")));
-        let version_str = policy_version.to_string();
-        let output_term = Term::NamedNode(p.output.0.clone());
-        let policy_term = Term::NamedNode(p.policy_iri.clone());
-        for g in support_graphs {
-            let Some(g_nonce) = g.1 else {
-                continue;
-            };
-            let mut all_held = self.reads.preparation().reserve(0)?;
-            let all = self.subjects_held(RDF_TYPE, &class, g, "projections", &mut all_held)?;
-            if all.is_empty() {
-                continue;
-            }
-            if g.0 != p.supports.0 {
-                let mut own_records = Vec::new();
-                for r in &all {
-                    if self.reads.contains(
-                        r.as_str(),
-                        &ev("reviewPolicy"),
-                        &policy_term,
-                        g.0.as_str(),
-                    )? {
-                        own_records.push(r);
-                    }
-                }
-                if !own_records.is_empty() {
-                    let mut sup_held = self.reads.preparation().reserve(0)?;
-                    let superseded = self.superseded_in_graph(&own_records, g, &mut sup_held)?;
-                    for r in own_records {
-                        if superseded.contains(r) {
-                            continue;
-                        }
-                        if self.reads.authenticated(r.as_str(), g.0.as_str(), g.1)?
-                            && self
-                                .text(r, rv::NONCE_PREDICATES[1], g)?
-                                .and_then(|v| Uuid::parse_str(&v).ok())
-                                == Some(g_nonce)
-                            && self.text(r, &ev("policyVersion"), g)?.as_deref()
-                                == Some(version_str.as_str())
-                        {
-                            return Err(same_version_policy_changed(&p.name));
-                        }
-                    }
-                }
-            }
-            if let Some(out_nonce) = p.output.1 {
-                let mut rival_policies: BTreeMap<&str, (NamedNode, u32)> = BTreeMap::new();
-                for r in &all {
-                    if !self.reads.contains(
-                        r.as_str(),
-                        &ev("output"),
-                        &output_term,
-                        g.0.as_str(),
-                    )? {
-                        continue;
-                    }
-                    let Some(rp) = self.iri(r, &ev("reviewPolicy"), g)? else {
-                        continue;
-                    };
-                    if rp == p.policy_iri {
-                        continue;
-                    }
-                    for (other_name, other_policy) in &settings.policies {
-                        if other_name == &p.name {
-                            continue;
-                        }
-                        let other_iri = rv::policy_iri(other_name);
-                        if rp == other_iri {
-                            rival_policies
-                                .entry(other_name.as_str())
-                                .or_insert((other_iri, other_policy.version));
-                        }
-                    }
-                }
-                for (other_iri, other_version) in rival_policies.into_values() {
-                    let other_term = Term::NamedNode(other_iri);
-                    let mut other_records = Vec::new();
-                    for r in &all {
-                        if self.reads.contains(
-                            r.as_str(),
-                            &ev("reviewPolicy"),
-                            &other_term,
-                            g.0.as_str(),
-                        )? {
-                            other_records.push(r);
-                        }
-                    }
-                    let mut sup_held = self.reads.preparation().reserve(0)?;
-                    let superseded = self.superseded_in_graph(&other_records, g, &mut sup_held)?;
-                    let other_version_str = other_version.to_string();
-                    for r in other_records {
-                        if superseded.contains(r) {
-                            continue;
-                        }
-                        if self.reads.contains(
-                            r.as_str(),
-                            &ev("output"),
-                            &output_term,
-                            g.0.as_str(),
-                        )? && self.reads.authenticated(r.as_str(), g.0.as_str(), g.1)?
-                            && self
-                                .text(r, rv::NONCE_PREDICATES[1], g)?
-                                .and_then(|v| Uuid::parse_str(&v).ok())
-                                == Some(g_nonce)
-                            && self
-                                .text(r, rv::NONCE_PREDICATES[2], g)?
-                                .and_then(|v| Uuid::parse_str(&v).ok())
-                                == Some(out_nonce)
-                            && self.text(r, &ev("policyVersion"), g)?.as_deref()
-                                == Some(other_version_str.as_str())
-                        {
-                            return Err(same_version_policy_changed(&p.name));
-                        }
-                    }
-                }
-            }
+        let rival_owned: Vec<(NamedNode, u32)> = settings
+            .policies
+            .iter()
+            .filter(|(name, _)| name.as_str() != p.name.as_str())
+            .map(|(name, other)| (rv::policy_iri(name), other.version))
+            .collect();
+        let rivals: Vec<(&str, u32)> = rival_owned
+            .iter()
+            .map(|(iri, ver)| (iri.as_str(), *ver))
+            .collect();
+        if self.reads.has_same_version_projection_drift(
+            p.policy_iri.as_str(),
+            policy_version,
+            p.supports.0.as_str(),
+            p.output.0.as_str(),
+            p.output.1,
+            managed_graphs,
+            &rivals,
+        )? {
+            return Err(same_version_policy_changed(&p.name));
         }
         Ok(())
     }
@@ -1971,8 +1840,12 @@ pub fn review(
             &p.supports.0,
             control,
         )?;
-        let supports = support_graphs(&settings, &capability);
-        state.check_same_version_drift_across_supports(&p, policy_version, &settings, &supports)?;
+        let protected_graphs = protected_managed_graphs(&settings, &capability);
+        let protected_refs: Vec<(&str, Uuid)> = protected_graphs
+            .iter()
+            .map(|(g, n)| (g.as_str(), *n))
+            .collect();
+        state.check_same_version_drift(&p, policy_version, &settings, &protected_refs)?;
         let existing = state.check_projection(&p, Some((policy_version, &record)))?;
         batch.records.push(record);
         skip.push(existing);
@@ -2078,15 +1951,11 @@ fn claim_graphs(settings: &Settings, capability: &ManagedWrite) -> Vec<G> {
         .collect()
 }
 
-fn support_graphs(settings: &Settings, capability: &ManagedWrite) -> Vec<G> {
+fn protected_managed_graphs(settings: &Settings, capability: &ManagedWrite) -> Vec<(String, Uuid)> {
     settings
-        .supports
-        .iter()
-        .filter_map(|g| NamedNode::new(g.as_str()).ok())
-        .map(|g| {
-            let n = capability.protection(g.as_str());
-            (g, n)
-        })
+        .managed_graphs()
+        .into_iter()
+        .filter_map(|g| capability.protection(&g).map(|n| (g, n)))
         .collect()
 }
 
@@ -2706,17 +2575,17 @@ pub fn reconcile_projection_prepared(
                         readable_optional(access.as_ref(), g)?;
                     }
                 }
-                let mut support_graphs: Vec<G> = vec![p.supports.clone()];
-                for g in &settings.supports {
+                let mut search_graphs: Vec<G> = vec![p.supports.clone()];
+                for g in settings.managed_graphs() {
                     if g != p.supports.0.as_str()
                         && let Ok(node) = NamedNode::new(g.as_str())
                     {
                         let nonce = capability.protection(g.as_str());
-                        support_graphs.push((node, nonce));
+                        search_graphs.push((node, nonce));
                     }
                 }
                 let mut linked: Option<(NamedNode, G)> = None;
-                'find_linked: for g in &support_graphs {
+                'find_linked: for g in &search_graphs {
                     let mut gen_held = preparation.reserve(0)?;
                     for r in state.subjects_held(
                         PROV_WAS_GENERATED_BY,
@@ -2829,15 +2698,14 @@ pub fn reconcile_projection_prepared(
                 ),
             ));
         }
-        // Catch same-version supports/output swaps across all configured supports graphs
-        // before scanning or planning changes.
-        let all_supports = support_graphs(&settings, &capability);
-        state.check_same_version_drift_across_supports(
-            &p,
-            policy.version,
-            &settings,
-            &all_supports,
-        )?;
+        // Catch same-version supports/output swaps and role changes across all
+        // continuously protected managed graphs before scanning or planning changes.
+        let protected_graphs = protected_managed_graphs(&settings, &capability);
+        let protected_refs: Vec<(&str, Uuid)> = protected_graphs
+            .iter()
+            .map(|(g, n)| (g.as_str(), *n))
+            .collect();
+        state.check_same_version_drift(&p, policy.version, &settings, &protected_refs)?;
         // Existing projection records of this policy, and which remain unsuperseded.
         let mut proj_held = preparation.reserve(0)?;
         let (existing_projections, superseded_projections) =
@@ -3105,6 +2973,9 @@ pub fn reconcile_projection_prepared(
         };
         drop(active_projections);
         drop(proj_held);
+        // Preadmit the projection IRI's Rust and JSON bytes before publication so
+        // committed responses never need another fallible reservation after publish.
+        response_held.grow_by((projection.as_str().len() as u64).saturating_mul(2))?;
         Ok(ReconcilePlan::Ready(Box::new(ReconcileReady {
             batch,
             projection,
@@ -3154,6 +3025,9 @@ pub fn reconcile_projection_prepared(
         options,
         control,
     )?;
+    logical
+        .store()
+        .failpoint("evidence-reconcile-after-publish");
     drop(_batch_held);
     drop(_diff_held);
     drop(_output_held);

@@ -621,11 +621,25 @@ pub(super) async fn reconcile_projection(
 /// grant stay live while the response stream is consumed.
 const RESPONSE_CHUNK_BYTES: usize = 64 << 10;
 
-/// Buffered JSON response body whose bytes drop before its memory reservation (and
-/// underlying pool grant) is released.
+/// Backing JSON buffer paired with its memory reservation. `buf` is declared before
+/// `_held` so the allocation frees before its pool credit returns, and attaching this
+/// owner via [`axum::body::Bytes::from_owner`] keeps the reservation live until every
+/// emitted frame slice has dropped.
+struct HeldBytes {
+    buf: Vec<u8>,
+    _held: sparkles::access::Reservation,
+}
+
+impl AsRef<[u8]> for HeldBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+/// Buffered JSON response body whose backing [`HeldBytes`] owner keeps the memory
+/// reservation (and underlying pool grant) charged until every emitted frame has dropped.
 struct HeldBody {
     data: axum::body::Bytes,
-    _held: sparkles::access::Reservation,
 }
 
 impl http_body::Body for HeldBody {
@@ -859,24 +873,38 @@ fn reconcile_projection_now(
     serde_json::to_writer(&mut counter, &response)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let exact_len = counter.0;
-    response_held.grow_to(exact_len as u64)?;
+    let committed = reconciled.committed;
+    if committed {
+        debug_assert!(
+            exact_len as u64 <= response_held.bytes(),
+            "committed reconciliation response ({exact_len} B) exceeded preadmitted reservation ({} B)",
+            response_held.bytes()
+        );
+    } else if exact_len as u64 > response_held.bytes() {
+        response_held.grow_to(exact_len as u64)?;
+    }
     let mut writer = ExactVecWriter::with_exact_capacity(exact_len);
     serde_json::to_writer(&mut writer, &response)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let body = writer.into_vec();
     let cap = body.capacity() as u64;
     drop(reconciled);
-    // Keep the exact buffer allocation charged to the preparation (and pool grant)
-    // until the HTTP response body finishes streaming or is dropped.
-    response_held.grow_to(cap)?;
+    // Committed responses are preadmitted before publication and must never fail with a
+    // post-commit deadline timeout; shrink to the exact retained buffer capacity and attach
+    // the reservation to the backing Bytes owner so emitted frames keep it charged.
+    if !committed && cap > response_held.bytes() {
+        response_held.grow_to(cap)?;
+    }
     response_held.release_to(cap);
     drop(preparation);
     let len = body.len();
     Ok((
         len,
         HeldBody {
-            data: axum::body::Bytes::from(body),
-            _held: response_held,
+            data: axum::body::Bytes::from_owner(HeldBytes {
+                buf: body,
+                _held: response_held,
+            }),
         },
     ))
 }

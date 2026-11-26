@@ -2596,3 +2596,361 @@ fn reconciling_handles_duplicate_live_supports_and_cancellation() {
         vec!["<urn:release> <urn:affectedBy> <urn:cve1>".to_string()]
     );
 }
+
+/// Moving a same-version policy's supports graph from A to an empty graph B while
+/// keeping A continuously protected under another managed role (such as `decisions`)
+/// retains A's protection nonce and must still be refused as `projection-unavailable`
+/// without deleting the policy's accepted triples or advancing the branch head.
+#[test]
+fn same_version_supports_role_change_retaining_protection_is_refused() {
+    use sparkles::managed::OwnerKind;
+
+    let ds = configured(ConflictMode::Refuse);
+    let a = claim_of(&propose(
+        &ds,
+        &occurrence_with("s1", "urn:cve1", Polarity::Positive),
+    ));
+    let b = claim_of(&propose(
+        &ds,
+        &occurrence_with("s2", "urn:cve2", Polarity::Positive),
+    ));
+    review(&ds, &[decision("a", &a, Disposition::Accepted, None)]).unwrap();
+    assert_eq!(
+        accepted(&ds),
+        vec!["<urn:release> <urn:affectedBy> <urn:cve1>".to_string()]
+    );
+
+    let nonce_before = ds
+        .store()
+        .managed_graphs()
+        .unwrap()
+        .unwrap()
+        .owners
+        .get(&OwnerKind::Evidence)
+        .unwrap()
+        .protections
+        .get(SUPPORTS)
+        .copied()
+        .expect("SUPPORTS protected");
+
+    // Move `main.supports` from SUPPORTS to a fresh empty graph `supports2` at version 1,
+    // removing SUPPORTS from `settings.supports` while keeping SUPPORTS as an extra
+    // decisions graph so its protection nonce is retained.
+    let supports2 = "urn:ev:supports2";
+    let mut moved = settings(ConflictMode::Refuse);
+    moved.decisions.push(SUPPORTS.into());
+    moved.supports = vec![supports2.into()];
+    moved.policies.get_mut("main").unwrap().supports = supports2.into();
+    evidence::configure(&ds, &moved, &Control::none()).unwrap();
+
+    let nonce_after = ds
+        .store()
+        .managed_graphs()
+        .unwrap()
+        .unwrap()
+        .owners
+        .get(&OwnerKind::Evidence)
+        .unwrap()
+        .protections
+        .get(SUPPORTS)
+        .copied()
+        .expect("SUPPORTS still protected");
+    assert_eq!(
+        nonce_after, nonce_before,
+        "role change within managed graphs must preserve SUPPORTS protection nonce"
+    );
+
+    let head = ds.store().head_commit().seq;
+    assert_eq!(
+        code(reconcile(&ds, "main", Some(1), &reviewer())),
+        "projection-unavailable"
+    );
+    assert_eq!(
+        code(review(
+            &ds,
+            &[decision("b", &b, Disposition::Accepted, None)]
+        )),
+        "projection-unavailable"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+    assert_eq!(
+        accepted(&ds),
+        vec!["<urn:release> <urn:affectedBy> <urn:cve1>".to_string()]
+    );
+
+    // Asymmetric rival takeover with a role change: `second` (v1) owns `(supports2, output2)`;
+    // `main` (v1, no prior projection) takes `(SUPPORTS, output2)` while `supports2` moves
+    // from `supports` to `decisions` (retaining its nonce) and `second` moves to `supports3`.
+    let supports3 = "urn:ev:supports3";
+    let output2 = "urn:ev:accepted2";
+    let ds2 = Dataset::memory();
+    let mut s2 = settings(ConflictMode::Refuse);
+    s2.supports.push(supports2.into());
+    s2.projections.push(output2.into());
+    s2.policies.insert(
+        "second".into(),
+        Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported],
+            required_scope: Vec::new(),
+            conflicts: ConflictMode::Refuse,
+            boundary: vec![SOURCES.into(), CLAIMS.into()],
+            decisions: DECISIONS.into(),
+            supports: supports2.into(),
+            output: output2.into(),
+        },
+    );
+    evidence::configure(&ds2, &s2, &Control::none()).unwrap();
+    let c = claim_of(&propose(
+        &ds2,
+        &occurrence_with("s3", "urn:cve3", Polarity::Positive),
+    ));
+    let mut o2 = reviewer();
+    o2.if_head = Some(ds2.store().head_commit().seq);
+    evidence::review(
+        None,
+        &ds2,
+        &ds2,
+        "second",
+        1,
+        &[decision("c", &c, Disposition::Accepted, None)],
+        &o2,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    let s2_nonce_before = ds2
+        .store()
+        .managed_graphs()
+        .unwrap()
+        .unwrap()
+        .owners
+        .get(&OwnerKind::Evidence)
+        .unwrap()
+        .protections
+        .get(supports2)
+        .copied()
+        .expect("supports2 protected");
+
+    let mut takeover = s2.clone();
+    takeover.decisions.push(supports2.into());
+    takeover.supports = vec![SUPPORTS.into(), supports3.into()];
+    takeover.policies.get_mut("main").unwrap().output = output2.into();
+    takeover.policies.get_mut("second").unwrap().supports = supports3.into();
+    takeover.policies.get_mut("second").unwrap().output = OUTPUT.into();
+    evidence::configure(&ds2, &takeover, &Control::none()).unwrap();
+    let s2_nonce_after = ds2
+        .store()
+        .managed_graphs()
+        .unwrap()
+        .unwrap()
+        .owners
+        .get(&OwnerKind::Evidence)
+        .unwrap()
+        .protections
+        .get(supports2)
+        .copied()
+        .expect("supports2 still protected");
+    assert_eq!(s2_nonce_after, s2_nonce_before);
+
+    let head2 = ds2.store().head_commit().seq;
+    assert_eq!(
+        code(reconcile(&ds2, "main", Some(1), &reviewer())),
+        "projection-unavailable"
+    );
+    assert_eq!(ds2.store().head_commit().seq, head2);
+    assert!(
+        ds2.ask(&format!(
+            "ASK {{ GRAPH <{output2}> {{ <urn:release> <urn:affectedBy> <urn:cve3> }} }}"
+        ))
+        .unwrap()
+    );
+}
+
+/// Ordinary review authorizes only the requested policy's own graphs and must not fail
+/// with `incomplete-evidence` or disclose content from an unrelated, unreadable supports
+/// graph even when that hidden graph exceeds `MAX_EVIDENCE` `ev:Projection` records,
+/// while still refusing a real same-version ownership conflict on the policy's output.
+#[test]
+fn ordinary_review_ignores_unrelated_unreadable_supports_graph() {
+    let decisions2 = "urn:ev:decisions2";
+    let supports2 = "urn:ev:supports2";
+    let output2 = "urn:ev:accepted2";
+    let ds = Dataset::memory();
+    let mut s = settings(ConflictMode::Refuse);
+    s.decisions.push(decisions2.into());
+    s.supports.push(supports2.into());
+    s.projections.push(output2.into());
+    s.policies.insert(
+        "other".into(),
+        Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported],
+            required_scope: Vec::new(),
+            conflicts: ConflictMode::Refuse,
+            boundary: vec![SOURCES.into(), OTHER.into()],
+            decisions: decisions2.into(),
+            supports: supports2.into(),
+            output: output2.into(),
+        },
+    );
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+
+    let a = claim_of(&propose(
+        &ds,
+        &occurrence_with("s1", "urn:cve1", Polarity::Positive),
+    ));
+    let b = claim_of(&propose(
+        &ds,
+        &occurrence_with("s2", "urn:cve2", Polarity::Positive),
+    ));
+
+    // Caller may read/write ONLY `main`'s graphs, not `other`'s `supports2`/`output2`.
+    let main_only = Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(
+            [SOURCES, CLAIMS, DECISIONS, SUPPORTS, OUTPUT],
+            &[],
+        )),
+        Graphs::Only(GraphRule::new([DECISIONS, SUPPORTS, OUTPUT], &[])),
+    ));
+
+    let review_restricted = |ds: &Dataset, key_name: &str, target: &(NamedNode, Sha256Digest)| {
+        let mut opts = reviewer();
+        opts.if_head = Some(ds.store().head_commit().seq);
+        opts.write = Some(main_only.clone());
+        let access = main_only.clone();
+        evidence::review(
+            None,
+            ds,
+            ds,
+            "main",
+            1,
+            &[decision(key_name, target, Disposition::Accepted, None)],
+            &opts,
+            &mut |_, _| Some(access.clone()),
+            &Control::none(),
+        )
+    };
+
+    // Baseline before hidden records exist in `supports2`: review succeeds.
+    let first = review_restricted(&ds, "a", &a).unwrap();
+    assert!(first.committed);
+    assert!(first.decisions[0].support.is_some());
+    assert_eq!(
+        accepted(&ds),
+        vec!["<urn:release> <urn:affectedBy> <urn:cve1>".to_string()]
+    );
+
+    // Populate the unrelated, unreadable `supports2` with MAX_EVIDENCE + 5 `ev:Projection`
+    // records (crossing the 10,000-record scan bound), including unauthenticated noise
+    // naming `main`'s policy IRI, then re-protect `supports2`.
+    evidence::detach(&ds, supports2).unwrap();
+    let main_policy = evidence::review::policy_iri("main");
+    let other_policy = evidence::review::policy_iri("other");
+    let mut nq = String::with_capacity(10_010 * 160);
+    for i in 0..10_005 {
+        nq.push_str(&format!(
+            "<urn:hidden-proj:{i}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{EV}Projection> <{supports2}> .\n\
+             <urn:hidden-proj:{i}> <{EV}reviewPolicy> <{}> <{supports2}> .\n",
+            if i < 5 {
+                main_policy.as_str()
+            } else {
+                other_policy.as_str()
+            }
+        ));
+    }
+    ds.load_str(&nq, oxrdfio::RdfFormat::NQuads).unwrap();
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+
+    // The exact same graph-restricted review on `main` must still succeed identically.
+    let second = review_restricted(&ds, "b", &b).unwrap();
+    assert!(second.committed);
+    assert!(second.decisions[0].support.is_some());
+    assert_eq!(
+        accepted(&ds),
+        vec![
+            "<urn:release> <urn:affectedBy> <urn:cve1>".to_string(),
+            "<urn:release> <urn:affectedBy> <urn:cve2>".to_string(),
+        ]
+    );
+
+    // Real ownership conflict in an unreadable supports graph must still refuse:
+    // `other` accepts and then withdraws a claim on `output2` (leaving `output2` empty
+    // while `other`'s active v1 projection in `supports2` still owns `output2`), then
+    // `main` (v1, no prior projection) swaps onto `output2` under unchanged protections.
+    let ds2 = Dataset::memory();
+    let mut s_conflict = settings(ConflictMode::Refuse);
+    s_conflict.decisions.push(decisions2.into());
+    s_conflict.supports.push(supports2.into());
+    s_conflict.projections.push(output2.into());
+    s_conflict.policies.insert(
+        "other".into(),
+        Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported],
+            required_scope: Vec::new(),
+            conflicts: ConflictMode::Refuse,
+            boundary: vec![SOURCES.into(), CLAIMS.into()],
+            decisions: decisions2.into(),
+            supports: supports2.into(),
+            output: output2.into(),
+        },
+    );
+    evidence::configure(&ds2, &s_conflict, &Control::none()).unwrap();
+    let c1 = claim_of(&propose(
+        &ds2,
+        &occurrence_with("s1", "urn:cve1", Polarity::Positive),
+    ));
+    let c2 = claim_of(&propose(
+        &ds2,
+        &occurrence_with("s2", "urn:cve2", Polarity::Positive),
+    ));
+    let mut o_other = reviewer();
+    o_other.if_head = Some(ds2.store().head_commit().seq);
+    evidence::review(
+        None,
+        &ds2,
+        &ds2,
+        "other",
+        1,
+        &[decision("c1", &c1, Disposition::Accepted, None)],
+        &o_other,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    withdraw(&ds2, &c1);
+
+    let mut swapped = s_conflict.clone();
+    swapped.policies.get_mut("main").unwrap().output = output2.into();
+    swapped.policies.get_mut("other").unwrap().output = OUTPUT.into();
+    evidence::configure(&ds2, &swapped, &Control::none()).unwrap();
+
+    // Caller has access ONLY to `main`'s new graphs (`output2`, NOT `supports2`).
+    let main_new_only = Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(
+            [SOURCES, CLAIMS, DECISIONS, SUPPORTS, output2],
+            &[],
+        )),
+        Graphs::Only(GraphRule::new([DECISIONS, SUPPORTS, output2], &[])),
+    ));
+    let mut opts = reviewer();
+    opts.if_head = Some(ds2.store().head_commit().seq);
+    opts.write = Some(main_new_only.clone());
+    let head_conflict = ds2.store().head_commit().seq;
+    assert_eq!(
+        code(evidence::review(
+            None,
+            &ds2,
+            &ds2,
+            "main",
+            1,
+            &[decision("c2", &c2, Disposition::Accepted, None)],
+            &opts,
+            &mut |_, _| Some(main_new_only.clone()),
+            &Control::none(),
+        )),
+        "projection-unavailable"
+    );
+    assert_eq!(ds2.store().head_commit().seq, head_conflict);
+}
