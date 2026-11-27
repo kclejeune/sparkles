@@ -2,200 +2,258 @@
 use crate::dataset::RecordedReasoning;
 use crate::sparql::pool::QueryPool;
 use crate::{Result, store::Store};
+#[cfg(feature = "reasoning")]
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, Serializer};
 use sparkles_budget::MemoryLease;
 use std::io::{BufWriter, Write};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 pub(crate) const FILE: &str = "reasoning-imports.json";
 
-/// Branches and materializations can borrow one immutable list and its reservations.
-#[derive(Clone, Default)]
-pub(crate) struct PendingImports(Option<Arc<Entry>>);
+/// Membership is private to the dataset. Snapshots and branches share the names.
+#[derive(Default)]
+pub(crate) struct PendingImports(Option<Box<Entry>>);
 
 struct Entry {
-    name: Arc<ImportName>,
-    older: OnceLock<PendingImports>,
+    name: Arc<PendingName>,
+    older: PendingImports,
     _credit: Option<MemoryLease>,
 }
 
-struct ImportName {
-    owner: Mutex<NameOwner>,
-    _overhead: Option<MemoryLease>,
-}
-
-#[derive(Clone)]
-pub(super) enum NameOwner {
-    Pending(Arc<PendingName>),
-    #[cfg(feature = "reasoning")]
-    Recorded(Arc<RecordedReasoning>, usize),
-}
-
-pub(super) struct PendingName {
+struct PendingName {
     iri: String,
-    _memory: Mutex<Option<MemoryLease>>,
-    #[cfg(feature = "reasoning")]
-    claimed: std::sync::atomic::AtomicBool,
+    #[cfg_attr(not(feature = "reasoning"), allow(dead_code))]
+    account: Arc<NameAccount>,
     _overhead: Option<MemoryLease>,
 }
 
-impl AsRef<str> for NameOwner {
-    fn as_ref(&self) -> &str {
-        match self {
-            Self::Pending(name) => &name.iri,
-            #[cfg(feature = "reasoning")]
-            Self::Recorded(record, index) => {
-                &record
-                    .value
-                    .as_ref()
-                    .expect("published record")
-                    .fetched_imports[*index]
-            }
-        }
+/// One retained payload reservation follows the name until both the pending
+/// string and its published copy are gone. Actual overlap has its own work lease.
+struct NameAccount {
+    _retained: Option<MemoryLease>,
+    #[cfg(feature = "reasoning")]
+    transfer: Mutex<Transfer>,
+    _overhead: Option<MemoryLease>,
+}
+
+#[cfg(feature = "reasoning")]
+#[derive(Default)]
+struct Transfer {
+    claimed: bool,
+    overlap: Option<MemoryLease>,
+}
+
+#[cfg(feature = "reasoning")]
+impl Drop for PendingName {
+    fn drop(&mut self) {
+        drop(std::mem::take(&mut self.iri));
+        let overlap = self.account.transfer.lock().overlap.take();
+        drop(overlap);
     }
 }
 
-impl Serialize for ImportName {
+impl Serialize for PendingName {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.owner.lock().as_ref())
+        serializer.serialize_str(&self.iri)
     }
 }
 
-/// A provisional name stays readable across commit and rollback. On publication
-/// its work lease covers any outstanding fetch reader, and its retained lease
-/// moves to the record. Journal aliases then read the name from that record.
 #[cfg(feature = "reasoning")]
 pub(crate) struct NameClaim {
-    slot: Arc<ImportName>,
     pending: Arc<PendingName>,
     work: Option<MemoryLease>,
-    index: usize,
 }
+
+#[cfg(feature = "reasoning")]
+pub(crate) struct RecordedImport(Arc<NameAccount>);
 
 #[cfg(feature = "reasoning")]
 impl NameClaim {
     pub fn bytes(&self) -> u64 {
-        self.pending.iri.len() as u64
+        self.work.as_ref().expect("unpublished claim").bytes()
     }
 
-    pub fn locate(&mut self, names: &[String]) {
-        self.index = names
-            .binary_search(&self.pending.iri)
-            .expect("prepared import");
+    pub fn is_exclusive(&self) -> bool {
+        Arc::strong_count(&self.pending) == 1 && Arc::strong_count(&self.pending.account) == 1
     }
 
-    pub fn transfer(&mut self) -> MemoryLease {
-        std::mem::replace(&mut *self.pending._memory.lock(), self.work.take())
-            .expect("claimed retained name")
+    pub fn into_exclusive(mut self) -> MemoryLease {
+        let name = Arc::get_mut(&mut self.pending).expect("retired private name");
+        Arc::get_mut(&mut name.account)
+            .expect("private account")
+            ._retained
+            .take()
+            .expect("pooled transfer")
     }
 
-    pub fn publish(self, record: &Arc<RecordedReasoning>) {
-        *self.slot.owner.lock() = NameOwner::Recorded(record.clone(), self.index);
+    pub fn publish(mut self) -> RecordedImport {
+        self.pending.account.transfer.lock().overlap = self.work.take();
+        RecordedImport(self.pending.account.clone())
     }
 }
 
 #[cfg(feature = "reasoning")]
 impl Drop for NameClaim {
     fn drop(&mut self) {
-        self.pending
-            .claimed
-            .store(false, std::sync::atomic::Ordering::Release);
+        if self.work.is_some() {
+            self.pending.account.transfer.lock().claimed = false;
+        }
+    }
+}
+
+#[cfg(feature = "reasoning")]
+impl Drop for RecordedImport {
+    fn drop(&mut self) {
+        let mut transfer = self.0.transfer.lock();
+        transfer.claimed = false;
+        let overlap = transfer.overlap.take();
+        drop(transfer);
+        drop(overlap);
     }
 }
 
 impl Drop for PendingImports {
     fn drop(&mut self) {
-        // Successive failed runs can leave more names than one discovery pass.
-        let mut head = self.0.take();
-        while let Some(mut entry) = head.and_then(Arc::into_inner) {
-            head = entry.older.take().and_then(|mut older| older.0.take());
+        while let Some(mut entry) = self.0.take() {
+            self.0 = entry.older.0.take();
         }
     }
 }
 
 impl Entry {
-    fn prepare(iri: &str, pool: Option<&Arc<QueryPool>>) -> Result<Arc<Self>> {
-        let overhead = size_of::<ImportName>() + size_of::<PendingName>() + 4 * size_of::<usize>();
-        let mut credit = RecordedReasoning::reserve(pool, (iri.len() + overhead) as u64)?;
-        let text_overhead = credit.as_mut().map(|l| {
-            l.split((size_of::<PendingName>() + 2 * size_of::<usize>()) as u64)
-                .expect("reserved name owner")
-        });
+    fn prepare(iri: &str, pool: Option<&Arc<QueryPool>>) -> Result<Box<Self>> {
+        let account_bytes = size_of::<NameAccount>() + 2 * size_of::<usize>();
+        let name_bytes = size_of::<PendingName>() + 2 * size_of::<usize>();
+        let mut credit =
+            RecordedReasoning::reserve(pool, (iri.len() + account_bytes + name_bytes) as u64)?;
+        let overhead = credit
+            .as_mut()
+            .map(|lease| lease.split(account_bytes as u64).expect("reserved account"));
         let payload = credit
             .as_mut()
-            .map(|l| l.split(iri.len() as u64).expect("reserved IRI"));
+            .map(|lease| lease.split(iri.len() as u64).expect("reserved IRI"));
         Self::link(
-            Arc::new(ImportName {
-                owner: Mutex::new(NameOwner::Pending(Arc::new(PendingName {
-                    iri: iri.to_owned(),
-                    _memory: Mutex::new(payload),
+            Arc::new(PendingName {
+                iri: iri.to_owned(),
+                account: Arc::new(NameAccount {
+                    _retained: payload,
                     #[cfg(feature = "reasoning")]
-                    claimed: false.into(),
-                    _overhead: text_overhead,
-                }))),
+                    transfer: Mutex::default(),
+                    _overhead: overhead,
+                }),
                 _overhead: credit,
             }),
             pool,
         )
     }
 
-    fn link(name: Arc<ImportName>, pool: Option<&Arc<QueryPool>>) -> Result<Arc<Self>> {
-        let bytes = size_of::<Self>() + 6 * size_of::<usize>();
-        let credit = RecordedReasoning::reserve(pool, bytes as u64)?;
-        Ok(Arc::new(Self {
+    fn link(name: Arc<PendingName>, pool: Option<&Arc<QueryPool>>) -> Result<Box<Self>> {
+        let bytes = size_of::<Self>() + 4 * size_of::<usize>();
+        Ok(Box::new(Self {
             name,
-            older: OnceLock::new(),
-            _credit: credit,
+            older: PendingImports::default(),
+            _credit: RecordedReasoning::reserve(pool, bytes as u64)?,
         }))
     }
 }
 
 impl PendingImports {
-    fn entries(&self) -> impl Iterator<Item = &Arc<Entry>> + Clone {
-        std::iter::successors(self.0.as_ref(), |entry| entry.older.get()?.0.as_ref())
+    fn entries(&self) -> impl Iterator<Item = &Entry> + Clone {
+        std::iter::successors(self.0.as_deref(), |entry| entry.older.0.as_deref())
     }
 
     pub(super) fn contains(&self, iri: &str) -> bool {
-        self.entries().any(|e| e.name.owner.lock().as_ref() == iri)
+        self.entries().any(|e| e.name.iri == iri)
     }
 
-    #[cfg(feature = "reasoning")]
-    pub(super) fn names(&self) -> impl Iterator<Item = NameOwner> {
-        self.entries().map(|e| e.name.owner.lock().clone())
-    }
-
-    #[cfg(feature = "reasoning")]
-    pub(super) fn claim(&self, iri: &str, pool: &Arc<QueryPool>) -> Result<Option<NameClaim>> {
-        use std::sync::atomic::Ordering;
-        for e in self.entries() {
-            let owner = e.name.owner.lock();
-            if let NameOwner::Pending(pending) = &*owner
-                && pending.iri == iri
-                && !pending.claimed.load(Ordering::Acquire)
-            {
-                let work = pool
-                    .work_parent()
-                    .reserve(iri.len() as u64)
-                    .map_err(super::parent_error)?;
-                pending.claimed.store(true, Ordering::Release);
-                return Ok(Some(NameClaim {
-                    slot: e.name.clone(),
-                    pending: pending.clone(),
-                    work: Some(work),
-                    index: 0,
-                }));
-            }
+    pub(crate) fn fork(&self, pool: Option<&Arc<QueryPool>>) -> Result<Self> {
+        let mut list = Self::default();
+        let mut tail = &mut list;
+        for entry in self.entries() {
+            tail = &mut tail.0.insert(Entry::link(entry.name.clone(), pool)?).older;
         }
-        Ok(None)
+        Ok(list)
     }
 
-    fn push(&mut self, entry: Arc<Entry>) {
-        assert!(
-            entry.older.set(self.clone()).is_ok(),
-            "an import publishes once"
-        );
+    #[cfg(any(feature = "reasoning", feature = "backup"))]
+    fn snapshot(
+        &self,
+        publishing: &[Arc<PendingName>],
+        parent: Option<sparkles_budget::ParentHandle>,
+        limit: Option<u64>,
+    ) -> Result<NameSnapshot> {
+        let loaded = self.entries().count();
+        let count = loaded + publishing.len();
+        let bytes = (count * size_of::<Arc<PendingName>>()) as u64;
+        if let Some(limit) = limit
+            && bytes > limit
+        {
+            return Err(super::parent_error(sparkles_budget::ParentRefused::Limit {
+                limit,
+                requested: bytes,
+                scope: sparkles_budget::Scope::Local,
+            }));
+        }
+        let credit = parent
+            .map(|p| p.reserve(bytes))
+            .transpose()
+            .map_err(super::parent_error)?;
+        let mut names = Vec::with_capacity(count);
+        names.extend(self.entries().map(|e| e.name.clone()));
+        names.extend_from_slice(publishing);
+        Ok(NameSnapshot {
+            names,
+            loaded,
+            _credit: credit,
+        })
+    }
+
+    #[cfg(feature = "reasoning")]
+    pub(super) fn refresh_names(
+        &self,
+        options: &mut crate::sparql::QueryOptions,
+    ) -> Result<NameSnapshot> {
+        let parent = options
+            .grant
+            .as_ref()
+            .map(|g| g.memory_parent())
+            .or_else(|| options.pool.as_ref().map(|p| p.work_parent()));
+        let snapshot = self.snapshot(&[], parent, options.max_memory_bytes)?;
+        if let Some(limit) = &mut options.max_memory_bytes {
+            *limit -= (snapshot.names.len() * size_of::<Arc<PendingName>>()) as u64;
+        }
+        Ok(snapshot)
+    }
+
+    #[cfg(feature = "reasoning")]
+    pub(super) fn claim(
+        &self,
+        iri: &str,
+        work: &mut sparkles_reasoner::PreparationMemory<'_>,
+    ) -> Result<Option<NameClaim>> {
+        let Some(entry) = self.entries().find(|e| e.name.iri == iri) else {
+            return Ok(None);
+        };
+        let account = &entry.name.account;
+        let mut transfer = account.transfer.lock();
+        if transfer.claimed {
+            return Ok(None);
+        }
+        let memory = work
+            .reserve(iri.len())
+            .map_err(super::parent_error)?
+            .expect("pooled import transfer");
+        transfer.claimed = true;
+        Ok(Some(NameClaim {
+            pending: entry.name.clone(),
+            work: Some(memory),
+        }))
+    }
+
+    fn push(&mut self, mut entry: Box<Entry>) {
+        entry.older.0 = self.0.take();
         self.0 = Some(entry);
     }
 
@@ -238,43 +296,78 @@ impl PendingImports {
             }
         }
         if reconcile {
-            ImportJournal::from(pending.clone()).save(store)?;
+            let journal = ImportJournal::from(pending);
+            journal.save(store)?;
+            return Ok(journal.loaded);
         }
         Ok(pending)
     }
+}
+#[derive(Default)]
+#[cfg(any(feature = "reasoning", feature = "backup"))]
+pub(crate) struct NameSnapshot {
+    names: Vec<Arc<PendingName>>,
+    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
+    loaded: usize,
+    _credit: Option<MemoryLease>,
+}
 
-    fn write(&self, writer: impl Write, publishing: &[Arc<Entry>]) -> std::io::Result<()> {
-        struct Names<I>(I);
-        impl<I: Iterator + Clone> Serialize for Names<I>
-        where
-            I::Item: Serialize,
-        {
-            fn serialize<S: Serializer>(
-                &self,
-                serializer: S,
-            ) -> std::result::Result<S::Ok, S::Error> {
-                serializer.collect_seq(self.0.clone())
-            }
-        }
-        #[derive(Serialize)]
-        struct Saved<I: Serialize, P: Serialize> {
-            format: u32,
-            imports: I,
-            publishing: P,
-        }
-        let saved = Saved {
-            format: 1,
-            imports: Names(self.entries().map(|entry| entry.name.as_ref())),
-            publishing: Names(publishing.iter().map(|entry| entry.name.as_ref())),
-        };
-        serde_json::to_writer(writer, &saved).map_err(std::io::Error::from)
+#[cfg(feature = "reasoning")]
+impl NameSnapshot {
+    pub(super) fn names(&self) -> impl Iterator<Item = &str> {
+        self.names.iter().map(|name| name.iri.as_str())
     }
 }
 
-#[derive(Clone, Default)]
+#[cfg(feature = "backup")]
+impl NameSnapshot {
+    pub(crate) fn backup_bytes(&self) -> Result<Option<Vec<u8>>> {
+        if self.names.is_empty() {
+            return Ok(None);
+        }
+        let (loaded, publishing) = self.names.split_at(self.loaded);
+        let mut bytes = Vec::new();
+        write_names(&mut bytes, loaded.iter().map(Arc::as_ref), publishing)?;
+        Ok(Some(bytes))
+    }
+}
+
+fn write_names<'a>(
+    writer: impl Write,
+    loaded: impl Iterator<Item = &'a PendingName> + Clone,
+    publishing: &[Arc<PendingName>],
+) -> std::io::Result<()> {
+    struct Names<I>(I);
+    impl<I: Iterator + Clone> Serialize for Names<I>
+    where
+        I::Item: Serialize,
+    {
+        fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+            serializer.collect_seq(self.0.clone())
+        }
+    }
+    #[derive(Serialize)]
+    struct Saved<I: Serialize, P: Serialize> {
+        format: u32,
+        imports: I,
+        publishing: P,
+    }
+    let saved = Saved {
+        format: 1,
+        imports: Names(loaded),
+        publishing: Names(publishing.iter().map(Arc::as_ref)),
+    };
+    serde_json::to_writer(writer, &saved).map_err(std::io::Error::from)
+}
+
+#[derive(Default)]
 pub(crate) struct ImportJournal {
     pub(crate) loaded: PendingImports,
-    publishing: Vec<Arc<Entry>>,
+    publishing: Vec<Arc<PendingName>>,
+    #[cfg(feature = "reasoning")]
+    next_run: u64,
+    #[cfg(feature = "reasoning")]
+    pub(crate) published_run: u64,
 }
 
 impl From<PendingImports> for ImportJournal {
@@ -288,21 +381,26 @@ impl From<PendingImports> for ImportJournal {
 
 impl ImportJournal {
     #[cfg(feature = "backup")]
-    pub(crate) fn backup_bytes(&self) -> Result<Option<Vec<u8>>> {
-        if self.loaded.0.is_none() && self.publishing.is_empty() {
-            return Ok(None);
-        }
-        let mut bytes = Vec::new();
-        self.loaded.write(&mut bytes, &self.publishing)?;
-        Ok(Some(bytes))
+    pub(crate) fn backup_snapshot(&self, pool: Option<&Arc<QueryPool>>) -> Result<NameSnapshot> {
+        self.loaded
+            .snapshot(&self.publishing, pool.map(|p| p.work_parent()), None)
     }
 
     fn save(&self, store: &Store) -> Result<()> {
+        self.save_except(store, &[])
+    }
+
+    fn save_except(&self, store: &Store, recorded: &[String]) -> Result<()> {
         let Some(root) = store.root() else {
             return Ok(());
         };
         let path = root.join(FILE);
-        if self.loaded.0.is_none() && self.publishing.is_empty() {
+        let loaded = self
+            .loaded
+            .entries()
+            .filter(|e| recorded.binary_search(&e.name.iri).is_err())
+            .map(|entry| entry.name.as_ref());
+        if self.publishing.is_empty() && loaded.clone().next().is_none() {
             return match std::fs::remove_file(path) {
                 Ok(()) => super::sync_dir(root),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -311,7 +409,7 @@ impl ImportJournal {
         }
         Ok(crate::fsutil::write_atomic_with(&path, |file| {
             let mut writer = BufWriter::new(file);
-            self.loaded.write(&mut writer, &self.publishing)?;
+            write_names(&mut writer, loaded, &self.publishing)?;
             writer.flush()
         })?)
     }
@@ -342,7 +440,7 @@ impl crate::Dataset {
         let mut options = opts.clone();
         let prior = options.write.before_publish.take();
         let dataset = self.clone();
-        let intent = entry.clone();
+        let intent = entry.name.clone();
         options.write.before_publish = Some(crate::guard::PublishHook::new(move || {
             if let Some(hook) = &prior {
                 (hook.0)()?;
@@ -368,7 +466,7 @@ impl crate::Dataset {
             if let Some(index) = journal
                 .publishing
                 .iter()
-                .position(|v| Arc::ptr_eq(v, &entry))
+                .position(|v| Arc::ptr_eq(v, &entry.name))
             {
                 // A WAL fence or generation switch can fail after reaching disk.
                 // Keep the admitted intent until reopen can see the recovered graph.
@@ -441,99 +539,37 @@ impl ImportJournal {
     }
 
     #[cfg(feature = "reasoning")]
-    pub(crate) fn retire(
-        &mut self,
-        store: &Store,
-        pool: Option<&Arc<QueryPool>>,
-        plan: Option<Retirement>,
-    ) -> Result<()> {
-        let Some(Retirement { before, mut after }) = plan else {
-            return Ok(());
-        };
-        let Some(new_count) = self
-            .loaded
-            .entries()
-            .position(|node| Arc::ptr_eq(node, &before))
-        else {
-            // Another publication already changed the captured list.
-            return Ok(());
-        };
-        if new_count != 0 {
-            // Concurrent LOADs prepended new names after this run prepared its
-            // record. Keep all of them ahead of the prepared remainder.
-            after =
-                match PendingImports::copy_onto(self.loaded.entries().take(new_count), after, pool)
-                {
-                    Ok(list) => list,
-                    // The previous journal remains valid. A later run or reopen
-                    // removes the redundant record entries without losing a LOAD.
-                    Err(crate::Error::BudgetExceeded(_)) => return Ok(()),
-                    Err(error) => return Err(error),
-                };
-        }
-        self.replace_loaded(store, after)
-    }
-}
-
-/// Immutable membership and its prepared replacement. Ordinary cleanup needs
-/// no further admission after the inference commit.
-#[cfg(feature = "reasoning")]
-pub(crate) struct Retirement {
-    before: Arc<Entry>,
-    after: PendingImports,
-}
-
-#[cfg(feature = "reasoning")]
-impl PendingImports {
-    fn copy_onto<'a>(
-        entries: impl Iterator<Item = &'a Arc<Entry>>,
-        mut tail: Self,
-        pool: Option<&Arc<QueryPool>>,
-    ) -> Result<Self> {
-        let mut reversed = Self::default();
-        for entry in entries {
-            reversed.push(Entry::link(entry.name.clone(), pool)?);
-        }
-        while let Some(mut head) = reversed.0.take() {
-            let private = Arc::get_mut(&mut head).expect("unpublished journal link");
-            reversed = private.older.take().unwrap_or_default();
-            tail.push(head);
-        }
-        Ok(tail)
+    pub(crate) fn prepare_run(&mut self) -> u64 {
+        self.next_run = self
+            .next_run
+            .checked_add(1)
+            .expect("materialization sequence exhausted");
+        self.next_run
     }
 
-    pub(super) fn retirement(
-        &self,
-        pool: Option<&Arc<QueryPool>>,
-        recorded: &[String],
-    ) -> Result<Option<Retirement>> {
-        let Some(before) = self.0.as_ref().filter(|_| !recorded.is_empty()) else {
-            return Ok(None);
-        };
-        let covered = |node: &Entry| {
-            let name = node.name.owner.lock();
-            recorded
-                .binary_search_by(|iri| iri.as_str().cmp(name.as_ref()))
-                .is_ok()
-        };
-        let Some((index, last)) = self
-            .entries()
-            .enumerate()
-            .filter(|(_, e)| covered(e))
-            .last()
-        else {
-            return Ok(None);
-        };
-        let tail = last.older.get().cloned().unwrap_or_default();
-        let after = Self::copy_onto(
-            self.entries().take(index).filter(|node| !covered(node)),
-            tail,
-            pool,
-        )?;
-        Ok(Some(Retirement {
-            before: before.clone(),
-            after,
-        }))
+    #[cfg(feature = "reasoning")]
+    pub(crate) fn retire(&mut self, store: &Store, recorded: &[String]) -> Result<()> {
+        if recorded.is_empty()
+            || !self
+                .loaded
+                .entries()
+                .any(|e| recorded.binary_search(&e.name.iri).is_ok())
+        {
+            return Ok(());
+        }
+        // The durable rewrite and the in-place unlink select the same names
+        // under the journal lock. A write failure leaves membership intact.
+        self.save_except(store, recorded)?;
+        let mut cursor = &mut self.loaded;
+        while let Some(entry) = cursor.0.as_ref() {
+            if recorded.binary_search(&entry.name.iri).is_ok() {
+                let mut removed = cursor.0.take().expect("current link");
+                cursor.0 = removed.older.0.take();
+            } else {
+                cursor = &mut cursor.0.as_mut().expect("current link").older;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -548,19 +584,68 @@ mod tests {
         for iri in ["old", "covered", "other", "also-covered"] {
             journal.loaded.push(Entry::prepare(iri, None).unwrap());
         }
-        let snapshot = journal.loaded.clone();
-        let plan = snapshot
-            .retirement(None, &["also-covered".into(), "covered".into()])
-            .unwrap();
+        let snapshot = journal.loaded.fork(None).unwrap();
         journal.loaded.push(Entry::prepare("new", None).unwrap());
-        journal.retire(ds.store(), None, plan).unwrap();
+        journal
+            .retire(ds.store(), &["also-covered".into(), "covered".into()])
+            .unwrap();
         let names: Vec<_> = journal
             .loaded
-            .names()
-            .map(|name| name.as_ref().to_owned())
+            .entries()
+            .map(|entry| entry.name.iri.as_str())
             .collect();
         assert_eq!(names, ["new", "other", "old"]);
         assert!(snapshot.contains("covered"));
+    }
+
+    #[test]
+    fn transfer_scratch_shares_the_materialization_limit() {
+        use crate::reasoning::{ReasonRequest, reasoner::Profile};
+        let iri = format!("urn:{}", "x".repeat(256 << 10));
+        let request = ReasonRequest {
+            profile: Profile::RdfsSimple,
+            incremental: false,
+            max_memory: Some(iri.len() + 1),
+            ..Default::default()
+        };
+        for retained_capacity in [4 << 20, 384 << 10] {
+            let pool = QueryPool::with_retained_capacity(16 << 20, retained_capacity).unwrap();
+            let ds = crate::Dataset::from_store_with(
+                Store::in_memory(Default::default()),
+                crate::DatasetOptions {
+                    pool: Some(pool.clone()),
+                    closure_cache_triples: 0,
+                    ..Default::default()
+                },
+            );
+            ds.update(&format!("INSERT DATA {{ <urn:o> <http://www.w3.org/2002/07/owl#imports> <{iri}> . GRAPH <{iri}> {{ <urn:s> <urn:p> 1 }} }}")).unwrap();
+            ds.state()
+                .pending_imports
+                .lock()
+                .loaded
+                .push(Entry::prepare(&iri, Some(&pool)).unwrap());
+            if retained_capacity == 4 << 20 {
+                ds.reasoning().run(&request).unwrap();
+            } else {
+                let retained = pool.domain_stats().retained_reserved;
+                let head = ds.store().snapshot().commit;
+                let err = ds.reasoning().run(&request).unwrap_err();
+                assert!(
+                    matches!(err, crate::Error::BudgetExceeded(crate::Budget { kind: crate::BudgetKind::Memory, limit, requested }) if limit == request.max_memory.unwrap() as u64 && requested > limit),
+                    "{err:?}"
+                );
+                assert_eq!(ds.store().snapshot().commit, head);
+                assert!(ds.reasoning().record().is_none());
+                assert_eq!(pool.domain_stats().retained_reserved, retained);
+                let retry = ReasonRequest {
+                    max_memory: Some(2 << 20),
+                    ..request.clone()
+                };
+                let result = ds.reasoning().run(&retry).unwrap();
+                assert!(result.report.peak_bytes > request.max_memory.unwrap() as u64);
+            }
+            assert_eq!(pool.domain_stats().work_reserved, 0);
+        }
     }
 
     #[test]
@@ -581,10 +666,10 @@ mod tests {
             journal
                 .loaded
                 .push(Entry::prepare(&iri, Some(&pool)).unwrap());
-            journal.loaded.names().next().unwrap()
+            journal.loaded.0.as_ref().unwrap().name.clone()
         };
         ds.reasoning().run(&Default::default()).unwrap();
-        assert_eq!(reader.as_ref(), iri);
+        assert_eq!(reader.iri, iri);
         assert_eq!(pool.domain_stats().work_reserved, iri.len() as u64);
         ds.reasoning().clear().unwrap();
         drop(reader);

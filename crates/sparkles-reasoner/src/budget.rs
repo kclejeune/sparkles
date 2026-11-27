@@ -393,6 +393,61 @@ impl Budget {
     }
 }
 
+/// Work that the facade prepares before commit and may retain after the run.
+pub struct PreparationMemory<'a> {
+    budget: &'a Budget,
+    detached: usize,
+}
+
+impl<'a> PreparationMemory<'a> {
+    pub(crate) fn new(budget: &'a Budget) -> Self {
+        Self {
+            budget,
+            detached: 0,
+        }
+    }
+
+    /// Charge the live request before allocation. Split the exact parent bytes
+    /// so the result can outlive the run without retaining its remaining grant.
+    pub fn reserve(&mut self, bytes: usize) -> Result<Option<MemoryLease>, ParentRefused> {
+        self.budget
+            .try_charge(bytes)
+            .map_err(|failure| match failure {
+                BudgetFailure::Local(error) => ParentRefused::Limit {
+                    limit: error.limit as u64,
+                    requested: (self.budget.used() as u64).saturating_add(bytes as u64),
+                    scope: Scope::Local,
+                },
+                BudgetFailure::Parent { refusal, .. } => refusal,
+            })?;
+        self.detached += bytes;
+        Ok(self.budget.parent.as_ref().map(|backing| {
+            backing
+                .lease
+                .lock()
+                .split(bytes as u64)
+                .expect("admitted preparation")
+        }))
+    }
+}
+
+impl Drop for PreparationMemory<'_> {
+    fn drop(&mut self) {
+        if self.detached == 0 {
+            return;
+        }
+        // Until the report is complete, used and reserved include the exact
+        // leases handed to the facade. The remaining backing covers the rest.
+        if let Some(backing) = &self.budget.parent {
+            let _guard = backing.lease.lock();
+            backing.reserved.fetch_sub(self.detached, Ordering::SeqCst);
+            self.budget.used.fetch_sub(self.detached, Ordering::SeqCst);
+        } else {
+            self.budget.release(self.detached);
+        }
+    }
+}
+
 /// Bytes charged to a budget, released on drop.
 pub(crate) struct Held {
     budget: Arc<Budget>,

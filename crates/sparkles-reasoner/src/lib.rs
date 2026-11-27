@@ -1307,6 +1307,29 @@ pub fn materialize_incremental_prepared(
     opts: &ReasonOptions,
     prepare: impl FnOnce(&Resolved, &[String]) -> anyhow::Result<()> + Send,
 ) -> anyhow::Result<ReasonReport> {
+    materialize_incremental_prepared_with_memory(
+        store,
+        profile,
+        extras,
+        inc,
+        opts,
+        |resolved, warnings, _| prepare(resolved, warnings),
+    )
+}
+
+#[doc(hidden)]
+pub use budget::PreparationMemory;
+
+/// Prepare facade metadata with the same live allowance as the inference transaction.
+#[doc(hidden)]
+pub fn materialize_incremental_prepared_with_memory(
+    store: &Store,
+    profile: &Profile,
+    extras: &Extras,
+    inc: Incremental<'_>,
+    opts: &ReasonOptions,
+    prepare: impl FnOnce(&Resolved, &[String], &mut PreparationMemory<'_>) -> anyhow::Result<()> + Send,
+) -> anyhow::Result<ReasonReport> {
     extras.validate()?;
     opts.inputs.validate()?;
     refuse_query_only(profile)?;
@@ -1325,7 +1348,7 @@ fn materialize_admitted(
     inc: Incremental<'_>,
     opts: &ReasonOptions,
     t0: Instant,
-    prepare: impl FnOnce(&Resolved, &[String]) -> anyhow::Result<()>,
+    prepare: impl FnOnce(&Resolved, &[String], &mut PreparationMemory<'_>) -> anyhow::Result<()>,
 ) -> anyhow::Result<ReasonReport> {
     let mut laps = Laps::new(t0);
     let staging = Budget::with_parent(opts.max_memory, opts.memory_parent.clone());
@@ -1704,9 +1727,10 @@ fn finish(
     t0: Instant,
     done: Done,
     mut laps: Laps,
-    prepare: impl FnOnce(&Resolved, &[String]) -> anyhow::Result<()>,
+    prepare: impl FnOnce(&Resolved, &[String], &mut PreparationMemory<'_>) -> anyhow::Result<()>,
 ) -> anyhow::Result<ReasonReport> {
     let mut txn = txn;
+    let mut preparation = PreparationMemory::new(&done.budget);
     let checked = (|| -> anyhow::Result<WorkingWarnings> {
         if opts
             .cancel
@@ -1733,7 +1757,7 @@ fn finish(
         let mut warnings = WorkingWarnings::try_clone_from(&resolved.warnings, &done.budget)?;
         warnings.extend_borrowed(done.warnings.as_slice())?;
         done.budget.check_peak()?;
-        prepare(resolved, warnings.as_slice())?;
+        prepare(resolved, warnings.as_slice(), &mut preparation)?;
         Ok(warnings)
     })();
     let warnings = match checked {

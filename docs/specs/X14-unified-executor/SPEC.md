@@ -254,9 +254,13 @@ scratch reservation when the report is ready. A dataset's reasoning record admit
 its warnings and fetched import names before the inference commit. It uses the
 retained pool when configured and otherwise draws exact credit from the dataset's
 work pool, if any. When a pending import and its final record would exceed the
-retained limit together, work credit backs the overlapping copy while the record
-takes over the name's retained credit. A catalog save streams the existing registry
-bytes for records that the pool refused. In-memory branches share the record and its reservation, and
+retained limit together, the active materialization budget admits the transfer
+bookkeeping and the overlapping IRI copy before the inference commit. Each
+in-memory branch has its own journal links and shares the pending names. A
+shared name keeps its retained credit until the last owner releases it. Work
+credit for the duplicate ends when either copy is released. A catalog save
+streams the existing registry bytes for records that the pool refused.
+In-memory branches share the record and its reservation, and
 reopened datasets admit the saved record before publishing it. Runtime checkpoints
 return scratch credit after their guards are released. WAL replay accounts for the
 overlap of growing tables and the conversion to materialization changes.

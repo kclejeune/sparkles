@@ -76,7 +76,7 @@ pub struct ReasonOutcome {
     pub record: ReasoningRecord,
 }
 
-/// The error code of a run that yielded to a waiting write
+/// The error code of a run superseded by a later publication or a waiting write
 /// ([`ReasonRequest::yield_to_writers`]).
 pub const SUPERSEDED: &str = "superseded";
 
@@ -91,14 +91,6 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
     let state = ds.state();
     let store: &Store = &state.store;
     let cancel = ctl.cancel.flag();
-    let (previous, pending_before) = {
-        let journal = state.pending_imports.lock();
-        (state.recorded_reasoning(), journal.loaded.clone())
-    };
-    let fetched_before = previous
-        .value
-        .as_ref()
-        .map_or(&[][..], |record| record.fetched_imports.as_slice());
     let (fetched, fetch_memory) = if req.inputs.imports == ImportMode::Fetch || req.refresh_imports
     {
         ctl.progress.report(0.02, "fetching imports");
@@ -114,19 +106,24 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
         if qopts.pool.is_none() && qopts.grant.is_none() {
             qopts.pool = state.pool.clone();
         }
-        let refresh = req
-            .refresh_imports
-            .then(|| {
-                (0..fetched_before.len())
-                    .map(|index| super::imports::NameOwner::Recorded(previous.clone(), index))
-                    .chain(
-                        pending_before
-                            .names()
-                            .filter(|name| !fetched_before.iter().any(|iri| iri == name.as_ref())),
-                    )
-            })
-            .into_iter()
-            .flatten();
+        let (previous, pending) = if req.refresh_imports {
+            let journal = state.pending_imports.lock();
+            (
+                Some(state.recorded_reasoning()),
+                journal.loaded.refresh_names(&mut qopts)?,
+            )
+        } else {
+            (None, Default::default())
+        };
+        let recorded = previous
+            .as_ref()
+            .and_then(|owner| owner.value.as_ref())
+            .map_or(&[][..], |record| record.fetched_imports.as_slice());
+        let refresh = recorded.iter().map(String::as_str).chain(
+            pending
+                .names()
+                .filter(|name| !recorded.iter().any(|iri| iri == name)),
+        );
         let (fetched, memory) = sparkles_reasoner::inputs::fetch_imports_with_names(
             store,
             &req.inputs,
@@ -139,7 +136,6 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
     } else {
         (Fetched::default(), None)
     };
-    drop(pending_before);
     ctl.progress.report(0.05, "loading triples");
     // the reasoner reports progress only once it holds the writer lock
     let locked = Arc::new(AtomicBool::new(false));
@@ -171,7 +167,6 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
     };
     let superseded = AtomicBool::new(false);
     let done = AtomicBool::new(false);
-    let pending = state.pending_imports.lock().loaded.clone();
     let mut prepared = None;
     let result = std::thread::scope(|s| {
         struct SignalDone<'a>(&'a AtomicBool);
@@ -204,21 +199,29 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
             since,
             cache: Some(&state.closure),
         };
-        sparkles_reasoner::materialize_incremental_prepared(
+        sparkles_reasoner::materialize_incremental_prepared_with_memory(
             store,
             &req.profile,
             &req.extras,
             inc,
             &opts,
-            |resolved, warnings| {
-                prepared = Some(prepare_record_strings(
+            |resolved, warnings, work| {
+                let mut journal = state.pending_imports.lock();
+                let current = state.recorded_reasoning();
+                let previous = current
+                    .value
+                    .as_ref()
+                    .map_or(&[][..], |r| r.fetched_imports.as_slice());
+                let strings = prepare_record_strings(
                     state.pool.as_ref(),
                     resolved,
-                    fetched_before,
-                    &pending,
+                    previous,
+                    &journal.loaded,
                     &fetched,
                     warnings,
-                )?);
+                    work,
+                )?;
+                prepared = Some((journal.prepare_run(), strings));
                 Ok(())
             },
         )
@@ -245,22 +248,23 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
     };
     drop(fetched);
     drop(fetch_memory);
-    drop(previous);
-    let PreparedRecordStrings {
-        warnings,
-        fetched_imports,
-        memory,
-        claims,
-        _claim_memory,
-        retirement,
-    } = prepared.expect("materialization prepared its record before committing");
+    let (
+        run,
+        PreparedRecordStrings {
+            warnings,
+            fetched_imports,
+            memory,
+            claims,
+            _claim_memory,
+        },
+    ) = prepared.expect("materialization prepared its record before committing");
     let mut record = recorded_with_warnings(&req.profile, &req.extras, &report, store, warnings);
     record_input_metadata(&mut record, &req.inputs, &report);
     record.fetched_imports = fetched_imports;
     // a run keeps the dataset's automatic re-run setting
     record.auto = state.read_reasoning().as_ref().and_then(|r| r.auto.clone());
     let outcome = record.clone();
-    state.set_reasoning_admitted(record, memory, claims, retirement)?;
+    state.set_reasoning_admitted(record, memory, claims, run)?;
     ctl.progress.report(1.0, "materialized");
     Ok(ReasonOutcome {
         report,
@@ -274,7 +278,6 @@ struct PreparedRecordStrings {
     memory: Option<sparkles_budget::MemoryLease>,
     claims: Vec<super::imports::NameClaim>,
     _claim_memory: Option<sparkles_budget::MemoryLease>,
-    retirement: Option<super::imports::Retirement>,
 }
 
 fn prepare_record_strings(
@@ -284,6 +287,7 @@ fn prepare_record_strings(
     pending: &super::imports::PendingImports,
     fetched: &Fetched,
     warnings: &[String],
+    work: &mut sparkles_reasoner::PreparationMemory<'_>,
 ) -> Result<PreparedRecordStrings> {
     // The resolver supplies the names actually read. Only a previous record,
     // committed journal entry or successful fetch establishes LOAD provenance.
@@ -313,15 +317,13 @@ fn prepare_record_strings(
             if count == 0 {
                 return Err(error);
             }
-            claim_memory = Some(
-                pool.work_parent()
-                    .reserve((count * size_of::<super::imports::NameClaim>()) as u64)
-                    .map_err(super::parent_error)?,
-            );
+            claim_memory = work
+                .reserve(count * size_of::<super::imports::NameClaim>())
+                .map_err(super::parent_error)?;
             claims = Vec::with_capacity(count);
             let mut reused = 0;
             for name in names.clone() {
-                if let Some(claim) = pending.claim(name, pool)? {
+                if let Some(claim) = pending.claim(name, work)? {
                     reused += claim.bytes();
                     claims.push(claim);
                 }
@@ -341,9 +343,6 @@ fn prepare_record_strings(
     fetched_imports.extend(names.cloned());
     fetched_imports.sort_unstable();
     fetched_imports.dedup();
-    for claim in &mut claims {
-        claim.locate(&fetched_imports);
-    }
     if let Some(lease) = &mut memory {
         let actual = reasoning_strings_bytes(
             saved_warnings.capacity(),
@@ -356,14 +355,12 @@ fn prepare_record_strings(
             .shrink(bytes - actual)
             .expect("unused duplicate name credit");
     }
-    let retirement = pending.retirement(pool, &fetched_imports)?;
     Ok(PreparedRecordStrings {
         warnings: saved_warnings,
         fetched_imports,
         memory,
         claims,
         _claim_memory: claim_memory,
-        retirement,
     })
 }
 

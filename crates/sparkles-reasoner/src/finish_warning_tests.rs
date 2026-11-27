@@ -110,7 +110,7 @@ fn invoke_finish(
         Instant::now(),
         done,
         Laps::new(Instant::now()),
-        |_, _| Ok(()),
+        |_, _, _| Ok(()),
     )
 }
 

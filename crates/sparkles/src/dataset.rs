@@ -242,10 +242,12 @@ impl Drop for DatasetState {
 #[derive(Default)]
 pub(crate) struct RecordedReasoning {
     pub(crate) value: Option<ReasoningRecord>,
-    // Release the reservation after its strings have been dropped.
-    _memory: Option<sparkles_budget::MemoryLease>,
     // Payload credit adopted from provisional import journal entries.
     _imports: Vec<sparkles_budget::MemoryLease>,
+    #[cfg(feature = "reasoning")]
+    _shared_imports: Vec<crate::reasoning::imports::RecordedImport>,
+    // Release the reservation after the strings and transfer slots it covers.
+    _memory: Option<sparkles_budget::MemoryLease>,
 }
 
 pub(crate) fn reasoning_strings_bytes(capacity: usize, bytes: impl Iterator<Item = usize>) -> u64 {
@@ -275,7 +277,35 @@ impl RecordedReasoning {
             value: record,
             _memory: Self::reserve(pool, bytes)?,
             _imports: Vec::new(),
+            #[cfg(feature = "reasoning")]
+            _shared_imports: Vec::new(),
         })
+    }
+
+    /// A private name needs only its payload lease. A shared name also needs
+    /// to release its overlap and become claimable if this record expires first.
+    #[cfg(feature = "reasoning")]
+    fn adopt_imports(&mut self, mut claims: Vec<crate::reasoning::imports::NameClaim>) {
+        let mut shared = 0;
+        for index in 0..claims.len() {
+            if !claims[index].is_exclusive() {
+                claims.swap(shared, index);
+                shared += 1;
+            }
+        }
+        self._imports = claims
+            .drain(shared..)
+            .map(|claim| claim.into_exclusive())
+            .collect();
+        self._shared_imports = claims.drain(..).map(|claim| claim.publish()).collect();
+        if let Some(memory) = &mut self._memory {
+            let unused = shared
+                * (size_of::<sparkles_budget::MemoryLease>()
+                    - size_of::<crate::reasoning::imports::RecordedImport>());
+            memory
+                .shrink(unused as u64)
+                .expect("reserved transfer slots");
+        }
     }
 
     pub(crate) fn reserve(
@@ -319,12 +349,13 @@ impl DatasetState {
     }
 
     /// Branches share both the immutable record and the pool that backs it.
-    pub(crate) fn inherit_reasoning(&self, source: &Self) {
+    pub(crate) fn inherit_reasoning(&self, source: &Self) -> Result<()> {
         let journal = source.pending_imports.lock();
+        let pending = journal.loaded.fork(self.pool.as_ref())?;
         self.replace_reasoning(source.recorded_reasoning());
-        let pending = journal.loaded.clone();
         drop(journal);
         self.pending_imports.lock().loaded = pending;
+        Ok(())
     }
 
     fn replace_reasoning(&self, record: Arc<RecordedReasoning>) {
@@ -353,26 +384,43 @@ impl DatasetState {
         record: ReasoningRecord,
         memory: Option<sparkles_budget::MemoryLease>,
         claims: Vec<crate::reasoning::imports::NameClaim>,
-        retirement: Option<crate::reasoning::imports::Retirement>,
+        run: u64,
     ) -> Result<()> {
         let record = RecordedReasoning {
             value: Some(record),
             _memory: memory,
-            _imports: Vec::with_capacity(claims.len()),
+            _imports: Vec::new(),
+            _shared_imports: Vec::new(),
         };
         let mut journal = self.pending_imports.lock();
+        // Preparation runs under the RDF writer. A delayed facade can finish
+        // after a later transaction has already published, even at the same head.
+        if run < journal.published_run {
+            return Err(Error::Component(Box::new(
+                crate::error::ComponentError::new(
+                    "reasoner",
+                    crate::reasoning::run::SUPERSEDED,
+                    "a later materialization published first",
+                ),
+            )));
+        }
+        let mut retired = Ok(());
         self.write_reasoning(record, |mut record| {
-            let mut claims = claims;
-            record
-                ._imports
-                .extend(claims.iter_mut().map(|claim| claim.transfer()));
-            let published = Arc::new(record);
-            for claim in claims {
-                claim.publish(&published);
-            }
-            published
+            // The record is already durable. If the journal rewrite fails,
+            // publish it with shared credit for the still-readable journal.
+            retired = journal.retire(
+                &self.store,
+                &record
+                    .value
+                    .as_ref()
+                    .expect("published record")
+                    .fetched_imports,
+            );
+            record.adopt_imports(claims);
+            journal.published_run = run;
+            Arc::new(record)
         })?;
-        journal.retire(&self.store, self.pool.as_ref(), retirement)
+        retired
     }
 
     fn write_reasoning(

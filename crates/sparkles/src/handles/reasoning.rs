@@ -51,7 +51,8 @@ impl Reasoning {
     /// run fails with [`Error::Cancelled`](crate::Error) and writes nothing, and a run
     /// that yields to a write ([`ReasonRequest::yield_to_writers`]) fails with a
     /// `reasoner` component error whose code is
-    /// [`SUPERSEDED`](crate::reasoning::run::SUPERSEDED).
+    /// [`SUPERSEDED`](crate::reasoning::run::SUPERSEDED). A run whose record was
+    /// superseded by a later materialization after commit also returns this code.
     ///
     /// [`ReasonRequest::yield_to_writers`]: crate::reasoning::ReasonRequest::yield_to_writers
     #[cfg(feature = "reasoning")]

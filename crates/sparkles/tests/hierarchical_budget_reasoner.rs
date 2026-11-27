@@ -1850,3 +1850,215 @@ fn persistent_backup_keeps_import_history_at_wal_cut() {
 fn memory_backup_keeps_import_history_at_snapshot() {
     backup_racing_import(true);
 }
+
+#[test]
+fn concurrent_materialization_preserves_pending_history_after_reopen() {
+    use sparkles::task::{Control, Progress};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let source = dir.path().join("import.ttl");
+    let pool = QueryPool::with_retained_capacity(16 * MIB, MIB).unwrap();
+    let ds = Dataset::open_with(
+        &root,
+        DatasetOptions {
+            pool: Some(pool.clone()),
+            closure_cache_triples: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut request = import_warning_request(&ds);
+    request.inputs.location_mapping.names.extend(
+        mapped_import(&ds, &source, "urn:import")
+            .inputs
+            .location_mapping
+            .names,
+    );
+    let blocker = pool.retained_parent().reserve(MIB - 1024).unwrap();
+    assert!(is_server_memory(&ds.reasoning().run(&request).unwrap_err()));
+    drop(blocker);
+    let other = ds.clone();
+    let concurrent = request.clone();
+    let ctl = Control {
+        progress: Progress::new(move |_, phase| {
+            if phase == "loading triples" {
+                assert_eq!(
+                    other
+                        .reasoning()
+                        .run(&concurrent)
+                        .unwrap()
+                        .record
+                        .fetched_imports,
+                    ["urn:import"]
+                );
+            }
+        }),
+        ..Control::none()
+    };
+    let result = ds.reasoning().run_with(&request, &ctl).unwrap();
+    assert_eq!(result.record.fetched_imports, ["urn:import"]);
+    drop(ctl);
+    drop(ds);
+    assert_refreshed(
+        &Dataset::open(&root).unwrap(),
+        request,
+        &source,
+        "urn:import",
+    );
+}
+
+#[test]
+fn partial_journal_retirement_fits_the_live_retained_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let source = dir.path().join("import.ttl");
+    let covered = format!("urn:import:{}", "x".repeat(16 << 10));
+    let ds = Dataset::open(&root).unwrap();
+    let names = ["urn:left", &covered, "urn:right"];
+    let mut requests = Vec::new();
+    for iri in names {
+        requests.push(mapped_import(&ds, &source, iri));
+        ds.update(&format!(
+            "INSERT DATA {{ GRAPH <{iri}> {{ <urn:s> <urn:p> <urn:first> }} }}"
+        ))
+        .unwrap();
+    }
+    for iri in ["urn:left", "urn:right"] {
+        ds.update(&format!(
+            "DELETE DATA {{ <urn:o> <http://www.w3.org/2002/07/owl#imports> <{iri}> }}"
+        ))
+        .unwrap();
+    }
+    drop(ds);
+    std::fs::write(
+        root.join("reasoning-imports.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "format": 1, "imports": names, "publishing": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let pool = QueryPool::with_retained_capacity(16 * MIB, MIB).unwrap();
+    let ds = Dataset::open_with(
+        &root,
+        DatasetOptions {
+            pool: Some(pool.clone()),
+            closure_cache_triples: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let slots = size_of::<String>() + size_of::<sparkles_budget::MemoryLease>();
+    let blocker = pool
+        .retained_parent()
+        .reserve(MIB - pool.domain_stats().retained_reserved - slots as u64)
+        .unwrap();
+    assert_eq!(
+        ds.reasoning()
+            .run(&requests[1])
+            .unwrap()
+            .record
+            .fetched_imports,
+        [covered.as_str()]
+    );
+    let journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("reasoning-imports.json")).unwrap())
+            .unwrap();
+    let mut remaining = journal["imports"].as_array().unwrap().clone();
+    remaining.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+    assert_eq!(remaining, ["urn:left", "urn:right"]);
+    drop(blocker);
+    drop(ds);
+    let ds = Dataset::open(&root).unwrap();
+    for index in [0, 2] {
+        let iri = names[index];
+        ds.update(&format!(
+            "INSERT DATA {{ <urn:o> <http://www.w3.org/2002/07/owl#imports> <{iri}> }}"
+        ))
+        .unwrap();
+        assert_refreshed(&ds, requests[index].clone(), &source, iri);
+    }
+}
+
+#[test]
+fn inherited_pending_name_can_publish_after_source_clear() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("import.ttl");
+    let iri = format!("urn:import:{}", "x".repeat(16 << 10));
+    let pool = QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap();
+    let ds = memory_with_reasoning_pool(pool.clone());
+    let req = mapped_import(&ds, &source, &iri);
+    let mut refused = import_warning_request(&ds);
+    refused
+        .inputs
+        .location_mapping
+        .names
+        .extend(req.inputs.location_mapping.names.clone());
+    assert!(is_server_memory(&ds.reasoning().run(&refused).unwrap_err()));
+    ds.update("DELETE DATA { <urn:o> <http://www.w3.org/2002/07/owl#imports> <urn:missing> }")
+        .unwrap();
+    ds.create_branch("copy", &Default::default()).unwrap();
+    let branch = ds.branch("copy").unwrap();
+    let mut source_request = import_warning_request(&ds);
+    source_request
+        .inputs
+        .location_mapping
+        .names
+        .insert("urn:missing".into(), "x".repeat(1024));
+    source_request
+        .inputs
+        .location_mapping
+        .names
+        .extend(req.inputs.location_mapping.names.clone());
+    let record = ds.reasoning().run(&source_request).unwrap().record;
+    assert_eq!(record.fetched_imports, [iri.as_str()]);
+    let warning_bytes: usize = record.warnings.iter().map(String::len).sum();
+    assert!(warning_bytes >= 1024);
+    let before = pool.domain_stats().retained_reserved;
+    ds.reasoning().clear().unwrap();
+    assert!(
+        pool.domain_stats().retained_reserved + warning_bytes as u64 <= before,
+        "source record credit stayed pinned"
+    );
+    assert_refreshed(&branch, req, &source, &iri);
+    assert_eq!(branch.reasoning().record().unwrap().fetched_imports, [iri]);
+    branch.reasoning().clear().unwrap();
+    assert_eq!(pool.domain_stats().retained_reserved, 0);
+    assert_eq!(pool.domain_stats().work_reserved, 0);
+}
+
+#[test]
+fn delayed_materialization_cannot_replace_a_later_record_at_the_same_commit() {
+    use sparkles::reasoning::reasoner::ImportMode;
+    use sparkles::task::{Control, Progress};
+
+    let ds = Dataset::memory();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("import.ttl");
+    let req = mapped_import(&ds, &source, "urn:import");
+    ds.reasoning().run(&req).unwrap();
+    let racing = ds.clone();
+    let ctl = Control {
+        progress: Progress::new(move |_, stage| {
+            if stage == "done" {
+                assert_eq!(
+                    racing.reasoning().run(&req).unwrap().record.fetched_imports,
+                    ["urn:import"]
+                );
+            }
+        }),
+        ..Control::none()
+    };
+    let mut older = ReasonRequest::default();
+    older.inputs.imports = ImportMode::None;
+    let err = ds.reasoning().run_with(&older, &ctl).unwrap_err();
+    assert!(
+        matches!(err, Error::Component(ref error) if error.code == sparkles::reasoning::run::SUPERSEDED),
+        "{err:?}"
+    );
+    assert_eq!(
+        ds.reasoning().record().unwrap().fetched_imports,
+        ["urn:import"]
+    );
+}

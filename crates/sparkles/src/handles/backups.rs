@@ -46,7 +46,7 @@ impl Backups<'_> {
             let journal = self.ds.state().pending_imports.lock();
             recorded = Some(self.ds.state().recorded_reasoning());
             if memory {
-                pending = Some(journal.clone());
+                pending = Some(journal.backup_snapshot(self.ds.pool())?);
                 Ok(None)
             } else {
                 self.ds.store().capture_import_journal()
