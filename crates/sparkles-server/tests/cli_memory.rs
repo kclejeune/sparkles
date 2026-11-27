@@ -384,6 +384,7 @@ fn memory_redaction_refusal_keeps_an_existing_source_without_a_cache() {
         }
         let out = status();
         assert!(!missing(&out), "{out:#}");
+        assert_eq!(report(&out, "MEMORY.md")["status"], "ambiguous");
         let row = report(&out, "staging-db.md");
         assert_eq!(row["source"], graph);
         assert_eq!(row["status"], "ambiguous");
@@ -604,6 +605,46 @@ fn refused_parent_preserves_hidden_project_instruction_owner() {
 #[test]
 fn refused_parent_preserves_hidden_user_instruction_owner() {
     check_hidden_instruction_owner(true);
+}
+
+#[test]
+fn status_reports_removed_cursor_rule_despite_refused_rule_with_same_graph() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let project = p.to_str().unwrap();
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let (code, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+    assert_eq!(code, 200);
+    settings["redaction"] = json!({"patterns": [{"name": "budget", "regex": "budget-marker"}]});
+    let (code, output) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(code, 200, "{output:#}");
+
+    let rules = p.join(".cursor/rules");
+    let original = rules.join("nested.rule.md");
+    std::fs::create_dir_all(rules.join("nested")).unwrap();
+    std::fs::write(&original, "Use four spaces.\n").unwrap();
+    let first = mem_json(&f, &s, "ana", &["sync", "generic", "--project", project]);
+    let graph = report(&first, "nested.rule.md")["graph"].as_str().unwrap();
+    let status = || {
+        mem_json(
+            &f,
+            &s,
+            "ana",
+            &["status", "--project", project, "--harness", "cursor"],
+        )
+    };
+
+    std::fs::write(&original, "budget-marker ".repeat(32_769)).unwrap();
+    assert_eq!(report(&status(), "nested.rule.md")["status"], "ambiguous");
+    std::fs::rename(original, rules.join("nested/rule.md")).unwrap();
+    let out = status();
+    assert_eq!(
+        out["sourcesWithoutFile"],
+        json!([{"source": graph, "path": ".cursor/rules/nested.rule.md", "deleted": false}]),
+        "{out:#}"
+    );
+    assert_eq!(out["files"], json!([]));
 }
 
 #[test]

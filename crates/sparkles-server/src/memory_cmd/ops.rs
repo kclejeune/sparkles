@@ -1802,7 +1802,7 @@ fn status_files(
         if candidates.is_empty() {
             // A project scan follows individual user imports, but never lists the whole user area.
             let in_area = scan.areas.iter().any(|area| graph.starts_with(area));
-            if !in_area && group.is_empty() && !scan.incomplete_areas.contains(&graph) {
+            if !in_area && group.is_empty() && !scan.refused_instruction_graphs.contains(&graph) {
                 continue;
             }
             if scan.absence_uncertain(&graph, stored_path) {

@@ -166,6 +166,8 @@ pub struct Scan {
     pub incomplete_areas: HashSet<String>,
     /// Refused files, keyed by graph area using the same relative paths as readable files.
     pub refused_paths: HashMap<String, HashSet<String>>,
+    /// Graphs of refused instructions that status observed, including imports outside the listed areas.
+    pub refused_instruction_graphs: HashSet<String>,
     /// Local lookup for formerly unmasked stored paths under the current redaction policy.
     masked_refusal_digests: HashMap<String, HashSet<String>>,
     /// Instruction areas reachable from a parent whose imports could not be read.
@@ -943,8 +945,11 @@ impl Scanner<'_> {
                     .last()
                     .is_some_and(|s| s.reason == "redaction-too-large")
                 {
-                    // The instruction key is known even when its content is unavailable.
-                    self.out.incomplete_areas.insert(graph);
+                    // Status can recognize an observed import outside its listed areas.
+                    // Ownership still depends on the path because instruction keys can collide.
+                    if self.keep_collisions {
+                        self.out.refused_instruction_graphs.insert(graph);
+                    }
                     if follow_imports {
                         let other = if user {
                             self.project_segment()
