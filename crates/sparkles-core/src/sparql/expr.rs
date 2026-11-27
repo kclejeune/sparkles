@@ -2430,7 +2430,13 @@ pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
                     return Err(TypeError);
                 }
                 let lit = Literal::new_typed_literal(r.lexical()?.as_ref(), dt.clone());
-                Val::Dec(ctx.intern_term(&Term::Literal(lit)), r)
+                let id = ctx.intern_term(&Term::Literal(lit));
+                // A refused intern gives `UNDEF`, which would equal the id of any other
+                // refused cast, so the cast fails instead.
+                if id.is_undef() {
+                    return Err(TypeError);
+                }
+                Val::Dec(id, r)
             }
         }
         "anyURI" => match &v {

@@ -1166,8 +1166,9 @@ impl Reuse {
             // expressions that the evaluation interns or grows on its way to it, none of
             // which records a refusal for the query. After the refusal the expression
             // gives up as it would after a latched one, so it takes no arm that the
-            // ordinary evaluation skips and interns no discarded value. Geometry constructors, whose charge
-            // lasts until the query ends, never reach this pass (see `prepare`).
+            // ordinary evaluation skips and interns no discarded value. Geometry
+            // constructors, whose charge lasts until the query ends, never reach this
+            // pass (see `prepare`).
             let values = match exec::column_rows_split_optional(ctx, &misses, expr, par)
                 .and_then(|values| ctx.check().map(|()| values))
             {
@@ -4130,10 +4131,9 @@ mod tests {
     /// Item 293 round 4: once the budget refuses an intern of `COALESCE`'s first arm
     /// during the misses, `COALESCE` gives up as it does after a latched refusal, and
     /// does not evaluate and intern the fallback arm that the evaluation without the map
-    /// never reaches. A first arm whose regular expression the budget refuses does not
-    /// serve here, because every budget at which the map's misses refuse the program is
-    /// too small for the evaluation without the map, so no run both declines the map and
-    /// fits the batch.
+    /// never reaches. A first arm with a large regular expression did not serve here,
+    /// because no budget in the sweep both declined the map after its misses and fitted
+    /// the batch.
     #[test]
     fn a_refused_coalesce_arm_does_not_evaluate_the_fallback() {
         let declined =
@@ -4205,6 +4205,46 @@ mod tests {
         assert!(
             declined > 0,
             "some budget declines the map after its misses"
+        );
+    }
+
+    /// Item 293 round 4: a derived integer cast whose literal the budget refuses inside
+    /// optional evaluation fails, so two refused casts of different values do not
+    /// compare equal on their `UNDEF` ids.
+    #[test]
+    fn refused_derived_integer_casts_do_not_compare_equal() {
+        use crate::sparql::expr::{Row, eval};
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 1 << 20);
+        let short = |n: i64| {
+            Expr::Call(
+                Func::Cast(xsd::SHORT.into_owned()),
+                vec![Expr::Const(Id::from_i64(n).unwrap())],
+            )
+        };
+        let expr = Expr::Eq(Box::new(short(1000)), Box::new(short(1001)));
+        let table = Table::new(Vec::new());
+        let row = Row {
+            table: &table,
+            i: 0,
+            map: &[],
+            dec: None,
+            exists: None,
+        };
+        let held = ctx.charge(ctx.memory_room() - 16).unwrap();
+        let (value, refused) =
+            ctx.optional_eval(|| eval(&expr, &row, &ctx).map(|v| v.into_id(&ctx)));
+        assert!(refused, "the budget refuses the casts' literals");
+        assert!(
+            value.is_err(),
+            "refused casts must not compare equal: {value:?}"
+        );
+        drop(held);
+        ctx.check().unwrap();
+        let equal = eval(&expr, &row, &ctx).map(|v| v.into_id(&ctx));
+        assert!(
+            matches!(equal, Ok(id) if id == Id::from_bool(false)),
+            "{equal:?}"
         );
     }
 
