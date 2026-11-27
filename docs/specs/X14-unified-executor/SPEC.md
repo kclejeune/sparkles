@@ -226,8 +226,8 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 ## Outcome
 
 Stages 1 and 3 have shipped, apart from item 484 of stage 3, which X16 holds with item
-479 of stage 2. Stage 4's accounting model, mode-neutral kernels and decoding twins have
-shipped, and the hierarchical budget of item 675 remains. Stage 5's
+479 of stage 2. Stage 4's query-memory accounting, mode-neutral kernels and decoding twins
+have shipped. Item 675 remains open for reasoning and incremental-view budgets. Stage 5's
 join-kernel library has shipped, and its other phases follow the
 [plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks the rest of the work.
 
@@ -1810,6 +1810,127 @@ instead of at the line's start, so item 696 follows it with `join_pairs`.
 The eager costs of 1% to 4% that stage 4 added to filters and aggregates, such as
 `subquery-agg` at 1.040 of 005df56d at 10.5M triples and `contains` at 1.036 at 1.05M
 triples, are unchanged, and item 682 holds them.
+
+### Fixed cost of the hierarchical budget
+
+An eager SELECT stores its charged projection metadata inline in the result backing.
+The query admits the vectors and names before building them and admits the inline
+storage as part of the result header before publishing it. Cursors still use one
+shared allocation for their variables and the batches that can outlive them.
+The common result header is larger for collected cursor, ASK and graph results.
+The fast account also owns a single grant reference and skips returning credit when
+it held none. Admission and pool granules are unchanged.
+
+Item 884 remains open pending a valid wall-time comparison on `atlas`. Set
+`BASE_BIN` and `TIP_BIN` to the server binaries built on the same Boat worker with
+matched `nix develop` compilers, identical release settings and
+`MBX_LEARNED_INCREMENTAL=false` from `0c425e86` and the item 884 tip. Set
+`PEOPLE_100K_ZST` to the 1.05M-triple synthetic dataset. Run the comparison under the
+timing kit's atlas locks. Arm C runs the base binary again as a same-binary control
+for all four small queries. Use syscall spinners in every arm so that a wake-up can
+run before the next scheduler tick.
+
+```sh
+python3 scripts/timing-kit.py stage --out .artifacts/884-atlas \
+  --base "A=$BASE_BIN" --tip "B=$TIP_BIN" --tip "C=$BASE_BIN" --data "$PEOPLE_100K_ZST" \
+  --only count-all,distinct-obj,predicate-counts,employee-docs,class-predicates,contains,two-hop-count \
+  --controls class-predicates,contains,two-hop-count --execution auto --spin-loop syscall \
+  --serve-args="--total-query-memory-mb 256" --rounds 18 --reps 200 --rotate \
+  --rerun-rounds 24 --rerun-reps 300
+printf 'STORE_OF_B=A\nSTORE_OF_C=A\n' >> .artifacts/884-atlas/run.env
+python3 scripts/timing-kit.py preflight .artifacts/884-atlas
+python3 scripts/timing-kit.py launch --host atlas --unit item-884-atlas .artifacts/884-atlas
+```
+
+After `DONE` reports exit 0, copy back `pass1` and retain its summaries and raw samples.
+Check the `wall_ms` distributions in `pass1/results/samples.tsv` for all three arms on
+the four small queries and reject a run with clusters at scheduler tick boundaries.
+The kit's execution verdict can leave a wall-only cost unflagged. Check wall and
+execution separately with paired per-round medians from `pass1/results/samples.tsv`,
+bootstrapping whole three-round rotations of per-round microsecond differences
+`1000 * (median(other) - median(A))` for absolute bounds and per-round ratios for the
+relative criterion. The wall control's 95% interval must fit inside ±2 µs for every
+query. The tip must meet the [Intel rule](PLAN.md#the-intel-rule) for both metrics,
+and the wall interval's paired upper bound must also be below 2 µs added.
+
+```sh
+python3 - .artifacts/884-atlas/pass1 <<'PY'
+import csv
+import json
+import random
+import statistics as stats
+import subprocess
+import sys
+from collections import defaultdict
+from itertools import chain
+from pathlib import Path
+
+run = Path(sys.argv[1])
+rounds = int(next(line.split("=", 1)[1] for line in (run / "run.env").read_text().splitlines()
+                  if line.startswith("ROUNDS=")))
+if rounds < 18 or rounds % 3:
+    sys.exit("Use at least 18 rounds in complete three-round rotations")
+queries = ("count-all", "distinct-obj", "predicate-counts", "employee-docs")
+samples = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+with (run / "results" / "samples.tsv").open() as fh:
+    for row in csv.DictReader(fh, delimiter="\t"):
+        if row["query"] not in queries or row["exec_ms"] == "error":
+            continue
+        r = int(row["round"])
+        for metric in ("wall_ms", "exec_ms"):
+            samples[(row["query"], metric)][row["variant"]][r].append(float(row[metric]))
+
+def boot_interval(values, seed):
+    rng = random.Random(seed)
+    rotations = [values[i:i+3] for i in range(0, len(values), 3)]
+    boot = [stats.median(chain.from_iterable(rng.choices(rotations, k=len(rotations))))
+            for _ in range(10_000)]
+    low, *_, high = stats.quantiles(boot, n=40, method="inclusive")
+    return low, stats.median(values), high
+
+accepted = True
+for pair, other, metrics in (("A-C", "C", ("wall_ms",)), ("A-B", "B", ("wall_ms", "exec_ms"))):
+    summary = run / f"summary-{pair}.json"
+    subprocess.run([sys.executable, "scripts/nsc-bench-summary.py", "--check",
+                    str(summary), "first"], check=True)
+    data = json.loads(summary.read_text())
+    if data["errors"]:
+        sys.exit(f"Failed timed requests in {pair}")
+    for query in queries:
+        for metric in metrics:
+            cell = data["queries"][query][metric]
+            ratios = cell["rounds"]
+            if len(ratios) != rounds or min(cell["epochs_a"], cell["epochs_b"]) != 2 * rounds:
+                sys.exit(f"Incomplete rotations for {pair} {query} {metric}")
+            by_var = samples[(query, metric)]
+            common = sorted(set(by_var["A"]) & set(by_var[other]))
+            if len(common) != rounds:
+                sys.exit(f"Incomplete sample rounds for {pair} {query} {metric}")
+            diffs_us = [1000 * (stats.median(by_var[other][r]) - stats.median(by_var["A"][r]))
+                        for r in common]
+            low, estimate, high = boot_interval(ratios, 884)
+            low_us, added_us, high_us = boot_interval(diffs_us, 884)
+            ok = (high <= 1.02 or added_us <= 0.5) if pair == "A-B" else low_us > -2
+            if metric == "wall_ms":
+                ok = ok and high_us < 2
+            accepted &= ok
+            print(f"{pair} {query} {metric}: medians {cell['a']:.6f}, {cell['b']:.6f} ms, "
+                  f"ratio {estimate:.4f} [{low:.4f}, {high:.4f}], "
+                  f"added {added_us:+.2f} µs [{low_us:+.2f}, {high_us:+.2f}], "
+                  f"{'pass' if ok else 'check with a repeat'}")
+sys.exit(0 if accepted else 1)
+PY
+```
+
+If the controls fail or the wall intervals leave a 2 µs effect unresolved, stage a
+fresh run of all arms with 36 rounds and 300 requests per round, even when the kit
+selects no rerun. Report a wall improvement only if its interval lies below zero.
+The adjacent comparison measures the effect of the item 884 change on one shared store.
+To estimate the remaining cost against the earlier query path, repeat the same procedure
+using `001f2328`, the first parent of the query hierarchy merge `65686274`, for both A
+and C, keeping `STORE_OF_C=A`, verifying store-format compatibility before setting
+`STORE_OF_B=A`, and recording separate imports if the older format requires them.
+Report that comparison separately because it includes changes between the two bases.
 
 ### Checked result output
 

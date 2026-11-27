@@ -403,8 +403,13 @@ pub struct QueryResult {
     inner: Arc<ResultBacking>,
 }
 
+enum ResultVariables {
+    Eager(cursor::Variables),
+    Shared(Arc<cursor::Variables>),
+}
+
 struct ResultBacking {
-    variables: Option<Arc<cursor::Variables>>,
+    variables: Option<ResultVariables>,
     table: Table,
     triples: Vec<Triple>,
     quads: Vec<Quad>,
@@ -429,7 +434,7 @@ impl Drop for ResultBacking {
 // callers or detach a credited payload, even when the public handle is cloned.
 struct ResultParts {
     kind: QueryKind,
-    variables: Option<Arc<cursor::Variables>>,
+    variables: Option<ResultVariables>,
     table: Table,
     boolean: bool,
     triples: Vec<Triple>,
@@ -526,10 +531,11 @@ impl QueryResult {
     }
 
     pub fn variables(&self) -> &[String] {
-        self.inner
-            .variables
-            .as_ref()
-            .map_or(&[], |variables| &variables.names)
+        match &self.inner.variables {
+            Some(ResultVariables::Eager(variables)) => &variables.names,
+            Some(ResultVariables::Shared(variables)) => &variables.names,
+            None => &[],
+        }
     }
     pub fn table(&self) -> table::TableView<'_> {
         table::TableView::new(&self.inner.table)
@@ -1559,10 +1565,7 @@ pub fn select_star_order(q: &str, r: &mut QueryResult) -> Result<()> {
     }
     r.inner.ctx.check()?;
     if Arc::strong_count(&r.inner) != 1
-        || r.inner
-            .variables
-            .as_ref()
-            .is_some_and(|variables| Arc::strong_count(variables) != 1)
+        || matches!(&r.inner.variables, Some(ResultVariables::Shared(vars)) if Arc::strong_count(vars) != 1)
     {
         return Err(Error::invalid("cannot reorder a shared query result"));
     }
@@ -1584,12 +1587,12 @@ pub fn select_star_order(q: &str, r: &mut QueryResult) -> Result<()> {
     r.inner.ctx.check()?;
     // No fallible operation remains once the first visible permutation starts.
     let backing = Arc::get_mut(&mut r.inner).expect("unique query result");
-    let variables = backing
-        .variables
-        .as_mut()
-        .map(|variables| Arc::get_mut(variables).expect("unique query variables"));
-    let Some(variables) = variables else {
-        return Ok(());
+    let variables = match &mut backing.variables {
+        Some(ResultVariables::Eager(variables)) => variables,
+        Some(ResultVariables::Shared(variables)) => {
+            Arc::get_mut(variables).expect("unique query variables")
+        }
+        None => return Ok(()),
     };
     for first in 0..order.len() {
         let mut at = first;
@@ -2012,7 +2015,7 @@ fn execute_prepared(
 #[inline(never)]
 fn select_output(
     ctx: &Arc<Ctx>,
-    variables: Arc<cursor::Variables>,
+    variables: cursor::Variables,
     bound: &[(table::VarId, Id)],
     materialized: table::Materialized<'_>,
     result: &mut ResultParts,
@@ -2024,7 +2027,7 @@ fn select_output(
         materialized.project(ctx, &variables.ids)?
     };
     let retained = projected.into_retained(ctx)?;
-    result.variables = Some(variables);
+    result.variables = Some(ResultVariables::Eager(variables));
     result.table = retained.table;
     result._table_credit = retained.credit;
     // substituted variables report their bound value
@@ -2061,7 +2064,7 @@ fn execute_prepared_parts(
         Query::Select { .. } => {
             let started = Instant::now();
             let variables =
-                cursor::Variables::new(&ctx, &pattern, &node.vars, "").map_err(|error| {
+                cursor::Variables::eager(&ctx, &pattern, &node.vars).map_err(|error| {
                     let mut plan = ctx.failed_plan();
                     if let Some(p) = &mut plan {
                         p.warnings = ctx.warnings();
@@ -3087,6 +3090,83 @@ mod result_backing_tests {
                 assert!(matches!(result, Err(Error::Invalid(_))));
             }
             assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
+
+    const SMALL_SELECT: &str = "SELECT ?x WHERE { VALUES ?x { 1 } }";
+
+    #[test]
+    fn small_eager_queries_share_the_pool_cap_until_the_last_result_drops() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let cap = 64 << 10;
+        let pool = pool::QueryPool::new(cap);
+        let opts = QueryOptions {
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+        let snapshot = store.snapshot();
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| query(snapshot.clone(), SMALL_SELECT, &opts));
+            let second = scope.spawn(|| query(snapshot.clone(), SMALL_SELECT, &opts));
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        let (result, refusal) = match (first, second) {
+            (Ok(result), Err(refusal)) | (Err(refusal), Ok(result)) => (result, refusal),
+            _ => panic!("one small query must take the pool's only grant"),
+        };
+        assert!(matches!(refusal, Error::BudgetExceeded(b)
+            if b.kind == crate::BudgetKind::ServerMemory && b.limit == cap));
+        assert!(matches!(
+            &result.inner.variables,
+            Some(ResultVariables::Eager(_))
+        ));
+        assert_eq!(result.variables(), ["x"]);
+        assert_eq!(pool.granted(), cap);
+        let last = result.clone();
+        drop(result);
+        assert_eq!(pool.granted(), cap);
+        drop(last);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn eager_variable_credit_returns_after_result_cancellation_and_unwind() {
+        struct InjectedPanic;
+        let store = crate::store::Store::in_memory(Default::default());
+        for unwind in [false, true] {
+            let pool = pool::QueryPool::new(64 << 10);
+            let grant = Arc::new(pool.empty_grant());
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let opts = QueryOptions {
+                grant: Some(grant.clone()),
+                cancel: Some(cancel.clone()),
+                ..Default::default()
+            };
+            let observed_grant = grant.clone();
+            let hook = probe::install(
+                move |point| {
+                    if let probe::Point::Allocation("query-result-backing", 1) = point {
+                        assert!(observed_grant.used() > 0);
+                        if unwind {
+                            std::panic::panic_any(InjectedPanic);
+                        }
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                },
+                None,
+            );
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                query(store.snapshot(), SMALL_SELECT, &opts)
+            }));
+            drop(hook);
+            if unwind {
+                assert!(matches!(outcome, Err(payload) if payload.is::<InjectedPanic>()));
+            } else {
+                assert!(matches!(outcome.unwrap(), Err(Error::Cancelled)));
+            }
+            assert_eq!(grant.used(), 0);
+            drop((opts, grant));
+            assert_eq!(pool.granted(), 0);
         }
     }
 

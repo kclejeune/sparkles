@@ -304,11 +304,26 @@ impl Variables {
         node_vars: &[VarId],
         query: &str,
     ) -> Result<(u64, u64)> {
-        let projected = pattern.and_then(Self::projection);
+        Self::estimate(
+            ctx,
+            pattern.and_then(Self::projection),
+            node_vars,
+            query,
+            arc_backing_bytes::<Self>(ctx)?,
+        )
+    }
+
+    fn estimate(
+        ctx: &Ctx,
+        projected: Option<&[oxrdf::Variable]>,
+        node_vars: &[VarId],
+        query: &str,
+        header: u64,
+    ) -> Result<(u64, u64)> {
         let count = projected.map_or(node_vars.len(), <[_]>::len);
         let overflow = || ctx.memory_exceeded(u64::MAX);
         let (text_bytes, longest) = {
-            let names = ctx.var_names.read();
+            let names = projected.is_none().then(|| ctx.var_names.read());
             let mut bytes = 0usize;
             let mut longest = 0usize;
             for index in 0..count {
@@ -318,6 +333,8 @@ impl Variables {
                 let name = match projected {
                     Some(variables) => variables[index].as_str(),
                     None => names
+                        .as_ref()
+                        .expect("unprojected query variables")
                         .get(node_vars[index] as usize)
                         .ok_or_else(|| Error::invalid("invalid cursor output variable"))?
                         .as_str(),
@@ -345,7 +362,7 @@ impl Variables {
             .checked_mul(std::mem::size_of::<String>() + std::mem::size_of::<VarId>())
             .and_then(|n| n.checked_add(text_bytes))
             .ok_or_else(overflow)?;
-        let retained = arc_backing_bytes::<Self>(ctx)?
+        let retained = header
             .checked_add(u64::try_from(payload).map_err(|_| overflow())?)
             .ok_or_else(overflow)?;
         Ok((retained, workspace))
@@ -357,10 +374,36 @@ impl Variables {
         node_vars: &[VarId],
         query: &str,
     ) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self::build(
+            ctx,
+            pattern,
+            node_vars,
+            query,
+            arc_backing_bytes::<Self>(ctx)?,
+        )?))
+    }
+
+    /// An eager result owns the variables inline and pays for that storage when
+    /// it admits its result backing. The variable vectors and names are paid here.
+    pub(super) fn eager(
+        ctx: &Arc<Ctx>,
+        pattern: &spargebra::algebra::GraphPattern,
+        node_vars: &[VarId],
+    ) -> Result<Self> {
+        Self::build(ctx, pattern, node_vars, "", 0)
+    }
+
+    fn build(
+        ctx: &Arc<Ctx>,
+        pattern: &spargebra::algebra::GraphPattern,
+        node_vars: &[VarId],
+        query: &str,
+        header: u64,
+    ) -> Result<Self> {
         let projected = Self::projection(pattern);
         let count = projected.map_or(node_vars.len(), <[_]>::len);
         let overflow = || ctx.memory_exceeded(u64::MAX);
-        let (bytes, workspace_bytes) = Self::estimate_bytes(ctx, Some(pattern), node_vars, query)?;
+        let (bytes, workspace_bytes) = Self::estimate(ctx, projected, node_vars, query, header)?;
         let star = workspace_bytes > 0;
         let workspace = if star {
             Some(ctx.charge(workspace_bytes)?)
@@ -468,11 +511,11 @@ impl Variables {
                 }
             }
         }
-        let variables = Arc::new(Self {
+        let variables = Self {
             names,
             ids,
             _charge: charge.into_output(ctx),
-        });
+        };
         drop(workspace);
         Ok(variables)
     }
@@ -2837,7 +2880,7 @@ impl QueryCursor {
             .into_retained(&self.ctx)?;
         super::ResultParts {
             kind: QueryKind::Select,
-            variables: Some(self.variables.clone()),
+            variables: Some(super::ResultVariables::Shared(self.variables.clone())),
             table: output.table,
             boolean: false,
             triples: Vec::new(),
@@ -8266,6 +8309,36 @@ mod retained_variable_tests {
         )
         .unwrap();
         (pool, cursor)
+    }
+
+    #[test]
+    fn eager_projection_avoids_the_shared_variable_allocation() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let context = Ctx::new(store.snapshot());
+        let id = context.var("x");
+        let ctx = Arc::new(context);
+        let pattern = spargebra::algebra::GraphPattern::Bgp {
+            patterns: Vec::new(),
+        };
+        let (shared, shared_stats) = crate::test_alloc::record_alloc_stats(|| {
+            Variables::new(&ctx, &pattern, &[id], "").unwrap()
+        });
+        let header = arc_backing_bytes::<Variables>(&ctx).unwrap();
+        let shared_bytes = ctx.live_bytes();
+        drop(shared);
+
+        let (eager, eager_stats) = crate::test_alloc::record_alloc_stats(|| {
+            Variables::eager(&ctx, &pattern, &[id]).unwrap()
+        });
+        assert_eq!(eager.names, ["x"]);
+        assert_eq!(eager.ids, [id]);
+        assert_eq!(ctx.live_bytes(), shared_bytes - header);
+        assert_eq!(
+            shared_stats.total_alloc - eager_stats.total_alloc,
+            header as usize
+        );
+        drop(eager);
+        assert_eq!(ctx.live_bytes(), 0);
     }
 
     #[test]
