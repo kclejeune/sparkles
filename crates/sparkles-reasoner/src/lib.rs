@@ -1354,17 +1354,13 @@ fn run_materialization(
         // A rejected preparation can release a copy lease under both the
         // import journal and RDF writer. Drain callbacks on their owning
         // thread after rollback (or commit) and reasoning permit release.
-        sparkles_core::sparql::pool::QueryPool::with_materialization_wakes(
-            opts.memory_parent.as_ref(),
-            || with_permit(opts, materialize),
-            |result| {
-                let report = result?;
-                if let Some(callback) = &opts.progress {
-                    pool::report_done(opts.pool.as_ref(), callback);
-                }
-                Ok(report)
-            },
-        )
+        let report = sparkles_core::sparql::pool::QueryPool::with_deferred_release_wakes(|| {
+            with_permit(opts, materialize)
+        })?;
+        if let Some(callback) = &opts.progress {
+            pool::report_done(opts.pool.as_ref(), callback);
+        }
+        Ok(report)
     })
 }
 

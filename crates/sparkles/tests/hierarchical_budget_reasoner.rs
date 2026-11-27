@@ -2701,3 +2701,126 @@ fn delayed_clear_orders_replacement_loads_of_a_pending_import() {
         }
     }
 }
+
+#[test]
+fn interrupted_replacement_load_recovers_only_committed_provenance() {
+    use std::process::Command;
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+
+    const CHILD: &str = "SPARKLES_REPLACEMENT_LOAD_CRASH";
+    const ROOT: &str = "SPARKLES_REPLACEMENT_LOAD_CRASH_ROOT";
+    const EXIT_AT_FAILPOINT: i32 = 42;
+    const BEFORE_WAL: &str = "group-preallocating";
+    const AFTER_WAL: &str = "group-written";
+    if let Ok(point) = std::env::var(CHILD) {
+        let point = [BEFORE_WAL, AFTER_WAL]
+            .into_iter()
+            .find(|&name| name == point)
+            .unwrap();
+        let dir = std::path::PathBuf::from(std::env::var_os(ROOT).unwrap());
+        let source = dir.join("import.ttl");
+        let ds = Dataset::open_with(
+            dir.join("db"),
+            DatasetOptions {
+                pool: Some(QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap()),
+                closure_cache_triples: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut request = mapped_import(&ds, &source, "urn:reload");
+        leave_import_pending(&ds, &request);
+        std::fs::write(&source, "<urn:s> <urn:p> <urn:replacement> .").unwrap();
+
+        let timeout = Duration::from_secs(10);
+        let (ready, committed) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let wait = Mutex::new(wait);
+        ds.store().set_failpoint(
+            "reasoning-clear-committed",
+            Some(Arc::new(move |_| {
+                ready.send(()).unwrap();
+                wait.lock().unwrap().recv_timeout(timeout).unwrap();
+            })),
+        );
+        let (finished, cleared) = mpsc::channel();
+        let clearing = ds.clone();
+        std::thread::spawn(move || {
+            clearing.reasoning().clear().unwrap();
+            finished.send(()).unwrap();
+        });
+        committed.recv_timeout(timeout).unwrap();
+        let cleared = Mutex::new(cleared);
+        ds.store().set_failpoint(
+            point,
+            Some(Arc::new(move |_| {
+                release.send(()).unwrap();
+                cleared.lock().unwrap().recv_timeout(timeout).unwrap();
+                std::process::exit(EXIT_AT_FAILPOINT);
+            })),
+        );
+        request.refresh_imports = true;
+        ds.reasoning().run(&request).unwrap();
+        panic!("replacement LOAD skipped the failpoint");
+    }
+
+    for (point, committed, reuse_sequence) in [
+        (AFTER_WAL, true, false),
+        (BEFORE_WAL, false, false),
+        (BEFORE_WAL, false, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "interrupted_replacement_load_recovers_only_committed_provenance",
+                "--nocapture",
+            ])
+            .env(CHILD, point)
+            .env(ROOT, dir.path())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(EXIT_AT_FAILPOINT), "{point}");
+        let root = dir.path().join("db");
+        if reuse_sequence {
+            use sparkles::store::Store;
+            let store = Store::open(&root, Default::default()).unwrap();
+            sparkles::sparql::update::update(
+                &store,
+                "INSERT DATA { <urn:unrelated> <urn:p> <urn:o> }",
+                &QueryOptions::default(),
+            )
+            .unwrap();
+        }
+        let ds = Dataset::open(root).unwrap();
+        let ask = |object| {
+            ds.ask(&format!(
+                "ASK {{ GRAPH <urn:reload> {{ <urn:s> <urn:p> <urn:{object}> }} }}"
+            ))
+            .unwrap()
+        };
+        assert_eq!(ask("first"), !committed, "{point}");
+        assert_eq!(ask("replacement"), committed, "{point}");
+
+        let source = dir.path().join("import.ttl");
+        let mut request = ReasonRequest::default();
+        request.inputs.imports = sparkles::reasoning::reasoner::ImportMode::Fetch;
+        request
+            .inputs
+            .location_mapping
+            .names
+            .insert("urn:reload".into(), format!("file://{}", source.display()));
+        request.refresh_imports = true;
+        std::fs::write(source, "<urn:s> <urn:p> <urn:updated> .").unwrap();
+        let record = ds.reasoning().run(&request).unwrap().record;
+        assert_eq!(
+            record.fetched_imports.contains(&"urn:reload".into()),
+            committed,
+            "{point}"
+        );
+        assert_eq!(ask("updated"), committed, "{point}");
+        assert_eq!(ask("first"), !committed, "{point}");
+        assert!(!ask("replacement"), "{point}");
+    }
+}

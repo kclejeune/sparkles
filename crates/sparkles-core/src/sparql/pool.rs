@@ -40,10 +40,32 @@ fn round_up(bytes: u64) -> u64 {
 
 type Waker = Arc<dyn Fn() + Send + Sync>;
 
+#[derive(Clone)]
+enum Wake {
+    Callback(Waker),
+    Signal(std::sync::mpsc::SyncSender<()>),
+}
+
+impl Wake {
+    fn notify(self, pool: &Arc<QueryPool>) {
+        match self {
+            Self::Callback(callback) => {
+                if !wakes::defer(pool) {
+                    callback();
+                }
+            }
+            Self::Signal(sender) => {
+                // One queued signal suffices. This never invokes user code.
+                let _ = sender.try_send(());
+            }
+        }
+    }
+}
+
 struct Waiter {
     ticket: u64,
     bytes: u64,
-    wake: Option<Waker>,
+    wake: Option<Wake>,
 }
 
 #[derive(Default)]
@@ -136,16 +158,16 @@ impl QueryPool {
         // least one side sees the other, so a release never skips the wake-up of a
         // waiter that did not see the freed memory.
         self.granted.fetch_sub(bytes, Ordering::SeqCst);
-        if self.waiting.load(Ordering::SeqCst) > 0 && !wakes::defer(self) {
+        if self.waiting.load(Ordering::SeqCst) > 0 {
             self.wake();
         }
     }
 
-    fn wake(&self) {
+    fn wake(self: &Arc<Self>) {
         // the callback runs outside the lock, so that it may poll its ticket
         let next = self.next_to_serve(&self.queue.lock());
-        if let Some((_, Some(f))) = next {
-            f();
+        if let Some((_, Some(wake))) = next {
+            wake.notify(self);
         }
         self.changed.notify_all();
     }
@@ -155,7 +177,7 @@ impl QueryPool {
     /// fits, so a release wakes the waiters that fit one after another instead of all of
     /// them. A waiter that was woken but finds the memory taken again passes the wake-up
     /// on in the same way. Blocking waiters have no callback and wait on `changed`.
-    fn next_to_serve(&self, q: &Queue) -> Option<(u64, Option<Waker>)> {
+    fn next_to_serve(&self, q: &Queue) -> Option<(u64, Option<Wake>)> {
         let granted = self.granted.load(Ordering::SeqCst);
         (0..q.waiters.len())
             .find(|&pos| {
@@ -192,9 +214,23 @@ impl QueryPool {
 
     /// Join the admission queue for an initial grant of `bytes`. `wake` is called when
     /// the pool's state changes, so that an async caller can poll again.
-    /// It runs synchronously during release, including Drop, and must not panic.
+    /// It may run synchronously during release, including Drop, and must not panic.
     /// Callback panics are not contained.
     pub fn enter(self: &Arc<Self>, bytes: u64, wake: Option<Waker>) -> Ticket {
+        self.enqueue(bytes, wake.map(Wake::Callback))
+    }
+
+    /// Join the admission queue with a signal receiver. Signals can be delivered
+    /// while callbacks are deferred. Poll the ticket after receiving a signal.
+    pub fn enter_with_signal(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> (Ticket, std::sync::mpsc::Receiver<()>) {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        (self.enqueue(bytes, Some(Wake::Signal(sender))), receiver)
+    }
+
+    fn enqueue(self: &Arc<Self>, bytes: u64, wake: Option<Wake>) -> Ticket {
         let bytes = self.clamp(bytes);
         let mut q = self.queue.lock();
         let ticket = q.next_ticket;
@@ -293,14 +329,14 @@ impl Ticket {
             // so the wake-up goes on to it rather than ending here.
             let next = pool.next_to_serve(&q);
             drop(q);
-            if let Some((ticket, Some(f))) = next
+            if let Some((ticket, Some(wake))) = next
                 && ticket != self.ticket
             {
-                f();
+                wake.notify(&pool);
             }
             return None;
         }
-        q.waiters.remove(pos);
+        let served = q.waiters.remove(pos);
         q.bypassed = if pos == 0 { 0 } else { q.bypassed + 1 };
         pool.waiting.store(q.waiters.len(), Ordering::SeqCst);
         pool.admitted.fetch_add(1, Ordering::Relaxed);
@@ -308,8 +344,10 @@ impl Ticket {
         // the next waiter may fit in what is left
         let next = pool.next_to_serve(&q);
         drop(q);
-        if let Some((_, Some(f))) = next {
-            f();
+        // Dropping the closure's captured values can also run user code.
+        drop(served);
+        if let Some((_, Some(wake))) = next {
+            wake.notify(&pool);
         }
         pool.changed.notify_all();
         Some(PoolGrant::with(pool.clone(), self.bytes))
@@ -322,13 +360,17 @@ impl Drop for Ticket {
             return;
         }
         let mut q = self.pool.queue.lock();
-        if q.waiters.front().is_some_and(|w| w.ticket == self.ticket) {
+        let Some(pos) = q.waiters.iter().position(|w| w.ticket == self.ticket) else {
+            return;
+        };
+        if pos == 0 {
             // the next head starts with no bypasses behind it
             q.bypassed = 0;
         }
-        q.waiters.retain(|w| w.ticket != self.ticket);
+        let cancelled = q.waiters.remove(pos);
         self.pool.waiting.store(q.waiters.len(), Ordering::SeqCst);
         drop(q);
+        drop(cancelled);
         // a smaller request behind this one may fit now
         self.pool.wake();
     }

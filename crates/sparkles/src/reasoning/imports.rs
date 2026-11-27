@@ -1,16 +1,17 @@
 //! Recovery of independent LOADs before their names reach a materialization record.
+use crate::Result;
 use crate::dataset::RecordedReasoning;
 use crate::sparql::pool::QueryPool;
-use crate::{Result, store::Store};
+use crate::store::{Store, import_journal};
 #[cfg(feature = "reasoning")]
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Serialize, Serializer};
 use sparkles_budget::MemoryLease;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-pub(crate) const FILE: &str = "reasoning-imports.json";
+pub(crate) use import_journal::FILE;
 
 /// Membership is private to the dataset. Snapshots and branches share the names.
 #[derive(Default)]
@@ -217,14 +218,13 @@ impl PendingImports {
     }
 
     #[cfg(any(feature = "reasoning", feature = "backup"))]
-    fn snapshot(
+    fn snapshot<'a>(
         &self,
-        publishing: &[Arc<Publishing>],
+        publishing: impl Iterator<Item = &'a Publishing> + Clone,
         parent: Option<sparkles_budget::ParentHandle>,
         limit: Option<u64>,
     ) -> Result<NameSnapshot> {
-        let loaded = self.entries().count();
-        let count = loaded + publishing.len();
+        let count = self.entries().count() + publishing.clone().count();
         let bytes = (count * size_of::<Arc<PendingName>>()) as u64;
         if let Some(limit) = limit
             && bytes > limit
@@ -241,10 +241,9 @@ impl PendingImports {
             .map_err(super::parent_error)?;
         let mut names = Vec::with_capacity(count);
         names.extend(self.entries().map(|e| e.name.clone()));
-        names.extend(publishing.iter().map(|intent| intent.name.clone()));
+        names.extend(publishing.map(|intent| intent.name.clone()));
         Ok(NameSnapshot {
             names,
-            loaded,
             _credit: credit,
         })
     }
@@ -259,7 +258,7 @@ impl PendingImports {
             .as_ref()
             .map(|g| g.memory_parent())
             .or_else(|| options.pool.as_ref().map(|p| p.work_parent()));
-        let snapshot = self.snapshot(&[], parent, options.max_memory_bytes)?;
+        let snapshot = self.snapshot(std::iter::empty(), parent, options.max_memory_bytes)?;
         if let Some(limit) = &mut options.max_memory_bytes {
             *limit -= (snapshot.names.len() * size_of::<Arc<PendingName>>()) as u64;
         }
@@ -293,18 +292,10 @@ impl PendingImports {
         pool: Option<&Arc<QueryPool>>,
         recorded: &[String],
     ) -> Result<Self> {
-        #[derive(Deserialize)]
-        struct Saved {
-            imports: Vec<String>,
-            publishing: Vec<String>,
-        }
         let mut pending = Self::default();
-        let bytes = match std::fs::read(root.join(FILE)) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(pending),
-            Err(e) => return Err(e.into()),
+        let Some(saved) = import_journal::read(root)? else {
+            return Ok(pending);
         };
-        let saved: Saved = crate::formats::settings_from_slice(FILE, &bytes)?;
         let mut reconcile = !saved.publishing.is_empty();
         for iri in saved.imports {
             if recorded.contains(&iri) || pending.contains(&iri) {
@@ -313,15 +304,26 @@ impl PendingImports {
             }
             pending.push(Entry::prepare(&iri, pool)?);
         }
-        // The pre-publication hook runs under the store writer. A crash can
-        // leave the intent on either side of the commit of a newly populated graph.
         let snap = store.snapshot();
-        for iri in saved.publishing {
-            if let Some(id) = snap.lookup_iri(&iri)
-                && snap.count(crate::index::Perm::Gspo, &[id.0])? != 0
-                && !pending.contains(&iri)
-                && !recorded.contains(&iri)
-            {
+        for intent in saved.publishing {
+            let (iri, committed) = match intent {
+                import_journal::Intent::Legacy(iri) => {
+                    // Older journals only recorded the name of the target graph.
+                    let present = snap
+                        .lookup_iri(&iri)
+                        .map(|id| snap.count(crate::index::Perm::Gspo, &[id.0]))
+                        .transpose()?
+                        .is_some_and(|count| count != 0);
+                    (iri, present)
+                }
+                import_journal::Intent::Tracked(p) => {
+                    // The writer reserves this sequence for this LOAD. After it
+                    // writes the intent, committing a different write at the
+                    // same sequence requires reopen and this reconciliation.
+                    (p.iri, p.commit <= snap.commit)
+                }
+            };
+            if committed && !pending.contains(&iri) && !recorded.contains(&iri) {
                 pending.push(Entry::prepare(&iri, pool)?);
             }
         }
@@ -337,8 +339,6 @@ impl PendingImports {
 #[cfg(any(feature = "reasoning", feature = "backup"))]
 pub(crate) struct NameSnapshot {
     names: Vec<Arc<PendingName>>,
-    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
-    loaded: usize,
     _credit: Option<MemoryLease>,
 }
 
@@ -355,12 +355,11 @@ impl NameSnapshot {
         if self.names.is_empty() {
             return Ok(None);
         }
-        let (loaded, publishing) = self.names.split_at(self.loaded);
         let mut bytes = Vec::new();
         write_names(
             &mut bytes,
-            loaded.iter().map(Arc::as_ref),
-            publishing.iter().map(Arc::as_ref),
+            self.names.iter().map(Arc::as_ref),
+            std::iter::empty(),
         )?;
         Ok(Some(bytes))
     }
@@ -369,7 +368,7 @@ impl NameSnapshot {
 fn write_names<'a>(
     writer: impl Write,
     loaded: impl Iterator<Item = &'a PendingName> + Clone,
-    publishing: impl Iterator<Item = &'a PendingName> + Clone,
+    publishing: impl Iterator<Item = &'a Publishing> + Clone,
 ) -> std::io::Result<()> {
     struct Names<I>(I);
     impl<I: Iterator + Clone> Serialize for Names<I>
@@ -387,37 +386,48 @@ fn write_names<'a>(
         publishing: P,
     }
     let saved = Saved {
-        format: 1,
+        format: if publishing.clone().next().is_some() {
+            2
+        } else {
+            1
+        },
         imports: Names(loaded),
-        publishing: Names(publishing),
+        publishing: Names(publishing.map(|p| import_journal::Publication {
+            iri: p.name.as_ref(),
+            commit: p.stamp().commit,
+        })),
     };
     serde_json::to_writer(writer, &saved).map_err(std::io::Error::from)
 }
 
 struct Publishing {
     name: Arc<PendingName>,
-    #[cfg(feature = "reasoning")]
-    loaded_after: std::sync::OnceLock<u64>,
+    stamp: std::sync::OnceLock<PublicationStamp>,
     _credit: Option<MemoryLease>,
 }
 
-#[cfg(feature = "reasoning")]
+struct PublicationStamp {
+    #[cfg(feature = "reasoning")]
+    loaded_after: u64,
+    commit: u64,
+}
+
 impl Publishing {
+    fn stamp(&self) -> &PublicationStamp {
+        self.stamp
+            .get()
+            .expect("intent stamped under the RDF writer")
+    }
+
+    #[cfg(feature = "reasoning")]
     fn new(name: Arc<PendingName>, pool: Option<&Arc<QueryPool>>) -> Result<Arc<Self>> {
         // Arc counters and the journal vector, which shrinks above four slots per intent.
         let bytes = size_of::<Self>() + 6 * size_of::<usize>();
         Ok(Arc::new(Self {
             name,
-            loaded_after: Default::default(),
+            stamp: Default::default(),
             _credit: RecordedReasoning::reserve(pool, bytes as u64)?,
         }))
-    }
-
-    fn sequence(&self) -> u64 {
-        *self
-            .loaded_after
-            .get()
-            .expect("intent stamped under the RDF writer")
     }
 }
 
@@ -445,9 +455,18 @@ impl From<PendingImports> for ImportJournal {
 
 impl ImportJournal {
     #[cfg(feature = "backup")]
-    pub(crate) fn backup_snapshot(&self, pool: Option<&Arc<QueryPool>>) -> Result<NameSnapshot> {
+    pub(crate) fn backup_snapshot(
+        &self,
+        pool: Option<&Arc<QueryPool>>,
+        commit: u64,
+    ) -> Result<NameSnapshot> {
+        let published = self
+            .publishing
+            .iter()
+            .map(Arc::as_ref)
+            .filter(|p| p.stamp().commit <= commit);
         self.loaded
-            .snapshot(&self.publishing, pool.map(|p| p.work_parent()), None)
+            .snapshot(published, pool.map(|p| p.work_parent()), None)
     }
 
     fn save(&self, store: &Store) -> Result<()> {
@@ -480,8 +499,8 @@ impl ImportJournal {
         let publishing = self
             .publishing
             .iter()
-            .filter(move |i| keep_publishing(i))
-            .map(|i| i.name.as_ref());
+            .map(Arc::as_ref)
+            .filter(move |i| keep_publishing(i));
         if publishing.clone().next().is_none() && loaded.clone().next().is_none() {
             return match std::fs::remove_file(path) {
                 Ok(()) => super::sync_dir(root),
@@ -505,7 +524,6 @@ impl crate::Dataset {
         update: &str,
         opts: &crate::sparql::QueryOptions,
     ) -> Result<()> {
-        let execute = |opts| crate::sparql::update::update(self.store(), update, opts).map(|_| ());
         let state = self.state();
         // A replacement LOAD needs its own publication intent. Share an existing
         // IRI allocation, but reserve its link before the writer can commit.
@@ -520,85 +538,57 @@ impl crate::Dataset {
             Some(name) => Entry::link(name, state.pool.as_ref())?,
             None => Entry::prepare(iri, state.pool.as_ref())?,
         };
-        let mut options = opts.clone();
-        let prior = options.write.before_publish.take();
-        let dataset = self.clone();
         let intent = Publishing::new(entry.name.clone(), state.pool.as_ref())?;
-        let publication = intent.clone();
-        options.write.before_publish = Some(crate::guard::PublishHook::new(move || {
-            if let Some(hook) = &prior {
-                (hook.0)()?;
-            }
-            let mut journal = dataset.state().pending_imports.lock();
-            if publication.loaded_after.get().is_none() {
-                journal.publishing.push(publication.clone());
-                if let Err(error) = journal.save(dataset.store()) {
-                    journal.publishing.pop();
-                    journal.publishing.shrink_to_fit();
-                    return Err(error);
-                }
-                publication
-                    .loaded_after
-                    .set(journal.next_run)
-                    .expect("serialized LOAD hook");
+        let before_commit = |commit| {
+            let mut journal = state.pending_imports.lock();
+            let stamp = PublicationStamp {
+                loaded_after: journal.next_run,
+                commit,
+            };
+            assert!(intent.stamp.set(stamp).is_ok(), "one commit per LOAD");
+            journal.publishing.push(intent.clone());
+            if let Err(error) = journal.save(self.store()) {
+                journal.publishing.pop();
+                journal.publishing.shrink_to_fit();
+                return Err(error);
             }
             Ok(())
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::sparql::update::update_with_commit_hook(
+                self.store(),
+                update,
+                opts,
+                &before_commit,
+            )
+            .map(|_| ())
         }));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(&options)));
-        let settled = QueryPool::with_deferred_release_wakes(|| -> Result<()> {
+        QueryPool::with_deferred_release_wakes(|| {
             let mut journal = state.pending_imports.lock();
             if let Some(index) = journal
                 .publishing
                 .iter()
                 .position(|v| Arc::ptr_eq(v, &intent))
             {
-                // A WAL fence or generation switch can fail after reaching disk.
-                // Keep the admitted intent until reopen can see the recovered graph.
-                if self.store().root().is_some()
-                    && matches!(
-                        &result,
-                        Ok(Err(crate::Error::Poisoned | crate::Error::Io(_)))
-                    )
-                {
-                    return Ok(());
+                let stamp = intent.stamp();
+                let committed = stamp.commit <= self.store().snapshot().commit;
+                // A fence or generation switch can reach disk without reaching
+                // the live snapshot. Keep that intent for recovery.
+                if !committed && self.store().root().is_some() {
+                    return;
                 }
                 journal.publishing.swap_remove(index);
                 if journal.publishing.capacity() > journal.publishing.len().saturating_mul(4) {
                     journal.publishing.shrink_to_fit();
                 }
-                let loaded = match &result {
-                    Ok(Ok(())) => true,
-                    Ok(Err(_)) => false,
-                    Err(_) => {
-                        let snap = self.store().snapshot();
-                        snap.lookup_iri(iri)
-                            .map(|id| snap.count(crate::index::Perm::Gspo, &[id.0]))
-                            .transpose()?
-                            .unwrap_or(0)
-                            != 0
-                    }
-                };
-                if loaded {
-                    journal.record_load(entry, intent.sequence());
-                } else {
-                    // Drop the refused intent from the durable list as well. A crash
-                    // before this rewrite is reconciled against the recovered graph.
-                    journal.save(self.store())?;
+                if committed {
+                    journal.record_load(entry, stamp.loaded_after);
                 }
             }
-            Ok(())
         });
         match result {
-            Ok(result) => {
-                settled?;
-                result
-            }
-            Err(panic) => {
-                if let Err(error) = settled {
-                    tracing::error!(%error, "could not reconcile an interrupted import");
-                }
-                std::panic::resume_unwind(panic)
-            }
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
         }
     }
 }
@@ -666,7 +656,11 @@ impl ImportJournal {
     pub(crate) fn finish_clear(&mut self, store: &Store, run: u64) -> Result<()> {
         // A committed writer can still be settling its intent. Retire that
         // intent at the same boundary so it cannot revive an older load.
-        self.clear_before(store, |e| e.loaded_after >= run, |i| i.sequence() >= run)
+        self.clear_before(
+            store,
+            |e| e.loaded_after >= run,
+            |i| i.stamp().loaded_after >= run,
+        )
     }
 
     #[cfg(feature = "reasoning")]
@@ -755,7 +749,15 @@ mod tests {
         }
         for (iri, stamp) in [("before", 0), ("after", clear)] {
             let intent = Publishing::new(Entry::prepare(iri, None).unwrap().name, None).unwrap();
-            intent.loaded_after.set(stamp).unwrap();
+            assert!(
+                intent
+                    .stamp
+                    .set(PublicationStamp {
+                        loaded_after: stamp,
+                        commit: stamp + 1
+                    })
+                    .is_ok()
+            );
             journal.publishing.push(intent);
         }
         // A failed write must leave both lists available to the retry.
@@ -770,7 +772,11 @@ mod tests {
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.path().join(FILE)).unwrap()).unwrap();
         assert_eq!(saved["imports"], serde_json::json!(["new", "middle"]));
-        assert_eq!(saved["publishing"], serde_json::json!(["after"]));
+        assert_eq!(saved["format"], 2);
+        assert_eq!(
+            saved["publishing"],
+            serde_json::json!([{ "iri": "after", "commit": clear + 1 }])
+        );
     }
 
     #[test]

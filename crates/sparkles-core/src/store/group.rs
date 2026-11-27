@@ -856,6 +856,7 @@ impl WriteTxn<'_> {
         validation: Option<Arc<crate::guard::ValidationSummary>>,
         grouped: bool,
         sync: &mut Option<(SyncPath, Duration)>,
+        hook: Option<crate::guard::CommitHook<'_>>,
     ) -> Result<Receipt> {
         let store = self.store;
         let group = store
@@ -965,6 +966,7 @@ impl WriteTxn<'_> {
                 "control_wal_bytes ({bytes}) underestimated encoded records ({data_len})"
             );
         }
+        self.guard.arm_commit_hook(hook, c.seq)?;
         // A merge's record is durable before its commit (open drops one above the head).
         if let Some(m) = self.merge.as_mut() {
             m.seq = c.seq;
@@ -4903,7 +4905,7 @@ mod tests {
                 .unwrap();
             txn.insert(ids).unwrap();
             let mut sync = None;
-            let err = txn.publish_grouped(None, group_commit, &mut sync);
+            let err = txn.publish_grouped(None, group_commit, &mut sync, None);
             drop(txn);
             assert!(
                 matches!(err, Err(Error::Corrupt(_))),

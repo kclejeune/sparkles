@@ -411,12 +411,31 @@ fn f16_reentry_from_run_threads_is_refused() {
 
 #[test]
 fn nested_done_can_wait_for_an_independent_query_wake() {
+    nested_done_wakes(true, true, "writing inferred graph");
+}
+
+#[test]
+fn nested_done_defers_cross_domain_query_callbacks() {
+    nested_done_wakes(true, false, "writing inferred graph");
+}
+
+#[test]
+fn nested_done_defers_query_callbacks_without_a_memory_parent() {
+    nested_done_wakes(false, false, "writing inferred graph");
+}
+
+#[test]
+fn nested_done_defers_query_callbacks_from_the_outer_reasoning_worker() {
+    nested_done_wakes(false, false, "reading the input graphs");
+}
+
+fn nested_done_wakes(has_parent: bool, same_domain: bool, outer_phase: &'static str) {
     use sparkles_core::sparql::pool::{GRANULE, QueryPool};
 
     within(
         Duration::from_secs(15),
         "the nested materialization",
-        || {
+        move || {
             let wait = |pool: &Arc<QueryPool>, wake: Arc<dyn Fn() + Send + Sync>| {
                 let blocker = pool
                     .work_parent()
@@ -429,7 +448,12 @@ fn nested_done_can_wait_for_an_independent_query_wake() {
             let outer = Arc::new(store(1));
             let inner = store(1);
             let outer_queries = QueryPool::new(4 * GRANULE);
-            let outer_parent = outer_queries.work_parent();
+            let outer_parent = has_parent.then(|| outer_queries.work_parent());
+            let waiter_pool = if same_domain {
+                outer_queries
+            } else {
+                QueryPool::new(4 * GRANULE)
+            };
             let inner_pool = thread_pool(1).unwrap();
             let outer_pool = thread_pool(1).unwrap();
             let outer_waiter = Arc::new(Mutex::new(None));
@@ -439,14 +463,14 @@ fn nested_done_can_wait_for_an_independent_query_wake() {
                 let outer_pool = outer_pool.clone();
                 let outer_waiter = outer_waiter.clone();
                 Arc::new(move |_: f32, phase: &str| {
-                    if phase != "writing inferred graph" {
+                    if phase != outer_phase {
                         return;
                     }
                     let outer = outer.clone();
                     let outer_pool = outer_pool.clone();
                     let woke = woke.clone();
                     let (blocker, ticket) = wait(
-                        &outer_queries,
+                        &waiter_pool,
                         Arc::new(move || {
                             let writable = outer
                                 .try_write_with(
@@ -467,17 +491,13 @@ fn nested_done_can_wait_for_an_independent_query_wake() {
                         pool: Some(inner_pool.clone()),
                         progress: Some(Arc::new(move |_, phase| {
                             if phase == "done" {
-                                // Both tickets become eligible inside this callback. Only the
-                                // outer domain must wait for its writer and reasoning permit.
+                                // Both tickets become eligible inside this callback. The
+                                // independent signal can arrive while user code is deferred.
                                 drop(outer_blocker.lock().unwrap().take().unwrap());
                                 let independent = QueryPool::new(GRANULE);
-                                let (wake, signal) = mpsc::channel();
-                                let (blocker, mut ticket) = wait(
-                                    &independent,
-                                    Arc::new(move || {
-                                        let _ = wake.send(());
-                                    }),
-                                );
+                                let blocker = independent.work_parent().reserve(1).unwrap();
+                                let (mut ticket, signal) = independent.enter_with_signal(GRANULE);
+                                assert!(ticket.poll().is_none());
                                 drop(blocker);
                                 signal
                                     .recv_timeout(Duration::from_secs(2))
@@ -499,13 +519,16 @@ fn nested_done_can_wait_for_an_independent_query_wake() {
                 &Extras::default(),
                 &ReasonOptions {
                     pool: Some(outer_pool),
-                    memory_parent: Some(outer_parent),
+                    memory_parent: outer_parent,
                     progress: Some(progress),
                     ..Default::default()
                 },
             )
             .unwrap();
-            assert!(observed.try_recv().expect("outer waiter did not wake"));
+            assert!(
+                observed.try_recv().expect("outer waiter did not wake"),
+                "the callback entered before the outer writer and permit were released"
+            );
         },
     );
 }

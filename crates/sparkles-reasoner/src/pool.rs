@@ -28,6 +28,7 @@
 //! would wait for itself.
 
 use parking_lot::{Condvar, Mutex};
+use sparkles_core::sparql::pool::QueryPool;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -248,8 +249,8 @@ impl Drop for Holding {
     }
 }
 
-/// The completion callback runs after admission and deferred query wakes have
-/// been released. Keep the same reentry rule as every other run callback.
+/// The completion callback runs after its own admission and query wake scope
+/// have been released. Keep the same reentry rule as every other run callback.
 pub(super) fn report_done(pool: Option<&Arc<ReasoningPool>>, callback: &crate::ProgressFn) {
     let _holding = pool.map(|p| Holding::new(mark(p)));
     callback(1.0, "done");
@@ -412,10 +413,10 @@ impl Exec {
     /// Run `f` on the run's threads.
     pub fn install<T: Send>(&self, f: impl FnOnce() -> T + Send) -> T {
         if let Some(p) = self.own.as_ref().and_then(|o| o.pool.as_ref()) {
-            return p.install(f);
+            return p.install(QueryPool::inherit_release_wakes(f));
         }
         if let Some(p) = &self.shared {
-            return p.pool.install(f);
+            return p.pool.install(QueryPool::inherit_release_wakes(f));
         }
         f()
     }
@@ -432,6 +433,7 @@ pub(crate) fn off_rayon<T: Send>(
     };
     // the caller's pool size: what "the caller's threads" means for a run without a pool
     let threads = rayon::current_num_threads();
+    let f = QueryPool::inherit_release_wakes(f);
     std::thread::scope(|s| {
         let h = std::thread::Builder::new()
             .name("call-reasoning".into())

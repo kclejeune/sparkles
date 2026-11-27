@@ -1816,7 +1816,7 @@ fn sparql_load_silent_http_limit_preserves_group_poisoned_and_writer_busy() {
         }
     );
     // Writer-entry refusal check: try_write_with refuses before parsing under no_wait=true.
-    let res = s2.load_sparql(&src, CommitKind::Update, &no_wait);
+    let res = s2.load_sparql(&src, CommitKind::Update, &no_wait, None);
     assert!(
         matches!(res, Err(SparqlLoadError::Store(Error::WriterBusy))),
         "writer-entry WriterBusy must stay SparqlLoadError::Store: {}",

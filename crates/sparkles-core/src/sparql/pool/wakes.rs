@@ -1,119 +1,104 @@
-//! Release callbacks may synchronously enter the store or wait for other queries.
+//! Arbitrary admission callbacks can synchronously enter any store.
 use super::QueryPool;
-use sparkles_budget::{DomainId, ParentHandle};
+use parking_lot::Mutex;
 use std::{cell::RefCell, mem::ManuallyDrop, sync::Arc};
 
-enum Scope {
-    All,
-    Materialization(Option<DomainId>),
-    Completion,
+type Pools = Vec<Arc<QueryPool>>;
+type Shared = Arc<Mutex<Pools>>;
+
+enum Pending {
+    Local(Pools),
+    Shared(Shared),
 }
 
-struct Frame {
-    scope: Scope,
-    pending: Vec<Arc<QueryPool>>,
-    outer: Option<Box<Frame>>,
-}
-
-type Current = ManuallyDrop<RefCell<Option<Frame>>>;
-// Each guard restores its predecessor. Leave the empty slot usable by TLS destructors.
+type Current = ManuallyDrop<RefCell<Option<Pending>>>;
+// Leave the empty slot usable by TLS destructors.
 const _: () = assert!(!std::mem::needs_drop::<Current>());
 thread_local! {
     static CURRENT: Current = const { ManuallyDrop::new(RefCell::new(None)) };
 }
 
-impl Frame {
-    fn defer(&mut self, pool: &Arc<QueryPool>, current: bool) -> bool {
-        if let Some(outer) = &mut self.outer
-            && outer.defer(pool, false)
-        {
-            return true;
-        }
-        if self.pending.iter().any(|p| Arc::ptr_eq(p, pool)) {
-            return true;
-        }
-        let guard = match &self.scope {
-            Scope::All => true,
-            Scope::Materialization(domain) => {
-                current || domain.as_ref().is_some_and(|id| *id == pool.domain())
-            }
-            Scope::Completion => false,
-        };
-        if guard {
-            self.pending.push(pool.clone());
-        }
-        guard
-    }
-}
-
 pub(super) fn defer(pool: &Arc<QueryPool>) -> bool {
     CURRENT.with(|slot| {
-        slot.borrow_mut()
-            .as_mut()
-            .is_some_and(|frame| frame.defer(pool, true))
+        let mut slot = slot.borrow_mut();
+        let Some(pending) = slot.as_mut() else {
+            return false;
+        };
+        let push = |pending: &mut Pools| {
+            if !pending.iter().any(|p| Arc::ptr_eq(p, pool)) {
+                pending.push(pool.clone());
+            }
+        };
+        match pending {
+            Pending::Local(pending) => push(pending),
+            Pending::Shared(pending) => push(&mut pending.lock()),
+        }
+        true
     })
 }
 
-fn scoped<T>(scope: Scope, work: impl FnOnce() -> T) -> T {
-    struct Drain;
-    impl Drop for Drain {
-        fn drop(&mut self) {
-            let frame = CURRENT.with(|slot| {
-                let mut slot = slot.borrow_mut();
-                let mut frame = slot.take().expect("active wake scope");
-                *slot = frame.outer.take().map(|outer| *outer);
-                frame
-            });
-            for pool in frame.pending {
-                // An ordinary inner lock hands its releases to the enclosing writer.
-                if !defer(&pool) {
+impl QueryPool {
+    /// Make released credit available immediately, and run callbacks after the
+    /// outer lock and its guards have left scope, including on unwind.
+    #[doc(hidden)]
+    pub fn with_deferred_release_wakes<T>(work: impl FnOnce() -> T) -> T {
+        struct Drain(bool);
+        impl Drop for Drain {
+            fn drop(&mut self) {
+                if !self.0 {
+                    return;
+                }
+                let pending = CURRENT.with(|slot| slot.borrow_mut().take());
+                let pools = match pending.expect("active wake scope") {
+                    Pending::Local(pools) => pools,
+                    Pending::Shared(pools) => std::mem::take(&mut *pools.lock()),
+                };
+                for pool in pools {
                     pool.wake();
                 }
             }
         }
-    }
-    CURRENT.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let outer = slot.take().map(Box::new);
-        *slot = Some(Frame {
-            scope,
-            pending: Vec::new(),
-            outer,
+        let outermost = CURRENT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_some() {
+                return false;
+            }
+            *slot = Some(Pending::Local(Vec::new()));
+            true
         });
-    });
-    let _drain = Drain;
-    work()
-}
-
-impl QueryPool {
-    /// Make released credit available immediately, and wake waiters after the
-    /// outer lock and its guards have left scope, including on unwind.
-    #[doc(hidden)]
-    pub fn with_deferred_release_wakes<T>(work: impl FnOnce() -> T) -> T {
-        scoped(Scope::All, work)
+        let _drain = Drain(outermost);
+        work()
     }
 
-    /// Drain the run's wakes after its writer and permit are released. A nested
-    /// completion can synchronously wait on independent pools while the outer
-    /// materialization continues to guard its own memory domain and pending wakes.
+    /// Carry the caller's deferral across a synchronous thread handoff. The
+    /// caller must wait for the returned work before leaving its own scope.
     #[doc(hidden)]
-    pub fn with_materialization_wakes<T, U>(
-        parent: Option<&ParentHandle>,
-        run: impl FnOnce() -> T,
-        complete: impl FnOnce(T) -> U,
-    ) -> U {
-        let work = || {
-            let result = scoped(
-                Scope::Materialization(parent.map(ParentHandle::domain)),
-                run,
-            );
-            complete(result)
-        };
-        if CURRENT.with(|slot| slot.borrow().is_some()) {
-            // The inner drain and its done callback both run outside its writer.
-            // Keep only the enclosing guards that own a wake or its memory domain.
-            scoped(Scope::Completion, work)
-        } else {
+    pub fn inherit_release_wakes<T>(work: impl FnOnce() -> T + Send) -> impl FnOnce() -> T + Send {
+        let inherited = CURRENT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let pending = slot.as_mut()?;
+            match pending {
+                Pending::Local(pools) => {
+                    let shared = Arc::new(Mutex::new(std::mem::take(pools)));
+                    *pending = Pending::Shared(shared.clone());
+                    Some(shared)
+                }
+                Pending::Shared(pools) => Some(pools.clone()),
+            }
+        });
+        move || {
+            struct Restore(Option<Pending>);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    CURRENT.with(|slot| *slot.borrow_mut() = self.0.take());
+                }
+            }
+            let Some(inherited) = inherited else {
+                return work();
+            };
+            let previous =
+                CURRENT.with(|slot| slot.borrow_mut().replace(Pending::Shared(inherited)));
+            let _restore = Restore(previous);
             work()
         }
     }

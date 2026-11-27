@@ -163,6 +163,11 @@ pub struct WriteOptions {
     pub before_publish: Option<PublishHook>,
 }
 
+/// Persist metadata tied to the reserved sequence of a data commit. Once
+/// called, failure or unwind leaves the sequence unavailable until reopen.
+#[doc(hidden)]
+pub type CommitHook<'a> = &'a (dyn Fn(u64) -> Result<()> + Sync);
+
 /// The check of [`WriteOptions::before_publish`].
 #[derive(Clone)]
 pub struct PublishHook(pub Arc<dyn Fn() -> Result<()> + Send + Sync>);
