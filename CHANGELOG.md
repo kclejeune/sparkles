@@ -1043,6 +1043,33 @@ of 64 took 0.31 µs on the JVM against 0.97 µs for a single call, and 0.31 µs 
 Node against 0.84 µs. In Python a batch saves about a tenth, since the lookup is most
 of an `in`.
 
+### BIND reuse across cursor batches
+
+A cursor BIND keeps observing repetition after its first batch, through a sampled sketch
+of its input keys and the exact distinct count of each batch, and admits its map of
+results when one row in eight repeats, or half the rows of a parallel-capable expression's
+first batch on more than one worker. Before, a first batch without enough repetition
+ended reuse for the query, so an input whose keys repeated only after 65,536 rows
+evaluated every row. A map that stops paying is released, and the sketch and the map are
+charged to the query's memory budget, about 128 KiB and 6 MiB when full. A refused batch
+charge releases them and evaluates the batch the ordinary way. A refusal of memory that
+the evaluation of the map's misses meets beside the map, including the terms it interns on
+the way to its result, releases them too. The misses that finished keep their values, and
+the remaining keys are evaluated the ordinary way in row order, so the batch never repeats
+an earlier row's transient allocation, such as the decode of a long triple term, after
+later rows' results are retained. After such a refusal the miss gives up as it would after
+a query's memory failure, so it evaluates no `COALESCE`, `IF` or other arm that the
+ordinary evaluation skips. A BIND that ends its input releases
+them for the operators above it. Expressions that can construct a geometry never enter
+the map, because each geometry they build stays charged until the query ends. On more than one
+worker, weak repetition of a parallel-capable expression admits the map only when the
+measured evaluation rate says it pays. The map's misses and the ordinary evaluation share
+one split controller, which keeps a contended expression serial for a cooldown and then
+retries the pool, in place of disabling parallel evaluation for the rest of the query.
+Roadmap item 293 stays open for its confirmation on forge, items 1082, 1083 and 1319
+follow the remaining costs, and item 1320 follows the charges that stand above the map's
+heap.
+
 ### One plan in every execution mode
 
 A query has one plan whatever its execution mode (roadmap item 827), and EXPLAIN shows
