@@ -867,7 +867,7 @@ fn verify_local_structured(
             unreachable!("only retained local revisions are grouped");
         };
         let json = std::str::from_utf8(bytes)
-            .map_err(|_| Error::invalid("JSON reference requires retained UTF-8"))?;
+            .map_err(|_| Error::invalid("span-mismatch: JSON reference requires retained UTF-8"))?;
         let pointers: Vec<_> = references
             .iter()
             .map(|index| {

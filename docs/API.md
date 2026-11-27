@@ -13816,7 +13816,7 @@ deleted, error}`, and holds nothing.
 | `409 hold-conflict` | An earlier attempt of the operation holds other commits. |
 | `409 holds-limit` | A referenced dataset cannot hold more commits. |
 | `409 unsupported-profile` | The profile is not enabled, or a written graph is detached. |
-| `422` | A reference does not verify, or the catalog identity or persistence check failed. A passage of an existing rendition and a structured value outside a retained JSON revision of the batch are `incomplete-evidence`. |
+| `422` | A reference or selection does not verify, with the codes of evidence resolution, or the catalog identity or persistence check failed. Unsupported structured normalization methods and exhausted resolution budgets answer `incomplete-evidence`. |
 | `503 holds-unavailable` | A referenced dataset could not confirm a durable hold. |
 | `503 authority-changed` | The caller's credential was revoked, expired or the access policy changed before the commit published. |
 

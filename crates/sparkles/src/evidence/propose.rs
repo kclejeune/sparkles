@@ -25,7 +25,10 @@
 //! recover at reopen. Each published proposal runs a bounded reconciliation on its
 //! own dataset and on each dataset it held. A retry can reacquire the same holds.
 
-use super::resolve::{Reference, Resolution};
+use super::resolve::{
+    MAX_REFERENCES, MEMORY_BYTES, ProposedPassage, ProposedStructured, Resolution, SelectionProbe,
+    SelectionRequirements, unavailable,
+};
 use crate::access::GraphAccess;
 use crate::branch::CommitRef;
 use crate::catalog::ReconcileCatalogIdentities;
@@ -34,15 +37,17 @@ use crate::store::{HistoryBound, HistoryQuery, ListedBranches, PublishedWriter, 
 use crate::task::Control;
 use crate::{Catalog, Dataset, Error, Result};
 use oxrdf::{NamedNode, Term};
-use sparkles_core::evidence::resolve::RecordRequest;
+use sparkles_core::access::{Preparation, Reservation};
 use sparkles_core::evidence::write::{
     self, ExistingRecord, Plan, ProposalOptions, ProtectedGraph, Reads, Stamp,
 };
 use sparkles_core::evidence::{
-    EvidenceInput, EvidenceRefTarget, RecordKind, RecordRef, RenditionContent,
-    ResolutionRequirement, Settings, Sha256Digest,
+    EvidenceInput, EvidenceRefInput, EvidenceRefTarget, JSON_LEXICAL_UTF8_V1,
+    JSON_LEXICAL_UTF8_VERSION, PassageInput, RecordKind, RecordRef, RenditionContent,
+    RenditionInput, ResolutionRequirement, Settings, Sha256Digest, StoredFactRef,
 };
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::borrow::Borrow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -385,139 +390,978 @@ fn replay(
     })
 }
 
-/// The references a proposal must resolve, and a refusal of a requirement this build
-/// cannot verify.
-fn references(
+/// Conservative byte charge for inserting a new entry into a `BTreeMap`/`BTreeSet`.
+/// The first insertion allocates a full leaf node (up to 11 entries plus node metadata);
+/// subsequent insertions cover the entry and amortized node-split overhead.
+fn btree_insert_charge<K, V>(empty: bool) -> u64 {
+    const BTREE_NODE_KEYS: u64 = 11;
+    let entry = (std::mem::size_of::<K>() as u64)
+        .saturating_add(std::mem::size_of::<V>() as u64)
+        .saturating_add(16);
+    if empty {
+        BTREE_NODE_KEYS.saturating_mul(entry).saturating_add(128)
+    } else {
+        entry.saturating_mul(2).saturating_add(64)
+    }
+}
+
+/// Vector whose heap capacity is admitted under a [`Preparation`] before growth and
+/// released when dropped. Storage is declared before `held` so it drops first.
+struct AdmittedVec<T> {
+    values: Vec<T>,
+    held: Reservation,
+}
+
+impl<T> AdmittedVec<T> {
+    fn new(prep: &Preparation, admit: &impl Fn(Error) -> Error) -> Result<Self> {
+        Ok(Self {
+            values: Vec::new(),
+            held: prep.reserve(0).map_err(admit)?,
+        })
+    }
+
+    fn push(
+        &mut self,
+        prep: &Preparation,
+        value: T,
+        admit: &impl Fn(Error) -> Error,
+    ) -> Result<()> {
+        prep.check().map_err(admit)?;
+        if self.values.len() == self.values.capacity() {
+            let next_cap = self
+                .values
+                .capacity()
+                .checked_mul(2)
+                .map(|n| n.max(1))
+                .ok_or_else(|| admit(prep.exhausted()))?;
+            let bytes = next_cap
+                .checked_mul(std::mem::size_of::<T>())
+                .and_then(|n| u64::try_from(n).ok())
+                .ok_or_else(|| admit(prep.exhausted()))?;
+            // Admit the replacement buffer while `self.held` still covers the old one,
+            // then drop the old buffer before releasing its reservation.
+            let mut new_held = prep.reserve(bytes).map_err(admit)?;
+            let mut next = Vec::new();
+            next.try_reserve_exact(next_cap)
+                .map_err(|_| admit(prep.exhausted()))?;
+            if std::mem::size_of::<T>() != 0 && next.capacity() > next_cap {
+                let extra = (next.capacity() - next_cap)
+                    .checked_mul(std::mem::size_of::<T>())
+                    .and_then(|n| u64::try_from(n).ok())
+                    .ok_or_else(|| admit(prep.exhausted()))?;
+                new_held.grow_by(extra).map_err(admit)?;
+            }
+            for item in self.values.drain(..) {
+                prep.check().map_err(admit)?;
+                next.push(item);
+            }
+            let old = std::mem::replace(&mut self.values, next);
+            drop(old);
+            self.held = new_held;
+        }
+        self.values.push(value);
+        Ok(())
+    }
+
+    fn as_slice(&self) -> &[T] {
+        &self.values
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.values
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
+
+/// Set whose node allocations are admitted before insertion and released when dropped.
+/// Storage is declared before `held` so it drops first.
+struct AdmittedSet<T> {
+    values: BTreeSet<T>,
+    held: Reservation,
+}
+
+impl<T: Ord> AdmittedSet<T> {
+    fn new(prep: &Preparation, admit: &impl Fn(Error) -> Error) -> Result<Self> {
+        Ok(Self {
+            values: BTreeSet::new(),
+            held: prep.reserve(0).map_err(admit)?,
+        })
+    }
+
+    fn insert(&mut self, value: T, admit: &impl Fn(Error) -> Error) -> Result<bool> {
+        if self.values.contains(&value) {
+            return Ok(false);
+        }
+        self.held
+            .grow_by(btree_insert_charge::<T, ()>(self.values.is_empty()))
+            .map_err(admit)?;
+        self.values.insert(value);
+        Ok(true)
+    }
+}
+
+/// Map whose node allocations are admitted before insertion and released when dropped.
+/// Storage is declared before `held` so it drops first.
+struct AdmittedMap<K, V> {
+    values: BTreeMap<K, V>,
+    held: Reservation,
+}
+
+impl<K: Ord, V> AdmittedMap<K, V> {
+    fn new(prep: &Preparation, admit: &impl Fn(Error) -> Error) -> Result<Self> {
+        Ok(Self {
+            values: BTreeMap::new(),
+            held: prep.reserve(0).map_err(admit)?,
+        })
+    }
+
+    fn get<Q: Ord + ?Sized>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+    {
+        self.values.get(key)
+    }
+
+    fn insert(&mut self, key: K, value: V, admit: &impl Fn(Error) -> Error) -> Result<Option<V>> {
+        if let Some(existing) = self.values.get_mut(&key) {
+            return Ok(Some(std::mem::replace(existing, value)));
+        }
+        self.held
+            .grow_by(btree_insert_charge::<K, V>(self.values.is_empty()))
+            .map_err(admit)?;
+        Ok(self.values.insert(key, value))
+    }
+
+    fn get_or_insert_with(
+        &mut self,
+        key: K,
+        make: impl FnOnce() -> Result<V>,
+        admit: &impl Fn(Error) -> Error,
+    ) -> Result<&mut V> {
+        if self.values.contains_key(&key) {
+            return Ok(self.values.get_mut(&key).expect("present key"));
+        }
+        self.held
+            .grow_by(btree_insert_charge::<K, V>(self.values.is_empty()))
+            .map_err(admit)?;
+        let value = make()?;
+        Ok(self.values.entry(key).or_insert(value))
+    }
+}
+
+/// Verify every requirement of a proposal under one shared [`Resolution`] (64 MiB
+/// preparation allowance, request deadline and cancellation) through the caller's read
+/// access before any source hold is acquired or commit is written.
+#[allow(clippy::too_many_arguments)]
+fn verify_requirements(
+    catalog: Option<&Catalog>,
+    main: &Dataset,
+    logical: &Dataset,
     input: &EvidenceInput,
     plan: &Plan,
     requirements: &[ResolutionRequirement],
-) -> Result<Vec<(String, Reference)>> {
-    let minted = |key: &str| plan.records.iter().find(|r| r.key == key).map(|r| &r.iri);
-    let resolve = |r: &RecordRef| match r {
-        RecordRef::Local(k) => minted(k.as_str()).cloned(),
-        RecordRef::Existing(iri) => Some(iri.clone()),
-    };
-    let unverifiable = |key: &str, what: &str| {
-        managed(
+    read: &mut dyn FnMut(&Dataset, &str) -> Option<Arc<GraphAccess>>,
+    control: &Control,
+) -> Result<()> {
+    verify_requirements_with_memory(
+        catalog,
+        main,
+        logical,
+        input,
+        plan,
+        requirements,
+        read,
+        control,
+        MEMORY_BYTES,
+    )
+}
+
+enum GenericReq<'a> {
+    Record(&'a NamedNode, &'a [RecordKind], SelectionRequirements),
+    Fact(&'a str, &'a StoredFactRef),
+}
+
+type PassageGroup<'a> = (usize, &'a NamedNode, AdmittedVec<ProposedPassage<'a>>);
+type StructuredGroup<'a> = (usize, &'a NamedNode, AdmittedVec<ProposedStructured<'a>>);
+
+#[allow(clippy::too_many_arguments)]
+fn check_deferred_literal_shapes(
+    resolution: &mut Resolution,
+    main: &Dataset,
+    logical: &Dataset,
+    access: Option<Arc<GraphAccess>>,
+    passages: &mut [PassageGroup<'_>],
+    structured: &mut [StructuredGroup<'_>],
+    limit_req_idx: usize,
+    control: &Control,
+) -> Result<()> {
+    passages.sort_unstable_by_key(|(req_idx, _, _)| *req_idx);
+    structured.sort_unstable_by_key(|(req_idx, _, _)| *req_idx);
+    let mut pi = 0usize;
+    let mut si = 0usize;
+    loop {
+        control.check()?;
+        let p_idx = passages.get(pi).map_or(usize::MAX, |(idx, _, _)| *idx);
+        let s_idx = structured.get(si).map_or(usize::MAX, |(idx, _, _)| *idx);
+        let e_idx = resolution
+            .next_pending_passage_req_idx()
+            .unwrap_or(usize::MAX);
+        if p_idx >= limit_req_idx && s_idx >= limit_req_idx && e_idx >= limit_req_idx {
+            break;
+        }
+        if p_idx <= s_idx && p_idx <= e_idx {
+            let iri = passages[pi].1;
+            pi += 1;
+            resolution.verify_selection_literal_shape(
+                iri.as_str(),
+                main,
+                logical,
+                access.clone(),
+                iri,
+                SelectionRequirements {
+                    rendition_content: true,
+                    ..Default::default()
+                },
+            )?;
+        } else if s_idx <= e_idx {
+            let iri = structured[si].1;
+            si += 1;
+            resolution.verify_selection_literal_shape(
+                iri.as_str(),
+                main,
+                logical,
+                access.clone(),
+                iri,
+                SelectionRequirements {
+                    structured_content: true,
+                    ..Default::default()
+                },
+            )?;
+        } else {
+            resolution
+                .verify_next_pending_passage(main, logical, access.clone())
+                .result?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_requirements_with_memory(
+    catalog: Option<&Catalog>,
+    main: &Dataset,
+    logical: &Dataset,
+    input: &EvidenceInput,
+    plan: &Plan,
+    requirements: &[ResolutionRequirement],
+    read: &mut dyn FnMut(&Dataset, &str) -> Option<Arc<GraphAccess>>,
+    control: &Control,
+    memory_bytes: u64,
+) -> Result<()> {
+    if requirements.is_empty() {
+        return Ok(());
+    }
+    let admit = |e: Error| match e {
+        Error::BudgetExceeded(_) => managed(
             ManagedErrorKind::IncompleteEvidence,
-            format!("{key}: {what} cannot be verified by this build, so nothing was written"),
-        )
+            "proposal requirements exceeded the resolution memory limit",
+        ),
+        e => e,
     };
-    let mut out: Vec<(String, Reference)> = Vec::new();
-    for requirement in requirements {
-        match requirement {
-            ResolutionRequirement::ExistingRecord {
-                record,
-                expected_kinds,
-            } => {
-                // every use is resolved with its own kinds, and record IRIs never stand
-                // for the batch keys of other references
-                out.push((
-                    record.as_str().to_string(),
-                    Reference::Record(RecordRequest {
-                        iri: record.clone(),
-                        kinds: expected_kinds.clone(),
-                        content_digest: None,
-                    }),
-                ));
+    let mut resolution = Resolution::with_memory(control.clone(), memory_bytes).map_err(admit)?;
+    let prep = resolution.preparation().clone();
+    let mut generic_count = 0usize;
+    let mut generic_reqs: AdmittedVec<GenericReq<'_>> = AdmittedVec::new(&prep, &admit)?;
+    let mut passage_groups: AdmittedVec<PassageGroup<'_>> = AdmittedVec::new(&prep, &admit)?;
+    let mut passage_refs: AdmittedVec<(&str, &NamedNode, &NamedNode, &NamedNode)> =
+        AdmittedVec::new(&prep, &admit)?;
+    let mut structured_groups: AdmittedVec<StructuredGroup<'_>> = AdmittedVec::new(&prep, &admit)?;
+    {
+        // Build O(log N) lookup and grouping maps once upfront, charged under the
+        // shared preparation allowance, and drop them before Phase 1 runs.
+        let mut records_by_key: AdmittedMap<&str, &NamedNode> = AdmittedMap::new(&prep, &admit)?;
+        for rec in &plan.records {
+            control.check()?;
+            records_by_key.insert(rec.key.as_str(), &rec.iri, &admit)?;
+        }
+        let mut renditions_by_key: AdmittedMap<&str, &RenditionInput> =
+            AdmittedMap::new(&prep, &admit)?;
+        for r in &input.renditions {
+            control.check()?;
+            renditions_by_key.insert(r.key.as_str(), r, &admit)?;
+        }
+        let mut passages_by_key: AdmittedMap<&str, &PassageInput> =
+            AdmittedMap::new(&prep, &admit)?;
+        for p in &input.passages {
+            control.check()?;
+            passages_by_key.insert(p.key.as_str(), p, &admit)?;
+        }
+        let mut references_by_key: AdmittedMap<&str, &EvidenceRefInput> =
+            AdmittedMap::new(&prep, &admit)?;
+        for r in &input.references {
+            control.check()?;
+            references_by_key.insert(r.key.as_str(), r, &admit)?;
+        }
+        fn resolve_ref<'a>(
+            records: &AdmittedMap<&str, &'a NamedNode>,
+            r: &'a RecordRef,
+        ) -> Option<&'a NamedNode> {
+            match r {
+                RecordRef::Local(k) => records.get(k.as_str()).copied(),
+                RecordRef::Existing(iri) => Some(iri),
             }
-            ResolutionRequirement::StoredFact { reference_key } => {
-                let fact = input
-                    .references
-                    .iter()
-                    .find(|r| r.key.as_str() == reference_key)
-                    .and_then(|r| match &r.target {
-                        EvidenceRefTarget::StoredFact(f) => Some(f.clone()),
-                        _ => None,
-                    })
-                    .ok_or_else(|| Error::invalid(format!("{reference_key}: no stored fact")))?;
-                out.push((reference_key.clone(), Reference::StoredFact(fact)));
-            }
-            ResolutionRequirement::PassageIdentity { passage_key } => {
-                let passage = input
-                    .passages
-                    .iter()
-                    .find(|p| p.key.as_str() == passage_key)
-                    .ok_or_else(|| Error::invalid(format!("{passage_key}: no passage")))?;
-                let RecordRef::Local(rendition) = &passage.rendition else {
-                    return Err(unverifiable(
-                        passage_key,
-                        "a passage of an existing rendition",
-                    ));
-                };
-                let rendition = input
-                    .renditions
-                    .iter()
-                    .find(|r| r.key.as_str() == rendition.as_str())
-                    .ok_or_else(|| Error::invalid(format!("{passage_key}: no rendition")))?;
-                if resolve(&rendition.revision) != resolve(&passage.revision) {
-                    return Err(Error::invalid(format!(
-                        "{passage_key}: the passage and its rendition name different revisions"
-                    )));
+        }
+        let resolve = |r| resolve_ref(&records_by_key, r);
+        let mut seen_records: AdmittedSet<(&NamedNode, u32)> = AdmittedSet::new(&prep, &admit)?;
+        let mut passage_group_idx: AdmittedMap<&NamedNode, usize> =
+            AdmittedMap::new(&prep, &admit)?;
+        let mut queued_passages: AdmittedSet<&str> = AdmittedSet::new(&prep, &admit)?;
+        let mut structured_group_idx: AdmittedMap<&NamedNode, usize> =
+            AdmittedMap::new(&prep, &admit)?;
+        let mut selection_needs: AdmittedMap<&NamedNode, SelectionRequirements> =
+            AdmittedMap::new(&prep, &admit)?;
+        for requirement in requirements {
+            control.check()?;
+            match requirement {
+                ResolutionRequirement::ExistingRecord {
+                    record,
+                    expected_kinds,
+                } => {
+                    generic_count += 1;
+                    if generic_count > MAX_REFERENCES {
+                        return Err(Error::invalid(format!(
+                            "a resolution names at most {MAX_REFERENCES} references"
+                        )));
+                    }
+                    let kinds_mask = expected_kinds.iter().fold(0u32, |mask, kind| {
+                        let bit = match kind {
+                            RecordKind::SourceRevision => 0,
+                            RecordKind::Rendition => 1,
+                            RecordKind::Passage => 2,
+                            RecordKind::EvidenceRef => 3,
+                            RecordKind::Claim => 4,
+                            RecordKind::EvidenceLink => 5,
+                            RecordKind::Assessment => 6,
+                            RecordKind::Note => 7,
+                            RecordKind::Decision => 8,
+                            RecordKind::Task => 9,
+                            RecordKind::ReviewDecision => 10,
+                            RecordKind::IdentityProposal => 11,
+                            RecordKind::AcceptanceSupport => 12,
+                            RecordKind::Withdrawal => 13,
+                            RecordKind::Projection => 14,
+                            RecordKind::ResolutionMap => 15,
+                        };
+                        mask | (1u32 << bit)
+                    });
+                    // Deduplicate identical `(record, expected_kinds)` probes while
+                    // preserving every distinct kind constraint on the same IRI.
+                    if seen_records.insert((record, kinds_mask), &admit)? {
+                        generic_reqs.push(
+                            &prep,
+                            GenericReq::Record(
+                                record,
+                                expected_kinds.as_slice(),
+                                SelectionRequirements::default(),
+                            ),
+                            &admit,
+                        )?;
+                    }
+                }
+                ResolutionRequirement::StoredFact { reference_key } => {
+                    generic_count += 1;
+                    if generic_count > MAX_REFERENCES {
+                        return Err(Error::invalid(format!(
+                            "a resolution names at most {MAX_REFERENCES} references"
+                        )));
+                    }
+                    let fact = references_by_key
+                        .get(reference_key.as_str())
+                        .and_then(|r| match &r.target {
+                            EvidenceRefTarget::StoredFact(f) => Some(f),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            Error::invalid(format!("{reference_key}: no stored fact"))
+                        })?;
+                    generic_reqs.push(
+                        &prep,
+                        GenericReq::Fact(reference_key.as_str(), fact),
+                        &admit,
+                    )?;
+                }
+                ResolutionRequirement::PassageIdentity { passage_key } => {
+                    let passage = passages_by_key
+                        .get(passage_key.as_str())
+                        .copied()
+                        .ok_or_else(|| Error::invalid(format!("{passage_key}: no passage")))?;
+                    match &passage.rendition {
+                        RecordRef::Local(rendition) => {
+                            let rendition = renditions_by_key
+                                .get(rendition.as_str())
+                                .copied()
+                                .ok_or_else(|| {
+                                    Error::invalid(format!("{passage_key}: no rendition"))
+                                })?;
+                            if resolve(&rendition.revision) != resolve(&passage.revision) {
+                                return Err(Error::invalid(format!(
+                                    "{passage_key}: the passage and its rendition name different revisions"
+                                )));
+                            }
+                        }
+                        RecordRef::Existing(rendition) => {
+                            let revision = resolve(&passage.revision).ok_or_else(|| {
+                                Error::invalid(format!("{passage_key}: no revision"))
+                            })?;
+                            selection_needs
+                                .get_or_insert_with(
+                                    rendition,
+                                    || Ok(SelectionRequirements::default()),
+                                    &admit,
+                                )?
+                                .rendition_content = true;
+                            if queued_passages.insert(passage.key.as_str(), &admit)? {
+                                let idx = *passage_group_idx.get_or_insert_with(
+                                    rendition,
+                                    || {
+                                        let i = passage_groups.len();
+                                        let group = AdmittedVec::new(&prep, &admit)?;
+                                        passage_groups.push(
+                                            &prep,
+                                            (usize::MAX, rendition, group),
+                                            &admit,
+                                        )?;
+                                        Ok(i)
+                                    },
+                                    &admit,
+                                )?;
+                                passage_groups.as_mut_slice()[idx].2.push(
+                                    &prep,
+                                    ProposedPassage {
+                                        key: passage.key.as_str(),
+                                        revision,
+                                        start: passage.start,
+                                        end: passage.end,
+                                        text_digest: passage.text_digest,
+                                        quote: passage.quote.as_deref(),
+                                    },
+                                    &admit,
+                                )?;
+                            }
+                        }
+                    }
+                }
+                ResolutionRequirement::RetainedPassage { passage_key } => {
+                    let passage = passages_by_key
+                        .get(passage_key.as_str())
+                        .copied()
+                        .ok_or_else(|| Error::invalid(format!("{passage_key}: no passage")))?;
+                    match &passage.rendition {
+                        RecordRef::Local(k) => {
+                            let local_text = renditions_by_key.get(k.as_str()).is_some_and(|r| {
+                                matches!(r.content, RenditionContent::NormalizedText(_))
+                            });
+                            if !local_text {
+                                return Err(unavailable(passage_key));
+                            }
+                        }
+                        RecordRef::Existing(rendition) => {
+                            let revision = resolve(&passage.revision).ok_or_else(|| {
+                                Error::invalid(format!("{passage_key}: no revision"))
+                            })?;
+                            selection_needs
+                                .get_or_insert_with(
+                                    rendition,
+                                    || Ok(SelectionRequirements::default()),
+                                    &admit,
+                                )?
+                                .rendition_content = true;
+                            if queued_passages.insert(passage.key.as_str(), &admit)? {
+                                let idx = *passage_group_idx.get_or_insert_with(
+                                    rendition,
+                                    || {
+                                        let i = passage_groups.len();
+                                        let group = AdmittedVec::new(&prep, &admit)?;
+                                        passage_groups.push(
+                                            &prep,
+                                            (usize::MAX, rendition, group),
+                                            &admit,
+                                        )?;
+                                        Ok(i)
+                                    },
+                                    &admit,
+                                )?;
+                                passage_groups.as_mut_slice()[idx].2.push(
+                                    &prep,
+                                    ProposedPassage {
+                                        key: passage.key.as_str(),
+                                        revision,
+                                        start: passage.start,
+                                        end: passage.end,
+                                        text_digest: passage.text_digest,
+                                        quote: passage.quote.as_deref(),
+                                    },
+                                    &admit,
+                                )?;
+                            }
+                        }
+                    }
+                }
+                ResolutionRequirement::PassageReferenceIdentity { reference_key } => {
+                    let reference = references_by_key
+                        .get(reference_key.as_str())
+                        .copied()
+                        .ok_or_else(|| Error::invalid(format!("{reference_key}: no reference")))?;
+                    let EvidenceRefTarget::Passage {
+                        revision,
+                        rendition,
+                        passage,
+                    } = &reference.target
+                    else {
+                        return Err(Error::invalid(format!("{reference_key}: no passage")));
+                    };
+                    match passage {
+                        RecordRef::Local(p_key) => {
+                            let local_passage = passages_by_key
+                                .get(p_key.as_str())
+                                .copied()
+                                .ok_or_else(|| {
+                                    Error::invalid(format!("{reference_key}: no passage"))
+                                })?;
+                            if resolve(revision) != resolve(&local_passage.revision)
+                                || resolve(rendition) != resolve(&local_passage.rendition)
+                            {
+                                return Err(Error::invalid(format!(
+                                    "{reference_key}: the reference names another revision or rendition than its passage"
+                                )));
+                            }
+                        }
+                        RecordRef::Existing(p_iri) => {
+                            let expected_rev = resolve(revision).ok_or_else(|| {
+                                Error::invalid(format!("{reference_key}: no revision"))
+                            })?;
+                            let expected_rend = resolve(rendition).ok_or_else(|| {
+                                Error::invalid(format!("{reference_key}: no rendition"))
+                            })?;
+                            selection_needs
+                                .get_or_insert_with(
+                                    p_iri,
+                                    || Ok(SelectionRequirements::default()),
+                                    &admit,
+                                )?
+                                .passage_lineage = true;
+                            passage_refs.push(
+                                &prep,
+                                (reference.key.as_str(), p_iri, expected_rev, expected_rend),
+                                &admit,
+                            )?;
+                        }
+                    }
+                }
+                ResolutionRequirement::StructuredValue { reference_key } => {
+                    let reference = references_by_key
+                        .get(reference_key.as_str())
+                        .copied()
+                        .ok_or_else(|| Error::invalid(format!("{reference_key}: no reference")))?;
+                    let EvidenceRefTarget::Structured {
+                        revision,
+                        pointer,
+                        method,
+                        value_digest,
+                    } = &reference.target
+                    else {
+                        return Err(Error::invalid(format!(
+                            "{reference_key}: no structured reference"
+                        )));
+                    };
+                    if method.method.as_str() != JSON_LEXICAL_UTF8_V1
+                        || method.version.as_str() != JSON_LEXICAL_UTF8_VERSION
+                    {
+                        return Err(managed(
+                            ManagedErrorKind::IncompleteEvidence,
+                            format!(
+                                "{reference_key}: structured normalization method <{}> version `{}` is not supported by this build, so nothing was written",
+                                method.method.as_str(),
+                                method.version.as_str()
+                            ),
+                        ));
+                    }
+                    match revision {
+                        RecordRef::Local(_) => {
+                            // A local retained revision was already verified by `prepare_input`;
+                            // a local metadata-only revision carries no retained bytes.
+                            return Err(unavailable(reference_key));
+                        }
+                        RecordRef::Existing(rev_iri) => {
+                            selection_needs
+                                .get_or_insert_with(
+                                    rev_iri,
+                                    || Ok(SelectionRequirements::default()),
+                                    &admit,
+                                )?
+                                .structured_content = true;
+                            let idx = *structured_group_idx.get_or_insert_with(
+                                rev_iri,
+                                || {
+                                    let i = structured_groups.len();
+                                    let group = AdmittedVec::new(&prep, &admit)?;
+                                    structured_groups.push(
+                                        &prep,
+                                        (usize::MAX, rev_iri, group),
+                                        &admit,
+                                    )?;
+                                    Ok(i)
+                                },
+                                &admit,
+                            )?;
+                            structured_groups.as_mut_slice()[idx].2.push(
+                                &prep,
+                                ProposedStructured {
+                                    key: reference.key.as_str(),
+                                    pointer: pointer.as_str(),
+                                    value_digest: *value_digest,
+                                },
+                                &admit,
+                            )?;
+                        }
+                    }
                 }
             }
-            ResolutionRequirement::RetainedPassage { passage_key } => {
-                let passage = input
-                    .passages
-                    .iter()
-                    .find(|p| p.key.as_str() == passage_key)
-                    .ok_or_else(|| Error::invalid(format!("{passage_key}: no passage")))?;
-                let local_text = match &passage.rendition {
-                    RecordRef::Local(k) => input.renditions.iter().any(|r| {
-                        r.key.as_str() == k.as_str()
-                            && matches!(r.content, RenditionContent::NormalizedText(_))
-                    }),
-                    RecordRef::Existing(_) => false,
-                };
-                if !local_text {
-                    return Err(unverifiable(
-                        passage_key,
-                        "a passage of a rendition without normalized text in this batch",
-                    ));
-                }
-            }
-            ResolutionRequirement::PassageReferenceIdentity { reference_key } => {
-                let reference = input
-                    .references
-                    .iter()
-                    .find(|r| r.key.as_str() == reference_key)
-                    .ok_or_else(|| Error::invalid(format!("{reference_key}: no reference")))?;
-                let EvidenceRefTarget::Passage {
-                    revision,
-                    rendition,
-                    passage,
-                } = &reference.target
-                else {
-                    return Err(Error::invalid(format!("{reference_key}: no passage")));
-                };
-                let RecordRef::Local(passage) = passage else {
-                    return Err(unverifiable(
-                        reference_key,
-                        "a reference to an existing passage",
-                    ));
-                };
-                let passage = input
-                    .passages
-                    .iter()
-                    .find(|p| p.key.as_str() == passage.as_str())
-                    .ok_or_else(|| Error::invalid(format!("{reference_key}: no passage")))?;
-                if resolve(revision) != resolve(&passage.revision)
-                    || resolve(rendition) != resolve(&passage.rendition)
+        }
+        for (req_idx, req) in generic_reqs.as_mut_slice().iter_mut().enumerate() {
+            control.check()?;
+            if let GenericReq::Record(iri, _, selection) = req
+                && let Some(needs) = selection_needs.get(iri)
+            {
+                *selection = *needs;
+                if needs.rendition_content
+                    && let Some(&g_idx) = passage_group_idx.get(iri)
                 {
-                    return Err(Error::invalid(format!(
-                        "{reference_key}: the reference names another revision or rendition than its passage"
-                    )));
+                    let first = &mut passage_groups.as_mut_slice()[g_idx].0;
+                    if *first == usize::MAX {
+                        *first = req_idx;
+                    }
                 }
-            }
-            ResolutionRequirement::StructuredValue { reference_key } => {
-                return Err(unverifiable(
-                    reference_key,
-                    "a structured value outside a retained JSON revision of this batch",
-                ));
+                if needs.structured_content
+                    && let Some(&g_idx) = structured_group_idx.get(iri)
+                {
+                    let first = &mut structured_groups.as_mut_slice()[g_idx].0;
+                    if *first == usize::MAX {
+                        *first = req_idx;
+                    }
+                }
             }
         }
     }
-    Ok(out)
+    // Phase 1: probe every ExistingRecord (with selection-target availability attached
+    // without reconstructing compatible retained literals yet) and every StoredFact so
+    // missing, graph-denied, metadata-only and predicate-masked targets share identical
+    // precedence, then release `generic_reqs` before reading any retained literal.
+    let mut record_access: Option<Option<Arc<GraphAccess>>> = None;
+    let mut has_deferred_literal = false;
+    let mut phase1_err: Option<(usize, Error)> = None;
+    for (req_idx, req) in generic_reqs.as_slice().iter().enumerate() {
+        control.check()?;
+        let outcome = match req {
+            GenericReq::Fact(key, fact) => {
+                let res = match catalog {
+                    Some(catalog) if fact.dataset != main.dataset_id() => {
+                        resolution.stored_fact(key, catalog, fact, &mut *read)
+                    }
+                    _ => resolution.stored_fact_in(key, main, fact, &mut *read),
+                };
+                res.map(|_| SelectionProbe::Complete)
+            }
+            GenericReq::Record(iri, kinds, selection) => {
+                let granted = match &record_access {
+                    Some(access) => access.clone(),
+                    None => {
+                        let access = resolution.logical_access(main, logical, read)?;
+                        record_access = Some(access.clone());
+                        access
+                    }
+                };
+                resolution.probe_record_with_selection_at(
+                    iri.as_str(),
+                    main,
+                    logical,
+                    granted,
+                    iri,
+                    kinds,
+                    *selection,
+                    req_idx,
+                )
+            }
+        };
+        match outcome {
+            Ok(SelectionProbe::Complete) => {}
+            Ok(SelectionProbe::DeferredLiteralShape) => has_deferred_literal = true,
+            Err(e) => {
+                if !has_deferred_literal {
+                    return Err(e);
+                }
+                phase1_err = Some((req_idx, e));
+                break;
+            }
+        }
+    }
+    drop(generic_reqs);
+    if let Some((err_idx, err)) = phase1_err {
+        let access = match record_access {
+            Some(access) => access,
+            None => resolution.logical_access(main, logical, read)?,
+        };
+        check_deferred_literal_shapes(
+            &mut resolution,
+            main,
+            logical,
+            access,
+            passage_groups.as_mut_slice(),
+            structured_groups.as_mut_slice(),
+            err_idx,
+            control,
+        )?;
+        return Err(err);
+    }
+    // Phase 2: read each retained literal once for content/identity verification,
+    // dropping each phase's admitted buffer as soon as it finishes so its reservation
+    // is released before the next.
+    if !passage_groups.is_empty() {
+        let access = match &record_access {
+            Some(access) => access.clone(),
+            None => {
+                let access = resolution.logical_access(main, logical, read)?;
+                record_access = Some(access.clone());
+                access
+            }
+        };
+        for idx in 0..passage_groups.len() {
+            control.check()?;
+            let (group_req_idx, rendition) = {
+                let g = &passage_groups.as_slice()[idx];
+                (g.0, g.1)
+            };
+            let outcome = resolution.verify_proposed_passages_checked(
+                main,
+                logical,
+                access.clone(),
+                rendition,
+                passage_groups.as_slice()[idx].2.as_slice(),
+                group_req_idx,
+            );
+            if let Err(e) = outcome.result {
+                let limit = if let Some(failed_req_idx) = outcome.failed_req_idx {
+                    Some(failed_req_idx)
+                } else {
+                    match e.code() {
+                        "invalid" | "span-mismatch" => Some(usize::MAX),
+                        "incomplete-evidence" | "immutable-record-conflict" => {
+                            Some(if outcome.shape_confirmed {
+                                usize::MAX
+                            } else {
+                                group_req_idx
+                            })
+                        }
+                        "evidence-unavailable" => Some(group_req_idx),
+                        _ => None,
+                    }
+                };
+                if let Some(limit) = limit {
+                    check_deferred_literal_shapes(
+                        &mut resolution,
+                        main,
+                        logical,
+                        access,
+                        &mut passage_groups.as_mut_slice()[idx + 1..],
+                        structured_groups.as_mut_slice(),
+                        limit,
+                        control,
+                    )?;
+                }
+                return Err(e);
+            }
+        }
+    }
+    drop(passage_groups);
+    if resolution.next_pending_passage_req_idx().is_some() {
+        let access = match &record_access {
+            Some(access) => access.clone(),
+            None => {
+                let access = resolution.logical_access(main, logical, read)?;
+                record_access = Some(access.clone());
+                access
+            }
+        };
+        while let Some(pending_req_idx) = resolution.next_pending_passage_req_idx() {
+            control.check()?;
+            let outcome = resolution.verify_next_pending_passage(main, logical, access.clone());
+            if let Err(e) = outcome.result {
+                let limit = match e.code() {
+                    "span-mismatch" | "evidence-unavailable" | "immutable-record-conflict" => {
+                        Some(pending_req_idx)
+                    }
+                    "incomplete-evidence" => Some(if outcome.shape_confirmed {
+                        usize::MAX
+                    } else {
+                        pending_req_idx
+                    }),
+                    _ => None,
+                };
+                if let Some(limit) = limit {
+                    check_deferred_literal_shapes(
+                        &mut resolution,
+                        main,
+                        logical,
+                        access,
+                        &mut [],
+                        structured_groups.as_mut_slice(),
+                        limit,
+                        control,
+                    )?;
+                }
+                return Err(e);
+            }
+        }
+    }
+    if !passage_refs.is_empty() {
+        let access = match &record_access {
+            Some(access) => access.clone(),
+            None => {
+                let access = resolution.logical_access(main, logical, read)?;
+                record_access = Some(access.clone());
+                access
+            }
+        };
+        let mut checked_passage_refs: AdmittedSet<(&NamedNode, &NamedNode, &NamedNode)> =
+            match AdmittedSet::new(&prep, &admit) {
+                Ok(set) => set,
+                Err(e) => {
+                    check_deferred_literal_shapes(
+                        &mut resolution,
+                        main,
+                        logical,
+                        access,
+                        &mut [],
+                        structured_groups.as_mut_slice(),
+                        usize::MAX,
+                        control,
+                    )?;
+                    return Err(e);
+                }
+            };
+        for (ref_key, passage, expected_rev, expected_rend) in passage_refs.as_slice() {
+            control.check()?;
+            let inserted = match checked_passage_refs
+                .insert((*passage, *expected_rev, *expected_rend), &admit)
+            {
+                Ok(inserted) => inserted,
+                Err(e) => {
+                    drop(checked_passage_refs);
+                    check_deferred_literal_shapes(
+                        &mut resolution,
+                        main,
+                        logical,
+                        access,
+                        &mut [],
+                        structured_groups.as_mut_slice(),
+                        usize::MAX,
+                        control,
+                    )?;
+                    return Err(e);
+                }
+            };
+            if inserted
+                && let Err(e) = resolution.verify_passage_reference(
+                    ref_key,
+                    main,
+                    logical,
+                    access.clone(),
+                    passage,
+                    expected_rev,
+                    expected_rend,
+                )
+            {
+                if matches!(
+                    e.code(),
+                    "invalid"
+                        | "span-mismatch"
+                        | "immutable-record-conflict"
+                        | "incomplete-evidence"
+                ) {
+                    drop(checked_passage_refs);
+                    check_deferred_literal_shapes(
+                        &mut resolution,
+                        main,
+                        logical,
+                        access,
+                        &mut [],
+                        structured_groups.as_mut_slice(),
+                        usize::MAX,
+                        control,
+                    )?;
+                }
+                return Err(e);
+            }
+        }
+        drop(checked_passage_refs);
+    }
+    drop(passage_refs);
+    if !structured_groups.is_empty() {
+        let access = match record_access {
+            Some(access) => access,
+            None => resolution.logical_access(main, logical, read)?,
+        };
+        for idx in 0..structured_groups.len() {
+            control.check()?;
+            let (group_req_idx, revision) = {
+                let g = &structured_groups.as_slice()[idx];
+                (g.0, g.1)
+            };
+            let outcome = resolution.verify_structured_references_checked(
+                main,
+                logical,
+                access.clone(),
+                revision,
+                structured_groups.as_slice()[idx].2.as_slice(),
+            );
+            if let Err(e) = outcome.result {
+                let limit = match e.code() {
+                    "span-mismatch" => Some(usize::MAX),
+                    "immutable-record-conflict" | "incomplete-evidence" => {
+                        Some(if outcome.shape_confirmed {
+                            usize::MAX
+                        } else {
+                            group_req_idx
+                        })
+                    }
+                    "evidence-unavailable" => Some(group_req_idx),
+                    _ => None,
+                };
+                if let Some(limit) = limit {
+                    check_deferred_literal_shapes(
+                        &mut resolution,
+                        main,
+                        logical,
+                        access,
+                        &mut [],
+                        &mut structured_groups.as_mut_slice()[idx + 1..],
+                        limit,
+                        control,
+                    )?;
+                }
+                return Err(e);
+            }
+        }
+    }
+    drop(structured_groups);
+    Ok(())
 }
 
 fn catalog_identity_changed() -> Error {
@@ -686,28 +1530,28 @@ pub fn propose(
     }
     // Retain the same dataset handles the resolver read. Reopening by UUID could
     // find a dataset restored in the meantime with different history at that commit.
-    let refs = references(input, &plan, prepared.requirements())?;
     let mut resolved_datasets = HashMap::new();
-    if !refs.is_empty() {
-        Resolution::new(control.clone())?.all(
-            catalog,
-            main,
-            logical,
-            &refs,
-            &mut |ds, branch| {
-                let granted = read(ds, branch)?;
-                if ds.dataset_id() != main.dataset_id() {
-                    let resolved: &Dataset = resolved_datasets
-                        .entry(ds.dataset_id())
-                        .or_insert_with(|| ds.clone());
-                    if !std::ptr::eq(resolved.store(), ds.store()) {
-                        return None;
-                    }
+    verify_requirements(
+        catalog,
+        main,
+        logical,
+        input,
+        &plan,
+        prepared.requirements(),
+        &mut |ds, branch| {
+            let granted = read(ds, branch)?;
+            if ds.dataset_id() != main.dataset_id() {
+                let resolved = resolved_datasets
+                    .entry(ds.dataset_id())
+                    .or_insert_with(|| ds.clone());
+                if !std::ptr::eq(resolved.store(), ds.store()) {
+                    return None;
                 }
-                Some(granted)
-            },
-        )?;
-    }
+            }
+            Some(granted)
+        },
+        control,
+    )?;
     main.store().failpoint("evidence-sources-resolved");
     let foreign: Vec<&Dataset> = resolved_datasets.values().collect();
     let (publication_catalog, source_identities) = if foreign.is_empty() {
@@ -1365,4 +2209,1218 @@ fn reconcile_operation_holds_controlled(
                 Ok(false)
             },
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sparkles_core::evidence::{MethodRef, RecordKey, RecordVersion, prepare_input};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn iri(s: &str) -> NamedNode {
+        NamedNode::new(s).unwrap()
+    }
+
+    fn key(s: &str) -> RecordKey {
+        RecordKey::new(s).unwrap()
+    }
+
+    fn btree_total_charge<K, V>(n: usize) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        btree_insert_charge::<K, V>(true)
+            .saturating_add(((n - 1) as u64).saturating_mul(btree_insert_charge::<K, V>(false)))
+    }
+
+    #[test]
+    fn admitted_containers_charge_exact_singleton_capacity_before_insert_and_release_on_drop() {
+        let admit = |e: Error| e;
+        let prep = Preparation::new(Control::none(), 64 * 1024).unwrap();
+        let baseline = prep.available_bytes();
+        let context_bytes = 64 * 1024 - baseline;
+        let digest = Sha256Digest::of_bytes(b"1", &Control::none()).unwrap();
+        let slot = std::mem::size_of::<ProposedStructured<'_>>() as u64;
+
+        // Singleton AdmittedVec allocates exact capacity 1 and charges its exact bytes.
+        {
+            let mut vec: AdmittedVec<ProposedStructured<'_>> =
+                AdmittedVec::new(&prep, &admit).unwrap();
+            vec.push(
+                &prep,
+                ProposedStructured {
+                    key: "s0",
+                    pointer: "/a",
+                    value_digest: digest,
+                },
+                &admit,
+            )
+            .unwrap();
+            assert_eq!(vec.values.capacity(), 1);
+            assert_eq!(baseline - prep.available_bytes(), slot);
+            // Second push grows capacity 1 -> 2 and settles to 2 slots after dropping old.
+            vec.push(
+                &prep,
+                ProposedStructured {
+                    key: "s1",
+                    pointer: "/b",
+                    value_digest: digest,
+                },
+                &admit,
+            )
+            .unwrap();
+            assert_eq!(vec.values.capacity(), 2);
+            assert_eq!(baseline - prep.available_bytes(), slot * 2);
+        }
+        assert_eq!(prep.available_bytes(), baseline);
+
+        // Vector growth must admit old + new capacity (1 + 2 = 3 slots) simultaneously:
+        // refuse when the new 2-slot buffer fits inside the allowance by itself (3*slot - 1)
+        // but old + new exceeds it, and succeed with 1 extra byte (3*slot).
+        {
+            let tight_peak =
+                Preparation::new(Control::none(), context_bytes + slot * 3 - 1).unwrap();
+            let mut vec: AdmittedVec<ProposedStructured<'_>> =
+                AdmittedVec::new(&tight_peak, &admit).unwrap();
+            vec.push(
+                &tight_peak,
+                ProposedStructured {
+                    key: "p0",
+                    pointer: "/a",
+                    value_digest: digest,
+                },
+                &admit,
+            )
+            .unwrap();
+            assert_eq!(vec.values.capacity(), 1);
+            let before_refusal = tight_peak.available_bytes();
+            assert!(matches!(
+                vec.push(
+                    &tight_peak,
+                    ProposedStructured {
+                        key: "p1",
+                        pointer: "/b",
+                        value_digest: digest,
+                    },
+                    &admit,
+                ),
+                Err(Error::BudgetExceeded(_))
+            ));
+            assert_eq!(vec.len(), 1);
+            assert_eq!(vec.values.capacity(), 1);
+            assert_eq!(tight_peak.available_bytes(), before_refusal);
+        }
+        {
+            let exact_peak = Preparation::new(Control::none(), context_bytes + slot * 3).unwrap();
+            let exact_baseline = exact_peak.available_bytes();
+            {
+                let mut vec: AdmittedVec<ProposedStructured<'_>> =
+                    AdmittedVec::new(&exact_peak, &admit).unwrap();
+                vec.push(
+                    &exact_peak,
+                    ProposedStructured {
+                        key: "p0",
+                        pointer: "/a",
+                        value_digest: digest,
+                    },
+                    &admit,
+                )
+                .unwrap();
+                vec.push(
+                    &exact_peak,
+                    ProposedStructured {
+                        key: "p1",
+                        pointer: "/b",
+                        value_digest: digest,
+                    },
+                    &admit,
+                )
+                .unwrap();
+                assert_eq!(vec.len(), 2);
+                assert_eq!(vec.values.capacity(), 2);
+                assert_eq!(exact_baseline - exact_peak.available_bytes(), slot * 2);
+            }
+            assert_eq!(exact_peak.available_bytes(), exact_baseline);
+        }
+
+        // AdmittedSet and AdmittedMap refuse before inserting when budget is too small.
+        let tiny = Preparation::new(Control::none(), context_bytes + 64).unwrap();
+        let mut set: AdmittedSet<&str> = AdmittedSet::new(&tiny, &admit).unwrap();
+        assert!(matches!(
+            set.insert("first", &admit),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert!(set.values.is_empty());
+
+        let mut map: AdmittedMap<&str, usize> = AdmittedMap::new(&tiny, &admit).unwrap();
+        assert!(matches!(
+            map.insert("first", 0, &admit),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert!(map.values.is_empty());
+    }
+
+    #[test]
+    fn singleton_structured_groups_and_long_input_errors_respect_preparation_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        let principal = iri("urn:agent:budget");
+        let digest = Sha256Digest::of_bytes(b"1", &Control::none()).unwrap();
+        let settings = Settings {
+            enabled: true,
+            source_records: vec!["urn:ev:sources".into()],
+            proposals: vec!["urn:ev:claims".into()],
+            ..Default::default()
+        };
+        let opts = ProposalOptions {
+            principal: &principal,
+            idempotency_key: None,
+            source_graph: None,
+            proposal_graph: None,
+            identity_graph: None,
+        };
+
+        // 1. 64 singleton structured groups: compute the exact admitted classification
+        //    cost (all 5 populated index/dedup maps + outer vectors + 64 inner singleton
+        //    group vectors). Setting the allowance 1 byte below that total admits every
+        //    index map, outer vector and the first 63 inner singleton groups, so the 64th
+        //    inner singleton group allocation decides refusal (`incomplete-evidence` with
+        //    zero store reads). Adding 1 byte completes classification and reaches Phase 1.
+        const N: usize = 64;
+        let refs: Vec<EvidenceRefInput> = (0..N)
+            .map(|i| EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key(&format!("sr-{i}")),
+                occurrence_key: key(&format!("sr-{i}")),
+                target: EvidenceRefTarget::Structured {
+                    revision: RecordRef::Existing(iri(&format!("urn:rev:singleton-{i}"))),
+                    pointer: "/x".into(),
+                    method: MethodRef {
+                        method: iri(JSON_LEXICAL_UTF8_V1),
+                        version: key(JSON_LEXICAL_UTF8_VERSION),
+                    },
+                    value_digest: digest,
+                },
+            })
+            .collect();
+        let input = EvidenceInput {
+            references: refs,
+            ..Default::default()
+        };
+        let prepared = prepare_input(&input, &Control::none()).unwrap();
+        let plan = write::plan(
+            &prepared,
+            ds.dataset_id(),
+            &settings,
+            &opts,
+            &Control::none(),
+        )
+        .unwrap();
+        let context_bytes = 64 * 1024
+            - Preparation::new(Control::none(), 64 * 1024)
+                .unwrap()
+                .available_bytes();
+        let index_and_outer_bytes = context_bytes
+            + btree_total_charge::<&str, &NamedNode>(N)
+            + btree_total_charge::<&str, &EvidenceRefInput>(N)
+            + btree_total_charge::<(&NamedNode, u32), ()>(N)
+            + (N as u64) * (std::mem::size_of::<GenericReq<'_>>() as u64)
+            + btree_total_charge::<&NamedNode, SelectionRequirements>(N)
+            + btree_total_charge::<&NamedNode, usize>(N)
+            + (N as u64) * (std::mem::size_of::<StructuredGroup<'_>>() as u64);
+        let inner_singleton_bytes =
+            (N as u64) * (std::mem::size_of::<ProposedStructured<'_>>() as u64);
+        let exact_classified_bytes = index_and_outer_bytes + inner_singleton_bytes;
+
+        let reads = AtomicUsize::new(0);
+        let err = verify_requirements_with_memory(
+            None,
+            &ds,
+            &ds,
+            &input,
+            &plan,
+            prepared.requirements(),
+            &mut |_, _| {
+                reads.fetch_add(1, Ordering::Relaxed);
+                None
+            },
+            &Control::none(),
+            exact_classified_bytes - 1,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "incomplete-evidence");
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+
+        // One more byte admits the 64th inner singleton group, releases the index maps,
+        // and enters Phase 1 (invoking `read` once before refusing with unavailable).
+        let exact_reads = AtomicUsize::new(0);
+        let exact_err = verify_requirements_with_memory(
+            None,
+            &ds,
+            &ds,
+            &input,
+            &plan,
+            prepared.requirements(),
+            &mut |_, _| {
+                exact_reads.fetch_add(1, Ordering::Relaxed);
+                None
+            },
+            &Control::none(),
+            exact_classified_bytes,
+        )
+        .unwrap_err();
+        assert_eq!(exact_err.code(), "evidence-unavailable");
+        assert_eq!(exact_reads.load(Ordering::Relaxed), 1);
+
+        // 2. Unsupported normalization method carrying a long method IRI fails
+        //    immediately with the input-only error without buffering deferred errors
+        //    or reading the store, even under a tight 4 KiB budget.
+        let long_method = iri(&format!(
+            "urn:example:unsupported-{}",
+            "m".repeat(16 * 1024)
+        ));
+        let long_input = EvidenceInput {
+            references: vec![EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("long-unsup"),
+                occurrence_key: key("long-unsup"),
+                target: EvidenceRefTarget::Structured {
+                    revision: RecordRef::Existing(iri("urn:rev:missing")),
+                    pointer: "/x".into(),
+                    method: MethodRef {
+                        method: long_method,
+                        version: key("v1"),
+                    },
+                    value_digest: digest,
+                },
+            }],
+            ..Default::default()
+        };
+        let long_prepared = prepare_input(&long_input, &Control::none()).unwrap();
+        let long_plan = write::plan(
+            &long_prepared,
+            ds.dataset_id(),
+            &settings,
+            &opts,
+            &Control::none(),
+        )
+        .unwrap();
+        let long_reads = AtomicUsize::new(0);
+        let long_err = verify_requirements_with_memory(
+            None,
+            &ds,
+            &ds,
+            &long_input,
+            &long_plan,
+            long_prepared.requirements(),
+            &mut |_, _| {
+                long_reads.fetch_add(1, Ordering::Relaxed);
+                Some(Arc::new(GraphAccess::all()))
+            },
+            &Control::none(),
+            4 * 1024,
+        )
+        .unwrap_err();
+        assert_eq!(long_err.code(), "incomplete-evidence");
+        assert!(long_err.to_string().contains("not supported by this build"));
+        assert_eq!(long_reads.load(Ordering::Relaxed), 0);
+    }
+
+    fn insert_managed_quads(ds: &Dataset, quads: Vec<oxrdf::Quad>) {
+        let store = ds.store();
+        let cap = store
+            .managed_writer(OwnerKind::Evidence, Uuid::new_v4())
+            .unwrap();
+        let mut txn = store
+            .try_write_with(
+                sparkles_core::commit::CommitKind::Transaction,
+                Default::default(),
+            )
+            .unwrap();
+        txn.set_managed(cap).unwrap();
+        let mut labels = std::collections::HashMap::new();
+        for q in &quads {
+            let ids = txn.encode_quad(q, &mut labels).unwrap();
+            txn.insert(ids).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    fn configure_test_evidence(ds: &Dataset) -> (Settings, Uuid) {
+        let settings = Settings {
+            enabled: true,
+            source_records: vec!["urn:ev:sources".into()],
+            proposals: vec!["urn:ev:claims".into()],
+            ..Default::default()
+        };
+        crate::evidence::configure(ds, &settings, &Control::none()).unwrap();
+        let capability = ds
+            .store()
+            .managed_writer(OwnerKind::Evidence, Uuid::new_v4())
+            .unwrap();
+        let nonce = capability
+            .protection("urn:ev:sources")
+            .expect("sources protection nonce");
+        (settings, nonce)
+    }
+
+    fn run_verify(
+        ds: &Dataset,
+        settings: &Settings,
+        input: &EvidenceInput,
+        memory_bytes: u64,
+    ) -> Result<()> {
+        let principal = iri("urn:agent:r4-test");
+        let opts = ProposalOptions {
+            principal: &principal,
+            idempotency_key: None,
+            source_graph: None,
+            proposal_graph: None,
+            identity_graph: None,
+        };
+        let prepared = prepare_input(input, &Control::none()).unwrap();
+        let plan = write::plan(
+            &prepared,
+            ds.dataset_id(),
+            settings,
+            &opts,
+            &Control::none(),
+        )
+        .unwrap();
+        verify_requirements_with_memory(
+            None,
+            ds,
+            ds,
+            input,
+            &plan,
+            prepared.requirements(),
+            &mut |_, _| Some(Arc::new(GraphAccess::all())),
+            &Control::none(),
+            memory_bytes,
+        )
+    }
+
+    #[test]
+    fn proposal_single_read_for_incompatible_kind_fallback_and_mixed_passages() {
+        use base64::Engine as _;
+        use oxrdf::{Literal, Term};
+        use sparkles_core::evidence::resolve::{
+            kind_iri, literal_read_counts, reset_literal_read_counts,
+        };
+
+        const EV: &str = "urn:x-sparkles:evidence:";
+        const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+        const PROV_DERIVED: &str = "http://www.w3.org/ns/prov#wasDerivedFrom";
+        const OA: &str = "http://www.w3.org/ns/oa#";
+        const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+        const XSD_BASE64: &str = "http://www.w3.org/2001/XMLSchema#base64Binary";
+
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        let (settings, nonce) = configure_test_evidence(&ds);
+        let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
+        let q =
+            |s: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(s.clone(), iri(p), o, sg.clone());
+        let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+        let int_lit =
+            |n: u64| Term::Literal(Literal::new_typed_literal(n.to_string(), iri(XSD_INTEGER)));
+
+        let op = iri("urn:op:r4-reads");
+        let rev_ok = iri("urn:rev:r4-ok");
+        let rend_ok = iri("urn:rend:r4-ok");
+        let rend_bad_shape = iri("urn:rend:r4-bad-shape");
+        let rend_bad_shape_2 = iri("urn:rend:r4-bad-shape-2");
+        let pass_ok_1 = iri("urn:pass:r4-ok-1");
+        let sel_1 = iri("urn:sel:r4-ok-1");
+        let pass_ok_2 = iri("urn:pass:r4-ok-2");
+        let sel_2 = iri("urn:sel:r4-ok-2");
+
+        let json = r#"{"score":42}"#;
+        let json_digest = Sha256Digest::of_bytes(json.as_bytes(), &Control::none()).unwrap();
+        let val_digest = Sha256Digest::of_bytes(b"42", &Control::none()).unwrap();
+        let json_b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+        let text = "single proposal read check";
+        let d_single = Sha256Digest::of_bytes(b"single", &Control::none()).unwrap();
+        let d_proposal = Sha256Digest::of_bytes(b"proposal", &Control::none()).unwrap();
+        let d_read = Sha256Digest::of_bytes(b"read", &Control::none()).unwrap();
+
+        insert_managed_quads(
+            &ds,
+            vec![
+                q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+                q(
+                    &op,
+                    &format!("{EV}datasetId"),
+                    lit(&ds.dataset_id().to_string()),
+                ),
+                q(
+                    &op,
+                    &format!("{EV}branchId"),
+                    lit(&ds.store().branch_id().to_string()),
+                ),
+                q(&op, &format!("{EV}commit"), int_lit(1)),
+                q(
+                    &op,
+                    &format!("{EV}graphProtection"),
+                    lit(&nonce.to_string()),
+                ),
+                // Valid SourceRevision
+                q(
+                    &rev_ok,
+                    RDF_TYPE,
+                    iri(kind_iri(RecordKind::SourceRevision)).into(),
+                ),
+                q(
+                    &rev_ok,
+                    &format!("{EV}availabilityReceipt"),
+                    op.clone().into(),
+                ),
+                q(
+                    &rev_ok,
+                    &format!("{EV}graphProtection"),
+                    lit(&nonce.to_string()),
+                ),
+                q(
+                    &rev_ok,
+                    &format!("{EV}contentDigest"),
+                    lit(&json_digest.to_string()),
+                ),
+                q(
+                    &rev_ok,
+                    &format!("{EV}retainedBytes"),
+                    Term::Literal(Literal::new_typed_literal(json_b64, iri(XSD_BASE64))),
+                ),
+                // Valid Rendition
+                q(
+                    &rend_ok,
+                    RDF_TYPE,
+                    iri(kind_iri(RecordKind::Rendition)).into(),
+                ),
+                q(
+                    &rend_ok,
+                    &format!("{EV}availabilityReceipt"),
+                    op.clone().into(),
+                ),
+                q(
+                    &rend_ok,
+                    &format!("{EV}graphProtection"),
+                    lit(&nonce.to_string()),
+                ),
+                q(&rend_ok, PROV_DERIVED, rev_ok.clone().into()),
+                q(&rend_ok, &format!("{EV}normalizedText"), lit(text)),
+                // Wrong-shape Rendition (Vocab IRI under ev:normalizedText)
+                q(
+                    &rend_bad_shape,
+                    RDF_TYPE,
+                    iri(kind_iri(RecordKind::Rendition)).into(),
+                ),
+                q(
+                    &rend_bad_shape,
+                    &format!("{EV}availabilityReceipt"),
+                    op.clone().into(),
+                ),
+                q(
+                    &rend_bad_shape,
+                    &format!("{EV}graphProtection"),
+                    lit(&nonce.to_string()),
+                ),
+                q(&rend_bad_shape, PROV_DERIVED, rev_ok.clone().into()),
+                q(
+                    &rend_bad_shape,
+                    &format!("{EV}normalizedText"),
+                    iri("urn:not:simple-literal").into(),
+                ),
+                // Second wrong-shape Rendition (for ordering between compatible & incompatible probes)
+                q(
+                    &rend_bad_shape_2,
+                    RDF_TYPE,
+                    iri(kind_iri(RecordKind::Rendition)).into(),
+                ),
+                q(
+                    &rend_bad_shape_2,
+                    &format!("{EV}availabilityReceipt"),
+                    op.clone().into(),
+                ),
+                q(
+                    &rend_bad_shape_2,
+                    &format!("{EV}graphProtection"),
+                    lit(&nonce.to_string()),
+                ),
+                q(&rend_bad_shape_2, PROV_DERIVED, rev_ok.clone().into()),
+                q(
+                    &rend_bad_shape_2,
+                    &format!("{EV}normalizedText"),
+                    iri("urn:not:simple-literal-2").into(),
+                ),
+                // Existing passage 1 on rend_ok
+                q(
+                    &pass_ok_1,
+                    RDF_TYPE,
+                    iri(kind_iri(RecordKind::Passage)).into(),
+                ),
+                q(
+                    &pass_ok_1,
+                    &format!("{EV}availabilityReceipt"),
+                    op.clone().into(),
+                ),
+                q(
+                    &pass_ok_1,
+                    &format!("{EV}graphProtection"),
+                    lit(&nonce.to_string()),
+                ),
+                q(
+                    &pass_ok_1,
+                    &format!("{EV}sourceRevision"),
+                    rev_ok.clone().into(),
+                ),
+                q(
+                    &pass_ok_1,
+                    &format!("{OA}hasSource"),
+                    rend_ok.clone().into(),
+                ),
+                q(
+                    &pass_ok_1,
+                    &format!("{OA}hasSelector"),
+                    sel_1.clone().into(),
+                ),
+                q(&sel_1, &format!("{OA}start"), int_lit(0)),
+                q(&sel_1, &format!("{OA}end"), int_lit(6)),
+                q(
+                    &pass_ok_1,
+                    &format!("{EV}textDigest"),
+                    lit(&d_single.to_string()),
+                ),
+                // Existing passage 2 on rend_ok
+                q(
+                    &pass_ok_2,
+                    RDF_TYPE,
+                    iri(kind_iri(RecordKind::Passage)).into(),
+                ),
+                q(
+                    &pass_ok_2,
+                    &format!("{EV}availabilityReceipt"),
+                    op.clone().into(),
+                ),
+                q(
+                    &pass_ok_2,
+                    &format!("{EV}graphProtection"),
+                    lit(&nonce.to_string()),
+                ),
+                q(
+                    &pass_ok_2,
+                    &format!("{EV}sourceRevision"),
+                    rev_ok.clone().into(),
+                ),
+                q(
+                    &pass_ok_2,
+                    &format!("{OA}hasSource"),
+                    rend_ok.clone().into(),
+                ),
+                q(
+                    &pass_ok_2,
+                    &format!("{OA}hasSelector"),
+                    sel_2.clone().into(),
+                ),
+                q(&sel_2, &format!("{OA}start"), int_lit(7)),
+                q(&sel_2, &format!("{OA}end"), int_lit(15)),
+                q(
+                    &pass_ok_2,
+                    &format!("{EV}textDigest"),
+                    lit(&d_proposal.to_string()),
+                ),
+            ],
+        );
+        ds.store().compact().unwrap();
+
+        // 1. Compatible rendition probe (rev_ok, rend_ok) followed by incompatible
+        //    (rend_ok, rend_ok): fallback reuses the exact shape already checked by the
+        //    incompatible probe -> 1 simple literal read total (not 2).
+        let compat_then_incompat = EvidenceInput {
+            passages: vec![
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p1"),
+                    revision: RecordRef::Existing(rev_ok.clone()),
+                    rendition: RecordRef::Existing(rend_ok.clone()),
+                    occurrence_key: key("p1"),
+                    start: 0,
+                    end: 6,
+                    text_digest: d_single,
+                    quote: Some("single".into()),
+                },
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p2"),
+                    revision: RecordRef::Existing(rend_ok.clone()),
+                    rendition: RecordRef::Existing(rend_ok.clone()),
+                    occurrence_key: key("p2"),
+                    start: 0,
+                    end: 6,
+                    text_digest: d_single,
+                    quote: Some("single".into()),
+                },
+            ],
+            ..Default::default()
+        };
+        reset_literal_read_counts();
+        let err = run_verify(&ds, &settings, &compat_then_incompat, MEMORY_BYTES).unwrap_err();
+        assert_eq!(err.code(), "immutable-record-conflict");
+        assert_eq!(literal_read_counts(), (1, 0));
+
+        // 2a. Earlier compatible probe on wrong-shape rendition T, then wrong-shape
+        //     rendition B, then incompatible (T, T): carries forward T's exact
+        //     Unavailable outcome at T's earlier position before B without rereading T
+        //     or reading B.
+        let earlier_bad_shape = EvidenceInput {
+            passages: vec![
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p-bad-1"),
+                    revision: RecordRef::Existing(rev_ok.clone()),
+                    rendition: RecordRef::Existing(rend_bad_shape.clone()),
+                    occurrence_key: key("p-bad-1"),
+                    start: 0,
+                    end: 6,
+                    text_digest: d_single,
+                    quote: None,
+                },
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p-bad-mid"),
+                    revision: RecordRef::Existing(rev_ok.clone()),
+                    rendition: RecordRef::Existing(rend_bad_shape_2.clone()),
+                    occurrence_key: key("p-bad-mid"),
+                    start: 0,
+                    end: 6,
+                    text_digest: d_single,
+                    quote: None,
+                },
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p-bad-2"),
+                    revision: RecordRef::Existing(rend_bad_shape.clone()),
+                    rendition: RecordRef::Existing(rend_bad_shape.clone()),
+                    occurrence_key: key("p-bad-2"),
+                    start: 0,
+                    end: 6,
+                    text_digest: d_single,
+                    quote: None,
+                },
+            ],
+            ..Default::default()
+        };
+        reset_literal_read_counts();
+        let err = run_verify(&ds, &settings, &earlier_bad_shape, MEMORY_BYTES).unwrap_err();
+        assert_eq!(err.code(), "evidence-unavailable");
+        assert!(err.to_string().contains(rend_bad_shape.as_str()));
+        assert_eq!(literal_read_counts(), (1, 0));
+
+        // 2b. Earlier compatible probe on valid rendition T, then wrong-shape rendition B,
+        //     then incompatible (T, T): fallback skips rereading T (cached Valid) and
+        //     reports B's earlier `evidence-unavailable` before T's kind conflict
+        //     (2 reads total: 1 for T, 1 for B).
+        let valid_then_bad_then_incompat = EvidenceInput {
+            passages: vec![
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p-ok-first"),
+                    revision: RecordRef::Existing(rev_ok.clone()),
+                    rendition: RecordRef::Existing(rend_ok.clone()),
+                    occurrence_key: key("p-ok-first"),
+                    start: 0,
+                    end: 6,
+                    text_digest: d_single,
+                    quote: Some("single".into()),
+                },
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p-bad-second"),
+                    revision: RecordRef::Existing(rev_ok.clone()),
+                    rendition: RecordRef::Existing(rend_bad_shape.clone()),
+                    occurrence_key: key("p-bad-second"),
+                    start: 0,
+                    end: 6,
+                    text_digest: d_single,
+                    quote: None,
+                },
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p-ok-incompat"),
+                    revision: RecordRef::Existing(rend_ok.clone()),
+                    rendition: RecordRef::Existing(rend_ok.clone()),
+                    occurrence_key: key("p-ok-incompat"),
+                    start: 0,
+                    end: 6,
+                    text_digest: d_single,
+                    quote: Some("single".into()),
+                },
+            ],
+            ..Default::default()
+        };
+        reset_literal_read_counts();
+        let err =
+            run_verify(&ds, &settings, &valid_then_bad_then_incompat, MEMORY_BYTES).unwrap_err();
+        assert_eq!(err.code(), "evidence-unavailable");
+        assert!(err.to_string().contains(rend_bad_shape.as_str()));
+        assert_eq!(literal_read_counts(), (2, 0));
+
+        // 3. Symmetric structured compatible probe followed by incompatible rendition probe:
+        //    exactly 1 typed literal read total.
+        let struct_then_incompat = EvidenceInput {
+            references: vec![EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("s-ok"),
+                occurrence_key: key("s-ok"),
+                target: EvidenceRefTarget::Structured {
+                    revision: RecordRef::Existing(rev_ok.clone()),
+                    pointer: "/score".into(),
+                    method: MethodRef {
+                        method: iri(JSON_LEXICAL_UTF8_V1),
+                        version: key(JSON_LEXICAL_UTF8_VERSION),
+                    },
+                    value_digest: val_digest,
+                },
+            }],
+            passages: vec![PassageInput {
+                version: RecordVersion::V1,
+                key: key("p-rev-as-rend"),
+                revision: RecordRef::Existing(rev_ok.clone()),
+                rendition: RecordRef::Existing(rev_ok.clone()),
+                occurrence_key: key("p-rev-as-rend"),
+                start: 0,
+                end: 6,
+                text_digest: d_single,
+                quote: None,
+            }],
+            ..Default::default()
+        };
+        reset_literal_read_counts();
+        let err = run_verify(&ds, &settings, &struct_then_incompat, MEMORY_BYTES).unwrap_err();
+        assert_eq!(err.code(), "immutable-record-conflict");
+        assert_eq!(literal_read_counts(), (0, 1));
+
+        // 4. Mixed successful proposal creating a new passage from `rend_ok` AND
+        //    referencing two existing passages on `rend_ok`: shares one single
+        //    `ev:normalizedText` read across both selection forms.
+        let mixed_ok = EvidenceInput {
+            passages: vec![PassageInput {
+                version: RecordVersion::V1,
+                key: key("p-new"),
+                revision: RecordRef::Existing(rev_ok.clone()),
+                rendition: RecordRef::Existing(rend_ok.clone()),
+                occurrence_key: key("p-new"),
+                start: 16,
+                end: 20,
+                text_digest: d_read,
+                quote: Some("read".into()),
+            }],
+            references: vec![
+                EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key("ref-existing-1"),
+                    occurrence_key: key("ref-existing-1"),
+                    target: EvidenceRefTarget::Passage {
+                        revision: RecordRef::Existing(rev_ok.clone()),
+                        rendition: RecordRef::Existing(rend_ok.clone()),
+                        passage: RecordRef::Existing(pass_ok_1.clone()),
+                    },
+                },
+                EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key("ref-existing-2"),
+                    occurrence_key: key("ref-existing-2"),
+                    target: EvidenceRefTarget::Passage {
+                        revision: RecordRef::Existing(rev_ok.clone()),
+                        rendition: RecordRef::Existing(rend_ok.clone()),
+                        passage: RecordRef::Existing(pass_ok_2.clone()),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        reset_literal_read_counts();
+        run_verify(&ds, &settings, &mixed_ok, MEMORY_BYTES).unwrap();
+        assert_eq!(literal_read_counts(), (1, 0));
+    }
+
+    #[test]
+    fn proposal_phase2_budget_and_mixed_batch_wrong_shape_fallback_parity() {
+        use base64::Engine as _;
+        use oxrdf::{Literal, Term};
+        use sparkles_core::evidence::resolve::kind_iri;
+
+        const EV: &str = "urn:x-sparkles:evidence:";
+        const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+        const PROV_DERIVED: &str = "http://www.w3.org/ns/prov#wasDerivedFrom";
+        const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+        const XSD_BASE64: &str = "http://www.w3.org/2001/XMLSchema#base64Binary";
+
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        let (settings, nonce) = configure_test_evidence(&ds);
+        let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
+        let q =
+            |s: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(s.clone(), iri(p), o, sg.clone());
+        let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+        let int_lit =
+            |n: u64| Term::Literal(Literal::new_typed_literal(n.to_string(), iri(XSD_INTEGER)));
+
+        let op = iri("urn:op:r4-budget");
+        let rev_big = iri("urn:rev:r4-big");
+        let rev_other = iri("urn:rev:r4-other");
+        let rev_bad = iri("urn:rev:r4-wrong-shape");
+        let rev_missing = iri("urn:rev:r4-missing");
+        let rend_ok = iri("urn:rend:r4-budget-ok");
+
+        // 180 KiB JSON -> ~240 KiB base64 literal (< 256 KiB Vec capacity): leaves a
+        // ~52 KiB window where the reconstructed vocab key fits during literal-shape
+        // checking (128 + 256 = 384 KiB peak), while the 180 KiB decoded buffer cannot
+        // fit simultaneously alongside the 256 KiB live key (256 + 180 = 436 KiB).
+        let json = format!(r#"{{"score":1,"pad":"{}"}}"#, "x".repeat(180 * 1024));
+        let json_digest = Sha256Digest::of_bytes(json.as_bytes(), &Control::none()).unwrap();
+        let val_digest = Sha256Digest::of_bytes(b"1", &Control::none()).unwrap();
+        let json_b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+        let text = "Release 1.2";
+        let d_text = Sha256Digest::of_bytes(text.as_bytes(), &Control::none()).unwrap();
+
+        let mut quads = vec![
+            q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+            q(
+                &op,
+                &format!("{EV}datasetId"),
+                lit(&ds.dataset_id().to_string()),
+            ),
+            q(
+                &op,
+                &format!("{EV}branchId"),
+                lit(&ds.store().branch_id().to_string()),
+            ),
+            q(&op, &format!("{EV}commit"), int_lit(1)),
+            q(
+                &op,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_big,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(
+                &rev_big,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rev_big,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_big,
+                &format!("{EV}contentDigest"),
+                lit(&json_digest.to_string()),
+            ),
+            q(
+                &rev_big,
+                &format!("{EV}retainedBytes"),
+                Term::Literal(Literal::new_typed_literal(json_b64, iri(XSD_BASE64))),
+            ),
+            q(
+                &rev_other,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(
+                &rev_other,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rev_other,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_other,
+                &format!("{EV}contentDigest"),
+                lit(&json_digest.to_string()),
+            ),
+            q(
+                &rev_bad,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(
+                &rev_bad,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rev_bad,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_bad,
+                &format!("{EV}contentDigest"),
+                lit(&json_digest.to_string()),
+            ),
+            q(
+                &rev_bad,
+                &format!("{EV}retainedBytes"),
+                iri("urn:not:base64-value").into(),
+            ),
+            q(
+                &rend_ok,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::Rendition)).into(),
+            ),
+            q(
+                &rend_ok,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rend_ok,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&rend_ok, PROV_DERIVED, rev_big.clone().into()),
+            q(&rend_ok, &format!("{EV}normalizedText"), lit(text)),
+        ];
+        // Isolate `rev_big`'s large base64 literal into its own front-coded Vocab block
+        // so IRI lookups do not scan past the 240 KiB literal.
+        let pad_sub = iri("urn:pad:vocab-blocks");
+        for i in 0..32u32 {
+            quads.push(q(
+                &pad_sub,
+                &format!("{EV}padBefore"),
+                lit(&format!("a{i:02}")),
+            ));
+            quads.push(q(
+                &pad_sub,
+                &format!("{EV}padAfter"),
+                lit(&format!("z{i:02}")),
+            ));
+        }
+        insert_managed_quads(&ds, quads);
+        ds.store().compact().unwrap();
+
+        let two_struct = |b: &NamedNode| EvidenceInput {
+            references: vec![
+                EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key("s-a"),
+                    occurrence_key: key("s-a"),
+                    target: EvidenceRefTarget::Structured {
+                        revision: RecordRef::Existing(rev_big.clone()),
+                        pointer: "/score".into(),
+                        method: MethodRef {
+                            method: iri(JSON_LEXICAL_UTF8_V1),
+                            version: key(JSON_LEXICAL_UTF8_VERSION),
+                        },
+                        value_digest: val_digest,
+                    },
+                },
+                EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key("s-b"),
+                    occurrence_key: key("s-b"),
+                    target: EvidenceRefTarget::Structured {
+                        revision: RecordRef::Existing(b.clone()),
+                        pointer: "/score".into(),
+                        method: MethodRef {
+                            method: iri(JSON_LEXICAL_UTF8_V1),
+                            version: key(JSON_LEXICAL_UTF8_VERSION),
+                        },
+                        value_digest: val_digest,
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+
+        let scrub = |e: &Error, target: &NamedNode| {
+            (
+                e.code().to_string(),
+                e.to_string().replace(target.as_str(), "TARGET"),
+            )
+        };
+
+        // Find a budget in [4 KiB, 512 KiB] where:
+        // - `(rev_big, rev_big)` fails in Phase 2 decoding with `incomplete-evidence`
+        //   naming `rev_big`, AND
+        // - `(rev_big, rev_missing)` succeeds at `rev_big`'s literal-shape check and
+        //   returns `evidence-unavailable` naming `rev_missing`.
+        let valid_pair = two_struct(&rev_big);
+        let absent_pair = two_struct(&rev_missing);
+        let wrong_shape_pair = two_struct(&rev_bad);
+
+        let mut decode_refusal_budget = None;
+        let mut key_refusal_budget = None;
+        for kib in (128u64..=768).step_by(8) {
+            let cap = kib * 1024;
+            let absent_res = run_verify(&ds, &settings, &absent_pair, cap);
+            let valid_res = run_verify(&ds, &settings, &valid_pair, cap);
+            if let (Err(a_err), Err(v_err)) = (&absent_res, &valid_res) {
+                if a_err.code() == "incomplete-evidence"
+                    && a_err.to_string().contains(rev_big.as_str())
+                    && key_refusal_budget.is_none()
+                {
+                    key_refusal_budget = Some(cap);
+                }
+                if a_err.code() == "evidence-unavailable"
+                    && a_err.to_string().contains(rev_missing.as_str())
+                    && v_err.code() == "incomplete-evidence"
+                    && v_err.to_string().contains(rev_big.as_str())
+                {
+                    decode_refusal_budget = Some(cap);
+                    break;
+                }
+            }
+        }
+        let decode_budget = decode_refusal_budget
+            .expect("expected a budget admitting A's shape check but refusing A's decode buffer");
+        let key_budget =
+            key_refusal_budget.expect("expected a tighter budget refusing A's vocab key itself");
+
+        // 1. Under `decode_budget`, Phase 2 decode refusal on A must still check B's
+        //    deferred literal shape and match absent B byte for byte.
+        let absent_err = run_verify(&ds, &settings, &absent_pair, decode_budget).unwrap_err();
+        let bad_shape_err =
+            run_verify(&ds, &settings, &wrong_shape_pair, decode_budget).unwrap_err();
+        assert_eq!(absent_err.code(), "evidence-unavailable");
+        assert_eq!(
+            scrub(&bad_shape_err, &rev_bad),
+            scrub(&absent_err, &rev_missing)
+        );
+
+        // 2. Under `key_budget` where A's vocab key itself does not fit, both absent B
+        //    and wrong-shape B return identical `incomplete-evidence` naming A.
+        let absent_key_err = run_verify(&ds, &settings, &absent_pair, key_budget).unwrap_err();
+        let bad_key_err = run_verify(&ds, &settings, &wrong_shape_pair, key_budget).unwrap_err();
+        assert_eq!(absent_key_err.code(), "incomplete-evidence");
+        assert_eq!(bad_key_err.code(), "incomplete-evidence");
+        assert_eq!(bad_key_err.to_string(), absent_key_err.to_string());
+
+        // 3. Mixed-batch Phase 2 fallback dispatch: an earlier proposed passage that
+        //    fails with `span-mismatch` (mismatched quote) or `invalid` (wrong revision)
+        //    still runs `check_deferred_literal_shapes` on a later wrong-shape target B
+        //    and matches absent B byte for byte.
+        let mixed_bad_quote = |b: &NamedNode| EvidenceInput {
+            passages: vec![PassageInput {
+                version: RecordVersion::V1,
+                key: key("p-bad-quote"),
+                revision: RecordRef::Existing(rev_big.clone()),
+                rendition: RecordRef::Existing(rend_ok.clone()),
+                occurrence_key: key("p-bad-quote"),
+                start: 0,
+                end: 11,
+                text_digest: d_text,
+                quote: Some("Wrong quote".into()),
+            }],
+            references: vec![EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("s-after-quote"),
+                occurrence_key: key("s-after-quote"),
+                target: EvidenceRefTarget::Structured {
+                    revision: RecordRef::Existing(b.clone()),
+                    pointer: "/score".into(),
+                    method: MethodRef {
+                        method: iri(JSON_LEXICAL_UTF8_V1),
+                        version: key(JSON_LEXICAL_UTF8_VERSION),
+                    },
+                    value_digest: val_digest,
+                },
+            }],
+            ..Default::default()
+        };
+        let quote_absent =
+            run_verify(&ds, &settings, &mixed_bad_quote(&rev_missing), MEMORY_BYTES).unwrap_err();
+        let quote_bad =
+            run_verify(&ds, &settings, &mixed_bad_quote(&rev_bad), MEMORY_BYTES).unwrap_err();
+        assert_eq!(quote_absent.code(), "evidence-unavailable");
+        assert_eq!(
+            scrub(&quote_bad, &rev_bad),
+            scrub(&quote_absent, &rev_missing)
+        );
+
+        let mixed_bad_rev = |b: &NamedNode| EvidenceInput {
+            passages: vec![PassageInput {
+                version: RecordVersion::V1,
+                key: key("p-bad-rev"),
+                revision: RecordRef::Existing(rev_other.clone()),
+                rendition: RecordRef::Existing(rend_ok.clone()),
+                occurrence_key: key("p-bad-rev"),
+                start: 0,
+                end: 11,
+                text_digest: d_text,
+                quote: Some(text.into()),
+            }],
+            references: vec![EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("s-after-rev"),
+                occurrence_key: key("s-after-rev"),
+                target: EvidenceRefTarget::Structured {
+                    revision: RecordRef::Existing(b.clone()),
+                    pointer: "/score".into(),
+                    method: MethodRef {
+                        method: iri(JSON_LEXICAL_UTF8_V1),
+                        version: key(JSON_LEXICAL_UTF8_VERSION),
+                    },
+                    value_digest: val_digest,
+                },
+            }],
+            ..Default::default()
+        };
+        let rev_absent =
+            run_verify(&ds, &settings, &mixed_bad_rev(&rev_missing), MEMORY_BYTES).unwrap_err();
+        let rev_bad_err =
+            run_verify(&ds, &settings, &mixed_bad_rev(&rev_bad), MEMORY_BYTES).unwrap_err();
+        assert_eq!(rev_absent.code(), "evidence-unavailable");
+        assert_eq!(
+            scrub(&rev_bad_err, &rev_bad),
+            scrub(&rev_absent, &rev_missing)
+        );
+
+        // 4. Phase 1 fallback dispatch: wrong-shape target B before missing target M
+        //    returns `evidence-unavailable` naming B (not M).
+        let bad_before_missing = EvidenceInput {
+            references: vec![
+                EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key("s-first-bad"),
+                    occurrence_key: key("s-first-bad"),
+                    target: EvidenceRefTarget::Structured {
+                        revision: RecordRef::Existing(rev_bad.clone()),
+                        pointer: "/score".into(),
+                        method: MethodRef {
+                            method: iri(JSON_LEXICAL_UTF8_V1),
+                            version: key(JSON_LEXICAL_UTF8_VERSION),
+                        },
+                        value_digest: val_digest,
+                    },
+                },
+                EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key("s-second-missing"),
+                    occurrence_key: key("s-second-missing"),
+                    target: EvidenceRefTarget::Structured {
+                        revision: RecordRef::Existing(rev_missing.clone()),
+                        pointer: "/score".into(),
+                        method: MethodRef {
+                            method: iri(JSON_LEXICAL_UTF8_V1),
+                            version: key(JSON_LEXICAL_UTF8_VERSION),
+                        },
+                        value_digest: val_digest,
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let err = run_verify(&ds, &settings, &bad_before_missing, MEMORY_BYTES).unwrap_err();
+        assert_eq!(err.code(), "evidence-unavailable");
+        assert!(err.to_string().contains(rev_bad.as_str()));
+    }
 }

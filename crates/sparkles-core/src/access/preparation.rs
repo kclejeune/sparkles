@@ -1312,11 +1312,15 @@ impl Preparation {
         Ok(result)
     }
 
-    /// The lexical form of a stored typed literal with exact datatype `datatype`,
-    /// borrowed for `each` without decoding it as a general [`Term`]. Avoids the
-    /// general term decoder's `128x` reserve so multi-MiB payloads (such as
-    /// `xsd:base64Binary` `ev:retainedBytes` up to C25's 16 MiB limit) fit within a
-    /// 64 MiB preparation allowance. `None` for any other term or datatype.
+    /// The lexical form of a vocabulary-stored typed literal with `datatype`, borrowed
+    /// for `each` without decoding it as a term. Only literals stored under `Tag::Vocab`
+    /// or `Tag::Delta` as `TextKey::Typed` keys match, including `xsd:base64Binary` and
+    /// any non-inlined lexical form of a datatype that can otherwise be inlined. Literals
+    /// stored under an inline tag, `xsd:string` literals stored as simple literal keys
+    /// for [`with_simple_literal`](Self::with_simple_literal), and any other term or
+    /// mismatched datatype pass `None`. On `Vocab`, reconstruction growth is settled to
+    /// the reconstructed key capacity before `each` runs so large retained literals do
+    /// not over-charge the allowance.
     pub fn with_typed_literal<R>(
         &self,
         snap: &Snapshot,
@@ -1324,48 +1328,51 @@ impl Preparation {
         datatype: &str,
         each: impl FnOnce(Option<&str>) -> Result<R>,
     ) -> Result<R> {
-        fn parse_typed_key<'a>(key: &'a [u8], datatype: &str) -> Option<&'a str> {
-            if key.first() != Some(&b'"') {
-                return None;
-            }
-            let sep = key.iter().rposition(|&b| b == crate::id::KEY_SEP)?;
-            let suffix = key.get(sep + 1..)?;
-            match suffix.split_first() {
-                Some((&b'^', dt)) if dt == datatype.as_bytes() => {
-                    std::str::from_utf8(&key[1..sep]).ok()
-                }
-                _ => None,
-            }
-        }
         self.check()?;
         let mut each = Some(each);
-        let mut workspace = self.reserve(0)?;
+        let mut call = |key: &[u8]| -> Result<R> {
+            let each = each.take().expect("called once");
+            let lexical = match crate::id::TextKey::parse(key) {
+                Some(crate::id::TextKey::Typed(text, dt)) if dt == datatype => Some(text),
+                _ => None,
+            };
+            each(lexical)
+        };
+        let workspace = std::cell::RefCell::new(self.reserve(0)?);
         let result = match id.tag() {
-            Tag::Vocab => snap.generation.vocab.get_with_controlled(
+            Tag::Vocab => snap.generation.vocab.get_with_controlled_capacity_checked(
                 id.payload(),
-                |bytes| workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256)),
-                |phase| self.checkpoint(phase),
-                |key| {
-                    // `workspace` already holds at least `2 * bytes + 256` for the
-                    // reconstructed vocabulary block that `key` borrows from.
-                    let each = each.take().expect("called once");
-                    each(parse_typed_key(key, datatype))
+                |old, new| {
+                    workspace
+                        .borrow_mut()
+                        .grow_to((old as u64).saturating_add(new as u64).saturating_add(256))
                 },
+                |cap| {
+                    workspace
+                        .borrow_mut()
+                        .release_to((cap as u64).saturating_add(256));
+                    Ok(())
+                },
+                |phase| self.checkpoint(phase),
+                |key| call(key),
             )?,
             Tag::Delta => snap.generation.dvocab.with_prepared(self, |vocab| {
                 if id.payload() >= snap.dvocab_len {
                     return Ok(None);
                 }
-                Ok(vocab.get(id.payload()).map(|key| {
-                    let _held = self.reserve((key.len() as u64).saturating_add(64))?;
-                    let each = each.take().expect("called once");
-                    each(parse_typed_key(key, datatype))
-                }))
+                vocab
+                    .get(id.payload())
+                    .map(|key| {
+                        let _held = self.reserve((key.len() as u64).saturating_add(64))?;
+                        call(key)
+                    })
+                    .transpose()
             })?,
             _ => None,
         };
+        drop(workspace);
         let result = match result {
-            Some(result) => result?,
+            Some(result) => result,
             None => (each.take().expect("not called"))(None)?,
         };
         self.check()?;

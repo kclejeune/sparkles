@@ -1084,10 +1084,31 @@ reconciliation and a retry.
 
 #### Proposal decisions
 
-1. **Unverifiable selections.** A passage of an existing rendition, a reference to an
-   existing passage and a structured value outside a retained JSON revision of the
-   same batch answer `incomplete-evidence`, because this step cannot yet verify them
-   against retained content. Roadmap item 551 tracks their verification.
+1. **Selections of existing records.** An earlier revision returned `incomplete-evidence`
+   for a passage of an existing rendition, a reference to an existing passage and a
+   structured value outside a retained JSON revision of the same batch. Roadmap item 551
+   adds bounded verification of all three through the proposal's shared `Resolution` and
+   its 64 MiB preparation allowance, under the caller's read access and triple masks. A
+   proposed passage of an existing rendition checks that the rendition is authenticated
+   and derived from the passage's revision, then reads its single `ev:normalizedText`
+   once via `Preparation::with_simple_literal` to verify every grouped passage's
+   code-point offsets, optional quote and `ev:textDigest`. A reference to an existing
+   passage verifies the passage through `Resolver::record` and confirms that the
+   passage's own `ev:sourceRevision`, its `oa:hasSource` rendition and that rendition's
+   `prov:wasDerivedFrom` match the reference. A structured `json-lexical-utf8:1`
+   reference against an existing revision authenticates the revision, reads its single
+   `ev:retainedBytes` (`xsd:base64Binary`) once via `Preparation::with_typed_literal`,
+   reserves the decoded byte buffer before chunked base64 decoding, checks the decoded
+   bytes against `ev:contentDigest`, validates UTF-8 and JSON and evaluates all grouped
+   RFC 6901 pointers in one bounded traversal whose memory cap stays within the
+   remaining preparation allowance. Existing or local non-JSON revisions, mismatched
+   quotes, missing pointers, duplicate keys and mismatched digests answer
+   `span-mismatch`. Missing, unreadable, masked or metadata-only targets answer
+   `evidence-unavailable` identically, detached records under a prior protection answer
+   `origin-not-reproduced`, mismatched revision or rendition identities answer `invalid`,
+   and unsupported structured normalization methods or exhausted memory budgets answer
+   `incomplete-evidence`. Record IRIs, record digests, source holds and authority checks
+   remain unchanged.
 2. **Records of an earlier protection.** A detach and a new protection invalidate the
    records written before them, which then answer `origin-not-reproduced`. Administered
    re-authentication (`sparkles::evidence::reauthenticate` and
@@ -1906,8 +1927,7 @@ references, the claims and one evidence link per claim.
 The C18 registration records the digest of the normalized text as the source's content
 digest when it keeps no other original bytes, which is the case for converted uploads.
 An upload and a later `source` run of the same registered source therefore describe the
-same revision. The passages are verified against the batch's own rendition text, which
-avoids the `incomplete-evidence` answer of proposal decision 1. A review verifies every
+same revision. The passages are verified against the batch's own rendition text. A review verifies every
 cited passage again against the rendition's retained `ev:normalizedText` before it
 accepts a claim, so the evidence rendition must keep the text. The text is therefore
 stored twice, once in the C18 chunks and once in the evidence rendition. That costs up
