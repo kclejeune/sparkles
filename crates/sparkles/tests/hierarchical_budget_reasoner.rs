@@ -2261,7 +2261,7 @@ fn refused_journal_inheritance_leaves_the_branch_name_available() {
 #[test]
 fn clearing_reasoning_supersedes_a_committed_unpublished_run() {
     use sparkles::task::{Control, Progress};
-    let ds = Dataset::memory();
+    let ds = inference_fixture();
     let racing = ds.clone();
     let ctl = Control {
         progress: Progress::new(move |_, phase| {
@@ -2279,5 +2279,240 @@ fn clearing_reasoning_supersedes_a_committed_unpublished_run() {
         matches!(err, Error::Component(ref e) if e.code == sparkles::reasoning::run::SUPERSEDED),
         "{err:?}"
     );
-    assert!(ds.reasoning().record().is_none());
+    assert_inference_visible(&ds, false);
+}
+
+#[test]
+fn refused_import_copy_wakes_after_rollback() {
+    use sparkles::sparql::pool::GRANULE;
+    use std::sync::{Mutex, mpsc};
+
+    let dir = tempfile::tempdir().unwrap();
+    let iri = format!("urn:import:{}", "x".repeat(16 << 10));
+    let pool = QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap();
+    let ds = memory_with_reasoning_pool(pool.clone());
+    let req = mapped_import(&ds, &dir.path().join("import.ttl"), &iri);
+    leave_import_pending(&ds, &req);
+    ds.create_branch("copy", &Default::default()).unwrap();
+    let branch = ds.branch("copy").unwrap();
+    ds.reasoning().run(&req).unwrap();
+    let before = pool.domain_stats();
+    let head = branch.store().head_commit().seq;
+    let retained = pool
+        .retained_parent()
+        .reserve(before.retained_capacity - before.retained_reserved)
+        .unwrap();
+
+    let waiting = Arc::new(Mutex::new(None));
+    let (observed, wakes) = mpsc::channel();
+    branch.store().set_failpoint(
+        "reasoning-import-copies-claimed",
+        Some(Arc::new({
+            let pool = pool.clone();
+            let waiting = waiting.clone();
+            let branch = branch.clone();
+            move |_| {
+                // The second copy is live. Leave the waiter one byte short until
+                // rollback drops that copy's work lease.
+                let blocker = pool
+                    .work_parent()
+                    .reserve(pool.capacity() - GRANULE - pool.granted() + 1)
+                    .unwrap();
+                let branch = branch.clone();
+                let observed = observed.clone();
+                let ticket = pool.enter(
+                    GRANULE,
+                    Some(Arc::new(move || {
+                        let writable = branch
+                            .store()
+                            .try_write_with(
+                                sparkles::commit::CommitKind::Update,
+                                sparkles::guard::WriteOptions {
+                                    no_wait: true,
+                                    ..Default::default()
+                                },
+                            )
+                            .is_ok();
+                        let _ = observed.send(writable);
+                    })),
+                );
+                *waiting.lock().unwrap() = Some((ticket, blocker));
+            }
+        })),
+    );
+    // A Rayon caller prepares on a different thread. Wake deferral must follow the writer.
+    let error = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap()
+        .install(|| branch.reasoning().run(&req))
+        .unwrap_err();
+    branch
+        .store()
+        .set_failpoint("reasoning-import-copies-claimed", None);
+    assert!(is_server_memory(&error), "{error:?}");
+    assert!(
+        wakes.try_recv().expect("rollback did not wake the waiter"),
+        "rollback woke the waiter under the RDF writer"
+    );
+    drop(waiting.lock().unwrap().take());
+    drop(retained);
+    assert_eq!(branch.store().head_commit().seq, head);
+    assert!(branch.reasoning().record().is_none());
+    assert_eq!(pool.domain_stats(), before);
+    assert_eq!(ds.reasoning().record().unwrap().fetched_imports, [iri]);
+}
+
+#[test]
+fn historical_fork_inherits_from_the_listed_ancestor() {
+    use sparkles::branch::{BranchOptions, DeleteOptions};
+    use sparkles::history::At;
+    use sparkles::reasoning::rdfs::NewSchema;
+
+    let ds = Dataset::memory();
+    let from = |name: &str| BranchOptions {
+        from: name.into(),
+        ..Default::default()
+    };
+    ds.create_branch("base", &Default::default()).unwrap();
+    let base = ds.branch("base").unwrap();
+    base.update("INSERT DATA { GRAPH <urn:schema> { <urn:A> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:B> } }").unwrap();
+    ds.create_branch("dev", &from("base")).unwrap();
+    let dev = ds.branch("dev").unwrap();
+    dev.store()
+        .set_retention(sparkles::history::Retention {
+            keep_commits: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    dev.update("INSERT DATA { <urn:first> a <urn:A> }").unwrap();
+    let first = dev.store().head_commit().seq;
+    dev.update("INSERT DATA { <urn:second> a <urn:A> }")
+        .unwrap();
+    ds.create_branch("feat", &from("dev")).unwrap();
+    ds.delete_branch_with(
+        "dev",
+        &DeleteOptions {
+            force: true,
+            reparent: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    base.reasoning()
+        .rdfs()
+        .set(NewSchema::Graph("urn:schema".into()))
+        .unwrap();
+
+    for name in ["copy", "after-reuse"] {
+        let info = ds
+            .create_branch(
+                name,
+                &BranchOptions {
+                    at: At::Commit(first),
+                    ..from("feat")
+                },
+            )
+            .unwrap();
+        assert_eq!(info.upstream.as_deref(), Some("base"));
+        let copy = ds.branch(name).unwrap();
+        assert!(copy.ask("ASK { <urn:first> a <urn:A> }").unwrap());
+        assert!(!copy.ask("ASK { <urn:second> a <urn:A> }").unwrap());
+        assert!(copy.ask("ASK { <urn:first> a <urn:B> }").unwrap());
+        if name == "copy" {
+            ds.create_branch("dev", &Default::default()).unwrap();
+        }
+    }
+}
+
+fn inference_fixture() -> Dataset {
+    let ds = Dataset::memory();
+    ds.update("INSERT DATA { <urn:a> a <urn:A> . <urn:A> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:B> }").unwrap();
+    ds
+}
+
+fn assert_inference_visible(ds: &Dataset, expected: bool) {
+    assert_eq!(
+        ds.ask(&format!(
+            "ASK {{ GRAPH <{}> {{ <urn:a> a <urn:B> }} }}",
+            sparkles::reasoning::INFERRED_GRAPH
+        ))
+        .unwrap(),
+        expected
+    );
+    assert_eq!(ds.ask("ASK { <urn:a> a <urn:B> }").unwrap(), expected);
+    assert_eq!(ds.reasoning().record().is_some(), expected);
+}
+
+#[test]
+fn delayed_clear_preserves_a_newer_materialization() {
+    use sparkles::task::{Control, Progress};
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+    let timeout = Duration::from_secs(10);
+    for had_inferences in [false, true] {
+        for clear_before_publication in [true, false] {
+            let ds = inference_fixture();
+            if had_inferences {
+                ds.reasoning().run(&ReasonRequest::default()).unwrap();
+            }
+            let (ready, committed) = mpsc::channel();
+            let (release, wait) = mpsc::channel();
+            let wait = Mutex::new(wait);
+            ds.store().set_failpoint(
+                "reasoning-clear-committed",
+                Some(Arc::new(move |_| {
+                    ready.send(()).unwrap();
+                    wait.lock().unwrap().recv_timeout(timeout).unwrap();
+                })),
+            );
+            std::thread::scope(|threads| {
+                let (finished, cleared) = mpsc::channel();
+                let ds = &ds;
+                let clear = threads.spawn(move || {
+                    let result = ds.reasoning().clear();
+                    finished.send(()).unwrap();
+                    result
+                });
+                committed.recv_timeout(timeout).unwrap();
+                let ctl = if clear_before_publication {
+                    let release = release.clone();
+                    let cleared = Mutex::new(cleared);
+                    Control {
+                        progress: Progress::new(move |_, phase| {
+                            if phase == "done" {
+                                release.send(()).unwrap();
+                                cleared.lock().unwrap().recv_timeout(timeout).unwrap();
+                            }
+                        }),
+                        ..Control::none()
+                    }
+                } else {
+                    Control::none()
+                };
+                let result = ds.reasoning().run_with(&ReasonRequest::default(), &ctl);
+                if !clear_before_publication {
+                    release.send(()).unwrap();
+                }
+                assert_eq!(clear.join().unwrap().unwrap() > 0, had_inferences);
+                result.unwrap();
+            });
+            assert_inference_visible(&ds, true);
+            assert_eq!(
+                ds.state().closure.kept().unwrap().1,
+                ds.store().head_commit().seq
+            );
+        }
+    }
+}
+
+#[test]
+fn refused_clear_preserves_the_materialized_closure() {
+    let ds = inference_fixture();
+    ds.reasoning().run(&ReasonRequest::default()).unwrap();
+    let kept = ds.state().closure.kept().unwrap();
+    ds.set_branch_protected("main", true).unwrap();
+    assert!(ds.reasoning().clear().is_err());
+    assert_inference_visible(&ds, true);
+    assert_eq!(ds.state().closure.kept(), Some(kept));
 }

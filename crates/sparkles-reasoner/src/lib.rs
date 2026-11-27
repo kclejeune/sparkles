@@ -487,10 +487,16 @@ fn admitted<T: Send>(
     f: impl FnOnce(&pool::Exec) -> anyhow::Result<T> + Send,
 ) -> anyhow::Result<T> {
     pool::Exec::refuse_own_threads(opts.pool.as_ref())?;
-    pool::off_rayon(|| {
-        let exec = pool::Exec::admit(opts.threads, opts.pool.as_ref(), opts.cancel.as_deref())?;
-        f(&exec)
-    })
+    pool::off_rayon(|| with_permit(opts, f))
+}
+
+/// Call on the native thread which owns and releases the reasoning permit.
+fn with_permit<T>(
+    opts: &ReasonOptions,
+    f: impl FnOnce(&pool::Exec) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let exec = pool::Exec::admit(opts.threads, opts.pool.as_ref(), opts.cancel.as_deref())?;
+    f(&exec)
 }
 
 fn derive(
@@ -1334,8 +1340,16 @@ pub fn materialize_incremental_prepared_with_memory(
     opts.inputs.validate()?;
     refuse_query_only(profile)?;
     let t0 = Instant::now();
-    admitted(opts, |exec| {
-        materialize_admitted(exec, store, profile, extras, inc, opts, t0, prepare)
+    pool::Exec::refuse_own_threads(opts.pool.as_ref())?;
+    pool::off_rayon(|| {
+        // A rejected preparation can release a copy lease under both the
+        // import journal and RDF writer. Drain callbacks on their owning
+        // thread after rollback (or commit) and reasoning permit release.
+        sparkles_core::sparql::pool::QueryPool::with_deferred_release_wakes(|| {
+            with_permit(opts, |exec| {
+                materialize_admitted(exec, store, profile, extras, inc, opts, t0, prepare)
+            })
+        })
     })
 }
 
@@ -2401,11 +2415,19 @@ pub fn refuse_query_only(profile: &Profile) -> anyhow::Result<()> {
 
 /// Remove [`INFERRED_GRAPH`]. Returns the number of triples removed.
 pub fn clear(store: &Store) -> anyhow::Result<u64> {
-    maintain::remove_saved(store);
+    Ok(clear_prepared(store, || ())?.0)
+}
+
+/// Capture the facade's clear order under the same writer as materialization
+/// preparation, even if the inferred graph has never existed.
+#[doc(hidden)]
+pub fn clear_prepared<T>(store: &Store, prepare: impl FnOnce() -> T) -> anyhow::Result<(u64, T)> {
     let mut txn = store.write_as(sparkles_core::commit::CommitKind::ReasonClear);
+    maintain::remove_saved(store);
+    let prepared = prepare();
     let snap = txn.base().clone();
     let Some(g) = snap.lookup_iri(INFERRED_GRAPH) else {
-        return Ok(0);
+        return Ok((0, prepared));
     };
     let keys = snap.scan_keys(Perm::Gspo, &[g.0])?;
     let mut n = 0;
@@ -2415,7 +2437,7 @@ pub fn clear(store: &Store) -> anyhow::Result<u64> {
         }
     }
     txn.commit()?;
-    Ok(n)
+    Ok((n, prepared))
 }
 
 /// How many facts of the closure of `snap`'s default graph DRed would delete first if

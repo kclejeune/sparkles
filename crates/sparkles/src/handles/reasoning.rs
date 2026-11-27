@@ -117,9 +117,16 @@ impl Reasoning {
     #[cfg(feature = "reasoning")]
     pub fn clear(&self) -> Result<u64> {
         let state = self.ds.state();
-        let n = sparkles_reasoner::clear(&state.store).map_err(super::from_anyhow)?;
-        state.closure.clear();
-        state.set_reasoning(None)?;
+        let (n, (clear, cache_generation)) =
+            crate::sparql::pool::QueryPool::with_deferred_release_wakes(|| {
+                sparkles_reasoner::clear_prepared(&state.store, || {
+                    let clear = state.pending_imports.lock().prepare_clear();
+                    (clear, state.closure.generation())
+                })
+            })
+            .map_err(super::from_anyhow)?;
+        state.store.failpoint("reasoning-clear-committed");
+        state.finish_reasoning_clear(clear, cache_generation)?;
         Ok(n)
     }
 

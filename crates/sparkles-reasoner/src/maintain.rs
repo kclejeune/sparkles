@@ -130,8 +130,24 @@ impl Cache {
 
     /// Drop the kept closure.
     pub fn clear(&self) {
+        self.clear_at_generation(None);
+    }
+
+    /// Identify the cache state observed while ordering a facade clear under the writer.
+    #[doc(hidden)]
+    pub fn generation(&self) -> u64 {
+        self.kept.lock().generation
+    }
+
+    /// A delayed clear may discard the entry it observed, keeping a replacement
+    /// installed by a newer run. Compare and detach under the same cache lock.
+    #[doc(hidden)]
+    pub fn clear_at_generation(&self, observed: Option<u64>) {
         let old = {
             let mut slot = self.kept.lock();
+            if observed.is_some_and(|generation| generation != slot.generation) {
+                return;
+            }
             slot.generation = slot.generation.wrapping_add(1);
             slot.kept.take()
         };

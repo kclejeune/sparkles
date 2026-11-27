@@ -217,7 +217,7 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
                         .map_or(&[][..], |r| r.fetched_imports.as_slice())
                 });
                 let strings = prepare_record_strings(
-                    state.pool.as_ref(),
+                    state,
                     resolved,
                     recorded,
                     &journal.loaded,
@@ -287,7 +287,7 @@ struct PreparedRecordStrings {
 }
 
 fn prepare_record_strings(
-    pool: Option<&Arc<crate::sparql::pool::QueryPool>>,
+    state: &crate::dataset::DatasetState,
     resolved: &sparkles_reasoner::inputs::Resolved,
     recorded: [&[String]; 2],
     pending: &super::imports::PendingImports,
@@ -314,6 +314,7 @@ fn prepare_record_strings(
         + reasoning_strings_bytes(count, names.clone().map(String::len));
     let mut claims = Vec::new();
     let mut claim_memory = None;
+    let pool = state.pool.as_ref();
     let mut memory = match RecordedReasoning::reserve(pool, bytes) {
         Ok(memory) => memory,
         Err(error) => {
@@ -337,6 +338,7 @@ fn prepare_record_strings(
             if claims.is_empty() {
                 return Err(error);
             }
+            state.store.failpoint("reasoning-import-copies-claimed");
             RecordedReasoning::reserve(
                 Some(pool),
                 bytes - reused + (claims.len() * size_of::<sparkles_budget::MemoryLease>()) as u64,

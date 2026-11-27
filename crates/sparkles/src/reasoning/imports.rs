@@ -398,6 +398,14 @@ pub(crate) struct ImportJournal {
     pub(crate) published_run: u64,
 }
 
+/// A clear owns the journal boundary it observed while holding the RDF writer.
+/// Subsequent LOADs prepend entries and keep their recovery provenance.
+#[cfg(feature = "reasoning")]
+pub(crate) struct PreparedClear {
+    pub(crate) run: u64,
+    first: Option<Arc<PendingName>>,
+}
+
 impl From<PendingImports> for ImportJournal {
     fn from(loaded: PendingImports) -> Self {
         Self {
@@ -550,18 +558,44 @@ impl crate::Dataset {
 }
 
 impl ImportJournal {
-    fn replace_loaded(&mut self, store: &Store, next: PendingImports) -> Result<()> {
-        let previous = std::mem::replace(&mut self.loaded, next);
+    pub(crate) fn clear_loaded(&mut self, store: &Store) -> Result<()> {
+        self.clear_loaded_from(store, |_| true)
+    }
+
+    fn clear_loaded_from(&mut self, store: &Store, start: impl Fn(&Entry) -> bool) -> Result<()> {
+        let mut tail = &mut self.loaded;
+        while let Some(entry) = tail.0.as_ref() {
+            if start(entry) {
+                break;
+            }
+            tail = &mut tail.0.as_mut().expect("current link").older;
+        }
+        let Some(removed) = tail.0.take() else {
+            return Ok(());
+        };
         if let Err(error) = self.save(store) {
-            self.loaded = previous;
+            let mut tail = &mut self.loaded;
+            while let Some(ref mut entry) = tail.0 {
+                tail = &mut entry.older;
+            }
+            tail.0 = Some(removed);
             return Err(error);
         }
         Ok(())
     }
 
-    pub(crate) fn clear_loaded(&mut self, store: &Store) -> Result<()> {
-        if self.loaded.0.is_some() {
-            self.replace_loaded(store, PendingImports::default())?;
+    #[cfg(feature = "reasoning")]
+    pub(crate) fn prepare_clear(&mut self) -> PreparedClear {
+        PreparedClear {
+            run: self.prepare_run(),
+            first: self.loaded.0.as_ref().map(|entry| entry.name.clone()),
+        }
+    }
+
+    #[cfg(feature = "reasoning")]
+    pub(crate) fn finish_clear(&mut self, store: &Store, clear: PreparedClear) -> Result<()> {
+        if let Some(first) = clear.first {
+            self.clear_loaded_from(store, |entry| Arc::ptr_eq(&entry.name, &first))?;
         }
         Ok(())
     }
@@ -576,10 +610,15 @@ impl ImportJournal {
     }
 
     #[cfg(feature = "reasoning")]
+    pub(crate) fn is_latest(&self, run: u64) -> bool {
+        run == self.next_run
+    }
+
+    #[cfg(feature = "reasoning")]
     pub(crate) fn can_retire(&self, run: u64) -> bool {
         // A later writer or a run still collecting inputs can publish a record
         // that omits these names. Leave its recovery source in the journal.
-        run == self.next_run && Arc::strong_count(&self.collecting) == 1
+        self.is_latest(run) && Arc::strong_count(&self.collecting) == 1
     }
 
     #[cfg(feature = "reasoning")]
@@ -611,6 +650,31 @@ impl ImportJournal {
 #[cfg(all(test, feature = "reasoning"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delayed_clear_removes_only_the_journal_entries_it_observed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = crate::Dataset::open(dir.path()).unwrap();
+        let mut journal = ImportJournal::default();
+        for iri in ["old", "also-old"] {
+            journal.loaded.push(Entry::prepare(iri, None).unwrap());
+        }
+        let first_clear = journal.prepare_clear();
+        journal
+            .loaded
+            .push(Entry::prepare("between", None).unwrap());
+        let second_clear = journal.prepare_clear();
+        journal.loaded.push(Entry::prepare("new", None).unwrap());
+        journal.finish_clear(ds.store(), first_clear).unwrap();
+        assert!(journal.loaded.contains("between"));
+        assert!(!journal.loaded.contains("old"));
+        journal.finish_clear(ds.store(), second_clear).unwrap();
+        let saved = PendingImports::read(dir.path(), ds.store(), None, &[]).unwrap();
+        for pending in [&journal.loaded, &saved] {
+            assert_eq!(pending.entries().count(), 1);
+            assert!(pending.contains("new"));
+        }
+    }
 
     #[test]
     fn retirement_preserves_new_entries_and_unrecorded_members_of_the_snapshot() {

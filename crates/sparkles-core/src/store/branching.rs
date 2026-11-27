@@ -1025,7 +1025,10 @@ impl BranchSet {
     // Resolve against the caller's locked table so rename checks exactly the entry
     // and upstream whose metadata it is about to publish.
     fn upstream_in(&self, t: &TableFile, id: uuid::Uuid) -> Option<uuid::Uuid> {
-        let mut cur = self.start_of(t, id)?.branch_id;
+        self.nearest_listed_in(t, self.start_of(t, id)?.branch_id)
+    }
+
+    fn nearest_listed_in(&self, t: &TableFile, mut cur: uuid::Uuid) -> Option<uuid::Uuid> {
         for _ in 0..1024 {
             if cur == self.dataset_id || t.by_id(cur).is_some() {
                 return Some(cur);
@@ -2193,7 +2196,7 @@ impl Store {
     }
 
     /// Prepare a facade handle for a memory branch before publishing the store.
-    /// The initializer receives the resolved upstream and the private new store.
+    /// The initializer receives the nearest listed upstream and the private new store.
     /// Its infallible completion publishes the handle once the table contains it.
     #[doc(hidden)]
     pub fn create_branch_with_memory_init<F: FnOnce()>(
@@ -2393,12 +2396,16 @@ impl Store {
         // held while the store and its indexes are built, so readers of the table do
         // not wait for text, spatial or vector builds. No branch is published until
         // all fallible initialization has completed.
-        let (ordinal, next) = {
+        let (ordinal, next, facade_source) = {
             let mut t = set.table.lock();
             admit(&t, true)?;
+            // Match BranchInfo::upstream even when a retired store owns the snapshot.
+            let facade_source = set
+                .nearest_listed_in(&t, owner_id)
+                .unwrap_or(self.dataset_id);
             let ordinal = t.next_ordinal as u16;
             t.next_ordinal += 1;
-            (ordinal, t.next_ordinal)
+            (ordinal, t.next_ordinal, facade_source)
         };
         self.failpoint("memory-ordinal-reserved");
         self.branching
@@ -2463,7 +2470,12 @@ impl Store {
             dst.lock().retention = src.lock().retention;
         }
         let store = Arc::new(store);
-        let publish = prepare(&up, store.clone())?;
+        let facade_upstream = if facade_source == owner_id {
+            up
+        } else {
+            self.branch_by_id(facade_source)?
+        };
+        let publish = prepare(&facade_upstream, store.clone())?;
         let mut t = set.table.lock();
         // another creation may have taken the name or the last slot meanwhile
         admit(&t, false)?;
