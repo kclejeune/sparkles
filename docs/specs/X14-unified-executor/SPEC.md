@@ -2318,7 +2318,8 @@ its rows. An admitted map evaluates its misses once per distinct key, holds a pe
 entry for a missed key until then, and is released when it answers fewer than one row in
 sixteen. The sketch, the map and each batch's scratch are charged to the query's memory
 budget, a refused charge falls back to ordinary evaluation, and every loop checks
-cancellation.
+cancellation. The batch charge is a bound sized by the batch, so the memory audit's
+`bind` fixture allows its ledger to stand above its heap until item 1320 tightens it.
 
 Weak repetition, from one repeated row in eight up to one in two, admits a
 parallel-capable expression on more than one worker only when it pays for the map. The

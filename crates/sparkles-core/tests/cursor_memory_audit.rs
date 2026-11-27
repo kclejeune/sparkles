@@ -327,6 +327,15 @@ fn allowance(name: &str) -> Allowance {
             over: 1100 * K,
             peak: 420 * K,
         },
+        // item 1320: cursor BIND reuse charges a batch that its map answers 68 bytes a
+        // row for vectors and pending entries it sizes by the batch, and rounds the
+        // map's retained charge up to a reservation step, several times what a map of
+        // 97 dense integers holds
+        "bind" => Allowance {
+            over: 64 * K,
+            peak: 352 * K,
+            ..exact
+        },
         // item 1186: top-k keeps a charge for slots it no longer holds
         "top k" => Allowance {
             over: 72 * K,
