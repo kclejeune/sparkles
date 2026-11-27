@@ -1209,11 +1209,15 @@ patterns, is in
   Settings tab when declared, locked, or runtime settings keep it off), and lets admins
   turn it off by patching `ingest: false`. When server ingestion is off, uploading a
   non-table document in `IngestPanel.svelte` asks for confirmation before sending
-  `extract: false` to store the document as a source without facts. Both Rust
+  `extract: false` to store the document as a source without facts. Source-only
+  previews still wait for approval, and automatic uploads run the merge checks.
+  The UI retries a stale enable write only while the displayed changes and recipients
+  agree with the approved proposal. The server checks the approved fields and
+  recipients again with the write. Both Rust
   (`memory_cmd::ops::plan_enable_ingest`) and TypeScript (`ui/src/lib/settings.ts`
   `planEnableIngest` and `enableIngest`) are verified against the shared fixture
-  `testsuite/settings/enable-ingest.json`, alongside Vitest tests and Playwright mock
-  tests in `ui/tests/mock/ingest.spec.ts`.
+  `testsuite/settings/enable-ingest.json`, alongside Vitest tests and Playwright
+  coverage in `ui/tests/e2e/settings.spec.ts` and `ui/tests/mock/ingest.spec.ts`.
 
 **Landed for item 57: `memory.scratchBranches.ttl`.** The `memory` kind gained the
 member `scratchBranches` with the field `ttl`, which sets how long a scratch branch of

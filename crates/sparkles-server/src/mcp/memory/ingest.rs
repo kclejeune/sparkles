@@ -958,7 +958,7 @@ fn bookkeeping(iri: &str) -> bool {
 
 impl Tools<'_> {
     pub(crate) fn register_source(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
-        self.register_source_with(args, &RenditionExtras::default(), false)
+        self.register_source_with(args, None, false)
     }
 
     /// `register_source` for a converted document (`POST /$/ingest`): its arguments with
@@ -980,13 +980,13 @@ impl Tools<'_> {
             Some(Value::Bool(b)) => b,
             Some(_) => return Err(ToolError::bad_argument("plan is true or false")),
         };
-        self.register_source_with(args, &extras, plan)
+        self.register_source_with(args, Some(&extras), plan)
     }
 
     fn register_source_with(
         &self,
         args: Map<String, Value>,
-        extras: &RenditionExtras,
+        converted: Option<&RenditionExtras>,
         plan: bool,
     ) -> Result<Outcome, ToolError> {
         let t0 = Instant::now();
@@ -1118,26 +1118,6 @@ impl Tools<'_> {
             "urn:uuid:{}",
             uuid_v5(&dataset_id, &format!("rendition\0{dig}")).hyphenated()
         ));
-        // §8.10.7 / item 77: no text the server recognizes as a secret enters an import
-        // graph, or any graph when `redaction.everywhere` is true
-        let main_ds = ds.main();
-        let main_ds: &Dataset = main_ds.as_deref().unwrap_or(&ds);
-        let memory = crate::assist::memory_settings(&self.server.state, main_ds);
-        let check_secrets = memory.redaction_everywhere()
-            || memory
-                .imports
-                .as_ref()
-                .is_some_and(|im| graph.as_str().starts_with(&im.base));
-        if check_secrets {
-            let mut texts: Vec<&str> = vec![&text];
-            if let Some(s) = original
-                .as_deref()
-                .and_then(|b| std::str::from_utf8(b).ok())
-            {
-                texts.push(s);
-            }
-            secret_check(&self.server.state, &memory, &texts)?;
-        }
         let transcript =
             format.starts_with("text/markdown") && format.contains("profile=transcript");
         let bounds = chunk_bounds(&text, transcript);
@@ -1163,6 +1143,56 @@ impl Tools<'_> {
                     ds.name
                 ),
             ));
+        }
+        // Internal conversion already applied serverIngest, including when it is off.
+        // Direct registration applies the import graph policy before retaining any text.
+        if converted.is_none() {
+            let main_ds = ds.main();
+            let memory = crate::assist::memory_settings(
+                &self.server.state,
+                main_ds.as_deref().unwrap_or(&ds),
+            );
+            let check_secrets = memory.redaction_everywhere()
+                || memory
+                    .imports
+                    .as_ref()
+                    .is_some_and(|im| graph.as_str().starts_with(&im.base));
+            if check_secrets {
+                let source_iri =
+                    percent_encoding::percent_decode_str(source.as_str()).decode_utf8_lossy();
+                let graph_iri =
+                    percent_encoding::percent_decode_str(graph.as_str()).decode_utf8_lossy();
+                let mut texts = vec![text.as_str(), source.as_str(), graph.as_str()];
+                if source_iri != source.as_str() {
+                    texts.push(&source_iri);
+                }
+                if graph_iri != graph.as_str() {
+                    texts.push(&graph_iri);
+                }
+                texts.extend(a.title.as_deref());
+                texts.extend(
+                    original
+                        .as_deref()
+                        .and_then(|b| std::str::from_utf8(b).ok()),
+                );
+                secret_check(&self.server.state, p, &memory, &texts, || {
+                    if self.call.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(ToolError::new(
+                            "cancelled",
+                            499,
+                            "registration was cancelled",
+                        ));
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(ToolError::new(
+                            "timeout",
+                            504,
+                            "the registration deadline passed",
+                        ));
+                    }
+                    Ok(())
+                })?;
+            }
         }
         let mut ropts = opts.clone();
         ropts.union_default_graph = Some(false);
@@ -1317,7 +1347,9 @@ impl Tools<'_> {
                 let _ = write!(ins, " ; <{PROV}wasRevisionOf> {old}");
             }
             ins.push_str(" .\n");
-            extras.write(&mut ins, &rendition);
+            if let Some(extras) = converted {
+                extras.write(&mut ins, &rendition);
+            }
             if settings.keep_text {
                 let slices = chunk_slices(&text, &bounds);
                 for (i, (s, e)) in bounds.iter().enumerate() {
@@ -1772,17 +1804,19 @@ impl Tools<'_> {
 /// characters, never the value.
 fn secret_check(
     st: &crate::state::AppState,
+    principal: &crate::auth::Principal,
     memory: &crate::assist::MemorySettings,
     texts: &[&str],
+    mut check: impl FnMut() -> Result<(), ToolError>,
 ) -> Result<(), ToolError> {
     let known = if memory.redaction_known_values() {
-        crate::settings::secrets::known_values(st)
+        crate::settings::secrets::known_values(st, principal)
     } else {
         Vec::new()
     };
     let policy = memory.redaction_policy(known, "server-secret");
     for t in texts {
-        if let Some((name, at)) = policy.first_match(t) {
+        if let Some((name, at)) = policy.first_match_checked(t, &mut check)? {
             let offset = t[..at].chars().count();
             return Err(ToolError::new(
                 "secret-detected",

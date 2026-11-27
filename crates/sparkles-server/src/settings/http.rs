@@ -315,11 +315,29 @@ pub async fn write(
 ) -> ApiResult<Resolved> {
     refuse_read_only(&st)?;
     let if_match = if_match(headers);
+    let ingest_confirmation = headers
+        .get("if-ingest-confirmation")
+        .map(|value| {
+            let value = percent_encoding::percent_decode(value.as_bytes()).decode_utf8_lossy();
+            serde_json::from_str::<Value>(&value)
+                .map_err(|_| bad("invalid If-Ingest-Confirmation header"))
+        })
+        .transpose()?;
+    if ingest_confirmation.is_some()
+        && (kind.name != super::ASSISTANT.name || !matches!(w, Write::Patch(_)))
+    {
+        return Err(bad(
+            "If-Ingest-Confirmation is for PATCH on assistant settings",
+        ));
+    }
     let op = op_of(w, kind)?;
     blocking(move || {
         let internal = |e: anyhow::Error| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
         let lock = st.settings.write_lock(&ds.name, kind);
         let _g = lock.lock();
+        // The same lock serializes model edits and declared settings reloads.
+        let model_lock = ingest_confirmation.as_ref().map(|_| st.settings.write_lock("", &super::MODELS));
+        let _model_guard = model_lock.as_ref().map(|lock| lock.lock());
         let models = st.models();
         let providers = Providers::Checked(models.as_deref());
         let declared = st.settings.declared();
@@ -330,6 +348,9 @@ pub async fn write(
         let r = resolve(kind, &declared, &ds.name, new, providers);
         if let Err(e) = &r.status {
             return Err(bad(format!("{}: {e}", kind.name)));
+        }
+        if let Some(confirmed) = ingest_confirmation {
+            check_ingest_confirmation(&cur, &r, models.as_deref(), &confirmed)?;
         }
         if super::prefixes::is(kind) {
             let n = super::prefixes::entries(&r.runtime);
@@ -351,6 +372,44 @@ pub async fn write(
         Ok(r)
     })
     .await
+}
+
+fn check_ingest_confirmation(
+    cur: &Resolved,
+    next: &Resolved,
+    models: Option<&crate::models::Models>,
+    confirmed: &Value,
+) -> ApiResult<()> {
+    let fields = ["enabled", "ingest", "send"].map(|field| {
+        let path = vec![field.to_string()];
+        json!([
+            field,
+            cur.effective[field],
+            cur.sources.get(&path).copied().unwrap_or("default")
+        ])
+    });
+    let mut recipients = Vec::new();
+    if let Some(models) = models
+        && let Ok(s) =
+            serde_json::from_value::<crate::assistant::AssistantSettings>(next.effective.clone())
+        && s.enabled
+        && s.ingest
+    {
+        for p in crate::assistant::configured_extract_pairs(models, &s) {
+            if s.send_to(&p.provider) >= crate::assistant::Send::Documents {
+                recipients.push([p.provider, p.model]);
+            }
+        }
+    }
+    if recipients.is_empty() || *confirmed != json!({ "fields": fields, "recipients": recipients })
+    {
+        return Err(err_code(
+            StatusCode::PRECONDITION_FAILED,
+            "precondition-failed",
+            "the ingestion settings or document recipients changed: review the changes again",
+        ));
+    }
+    Ok(())
 }
 
 /// A settings write on a read-only server (`serve --read-only`) is refused as other

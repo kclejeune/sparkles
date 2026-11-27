@@ -2,7 +2,6 @@
   // Server-side ingestion status line and admin controls (spec C19 item 77), shared by
   // IngestPanel (dataset page) and IngestSettings (memory page).
   import { base } from '$app/paths';
-  import * as api from '$lib/api';
   import { toasts } from '$lib/app.svelte';
   import * as askApi from '$lib/ask-api';
   import {
@@ -25,21 +24,22 @@
   }: {
     ds: string;
     canAdmin?: boolean;
-    onstate?: (state: { on: boolean; loading: boolean }) => void;
+    onstate?: (state: { on: boolean; known: boolean; loading: boolean }) => void;
   } = $props();
 
   let kind = $state<SettingsKind | null>(null);
   let assistant = $state<askApi.AssistantSettings | null>(null);
   let loading = $state(true);
-  let unsupported = $state(false);
   let busy = $state(false);
   let confirmOpen = $state(false);
+  let confirmation = $state<IngestAvailability | null>(null);
+  let changed = $state(false);
 
   const enc = encodeURIComponent;
 
-  const availability: IngestAvailability = $derived(
-    describeIngestState(kind, assistant?.status ?? null),
-  );
+  const availability: IngestAvailability = $derived(describeIngestState(kind, assistant));
+
+  const known = $derived(assistant?.status?.ingest !== undefined);
 
   const settingsHref = (field?: string) =>
     `${base}/datasets/${enc(ds)}?tab=settings${field ? `#setting-assistant-${field}` : ''}`;
@@ -47,23 +47,14 @@
   async function load() {
     const name = ds;
     loading = true;
-    unsupported = false;
     try {
       const [kRes, aRes] = await Promise.allSettled([
         readKind(datasetKindUrl(name, 'assistant')),
         askApi.assistantSettings(name),
       ]);
       if (name !== ds) return;
-      if (kRes.status === 'fulfilled') {
-        kind = kRes.value;
-      } else {
-        kind = null;
-        const e = kRes.reason;
-        if (e instanceof api.ApiError && (e.status === 404 || e.status === 405 || e.status === 501))
-          unsupported = true;
-      }
+      kind = kRes.status === 'fulfilled' ? kRes.value : null;
       assistant = aRes.status === 'fulfilled' ? aRes.value : null;
-      if (!kind && !assistant) unsupported = true;
     } finally {
       if (name === ds) {
         loading = false;
@@ -76,20 +67,33 @@
   });
 
   $effect(() => {
-    onstate?.({ on: unsupported ? true : availability.on, loading });
+    onstate?.({ on: availability.on, known, loading });
   });
 
+  function confirmEnable() {
+    confirmation = availability;
+    changed = false;
+    confirmOpen = true;
+  }
+
   async function turnOn() {
+    if (!confirmation) return;
     busy = true;
     try {
-      const res = await enableIngest(ds);
+      const res = await enableIngest(ds, confirmation);
       kind = res.kind;
-      confirmOpen = false;
-      toasts.push(
-        'success',
-        res.changed ? 'Server ingestion turned on' : 'Server ingestion settings were unchanged',
-      );
-      await load();
+      if (res.changed) {
+        confirmOpen = false;
+        await load();
+        if (availability.on) toasts.push('success', 'Server ingestion turned on');
+      } else {
+        assistant = res.assistant;
+        const revised = describeIngestState(kind, assistant);
+        confirmation = revised;
+        changed = true;
+        confirmOpen = revised.canEnableDirectly;
+        if (!confirmOpen) toasts.push('info', 'The server ingestion settings changed');
+      }
     } catch (e) {
       toasts.error('Could not turn on server ingestion', e);
     } finally {
@@ -111,7 +115,7 @@
   }
 </script>
 
-{#if !unsupported && !loading}
+{#if !loading}
   <div
     class="ingest-state"
     class:off={!availability.on}
@@ -119,12 +123,15 @@
     data-testid="server-ingest-status"
   >
     <div class="state-line">
-      {#if availability.on}
+      {#if !known}
+        <span class="small">Server ingestion status is unavailable.</span>
+      {:else if availability.on}
         <span class="small">
-          <strong>Server ingestion is on:</strong> documents go to
-          {#each availability.activeProviders as p, i (`${p.provider}/${p.model}`)}
-            {#if i > 0}{', '}{/if}<code class="mono">{p.provider}/{p.model}</code>
-          {/each}.
+          <strong>Server ingestion is on</strong>{#if availability.activeProviders.length}:
+            documents go to
+            {#each availability.activeProviders as p, i (i)}
+              {#if i > 0}{', '}{/if}<code class="mono">{p.provider}/{p.model}</code>
+            {/each}{/if}.
         </span>
         {#if canAdmin && !availability.ingestLocked}
           <button class="btn sm" disabled={busy} onclick={turnOff}>Turn off server ingestion</button
@@ -138,7 +145,7 @@
         </span>
         {#if canAdmin}
           {#if availability.canEnableDirectly}
-            <button class="btn primary sm" disabled={busy} onclick={() => (confirmOpen = true)}
+            <button class="btn primary sm" disabled={busy} onclick={confirmEnable}
               >Turn on server ingestion</button
             >
           {:else if availability.blockingField}
@@ -153,16 +160,21 @@
 {/if}
 
 <Modal bind:open={confirmOpen} title="Turn on server ingestion" width={500} closeDisabled={busy}>
-  {#if availability.plan}
+  {#if confirmation?.plan}
+    {#if changed}
+      <p class="small" role="status">
+        The ingestion settings changed. Review the updated proposal.
+      </p>
+    {/if}
     <p class="small">
       Turning on server ingestion changes only default assistant fields and leaves configured or
       locked settings untouched.
     </p>
-    {#if availability.plan.changed.length}
+    {#if confirmation.plan.changed.length}
       <div class="dialog-section">
         <h3>Fields that will change</h3>
         <ul>
-          {#each availability.plan.changed as c (c.field)}
+          {#each confirmation.plan.changed as c (c.field)}
             <li>
               <code class="mono">{c.field}</code>:
               <code class="mono">{valueText(c.current)}</code> &rarr;
@@ -172,11 +184,11 @@
         </ul>
       </div>
     {/if}
-    {#if availability.plan.unchanged.length}
+    {#if confirmation.plan.unchanged.length}
       <div class="dialog-section">
         <h3>Fields that stay as configured</h3>
         <ul>
-          {#each availability.plan.unchanged as u (u.field)}
+          {#each confirmation.plan.unchanged as u (u.field)}
             <li>
               <code class="mono">{u.field}</code> stays
               <code class="mono">{valueText(u.current)}</code> ({sourceReason(u.source)})
@@ -187,12 +199,12 @@
     {/if}
     <div class="dialog-section">
       <h3>Extract providers</h3>
-      {#if availability.providers.length}
+      {#if confirmation.enableProviders.length}
         <ul>
-          {#each availability.providers as p (`${p.provider}/${p.model}`)}
+          {#each confirmation.enableProviders as p, i (i)}
             <li>
               <code class="mono">{p.provider}/{p.model}</code>
-              {#if !p.receivesDocuments && p.send !== 'documents' && kind?.effective?.sendByProvider}
+              {#if !p.receivesDocuments}
                 <span class="faint">
                   (per-provider limit: <code class="mono">{p.send}</code>)
                 </span>

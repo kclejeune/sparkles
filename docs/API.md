@@ -13014,15 +13014,18 @@ prefix of every import graph in `imports`:
 ```json
 {
   "agentGraphs": ["https://example.org/memory/import/*"],
-  "imports": { "base": "https://example.org/memory/import/", "extract": "agent",
-               "secretPatterns": [ { "name": "internal-token", "regex": "itk_[A-Za-z0-9]{32}" } ] }
+  "imports": { "base": "https://example.org/memory/import/", "extract": "agent" },
+  "redaction": {
+    "patterns": [{ "name": "internal-token", "regex": "itk_[A-Za-z0-9]{32}" }],
+    "personal": ["email"],
+    "serverIngest": "redact"
+  }
 }
 ```
 
 `base` is an IRI that ends in `/` or `#`, and `agentGraphs` must cover it, so imported
-facts are unreviewed until a person promotes them. `secretPatterns` adds redaction
-patterns to the built-in ones, and each regex must compile. `transcripts` (off by
-default) lets the people who opt in import their session transcripts. `extract` is
+facts are unreviewed until a person promotes them. `transcripts` is off by default.
+It lets the people who opt in import their session transcripts. `extract` is
 `agent` (the default), `server` or `none`, and says who extracts facts from the prose
 of imported files. With `server`, each `sparkles memory sync` starts a server extraction
 of every new, edited or renamed file that needs one, with `source` and `mode: "memory"`
@@ -13048,12 +13051,6 @@ query parameters, needs `read` and counts as a query. Three arguments of
 | `original` | The file's bytes in base64 when the text is their normalized form, such as a file with `\r\n` line ends. They are kept as `spk:originalContent`, their SHA-256 becomes the digest, and the result says `originalKept`. Bytes whose normalized form is not the text are a `400`. |
 | `reanchor` | For a changed text, the same commit gives each fact that cites the previous rendition a second reifier at the one place its quote occurs in the new text, and retracts with supersession the facts whose quote no longer occurs exactly once. The result counts `reanchored` and `retracted`. |
 | `reanchorFrom` | An earlier source, such as a renamed file's. Each fact that cites it and whose quote occurs in the new text is copied into the new graph with a reifier derived from the old one, and the result counts `copied`. It needs `write` on both graphs. |
-
-In a graph under `imports.base`, a text that matches a built-in secret pattern or one of
-`secretPatterns` is refused with a `422` and code `secret-detected`. The error names the
-pattern and the offset of the match, never the matched text, so a client that skipped
-redaction cannot store a secret the server recognizes. Pattern matching cannot find
-every secret.
 
 `list_sources` reports `needsExtraction` for each source. A rendition needs extraction
 until a fact cites a span of it through an activity that is neither a re-anchoring nor
@@ -13099,6 +13096,31 @@ unless `includeUnreviewed` is set. They follow the header as a `# communities le
 line, a `##` line per report with its IRI, quoted title, member count and status, and a
 `summary` line with the quoted summary, and the answer lists them in `communities`. The
 reports count toward `maxChars`, so a brief drops the lowest rated reports that do not fit.
+
+#### Memory redaction
+
+`memory.redaction` is stored as format 4 of `memory.json`. The policy combines
+the built-in patterns with `redaction.patterns` and legacy `imports.secretPatterns`.
+Every regex must compile. The optional `entropy` detector scans values in
+assignments, headers, query parameters and quoted strings. It accepts
+`minLength` from 8 to 1024 and `minBitsPerChar` from 0 to 8. Their defaults are
+20 and 4. Zero entropy matches any eligible token meeting the length threshold.
+`personal` can enable `email`, `phone`, `payment-card`, `iban` and `ip`. A
+detection wholly covered by a regex in `allow` is ignored.
+
+`knownValues` defaults to true. On the server it enables exact matching against the
+server's secret inventory only for a server-wide administrator or the local operator.
+A dataset reader, writer or dataset administrator uses the same pattern, entropy and
+personal data detectors regardless of the server secret inventory. The CLI checks
+its own sensitive environment variables when `knownValues` is true and can also read
+explicit local values using `--redact-known-values`.
+
+Direct `register_source` and `POST /{ds}/sources` check normalized text, retained
+original bytes, the title and source and graph IRIs when the graph is under
+`imports.base` or `redaction.everywhere` is true. A detected match fails with
+`422 secret-detected` and gives its detector and character offset. Ingestion tasks
+use the independent `redaction.serverIngest` setting described under
+[Ingestion](#ingestion).
 
 ### Ingest profiles
 
@@ -13164,6 +13186,15 @@ role for the facts, links their entities with `link_entities`, and writes them w
 `assert_facts`, each with the span of its quote. Every tool runs as the caller, so an
 ingestion writes nothing the caller could not write with those tools.
 
+**`GET /$/assistant/{ds}`** includes `status.ingest`, which says if server extraction
+is on, and `status.extract`, which lists the configured extract provider and model
+pairs before their send limits. Providers removed from the server are excluded.
+The Web UI confirms the proposed enable patch and its document recipients. It sends
+`If-Match` and `If-Ingest-Confirmation` on the assistant settings PATCH. The latter
+is percent-encoded JSON with `fields` in the order `enabled`, `ingest`, `send`, each
+as `[field, currentValue, source]`, and `recipients` as the proposed ordered
+`[provider, model]` pairs. A changed field or recipient list fails with `412`.
+
 **`POST /$/ingest/{ds}`** starts a task and answers `202` with it and a `Location`
 header. The document is the `file` part of a multipart upload, with the options as
 further fields, or JSON with `text` or a `url` that the server fetches through its
@@ -13179,7 +13210,7 @@ curl -H 'Content-Type: application/json' \
 | Option | Meaning |
 |---|---|
 | `format` | The media type, when the file name or content does not say it. |
-| `title`, `iri`, `graph`, `profile`, `message` | As `register_source` takes them. A `url` is the source's IRI by default. |
+| `title`, `iri`, `graph`, `profile`, `message` | As `register_source` takes them. An eligible fetch `url` is the default source IRI. A URL with user info, a query string, a fragment or a policy match gets a generated IRI. An explicitly supplied IRI matching the policy fails with `sensitive-locator`. |
 | `mode` | `branch` (the default) writes on `ingest.<slug>-<n>`, or `proposals.<agent>.ingest-<slug>-<n>` for an agent of the memory settings. `preview` writes nothing until an approval. `auto` merges into `main` when every check passes and needs `admin`. `memory` needs `source` and writes the facts on `main` into the source's graph, which must be an agent graph (`not-agent-memory` otherwise), so they are unreviewed memory. A `source` cannot be previewed. |
 | `source` | The IRI of a registered source, or of its graph, to extract from instead of a new document. The task reads the source's live rendition with `read_chunks`. It cannot be combined with `file`, `text` or `url`, and fails with `unknown-source` (`404`) when no live source matches. |
 | `branch` | The review branch to use instead. |
@@ -13223,6 +13254,18 @@ bound of the converter, such as a ZIP bomb or a small file that would need more 
 128 MiB of output, fails with `too-large`, and a conversion that outlasts the task's
 deadline with `conversion-timeout`.
 
+The default `redaction.serverIngest: "redact"` applies the memory policy to converted
+document text and title before storage and extraction. The result includes
+`redactions` with counts by detector when there are replacements. In `refuse` mode a
+match fails the task with `secret-detected`. In `off` mode the ingestion pipeline leaves
+the text alone, including in graphs covered by the direct registration policy. An
+extraction from a stored rendition requiring replacement fails with
+`422 redaction-required` before model calls or writes. Register a redacted rendition
+before retrying. A table draft applies the policy to the model sample and reports the
+sample's counts. A workbook also reports the sum of its sheet counts. The preview
+and table upload use the original rows. Task listings keep the request mode, format
+and size when supplied and omit raw file names and locators.
+
 Before any model call the task estimates the extraction's tokens from the chunks, the
 profile and the answer, and its cost from the first pair's pricing. Above the dataset's
 `confirmTokens` the task waits in `awaiting-confirmation` for
@@ -13251,12 +13294,13 @@ it and to admins of the dataset, and finished tasks are kept for 7 days.
 **`DELETE /$/ingest/{ds}/{task}`** cancels a running task, which keeps what it already
 wrote on its branch, or forgets one that has ended.
 
-A `preview` task ends in `awaiting-approval` with the proposals in its result.
+A new `preview` task ends in `awaiting-approval` with its pending source and any proposals.
 **`POST /$/ingest/{ds}/{task}/approve`** writes the source and the facts to `main` as the
 caller, and fails with `409` when `main` changed since the preview. An `auto` task
 merges its branch when no fact failed, no entity is ambiguous, the guard reported
 nothing, every fact's confidence is at least `autoConfidence` and the merge preview has
-no conflict. Otherwise it keeps the branch and gives the reason as `autoFallback`.
+no conflict. A source-only `auto` task runs the merge checks without fact checks.
+When a check blocks the merge, the task keeps the branch and reports `autoFallback`.
 
 The review page's sources carry `pages` with each page's number and start, and
 `ocrPages` and `omittedPages`, so the UI shows the page of each fact.

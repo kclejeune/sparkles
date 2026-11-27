@@ -15,9 +15,7 @@
 use crate::assist::{read_file, write_file};
 use crate::auth::Principal;
 use crate::http::{AdminBody, ApiResult, blocking, dataset, err, err_code};
-#[cfg(feature = "mcp")]
-use crate::models::Models;
-use crate::models::{Pair, Role};
+use crate::models::{Models, Pair, Role};
 use crate::settings::{Providers, Typed};
 use crate::state::{AppState, Dataset};
 use axum::extract::{Path, Query, State};
@@ -1472,6 +1470,17 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/$/models/usage", get(usage))
 }
 
+/// The extract role before send limits, omitting providers that no longer exist.
+pub(crate) fn configured_extract_pairs(models: &Models, s: &AssistantSettings) -> Vec<Pair> {
+    let mut pairs = s
+        .roles
+        .get(&Role::Extract)
+        .cloned()
+        .unwrap_or_else(|| models.pairs(Role::Extract));
+    pairs.retain(|p| models.provider(&p.provider).is_some());
+    pairs
+}
+
 /// The settings, with a `status` that says whether asking and ingestion work and which
 /// pairs they use.
 fn settings_json(st: &AppState, s: &AssistantSettings) -> Value {
@@ -1481,19 +1490,14 @@ fn settings_json(st: &AppState, s: &AssistantSettings) -> Value {
         "historyDays": s.history_days(st),
     });
     if let Some(m) = st.models() {
-        let extract = s
-            .roles
-            .get(&Role::Extract)
-            .cloned()
-            .unwrap_or_else(|| m.pairs(Role::Extract));
+        let extract = configured_extract_pairs(&m, s);
         status["extract"] = serde_json::to_value(&extract).unwrap_or_default();
-        let ingest_on = s.enabled
+        status["ingest"] = (s.enabled
             && s.ingest
-            && s.send >= Send::Documents
-            && extract.iter().any(|p| {
-                m.provider(&p.provider).is_some() && s.send_to(&p.provider) >= Send::Documents
-            });
-        status["ingest"] = ingest_on.into();
+            && extract
+                .iter()
+                .any(|p| s.send_to(&p.provider) >= Send::Documents))
+        .into();
     } else {
         status["ingest"] = false.into();
     }

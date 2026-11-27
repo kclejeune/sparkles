@@ -63,6 +63,7 @@ test('a table gets a mapping draft', async ({ page }) => {
   const task = await ingest(page, 'people.csv', 'text/csv');
   await expect(task).toContainText('Mapping draft (by the model): 3 rows become 6 triples');
   await expect(task.getByLabel('Mapping')).toHaveValue(/tableSchema/);
+  await expect(task).toContainText('Redacted in the sample sent to the model: email (1)');
 });
 
 test('when server ingestion is off, panel states so and asks before storing without facts', async ({
@@ -106,6 +107,7 @@ test('when server ingestion is off, panel states so and asks before storing with
   await expect(enableDialog).toContainText('ingest');
   await expect(enableDialog).toContainText('send');
   await expect(enableDialog).toContainText('mock/small');
+  await expect(enableDialog.getByText(/per-provider limit/)).toHaveCount(0);
   await expect(enableDialog).toContainText('query result rows');
   await enableDialog.getByRole('button', { name: 'Turn on server ingestion' }).click();
   await expect(status).toContainText(
@@ -134,4 +136,67 @@ test('a locked send setting explains why server ingestion is off and links to Se
     'href',
     /\/datasets\/scratch\?tab=settings#setting-assistant-send$/,
   );
+});
+
+test('documents wait for ingestion status and require a store-only choice if it fails', async ({
+  page,
+}) => {
+  let release!: () => void;
+  const wait = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route('**/$/assistant/org', async (route) => {
+    await wait;
+    await route.fulfill({ status: 503, json: { error: 'unavailable' } });
+  });
+  await page.route('**/$/settings/org/assistant', (route) => route.fulfill({ status: 503 }));
+  await page.goto('/ui/datasets/org');
+  const panel = page.getByRole('region', { name: 'Ingest' });
+  await panel.getByLabel('Document to ingest').setInputFiles({
+    name: 'scanned.pdf',
+    mimeType: 'application/pdf',
+    buffer: Buffer.from('%PDF-1.4\n'),
+  });
+  const start = panel.getByRole('button', { name: 'Ingest', exact: true });
+  await expect(start).toBeDisabled();
+  const extracts: (string | undefined)[] = [];
+  await page.route('**/$/ingest/org', async (route) => {
+    if (route.request().method() === 'POST') {
+      extracts.push(
+        route
+          .request()
+          .postData()
+          ?.match(/name="extract"\r?\n\r?\n([^\r\n]+)/)?.[1],
+      );
+    }
+    await route.continue();
+  });
+  release();
+  await expect(panel.getByTestId('server-ingest-status')).toContainText('status is unavailable');
+  await panel.getByLabel('Review mode').selectOption('preview');
+  await start.click();
+  const dialog = page.getByRole('dialog', {
+    name: 'Store this document as a source without facts?',
+  });
+  await expect(dialog).toContainText('stored on main after approval');
+  await dialog.getByRole('button', { name: 'Store without facts' }).click();
+  const task = panel.getByRole('group', { name: 'Ingestion task' });
+  await task.getByRole('button', { name: 'Ingest the readable pages' }).click();
+  await expect(task).toContainText('Source preview');
+  expect(extracts).toEqual(['false', 'false']);
+});
+
+test('an enabled status uses the assistant response when layered settings are unavailable', async ({
+  page,
+}) => {
+  await page.route('**/$/settings/org/assistant', (route) => route.fulfill({ status: 503 }));
+  await page.route('**/$/assistant/org', async (route) => {
+    const response = await route.fetch();
+    const data = await response.json();
+    data.status.extract = [data.status.extract[0], data.status.extract[0]];
+    await route.fulfill({ response, json: data });
+  });
+  await page.goto('/ui/datasets/org');
+  const status = page.getByRole('region', { name: 'Ingest' }).getByTestId('server-ingest-status');
+  await expect(status).toContainText('documents go to mock/small, mock/small');
 });

@@ -11,7 +11,7 @@ use super::{PdfRuntime, Status, Task};
 use crate::auth::{Level, Principal};
 use crate::mcp::errors::ToolError;
 use crate::mcp::{Call, McpServer};
-use crate::models::{Models, Pair, Role, StepRecord};
+use crate::models::{Models, Pair, StepRecord};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -319,11 +319,15 @@ pub fn slug(s: &str) -> String {
     }
 }
 
-/// The name a file or URL gives a document, without its directories.
-pub(super) fn base_name(s: &str) -> &str {
-    let s = s.split(['?', '#']).next().unwrap_or(s);
-    let s = s.trim_end_matches('/');
-    s.rsplit('/').next().unwrap_or(s)
+/// The last path segment of a fetch URL can supply a file name for format detection.
+pub(super) fn url_name(raw: &str) -> Option<String> {
+    let url = url::Url::parse(raw).ok()?;
+    let name = url.path_segments()?.rfind(|s| !s.is_empty())?;
+    Some(
+        percent_encoding::percent_decode_str(name)
+            .decode_utf8_lossy()
+            .into_owned(),
+    )
 }
 
 /// Run one ingestion. The value is the result; the usage is reported either way.
@@ -339,85 +343,153 @@ pub fn run(ctx: &Ctx, req: &Request) -> (Result<Value, Value>, Value) {
     (out, usage)
 }
 
-/// The result of applying the dataset's `memory.redaction` policy to document text before
-/// server-side ingestion writes it or sends it to a model (C18 item 77).
-pub(super) struct RedactionOutcome {
-    pub text: String,
-    pub title: Option<String>,
-    pub page_starts: Vec<usize>,
-    pub counts: std::collections::BTreeMap<String, usize>,
+/// The policy for one ingestion, shared by its text and retained metadata.
+pub(super) struct Redaction {
+    mode: crate::assist::ServerIngestRedaction,
+    policy: sparkles_memory_import::redact::Policy,
 }
 
-/// Apply the dataset's `memory.redaction` policy according to `redaction.serverIngest`
-/// (`redact` by default, `refuse` to fail with `secret-detected`, `off` to leave text
-/// unchanged). Never logs or returns secret values.
-pub(super) fn apply_redaction(
-    st: &crate::state::AppState,
-    ds: &crate::state::Dataset,
-    text: &str,
-    title: Option<&str>,
-    page_starts: &[usize],
-) -> Result<RedactionOutcome, Failed> {
-    let memory = crate::assist::memory_settings(st, ds);
-    let mode = memory.server_ingest_redaction();
-    if mode == crate::assist::ServerIngestRedaction::Off {
-        return Ok(RedactionOutcome {
-            text: text.to_string(),
-            title: title.map(str::to_string),
-            page_starts: page_starts.to_vec(),
-            counts: std::collections::BTreeMap::new(),
-        });
+impl Redaction {
+    pub fn new(r: &Run, ds: &crate::state::Dataset) -> Self {
+        let st = &r.ctx.server.state;
+        let memory = crate::assist::memory_settings(st, ds);
+        let mode = memory.server_ingest_redaction();
+        let known = if mode != crate::assist::ServerIngestRedaction::Off
+            && memory.redaction_known_values()
+        {
+            crate::settings::secrets::known_values(st, r.ctx.principal)
+        } else {
+            Vec::new()
+        };
+        Self {
+            mode,
+            policy: memory.redaction_policy(known, "server-secret"),
+        }
     }
-    let known = if memory.redaction_known_values() {
-        crate::settings::secrets::known_values(st)
-    } else {
-        Vec::new()
-    };
-    let policy = memory.redaction_policy(known, "server-secret");
-    if mode == crate::assist::ServerIngestRedaction::Refuse {
-        for candidate in title.into_iter().chain(std::iter::once(text)) {
-            if let Some((name, at)) = policy.first_match(candidate) {
-                let offset = candidate[..at].chars().count();
-                return Err(Failed(json!({
-                    "code": "secret-detected",
-                    "status": 422,
-                    "message": format!(
-                        "the text matches the secret pattern {name} at character {offset}; nothing was written"
-                    ),
-                    "detector": name,
-                    "pattern": name,
-                    "offset": offset,
-                })));
+
+    fn first_match(&self, r: &Run, text: &str) -> Result<Option<(String, usize)>, Failed> {
+        if self.mode == crate::assist::ServerIngestRedaction::Off {
+            return Ok(None);
+        }
+        self.policy.first_match_checked(text, || r.check())
+    }
+
+    fn refusal(text: &str, name: &str, at: usize) -> Failed {
+        let offset = text[..at].chars().count();
+        Failed(json!({
+            "code": "secret-detected",
+            "status": 422,
+            "message": format!(
+                "the text matches the secret pattern {name} at character {offset}; nothing was written"
+            ),
+            "detector": name,
+            "pattern": name,
+            "offset": offset,
+        }))
+    }
+
+    /// Keep the stored rendition and extraction coordinates identical.
+    pub fn check_existing(&self, r: &Run, text: &str) -> Result<(), Failed> {
+        if let Some((name, at)) = self.first_match(r, text)? {
+            if self.mode == crate::assist::ServerIngestRedaction::Refuse {
+                return Err(Self::refusal(text, &name, at));
             }
+            return Err(Refusal::new(
+                "redaction-required",
+                422,
+                "the stored rendition requires redaction: ingest a new, redacted rendition before extracting facts",
+            )
+            .into());
         }
-        return Ok(RedactionOutcome {
-            text: text.to_string(),
-            title: title.map(str::to_string),
-            page_starts: page_starts.to_vec(),
-            counts: std::collections::BTreeMap::new(),
-        });
+        Ok(())
     }
-    let (redacted, edits) = policy.redact_with_edits(text);
-    let remapped = sparkles_memory_import::redact::remap_char_offsets(
-        text,
-        &redacted.text,
-        &edits,
-        page_starts,
-    );
-    let mut counts = redacted.counts();
-    let new_title = title.map(|t| {
-        let r = policy.redact(t);
-        for (k, v) in r.counts() {
-            *counts.entry(k).or_default() += v;
+
+    pub fn text(
+        &self,
+        r: &Run,
+        text: &str,
+    ) -> Result<
+        (
+            sparkles_memory_import::redact::Redacted,
+            Vec<sparkles_memory_import::redact::Edit>,
+        ),
+        Failed,
+    > {
+        use crate::assist::ServerIngestRedaction::{Redact, Refuse};
+        if self.mode == Redact {
+            return self.policy.redact_checked(text, || r.check());
         }
-        r.text
-    });
-    Ok(RedactionOutcome {
-        text: redacted.text,
-        title: new_title,
-        page_starts: remapped,
-        counts,
-    })
+        if self.mode == Refuse
+            && let Some((name, at)) = self.first_match(r, text)?
+        {
+            return Err(Self::refusal(text, &name, at));
+        }
+        Ok((
+            sparkles_memory_import::redact::Redacted {
+                text: text.to_string(),
+                names: Vec::new(),
+            },
+            Vec::new(),
+        ))
+    }
+
+    pub fn document(
+        &self,
+        r: &Run,
+        converted: &mut Converted,
+        title: Option<&str>,
+    ) -> Result<(Option<String>, std::collections::BTreeMap<String, usize>), Failed> {
+        let (redacted, edits) = self.text(r, &converted.text)?;
+        let mut counts = redacted.counts();
+        converted.replace_text(redacted.text, &edits);
+        let title = if let Some(t) = title {
+            let (redacted, _) = self.text(r, t)?;
+            for (k, v) in redacted.counts() {
+                *counts.entry(k).or_default() += v;
+            }
+            Some(redacted.text)
+        } else {
+            None
+        };
+        Ok((title, counts))
+    }
+
+    pub fn check_locator(&self, r: &Run, value: &str) -> Result<(), Failed> {
+        if self.matches_locator(r, value)? {
+            return Err(Refusal::new(
+                "sensitive-locator",
+                422,
+                "a source or graph IRI matches the redaction policy: use a different IRI",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn matches_locator(&self, r: &Run, value: &str) -> Result<bool, Failed> {
+        let decoded = percent_encoding::percent_decode_str(value).decode_utf8_lossy();
+        Ok(self.first_match(r, value)?.is_some()
+            || (decoded != value && self.first_match(r, &decoded)?.is_some()))
+    }
+
+    /// Fetch URLs with userinfo or query strings may identify private resources.
+    /// Use a generated source IRI when retaining a URL would disclose that metadata.
+    pub fn fetched_locator(&self, r: &Run, url: Option<&str>) -> Result<Option<String>, Failed> {
+        let Some(raw) = url else { return Ok(None) };
+        let Ok(url) = url::Url::parse(raw) else {
+            return Ok(None);
+        };
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || self.matches_locator(r, raw)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(raw.to_string()))
+    }
 }
 
 /// The dataset's `ingest.json` members of Phase 4.
@@ -451,7 +523,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     let name = req
         .name
         .clone()
-        .or_else(|| req.url.as_deref().map(|u| base_name(u).to_string()));
+        .or_else(|| req.url.as_deref().and_then(url_name));
     let format = Format::detect(req.media_type.as_deref(), name.as_deref(), &req.bytes)?;
     if matches!(format, Format::Csv | Format::Tsv) {
         return super::csv::draft(r, req, &ds, format, name.as_deref());
@@ -511,22 +583,13 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         .clone()
         .or_else(|| converted.title.clone())
         .or_else(|| name.clone());
-    let redacted = apply_redaction(
-        st,
-        &ds,
-        &converted.text,
-        raw_title.as_deref(),
-        &converted.page_starts,
-    )?;
-    converted.text = redacted.text;
-    converted.page_starts = redacted.page_starts;
-    let title = redacted.title;
-    let redactions = redacted.counts;
-    let iri = req.iri.clone().or_else(|| {
-        req.url
-            .clone()
-            .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
-    });
+    let redaction = Redaction::new(r, &ds);
+    let (title, redactions) = redaction.document(r, &mut converted, raw_title.as_deref())?;
+    for locator in [&req.iri, &req.graph].into_iter().flatten() {
+        redaction.check_locator(r, locator)?;
+    }
+    let locator = redaction.fetched_locator(r, req.url.as_deref())?;
+    let iri = req.iri.as_ref().or(locator.as_ref());
     let profile = req.profile.clone().unwrap_or_else(|| "default".into());
     let ingest = crate::mcp::memory::ingest::ingest_settings(st, &ds);
     let limits = Limits {
@@ -560,7 +623,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     if let Some(g) = &req.graph {
         reg.insert("graph".into(), g.clone().into());
     }
-    if let Some(i) = &iri {
+    if let Some(i) = iri {
         reg.insert("iri".into(), i.clone().into());
     }
     if let Some(t) = &title {
@@ -655,6 +718,23 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
             out["notes"] = json!([
                 "no fact was extracted: the dataset's assistant does not let ingestion use a provider"
             ]);
+        }
+        match req.mode {
+            Mode::Preview => {
+                out["outcome"] = "preview".into();
+                out["head"] = base_head.into();
+                ctx.progress.approval(Approval {
+                    register: reg,
+                    asserts: Vec::new(),
+                    head: base_head,
+                });
+            }
+            Mode::Auto => {
+                let b = branch.as_deref().expect("auto has a branch");
+                let message = format!("Ingest {}", title.as_deref().unwrap_or("a document"));
+                merge_if(r, b, &message, None, &mut out)?;
+            }
+            Mode::Branch | Mode::Memory | Mode::Claims => {}
         }
         return Ok(out);
     };
@@ -855,15 +935,11 @@ fn run_existing(r: &mut Run, req: &Request, source: &str) -> Result<Value, Faile
         .title
         .clone()
         .or_else(|| found["title"].as_str().map(str::to_string));
-    let redacted = apply_redaction(st, &ds, &text, raw_title.as_deref(), &[])?;
-    let redactions = redacted.counts;
-    let (text, chunks) = if redactions.is_empty() {
-        (text, chunks)
-    } else {
-        let new_chunks = crate::mcp::memory::ingest::chunk_bounds(&redacted.text, false);
-        (redacted.text, new_chunks)
-    };
-    let title = redacted.title;
+    let redaction = Redaction::new(r, &ds);
+    redaction.check_existing(r, &text)?;
+    let title = raw_title
+        .map(|title| redaction.text(r, &title).map(|(value, _)| value.text))
+        .transpose()?;
     if req.mode == Mode::Memory && !crate::assist::memory_settings(st, &ds).is_agent_graph(&graph) {
         return Err(Failed::new(
             "not-agent-memory",
@@ -906,9 +982,6 @@ fn run_existing(r: &mut Run, req: &Request, source: &str) -> Result<Value, Faile
         "chunks": chunks.len(),
         "profile": profile,
     });
-    if !redactions.is_empty() {
-        out["redactions"] = json!(redactions);
-    }
     if let Some(b) = &branch {
         out["branch"] = b.clone().into();
         out["review"] = review_link(&ds.name, b).into();
@@ -1084,14 +1157,9 @@ pub(super) fn rendition_extras(c: &Converted) -> Value {
 
 fn pages_json(c: &Converted, out: &mut Value) {
     if !c.page_starts.is_empty() {
-        let map = convert::PageMap::new(&c.text, &c.page_starts);
-        out["pages"] = c
-            .page_starts
-            .iter()
-            .filter_map(|s| {
-                let page = map.page_of(*s)?;
-                Some(json!({ "page": page, "start": s }))
-            })
+        out["pages"] = convert::PageMap::new(&c.text, &c.page_starts)
+            .entries()
+            .map(|(start, page)| json!({ "page": page, "start": start }))
             .collect::<Vec<_>>()
             .into();
     }
@@ -1115,11 +1183,7 @@ pub fn extract_pairs(
     if !s.enabled || !s.ingest {
         return Vec::new();
     }
-    let lists = crate::assistant::lists(models, s);
-    lists
-        .get(&Role::Extract)
-        .cloned()
-        .unwrap_or_default()
+    crate::assistant::configured_extract_pairs(models, s)
         .into_iter()
         .filter(|p| s.send_to(&p.provider) >= crate::assistant::Send::Documents)
         .collect()

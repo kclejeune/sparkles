@@ -6,6 +6,7 @@
 // shape, so the helpers take the kind's URL rather than a dataset.
 
 import { ApiError, errorMessage, json } from './api';
+import { assistantSettings, type AssistantSettings } from './ask-api';
 
 const enc = encodeURIComponent;
 
@@ -54,7 +55,7 @@ export type DatasetKind = (typeof DATASET_KINDS)[number];
 export const datasetKindUrl = (ds: string, kind: string) => `/$/settings/${enc(ds)}/${enc(kind)}`;
 
 /** The headers of a write: JSON, and `If-Match` when the caller read an ETag. */
-function writeInit(method: string, etag?: string | null, body?: unknown): RequestInit {
+function writeInit(method: string, etag?: string | null, body?: unknown) {
   const headers: Record<string, string> = {};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (etag) headers['If-Match'] = etag;
@@ -959,6 +960,8 @@ export type IngestAvailability = {
   modelsConfigured: boolean;
   providers: ExtractProviderView[];
   activeProviders: ExtractProviderView[];
+  /** Providers and send levels after applying the enable patch. */
+  enableProviders: ExtractProviderView[];
   plan: EnableIngestPlan | null;
   /** The first setting field keeping server ingestion off, when applicable. */
   blockingField?: {
@@ -981,7 +984,7 @@ function sendOfProvider(
 ): string {
   const base = overrideSend ?? (typeof effective?.send === 'string' ? effective.send : 'schema');
   const byProv = effective?.sendByProvider;
-  if (isObject(byProv) && typeof byProv[provider] === 'string') {
+  if (isObject(byProv) && Object.keys(byProv).length > 0 && typeof byProv[provider] === 'string') {
     const specific = byProv[provider] as string;
     const rank = (s: string) => (s === 'documents' ? 2 : s === 'rows' ? 1 : 0);
     return rank(specific) < rank(base) ? specific : base;
@@ -992,37 +995,26 @@ function sendOfProvider(
 /** Describe the current server-side ingestion state for a dataset. */
 export function describeIngestState(
   kind: SettingsKind | null,
-  assistant?: {
-    models?: boolean;
-    ingest?: boolean;
-    extract?: { provider: string; model: string }[];
-  } | null,
+  assistant?: AssistantSettings | null,
 ): IngestAvailability {
-  const effective = kind?.effective ?? {};
+  const effective = kind?.effective ?? assistant;
+  const status = assistant?.status;
   const plan = kind ? planEnableIngest(kind) : null;
-  const modelsConfigured = assistant?.models ?? true;
-  const rawPairs: { provider: string; model: string }[] =
-    assistant?.extract ??
-    (isObject(effective.roles) && Array.isArray(effective.roles.extract)
-      ? (effective.roles.extract as { provider: string; model: string }[])
-      : []);
-  const providers: ExtractProviderView[] = rawPairs.map((p) => {
-    const send = sendOfProvider(effective, p.provider);
-    return {
-      provider: p.provider,
-      model: p.model,
-      send,
-      receivesDocuments: send === 'documents',
-    };
-  });
+  const modelsConfigured = status?.models ?? false;
+  const rawPairs = status?.extract ?? [];
+  const providersAt = (overrideSend?: string): ExtractProviderView[] =>
+    rawPairs.map(({ provider, model }) => {
+      const send = sendOfProvider(effective ?? undefined, provider, overrideSend);
+      return { provider, model, send, receivesDocuments: send === 'documents' };
+    });
+  const providers = providersAt();
   const activeProviders = providers.filter((p) => p.receivesDocuments);
+  const afterSend = plan?.patch.send ?? effective?.send;
+  const enableProviders = providersAt(typeof afterSend === 'string' ? afterSend : undefined);
   const ingestLocked = kind ? fieldInfo(kind, 'ingest').locked : false;
   const fieldsOn =
-    effective.enabled === true && effective.ingest === true && effective.send === 'documents';
-  const on =
-    assistant?.ingest !== undefined
-      ? assistant.ingest
-      : modelsConfigured && fieldsOn && activeProviders.length > 0;
+    effective?.enabled === true && effective.ingest === true && effective.send === 'documents';
+  const on = status?.ingest === true;
 
   if (on) {
     return {
@@ -1030,6 +1022,7 @@ export function describeIngestState(
       modelsConfigured,
       providers,
       activeProviders,
+      enableProviders,
       plan,
       canEnableDirectly: false,
       ingestLocked,
@@ -1060,8 +1053,7 @@ export function describeIngestState(
   }
 
   const wouldHaveActiveProvider =
-    modelsConfigured &&
-    rawPairs.some((p) => sendOfProvider(effective, p.provider, 'documents') === 'documents');
+    modelsConfigured && enableProviders.some((p) => p.receivesDocuments);
   const canEnableDirectly =
     plan != null &&
     plan.wouldEnable &&
@@ -1073,6 +1065,7 @@ export function describeIngestState(
     modelsConfigured,
     providers,
     activeProviders,
+    enableProviders,
     plan,
     blockingField,
     reason,
@@ -1094,31 +1087,46 @@ export function sourceReason(source: FieldSource): string {
   }
 }
 
-/**
- * Enable server-side ingestion for `ds` under the C19 §8.1 rule: read
- * `/$/settings/{ds}/assistant`, patch only default fields with `If-Match`, and retry up to
- * three times on `412`.
- */
-export async function enableIngest(
-  ds: string,
-): Promise<{ kind: SettingsKind; plan: EnableIngestPlan; changed: boolean }> {
+function ingestConfirmation(s: IngestAvailability): string {
+  const fields = INGEST_FIELDS.map(([field]) => {
+    const f =
+      s.plan?.changed.find((f) => f.field === field) ??
+      s.plan?.unchanged.find((f) => f.field === field);
+    return [field, f?.current, f?.source];
+  });
+  const recipients = s.enableProviders
+    .filter((p) => p.receivesDocuments)
+    .map((p) => [p.provider, p.model]);
+  return JSON.stringify({ fields, recipients });
+}
+
+/** Apply the approved enable patch and retry a stale write only for the same plan. */
+export async function enableIngest(ds: string, confirmed: IngestAvailability) {
   const url = datasetKindUrl(ds, 'assistant');
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const cur = await readKind(url);
-    const plan = planEnableIngest(cur);
-    if (Object.keys(plan.patch).length === 0) {
-      return { kind: cur, plan, changed: false };
+  const confirmation = ingestConfirmation(confirmed);
+  for (let attempt = 0; ; attempt++) {
+    const [kind, assistant] = await Promise.all([readKind(url), assistantSettings(ds)]);
+    const current = describeIngestState(kind, assistant);
+    if (
+      !current.canEnableDirectly ||
+      !current.plan ||
+      ingestConfirmation(current) !== confirmation ||
+      JSON.stringify(current.enableProviders) !== JSON.stringify(confirmed.enableProviders)
+    ) {
+      return { kind, assistant, changed: false };
     }
+    const init = writeInit('PATCH', kind.etag, current.plan.patch);
     try {
-      const next = await patchKind(url, plan.patch, cur.etag);
-      return { kind: next, plan, changed: true };
+      const next = await json<SettingsKind>(url, {
+        ...init,
+        headers: { ...init.headers, 'If-Ingest-Confirmation': enc(confirmation) },
+      });
+      return { kind: next, assistant, changed: true };
     } catch (e) {
       if (e instanceof ApiError && e.status === 412 && attempt < 2) continue;
       throw e;
     }
   }
-  const cur = await readKind(url);
-  return { kind: cur, plan: planEnableIngest(cur), changed: false };
 }
 
 /**

@@ -30,7 +30,8 @@
   let mode = $state<review.IngestMode>('branch');
   let allowPartial = $state(false);
   let busy = $state(false);
-  let ingestStatus = $state({ on: true, loading: true });
+  let ingestStatus = $state({ on: false, known: false, loading: true });
+  let lastExtract: boolean | undefined;
   let storeOnlyConfirm = $state(false);
   /** The task this panel follows. */
   let task = $state<review.IngestTask | null>(null);
@@ -104,12 +105,12 @@
   const isTableFile = (f: File | null) => f != null && /\.(csv|tsv|xlsx|ods)$/i.test(f.name);
 
   function requestStart() {
-    if (!file) return;
-    if (!ingestStatus.loading && !ingestStatus.on && !isTableFile(file)) {
+    if (!file || ingestStatus.loading) return;
+    if (!ingestStatus.on && !isTableFile(file)) {
       storeOnlyConfirm = true;
       return;
     }
-    void start(allowPartial);
+    void start(allowPartial, ingestStatus.on ? undefined : false);
   }
 
   async function start(partial = allowPartial, extract?: boolean) {
@@ -122,6 +123,7 @@
         allowPartial: partial || undefined,
         extract,
       });
+      lastExtract = extract;
       void follow(t);
     } catch (e) {
       toasts.error('Could not start the ingestion', e);
@@ -142,7 +144,7 @@
           what === 'confirm'
             ? await review.confirmIngest(ds, task.id)
             : await review.approveIngest(ds, task.id);
-        if (what === 'approve') toasts.push('success', 'Wrote the facts to main');
+        if (what === 'approve') toasts.push('success', 'Wrote to main');
         void follow(t);
       }
     } catch (e) {
@@ -199,6 +201,11 @@
     const d = r.sheets?.[sheet];
     return d?.csv ? new File([d.csv], `${d.sheet}.csv`, { type: 'text/csv' }) : null;
   });
+  const showRedactions = (counts: Record<string, number>) =>
+    Object.entries(counts)
+      .map(([detector, count]) => `${detector} (${count})`)
+      .join(', ');
+
   const label = (t: review.IngestTask) => t.input.name ?? t.input.url ?? t.id;
 </script>
 
@@ -240,8 +247,10 @@
           <label><input type="checkbox" bind:checked={allowPartial} /> Skip unreadable pages</label>
         {/if}
         <span class="spacer"></span>
-        <button class="btn primary sm" disabled={!file || busy} onclick={requestStart}
-          >Ingest</button
+        <button
+          class="btn primary sm"
+          disabled={!file || busy || ingestStatus.loading}
+          onclick={requestStart}>Ingest</button
         >
       </div>
 
@@ -299,7 +308,11 @@
             </div>
             {#if err.code === 'needs-ocr' && file}
               <div class="row">
-                <button class="btn sm" disabled={busy} onclick={() => start(true)}
+                <button
+                  class="btn sm"
+                  disabled={busy || ingestStatus.loading}
+                  onclick={() =>
+                    start(true, ingestStatus.on && lastExtract !== false ? undefined : false)}
                   >Ingest the readable pages</button
                 >
               </div>
@@ -336,6 +349,11 @@
                 {(d.rows ?? 0) === 1 ? 'becomes' : 'become'}
                 {fmtCount(d.triples ?? 0, 'triple')}.
               </p>
+              {#if d.redactions && Object.keys(d.redactions).length}
+                <p class="msg">
+                  Redacted in the sample sent to the model: {showRedactions(d.redactions)}.
+                </p>
+              {/if}
               <label class="small"
                 >Mapping (CSVW)
                 <textarea class="input mono" rows="8" aria-label="Mapping" bind:value={mappingText}
@@ -400,6 +418,10 @@
             <p class="msg">
               {#if r.outcome === 'already-registered'}
                 This source is already registered. Nothing was written.
+              {:else if r.outcome === 'preview' && r.proposed == null}
+                Source preview. Approve to register it on main.
+              {:else if r.outcome === 'merged' && r.proposed == null}
+                Source registered on main.
               {:else if r.outcome === 'merged'}
                 {r.proposed} fact{r.proposed === 1 ? '' : 's'} merged into main.
               {:else if r.outcome === 'approved'}
@@ -422,14 +444,12 @@
             {#if r.autoFallback}<p class="msg">Kept for review: {r.autoFallback}.</p>{/if}
             {#if r.redactions && Object.keys(r.redactions).length}
               <p class="msg">
-                Redacted before storage and extraction: {Object.entries(r.redactions)
-                  .map(([k, n]) => `${k} (${n})`)
-                  .join(', ')}.
+                Redacted before storage and extraction: {showRedactions(r.redactions)}.
               </p>
             {/if}
             {#each r.notes ?? [] as n (n)}<p class="msg">{n}</p>{/each}
             <div class="row">
-              {#if r.branch}
+              {#if r.branch && r.outcome !== 'merged'}
                 <a class="btn primary sm" href={reviewHref(base, ds, r.branch)}>Review proposals</a>
               {/if}
               {#if task.status === 'awaiting-approval'}
@@ -469,8 +489,18 @@
     closeDisabled={busy}
   >
     <p class="small">
-      Server ingestion is off for this dataset. Uploading <code class="mono">{file?.name}</code> will
-      store it as a source without running a model or extracting facts.
+      {ingestStatus.known
+        ? 'Server ingestion is off for this dataset.'
+        : 'Server ingestion status is unavailable.'}
+      <code class="mono">{file?.name}</code>
+      {#if mode === 'preview'}
+        will be previewed and stored on main after approval.
+      {:else if mode === 'auto'}
+        will be stored on main when the merge checks pass, or kept on a review branch.
+      {:else}
+        will be stored on a review branch.
+      {/if}
+      No model will run.
     </p>
     {#snippet actions()}
       <button class="btn sm" disabled={busy} onclick={() => (storeOnlyConfirm = false)}

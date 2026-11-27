@@ -39,7 +39,14 @@ const LOCKED_BY_DS = {
 
 function layeredAssistant(name) {
   const lockInfo = LOCKED_BY_DS[name] ?? { declared: {}, locked: [] };
-  const defaults = { enabled: false, ask: true, ingest: false, send: 'schema', historyDays: 30 };
+  const defaults = {
+    enabled: false,
+    ask: true,
+    ingest: false,
+    send: 'schema',
+    sendByProvider: {},
+    historyDays: 30,
+  };
   const initialRuntime = name === 'org' ? { enabled: true, ingest: true, send: 'documents' } : {};
   const runtime = settings[name] ?? initialRuntime;
   const declared = { ...lockInfo.declared };
@@ -161,7 +168,9 @@ function settingsOf(name) {
   const s = layeredAssistant(name).effective;
   const enabled = !!s.enabled;
   const days = s.historyDays ?? 30;
-  const ingestOn = enabled && !!s.ingest && s.send === 'documents';
+  const extract = s.roles?.extract ?? EXTRACT;
+  const receives = (p) => (s.sendByProvider[p.provider] ?? s.send) === 'documents';
+  const ingestOn = enabled && !!s.ingest && s.send === 'documents' && extract.some(receives);
   return {
     ...s,
     status: enabled
@@ -172,7 +181,7 @@ function settingsOf(name) {
           draft: DRAFT,
           summary: s.send !== 'schema',
           ingest: ingestOn,
-          extract: EXTRACT,
+          extract,
         }
       : {
           models: true,
@@ -180,7 +189,7 @@ function settingsOf(name) {
           ask: false,
           reason: 'the dataset has no assistant (PUT /$/assistant/{ds} with enabled)',
           ingest: false,
-          extract: EXTRACT,
+          extract,
         },
   };
 }

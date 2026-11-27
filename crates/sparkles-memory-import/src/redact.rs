@@ -12,9 +12,10 @@
 //! - exact known-value matching (`known_values`, 8+ characters) via Aho-Corasick;
 //! - an allow-list of regular expressions whose matched spans are never redacted.
 
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use aho_corasick::AhoCorasick;
 use regex::Regex;
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::net::Ipv6Addr;
 use std::sync::LazyLock;
 
@@ -216,10 +217,7 @@ impl Policy {
         self.known_matcher = if kept.is_empty() {
             None
         } else {
-            AhoCorasickBuilder::new()
-                .match_kind(MatchKind::LeftmostLongest)
-                .build(&kept)
-                .ok()
+            AhoCorasick::new(&kept).ok()
         };
         self
     }
@@ -232,99 +230,181 @@ impl Policy {
     /// Replace every match in `text` and return the byte-offset edits
     /// `(orig_start, orig_end, new_start, new_end)` in order, so callers can remap
     /// character offsets such as PDF page starts.
-    pub fn redact_with_edits(&self, text: &str) -> (Redacted, Vec<(usize, usize, usize, usize)>) {
-        let found = self.candidates(text);
+    pub fn redact_with_edits(&self, text: &str) -> (Redacted, Vec<Edit>) {
+        self.redact_checked(text, || Ok::<_, Infallible>(()))
+            .unwrap()
+    }
+
+    /// Redact text, checking the caller's deadline or cancellation during matching.
+    pub fn redact_checked<E>(
+        &self,
+        text: &str,
+        mut check: impl FnMut() -> Result<(), E>,
+    ) -> Result<(Redacted, Vec<Edit>), E> {
+        let mut found = BTreeMap::new();
+        self.visit(text, &mut check, |candidate| {
+            merge_match(&mut found, candidate)
+        })?;
+
         let mut out = String::with_capacity(text.len());
         let mut names = Vec::new();
         let mut edits = Vec::new();
         let mut at = 0;
-        for (s, e, _, name) in found {
-            if s < at {
-                continue;
-            }
-            out.push_str(&text[at..s]);
+        for (start, (end, _, name)) in found {
+            check()?;
+            out.push_str(&text[at..start]);
             let new_start = out.len();
             out.push_str("[redacted:");
-            out.push_str(&name);
+            out.push_str(name);
             out.push(']');
-            let new_end = out.len();
-            names.push(name);
-            edits.push((s, e, new_start, new_end));
-            at = e;
+            names.push(name.to_string());
+            edits.push((start, end, new_start, out.len()));
+            at = end;
         }
         out.push_str(&text[at..]);
-        (Redacted { text: out, names }, edits)
+        check()?;
+        Ok((Redacted { text: out, names }, edits))
     }
 
     /// The first match of this policy in `text`, as `(detector_name, byte_offset)`.
     pub fn first_match(&self, text: &str) -> Option<(String, usize)> {
-        self.candidates(text)
-            .into_iter()
-            .next()
-            .map(|(s, _, _, name)| (name, s))
+        self.first_match_checked(text, || Ok::<_, Infallible>(()))
+            .unwrap()
     }
 
-    /// Collect, filter by allow-list, and sort all candidate matches `(start, end, priority, name)`.
-    fn candidates(&self, text: &str) -> Vec<(usize, usize, usize, String)> {
-        let mut found: Vec<(usize, usize, usize, String)> = Vec::new();
-        // Priority 0: known exact values (Aho-Corasick).
+    /// Find the first match without collecting every candidate.
+    pub fn first_match_checked<E>(
+        &self,
+        text: &str,
+        mut check: impl FnMut() -> Result<(), E>,
+    ) -> Result<Option<(String, usize)>, E> {
+        let mut first = None;
+        self.visit(text, &mut check, |(start, _, priority, name)| {
+            if first.is_none_or(|(s, p, _)| (start, priority) < (s, p)) {
+                first = Some((start, priority, name));
+            }
+        })?;
+        Ok(first.map(|(start, _, name)| (name.to_string(), start)))
+    }
+
+    fn visit<'a, E>(
+        &'a self,
+        text: &str,
+        check: &mut impl FnMut() -> Result<(), E>,
+        mut visit: impl FnMut((usize, usize, usize, &'a str)),
+    ) -> Result<(), E> {
+        static MARKER: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"\[redacted:([A-Za-z0-9_-]{1,64})\]").expect("marker regex compiles")
+        });
+        let mut allowed = BTreeMap::<usize, usize>::new();
+        for re in &self.allow {
+            check()?;
+            for m in re.find_iter(text) {
+                check()?;
+                if !m.is_empty() {
+                    let end = allowed.entry(m.start()).or_default();
+                    *end = (*end).max(m.end());
+                }
+            }
+        }
+        let mut farthest = 0;
+        // Retain the prefix maximum of the ends so one binary search answers containment.
+        let allowed: Vec<_> = allowed
+            .into_iter()
+            .filter(|&(_, end)| {
+                if end <= farthest {
+                    return false;
+                }
+                farthest = end;
+                true
+            })
+            .collect();
+
+        let mut markers = Vec::new();
+        for c in MARKER.captures_iter(text) {
+            check()?;
+            let name = &c[1];
+            if matches!(name, "known-value" | "server-secret" | "high-entropy")
+                || name == self.known_label
+                || PersonalCategory::parse(name).is_some()
+                || self.patterns.iter().any(|p| p.name == name)
+            {
+                let m = c.get(0).expect("group 0");
+                markers.push((m.start(), m.end()));
+            }
+        }
+        let mut candidate = |s, e, priority, name| {
+            let covered = |ranges: &[(usize, usize)]| {
+                let i = ranges.partition_point(|&(start, _)| start <= s);
+                i > 0 && ranges[i - 1].1 >= e
+            };
+            if s < e && !covered(&allowed) && (priority == 0 || !covered(&markers)) {
+                visit((s, e, priority, name));
+            }
+        };
         if let Some(ac) = &self.known_matcher {
-            for m in ac.find_iter(text) {
-                if m.start() < m.end() && !text[m.start()..].starts_with("[redacted:") {
-                    found.push((m.start(), m.end(), 0, self.known_label.clone()));
-                }
+            check()?;
+            for m in ac.find_overlapping_iter(text) {
+                check()?;
+                candidate(m.start(), m.end(), 0, &self.known_label);
             }
         }
-        // Priority 1..=patterns.len(): named patterns in order.
         for (pi, p) in self.patterns.iter().enumerate() {
+            check()?;
             for c in p.regex.captures_iter(text) {
+                check()?;
                 let m = c.name("v").or_else(|| c.get(0)).expect("group 0");
-                if m.start() == m.end() || text[m.start()..m.end()].starts_with("[redacted:") {
-                    continue;
-                }
-                found.push((m.start(), m.end(), 1 + pi, p.name.clone()));
+                candidate(m.start(), m.end(), 1 + pi, &p.name);
             }
         }
-        // Personal data categories.
         let personal_base = 1 + self.patterns.len();
         for (ci, cat) in self.personal.iter().enumerate() {
-            let prio = personal_base + ci;
+            check()?;
             for (s, e) in find_personal(*cat, text) {
-                if s < e && !text[s..].starts_with("[redacted:") {
-                    found.push((s, e, prio, cat.as_str().to_string()));
-                }
+                check()?;
+                candidate(s, e, personal_base + ci, cat.as_str());
             }
         }
-        // High-entropy tokens (lowest priority, so specific patterns win at the same place).
         if let Some(cfg) = self.entropy {
-            let prio = personal_base + self.personal.len() + 1;
+            check()?;
+            let prio = personal_base + self.personal.len();
             for (s, e) in find_high_entropy(text, cfg) {
-                if s < e && !text[s..].starts_with("[redacted:") {
-                    found.push((s, e, prio, "high-entropy".into()));
-                }
+                check()?;
+                candidate(s, e, prio, "high-entropy");
             }
         }
-        if found.is_empty() {
-            return found;
-        }
-        // Allow list: any candidate contained inside an allowed span is skipped.
-        if !self.allow.is_empty() {
-            let mut allowed: Vec<(usize, usize)> = Vec::new();
-            for re in &self.allow {
-                for m in re.find_iter(text) {
-                    if m.start() < m.end() {
-                        allowed.push((m.start(), m.end()));
-                    }
-                }
-            }
-            if !allowed.is_empty() {
-                found.retain(|&(s, e, _, _)| !allowed.iter().any(|&(a, b)| a <= s && e <= b));
-            }
-        }
-        found.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)).then(b.1.cmp(&a.1)));
-        found
+        check()
     }
 }
+
+/// Keep only the disjoint replacement spans while visiting candidates. This also
+/// bounds memory when many detectors match the same text.
+fn merge_match<'a>(
+    matches: &mut BTreeMap<usize, (usize, usize, &'a str)>,
+    (mut start, mut end, mut priority, mut name): (usize, usize, usize, &'a str),
+) {
+    if let Some((&s, &(e, p, n))) = matches.range(..=start).next_back()
+        && e > start
+    {
+        if (s, p) <= (start, priority) {
+            if e >= end {
+                return;
+            }
+            (priority, name) = (p, n);
+        }
+        start = s;
+        end = end.max(e);
+        matches.remove(&s);
+    }
+    while let Some((&s, &(e, _, _))) = matches.range(start..end).next() {
+        end = end.max(e);
+        matches.remove(&s);
+    }
+    matches.insert(start, (end, priority, name));
+}
+
+/// Byte offsets of one replacement: original start and end, then replacement start and end.
+pub type Edit = (usize, usize, usize, usize);
 
 /// What redaction did to one text.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -346,7 +426,7 @@ impl Redacted {
 }
 
 /// Replace every match of `patterns` in `text`. Matches are found in the original text
-/// and do not overlap; at one place the longest match of the earliest pattern wins.
+/// and overlapping matches are combined; the earliest match names the replacement.
 pub fn redact(text: &str, patterns: &[Pattern]) -> Redacted {
     Policy::from_patterns(patterns.to_vec()).redact(text)
 }
@@ -424,7 +504,7 @@ where
 pub fn remap_char_offsets(
     orig: &str,
     redacted: &str,
-    edits: &[(usize, usize, usize, usize)],
+    edits: &[Edit],
     offsets: &[usize],
 ) -> Vec<usize> {
     if edits.is_empty() || offsets.is_empty() {
@@ -599,8 +679,9 @@ static IPV4_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("ipv4 regex compiles")
 });
 
-static IPV6_CANDIDATE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[0-9A-Fa-f:]{2,39}").expect("ipv6 regex compiles"));
+static IPV6_CANDIDATE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[0-9A-Fa-f:]{2,39}(?:\.[0-9]{1,3}){0,3}").expect("ipv6 regex compiles")
+});
 
 fn find_personal(cat: PersonalCategory, text: &str) -> Vec<(usize, usize)> {
     match cat {
@@ -614,18 +695,18 @@ fn find_personal(cat: PersonalCategory, text: &str) -> Vec<(usize, usize)> {
 
 fn find_emails(text: &str) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
+    let mut at = 0;
+    let mut userinfo = false;
     for m in EMAIL_RE.find_iter(text) {
         // Skip URL userinfo like `https://user@host.example` or `postgres://user:pass@host.example`.
-        let before = &text[..m.start()];
-        if before.ends_with("://") {
-            continue;
+        let before = &text[at..m.start()];
+        if let Some(i) = before.rfind(|c: char| c == '/' || c.is_whitespace()) {
+            userinfo = text[..at + i + 1].ends_with("://");
         }
-        if let Some(scheme_end) = before.rfind("://")
-            && !before[scheme_end + 3..].contains(|c: char| c.is_whitespace() || c == '/')
-        {
-            continue;
+        if !userinfo {
+            out.push((m.start(), m.end()));
         }
-        out.push((m.start(), m.end()));
+        at = m.end();
     }
     out
 }
@@ -752,7 +833,9 @@ fn find_ips(text: &str) -> Vec<(usize, usize)> {
         if s > 0 && (bytes[s - 1] == b'.' || bytes[s - 1].is_ascii_alphanumeric()) {
             continue;
         }
-        if e < bytes.len() && (bytes[e] == b'.' || bytes[e].is_ascii_alphanumeric()) {
+        if e < bytes.len()
+            && (continues_dotted_address(bytes, e) || bytes[e].is_ascii_alphanumeric())
+        {
             continue;
         }
         out.push((s, e));
@@ -762,10 +845,10 @@ fn find_ips(text: &str) -> Vec<(usize, usize)> {
         let e = m.end();
         let cand = m.as_str();
         // Need at least two colons so times like 12:30 or hex pairs are not considered.
-        if cand.bytes().filter(|&b| b == b':').count() < 2 {
+        if cand == "::" || cand.bytes().filter(|&b| b == b':').count() < 2 {
             continue;
         }
-        // Exclude bare `::` without any address parts or surrounded by word/colon characters.
+        // Keep matches bounded by punctuation or whitespace.
         if s > 0 {
             let prev = bytes[s - 1];
             if prev.is_ascii_alphanumeric() || prev == b':' || prev == b'_' {
@@ -774,7 +857,11 @@ fn find_ips(text: &str) -> Vec<(usize, usize)> {
         }
         if e < bytes.len() {
             let next = bytes[e];
-            if next.is_ascii_alphanumeric() || next == b':' || next == b'_' {
+            if next.is_ascii_alphanumeric()
+                || next == b':'
+                || next == b'_'
+                || continues_dotted_address(bytes, e)
+            {
                 continue;
             }
         }
@@ -783,6 +870,10 @@ fn find_ips(text: &str) -> Vec<(usize, usize)> {
         }
     }
     out
+}
+
+fn continues_dotted_address(bytes: &[u8], end: usize) -> bool {
+    bytes.get(end) == Some(&b'.') && bytes.get(end + 1).is_some_and(u8::is_ascii_digit)
 }
 
 #[cfg(test)]
@@ -917,11 +1008,24 @@ mod tests {
             "Bad IBAN: GB00 WEST 1234 5698 7654 32\n",
             "Local phone: 415-555-2671\n",
             "Version: 1.2.3.4.5 and 999.1.2.3\n",
-            "Time: 12:30 and short +12345\n",
+            "Time: 12:30 and short +12345, separator a :: b\n",
         );
         let r = policy.redact(safe);
         assert!(r.names.is_empty(), "{:?} -> {}", r.names, r.text);
         assert_eq!(r.text, safe);
+    }
+
+    #[test]
+    fn embedded_ipv4_addresses_redact_whole_with_surrounding_punctuation() {
+        let mut p = Policy::from_patterns(Vec::new());
+        p.personal = vec![PersonalCategory::Ip];
+        let r = p
+            .redact("From (::ffff:192.0.2.1), https://[::ffff:192.0.2.2]:80 and ::ffff:192.0.2.3.");
+        assert_eq!(
+            r.text,
+            "From ([redacted:ip]), https://[[redacted:ip]]:80 and [redacted:ip]."
+        );
+        assert_eq!(r.names, ["ip", "ip", "ip"]);
     }
 
     #[test]
@@ -950,6 +1054,48 @@ mod tests {
             format!("test={test_key} real=[redacted:github-token]")
         );
         assert_eq!(r.names, vec!["github-token"]);
+    }
+
+    #[test]
+    fn overlapping_matches_redact_the_union_after_allow_filtering() {
+        let p = Policy::default().with_known_values(["secret12"], "known");
+        let r = p.redact("API_KEY=secret12_live_9876543210");
+        assert_eq!(r.text, "API_KEY=[redacted:known]");
+        assert_eq!(p.first_match(&r.text), None);
+        assert!(
+            p.first_match("API_KEY=[redacted:known]_live_9876543210")
+                .is_some()
+        );
+        let fake = format!("[redacted:ghp_{}]", "T".repeat(36));
+        assert_eq!(p.first_match(&fake), Some(("github-token".into(), 10)));
+
+        let regex = Pattern::new("prefix", "abcde").unwrap();
+        let mut p =
+            Policy::from_patterns(vec![regex]).with_known_values(["cdefghij", "ghijklmn"], "known");
+        assert_eq!(p.redact("abcdefghijklmn!").text, "[redacted:prefix]!");
+        p.patterns.clear();
+        assert_eq!(p.redact("abcdefghijklmn!").text, "ab[redacted:known]!");
+        p.allow.push(Regex::new("cdefghij").unwrap());
+        assert_eq!(p.redact("abcdefghijklmn!").text, "abcdef[redacted:known]!");
+    }
+
+    #[test]
+    fn dense_allow_list_and_cancellation() {
+        let mut p = Policy::from_patterns(vec![Pattern::new("token", "token").unwrap()]);
+        p.allow.push(Regex::new("allowed-token").unwrap());
+        let text = "allowed-token ".repeat(100_000) + "token";
+        assert_eq!(p.first_match(&text), Some(("token".into(), 1_400_000)));
+        assert_eq!(p.redact(&text).names, ["token"]);
+        let mut calls = 0;
+        let check = || {
+            calls += 1;
+            if calls > 100 {
+                Err("cancelled")
+            } else {
+                Ok(())
+            }
+        };
+        assert_eq!(p.redact_checked(&text, check), Err("cancelled"));
     }
 
     #[test]

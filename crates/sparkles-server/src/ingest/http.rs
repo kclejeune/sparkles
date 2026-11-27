@@ -292,18 +292,12 @@ async fn start(
         ));
     }
     let mut input = json!({ "mode": mode.as_str() });
-    if let Some(n) = &name {
-        input["name"] = n.clone().into();
-    }
-    if let Some(u) = &o.url {
-        input["url"] = u.clone().into();
-    }
+    // Task listings can be read by dataset admins as well as the uploader.
+    // A raw filename, fetch URL or source locator can contain credentials.
     if let Some(m) = &media_type {
         input["format"] = m.clone().into();
     }
-    if let Some(s) = &o.source {
-        input["source"] = s.clone().into();
-    } else if !fetched {
+    if o.source.is_none() && !fetched {
         input["bytes"] = bytes.len().into();
     }
     let req = Request {
@@ -395,10 +389,12 @@ fn spawn(
                         sparkles::error::Error::NotPermitted(_) => "fetch-refused",
                         _ => "fetch-failed",
                     };
-                    t.finish(
-                        Err(json!({ "code": code, "message": e.to_string() })),
-                        json!({}),
-                    );
+                    let message = if code == "fetch-refused" {
+                        "the server's outbound policy refused the document URL"
+                    } else {
+                        "the server could not fetch the document"
+                    };
+                    t.finish(Err(json!({ "code": code, "message": message })), json!({}));
                     return;
                 }
             }

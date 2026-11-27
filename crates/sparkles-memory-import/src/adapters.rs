@@ -386,16 +386,31 @@ impl Scanner<'_> {
         if crate::is_generated(text) {
             return skip(self, "generated");
         }
-        let r = match self.policy {
-            Some(p) => p.redact(text),
-            None => redact::redact(text, self.req.patterns),
-        };
+        let r = self.redact(text);
         Some(Read {
             modified: mtime(&meta),
             text: r.text,
             redactions: r.names,
             bytes,
         })
+    }
+
+    fn redact(&self, value: &str) -> redact::Redacted {
+        match self.policy {
+            Some(p) => p.redact(value),
+            None => redact::redact(value, self.req.patterns),
+        }
+    }
+
+    fn path_key(&self, path: &str) -> String {
+        if self.redact(path).names.is_empty() {
+            path_key(path)
+        } else {
+            // Keep distinct files distinct without embedding the matched path in their IRIs.
+            ids::digest(path.as_bytes())
+                .trim_start_matches("sha256:")
+                .to_string()
+        }
     }
 
     /// The source's description and the project's facts, which every file's graph has.
@@ -414,7 +429,12 @@ impl Scanner<'_> {
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         facts.push(fact(graph, RDF_TYPE, Obj::Iri(PROV_ENTITY.into()), None));
-        facts.push(fact(graph, DCT_TITLE, Obj::lit(title), None));
+        facts.push(fact(
+            graph,
+            DCT_TITLE,
+            Obj::lit(self.redact(&title).text),
+            None,
+        ));
         facts.push(fact(graph, DCT_FORMAT, Obj::lit("text/markdown"), None));
         facts.push(fact(
             graph,
@@ -423,7 +443,12 @@ impl Scanner<'_> {
             None,
         ));
         facts.push(fact(graph, &mem("harness"), Obj::Iri(harness.iri()), None));
-        facts.push(fact(graph, &mem("filePath"), Obj::lit(rel_path), None));
+        facts.push(fact(
+            graph,
+            &mem("filePath"),
+            Obj::lit(self.redact(rel_path).text),
+            None,
+        ));
         facts.push(fact(
             graph,
             DCT_MODIFIED,
@@ -471,6 +496,8 @@ impl Scanner<'_> {
         for (iri, line) in crate::copies_of(&read.text) {
             facts.push(fact(&graph, &mem("copyOf"), Obj::Iri(iri), Some(&line)));
         }
+        let title = self.redact(&title).text;
+        let rel_path = self.redact(&rel_path).text;
         self.out.files.push(FileImport {
             adapter,
             harness,
@@ -522,7 +549,7 @@ impl Scanner<'_> {
             .map(|(v, l)| (v.to_string(), l.to_string()));
         let key = match &name {
             Some((n, _)) if !norm_name(n).is_empty() => norm_name(n),
-            _ => path_key(&rel_path),
+            _ => self.path_key(&rel_path),
         };
         let graph = self.ctx().graph(
             harness.segment(),
@@ -594,7 +621,12 @@ impl Scanner<'_> {
                 None,
             ));
         }
-        facts.push(fact(&m, &mem("filePath"), Obj::lit(rel_path.clone()), None));
+        facts.push(fact(
+            &m,
+            &mem("filePath"),
+            Obj::lit(self.redact(&rel_path).text),
+            None,
+        ));
         facts.push(fact(&m, &mem("file"), Obj::Iri(graph.clone()), None));
         let mut linked = BTreeSet::new();
         for (target, line) in wiki_links(doc.body) {
@@ -754,7 +786,7 @@ impl Scanner<'_> {
                 self.project_segment()
             };
             let rel_path = rel(&path, &root);
-            let key = format!("{key_prefix}{}", path_key(&rel_path));
+            let key = format!("{key_prefix}{}", self.path_key(&rel_path));
             let graph = self.ctx().graph(
                 harness.segment(),
                 &project_segment,
@@ -772,10 +804,15 @@ impl Scanner<'_> {
                 .instructions_iri(harness.segment(), &project_key, &key);
             let mut facts = vec![
                 fact(&i, RDF_TYPE, Obj::Iri(mem("Instructions")), None),
-                fact(&i, RDFS_LABEL, Obj::lit(rel_path.clone()), None),
+                fact(&i, RDFS_LABEL, Obj::lit(self.redact(&rel_path).text), None),
                 fact(&i, &mem("scope"), Obj::Iri(scope.iri()), None),
                 fact(&i, &mem("harness"), Obj::Iri(harness.iri()), None),
-                fact(&i, &mem("filePath"), Obj::lit(rel_path.clone()), None),
+                fact(
+                    &i,
+                    &mem("filePath"),
+                    Obj::lit(self.redact(&rel_path).text),
+                    None,
+                ),
                 fact(&i, &mem("file"), Obj::Iri(graph.clone()), None),
             ];
             if !user && let Some(k) = self.project_key() {
@@ -809,7 +846,7 @@ impl Scanner<'_> {
                     let target = self.resolve_import(&raw, &base_dir);
                     let iri = match target {
                         Some((t, tscope, tuser, troot, tprefix)) => {
-                            let tkey = format!("{tprefix}{}", path_key(&rel(&t, &troot)));
+                            let tkey = format!("{tprefix}{}", self.path_key(&rel(&t, &troot)));
                             let pk = if tuser {
                                 "user".to_string()
                             } else {

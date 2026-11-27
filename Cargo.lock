@@ -6057,6 +6057,7 @@ dependencies = [
 name = "sparkles-memory-import"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "chrono",
  "regex",
  "serde_json",

@@ -1011,6 +1011,8 @@ mod tests {
             json!({"agents": {"a": {"conversationFacts": "later"}}}),
             json!({"redaction": {"personal": ["ssn"]}}),
             json!({"redaction": {"entropy": {"minLength": 4}}}),
+            json!({"redaction": {"entropy": {"minLength": 1025}}}),
+            json!({"redaction": {"entropy": {"minBitsPerChar": -0.1}}}),
             json!({"redaction": {"entropy": {"minBitsPerChar": 9.0}}}),
             json!({"redaction": {"allow": ["[invalid"]}}),
             json!({"redaction": {"serverIngest": "ignore"}}),
@@ -1045,6 +1047,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(disk["format"], 4, "{disk}");
+        for entropy in [
+            json!({"minLength": 8, "minBitsPerChar": 8.0}),
+            json!({"minLength": 1024, "minBitsPerChar": 0.0}),
+        ] {
+            let (s, v) = send(
+                &app,
+                json_req(
+                    "PUT",
+                    "/$/memory/org",
+                    json!({
+                        "redaction": { "entropy": entropy }
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{v}");
+            assert_eq!(v["redaction"]["entropy"], entropy, "{v}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

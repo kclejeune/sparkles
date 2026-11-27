@@ -299,6 +299,55 @@ pub struct Converted {
     pub notes: Vec<String>,
 }
 
+impl Converted {
+    /// Replace the rendition text and retain converter-owned page markers. An edit can
+    /// consume part or all of a marker, including markers of multiple pages.
+    pub fn replace_text(
+        &mut self,
+        redacted: String,
+        edits: &[sparkles_memory_import::redact::Edit],
+    ) {
+        if self.page_starts.is_empty() || edits.is_empty() {
+            self.text = redacted;
+            return;
+        }
+        let offsets = sparkles_memory_import::redact::remap_char_offsets(
+            &self.text,
+            &redacted,
+            edits,
+            &self.page_starts,
+        );
+        let pages = PageMap::new(&self.text, &self.page_starts).pages;
+        let mut chars = redacted.char_indices();
+        let mut at = 0;
+        let mut copied = 0;
+        let mut added = 0;
+        let mut text = String::new();
+        for ((start, offset), page) in self.page_starts.iter_mut().zip(offsets).zip(pages) {
+            while at < offset && chars.next().is_some() {
+                at += 1;
+            }
+            *start = offset + added;
+            let byte = chars
+                .clone()
+                .next()
+                .map_or(redacted.len(), |(byte, _)| byte);
+            if let Some(page) = page
+                && marker_at(&redacted[byte..]) != Some(page)
+            {
+                text.push_str(&redacted[copied..byte]);
+                let marker = format!("\n<!-- Page {page} -->\n");
+                text.push_str(&marker);
+                copied = byte;
+                *start += 1; // The marker starts after the inserted newline.
+                added += marker.len();
+            }
+        }
+        text.push_str(&redacted[copied..]);
+        self.text = text;
+    }
+}
+
 /// The page of each page start of a rendition, read once. Reading a start's marker with
 /// `chars().skip(start)` scans the text from its beginning, so a lookup for every fact or
 /// page of a long PDF took time quadratic in the text.
@@ -321,14 +370,17 @@ impl<'a> PageMap<'a> {
                 }
                 // a start past the end has no marker
                 let (byte, _) = chars.clone().next()?;
-                let marker = text[byte..]
-                    .char_indices()
-                    .nth(24)
-                    .map_or(&text[byte..], |(end, _)| &text[byte..byte + end]);
-                marker_page(marker)
+                marker_at(&text[byte..])
             })
             .collect();
         PageMap { starts, pages }
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (usize, u32)> + '_ {
+        self.starts
+            .iter()
+            .zip(&self.pages)
+            .filter_map(|(&start, &page)| page.map(|page| (start, page)))
     }
 
     /// The page whose marker starts the last page start at or before `offset`.
@@ -336,6 +388,14 @@ impl<'a> PageMap<'a> {
         let i = self.starts.partition_point(|s| *s <= offset);
         *self.pages.get(i.checked_sub(1)?)?
     }
+}
+
+fn marker_at(text: &str) -> Option<u32> {
+    let end = text
+        .char_indices()
+        .nth(24)
+        .map_or(text.len(), |(byte, _)| byte);
+    marker_page(&text[..end])
 }
 
 /// The page number of a `<!-- Page N -->` marker at the start of `s`.
@@ -482,6 +542,33 @@ fn pdf(bytes: &[u8], o: &Options) -> Result<Converted, Refusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redaction_restores_a_consumed_page_marker() {
+        use sparkles_memory_import::redact::{Pattern, Policy};
+        let text = "<!-- Page 1 -->\nCafé hidden-start\n<!-- Page 2 -->\nhidden-end A fact.\n<!-- Page 3 -->\nOutra.";
+        let mut doc = Converted {
+            text: text.to_string(),
+            page_starts: page_starts(text),
+            ..Default::default()
+        };
+        let policy = Policy::from_patterns(vec![
+            Pattern::new("multiline", r"(?s)hidden-start.*?hidden-end").unwrap(),
+        ]);
+        let (redacted, edits) = policy.redact_with_edits(text);
+        assert!(!redacted.text.contains("<!-- Page 2 -->"));
+        doc.replace_text(redacted.text, &edits);
+        assert!(!doc.text.contains("hidden-"));
+        let pages = PageMap::new(&doc.text, &doc.page_starts);
+        for (quote, page) in [("A fact.", 2), ("Outra.", 3)] {
+            let offset = doc.text[..doc.text.find(quote).unwrap()].chars().count();
+            assert_eq!(pages.page_of(offset), Some(page));
+        }
+        assert_eq!(
+            pages.entries().map(|(_, p)| p).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+    }
 
     #[test]
     fn formats() {

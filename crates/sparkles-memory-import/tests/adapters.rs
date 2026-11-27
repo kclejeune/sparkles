@@ -383,3 +383,34 @@ fn redaction_digest_and_renames() {
     assert_eq!(after.rel_path, "infra/staging-db.md");
     assert_eq!(after.digest, before.digest);
 }
+
+#[test]
+fn filenames_and_relative_paths_are_redacted_in_published_metadata() {
+    use sparkles_memory_import::scan_with_policy;
+    let f = fixture();
+    let c = ctx();
+    let hidden = "synthetic-file-key-9876";
+    let path = f.repo.join(format!("docs/{hidden}.md"));
+    write(&path, "# Safe body");
+    let request = Request {
+        ctx: &c,
+        roots: &f.roots,
+        adapters: vec![Adapter::Generic],
+        project: Some(Project::of(&f.repo)),
+        user_scope: false,
+        paths: vec![path.clone()],
+        instructions_only: false,
+        patterns: &[],
+    };
+    let policy = redact::Policy::default().with_known_values([hidden], "known-value");
+    let scan = scan_with_policy(&request, &policy);
+    let file = scan.files.iter().find(|file| file.path == path).unwrap();
+    assert_eq!(file.title, "[redacted:known-value].md");
+    assert!(file.rel_path.contains("[redacted:known-value]"));
+    assert!(!file.graph.contains(hidden));
+    assert!(
+        file.facts
+            .iter()
+            .all(|fact| !format!("{fact:?}").contains(hidden))
+    );
+}

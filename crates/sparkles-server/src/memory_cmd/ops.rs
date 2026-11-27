@@ -1297,6 +1297,10 @@ fn child_args(env: &Env, flags: &ImportFlags) -> Vec<String> {
             .as_ref()
             .map(|p| p.display().to_string()),
     );
+    if let Some(p) = &flags.redact_known_values {
+        a.push("--redact-known-values".into());
+        a.push(p.display().to_string());
+    }
     for p in &flags.paths {
         a.push("--path".into());
         a.push(p.display().to_string());

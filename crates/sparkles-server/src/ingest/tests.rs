@@ -1061,7 +1061,7 @@ async fn extraction_of_a_registered_source() {
     assert_eq!(r["mode"], "memory");
     assert_eq!(r["proposed"], 1, "{v}");
     assert!(r["branch"].is_null(), "{v}");
-    assert_eq!(v["input"]["source"], g);
+    assert!(v["input"]["source"].is_null());
     assert!(
         ask(
             &app,
@@ -2773,7 +2773,7 @@ async fn csv_draft_redacts_sample_before_model_call() {
 #[tokio::test]
 async fn assistant_status_reports_ingest_and_extract_pairs() {
     let m = proposals_mock();
-    let (_st, router) = app(Some([&m.url(), &m.url()]));
+    let (st, router) = app(Some([&m.url(), &m.url()]));
     // Initially assistant is disabled, so ingest is off, while status.extract still lists
     // the server's extract pairs so dataset admins know what turning it on will use.
     let (s, v) = send(&router, req("GET", "/$/assistant/org", Value::Null)).await;
@@ -2806,9 +2806,506 @@ async fn assistant_status_reports_ingest_and_extract_pairs() {
     .await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v["status"]["ingest"], false, "{v}");
+    let (s, v) = send(&router, req("PUT", "/$/assistant/org", json!({
+        "enabled": true, "ingest": true, "send": "documents",
+        "roles": { "extract": [{ "provider": "top", "model": "m" }, { "provider": "cheap", "model": "m" }] }
+    }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let mut config = st.models().unwrap().config.clone();
+    config.providers.remove("top");
+    st.set_models(Some(Arc::new(Models::new(
+        config,
+        Default::default(),
+        Default::default(),
+    ))));
+    let (_, v) = send(&router, req("GET", "/$/assistant/org", Value::Null)).await;
+    assert_eq!(v["status"]["ingest"], true, "{v}");
+    assert_eq!(
+        v["status"]["extract"],
+        json!([{ "provider": "cheap", "model": "m" }]),
+        "{v}"
+    );
+    let mut config = st.models().unwrap().config.clone();
+    config.providers.remove("cheap");
+    st.set_models(Some(Arc::new(Models::new(
+        config,
+        Default::default(),
+        Default::default(),
+    ))));
+    let (_, v) = send(&router, req("GET", "/$/assistant/org", Value::Null)).await;
+    assert_eq!(v["status"]["ingest"], false, "{v}");
+    assert_eq!(v["status"]["extract"], json!([]), "{v}");
     // Without model providers configured, status.ingest is false.
     let (_st2, router2) = app(None);
     let (s, v) = send(&router2, req("GET", "/$/assistant/org", Value::Null)).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v["status"]["ingest"], false, "{v}");
+}
+
+#[tokio::test]
+async fn existing_source_redaction_is_refused_before_extraction_in_both_modes() {
+    let m = proposals_mock();
+    let (st, app) = app(Some([&m.url(), &m.url()]));
+    enable(&app).await;
+    evidence(&app).await;
+    let g = "https://example.org/agent/notes";
+    let (status, value) = send(
+        &app,
+        req(
+            "PUT",
+            "/$/memory/org",
+            json!({
+                "agentGraphs": ["https://example.org/agent/*"],
+                "redaction": { "personal": ["email"] }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let quote = "Ana Lima moved to the payments team this week.";
+    let long_email = format!("{}@example.org", "long".repeat(14));
+    let (status, value) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({
+                "iri": g, "graph": g, "format": "text/markdown",
+                "text": format!("Café: a@b.io and {long_email}.\n\n{quote}")
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let before = head(&st);
+    for mode in ["memory", "claims"] {
+        let v = ingest(
+            &app,
+            req(
+                "POST",
+                "/$/ingest/org",
+                json!({ "source": g, "mode": mode }),
+            ),
+        )
+        .await;
+        assert_eq!(v["status"], "failed", "{v}");
+        assert_eq!(v["error"]["code"], "redaction-required", "{v}");
+        assert!(!v.to_string().contains(&long_email));
+    }
+    assert_eq!(head(&st), before);
+    assert!(m.requests().is_empty());
+}
+
+#[tokio::test]
+async fn dataset_admin_ingestion_observables_depend_only_on_public_detectors() {
+    use crate::auth::{Access, Grants, Kind, Level, Principal, Scheme};
+    let server_value = "synthetic-provider-value-6789";
+    let other_value = "synthetic-different-value-6789";
+    let provider = MockModel::start(|_, _| {
+        (
+            200,
+            mock::openai(&json!({ "subjectColumn": "", "class": "", "columns": [] }).to_string()),
+        )
+    });
+    let (_secrets, st, admin) = app_with_secret(&provider.url(), server_value);
+    let (_others, st_without, admin_without) = app_with_secret(&provider.url(), other_value);
+    let dataset_app = |st: &Arc<AppState>, level| {
+        let p = Principal::new(
+            Kind::Token,
+            "dataset-principal",
+            Scheme::Bearer,
+            Access::of(Grants {
+                datasets: vec![("org".into(), level)],
+                ..Default::default()
+            }),
+        );
+        super::http::routes()
+            .merge(crate::mcp::rest::routes())
+            .layer(axum::Extension(p))
+            .with_state(st.clone())
+    };
+    let app = dataset_app(&st, Level::Admin);
+    let app_without = dataset_app(&st_without, Level::Admin);
+    let token = format!("ghp_{}", "T".repeat(36));
+    for mode in ["redact", "refuse"] {
+        for router in [&admin, &admin_without] {
+            let (status, v) = send(
+                router,
+                req(
+                    "PUT",
+                    "/$/memory/org",
+                    json!({
+                        "redaction": { "everywhere": true, "serverIngest": mode }
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+        }
+        for test_body in [server_value.to_string(), format!("{server_value}\n{token}")] {
+            let mut outcomes = Vec::new();
+            for router in [&app, &app_without] {
+                let v = ingest(router, req("POST", "/$/ingest/org", json!({
+                    "text": test_body, "format": "text/plain", "mode": "preview", "extract": false
+                }))).await;
+                if mode == "refuse" && test_body.contains(&token) {
+                    assert_eq!(v["error"]["detector"], "github-token", "{v}");
+                } else {
+                    assert_eq!(v["status"], "awaiting-approval", "{v}");
+                    if test_body.contains(&token) {
+                        assert_eq!(v["result"]["redactions"], json!({"github-token": 1}), "{v}");
+                    } else {
+                        assert!(v["result"]["redactions"].is_null(), "{v}");
+                    }
+                }
+                assert!(!v.to_string().contains("server-secret"), "{v}");
+                outcomes.push((
+                    v["error"].clone(),
+                    v["result"]["digest"].clone(),
+                    v["result"]["length"].clone(),
+                ));
+            }
+            assert_eq!(outcomes[0], outcomes[1]);
+        }
+    }
+    // Direct registration has the same boundary even on a protected graph.
+    let (status, v) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({
+                "graph": "urn:source:private-test", "text": server_value
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert!(provider.requests().is_empty());
+
+    // Model-assisted table drafts are available to dataset readers.
+    let reader = dataset_app(&st, Level::Read);
+    let reader_without = dataset_app(&st_without, Level::Read);
+    for mode in ["redact", "refuse"] {
+        for router in [&admin, &admin_without] {
+            enable(router).await;
+            let (status, v) = send(
+                router,
+                req(
+                    "PUT",
+                    "/$/memory/org",
+                    json!({
+                        "redaction": { "serverIngest": mode }
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+        }
+        let csv = format!("id,note\n1,{server_value} and {token}\n");
+        for router in [&reader, &reader_without] {
+            let v = ingest(
+                router,
+                multipart(
+                    "/$/ingest/org",
+                    &[("file", Some("notes.csv"), Some("text/csv"), csv.as_bytes())],
+                ),
+            )
+            .await;
+            if mode == "redact" {
+                assert_eq!(v["status"], "done", "{v}");
+                assert_eq!(v["result"]["redactions"], json!({"github-token": 1}), "{v}");
+            } else {
+                assert_eq!(v["error"]["detector"], "github-token", "{v}");
+            }
+            assert!(!v.to_string().contains("server-secret"), "{v}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn redaction_covers_titles_filenames_and_explicit_source_iris() {
+    let (_st, app) = app(None);
+    let key = format!("ghp_{}", "H".repeat(36));
+    let (status, v) = send(
+        &app,
+        req(
+            "PUT",
+            "/$/memory/org",
+            json!({
+                "redaction": { "everywhere": true }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let (status, v) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({
+                "text": "Plain body.", "title": key
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert_eq!(v["detector"], "github-token", "{v}");
+    let v = ingest(
+        &app,
+        req(
+            "POST",
+            "/$/ingest/org",
+            json!({
+                "text": "Plain body.", "format": "text/plain",
+                "iri": format!("https://example.org/?token={key}"),
+                "extract": false
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], "sensitive-locator", "{v}");
+    assert!(!v.to_string().contains(&key));
+    let v = ingest(
+        &app,
+        multipart(
+            "/$/ingest/org",
+            &[(
+                "file",
+                Some(&format!("{key}.md")),
+                Some("text/markdown"),
+                b"# Plain body",
+            )],
+        ),
+    )
+    .await;
+    assert_eq!(v["result"]["redactions"]["github-token"], 1, "{v}");
+    assert!(!v.to_string().contains(&key));
+    let branch = v["result"]["branch"].as_str().unwrap();
+    let sources = review(&app, branch).await;
+    assert!(!sources.to_string().contains(&key));
+    assert!(
+        sources.to_string().contains("[redacted:github-token].md"),
+        "{sources}"
+    );
+}
+
+#[tokio::test]
+async fn fetch_credentials_and_query_are_absent_from_ingest_metadata() {
+    let endpoint = MockModel::start(|_, _| (200, json!("Fetched document.")));
+    let mut st = AppState::standalone(Default::default(), Duration::from_secs(30));
+    st.outbound.allow_private = true;
+    let st = Arc::new(st);
+    st.attach("org", DbType::Mem, None).unwrap();
+    let app = crate::http::router(st);
+    let authority = endpoint.url();
+    let authority = authority.strip_prefix("http://").unwrap();
+    let raw =
+        format!("http://sample:synthetic-test-password@{authority}?auth=synthetic-query-value");
+    let v = ingest(
+        &app,
+        req(
+            "POST",
+            "/$/ingest/org",
+            json!({
+                "url": raw, "format": "text/plain", "extract": false
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(v["status"], "done", "{v}");
+    assert!(
+        v["result"]["source"]
+            .as_str()
+            .unwrap()
+            .contains("urn:uuid:"),
+        "{v}"
+    );
+    let branch = v["result"]["branch"].as_str().unwrap();
+    for record in [v.clone(), review(&app, branch).await] {
+        let record = record.to_string();
+        assert!(!record.contains("synthetic-test-password"), "{record}");
+        assert!(!record.contains("synthetic-query-value"), "{record}");
+    }
+}
+
+#[tokio::test]
+async fn server_ingest_off_and_direct_registration_have_independent_scopes() {
+    let (_st, app) = app(None);
+    let text = format!("Synthetic ghp_{}", "G".repeat(36));
+    let base = "urn:imports/";
+    let graph = "urn:imports/test";
+    for everywhere in [false, true] {
+        let (status, v) = send(
+            &app,
+            req(
+                "PUT",
+                "/$/memory/org",
+                json!({
+                    "agentGraphs": ["urn:imports/*"],
+                    "imports": { "base": base },
+                    "redaction": { "everywhere": everywhere, "serverIngest": "off" }
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let graph = if everywhere {
+            "urn:elsewhere:test"
+        } else {
+            graph
+        };
+        let v = ingest(
+            &app,
+            req(
+                "POST",
+                "/$/ingest/org",
+                json!({
+                    "text": text, "format": "text/plain", "extract": false, "graph": graph
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(v["status"], "done", "{v}");
+        assert!(v["result"]["redactions"].is_null(), "{v}");
+        let (status, v) = send(
+            &app,
+            req(
+                "POST",
+                "/org/sources",
+                json!({
+                    "text": text, "graph": graph
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+        assert_eq!(v["detector"], "github-token", "{v}");
+    }
+}
+
+#[tokio::test]
+async fn source_only_ingestion_honors_branch_preview_and_auto() {
+    let (st, app) = app(None);
+    let before = head(&st);
+    for mode in ["branch", "preview", "auto"] {
+        let v = ingest(
+            &app,
+            req(
+                "POST",
+                "/$/ingest/org",
+                json!({
+                    "mode": mode, "format": "text/markdown", "extract": false,
+                    "text": format!("# The {mode} source"), "graph": format!("urn:source:{mode}")
+                }),
+            ),
+        )
+        .await;
+        match mode {
+            "branch" => {
+                assert_eq!(v["status"], "done", "{v}");
+                assert_eq!(v["result"]["outcome"], "registered", "{v}");
+                let branch = v["result"]["branch"].as_str().unwrap();
+                assert_eq!(
+                    review(&app, branch).await["sources"][0]["text"],
+                    "# The branch source"
+                );
+                assert_eq!(head(&st), before);
+            }
+            "preview" => {
+                assert_eq!(v["status"], "awaiting-approval", "{v}");
+                assert_eq!(v["result"]["outcome"], "preview", "{v}");
+                assert_eq!(head(&st), before);
+                let uri = format!("/$/ingest/org/{}/approve", v["id"].as_str().unwrap());
+                let (status, v) = send(&app, req("POST", &uri, Value::Null)).await;
+                assert_eq!(status, StatusCode::OK, "{v}");
+                assert_eq!(v["result"]["outcome"], "approved", "{v}");
+                assert!(ask(&app, "ASK { GRAPH <urn:source:preview> { ?s ?p ?o } }").await);
+            }
+            _ => {
+                assert_eq!(v["status"], "done", "{v}");
+                assert_eq!(v["result"]["outcome"], "merged", "{v}");
+                assert!(ask(&app, "ASK { GRAPH <urn:source:auto> { ?s ?p ?o } }").await);
+            }
+        }
+    }
+    assert!(!ask(&app, "ASK { GRAPH <urn:source:branch> { ?s ?p ?o } }").await);
+}
+
+#[tokio::test]
+async fn confirmed_recipients_are_checked_against_current_model_configuration() {
+    let m = proposals_mock();
+    let (_st, app) = app(Some([&m.url(), &m.url()]));
+    let confirm = |recipients: Value| {
+        let mut request = req(
+            "PATCH",
+            "/$/settings/org/assistant",
+            json!({
+                "enabled": true, "ingest": true, "send": "documents"
+            }),
+        );
+        let value = json!({
+            "fields": [["enabled", false, "default"], ["ingest", false, "default"],
+                       ["send", "schema", "default"]],
+            "recipients": recipients,
+        });
+        request.headers_mut().insert(
+            "if-ingest-confirmation",
+            percent_encoding::utf8_percent_encode(
+                &value.to_string(),
+                percent_encoding::NON_ALPHANUMERIC,
+            )
+            .to_string()
+            .parse()
+            .unwrap(),
+        );
+        request
+    };
+    let (status, v) = send(&app, confirm(json!([["cheap", "m"]]))).await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{v}");
+    let (_, v) = send(&app, req("GET", "/$/assistant/org", Value::Null)).await;
+    assert_eq!(v["status"]["ingest"], false, "{v}");
+    let (status, v) = send(&app, confirm(json!([["cheap", "m"], ["top", "m"]]))).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+}
+
+#[cfg(feature = "office")]
+#[tokio::test]
+async fn workbook_redaction_counts_include_each_model_sample() {
+    let model = MockModel::start(|_, _| {
+        (
+            200,
+            mock::openai(&json!({ "subjectColumn": "", "class": "", "columns": [] }).to_string()),
+        )
+    });
+    let (_st, app) = app(Some([&model.url(), &model.url()]));
+    enable(&app).await;
+    let (s, v) = send(
+        &app,
+        req(
+            "PUT",
+            "/$/memory/org",
+            json!({
+                "redaction": { "patterns": [{ "name": "sample-name", "regex": "Ana" }] }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let v = ingest(
+        &app,
+        office_upload(&workbook_of(&["First", "Second"]), "names.xlsx", &[]),
+    )
+    .await;
+    let r = &v["result"];
+    assert_eq!(r["redactions"], json!({"sample-name": 2}), "{v}");
+    for sheet in r["sheets"].as_array().unwrap() {
+        assert_eq!(sheet["redactions"], json!({"sample-name": 1}), "{v}");
+        assert!(sheet["csv"].as_str().unwrap().contains("Ana"));
+    }
+    assert!(!model.requests().is_empty());
+    for request in model.requests() {
+        assert!(request.body.to_string().contains("[redacted:sample-name]"));
+    }
 }

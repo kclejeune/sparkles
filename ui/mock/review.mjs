@@ -332,6 +332,7 @@ async function handleTasks(
           },
           preview: { rows: 3, triples: ['<http://example.org/people/1> <x> <y> .'] },
           drafted: 'model',
+          redactions: { email: 1 },
         },
       });
     } else if (
@@ -350,9 +351,9 @@ async function handleTasks(
         },
       });
     } else if (fields.extract === 'false') {
-      t = newTask(name, input, 'done', {
+      t = newTask(name, input, mode === 'preview' ? 'awaiting-approval' : 'done', {
         result: {
-          outcome: 'registered',
+          outcome: mode === 'preview' ? 'preview' : mode === 'auto' ? 'merged' : 'registered',
           mode,
           format: lower.endsWith('.pdf') ? 'pdf' : 'markdown',
           source: `https://example.org/sources/${st.tasks.length + 1}`,

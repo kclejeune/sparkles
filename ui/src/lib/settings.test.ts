@@ -625,16 +625,17 @@ describe('assistant server ingestion (C19 §8.1 / item 77)', () => {
     const extract = [{ provider: 'local', model: 'qwen3:14b' }];
     const offDefault = describeIngestState(
       kind({
-        effective: { enabled: false, ingest: false, send: 'schema' },
+        effective: { enabled: false, ingest: false, send: 'schema', sendByProvider: {} },
         sources: { enabled: 'default', ingest: 'default', send: 'default' },
         locked: [],
         overridden: [],
       }),
-      { models: true, ingest: false, extract },
+      { status: { ask: false, historyDays: 30, models: true, ingest: false, extract } },
     );
     expect(offDefault.on).toBe(false);
     expect(offDefault.canEnableDirectly).toBe(true);
     expect(offDefault.blockingField?.field).toBe('enabled');
+    expect(offDefault.enableProviders[0].send).toBe('documents');
 
     const lockedSend = describeIngestState(
       kind({
@@ -643,7 +644,7 @@ describe('assistant server ingestion (C19 §8.1 / item 77)', () => {
         locked: ['send'],
         overridden: [],
       }),
-      { models: true, ingest: false, extract },
+      { status: { ask: false, historyDays: 30, models: true, ingest: false, extract } },
     );
     expect(lockedSend.on).toBe(false);
     expect(lockedSend.canEnableDirectly).toBe(false);
@@ -657,7 +658,7 @@ describe('assistant server ingestion (C19 §8.1 / item 77)', () => {
         locked: [],
         overridden: [],
       }),
-      { models: true, ingest: true, extract },
+      { status: { ask: false, historyDays: 30, models: true, ingest: true, extract } },
     );
     expect(active.on).toBe(true);
     expect(active.activeProviders).toEqual([
@@ -665,70 +666,143 @@ describe('assistant server ingestion (C19 §8.1 / item 77)', () => {
     ]);
   });
 
-  it('retries on 412 in enableIngest and disables ingest via PATCH', async () => {
-    const baseKind = kind({
-      effective: { enabled: false, ingest: false, send: 'schema' },
-      sources: { enabled: 'default', ingest: 'default', send: 'default' },
-      locked: [],
-      overridden: [],
-      etag: '"v1"',
+  it('uses effective assistant settings when the layered read fails', () => {
+    const status = {
+      ask: false,
+      historyDays: 30,
+      models: true,
+      ingest: true,
+      extract: [
+        { provider: 'local', model: 'small' },
+        { provider: 'other', model: 'large' },
+      ],
+    };
+    const current = describeIngestState(null, {
+      send: 'documents',
+      sendByProvider: { other: 'rows' },
+      status,
     });
-    const enabledKind = kind({
-      effective: { enabled: true, ingest: true, send: 'documents' },
-      sources: { enabled: 'runtime', ingest: 'runtime', send: 'runtime' },
+    expect(current.activeProviders.map((p) => p.provider)).toEqual(['local']);
+    const k = kind({
+      effective: { send: 'schema', sendByProvider: { other: 'rows' } },
+      sources: { send: 'default' },
       locked: [],
-      overridden: [],
-      etag: '"v2"',
     });
-    const disabledKind = kind({
-      effective: { enabled: true, ingest: false, send: 'documents' },
-      sources: { enabled: 'runtime', ingest: 'runtime', send: 'runtime' },
-      locked: [],
-      overridden: [],
-      etag: '"v3"',
-    });
-    const calls: Array<{ method: string; url: string; ifMatch: string | null; body?: unknown }> =
-      [];
-    let patchCount = 0;
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const url = String(input);
-        const method = init?.method ?? 'GET';
-        const headers = new Headers(init?.headers);
-        const body = init?.body ? JSON.parse(String(init.body)) : undefined;
-        calls.push({ method, url, ifMatch: headers.get('If-Match'), body });
-        if (method === 'GET') {
-          const payload = patchCount >= 2 ? enabledKind : baseKind;
+    const proposed = describeIngestState(k, { status: { ...status, ingest: false } });
+    expect(proposed.enableProviders.map((p) => [p.provider, p.send])).toEqual([
+      ['local', 'documents'],
+      ['other', 'rows'],
+    ]);
+  });
+
+  it.each([false, true])(
+    'rechecks the approved plan after 412 with changed recipients %s',
+    async (changed) => {
+      const baseKind = kind({
+        effective: { enabled: false, ingest: false, send: 'schema', sendByProvider: {} },
+        sources: { enabled: 'default', ingest: 'default', send: 'default' },
+        locked: [],
+        overridden: [],
+        etag: '"v1"',
+      });
+      const enabledKind = kind({
+        effective: { enabled: true, ingest: true, send: 'documents' },
+        sources: { enabled: 'runtime', ingest: 'runtime', send: 'runtime' },
+        locked: [],
+        overridden: [],
+        etag: '"v2"',
+      });
+      const disabledKind = kind({
+        effective: { enabled: true, ingest: false, send: 'documents' },
+        sources: { enabled: 'runtime', ingest: 'runtime', send: 'runtime' },
+        locked: [],
+        overridden: [],
+        etag: '"v3"',
+      });
+      const calls: Array<{
+        method: string;
+        url: string;
+        ifMatch: string | null;
+        approval: string | null;
+        body?: unknown;
+      }> = [];
+      const assistant = {
+        status: {
+          ask: false,
+          historyDays: 30,
+          models: true,
+          ingest: false,
+          extract: [{ provider: 'local', model: 'm' }],
+        },
+      };
+      let patchCount = 0;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input);
+          const method = init?.method ?? 'GET';
+          const headers = new Headers(init?.headers);
+          const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+          calls.push({
+            method,
+            url,
+            ifMatch: headers.get('If-Match'),
+            approval: headers.get('If-Ingest-Confirmation'),
+            body,
+          });
+          if (method === 'GET') {
+            const payload = url.includes('/$/assistant/')
+              ? changed && patchCount === 1
+                ? { status: { ...assistant.status, extract: [{ provider: 'other', model: 'n' }] } }
+                : assistant
+              : patchCount >= 2
+                ? enabledKind
+                : baseKind;
+            return new Response(JSON.stringify(payload), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+          patchCount++;
+          if (patchCount === 1) {
+            return new Response(JSON.stringify({ message: 'stale' }), {
+              status: 412,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+          const payload = body?.ingest === false ? disabledKind : enabledKind;
           return new Response(JSON.stringify(payload), {
             status: 200,
             headers: { 'Content-Type': 'application/json' },
           });
-        }
-        patchCount++;
-        if (patchCount === 1) {
-          return new Response(JSON.stringify({ message: 'stale' }), {
-            status: 412,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        const payload = body?.ingest === false ? disabledKind : enabledKind;
-        return new Response(JSON.stringify(payload), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
+        }),
+      );
+
+      const res = await enableIngest('org', describeIngestState(baseKind, assistant));
+      expect(res.changed).toBe(!changed);
+      const patches = calls.filter((c) => c.method === 'PATCH');
+      expect(patches).toHaveLength(changed ? 1 : 2);
+      expect(patches[0].ifMatch).toBe('"v1"');
+      expect(patches[0].body).toEqual({ enabled: true, ingest: true, send: 'documents' });
+      for (const patch of patches) {
+        expect(JSON.parse(decodeURIComponent(patch.approval ?? ''))).toEqual({
+          fields: [
+            ['enabled', false, 'default'],
+            ['ingest', false, 'default'],
+            ['send', 'schema', 'default'],
+          ],
+          recipients: [['local', 'm']],
         });
-      }),
-    );
+      }
+      if (changed) {
+        expect(res.assistant.status?.extract?.[0].provider).toBe('other');
+        return;
+      }
+      expect(res.kind.etag).toBe('"v2"');
 
-    const res = await enableIngest('org');
-    expect(res.changed).toBe(true);
-    expect(res.kind.etag).toBe('"v2"');
-    expect(calls.filter((c) => c.method === 'PATCH')).toHaveLength(2);
-    expect(calls[1].ifMatch).toBe('"v1"');
-    expect(calls[1].body).toEqual({ enabled: true, ingest: true, send: 'documents' });
-
-    const off = await disableIngest('org');
-    expect(off.effective.ingest).toBe(false);
-    expect(calls.at(-1)?.body).toEqual({ ingest: false });
-  });
+      const off = await disableIngest('org');
+      expect(off.effective.ingest).toBe(false);
+      expect(calls.at(-1)?.body).toEqual({ ingest: false });
+    },
+  );
 });

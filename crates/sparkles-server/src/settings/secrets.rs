@@ -1063,7 +1063,15 @@ pub fn stored(dir: &FsPath) -> BTreeMap<String, SystemTime> {
 /// All readable server secret values (model provider keys, `--model-secret` sources, and
 /// runtime secrets in `<dataDir>/secrets`) for exact-value redaction before document text
 /// is stored or sent to a model (C18 item 77). Values are never logged or returned.
-pub fn known_values(st: &crate::state::AppState) -> Vec<String> {
+pub fn known_values(
+    st: &crate::state::AppState,
+    principal: &crate::auth::Principal,
+) -> Vec<String> {
+    // Matching can change even a successful response's digest, length or model output.
+    // Only principals with server-wide authority may observe any of those differences.
+    if !principal.has(crate::auth::ServerPerm::ServerAdmin) {
+        return Vec::new();
+    }
     let mut seen = BTreeSet::new();
     let mut push = |raw: String| {
         let trimmed = raw.trim().to_string();

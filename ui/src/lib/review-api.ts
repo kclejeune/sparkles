@@ -355,6 +355,7 @@ export type IngestSheetDraft = {
   preview?: { rows: number; triples: string[] };
   drafted?: 'model' | 'default';
   warnings?: string[];
+  redactions?: Record<string, number>;
   links?: IngestLink[];
   error?: { code: string; message?: string };
 };
