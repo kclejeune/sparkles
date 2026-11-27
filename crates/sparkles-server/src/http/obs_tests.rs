@@ -2,6 +2,7 @@
 
 use super::router;
 use crate::obs::Phase;
+use crate::state::tests::HookPoint;
 use crate::state::{AppState, DbType};
 use axum::Router;
 use axum::body::Body;
@@ -101,6 +102,52 @@ async fn send(app: &Router, req: Request<Body>) -> Resp {
         headers,
         body,
     }
+}
+
+#[tokio::test]
+async fn recreate_source_during_rename_cleanup_conflicts_before_publication() {
+    let s = server();
+    let original = s.state.create("a", DbType::Mem).unwrap().store.dataset_id();
+    let (paused, at_cleanup) = std::sync::mpsc::channel();
+    let (resume, release) = std::sync::mpsc::channel();
+    s.state
+        .lifecycle_hooks
+        .set(HookPoint::RenameCleanup, "a", move || {
+            paused.send(()).unwrap();
+            release.recv_timeout(Duration::from_secs(15)).unwrap();
+        });
+    let renaming = {
+        let st = s.state.clone();
+        std::thread::spawn(move || st.rename("a", "b").unwrap())
+    };
+    at_cleanup.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    assert_eq!(s.state.catalog.get("b").unwrap().dataset_id(), original);
+    let create = || {
+        Request::post("/$/datasets")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"dbName":"a","dbType":"persistent"}"#))
+            .unwrap()
+    };
+    let conflict = send(&s.app, create()).await;
+    let published = s.state.catalog.get("a").is_some();
+    let directory_created = s.state.data_dir.join("databases/a").exists();
+    resume.send(()).unwrap();
+    renaming.join().unwrap();
+
+    assert_eq!(conflict.status, StatusCode::CONFLICT, "{}", conflict.text());
+    assert!(!published);
+    assert!(!directory_created);
+    let recreated = send(&s.app, create()).await;
+    assert_eq!(
+        recreated.status,
+        StatusCode::CREATED,
+        "{}",
+        recreated.text()
+    );
+    let id = s.state.get("a").unwrap().store.dataset_id();
+    assert_ne!(id, original);
+    assert_eq!(recreated.json()["id"], id.to_string());
 }
 
 async fn get(app: &Router, uri: &str) -> Resp {

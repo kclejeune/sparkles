@@ -262,6 +262,13 @@ pub struct Catalog {
     pub(crate) inner: Arc<Inner>,
 }
 
+/// Lifecycle notifications used by the server to reconcile store metrics.
+#[doc(hidden)]
+pub enum RenameEvent<'a> {
+    Closed(u64, &'a crate::store::Store),
+    Publishing(u64),
+}
+
 pub(crate) struct CatalogIdentities(
     parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, BTreeMap<String, Entry>>,
 );
@@ -1377,17 +1384,18 @@ impl Catalog {
     /// handles, including branch handles, so that the old store can be closed. As in
     /// [`delete`](Self::delete), the dataset's own views workers do not count.
     pub fn rename(&self, from: &str, to: &str) -> Result<Dataset> {
-        self.rename_observed(from, to, |_, _| {})
+        self.rename_observed(from, to, |_| {})
     }
 
     /// Notify the server at the same managed close boundary as
-    /// [`Self::delete_observed`]. In-memory renames preserve their opening.
+    /// [`Self::delete_observed`] and just before a committed alias becomes visible.
+    /// In-memory renames preserve their opening and only send the latter notification.
     #[doc(hidden)]
     pub fn rename_observed(
         &self,
         from: &str,
         to: &str,
-        on_closed: impl FnOnce(u64, &crate::store::Store),
+        mut observe: impl FnMut(RenameEvent<'_>),
     ) -> Result<Dataset> {
         let _g = self.manage()?;
         self.require_determinate_registry(from)?;
@@ -1425,14 +1433,32 @@ impl Catalog {
         };
         if entry.kind == DatasetKind::Memory {
             drop(map);
-            entry.dataset.alias = Some(Arc::from(to));
-            self.inner.entries.write().insert(to.into(), entry);
-            if let Err(e) = self.save_locked() {
-                let mut entry = self.inner.entries.write().remove(to).expect("inserted");
-                entry.dataset.alias = Some(Arc::from(from));
-                self.inner.entries.write().insert(from.into(), entry);
-                return Err(e);
+            if let Some(dir) = self.dir() {
+                let mut registry = self.registry_locked();
+                let index = registry
+                    .datasets
+                    .partition_point(|row| row.name.as_str() < to);
+                registry.datasets.insert(
+                    index,
+                    RegistryEntry {
+                        name: to.into(),
+                        kind: DatasetKind::Memory,
+                        id: None,
+                        revision: None,
+                        reasoning: entry.dataset.reasoning_record(),
+                    },
+                );
+                if let Err(e) = self
+                    .replace_registry_locked(dir, &registry)
+                    .and_then(|()| sync_dir(dir))
+                {
+                    self.inner.entries.write().insert(from.into(), entry);
+                    return Err(e);
+                }
             }
+            entry.dataset.alias = Some(Arc::from(to));
+            observe(RenameEvent::Publishing(entry.dataset.state().open_id));
+            self.inner.entries.write().insert(to.into(), entry);
             return Ok(self.get(to).expect("renamed"));
         }
         let dir = self.dir().expect("persistent catalog");
@@ -1441,9 +1467,10 @@ impl Catalog {
         self.hold_closing_locked(from, &entry.dataset, revision);
         let closed = {
             let _disposing = self.disposal_scope();
-            entry
-                .dataset
-                .close_for_disposal(|| drop(map.take()), on_closed)
+            entry.dataset.close_for_disposal(
+                || drop(map.take()),
+                |id, store| observe(RenameEvent::Closed(id, store)),
+            )
         };
         drop(paused);
         let reasoning = match closed {
@@ -1499,6 +1526,7 @@ impl Catalog {
                 );
             }
             self.save_locked()?;
+            observe(RenameEvent::Publishing(ds.state().open_id));
             self.inner.entries.write().insert(
                 to.into(),
                 Entry {

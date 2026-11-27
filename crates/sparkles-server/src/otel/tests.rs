@@ -3849,26 +3849,48 @@ async fn phase2_otlp_stale_scrape_across_concurrent_memory_rename() {
     }
 }
 
-#[test]
-fn phase2_otlp_successive_renames_commit_in_catalog_order() {
+#[tokio::test]
+async fn phase2_otlp_successive_renames_commit_in_catalog_order() {
+    for cap in [1, 2] {
+        check_successive_renames(cap).await;
+    }
+}
+
+async fn check_successive_renames(cap: usize) {
     let dir = tempfile::tempdir().unwrap();
     let mut st = AppState::new(
         dir.path(),
         StoreOptions {
             bulk_threshold: 1,
+            result_cache_bytes: 0,
             ..Default::default()
         },
         Duration::from_secs(30),
     )
     .unwrap();
-    st.metrics = crate::obs::Metrics::new(true, 1);
+    st.metrics = crate::obs::Metrics::new(true, cap);
     let st = Arc::new(st);
     {
         let a = st.create("a", DbType::Mem).unwrap();
         phase2_bulk_load(&a.store, DATA);
     }
+    st.set_phase(Phase::Ready);
+    let app = router(st.clone());
+    let query = |name| {
+        HttpRequest::get(format!(
+            "/{name}/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D%20ORDER%20BY%20%3Fs"
+        ))
+        .body(Body::empty())
+        .unwrap()
+    };
+    assert_eq!(call(&app, query("a")).await.0, StatusCode::OK);
     let cum = MetricsHarness::with_temporality(&st, Temporality::Cumulative);
     assert_all_three_phase2_parity(&st, &cum, "a");
+    let before = crate::obs::metrics_json(&st);
+    let before = &before["datasets"][0];
+    let rows = before["rowsProduced"].as_u64().unwrap();
+    let peak = before["queryMemoryPeak"]["sumBytes"].as_u64().unwrap();
+    assert!(rows > 0);
 
     let published = PausedHook::at(&st, HookPoint::RenamePublished, "a");
     let first = {
@@ -3877,6 +3899,8 @@ fn phase2_otlp_successive_renames_commit_in_catalog_order() {
     };
     published.wait();
     assert!(st.catalog.get("b").is_some());
+    // Consume the full response before the first rename can continue.
+    assert_eq!(call(&app, query("b")).await.0, StatusCode::OK);
 
     let scrape = PausedHook::new(|hook| crate::obs::set_gauges_after_datasets_hook(&st, hook));
     let snapshot = {
@@ -3903,6 +3927,11 @@ fn phase2_otlp_successive_renames_commit_in_catalog_order() {
     scrape.resume();
     let stale = snapshot.join().unwrap();
     let fresh = crate::obs::metrics_json(&st);
+    let datasets = fresh["datasets"].as_array().unwrap();
+    assert_eq!(datasets.len(), 1, "cap {cap}: {fresh}");
+    assert_eq!(datasets[0]["rowsProduced"], rows * 2, "cap {cap}");
+    assert_eq!(datasets[0]["queryMemoryPeak"]["count"], 2, "cap {cap}");
+    assert!(datasets[0]["queryMemoryPeak"]["sumBytes"].as_u64().unwrap() > peak);
     for json in [&stale, &fresh] {
         for ds in json["datasets"].as_array().unwrap() {
             assert_eq!(ds["name"], "c", "unexpected alias in {json}");

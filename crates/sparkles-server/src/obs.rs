@@ -1229,11 +1229,9 @@ impl Metrics {
         }
     }
 
-    /// Commit a completed rename: move any named series from `from` to `to`, keeping the
-    /// store's `$other` state intact when the same open store survived (memory rename) or
-    /// retiring old `$other` counters and dropping old promotion offsets when the store
-    /// reopened at zero (persistent rename).
-    pub(crate) fn commit_rename(
+    /// Move the named series before the catalog exposes the destination to requests.
+    /// An in-flight scrape of the same opening must skip the vacated alias.
+    pub(crate) fn move_rename_series(
         &self,
         from: &str,
         to: &str,
@@ -1245,21 +1243,29 @@ impl Metrics {
         if let Some(series) = w.remove(from) {
             w.insert(to.to_string(), series);
         }
+        if old_open_id == Some(new_open_id) && ledger.active_scrapes > 0 {
+            ledger.renamed_from.insert((from.to_string(), new_open_id));
+            ledger.renamed_from.remove(&(to.to_string(), new_open_id));
+        }
+    }
+
+    /// Keep the predecessor's pending `$other` contribution until the catalog has
+    /// published the destination. Retire it if the store reopened at zero.
+    pub(crate) fn finish_rename(&self, old_open_id: Option<u64>, new_open_id: u64) {
+        let mut ledger = self.other_store.lock();
         if let Some(old_id) = old_open_id {
             ledger.restored_during_scrape.remove(&old_id);
             let contrib = ledger.pending.remove(&old_id).and_then(|e| e.contrib);
             if old_id == new_open_id {
-                if ledger.active_scrapes > 0 {
-                    ledger.renamed_from.insert((from.to_string(), old_id));
-                    ledger.renamed_from.remove(&(to.to_string(), old_id));
-                    if let Some(c) = contrib {
-                        ledger.restored_during_scrape.insert(old_id, c);
-                    }
+                if ledger.active_scrapes > 0
+                    && let Some(c) = contrib
+                {
+                    ledger.restored_during_scrape.insert(old_id, c);
                 }
             } else {
                 if let Some(c) = contrib {
                     ledger.retired.add_assign(&c);
-                    w.entry(OTHER.to_string()).or_default();
+                    self.ensure_other_slot();
                 }
                 ledger.stores.remove(&old_id);
                 if ledger.active_scrapes > 0 {
@@ -1297,7 +1303,7 @@ impl Metrics {
     /// Carry a renamed dataset's series over to its new name.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn rename(&self, from: &str, to: &str) {
-        self.commit_rename(from, to, None, 0);
+        self.move_rename_series(from, to, None, 0);
     }
 
     pub fn active(&self, op: Op) -> i64 {

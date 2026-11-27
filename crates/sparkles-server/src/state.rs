@@ -400,6 +400,19 @@ impl Drop for Leaving<'_> {
 struct LeavingNames {
     sources: BTreeSet<String>,
     rename_targets: BTreeSet<String>,
+    creating: BTreeSet<String>,
+}
+
+/// Keeps a create's alias stable until its routing object has been obtained.
+struct Creating<'a> {
+    st: &'a AppState,
+    name: &'a str,
+}
+
+impl Drop for Creating<'_> {
+    fn drop(&mut self) {
+        self.st.leaving.lock().creating.remove(self.name);
+    }
 }
 
 /// Counts a store swap in progress on [`AppState`] until dropped, and reconciles
@@ -1244,14 +1257,25 @@ impl AppState {
         if self.leaving.lock().sources.contains(name) {
             return None;
         }
-        let ds = self.wrap_dataset(name, info.kind, dataset, info.attached);
+        Some(self.wrap_and_cache(&mut routing, name, info.kind, dataset, info.attached))
+    }
+
+    fn wrap_and_cache(
+        &self,
+        routing: &mut BTreeMap<String, Arc<Dataset>>,
+        name: &str,
+        kind: DbType,
+        dataset: sparkles::Dataset,
+        ephemeral: bool,
+    ) -> Arc<Dataset> {
+        let ds = self.wrap_dataset(name, kind, dataset, ephemeral);
         // A request that passed the restore guard can reach this lookup after the
         // routing cache was drained. Its temporary wrapper must not keep the old
         // library dataset alive after that request finishes.
         if self.catalog.restoring_by(name).is_none() {
             routing.insert(name.to_string(), ds.clone());
         }
-        Some(ds)
+        ds
     }
 
     #[cfg(all(test, feature = "backup"))]
@@ -1286,19 +1310,38 @@ impl AppState {
     }
 
     pub fn create(&self, name: &str, kind: DbType) -> Result<Arc<Dataset>> {
+        let _creating = {
+            let mut names = self.leaving.lock();
+            if names.sources.contains(name)
+                || names.rename_targets.contains(name)
+                || !names.creating.insert(name.to_string())
+            {
+                return Err(sparkles::Error::Conflict(format!(
+                    "dataset /{name} is being created, deleted or renamed"
+                ))
+                .into());
+            }
+            Creating { st: self, name }
+        };
         self.catalog.set_defaults(sparkles::DatasetOptions {
             store: self.store_opts.clone(),
             closure_cache_triples: self.reason_cache_triples,
             ..Default::default()
         });
-        self.catalog.create(
+        let dataset = self.catalog.create(
             name,
             &sparkles::catalog::CreateDataset {
                 kind,
                 ..Default::default()
             },
         )?;
-        Ok(self.get(name).expect("created"))
+        let mut routing = self.routing.lock();
+        if let Some(ds) = routing.get(name)
+            && ds.open_id == dataset.state().open_id
+        {
+            return Ok(ds.clone());
+        }
+        Ok(self.wrap_and_cache(&mut routing, name, kind, dataset, false))
     }
     /// Startup attaches its datasets with [`attach_expected`](Self::attach_expected),
     /// so outside the tests only `sparkles ingest` (with `mcp`) attaches this way.
@@ -1454,6 +1497,16 @@ impl AppState {
                 ))
                 .into());
             }
+            if let Some(creating) = [Some(name), target]
+                .into_iter()
+                .flatten()
+                .find(|n| leaving.creating.contains(*n))
+            {
+                return Err(sparkles::Error::Conflict(format!(
+                    "dataset /{creating} is being created"
+                ))
+                .into());
+            }
             if !leaving.rename_targets.contains(name)
                 && !target.is_some_and(|to| {
                     leaving.sources.contains(to) || leaving.rename_targets.contains(to)
@@ -1461,8 +1514,8 @@ impl AppState {
             {
                 break (routing, leaving);
             }
-            // A catalog rename can already expose its destination while its metrics
-            // still belong to the source. Wait before sampling or mutating that alias.
+            // A rename can already expose its destination while server state is still
+            // being moved. Wait before sampling or mutating that alias.
             drop(routing);
             #[cfg(all(test, feature = "otel"))]
             self.lifecycle_hooks
@@ -1657,18 +1710,25 @@ impl AppState {
         #[cfg(test)]
         self.lifecycle_hooks
             .run(tests::HookPoint::BeforeMutation, from);
-        let result = self
-            .catalog
-            .rename_observed(from, to, |id, store| leaving.observe_close(id, store));
+        use sparkles::catalog::RenameEvent;
+        let result = self.catalog.rename_observed(from, to, |event| match event {
+            RenameEvent::Closed(id, store) => leaving.observe_close(id, store),
+            RenameEvent::Publishing(id) => {
+                self.metrics
+                    .move_rename_series(from, to, leaving.open_id, id);
+            }
+        });
         match result {
             Ok(ds) => {
                 #[cfg(all(test, feature = "otel"))]
                 self.lifecycle_hooks
                     .run(tests::HookPoint::RenamePublished, from);
-                let new_open_id = ds.state().open_id;
                 self.metrics
-                    .commit_rename(from, to, leaving.open_id, new_open_id);
+                    .finish_rename(leaving.open_id, ds.state().open_id);
                 leaving.disarm_metrics();
+                #[cfg(test)]
+                self.lifecycle_hooks
+                    .run(tests::HookPoint::RenameCleanup, from);
                 drop(ds);
                 self.volatile.rename(from, to);
                 self.compaction.rename(from, to);
@@ -2181,6 +2241,7 @@ pub(crate) mod tests {
         BeforeMutation,
         #[cfg(feature = "otel")]
         RenamePublished,
+        RenameCleanup,
         #[cfg(feature = "otel")]
         WaitingForRename,
         #[cfg(all(feature = "backup", feature = "otel"))]
