@@ -1336,6 +1336,12 @@ impl Vocab {
                                 cur_cap: key.capacity(),
                             };
                             table.measure_with::<true, _, E>(suffix, &mut measure)?
+                        } else if S::ROOM
+                            && prefix.saturating_add(e.most()).saturating_add(FSST_ROOM) <= cap
+                        {
+                            // The admitted buffer fits the largest possible suffix and its
+                            // optional headroom. The walk decodes the actual bytes once.
+                            e.most()
                         } else {
                             table.decoded_len(suffix)
                         }
@@ -1612,7 +1618,7 @@ impl Vocab {
         reserve: impl FnMut(usize) -> std::result::Result<(), E>,
         f: impl FnOnce(Option<usize>, &[u8]) -> T,
     ) -> std::result::Result<Option<T>, E> {
-        self.get_with_shared_prefix_checked_impl::<false, T, E>(id, &mut Vec::new(), reserve, f)
+        self.get_with_shared_prefix_checked_in(id, &mut Vec::new(), reserve, f)
     }
 
     /// [`Vocab::get_with_shared_prefix`] reusing the caller's scratch buffer across calls,
@@ -1623,25 +1629,12 @@ impl Vocab {
         &self,
         id: u64,
         key: &mut Vec<u8>,
-        reserve: impl FnMut(usize) -> std::result::Result<(), E>,
-        f: impl FnOnce(Option<usize>, &[u8]) -> T,
-    ) -> std::result::Result<Option<T>, E> {
-        self.get_with_shared_prefix_checked_impl::<false, T, E>(id, key, reserve, f)
-    }
-
-    #[inline(always)]
-    fn get_with_shared_prefix_checked_impl<const ROOM: bool, T, E>(
-        &self,
-        id: u64,
-        key: &mut Vec<u8>,
         mut reserve: impl FnMut(usize) -> std::result::Result<(), E>,
         f: impl FnOnce(Option<usize>, &[u8]) -> T,
     ) -> std::result::Result<Option<T>, E> {
         if id >= self.len {
             return Ok(None);
         }
-        let b = (id as usize) / FC_BLOCK;
-        let want = (id as usize) % FC_BLOCK;
         let capacity = self.scratch_capacity();
         if key.capacity() < capacity {
             reserve(capacity)?;
@@ -1653,6 +1646,21 @@ impl Vocab {
                 key.capacity(),
             ));
         }
+        let shared = self.decode_key_checked_in::<false, E>(id, key, reserve)?;
+        Ok(Some(f(shared, key)))
+    }
+
+    /// Walk a single valid id into admitted scratch. The block walk returns the selected
+    /// entry's shared prefix, so callers can use it without reading a second key.
+    #[inline(always)]
+    fn decode_key_checked_in<const ROOM: bool, E>(
+        &self,
+        id: u64,
+        key: &mut Vec<u8>,
+        reserve: impl FnMut(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<usize>, E> {
+        let b = (id as usize) / FC_BLOCK;
+        let want = (id as usize) % FC_BLOCK;
         let mut buf = std::mem::take(key);
         let mut scratch = CheckedScratch::<_, ROOM> { reserve };
         let mut ignore = |_, _, _: &mut Vec<u8>, _: &mut CheckedScratch<_, ROOM>| Ok(true);
@@ -1664,8 +1672,7 @@ impl Vocab {
             self.decode_block_dispatch::<false, _, E>(b, mask, &mut buf, &mut scratch, &mut ignore)
         };
         *key = buf;
-        let shared = res?;
-        Ok(Some(f((want != 0).then_some(shared), key)))
+        res.map(|shared| (want != 0).then_some(shared))
     }
 
     /// Decode many ids (sorted ascending, deduplicated), touching each front-coded
@@ -1842,21 +1849,13 @@ impl Vocab {
         id: u64,
         key: &mut Vec<u8>,
         reserve: impl FnMut(usize) -> std::result::Result<(), E>,
-        mut f: impl FnMut(&[u8]) -> T,
+        f: impl FnOnce(&[u8]) -> T,
     ) -> std::result::Result<Option<T>, E> {
-        let mut out = None;
-        let mut scratch = CheckedScratch::<_, true> { reserve };
-        self.get_sorted_with(
-            &[id],
-            key,
-            &mut scratch,
-            |_, key| {
-                out = Some(f(key));
-                Ok(())
-            },
-            true,
-        )?;
-        Ok(out)
+        if id >= self.len {
+            return Ok(None);
+        }
+        self.decode_key_checked_in::<true, E>(id, key, reserve)?;
+        Ok(Some(f(key)))
     }
 
     /// Request-controlled reconstruction. The callback borrows admitted scratch.
@@ -4002,6 +4001,51 @@ mod tests {
                 v.get_with_checked(u64::MAX, |_| Err::<(), _>(()), |_| panic!("invalid key")),
                 Ok(None)
             );
+        }
+    }
+
+    #[test]
+    fn checked_single_key_reuses_admitted_scratch_after_refused_growth() {
+        let keys = [
+            b"\"aa".to_vec(),
+            format!("\"a{}", "b".repeat(64 << 10)).into_bytes(),
+            b"\"az".to_vec(),
+        ];
+        for fsst in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            write_codec(dir.path(), &keys, fsst);
+            let v = Vocab::open(dir.path()).unwrap();
+            let mut key = Vec::new();
+            let mut admitted = 0;
+            assert_eq!(
+                v.get_with_checked_in(
+                    0,
+                    &mut key,
+                    |need| {
+                        admitted = need;
+                        Ok::<_, usize>(())
+                    },
+                    |k| k.to_vec(),
+                ),
+                Ok(Some(keys[0].clone())),
+            );
+            assert_eq!(key.capacity(), admitted);
+            let allocation = key.as_ptr();
+
+            let refused: Result<Option<()>, usize> =
+                v.get_with_checked_in(1, &mut key, Err, |_| {
+                    panic!("the reader ran without admitted scratch");
+                });
+            assert!(refused.unwrap_err() > admitted);
+            assert_eq!(key.capacity(), admitted);
+            assert_eq!(key.as_ptr(), allocation);
+
+            // The long predecessor shares only the first two bytes of the next key.
+            assert_eq!(
+                v.get_with_checked_in(2, &mut key, Err, |k| k.to_vec()),
+                Ok(Some(keys[2].clone())),
+            );
+            assert_eq!(key.as_ptr(), allocation);
         }
     }
 

@@ -16258,6 +16258,14 @@ mod string_order_tests {
                 t.push_row(&[ids[2 * i], ids[2 * i + 1]]);
             }
             let e = cmp(x, y, CmpOp::Lt);
+            // Start the bypass before arming the observer, so it fires during the
+            // direct comparison's checked walk in the second mask.
+            assert!(
+                string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(ctx.floor_cache().bypassed(), 1);
             let cancel = ctx.cancel.clone();
             crate::algo::set_projection_observer(Some(std::sync::Arc::new(move |event| {
                 if let crate::algo::ProjectionEvent::Materialized(
@@ -16271,7 +16279,7 @@ mod string_order_tests {
             let result = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
             crate::algo::set_projection_observer(None);
             assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
-            assert_eq!(ctx.floor_cache().bypassed(), 1);
+            assert_eq!(ctx.floor_cache().bypassed(), 2);
         }
     }
 

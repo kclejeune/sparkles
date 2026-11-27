@@ -347,22 +347,25 @@ A/A failure disclosed above and eager `str-pair-colleague` awaiting confirmation
   95% interval of 1.00003 to 1.0015, +20.2 µs by the formula (+15.6 µs paired round
   median) across 9 of 12 slower rounds and 1.0000 times the instructions.
 
-`str-pair-colleague` holds 30,077 and 25,967 distinct names in its 30,077 rows, so its
-floors are nearly all computed once, and in streaming execution they cost more than
-comparing the two keys. A switch that turns the floors off
-when a prefix of the rows repeats few values was considered and not built, because in a
-shuffled order the first 4,096 rows of `str-pair-names` repeat as few values as
-`str-pair-colleague` while the whole query repeats many, so the switch would lose the
-names query's 2x. A profile of the per-worker maps put most of the floors' time in
-`Ctx::with_vocab_key_prev` and `Vocab::get_with_prev_checked`, which read the key and its
-predecessor. The shared table has not been profiled, so that read is the suspected cause
-of its cost. Item 1088 uses the exact common prefix length that both vocabulary codecs
-store between adjacent keys in a block. If that length covers the current key's lexical
-prefix, the preceding key extends it. At a block boundary the lookup reads the preceding
-key when needed. A cursor uses a single-key walk to obtain the key and its stored prefix
-length. The decoding envelope admits scratch before allocation. The cursor reports any
-refusal on the next query check. The shared table still serves every eligible mask. The
-timing comparison is pending.
+`str-pair-colleague` holds 30,077 and 25,967 distinct names in its 30,077 rows, so most
+floors are computed only once. A profile of the per-worker maps put most of their cost
+in `Ctx::with_vocab_key_prev` and `Vocab::get_with_prev_checked`, which read the key and
+its predecessor. Item 1088 uses the common prefix length stored by both vocabulary
+codecs to detect a proper extension inside a block. A block boundary still needs the
+preceding key. The checked floor walk admits its initial scratch before the walk and
+reuses it across lookups. The cache can defer allocation when the first eligible mask's
+estimate predicts few hits, or bypass a table after a sufficiently large sample of
+lookups falls below one hit in eight. Every fourth mask probes so that late reuse can
+re-enable floors, including when shuffled `str-pair-names` repeats few values in its
+first batch.
+
+The direct comparison uses the same single-key block walk for each operand, with a
+reusable buffer for each key. A full FSST suffix needs no separate length scan when
+the admitted buffer fits the maximum decoded length and the optional decoder headroom.
+For other suffixes the growth check still uses the measured length. Scratch remains
+inside the decoding envelope, and the cursor's checkpoints still report cancellation
+and required decoding refusals. [Forge confirmation](#forge-confirmation-for-item-1088)
+of the streaming cost is pending.
 
 Queries that the floors do not reach also became slower in every round, and item 1089
 holds these costs. The 37-query screens compared 174de1f8, before the shared table, with
@@ -2011,3 +2014,69 @@ vocabulary read locks are released before memory admission or geometry parsing.
 GeoJSON fallback and recheck paths admit the JSON value tree before parsing. The parser
 reads object keys as ordinary strings and bounds the unknown-type diagnostic. The
 nearest-neighbour fallback keeps parsed entry credit through distance measurement.
+
+### Forge confirmation for item 1088
+
+Use release binaries built on the Boat worker with the same compiler and profile and
+`MBX_LEARNED_INCREMENTAL=false`. Set `BASE_BIN` to the binary for `0c425e86`,
+`TIP_BIN` to the candidate, and `PRE1069_BIN` to the binary for `c0948014`. Run the
+following from the candidate checkout on forge in a named terminal. It reuses the
+historical queries and CPU placement, compares the candidate against its base and the
+pre-1069 baseline, and records a same-binary control for each thread count.
+
+```bash
+export BASE_BIN TIP_BIN PRE1069_BIN
+flock "$HOME/lanes/.heavy.lock" bash -s <<'SH'
+set -euo pipefail
+: "${BASE_BIN:?}" "${TIP_BIN:?}" "${PRE1069_BIN:?}"
+repo=$PWD
+runs="$repo/.artifacts/bench-floor-1088/$(date -u +%Y%m%dT%H%M%SZ)"
+queries="$repo/docs/benchmarks/synthetic/runs/2026-11-19-floor-table-ab-forge-3a8b7adb/g1-streaming/queries"
+mkdir -p "$runs"
+python3 scripts/gen-data.py 100000 | zstd -q -o "$runs/data.nt.zst"
+for threads in 1 12; do
+    server_cpu=2 client_cpu=4 spin=1
+    if [ "$threads" -eq 12 ]; then
+        server_cpu=0-11 client_cpu=12 spin=0
+    fi
+    for comparison in control candidate recovery; do
+        a=$BASE_BIN b=$TIP_BIN
+        case "$comparison" in
+            control) b=$BASE_BIN ;;
+            recovery) a=$PRE1069_BIN ;;
+        esac
+        out="$runs/$threads-$comparison"
+        mkdir -p "$out/queries"
+        for query in str-pair-colleague str-pair-names str-pair-lt; do
+            cp "$queries/$query.rq" "$out/queries/"
+        done
+        install -m 755 "$a" "$out/bin-A"
+        install -m 755 "$b" "$out/bin-B"
+        {
+            printf 'host: %s\nA: %s\nB: %s\n' "$(hostname)" "$a" "$b"
+            sha256sum "$a" "$b" "$runs/data.nt.zst"
+            readelf -p .comment "$a" "$b"
+        } >"$out/manifest.txt"
+        cp "$runs/data.nt.zst" "$out/"
+        cp scripts/nsc-bench-remote.sh "$out/"
+        cat >"$out/run.env" <<EOF
+ROUNDS=12
+REPS=16
+WARMUP=3
+ORDERS="A B B A;B A A B"
+RAYON_THREADS=$threads
+SERVER_CPU=$server_cpu
+CLIENT_CPU=$client_cpu
+SPIN=$spin
+EXECUTION=streaming
+PORT=31941
+EOF
+        bash "$out/nsc-bench-remote.sh"
+        python3 scripts/nsc-bench-summary.py "$out" >"$out/summary.md"
+    done
+done
+for out in "$runs"/{1,12}-{control,candidate,recovery}; do
+    python3 scripts/nsc-bench-summary.py --check "$out/summary.json" first
+done
+SH
+```
