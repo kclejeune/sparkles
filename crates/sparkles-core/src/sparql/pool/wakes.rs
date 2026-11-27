@@ -11,6 +11,48 @@ type Shared = Arc<Mutex<Option<Pools>>>;
 enum Pending {
     Local(Pools),
     Shared(Shared),
+    /// A captured deferral in place of the thread's own, which stays the fallback for
+    /// releases that arrive after the capture closes.
+    Captured(Shared, Option<Box<Pending>>),
+}
+
+impl Pending {
+    /// Queue `pool` on the innermost open deferral. Each shared list is unlocked before
+    /// the next one is tried.
+    fn push(&mut self, pool: &Arc<QueryPool>) -> bool {
+        let push = |pending: &mut Pools| {
+            if !pending.iter().any(|p| Arc::ptr_eq(p, pool)) {
+                pending.push(pool.clone());
+            }
+            true
+        };
+        match self {
+            Pending::Local(pending) => push(pending),
+            Pending::Shared(pending) => pending.lock().as_mut().is_some_and(push),
+            Pending::Captured(captured, outer) => {
+                let queued = captured.lock().as_mut().is_some_and(push);
+                queued || outer.as_deref_mut().is_some_and(|outer| outer.push(pool))
+            }
+        }
+    }
+
+    /// The innermost open deferral, shared so that other threads can reach it.
+    fn capture(&mut self) -> Option<ReleaseWakes> {
+        match self {
+            Pending::Local(pools) => {
+                let shared = Arc::new(Mutex::new(Some(std::mem::take(pools))));
+                *self = Pending::Shared(shared.clone());
+                Some(ReleaseWakes(shared))
+            }
+            Pending::Shared(pools) => Some(ReleaseWakes(pools.clone())),
+            Pending::Captured(captured, outer) => {
+                if captured.lock().is_some() {
+                    return Some(ReleaseWakes(captured.clone()));
+                }
+                outer.as_deref_mut().and_then(Pending::capture)
+            }
+        }
+    }
 }
 
 type Current = ManuallyDrop<RefCell<Option<Pending>>>;
@@ -24,23 +66,9 @@ thread_local! {
 /// and the caller then notifies inline.
 pub(super) fn defer(pool: &Arc<QueryPool>) -> bool {
     CURRENT.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let Some(pending) = slot.as_mut() else {
-            return false;
-        };
-        let push = |pending: &mut Pools| {
-            if !pending.iter().any(|p| Arc::ptr_eq(p, pool)) {
-                pending.push(pool.clone());
-            }
-        };
-        match pending {
-            Pending::Local(pending) => push(pending),
-            Pending::Shared(pending) => match pending.lock().as_mut() {
-                Some(pending) => push(pending),
-                None => return false,
-            },
-        }
-        true
+        slot.borrow_mut()
+            .as_mut()
+            .is_some_and(|pending| pending.push(pool))
     })
 }
 
@@ -62,20 +90,36 @@ impl std::fmt::Debug for ReleaseWakes {
 impl ReleaseWakes {
     /// Run `work` with this deferral in place of the thread's own while it is open.
     /// A task stolen onto a thread that works for another scope then still defers
-    /// into its own scope.
+    /// into its own scope. While this deferral is open it takes every release, and
+    /// its owner's drain delivers them. Once it closes, the thread's own deferral
+    /// takes them, so a callback never runs inline inside it. A thread without one
+    /// then notifies inline. A holder that may outlive its scope's lock, such as a
+    /// cache, should not capture a deferral at all.
     pub fn run<T>(&self, work: impl FnOnce() -> T) -> T {
-        struct Restore(Option<Pending>);
+        struct Restore;
         impl Drop for Restore {
             fn drop(&mut self) {
-                CURRENT.with(|slot| *slot.borrow_mut() = self.0.take());
+                CURRENT.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    match slot.take() {
+                        Some(Pending::Captured(_, outer)) => *slot = outer.map(|outer| *outer),
+                        other => {
+                            debug_assert!(false, "a capture left its slot");
+                            *slot = other;
+                        }
+                    }
+                });
             }
         }
         if self.0.lock().is_none() {
             return work();
         }
-        let previous =
-            CURRENT.with(|slot| slot.borrow_mut().replace(Pending::Shared(self.0.clone())));
-        let _restore = Restore(previous);
+        CURRENT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let outer = slot.take().map(Box::new);
+            *slot = Some(Pending::Captured(self.0.clone(), outer));
+        });
+        let _restore = Restore;
         work()
     }
 }
@@ -96,6 +140,10 @@ impl QueryPool {
                     Pending::Local(pools) => pools,
                     // Closing and taking are one step under the lock.
                     Pending::Shared(pools) => pools.lock().take().unwrap_or_default(),
+                    Pending::Captured(..) => {
+                        debug_assert!(false, "a capture restores its slot");
+                        Vec::new()
+                    }
                 };
                 for pool in pools {
                     pool.wake();
@@ -119,18 +167,7 @@ impl QueryPool {
     /// budget, keeps it and releases through [`ReleaseWakes::run`].
     #[doc(hidden)]
     pub fn capture_release_wakes() -> Option<ReleaseWakes> {
-        CURRENT.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            let pending = slot.as_mut()?;
-            match pending {
-                Pending::Local(pools) => {
-                    let shared = Arc::new(Mutex::new(Some(std::mem::take(pools))));
-                    *pending = Pending::Shared(shared.clone());
-                    Some(ReleaseWakes(shared))
-                }
-                Pending::Shared(pools) => Some(ReleaseWakes(pools.clone())),
-            }
-        })
+        CURRENT.with(|slot| slot.borrow_mut().as_mut().and_then(Pending::capture))
     }
 
     /// Carry the caller's deferral across a synchronous thread handoff. The

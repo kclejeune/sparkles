@@ -567,6 +567,9 @@ impl crate::Dataset {
             };
             journal.save_selected(self.store(), |_| true, |p| !std::ptr::eq(p, &*intent))?;
             journal.publishing.swap_remove(index);
+            if journal.publishing.capacity() > journal.publishing.len().saturating_mul(4) {
+                journal.publishing.shrink_to_fit();
+            }
             Ok(())
         };
         let hooks = CommitHooks { persist, retire };

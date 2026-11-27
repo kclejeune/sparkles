@@ -1245,7 +1245,8 @@ pub(crate) fn keep(
     // Migrate off the run's transient work budget onto the cache's retained budget so
     // finishing a materialization returns work-pool credit to exact 0 and the next
     // incremental run does not double-charge the closure across two work budgets.
-    let kept_budget = Budget::with_parent(None, cache.retained_parent());
+    // The run that evicts or takes the closure releases it under its own deferral.
+    let kept_budget = Budget::retained(None, cache.retained_parent());
     let closure_plan = match closure.plan_budget_transfer(&kept_budget) {
         Ok(plan) => plan,
         Err(e) => {

@@ -182,7 +182,8 @@ struct Backing {
     /// The release-wake deferral open where the run began. A rayon worker does not
     /// inherit the root thread's deferral, so every parent release goes through it,
     /// whichever thread runs it. Query wake callbacks then wait for the run's scope
-    /// to leave its writer lock and permit.
+    /// to leave its writer lock and permit. A [retained](Budget::retained) budget has
+    /// none and defers into the releasing thread's deferral.
     wakes: Option<ReleaseWakes>,
 }
 
@@ -224,6 +225,21 @@ impl Budget {
     }
 
     pub fn with_parent(limit: Option<usize>, parent: Option<ParentHandle>) -> Arc<Budget> {
+        Self::backed(limit, parent, QueryPool::capture_release_wakes)
+    }
+
+    /// A budget that outlives the run creating it, such as a cache's. Another run can
+    /// release it while the creating run is still open or after it closes, so its
+    /// releases defer into the deferral of the thread that releases them.
+    pub fn retained(limit: Option<usize>, parent: Option<ParentHandle>) -> Arc<Budget> {
+        Self::backed(limit, parent, || None)
+    }
+
+    fn backed(
+        limit: Option<usize>,
+        parent: Option<ParentHandle>,
+        wakes: impl FnOnce() -> Option<ReleaseWakes>,
+    ) -> Arc<Budget> {
         Arc::new(Budget {
             limit: limit.unwrap_or(usize::MAX),
             step: limit.map_or(MAX_STEP, |l| (l >> STEP_SHIFT).min(MAX_STEP)),
@@ -235,7 +251,7 @@ impl Budget {
                 // a backend and cannot refuse or allocate reservation credit.
                 lease: Mutex::new(parent.reserve(0).expect("zero reservation")),
                 reserved: AtomicUsize::new(0),
-                wakes: QueryPool::capture_release_wakes(),
+                wakes: wakes(),
                 parent,
             }),
         })

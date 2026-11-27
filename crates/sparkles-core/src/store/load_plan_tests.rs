@@ -2516,8 +2516,9 @@ fn sparql_load_profile() {
 
 /// A tracked LOAD that is refused after its intent was persisted retires the intent
 /// and leaves the writer usable for the same sequence, on the bulk, WAL and in-memory
-/// paths. The bulk path also removes its unpublished generation. A failed retirement
-/// keeps the writer poisoned.
+/// paths. The bulk path also removes its unpublished generation, and a disk measurement
+/// taken while the intent was synced no longer counts it. A failed retirement keeps the
+/// writer poisoned.
 #[test]
 fn a_refusal_after_the_commit_intent_retires_it_on_every_path() {
     use crate::error::Error;
@@ -2539,12 +2540,18 @@ fn a_refusal_after_the_commit_intent_retires_it_on_every_path() {
         persisted: AtomicU64,
         retired: AtomicU64,
         generations: AtomicU64,
+        quota: Option<Arc<crate::store::quota::Quota>>,
+        measured: AtomicU64,
     }
     impl CommitIntent for Intent {
         fn persist(&self, seq: u64) -> crate::Result<()> {
             self.persisted.store(seq, SeqCst);
             if let Some(root) = &self.root {
                 self.generations.store(generations(root) as u64, SeqCst);
+            }
+            if let Some(quota) = &self.quota {
+                quota.invalidate();
+                self.measured.store(quota.used(), SeqCst);
             }
             // the cancellation arrives while the intent is being synced
             self.cancel.store(true, SeqCst);
@@ -2596,6 +2603,8 @@ fn a_refusal_after_the_commit_intent_retires_it_on_every_path() {
             persisted: AtomicU64::new(0),
             retired: AtomicU64::new(0),
             generations: AtomicU64::new(0),
+            quota: persistent.then(|| s.quota.clone()),
+            measured: AtomicU64::new(0),
         };
         let mut q = QueryOptions::default();
         q.write.cancel = Some(cancel);
@@ -2616,6 +2625,14 @@ fn a_refusal_after_the_commit_intent_retires_it_on_every_path() {
                 "{name}"
             );
             assert_eq!(generations(&root), before, "{name}");
+        }
+        if bulk {
+            // the next measurement walks the directory without the candidate
+            let cached = s.quota.used();
+            s.quota.invalidate();
+            let walked = s.quota.used();
+            assert_eq!(cached, walked, "{name}");
+            assert!(intent.measured.load(SeqCst) > walked, "{name}");
         }
         let next = update(
             &s,

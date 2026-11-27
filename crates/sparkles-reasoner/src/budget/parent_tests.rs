@@ -289,3 +289,57 @@ fn sibling_worker_releases_defer_query_wakes_into_the_run() {
         assert_eq!(calls.load(Ordering::SeqCst), 1, "{case:?} lost its wake");
     }
 }
+
+/// A cache's budget is published by one run and evicted by another, which may hold
+/// its writer after the publishing run has finished. The eviction's query wake waits
+/// for the evicting run's scope, whichever scope closes first.
+#[test]
+fn a_retained_budget_defers_its_release_into_the_releasing_scope() {
+    use sparkles_core::sparql::pool::GRANULE;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc::channel;
+    let pool = QueryPool::new(2 * GRANULE);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _ticket = pool.enter(
+        GRANULE,
+        Some({
+            let calls = calls.clone();
+            Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+            })
+        }),
+    );
+    let (budget_tx, budget_rx) = channel();
+    let (dropped_tx, dropped_rx) = channel();
+    let (closed_tx, closed_rx) = channel();
+    std::thread::scope(|s| {
+        s.spawn({
+            let calls = calls.clone();
+            move || {
+                let budget: Arc<Budget> = budget_rx.recv().unwrap();
+                QueryPool::with_deferred_release_wakes(|| {
+                    // the evicting run drops the cached closure under its writer
+                    drop(budget);
+                    dropped_tx.send(()).unwrap();
+                    closed_rx.recv().unwrap();
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        0,
+                        "the publishing run woke the waiter inside the evicting run"
+                    );
+                });
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "the wake was lost");
+            }
+        });
+        QueryPool::with_deferred_release_wakes(|| {
+            let budget = Budget::retained(None, Some(pool.work_parent()));
+            budget
+                .try_charge(usize::try_from(2 * GRANULE).unwrap())
+                .unwrap();
+            budget_tx.send(budget).unwrap();
+            dropped_rx.recv().unwrap();
+        });
+        closed_tx.send(()).unwrap();
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}

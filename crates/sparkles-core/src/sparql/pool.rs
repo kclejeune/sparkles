@@ -743,6 +743,57 @@ mod tests {
     }
 
     #[test]
+    fn a_capture_that_closes_during_a_release_falls_back_to_the_threads_deferral() {
+        let pool = QueryPool::new(GRANULE);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _ticket = pool.enter(
+            GRANULE,
+            Some({
+                let calls = calls.clone();
+                Arc::new(move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        );
+        let grant = pool.empty_grant();
+        grant.charge(GRANULE).unwrap();
+        let (wakes_tx, wakes_rx) = std::sync::mpsc::channel();
+        let (installed_tx, installed_rx) = std::sync::mpsc::channel();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            // Run B releases memory that run A's budget owns, and A finishes while
+            // A's capture is in place on B's thread.
+            s.spawn({
+                let calls = calls.clone();
+                move || {
+                    let wakes: ReleaseWakes = wakes_rx.recv().unwrap();
+                    QueryPool::with_deferred_release_wakes(|| {
+                        wakes.run(|| {
+                            installed_tx.send(()).unwrap();
+                            closed_rx.recv().unwrap();
+                            drop(grant);
+                        });
+                        assert_eq!(
+                            calls.load(Ordering::SeqCst),
+                            0,
+                            "the callback ran inside run B's deferral"
+                        );
+                    });
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                }
+            });
+            QueryPool::with_deferred_release_wakes(|| {
+                let wakes = QueryPool::capture_release_wakes().expect("open scope");
+                wakes_tx.send(wakes).unwrap();
+                installed_rx.recv().unwrap();
+            });
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "run A had nothing queued");
+            closed_tx.send(()).unwrap();
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn a_signal_ticket_that_fits_at_entry_holds_a_signal() {
         let pool = QueryPool::new(2 * GRANULE);
         let (mut ticket, signal) = pool.enter_with_signal(GRANULE);

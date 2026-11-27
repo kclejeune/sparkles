@@ -77,7 +77,8 @@ pub(super) fn discard_uncommitted(root: &Path, head: u64) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+// Directory syncs are recorded only where `sync_dir` performs them.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

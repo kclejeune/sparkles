@@ -6620,10 +6620,11 @@ impl Store {
             tracked = match self.arm_commit_hook(w, bulk.hook, head.seq, o) {
                 Ok(tracked) => tracked,
                 Err(e) => {
-                    // CURRENT still names the old generation
+                    // CURRENT still names the old generation. A walk during the
+                    // intent's sync may have counted the candidate.
                     drop(wal);
                     drop(gen_);
-                    let _ = std::fs::remove_dir_all(&dir);
+                    cleanup_dir(&dir);
                     return Err(SparqlLoadError::Store(e));
                 }
             };
