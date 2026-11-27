@@ -290,12 +290,14 @@ checks take constant time. A neighbor outside the branch's interval has a shorte
 suffix that avoids it. The search walks the recorded hops only if an unresolved hop
 could supply a second route or improve the certified threshold. It excludes the branch
 and prunes over-budget prefixes. It orders pending work by the prefix length plus the
-minimum remaining distance. At equal bounds it explores known descendants before
-checking intervals, so a shorter exit at another node can settle the threshold without
-building the index. The deeper children of a node in the shortest-hop tree all have
-the same lower bound. The queue keeps one offset into the node's hop list for these
-children and another for hops that need interval checks. A shorter exit can discard
-a whole group before the walk enqueues its nodes. Each node expands at its shortest
+minimum remaining distance. At equal bounds the walk uses an existing ancestry index immediately.
+Before building one, it allows visits and child scans that could reach a shallow exit
+to examine up to one hop or queue entry per node in the tree in total. It checks
+intervals first if the next scan would exceed that allowance or the children are
+too deep to reach a shallow exit. The walk keeps offsets into a node's hop list for
+its deeper tree children, pending interval checks and hops whose indexed suffix
+returns to the branch. It settles exits before enqueuing those returning hops, so
+a shorter exit can discard the whole group. Each node expands at its shortest
 prefix. The walk stops when the remaining bounds cannot improve the threshold.
 The virtual endpoint represents a completed cycle and can only appear as a source of
 recorded hops. The query memory budget covers retained hops and intervals, the

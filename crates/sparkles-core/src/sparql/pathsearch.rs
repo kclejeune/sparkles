@@ -1567,14 +1567,16 @@ impl ReverseAlternatives {
         let mut scratch = ctx.charge(0)?;
         // A prefix plus its minimum suffix is a lower bound for every exit
         // reachable through it. This bound never decreases along an edge.
-        // On ties, expand known descendants before paying for an interval check.
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
         enum Work {
             Visit,
             TreeChildren,
+            IndexedReturns,
             CheckIntervals,
         }
         let mut queue = BinaryHeap::new();
+        let mut intervals = BinaryHeap::new();
+        let mut tie_budget = tree.dist.len();
         let mut prefixes = HbMap::default();
         let mut base = push_heap(
             &mut queue,
@@ -1582,7 +1584,36 @@ impl ReverseAlternatives {
             &mut scratch,
             0,
         )?;
-        while let Some(Reverse((bound, work, u, prefix, start))) = queue.pop() {
+        loop {
+            let next = match (queue.peek(), intervals.peek()) {
+                (Some(Reverse((bound, work, u, _, start))), Some(Reverse((check, _, _, _, _))))
+                    if bound == check =>
+                {
+                    // Below a child of this depth even the shallowest neighbor
+                    // needs intervals. Otherwise allow cheap scans up to the
+                    // cost of one index, counting the pop and its whole slice.
+                    let can_exit =
+                        *work != Work::TreeChildren || tree.dist[u].saturating_sub(depth) < 2;
+                    let hops = self.branches.get(u).map_or(1, |b| b.hops.len());
+                    if tree.ancestry.is_none()
+                        && can_exit
+                        && let Some(left) = tie_budget.checked_sub(1 + (hops - start))
+                    {
+                        tie_budget = left;
+                        queue.pop()
+                    } else {
+                        intervals.pop()
+                    }
+                }
+                (Some(Reverse((bound, ..))), Some(Reverse((check, ..)))) if check < bound => {
+                    intervals.pop()
+                }
+                (Some(_), _) => queue.pop(),
+                (None, _) => intervals.pop(),
+            };
+            let Some(Reverse((bound, work, u, prefix, start))) = next else {
+                break;
+            };
             poll()?;
             if second.is_some_and(|len| len <= bound) {
                 break;
@@ -1600,7 +1631,12 @@ impl ReverseAlternatives {
             // every child or cross-tree hop. Recheck the bound at dispatch.
             let mut children = None;
             let mut deferred = None;
-            for (j, &v) in hops[start..].iter().enumerate() {
+            let mut indexed_returns = None;
+            let record_group = |group: &mut Option<(u32, usize)>, lower: u32, offset| {
+                let (min, _) = group.get_or_insert((lower, offset));
+                *min = (*min).min(lower);
+            };
+            for (offset, &v) in hops.iter().enumerate().skip(start) {
                 poll()?;
                 if v == source {
                     continue;
@@ -1616,25 +1652,29 @@ impl ReverseAlternatives {
                 let child = cheap.is_none() && parents[&(v, suffix)].node == u;
                 let needs_index = cheap.is_none() && !child && v != parent;
                 let avoids = match work {
-                    Work::TreeChildren if child => false,
-                    Work::CheckIntervals if needs_index => {
-                        tree.suffix_avoids(ctx, v, source, poll)?
-                    }
-                    Work::TreeChildren | Work::CheckIntervals => continue,
                     Work::Visit if child => {
-                        children.get_or_insert((lower, j));
+                        children.get_or_insert((lower, offset));
                         continue;
                     }
-                    Work::Visit if needs_index => {
-                        if let Some(index) = tree.ancestry.as_ref() {
-                            index.avoids(v, source)
+                    Work::Visit if needs_index && tree.ancestry.is_none() => {
+                        record_group(&mut deferred, lower, offset);
+                        continue;
+                    }
+                    Work::Visit | Work::CheckIntervals if needs_index => {
+                        if tree.suffix_avoids(ctx, v, source, poll)? {
+                            true
                         } else {
-                            let (min, _) = deferred.get_or_insert((lower, j));
-                            *min = (*min).min(lower);
+                            // A later exit in this slice may prune all returns.
+                            record_group(&mut indexed_returns, lower, offset);
                             continue;
                         }
                     }
                     Work::Visit => cheap.unwrap_or(false),
+                    Work::TreeChildren if child => false,
+                    // Every indexed exit in this slice already set or tied
+                    // the threshold. Only returning hops survive the bound.
+                    Work::IndexedReturns if needs_index => false,
+                    _ => continue,
                 };
                 if avoids {
                     // Shallow first edges were counted by the initial scan.
@@ -1660,13 +1700,18 @@ impl ReverseAlternatives {
             }
             for (kind, group) in [
                 (Work::TreeChildren, children),
+                (Work::IndexedReturns, indexed_returns),
                 (Work::CheckIntervals, deferred),
             ] {
                 if let Some((lower, start)) = group
                     && second.is_none_or(|len| lower < len)
                 {
                     base = push_heap(
-                        &mut queue,
+                        if kind == Work::CheckIntervals {
+                            &mut intervals
+                        } else {
+                            &mut queue
+                        },
                         Reverse((lower, kind, u, prefix, start)),
                         &mut scratch,
                         base,
@@ -14716,13 +14761,95 @@ mod tree_tests {
 
     #[test]
     fn reverse_walk_deep_exit_prunes_dense_descendants() {
+        assert_dense_first_row(
+            "ex:a ex:p ex:b {| ex:w 2e0 |} . ex:b ex:p ex:a, ex:u . ex:u ex:p ex:b, ex:h . \
+             ex:h ex:p ex:c . ex:c ex:p ex:d . ex:d ex:p ex:t . ",
+            1024,
+            7,
+            10,
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn reverse_walk_tied_deep_children_yield_to_intervals() {
+        assert_dense_first_row(
+            "ex:a ex:p ex:b {| ex:w 2e0 |} . ex:b ex:p ex:a, ex:u . ex:u ex:p ex:b, ex:h . \
+             ex:h ex:p ex:c1 {| ex:w 0.1e0 |} . ex:c1 ex:p ex:c2 . ex:c2 ex:p ex:d . ex:d ex:p ex:t . ",
+            128,
+            7,
+            11,
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn reverse_walk_tied_shallow_children_have_bounded_work() {
+        assert_dense_first_row(
+            "ex:a ex:p ex:u {| ex:w 2e0 |} . ex:u ex:p ex:a, ex:h . \
+             ex:h ex:p ex:c {| ex:w 0.1e0 |} . ex:c ex:p ex:d . ex:d ex:p ex:t . ",
+            128,
+            5,
+            9,
+            None,
+        );
+    }
+
+    #[test]
+    fn reverse_walk_tied_sparse_child_can_settle_without_intervals() {
+        assert_shallow_first_row(
+            "ex:a ex:p ex:t {| ex:w 0.5e0 |} . ex:u ex:p ex:a . ex:w ex:p ex:u, ex:z . \
+             ex:h ex:p ex:c . ex:c ex:p ex:d . ex:d ex:p ex:t . ex:z ex:p ex:y . \
+             ex:a ex:p ex:u {| ex:w 2e0 |} . ex:u ex:p ex:w, ex:h . ex:y ex:p ex:t {| ex:w 10e0 |} . ",
+            5,
+            11,
+            24,
+        );
+    }
+
+    #[test]
+    fn reverse_walk_cached_intervals_prune_returning_peers_before_enqueue() {
         use std::fmt::Write as _;
 
         let n = 1024;
         let mut ttl = String::from(
             "@prefix ex: <http://example.org/> . ex:a ex:p ex:t {| ex:w 0.5e0 |} . \
-             ex:a ex:p ex:b {| ex:w 2e0 |} . ex:b ex:p ex:a, ex:u . ex:u ex:p ex:b, ex:h . \
-             ex:h ex:p ex:c . ex:c ex:p ex:d . ex:d ex:p ex:t . ex:w ex:p ex:t {| ex:w 1e12 |} . ",
+             ex:a ex:p ex:u {| ex:w 2e0 |} . ex:b ex:p ex:a . ex:u ex:p ex:b, ex:z . \
+             ex:z ex:p ex:y . ex:y ex:p ex:t {| ex:w 10e0 |} . ex:w ex:p ex:t {| ex:w 1e12 |} . ",
+        );
+        for i in 0..n {
+            write!(ttl, "ex:u ex:p ex:v{i} . ex:v{i} ex:p ex:b . ").unwrap();
+        }
+        let properties = format!(
+            "path:source ?src ; path:target ex:t ; path:predicate ex:p ; \
+             path:weight ex:w ; path:maxLength 5 ; path:maxVisited {}",
+            n + 9
+        );
+        test_hooks::REVERSE_WALK_ENQUEUES.with(|count| count.set(0));
+        test_hooks::REVERSE_ANCESTRY_BUILDS.with(|count| count.set(0));
+        for (first, _) in reverse_first_rows(ttl, &properties, None) {
+            assert_eq!(
+                first,
+                Term::NamedNode(oxrdf::NamedNode::new("http://example.org/a").unwrap())
+            );
+        }
+        test_hooks::REVERSE_ANCESTRY_BUILDS.with(|count| assert_eq!(count.get(), 2));
+        // Both engines need only the prefix through u to find the exit at z.
+        test_hooks::REVERSE_WALK_ENQUEUES.with(|count| assert_eq!(count.get(), 2));
+    }
+
+    fn assert_dense_first_row(
+        edges: &str,
+        n: usize,
+        max_len: u32,
+        visits: usize,
+        enqueues: Option<usize>,
+    ) {
+        use std::fmt::Write as _;
+
+        let mut ttl = format!(
+            "@prefix ex: <http://example.org/> . ex:a ex:p ex:t {{| ex:w 0.5e0 |}} . \
+             ex:w ex:p ex:t {{| ex:w 1e12 |}} . {edges}"
         );
         for i in 0..n {
             write!(ttl, "ex:u ex:p ex:v{i} . ex:v{i} ex:p ex:u").unwrap();
@@ -14735,8 +14862,8 @@ mod tree_tests {
         }
         let properties = format!(
             "path:source ?src ; path:target ex:t ; path:predicate ex:p ; \
-             path:weight ex:w ; path:maxLength 7 ; path:maxVisited {}",
-            n + 10
+             path:weight ex:w ; path:maxLength {max_len} ; path:maxVisited {}",
+            n + visits
         );
         test_hooks::REVERSE_WALK_ENQUEUES.with(|count| count.set(0));
         for (first, steps) in reverse_first_rows(ttl, &properties, None) {
@@ -14749,8 +14876,9 @@ mod tree_tests {
                 "{steps} suffix steps for {n} descendants"
             );
         }
-        // Each engine queues b and u. The exit through h prunes every peer.
-        test_hooks::REVERSE_WALK_ENQUEUES.with(|count| assert_eq!(count.get(), 4));
+        if let Some(per_engine) = enqueues {
+            test_hooks::REVERSE_WALK_ENQUEUES.with(|count| assert_eq!(count.get(), 2 * per_engine));
+        }
     }
 
     fn assert_shallow_first_row(edges: &str, max_len: u32, visits: usize, max_steps: usize) {
