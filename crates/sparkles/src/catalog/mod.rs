@@ -1031,6 +1031,17 @@ impl Catalog {
     /// while the registry is locked and removed after the lock is released, so deleting
     /// a large dataset does not hold up other catalog operations.
     pub fn delete(&self, name: &str) -> Result<bool> {
+        self.delete_observed(name, |_, _| {})
+    }
+
+    /// Notify the server when a managed opening has committed to close, before
+    /// registry changes or rollback. The observer may read the drained store.
+    #[doc(hidden)]
+    pub fn delete_observed(
+        &self,
+        name: &str,
+        on_closed: impl FnOnce(u64, &crate::store::Store),
+    ) -> Result<bool> {
         let trash = {
             let _g = self.manage()?;
             self.require_determinate_registry(name)?;
@@ -1076,7 +1087,9 @@ impl Catalog {
                 self.hold_closing_locked(name, &entry.dataset, revision);
                 let closed = {
                     let _disposing = self.disposal_scope();
-                    entry.dataset.close_for_disposal(|| drop(map.take()))
+                    entry
+                        .dataset
+                        .close_for_disposal(|| drop(map.take()), on_closed)
                 };
                 drop(paused);
                 // A committed close that unwinds out of this call leaves the dataset
@@ -1364,6 +1377,18 @@ impl Catalog {
     /// handles, including branch handles, so that the old store can be closed. As in
     /// [`delete`](Self::delete), the dataset's own views workers do not count.
     pub fn rename(&self, from: &str, to: &str) -> Result<Dataset> {
+        self.rename_observed(from, to, |_, _| {})
+    }
+
+    /// Notify the server at the same managed close boundary as
+    /// [`Self::delete_observed`]. In-memory renames preserve their opening.
+    #[doc(hidden)]
+    pub fn rename_observed(
+        &self,
+        from: &str,
+        to: &str,
+        on_closed: impl FnOnce(u64, &crate::store::Store),
+    ) -> Result<Dataset> {
         let _g = self.manage()?;
         self.require_determinate_registry(from)?;
         self.available(to, true)?;
@@ -1416,7 +1441,9 @@ impl Catalog {
         self.hold_closing_locked(from, &entry.dataset, revision);
         let closed = {
             let _disposing = self.disposal_scope();
-            entry.dataset.close_for_disposal(|| drop(map.take()))
+            entry
+                .dataset
+                .close_for_disposal(|| drop(map.take()), on_closed)
         };
         drop(paused);
         let reasoning = match closed {

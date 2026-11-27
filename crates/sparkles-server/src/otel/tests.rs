@@ -6,6 +6,7 @@ use super::*;
 use crate::http::router;
 use crate::obs::Phase;
 use crate::state::DbType;
+use crate::state::tests::HookPoint;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
@@ -22,6 +23,7 @@ use sparkles::io::Source;
 use sparkles::store::StoreOptions;
 use std::net::SocketAddr;
 use std::sync::OnceLock;
+use std::sync::mpsc;
 use tower::ServiceExt;
 
 struct Pipeline {
@@ -735,6 +737,38 @@ fn otel_f64(otlp: &OtlpSnapshot, name: &str, unit: &str, attrs: &[(&str, &str)])
         OtlpValue::F64(n) => n,
         OtlpValue::U64(n) => panic!("{name} expected F64 sum, got U64({n})"),
     })
+}
+
+struct PausedHook {
+    entered: mpsc::Receiver<()>,
+    release: mpsc::Sender<()>,
+}
+
+impl PausedHook {
+    fn new(install: impl FnOnce(Box<dyn FnOnce() + Send>)) -> Self {
+        let (entered, reached) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        install(Box::new(move || {
+            entered.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(15)).unwrap();
+        }));
+        Self {
+            entered: reached,
+            release,
+        }
+    }
+
+    fn at(st: &AppState, point: HookPoint, name: &str) -> Self {
+        Self::new(|hook| st.lifecycle_hooks.set(point, name, hook))
+    }
+
+    fn wait(&self) {
+        self.entered.recv_timeout(Duration::from_secs(10)).unwrap();
+    }
+
+    fn resume(self) {
+        self.release.send(()).unwrap();
+    }
 }
 
 fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, label: &str) {
@@ -2382,10 +2416,11 @@ async fn phase2_otlp_concurrent_delete_and_promotion_never_drop_or_double_count(
 
     let (entered, entered_rx) = mpsc::channel();
     let (release, release_rx) = mpsc::channel::<()>();
-    crate::state::tests::set_delete_hook("b", move || {
-        entered.send(()).unwrap();
-        release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
-    });
+    st.lifecycle_hooks
+        .set(HookPoint::BeforeMutation, "b", move || {
+            entered.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        });
     let deleter = {
         let st = st.clone();
         std::thread::spawn(move || st.delete("b").unwrap())
@@ -3342,12 +3377,14 @@ async fn phase2_otlp_restored_during_scrape_pruned_on_delete_pending_and_promoti
         let ran = hook_ran_b.clone();
         crate::obs::set_gauges_after_datasets_hook(&st, move || {
             assert!(st_hook.rename("c", "a").is_err());
-            crate::state::tests::set_delete_hook("c", move || {
-                del_entered.send(()).unwrap();
-                del_release_rx
-                    .recv_timeout(Duration::from_secs(15))
-                    .unwrap();
-            });
+            st_hook
+                .lifecycle_hooks
+                .set(HookPoint::BeforeMutation, "c", move || {
+                    del_entered.send(()).unwrap();
+                    del_release_rx
+                        .recv_timeout(Duration::from_secs(15))
+                        .unwrap();
+                });
             let st_del = st_hook.clone();
             let handle = std::thread::spawn(move || st_del.delete("c").unwrap());
             del_entered_rx
@@ -3812,6 +3849,77 @@ async fn phase2_otlp_stale_scrape_across_concurrent_memory_rename() {
     }
 }
 
+#[test]
+fn phase2_otlp_successive_renames_commit_in_catalog_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = AppState::new(
+        dir.path(),
+        StoreOptions {
+            bulk_threshold: 1,
+            ..Default::default()
+        },
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    st.metrics = crate::obs::Metrics::new(true, 1);
+    let st = Arc::new(st);
+    {
+        let a = st.create("a", DbType::Mem).unwrap();
+        phase2_bulk_load(&a.store, DATA);
+    }
+    let cum = MetricsHarness::with_temporality(&st, Temporality::Cumulative);
+    assert_all_three_phase2_parity(&st, &cum, "a");
+
+    let published = PausedHook::at(&st, HookPoint::RenamePublished, "a");
+    let first = {
+        let st = st.clone();
+        std::thread::spawn(move || st.rename("a", "b").unwrap())
+    };
+    published.wait();
+    assert!(st.catalog.get("b").is_some());
+
+    let scrape = PausedHook::new(|hook| crate::obs::set_gauges_after_datasets_hook(&st, hook));
+    let snapshot = {
+        let st = st.clone();
+        std::thread::spawn(move || crate::obs::metrics_json(&st))
+    };
+    scrape.wait();
+
+    let (waiting, waiter) = mpsc::channel();
+    st.lifecycle_hooks
+        .set(HookPoint::WaitingForRename, "b", move || {
+            waiting.send(()).unwrap();
+        });
+    let second = {
+        let st = st.clone();
+        std::thread::spawn(move || st.rename("b", "c").unwrap())
+    };
+    waiter.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(st.catalog.get("c").is_none());
+    published.resume();
+    first.join().unwrap();
+    second.join().unwrap();
+
+    scrape.resume();
+    let stale = snapshot.join().unwrap();
+    let fresh = crate::obs::metrics_json(&st);
+    for json in [&stale, &fresh] {
+        for ds in json["datasets"].as_array().unwrap() {
+            assert_eq!(ds["name"], "c", "unexpected alias in {json}");
+        }
+    }
+    assert_all_three_phase2_parity(&st, &cum, "c");
+    assert_eq!(
+        otel_u64(
+            &cum.collect(),
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "c"), ("reason", "bulk")]
+        ),
+        Some(1)
+    );
+}
+
 #[tokio::test]
 async fn phase2_otlp_failed_delete_promotion_conserves_published_pending_counters() {
     use std::sync::mpsc;
@@ -3890,6 +3998,13 @@ async fn phase2_otlp_failed_delete_promotion_conserves_published_pending_counter
         Some(1)
     );
 
+    let scrape = PausedHook::new(|hook| crate::obs::set_gauges_after_datasets_hook(&st, hook));
+    let stale = {
+        let st = st.clone();
+        std::thread::spawn(move || crate::obs::metrics_json(&st))
+    };
+    scrape.wait();
+
     // Complete a second rebuild and extra cache hits on `b` WITHOUT scraping.
     {
         let b = st.get("b").unwrap();
@@ -3925,18 +4040,18 @@ async fn phase2_otlp_failed_delete_promotion_conserves_published_pending_counter
         .unwrap();
     let (entered, entered_rx) = mpsc::channel();
     let (release, release_rx) = mpsc::channel::<()>();
-    crate::state::tests::set_delete_hook("b", move || {
-        entered.send(()).unwrap();
-        release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
-    });
+    st.lifecycle_hooks
+        .set(HookPoint::BeforeMutation, "b", move || {
+            entered.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        });
     let deleter = {
         let st = st.clone();
         std::thread::spawn(move || st.delete("b"))
     };
     entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
 
-    // Free the named slot while `b` is paused in `leaving`, then scrape the pending totals.
-    assert!(st.delete("a").unwrap());
+    // Publish pending counters while the named slot is still occupied.
     let c_mid = cum_h.collect();
     let _d_mid = delta_h.collect();
     let hits_published = otel_f64(
@@ -3962,8 +4077,22 @@ async fn phase2_otlp_failed_delete_promotion_conserves_published_pending_counter
     assert!(deleter.join().unwrap().is_err());
     drop(reservation);
 
+    // The older scrape already sampled the same opening under the same alias.
+    // It must emit the newer published contribution while `b` is still overflow.
+    scrape.resume();
+    let stale = stale.join().unwrap();
+    let other = stale["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "$other")
+        .unwrap();
+    assert_eq!(other["rebuilds"]["bulk"]["count"], 2);
+    assert_eq!(other["resultCache"]["hits"].as_f64(), Some(hits_published));
+
     // Next scrape promotes `b` into the vacant named slot: `$other` must retain the full
     // published pending counters (2 rebuilds, `hits_published`) with zero negative delta.
+    assert!(st.delete("a").unwrap());
     assert_all_three_phase2_parity(&st, &cum_h, "$other");
     assert_all_three_phase2_parity(&st, &cum_h, "b");
     let c_after = cum_h.collect();
@@ -4421,4 +4550,270 @@ async fn phase2_otlp_in_place_backup_restore_retires_overflow_and_handles_refusa
         ),
         Some(0)
     );
+}
+
+fn phase2_bulk_load(store: &sparkles::store::Store, data: &str) {
+    store
+        .load(&[Source::from_bytes(
+            data.as_bytes().to_vec(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+}
+
+#[cfg(feature = "backup")]
+fn phase2_restore_fixture() -> (tempfile::TempDir, Arc<AppState>, u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = AppState::new(
+        dir.path(),
+        StoreOptions {
+            bulk_threshold: 1,
+            result_cache_min_ms: 0.0,
+            ..Default::default()
+        },
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    st.metrics = crate::obs::Metrics::new(true, 1);
+    let st = Arc::new(st);
+    st.create("a", DbType::Mem).unwrap();
+    let b = st.create("b", DbType::Persistent).unwrap();
+    phase2_bulk_load(&b.store, DATA);
+    let id = b.open_id;
+    (dir, st, id)
+}
+
+#[cfg(feature = "backup")]
+#[test]
+fn phase2_otlp_uncached_overflow_is_retired_on_delete_and_persistent_rename() {
+    for rename in [false, true] {
+        let (_dir, st, old_id) = phase2_restore_fixture();
+        st.forget_routing("b");
+        let reservation = st
+            .catalog
+            .reserve("b", sparkles::catalog::ReservationKind::Restore, "reuse")
+            .unwrap();
+        let cum = MetricsHarness::with_temporality(&st, Temporality::Cumulative);
+        // A scrape can see a reserved opening, but it cannot cache its wrapper.
+        assert_all_three_phase2_parity(&st, &cum, "$other");
+        assert!(st.metrics.other_ledger_store_ids().contains(&old_id));
+        assert_eq!(Arc::strong_count(&st.get("b").unwrap()), 1);
+        drop(reservation);
+
+        let leaving = PausedHook::at(&st, HookPoint::BeforeMutation, "b");
+        let mutation = {
+            let st = st.clone();
+            std::thread::spawn(move || {
+                if rename {
+                    st.rename("b", "c").unwrap();
+                } else {
+                    assert!(st.delete("b").unwrap());
+                }
+            })
+        };
+        leaving.wait();
+        assert_eq!(
+            otel_u64(
+                &cum.collect(),
+                "sparkles.rebuilds",
+                "{rebuild}",
+                &[("dataset", "$other"), ("reason", "bulk")]
+            ),
+            Some(1),
+            "pending counters disappeared when there was no cached routing wrapper"
+        );
+        leaving.resume();
+        mutation.join().unwrap();
+        if rename {
+            assert_ne!(st.catalog.get("c").unwrap().state().open_id, old_id);
+        }
+        assert!(!st.metrics.other_ledger_store_ids().contains(&old_id));
+        assert_all_three_phase2_parity(&st, &cum, "$other");
+        assert_eq!(
+            otel_u64(
+                &cum.collect(),
+                "sparkles.rebuilds",
+                "{rebuild}",
+                &[("dataset", "$other"), ("reason", "bulk")]
+            ),
+            Some(1)
+        );
+    }
+}
+
+#[cfg(feature = "backup")]
+#[test]
+fn phase2_otlp_backup_swap_retires_work_completed_during_catalog_drain() {
+    for rollback in [false, true] {
+        let (dir, st, old_id) = phase2_restore_fixture();
+        let cum = MetricsHarness::with_temporality(&st, Temporality::Cumulative);
+        assert_all_three_phase2_parity(&st, &cum, "$other");
+        let staged = dir.path().join("databases/.restore-b-drain");
+        if !rollback {
+            drop(sparkles::store::Store::open(&staged, StoreOptions::default()).unwrap());
+        }
+        let held = st.catalog.get("b").unwrap();
+        let pending = PausedHook::at(&st, HookPoint::SwapPending, "b");
+        let restore = {
+            let st = st.clone();
+            std::thread::spawn(move || {
+                crate::backup::swap::replace_in_place(&st, "b", &staged, "swap-drain", false)
+            })
+        };
+        pending.wait();
+        assert_eq!(
+            otel_u64(
+                &cum.collect(),
+                "sparkles.rebuilds",
+                "{rebuild}",
+                &[("dataset", "$other"), ("reason", "bulk")]
+            ),
+            Some(1)
+        );
+        pending.resume();
+        // The catalog handle survives the HTTP drain and keeps the predecessor
+        // from closing until the second rebuild has finished.
+        let more: String = (0..6)
+            .map(|i| format!("<http://ex/swap-drain{i}> <http://ex/p> <http://ex/o> .\n"))
+            .collect();
+        phase2_bulk_load(held.store(), &more);
+        assert_eq!(
+            held.store()
+                .rebuilds(sparkles::store::RebuildReason::Bulk)
+                .count(),
+            2
+        );
+        drop(held);
+        assert_eq!(restore.join().unwrap().is_err(), rollback);
+        assert_ne!(st.get("b").unwrap().open_id, old_id);
+        assert!(!st.metrics.other_ledger_store_ids().contains(&old_id));
+        assert_all_three_phase2_parity(&st, &cum, "$other");
+        let after = cum.collect();
+        for metric in ["sparkles.rebuilds", "sparkles.rebuild.duration.count"] {
+            assert_eq!(
+                otel_u64(
+                    &after,
+                    metric,
+                    "{rebuild}",
+                    &[("dataset", "$other"), ("reason", "bulk")]
+                ),
+                Some(2)
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "backup", unix))]
+#[tokio::test]
+async fn phase2_otlp_refused_mutation_during_detached_backup_swap_keeps_opening() {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    for rename in [false, true] {
+        let (dir, st, old_id) = phase2_restore_fixture();
+        st.set_phase(Phase::Ready);
+        let app = router(st.clone());
+        let q = "SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D%20ORDER%20BY%20%3Fs%20%3Fp%20%3Fo";
+        // Claim the only named slot before doing work on `b`.
+        let cum = MetricsHarness::with_temporality(&st, Temporality::Cumulative);
+        assert_all_three_phase2_parity(&st, &cum, "$other");
+        for _ in 0..2 {
+            assert_eq!(
+                call(
+                    &app,
+                    HttpRequest::get(format!("/b/sparql?query={q}"))
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .0,
+                StatusCode::OK
+            );
+        }
+        let hits = otel_f64(
+            &cum.collect(),
+            "sparkles.result_cache.hits",
+            "{hit}",
+            &[("dataset", "$other")],
+        )
+        .unwrap();
+        assert!(hits > 0.0);
+
+        // A FIFO keeps the real restore blocked in header inspection after detachment.
+        let staged = dir.path().join("databases/.restore-b-invalid");
+        std::fs::create_dir(&staged).unwrap();
+        let header = staged.join("dataset.json");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&header)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let reserved = PausedHook::at(&st, HookPoint::SwapReserved, "b");
+        let restore = {
+            let st = st.clone();
+            std::thread::spawn(move || {
+                crate::backup::swap::replace_in_place(&st, "b", &staged, "swap-invalid", false)
+            })
+        };
+        reserved.wait();
+        let leaving = PausedHook::at(&st, HookPoint::BeforeMutation, "b");
+        let mutation = {
+            let st = st.clone();
+            std::thread::spawn(move || {
+                if rename {
+                    st.rename("b", "c")
+                } else {
+                    st.delete("b").map(drop)
+                }
+            })
+        };
+        leaving.wait();
+        reserved.resume();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut writer = loop {
+            let open = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&header);
+            match open {
+                Ok(writer) => break writer,
+                Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                    assert!(std::time::Instant::now() < deadline, "swap never detached");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(e) => panic!("opening restore header FIFO: {e}"),
+            }
+        };
+        assert!(st.catalog.get("b").is_none());
+        leaving.resume();
+        let error = mutation.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("reserved"), "{error}");
+        writer.write_all(b"not-json").unwrap();
+        drop(writer);
+        assert!(restore.join().unwrap().is_err());
+        assert_eq!(st.get("b").unwrap().open_id, old_id);
+        assert_all_three_phase2_parity(&st, &cum, "$other");
+        let after = cum.collect();
+        assert_eq!(
+            otel_u64(
+                &after,
+                "sparkles.rebuilds",
+                "{rebuild}",
+                &[("dataset", "$other"), ("reason", "bulk")]
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            otel_f64(
+                &after,
+                "sparkles.result_cache.hits",
+                "{hit}",
+                &[("dataset", "$other")]
+            ),
+            Some(hits)
+        );
+    }
 }

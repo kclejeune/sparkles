@@ -547,8 +547,9 @@ impl Dataset {
     pub(crate) fn close_for_disposal(
         self,
         release_entries: impl FnOnce(),
+        on_closed: impl FnOnce(u64, &Store),
     ) -> std::result::Result<Option<ReasoningRecord>, RefusedClose> {
-        lifecycle::close(self, release_entries)
+        lifecycle::close(self, release_entries, on_closed)
     }
 
     /// The name a catalog or a server gave the dataset, if any.

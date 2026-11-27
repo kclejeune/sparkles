@@ -1718,14 +1718,19 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
             {
                 continue;
             }
-            live_ids.insert(s.open_id);
+            if !live_ids.insert(s.open_id) {
+                continue;
+            }
             let label = st.metrics.series(Some(&s.name)).0;
             let is_other = label == OTHER;
             let effective = if is_other {
                 let entry = ledger.stores.entry(s.open_id).or_default();
                 let eff = s.counters.sub(&entry.promoted_offset);
                 entry.seen_under_other = entry.seen_under_other.max_with(&eff);
-                eff
+                if let Some(restored) = ledger.restored_during_scrape.get(&s.open_id) {
+                    entry.seen_under_other = entry.seen_under_other.max_with(restored);
+                }
+                entry.seen_under_other.clone_counters()
             } else {
                 ledger.restored_during_scrape.remove(&s.open_id);
                 if let Some(entry) = ledger.stores.get_mut(&s.open_id) {
@@ -1764,9 +1769,9 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         let mut carried = ledger.retired.clone_counters();
         for (&id, entry) in &ledger.pending {
             if let Some(c) = &entry.contrib {
-                carried.add_assign(c);
                 let st_entry = ledger.stores.entry(id).or_default();
                 st_entry.seen_under_other = st_entry.seen_under_other.max_with(c);
+                carried.add_assign(&st_entry.seen_under_other);
             }
         }
         for (&id, c) in &ledger.restored_during_scrape {
@@ -1774,9 +1779,9 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
                 && !ledger.pending.contains_key(&id)
                 && !ledger.retired_ids.contains(&id)
             {
-                carried.add_assign(c);
                 let st_entry = ledger.stores.entry(id).or_default();
                 st_entry.seen_under_other = st_entry.seen_under_other.max_with(c);
+                carried.add_assign(&st_entry.seen_under_other);
             }
         }
         if carried.any() || st.metrics.has_other_slot() {

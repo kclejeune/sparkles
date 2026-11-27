@@ -28,6 +28,9 @@ pub fn replace_in_place(
         .catalog
         .reserve(name, sparkles::catalog::ReservationKind::Restore, task)
         .map_err(|e| BackupError::new(Code::DatasetBusy, e.to_string()))?;
+    #[cfg(all(test, feature = "otel"))]
+    st.lifecycle_hooks
+        .run(crate::state::tests::HookPoint::SwapReserved, name);
     crate::compaction::cancel(st, name);
     let start = Instant::now();
     loop {
@@ -43,13 +46,17 @@ pub fn replace_in_place(
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    // Detach routing and hold the predecessor store's `$other` counters as pending
-    // until the swap or its rollback finishes (the catalog lists the dataset again
-    // only once the swap or its rollback is done).
-    let swapping = st.begin_swap(name);
-    let result = st
-        .catalog
-        .replace_restored_reserved(r, restored, task, keep);
+    // Keep the predecessor's `$other` counters pending until the catalog closes the
+    // opening or the swap refuses it.
+    let mut swapping = st.begin_swap(name);
+    #[cfg(all(test, feature = "otel"))]
+    st.lifecycle_hooks
+        .run(crate::state::tests::HookPoint::SwapPending, name);
+    let result =
+        st.catalog
+            .replace_restored_reserved_observed(r, restored, task, keep, |id, store| {
+                swapping.observe_close(name, id, store)
+            });
     drop(swapping);
     // Recreate the HTTP observers on success and on rollback.
     let ds = st.get(name);
