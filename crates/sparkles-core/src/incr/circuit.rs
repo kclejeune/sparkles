@@ -853,8 +853,11 @@ impl Circuit {
 
     /// The approximate memory of the state and the result.
     pub fn bytes(&self) -> u64 {
-        self.root.bytes()
-            + self.result.bytes(self.root.schema.len())
+        self.root.bytes() + self.non_operator_bytes()
+    }
+
+    fn non_operator_bytes(&self) -> u64 {
+        self.result.bytes(self.root.schema.len())
             + self.terms.bytes()
             + self.version_bytes()
             + prov::map_bytes(&self.ann, self.root.schema.len())
@@ -1290,6 +1293,7 @@ impl Circuit {
         &mut self,
         out: Changes,
         out_lease: &mut super::budget::ScratchLease,
+        check: &mut impl FnMut() -> Result<()>,
     ) -> Result<()> {
         if !self.keep_result {
             drop(out);
@@ -1301,7 +1305,10 @@ impl Circuit {
         let handle = self.budget.handle();
         let mut pass_reserved = 0u64;
         let mut z = ZSet::new();
-        for (r, w) in out {
+        for (i, (r, w)) in out.into_iter().enumerate() {
+            if i.is_multiple_of(256) {
+                check()?;
+            }
             if w == 0 {
                 continue;
             }
@@ -1324,6 +1331,7 @@ impl Circuit {
                 pass_reserved = cur;
             }
         }
+        check()?;
         self.result = z;
         Ok(())
     }
@@ -1366,6 +1374,26 @@ impl Circuit {
 
     /// Evaluate the circuit from scratch at `snap`.
     pub fn build(&mut self, snap: Arc<Snapshot>, control: &Control) -> Result<()> {
+        self.build_inner(snap, control, None)
+    }
+
+    /// Build a transient circuit for eager row decoding. Only shared views need an
+    /// immutable version, so a fallback keeps the installed result and term dictionary.
+    pub(super) fn build_for_read(
+        &mut self,
+        snap: Arc<Snapshot>,
+        control: &Control,
+        checks: super::pass::BuildChecks<'_>,
+    ) -> Result<()> {
+        self.build_inner(snap, control, Some(checks))
+    }
+
+    fn build_inner(
+        &mut self,
+        snap: Arc<Snapshot>,
+        control: &Control,
+        read_checks: Option<super::pass::BuildChecks<'_>>,
+    ) -> Result<()> {
         self.clear_moves();
         self.root.clear();
         self.result = ZSet::new();
@@ -1423,6 +1451,16 @@ impl Circuit {
                             parent,
                             grant,
                         )?;
+                        let prep = if let Some(checks) = read_checks {
+                            (checks.check)()?;
+                            prep.with_query_controls(
+                                None,
+                                Some(checks.cancellation.clone()),
+                                control.deadline,
+                            )?
+                        } else {
+                            prep
+                        };
                         let prepared = a.masked_controlled(&frozen_snap, &prep)?;
                         let masked = prepared.snapshot_arc();
                         _prepared_mask = Some(prepared);
@@ -1438,6 +1476,7 @@ impl Circuit {
         circuit_test_hook(CircuitTestPhase::AfterBuildSample);
         let vis = Vis::new(self.access.as_ref(), &eval_snap);
         let (mut p, root) = self.pass(eval_snap, None, &[], &[], &vis, control);
+        p.build_checks = read_checks;
         let width = root.schema.len();
         let budget = p.budget_handle();
         let res = if p.prov.is_none() {
@@ -1469,7 +1508,14 @@ impl Circuit {
             self.build_scanned = scanned;
             self.build_estimated = estimated;
         }
-        if let Err(e) = self.install_build_result_budgeted(out, &mut out_lease) {
+        let mut check = || {
+            if let Some(checks) = read_checks {
+                control.check()?;
+                (checks.check)()?;
+            }
+            Ok(())
+        };
+        if let Err(e) = self.install_build_result_budgeted(out, &mut out_lease, &mut check) {
             drop(ann);
             self.clear_state();
             drop(out_lease);
@@ -1492,12 +1538,19 @@ impl Circuit {
         self.evidence_key = ev_key;
         self.managed_generation = ev_gen;
         self.last = stats;
-        if let Err(e) = self.publish_fresh_version_budgeted() {
-            self.applied = prev_applied;
-            self.clear_state();
-            return Err(e);
-        }
-        if let Err(e) = self.budget.commit_pass(self.bytes()) {
+        let finish = (|| {
+            let bytes = if read_checks.is_some() {
+                check()?;
+                let bytes = self.root.bytes_checked(&mut check)? + self.non_operator_bytes();
+                check()?;
+                bytes
+            } else {
+                self.publish_fresh_version_budgeted()?;
+                self.bytes()
+            };
+            self.budget.commit_pass(bytes)
+        })();
+        if let Err(e) = finish {
             self.applied = prev_applied;
             self.clear_state();
             return Err(e);
@@ -2001,8 +2054,9 @@ impl Circuit {
     #[allow(clippy::type_complexity)]
     pub(crate) fn rows_budgeted(
         &self,
+        check: &dyn Fn() -> Result<()>,
     ) -> Result<(Vec<(Vec<Option<Term>>, i64)>, Option<MemoryLease>)> {
-        let (rows, mut lease) = self.rows_charged()?;
+        let (rows, mut lease) = self.rows_charged_checked(check)?;
         Ok((rows, self.budget.detach_scratch_lease(&mut lease)))
     }
 
@@ -2010,12 +2064,23 @@ impl Circuit {
     pub(crate) fn rows_charged(
         &self,
     ) -> Result<(Vec<(Vec<Option<Term>>, i64)>, super::budget::ScratchLease)> {
+        self.rows_charged_checked(&|| Ok(()))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn rows_charged_checked(
+        &self,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<(Vec<(Vec<Option<Term>>, i64)>, super::budget::ScratchLease)> {
         let mut lease = self.budget.scratch_lease();
         let Some(snap) = &self.snap else {
             return Ok((Vec::new(), lease));
         };
         let mut out = Vec::new();
         let mut push_decoded = |cols, row: &Row, w: i64| -> Result<()> {
+            if out.len().is_multiple_of(256) {
+                check()?;
+            }
             reserve_vec_slot(&out, &mut lease)?;
             let decoded = self.decode_row_budgeted(snap, cols, row, &mut lease)?;
             out.push((decoded, w));
@@ -2024,7 +2089,7 @@ impl Circuit {
         if let Some((w, cols)) = self.root.result_window()
             && w.positions
         {
-            w.for_each_row(|row, n| push_decoded(cols, row, n))?;
+            w.for_each_row_checked(check, |row, n| push_decoded(cols, row, n))?;
         } else {
             for (row, w) in self.result.iter() {
                 push_decoded(None, row, w)?;

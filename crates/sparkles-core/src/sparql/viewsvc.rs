@@ -733,6 +733,18 @@ pub fn view_rows_retained_bytes(rows: &ViewRows) -> u64 {
 pub trait ViewSource: Send + Sync + std::fmt::Debug {
     fn read_view(&self, r: &ViewRead<'_>) -> Result<ViewRows>;
 
+    /// Like [`read_view`](Self::read_view), polling `check` cooperatively while waiting
+    /// so eager queries honor cancellation alongside deadlines. A fallback that runs
+    /// nested SPARQL can obtain the caller's cancellation flags from `cancellation`.
+    fn read_view_with_check(
+        &self,
+        r: &ViewRead<'_>,
+        _check: &dyn Fn() -> Result<()>,
+        _cancellation: &dyn Fn() -> crate::task::Cancellation,
+    ) -> Result<ViewRows> {
+        self.read_view(r)
+    }
+
     /// Whether this source implements preadmitted streaming opens for cursors.
     fn streams_views(&self) -> bool {
         false
@@ -881,18 +893,29 @@ pub(super) fn run(ctx: &Ctx, spec: &ViewSpec, vars: &[VarId]) -> Result<Table> {
     let get_parent = || ctx.memory_parent();
     let memory_pool = ctx.grant().map(|g| g.pool());
     let max_memory_bytes = (ctx.mem_limit != u64::MAX).then_some(ctx.mem_limit);
-    let rows = source.read_view(&ViewRead {
-        name: &spec.name,
-        at: ctx.snap.commit,
-        snap: Some(&ctx.snap),
-        allow_stale: spec.allow_stale,
-        caller: ctx.graphs.as_ref(),
-        deadline: ctx.current_deadline(),
-        aggregate_errors: Some(ctx.aggregate_errors),
-        memory_parent: Some(&get_parent),
-        memory_pool,
-        max_memory_bytes,
-    })?;
+    let cancellation = || {
+        let primary = crate::task::Cancellation::from_flags([ctx.cancel.clone()]);
+        match &ctx.cancellation {
+            Some(other) => primary.combine(other),
+            None => primary,
+        }
+    };
+    let rows = source.read_view_with_check(
+        &ViewRead {
+            name: &spec.name,
+            at: ctx.snap.commit,
+            snap: Some(&ctx.snap),
+            allow_stale: spec.allow_stale,
+            caller: ctx.graphs.as_ref(),
+            deadline: ctx.current_deadline(),
+            aggregate_errors: Some(ctx.aggregate_errors),
+            memory_parent: Some(&get_parent),
+            memory_pool,
+            max_memory_bytes,
+        },
+        &|| ctx.check(),
+        &cancellation,
+    )?;
     if let Some(m) = rows.evaluated_under {
         ctx.warn(evaluated(&spec.name, m));
     }

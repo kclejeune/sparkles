@@ -18,6 +18,8 @@ pub(super) enum Status {
 #[derive(Clone, Debug)]
 pub(super) struct Info {
     pub(super) status: Status,
+    /// the runtime mode generation this circuit has been compiled for
+    pub(super) mode_gen: u64,
     pub(super) applied: u64,
     pub(super) rows: u64,
     pub(super) bytes: u64,
@@ -86,10 +88,25 @@ pub(crate) struct Slot {
     /// that evaluation publishes leads from one mode to the other, and diffs from before
     /// it must not rewind a view across the switch
     pub(super) rebased: bool,
+    /// the runtime mode generation `circuit` has been compiled for
+    pub(super) mode_gen: u64,
+    /// Completion of the previous circuit's payload and credit release.
+    pub(super) retirement: Option<Arc<RetirementCompletion>>,
     pub(super) circuit: Circuit,
 }
 
 impl Slot {
+    pub(super) fn pending_retirement(&mut self) -> Option<&Arc<RetirementCompletion>> {
+        if self
+            .retirement
+            .as_ref()
+            .is_some_and(|completion| completion.released.get().is_some())
+        {
+            self.retirement = None;
+        }
+        self.retirement.as_ref()
+    }
+
     /// Leaf reclaim hook for `ViewBudget`: drops oldest replay diffs when active state
     /// needs headroom under the local cap or parent pool. Captures a `Weak` reference so
     /// `Slot::history` remains the sole strong owner and drops strictly before
@@ -794,6 +811,8 @@ mod drop_order_tests {
             subs: Vec::new(),
             view_limits,
             rebased: false,
+            mode_gen: 0,
+            retirement: None,
             circuit,
         };
         let rows: Arc<[(Vec<Option<Term>>, i64)]> = Arc::from(vec![(

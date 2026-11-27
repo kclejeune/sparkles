@@ -100,6 +100,25 @@ pub(super) struct DeferredDrops {
     pub(super) cells: Vec<Arc<Cell>>,
     pub(super) queued: Vec<super::live::QueuedEvent>,
     pub(super) retired: Vec<MemoryLease>,
+    // Drop these guards after the retired leases have returned their credit.
+    pub(super) retirements: Vec<Retirement>,
+}
+
+pub(super) struct Retirement {
+    completion: Arc<RetirementCompletion>,
+    kick: Arc<tokio::sync::Notify>,
+}
+
+pub(super) struct RetirementCompletion {
+    owner: std::thread::ThreadId,
+    released: std::sync::OnceLock<()>,
+}
+
+impl Drop for Retirement {
+    fn drop(&mut self) {
+        let _ = self.completion.released.set(());
+        self.kick.notify_one();
+    }
 }
 
 /// The branch whose state Phase 1 keeps.
@@ -149,7 +168,9 @@ impl Default for RuntimeOptions {
     }
 }
 
-/// What the runtime asks of its host.
+/// What the runtime asks of its host. After changing the installed host's inference
+/// or aggregate-error settings, call [`Runtime::mode_changed`] so timed reads reject
+/// the previous mode until the runtime publishes the change.
 pub trait Host: Send + Sync {
     /// The view of the dataset that `principal` reads (`None`: every quad). `None` as
     /// the principal is a view without one, which reads every quad.
@@ -198,6 +219,11 @@ impl Host for OpenHost {
     }
 }
 
+#[cfg(test)]
+type TestHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+type WaitHook = Arc<dyn Fn(Instant) + Send + Sync>;
+
 /// The views and live queries of one dataset.
 pub struct Runtime {
     opts: RwLock<RuntimeOptions>,
@@ -205,7 +231,14 @@ pub struct Runtime {
     dataset: uuid::Uuid,
     pool: Option<Arc<QueryPool>>,
     host: RwLock<Option<Arc<dyn Host>>>,
+    /// Invalidates the published mode on host replacement and settings changes.
+    host_seq: AtomicU64,
+    /// Orders mode observations taken concurrently outside the registry.
+    next_mode_sample: AtomicU64,
     reg: Mutex<Registry>,
+    /// Atomic mirror of `reg.mode_gen` updated under `reg` so readers and rounds can
+    /// detect a newer recorded mode generation without reacquiring `reg` under `cell.state`.
+    mode_gen: AtomicU64,
     /// The definitions as backups and clones capture them, replaced while `reg` is
     /// held after every change. A leaf lock: a capture reads it under the store's
     /// writer lock, and nothing that holds it waits for another lock.
@@ -236,6 +269,24 @@ pub struct Runtime {
     /// without a commit, so a live query resumed at or before it gets the whole result,
     /// even when its circuit was collected and created again since.
     switched: AtomicU64,
+    /// Test hook invoked in `open_view` between releasing `reg` and acquiring `cell.state`.
+    #[cfg(test)]
+    before_read_state_hook: Mutex<Option<TestHook>>,
+    #[cfg(test)]
+    observer_wait_hook: Mutex<Option<WaitHook>>,
+    #[cfg(test)]
+    busy_locked_hook: Mutex<Option<TestHook>>,
+    #[cfg(test)]
+    before_mode_host_hook: Mutex<Option<TestHook>>,
+    #[cfg(test)]
+    wait_info_hook: Mutex<Option<TestHook>>,
+    #[cfg(test)]
+    note_pass_hook: Mutex<Option<TestHook>>,
+    #[cfg(test)]
+    retirement_wait_hook: Mutex<Option<TestHook>>,
+    /// Test counter incremented whenever `round` waits on a busy cell in Pass 2.
+    #[cfg(test)]
+    busy_waits: AtomicUsize,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -268,7 +319,10 @@ impl Runtime {
             dataset,
             pool,
             host: RwLock::new(None),
+            host_seq: AtomicU64::new(0),
+            next_mode_sample: AtomicU64::new(0),
             reg: Mutex::new(reg),
+            mode_gen: AtomicU64::new(0),
             defs,
             epoch: Mutex::new(0),
             cv: Condvar::new(),
@@ -286,6 +340,22 @@ impl Runtime {
             deferred_close: AtomicBool::new(false),
             seen: AtomicU64::new(0),
             switched: AtomicU64::new(0),
+            #[cfg(test)]
+            before_read_state_hook: Mutex::new(None),
+            #[cfg(test)]
+            busy_waits: AtomicUsize::new(0),
+            #[cfg(test)]
+            observer_wait_hook: Mutex::new(None),
+            #[cfg(test)]
+            busy_locked_hook: Mutex::new(None),
+            #[cfg(test)]
+            before_mode_host_hook: Mutex::new(None),
+            #[cfg(test)]
+            wait_info_hook: Mutex::new(None),
+            #[cfg(test)]
+            note_pass_hook: Mutex::new(None),
+            #[cfg(test)]
+            retirement_wait_hook: Mutex::new(None),
         })
     }
 
@@ -306,7 +376,29 @@ impl Runtime {
     /// next round.
     pub fn set_host(&self, host: Arc<dyn Host>) {
         let _operation = Operation::enter();
-        *self.host.write() = Some(host);
+        let old = {
+            let mut slot = self.host.write();
+            let old = slot.replace(host);
+            self.host_seq.fetch_add(1, Ordering::AcqRel);
+            old
+        };
+        drop(old);
+        self.kick();
+    }
+
+    pub(super) fn current_host(&self) -> (u64, Option<Arc<dyn Host>>) {
+        let slot = self.host.read();
+        (self.host_seq(), slot.clone())
+    }
+
+    pub(super) fn host_seq(&self) -> u64 {
+        self.host_seq.load(Ordering::Acquire)
+    }
+
+    /// Invalidate the published mode after changing the installed host's settings.
+    /// Timed view reads wait for a fresh publication before accepting cached rows.
+    pub fn mode_changed(&self) {
+        self.host_seq.fetch_add(1, Ordering::AcqRel);
         self.kick();
     }
 
@@ -339,6 +431,13 @@ impl Runtime {
     /// Wake the worker for a round.
     pub fn kick(&self) {
         self.kick.notify_one();
+    }
+
+    #[cfg(test)]
+    fn before_observer_wait(&self, until: Instant) {
+        if let Some(hook) = self.observer_wait_hook.lock().clone() {
+            hook(until);
+        }
     }
 
     fn parse(&self, host: &dyn Host, text: &str) -> Result<Query> {

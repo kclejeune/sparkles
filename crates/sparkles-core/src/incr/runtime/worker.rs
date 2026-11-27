@@ -274,9 +274,4 @@ impl Runtime {
         }
         true
     }
-
-    /// Wait until a round has finished after this call, at most until `until`.
-    pub(super) fn wait_round(&self, until: Instant) -> bool {
-        self.wait_round_after(self.round_epoch(), until)
-    }
 }

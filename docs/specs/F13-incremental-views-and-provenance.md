@@ -1730,6 +1730,55 @@ the persistent reopen assertion that exposed the directory lock race. The worker
 callback case that reopens through a retained state and the thread-local destruction
 case each pass 100 repetitions.
 
+### View read deadlines across mode changes
+
+Item 1101 separated mode change recording from per-circuit recompilation so a view read
+never holds the registry lock across another view's running pass or waits past its
+deadline or cancellation.
+
+The registry tracks a monotonically increasing mode generation alongside the dataset's
+inference, aggregate-error reading, and host revision. Mode sampling runs outside the
+registry lock. A host replacement or settings change invalidates the published mode until
+a fresh sample is recorded. Timed readers use the published mode without calling the host,
+and planning uses it only after a host has published a current mode and the registry is
+immediately available. A newer host revision takes precedence over older samples.
+
+Idle circuits recompile outside the registry lock. A worker or live join can start a
+replacement build after the old operators have been dropped and their detached budget
+leases have returned credit to the pool. Worker rounds process idle circuits before busy
+circuits and recheck the host mode outside circuit state after waiting for a busy circuit.
+They check the published revision again when they reacquire state. A new RDFS setting
+with an unchanged checkpoint key still starts a new mode generation. Rounds release their
+busy-cell references before garbage collection and checkpointing.
+
+View reads revalidate the runtime mode inside the circuit lock before accepting a version
+or preparing a fallback. Both streaming and eager reads honor deadlines and cancellation,
+including while waiting for an `allowStale` read and when circuit metadata is busy. An
+eager fallback checks both controls while preparing, installing and decoding its results.
+In an ordered fallback, those checks cover entries skipped by the offset and entries
+scanned for memory accounting. The private circuit keeps its term dictionary and result
+for decoding. A missing view returns `view-not-found` when the registry entry is checked.
+Metadata for a view waiting on a mode change reports a build in progress and omits the
+previous plan and row count.
+`wait_built` uses one metadata snapshot to decide whether the build completed and returns
+current metadata with the commit and row count published by that pass. Its timeout bounds
+the wait and it does not run a build. Garbage collection preserves the live-query switch
+boundary when dropping an unswitched dead circuit.
+
+Tests synchronize competing worker and live-join builds while the old pool credit is still
+held, pause mode sampling while timed operations run, replace an equal-schema RDFS setting
+during Pass 2, and change the reading between the Pass 2 probe and admission. They hold
+the registry during a catalog attach while a Pass 2 host callback consults runtime stats
+and publish a new host revision after a concurrent sample of the old revision. Tests
+hold circuit metadata past the read deadline and reopen a dataset with a nondefault
+aggregate-error reading before its first plan. They also complete a build between the
+catalog's snapshot and its return decision, check metadata while worker and live builders
+are about to publish, and cancel eager fallbacks during result installation, ordered
+output preparation and retained window accounting. Other tests synchronize GC ownership
+release before checkpointing, change mode after the reader's first generation check,
+advance the epoch at expiration, and cancel eager and streaming queries after an
+incomplete view read has waited.
+
 ### Scope changes
 
 **RSP-QL windows and complex event processing.** The non-goal in §1 excluded stream reasoning and windows over time, as in RSP-QL or C-SPARQL, so that a commit stayed the only unit of change. RSP-QL windows and complex event processing are now planned under [ROADMAP](../ROADMAP.md) item 467 in this spec's Roadmap follow-ups.

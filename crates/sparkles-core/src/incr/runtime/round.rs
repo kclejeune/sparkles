@@ -20,6 +20,19 @@ pub(super) fn failure(e: &Error) -> (String, String) {
     (code.to_string(), e.to_string())
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum PassKind {
+    Build,
+    Advance,
+    Skip,
+}
+
+enum CellPass {
+    Done,
+    Busy,
+    Rotated,
+}
+
 impl Runtime {
     /// Run one round: attach pending views, build what needs building and advance
     /// every circuit to the store's head. Returns whether anything was done.
@@ -29,51 +42,89 @@ impl Runtime {
             return false;
         }
         self.attach_pending(store);
-        let cells: Vec<Arc<Cell>> = self.reg.lock().cells.values().cloned().collect();
+        let (target, cells) = {
+            let reg = self.reg.lock();
+            (
+                reg.target_mode(),
+                reg.cells.values().cloned().collect::<Vec<_>>(),
+            )
+        };
         let mut deltas: FxHashMap<u64, Arc<DeltaSet>> = FxHashMap::default();
         let mut worked = false;
+        let mut mode_rotated = false;
         let mut over: Vec<(Arc<Cell>, u64)> = Vec::new();
+        let mut busy: Vec<Arc<Cell>> = Vec::new();
+        // Process idle cells first so a concurrent pass or live-query build on one
+        // circuit cannot delay unrelated views from switching mode and rebuilding.
         for cell in &cells {
-            // the status is read under the state lock: a switch of the inference replaces
-            // the circuit and marks it `building` under that lock
-            let mut deferred = DeferredDrops::default();
+            if self.closed.load(Ordering::Acquire)
+                || !self.mode_is_current(target.generation, target.host_seq)
             {
-                let mut st = cell.state.lock();
-                // Prune departed or explicitly closed live subscribers before admitting
-                // a build or advance pass so the first pass uses the exact active ceiling.
-                st.prune_dead_subs();
-                let status = cell.info.lock().status.clone();
-                match status {
-                    Status::Building => {
-                        self.build(store, cell, &mut st, &mut deferred);
-                        worked = true;
-                    }
-                    Status::Ready => {
-                        if self.advance(store, cell, &mut st, &mut deltas, &mut deferred) {
-                            worked = true;
-                        }
-                    }
-                    Status::Failed { .. } => {}
+                mode_rotated = true;
+                break;
+            }
+            match self.try_round_cell(store, cell, &target, &mut deltas, &mut worked) {
+                CellPass::Done => {
+                    let bytes = cell.info.lock().bytes;
+                    over.push((cell.clone(), bytes));
                 }
-                deferred.retired.extend(st.circuit.drain_retired());
-            }
-            drop(deferred);
-            let bytes = cell.info.lock().bytes;
-            over.push((cell.clone(), bytes));
-        }
-        let internal: Vec<Arc<InternalCell>> = self.reg.lock().internal.values().cloned().collect();
-        for cell in &internal {
-            if cell.handles.load(Ordering::Acquire) > 0 && self.round_internal(store, cell) {
-                worked = true;
+                CellPass::Busy => {
+                    busy.push(cell.clone());
+                }
+                CellPass::Rotated => {
+                    mode_rotated = true;
+                    break;
+                }
             }
         }
-        drop(internal);
-        self.collect_internal(store);
+        if !mode_rotated {
+            for cell in busy.drain(..) {
+                let outcome = {
+                    let Some(st) = self.wait_for_busy_cell(&cell, &target) else {
+                        mode_rotated = true;
+                        break;
+                    };
+                    self.round_cell_locked(
+                        store,
+                        &cell,
+                        st,
+                        &target,
+                        &mut deltas,
+                        &mut worked,
+                        true,
+                    )
+                };
+                match outcome {
+                    CellPass::Done => {
+                        let bytes = cell.info.lock().bytes;
+                        over.push((cell, bytes));
+                    }
+                    CellPass::Busy => {}
+                    CellPass::Rotated => {
+                        mode_rotated = true;
+                        break;
+                    }
+                }
+            }
+        }
+        drop(busy);
+        if !mode_rotated {
+            self.mark_mode_switched(target.generation);
+            let internal: Vec<Arc<InternalCell>> =
+                self.reg.lock().internal.values().cloned().collect();
+            for cell in &internal {
+                if cell.handles.load(Ordering::Acquire) > 0 && self.round_internal(store, cell) {
+                    worked = true;
+                }
+            }
+            drop(internal);
+            self.collect_internal(store);
+        }
         self.budgets(&over);
         drop(over);
         drop(cells);
         self.gc();
-        if self.root.is_some() {
+        if !mode_rotated && self.root.is_some() {
             let due = self.last_checkpoint.lock().elapsed()
                 >= Duration::from_secs(self.opts.read().checkpoint_seconds);
             if due {
@@ -82,7 +133,136 @@ impl Runtime {
         }
         *self.epoch.lock() += 1;
         self.cv.notify_all();
+        if mode_rotated && !self.closed.load(Ordering::Acquire) {
+            self.kick();
+        }
         worked
+    }
+
+    fn try_round_cell(
+        &self,
+        store: &Store,
+        cell: &Arc<Cell>,
+        target: &TargetMode,
+        deltas: &mut FxHashMap<u64, Arc<DeltaSet>>,
+        worked: &mut bool,
+    ) -> CellPass {
+        let Some(st) = cell.state.try_lock() else {
+            return CellPass::Busy;
+        };
+        self.round_cell_locked(store, cell, st, target, deltas, worked, false)
+    }
+
+    fn wait_for_busy_cell<'a>(
+        &self,
+        cell: &'a Cell,
+        target: &TargetMode,
+    ) -> Option<parking_lot::MutexGuard<'a, Slot>> {
+        loop {
+            if self.closed.load(Ordering::Acquire) || self.mode_changed_since(target) {
+                return None;
+            }
+            if let Some(st) = cell.state.try_lock_for(read::WAIT_STEP) {
+                #[cfg(test)]
+                if let Some(hook) = self.busy_locked_hook.lock().clone() {
+                    hook();
+                }
+                // Hosts can consult the registry while a catalog attach holds it
+                // and waits for this cell. Release state before probing the host.
+                drop(st);
+                if self.mode_changed_since(target) {
+                    return None;
+                }
+                if let Some(st) = cell.state.try_lock() {
+                    return (!self.closed.load(Ordering::Acquire)
+                        && self.mode_is_current(target.generation, target.host_seq))
+                    .then_some(st);
+                }
+            }
+            #[cfg(test)]
+            self.busy_waits.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn round_cell_locked<'a>(
+        &self,
+        store: &Store,
+        cell: &'a Arc<Cell>,
+        state: parking_lot::MutexGuard<'a, Slot>,
+        target: &TargetMode,
+        deltas: &mut FxHashMap<u64, Arc<DeltaSet>>,
+        worked: &mut bool,
+        blocking: bool,
+    ) -> CellPass {
+        // Declare deferred drops first so an unwind releases the state lock before
+        // returning retired credit, which may synchronously wake a pool waiter.
+        let mut deferred = DeferredDrops::default();
+        let mut st = state;
+        // Release replaced operators and detached budget leases outside `cell.state`
+        // before starting the replacement build so tight shared pools can recycle the
+        // freed credit instead of failing with `over-budget`.
+        if st.pending_retirement().is_some() {
+            return CellPass::Busy;
+        }
+        if st.mode_gen < target.generation {
+            let switched = self.switch_cell(cell, &mut st, target, &mut deferred);
+            drop(st);
+            drop(std::mem::take(&mut deferred));
+            if switched {
+                *worked = true;
+            }
+            if self.closed.load(Ordering::Acquire)
+                || !self.mode_is_current(target.generation, target.host_seq)
+            {
+                return CellPass::Rotated;
+            }
+            st = if blocking {
+                let Some(st) = self.wait_for_busy_cell(cell, target) else {
+                    return CellPass::Rotated;
+                };
+                st
+            } else {
+                let Some(st) = cell.state.try_lock() else {
+                    return CellPass::Busy;
+                };
+                st
+            };
+        }
+
+        // Revalidate that no newer mode generation was recorded before starting a build
+        // or advance pass under `target`.
+        if self.closed.load(Ordering::Acquire)
+            || !self.mode_is_current(target.generation, target.host_seq)
+            || st.mode_gen < target.generation
+        {
+            drop(st);
+            return CellPass::Rotated;
+        }
+
+        if st.pending_retirement().is_some() {
+            return CellPass::Busy;
+        }
+        // Prune departed or explicitly closed live subscribers before admitting
+        // a build or advance pass so the first pass uses the exact active ceiling.
+        st.prune_dead_subs();
+        let status = cell.info.lock().status.clone();
+        match status {
+            Status::Building => {
+                self.build(store, cell, &mut st, &mut deferred);
+                *worked = true;
+            }
+            Status::Ready => {
+                if self.advance(store, cell, &mut st, deltas, &mut deferred) {
+                    *worked = true;
+                }
+            }
+            Status::Failed { .. } => {}
+        }
+        deferred.retired.extend(st.circuit.drain_retired());
+        drop(st);
+        drop(deferred);
+        CellPass::Done
     }
 
     pub(super) fn control(&self) -> Control {
@@ -100,18 +280,28 @@ impl Runtime {
         }
     }
 
-    pub(super) fn note_pass(&self, cell: &Cell, st: &Slot, took: Duration, skipped: bool) {
+    pub(super) fn note_pass(&self, cell: &Cell, st: &Slot, took: Duration, kind: PassKind) {
         self.seen.fetch_max(st.circuit.applied, Ordering::AcqRel);
-        let mut info = cell.info.lock();
-        info.applied = st.circuit.applied;
-        info.rows = st.circuit.result.total().max(0) as u64;
-        info.bytes = st.circuit.bytes();
-        info.published_bytes = st
+        let rows = st.circuit.result.total().max(0) as u64;
+        let bytes = st.circuit.bytes();
+        let published_bytes = st
             .circuit
             .version
             .as_ref()
             .map_or(0, |v| v.published_bytes());
-        if skipped {
+        #[cfg(test)]
+        if let Some(hook) = self.note_pass_hook.lock().clone() {
+            hook();
+        }
+        let mut info = cell.info.lock();
+        info.applied = st.circuit.applied;
+        info.rows = rows;
+        info.bytes = bytes;
+        info.published_bytes = published_bytes;
+        if matches!(kind, PassKind::Build) {
+            info.status = Status::Ready;
+        }
+        if matches!(kind, PassKind::Skip) {
             info.skipped += 1;
             self.counters.skipped.fetch_add(1, Ordering::Relaxed);
             return;
@@ -136,6 +326,17 @@ impl Runtime {
     }
 
     pub(super) fn fail(&self, cell: &Cell, st: &mut Slot, e: &Error, deferred: &mut DeferredDrops) {
+        self.fail_at_mode_gen(cell, st, e, None, deferred);
+    }
+
+    pub(super) fn fail_at_mode_gen(
+        &self,
+        cell: &Cell,
+        st: &mut Slot,
+        e: &Error,
+        mode_gen: Option<u64>,
+        deferred: &mut DeferredDrops,
+    ) {
         let (code, message) = failure(e);
         tracing::warn!(
             target: "sparkles::incr::runtime",
@@ -145,6 +346,9 @@ impl Runtime {
         st.clear_history();
         st.circuit.clear_state();
         let mut info = cell.info.lock();
+        if let Some(generation) = mode_gen {
+            info.mode_gen = generation;
+        }
         info.rows = 0;
         info.bytes = 0;
         info.status = Status::Failed { code, message };
@@ -171,8 +375,7 @@ impl Runtime {
         // a rebuild's change reaches live queries
         match st.evaluate(snap, &self.control()) {
             Ok(change) => {
-                cell.info.lock().status = Status::Ready;
-                self.note_pass(cell, st, t0.elapsed(), false);
+                self.note_pass(cell, st, t0.elapsed(), PassKind::Build);
                 let ev_boundary_crossed = restricted
                     && had_snap
                     && (ev_mismatch || st.circuit.evidence_stamp() != prev_stamp);
@@ -233,8 +436,7 @@ impl Runtime {
                     drop(c);
                     drop(c_lease);
                     self.counters.resets.fetch_add(1, Ordering::Relaxed);
-                    cell.info.lock().status = Status::Ready;
-                    self.note_pass(cell, st, t0.elapsed(), false);
+                    self.note_pass(cell, st, t0.elapsed(), PassKind::Build);
                     self.live_budgets_inner(st, true, deferred);
                     self.publish_evidence_reset(st, deferred);
                 }
@@ -262,13 +464,13 @@ impl Runtime {
         let took = t0.elapsed();
         match r {
             Ok(crate::incr::circuit::ChargedAdvance::Skipped) => {
-                self.note_pass(cell, st, took, true);
+                self.note_pass(cell, st, took, PassKind::Skip);
                 let to = st.circuit.applied;
                 let max = self.opts.read().history_commits;
                 st.remember(from, to, Arc::from(Vec::new()), max);
             }
             Ok(crate::incr::circuit::ChargedAdvance::Changed(c, c_lease)) => {
-                self.note_pass(cell, st, took, false);
+                self.note_pass(cell, st, took, PassKind::Advance);
                 self.publish(st, from, c, c_lease, false, deferred);
             }
             Ok(crate::incr::circuit::ChargedAdvance::Reset(c, c_lease)) => {
@@ -280,8 +482,7 @@ impl Runtime {
                         st.circuit.applied
                     );
                 }
-                cell.info.lock().status = Status::Ready;
-                self.note_pass(cell, st, took, false);
+                self.note_pass(cell, st, took, PassKind::Build);
                 let ev_now_changed =
                     restricted && (ev_changed || st.circuit.evidence_stamp() != prev_stamp);
                 if ev_now_changed {
@@ -747,6 +948,7 @@ impl Runtime {
         let mut deferred = DeferredDrops::default();
         {
             let mut reg = self.reg.lock();
+            let mode_gen = reg.mode_gen;
             reg.cells.retain(|_, c| {
                 if c.pending.load(Ordering::Acquire) > 0 {
                     return true;
@@ -754,6 +956,11 @@ impl Runtime {
                 match c.state.try_lock() {
                     Some(mut st) => {
                         let keep = st.alive();
+                        if !keep && st.mode_gen < mode_gen {
+                            let boundary =
+                                self.seen.load(Ordering::Acquire).max(st.circuit.applied);
+                            self.switched.fetch_max(boundary, Ordering::AcqRel);
+                        }
                         deferred.retired.extend(st.circuit.drain_retired());
                         if !keep {
                             deferred.cells.push(c.clone());

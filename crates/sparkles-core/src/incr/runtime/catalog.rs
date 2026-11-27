@@ -36,10 +36,11 @@ impl Runtime {
         compile(&q, whole_reason(access.as_ref()))?;
         let mut deferred = DeferredDrops::default();
         let mut need_gc = false;
-        let res = {
+        self.refresh_mode();
+        let (res, target, lagging) = {
             let mut reg = self.reg.lock();
             reg.writable()?;
-            self.sync_inference(&mut reg, host.as_ref(), &mut deferred);
+            let (target, lagging) = self.lagging_cells(&mut reg);
             // a new definition is the operator's: it runs, and no longer waits for a check
             if let Some(root) = &self.root {
                 views::write(root, name, &def)?;
@@ -53,9 +54,18 @@ impl Runtime {
             reg.views
                 .insert(name.to_string(), ViewEntry::new(name, def, None));
             *self.defs.write() = reg.defs();
-            self.attach(store, &mut reg, name, &mut deferred.retired)
+            let res = self.attach(store, &mut reg, name, &mut deferred.retired);
+            (res, target, lagging)
+        };
+        let any_busy = if !lagging.is_empty() {
+            self.try_switch_cells(&lagging, &target, &mut deferred)
+        } else {
+            false
         };
         drop(deferred);
+        if !lagging.is_empty() && !any_busy {
+            self.mark_mode_switched(target.generation);
+        }
         if need_gc {
             self.gc();
         }
@@ -115,7 +125,19 @@ impl Runtime {
         Ok(())
     }
 
-    pub(super) fn info(&self, name: &str, e: &ViewEntry, head: u64) -> ViewInfo {
+    pub(super) fn info(&self, name: &str, e: &ViewEntry, head: u64, reg: &Registry) -> ViewInfo {
+        let snapshot = e.cell.as_ref().map(|cell| cell.info.lock().clone());
+        self.info_from_snapshot(name, e, head, reg, snapshot)
+    }
+
+    fn info_from_snapshot(
+        &self,
+        name: &str,
+        e: &ViewEntry,
+        head: u64,
+        reg: &Registry,
+        snapshot: Option<cell::Info>,
+    ) -> ViewInfo {
         let mut v = ViewInfo {
             name: name.to_string(),
             definition: e.def.clone(),
@@ -139,28 +161,36 @@ impl Runtime {
         } else if let Some(err) = &e.error {
             v.state = ViewState::Failed { error: err.clone() };
         }
-        let Some(cell) = &e.cell else {
+        let Some(i) = snapshot else {
             return v;
         };
-        let i = cell.info.lock().clone();
-        if i.status_ready() {
+        let stale_mode = !self.mode_is_current(i.mode_gen, reg.host_seq);
+        if i.status_ready() && !stale_mode {
             v.commit = Some(i.applied);
         }
         v.columns = i.columns;
-        v.evaluation = Some(if i.whole.is_some() {
+        let whole = if stale_mode {
+            whole_reason(e.access.as_ref())
+                .map(str::to_string)
+                .or_else(|| reg.inference.as_ref().map(|inf| inf.reason().to_string()))
+        } else {
+            i.whole
+        };
+        v.evaluation = Some(if whole.is_some() {
             crate::incr::ops::Mode::Recompute
         } else {
             crate::incr::ops::Mode::Incremental
         });
-        v.evaluation_reason = i.whole;
-        v.plan = Some(i.plan);
-        v.rows = i.rows;
+        v.evaluation_reason = whole;
+        v.plan = (!stale_mode).then_some(i.plan);
+        v.rows = if stale_mode { 0 } else { i.rows };
         v.state_bytes = i.bytes;
         v.passes = i.passes;
         v.skipped = i.skipped;
         v.pass_ms = i.pass_time.as_secs_f64() * 1e3;
         v.recompute_ms = i.recompute_time.as_secs_f64() * 1e3;
         v.state = match i.status {
+            _ if stale_mode => ViewState::Building,
             Status::Building => ViewState::Building,
             Status::Ready if i.applied >= head => ViewState::Current,
             Status::Ready => ViewState::Behind {
@@ -187,32 +217,22 @@ impl Runtime {
     pub fn get(&self, store: &Store, name: &str) -> Result<ViewInfo> {
         let _operation = Operation::enter();
         let head = store.snapshot().commit;
-        let mut deferred = DeferredDrops::default();
-        let out = {
-            let mut reg = self.reg.lock();
-            self.sync_for_read(&mut reg, &mut deferred);
-            let e = reg.view(name)?;
-            Ok(self.info(name, e, head))
-        };
-        drop(deferred);
-        out
+        self.sync_mode_nonblocking();
+        let reg = self.reg.lock();
+        let e = reg.view(name)?;
+        Ok(self.info(name, e, head, &reg))
     }
 
     /// Every view with its state, by name.
     pub fn list(&self, store: &Store) -> Vec<ViewInfo> {
         let _operation = Operation::enter();
         let head = store.snapshot().commit;
-        let mut deferred = DeferredDrops::default();
-        let out = {
-            let mut reg = self.reg.lock();
-            self.sync_for_read(&mut reg, &mut deferred);
-            reg.views
-                .iter()
-                .map(|(n, e)| self.info(n, e, head))
-                .collect()
-        };
-        drop(deferred);
-        out
+        self.sync_mode_nonblocking();
+        let reg = self.reg.lock();
+        reg.views
+            .iter()
+            .map(|(n, e)| self.info(n, e, head, &reg))
+            .collect()
     }
 
     /// The names and definitions of the views.
@@ -229,6 +249,8 @@ impl Runtime {
     pub fn wait_built(&self, name: &str, timeout: Duration) -> Result<ViewInfo> {
         let _operation = Operation::enter();
         let until = Instant::now() + timeout;
+        let mut last_info: Option<ViewInfo> = None;
+        let mut final_check = false;
         loop {
             if self.is_closed() {
                 return Err(crate::incr::error(
@@ -236,55 +258,65 @@ impl Runtime {
                     "the dataset is closing",
                 ));
             }
-            let epoch = self.round_epoch();
-            let mut deferred = DeferredDrops::default();
-            let (cell, err) = {
-                let mut reg = self.reg.lock();
-                self.sync_for_read(&mut reg, &mut deferred);
-                let e = reg.view(name)?;
-                (
-                    e.cell.clone(),
-                    e.suspended.clone().or_else(|| e.error.clone()),
-                )
+            let round_start = self.round_epoch();
+            let now = Instant::now();
+            let reg_guard = if final_check || now >= until {
+                self.reg.try_lock()
+            } else {
+                self.reg.try_lock_until((now + read::WAIT_STEP).min(until))
             };
-            drop(deferred);
-            if err.is_some() {
-                break;
-            }
-            if cell.is_some_and(|c| c.info.lock().status != Status::Building) {
-                break;
-            }
-            if self.is_closed() {
-                return Err(crate::incr::error(
-                    "views-unavailable",
-                    "the dataset is closing",
-                ));
-            }
-            self.kick();
-            if !self.wait_round_after(epoch, until) {
+            let observed = if let Some(reg) = reg_guard {
                 if self.is_closed() {
                     return Err(crate::incr::error(
                         "views-unavailable",
                         "the dataset is closing",
                     ));
                 }
-                if Instant::now() >= until {
+                let e = reg.view(name)?;
+                let snapshot = e
+                    .cell
+                    .as_ref()
+                    .and_then(|c| c.info.try_lock().map(|i| i.clone()));
+                if snapshot.is_some() || e.cell.is_none() {
+                    let head = snapshot.as_ref().map_or(0, |i| i.applied);
+                    let info = self.info_from_snapshot(name, e, head, &reg, snapshot);
+                    #[cfg(test)]
+                    if let Some(hook) = self.wait_info_hook.lock().clone() {
+                        hook();
+                    }
+                    Some(info)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(info) = observed {
+                let ready = info.state != ViewState::Building;
+                last_info = Some(info);
+                if ready {
                     break;
                 }
             }
+            if final_check || Instant::now() >= until {
+                break;
+            }
+            self.kick();
+            let step = (Instant::now() + read::WAIT_STEP).min(until);
+            #[cfg(test)]
+            self.before_observer_wait(until);
+            self.wait_round_after(round_start, step);
+            final_check = Instant::now() >= until;
         }
         #[cfg(test)]
         fire_wait_built_final_hook();
-        let reg = self.reg.lock();
         if self.is_closed() {
             return Err(crate::incr::error(
                 "views-unavailable",
                 "the dataset is closing",
             ));
         }
-        let e = reg.view(name)?;
-        let head = e.cell.as_ref().map_or(0, |c| c.info.lock().applied);
-        Ok(self.info(name, e, head))
+        last_info.ok_or(Error::Timeout)
     }
 }
 

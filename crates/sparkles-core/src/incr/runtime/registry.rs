@@ -25,10 +25,28 @@ pub(super) struct LiveRegistration {
     pub(super) queue: Weak<Shared>,
 }
 
+/// A snapshot of the runtime's target inference and aggregate-error reading with its
+/// monotonically increasing mode generation.
+#[derive(Clone)]
+pub(super) struct TargetMode {
+    pub(super) generation: u64,
+    pub(super) host_seq: u64,
+    pub(super) inference: Option<Arc<Inference>>,
+    pub(super) aggregate_errors: crate::sparql::AggregateErrors,
+}
+
 #[derive(Default)]
 pub(super) struct Registry {
     pub(super) cells: FxHashMap<u64, Arc<Cell>>,
     pub(super) live: Vec<LiveRegistration>,
+    /// monotonically increasing generation bumped whenever `inference` or
+    /// `aggregate_errors` changes
+    pub(super) mode_gen: u64,
+    /// host revision whose mode has been recorded on `reg`
+    pub(super) host_seq: u64,
+    pub(super) mode_sample: u64,
+    /// highest `mode_gen` known to have been applied to every cell in `cells`
+    pub(super) switched_gen: u64,
     /// the dataset's inference that every circuit is compiled for
     pub(super) inference: Option<Arc<Inference>>,
     /// the dataset's reading of errors in aggregates, which every circuit runs with
@@ -115,6 +133,17 @@ impl Registry {
             }
         }
         reg
+    }
+
+    /// The target inference and aggregate-error reading at the registry's current
+    /// mode generation.
+    pub(super) fn target_mode(&self) -> TargetMode {
+        TargetMode {
+            generation: self.mode_gen,
+            host_seq: self.host_seq,
+            inference: self.inference.clone(),
+            aggregate_errors: self.aggregate_errors,
+        }
     }
 
     /// View `name`, or `view-not-found`.
