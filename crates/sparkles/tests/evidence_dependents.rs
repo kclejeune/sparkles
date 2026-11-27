@@ -647,6 +647,7 @@ fn reports_whose_activity_used_changed_records_are_found() {
         &ds,
         &EvidenceInput {
             revisions: vec![SourceRevisionInput {
+                was_revision_of: None,
                 version: RecordVersion::V1,
                 key: key("rev"),
                 source: iri("urn:source:advisory"),

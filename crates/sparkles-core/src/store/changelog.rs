@@ -3395,7 +3395,10 @@ fn decode_record_meta_prefix(prefix: &[u8], expected_seq: u64) -> Option<ChangeC
         return None;
     }
     match ty {
-        REC_CHANGES | REC_SUMMARY => decode_meta(&mut c, seq),
+        REC_CHANGES | REC_SUMMARY => decode_meta_with(&mut c, seq, &Unlimited)
+            .ok()
+            .flatten()
+            .map(Arc::unwrap_or_clone),
         _ => None,
     }
 }
@@ -3417,17 +3420,17 @@ fn read_record_meta_from_file(f: &File, offset: u64, expected_seq: u64) -> Resul
     const INITIAL_PREFIX: usize = 4096;
     const MAX_META_PREFIX: usize = 1 << 20;
     const CRC_CHUNK: usize = 64 << 10;
-    let map_eof = |e: std::io::Error| {
-        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+    let map_eof = |e: Error| {
+        if matches!(&e, Error::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
             Error::Corrupt(format!(
                 "truncated change-log record for commit {expected_seq} at offset {offset}"
             ))
         } else {
-            e.into()
+            e
         }
     };
     let mut h = [0u8; 8];
-    read_exact_at(f, &mut h, offset).map_err(map_eof)?;
+    read_exact_at_with(f, &mut h, offset, &Unlimited).map_err(map_eof)?;
     let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
     let expected_crc = u32::from_le_bytes(h[4..8].try_into().unwrap());
     if len == 0 {
@@ -3437,7 +3440,7 @@ fn read_record_meta_from_file(f: &File, offset: u64, expected_seq: u64) -> Resul
     }
     let first_read = len.min(INITIAL_PREFIX);
     let mut buf = vec![0u8; first_read];
-    read_exact_at(f, &mut buf, offset + 8).map_err(map_eof)?;
+    read_exact_at_with(f, &mut buf, offset + 8, &Unlimited).map_err(map_eof)?;
 
     let mut crc = flate2::Crc::new();
     crc.update(&buf);
@@ -3453,8 +3456,13 @@ fn read_record_meta_from_file(f: &File, offset: u64, expected_seq: u64) -> Resul
         if len > first_read && header_ok {
             let cap = len.min(MAX_META_PREFIX);
             buf.resize(cap, 0);
-            read_exact_at(f, &mut buf[first_read..], offset + 8 + first_read as u64)
-                .map_err(map_eof)?;
+            read_exact_at_with(
+                f,
+                &mut buf[first_read..],
+                offset + 8 + first_read as u64,
+                &Unlimited,
+            )
+            .map_err(map_eof)?;
             crc.update(&buf[first_read..]);
             hashed = cap;
             decode_record_meta_prefix(&buf, expected_seq).ok_or_else(|| {
@@ -3475,7 +3483,8 @@ fn read_record_meta_from_file(f: &File, offset: u64, expected_seq: u64) -> Resul
         let mut chunk = vec![0u8; (len - hashed).min(CRC_CHUNK)];
         while hashed < len {
             let n = (len - hashed).min(chunk.len());
-            read_exact_at(f, &mut chunk[..n], offset + 8 + hashed as u64).map_err(map_eof)?;
+            read_exact_at_with(f, &mut chunk[..n], offset + 8 + hashed as u64, &Unlimited)
+                .map_err(map_eof)?;
             crc.update(&chunk[..n]);
             hashed += n;
         }

@@ -1256,6 +1256,26 @@ fn reconciling_after_output_detach_rebuilds_from_vouched_supports() {
         .unwrap()
     );
 
+    let visible = sparkles::sparql::query(
+        ds.store().snapshot(),
+        &format!("ASK {{ GRAPH <{OUTPUT}> {{ <urn:release> <urn:affectedBy> <urn:cve1> }} }}"),
+        &sparkles::sparql::QueryOptions {
+            graphs: Some(Arc::new(GraphAccess::graphs(
+                Graphs::Only(GraphRule::new(
+                    [SOURCES, CLAIMS, DECISIONS, SUPPORTS, OUTPUT],
+                    &[],
+                )),
+                Graphs::none(),
+            ))),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        visible.boolean,
+        "restricted reads must see the reconciled projection"
+    );
+
     // Replay returns the first receipt; different payload conflicts.
     let replay = reconcile(&ds, "main", Some(1), &opts).unwrap();
     assert!(!replay.committed && replay.replayed);

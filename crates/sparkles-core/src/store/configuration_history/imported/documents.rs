@@ -372,7 +372,7 @@ pub(super) fn source_header(
                     memory: Some(allowance),
                     held: 0,
                 })?;
-                let physical = crate::commit::decode_gen_commit_bytes_controlled(
+                let physical = crate::commit::decode_gen_commit_bytes_with(
                     Path::new("original-primary/commit.json"),
                     &commit_bytes.value,
                     &mut budget,

@@ -1325,6 +1325,7 @@ const EXTRA_KEYS: &[&str] = &[
     "dataset.clone_to_memory_with",
     "dataset.branch",
     "dataset.run_mapping",
+    "evidence.claim_states",
     "history.wait_for_commit",
     "history.prune",
     "history.tick",
@@ -1361,6 +1362,7 @@ fn check_library_only_calls(ds: &Dataset, cat: &sparkles::Catalog) {
     ds.run_mapping("", None, &any(), &any(), None);
     ds.clone_to_with("clone", &Default::default(), &Default::default());
     ds.clone_to_memory_with("clone", &Default::default(), &Default::default());
+    let _ = sparkles::evidence::binding::claim_states(ds, None, None, "", &[], &any());
     ds.algorithms().query_text(&any(), false);
     ds.algorithms().stats(&any(), &Default::default());
     ds.algorithms().run_write(

@@ -1168,6 +1168,7 @@ mod tests {
                 &ds,
                 &EvidenceInput {
                     revisions: vec![SourceRevisionInput {
+                        was_revision_of: None,
                         version: RecordVersion::V1,
                         key: key("rev"),
                         source: iri("urn:source:registry"),
@@ -1285,6 +1286,7 @@ mod tests {
                     &ds,
                     &EvidenceInput {
                         revisions: vec![SourceRevisionInput {
+                            was_revision_of: None,
                             version: RecordVersion::V1,
                             key: key("rev-alias"),
                             source: iri("urn:source:alias-reg"),
@@ -1914,6 +1916,7 @@ mod tests {
                 &ds,
                 &EvidenceInput {
                     revisions: vec![SourceRevisionInput {
+                        was_revision_of: None,
                         version: RecordVersion::V1,
                         key: key("rev-evp"),
                         source: iri("urn:source:evp"),

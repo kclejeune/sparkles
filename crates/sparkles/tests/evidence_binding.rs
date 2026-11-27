@@ -76,6 +76,43 @@ fn claim_proposal_bytes(source: &str, occ: &str) -> Vec<u8> {
     .unwrap()
 }
 
+#[test]
+fn proposal_preserves_source_revision_predecessors() {
+    let ds = Dataset::memory();
+    let control = Control::none();
+    binding::configure(&ds, &settings_bytes(), &control).unwrap();
+    let proposal = json!({
+        "revisions": [
+            {
+                "key": "first",
+                "source": "urn:bulletin",
+                "sourceKey": "first",
+                "content": {"text": "first revision"}
+            },
+            {
+                "key": "second",
+                "source": "urn:bulletin",
+                "sourceKey": "second",
+                "content": {"text": "second revision"},
+                "wasRevisionOf": {"key": "first"}
+            }
+        ]
+    });
+    let receipt = binding::propose_bytes(
+        &ds,
+        None,
+        None,
+        None,
+        &serde_json::to_vec(&proposal).unwrap(),
+        &control,
+    )
+    .unwrap();
+    assert_eq!(receipt["committed"], true);
+    assert!(ds.ask(&format!(
+        "ASK {{ GRAPH <{SOURCES_G}> {{ ?later <http://www.w3.org/ns/prov#wasRevisionOf> ?earlier }} }}"
+    )).unwrap());
+}
+
 /// Regression for F2 (Sol P1 #2): hold listing reads only the branch table and never takes
 /// writer locks, so it does not deadlock when a write transaction is open on a persistent store.
 #[test]

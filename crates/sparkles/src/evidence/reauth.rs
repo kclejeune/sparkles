@@ -1000,6 +1000,7 @@ mod tests {
         evidence::configure(&ds, &settings, &Control::none()).unwrap();
         let mut batch = EvidenceInput::default();
         batch.revisions.push(SourceRevisionInput {
+            was_revision_of: None,
             version: RecordVersion::V1,
             key: RecordKey::new("rev").unwrap(),
             source: NamedNode::new_unchecked("https://example.org/src"),
@@ -1388,6 +1389,7 @@ mod tests {
         let popts = ProposeOptions::new(NamedNode::new_unchecked("urn:x-sparkles:principal:imp"));
         let mut rev_batch = EvidenceInput::default();
         rev_batch.revisions.push(SourceRevisionInput {
+            was_revision_of: None,
             version: RecordVersion::V1,
             key: RecordKey::new("rev-shared").unwrap(),
             source: NamedNode::new_unchecked("https://example.org/src/shared"),

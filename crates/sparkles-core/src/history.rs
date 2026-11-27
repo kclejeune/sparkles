@@ -652,7 +652,7 @@ pub(crate) fn read_file_controlled(
         }
         Err(e) => return Err(e),
     };
-    decode_file_controlled(&bytes, dataset_id, budget)
+    decode_file_with(&bytes, dataset_id, budget)
 }
 
 /// Validate current history metadata without startup writers or recovery cleanup.

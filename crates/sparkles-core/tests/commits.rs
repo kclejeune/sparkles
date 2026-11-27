@@ -725,10 +725,15 @@ fn an_unframed_delta_vocabulary_is_refused_with_dump_and_reload() {
     assert_eq!(sparkles_core::commit::DATASET_READER, 11);
     let mut ds: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("dataset.json")).unwrap()).unwrap();
-    ds["minimumReader"] = serde_json::json!(sparkles_core::commit::DATASET_READER + 1);
+    let newer_reader = sparkles_core::commit::DATASET_READER + 1;
+    ds["minimumReader"] = serde_json::json!(newer_reader);
     std::fs::write(root.join("dataset.json"), ds.to_string()).unwrap();
     let e = Store::open(&root, StoreOptions::default()).err().unwrap();
-    assert!(e.to_string().contains("requires reader 11"), "{e}");
+    assert!(
+        e.to_string()
+            .contains(&format!("requires reader {newer_reader}")),
+        "{e}"
+    );
     assert!(e.to_string().contains("newer release"), "{e}");
 }
 

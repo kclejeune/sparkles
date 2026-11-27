@@ -320,7 +320,7 @@ pub(in crate::store) fn authenticate_retained_generation(
             budget.release(physical.charge);
         }
         let vocabulary = cold::head_vocabulary_controlled(&entry.dir, &family_root, &mut budget)?;
-        let terms = vocabulary.value.len_limited(&budget.owned_limit()?)?;
+        let terms = vocabulary.value.len_with(&budget)?;
         let annotations =
             crate::annotations::seqs_controlled(&family_root, store.dataset_id, &mut budget)?;
         let path = entry.dir.join("wal.log");
@@ -1082,16 +1082,17 @@ pub(in crate::store) fn cold_commit_snapshot_limited(
     else {
         return Ok(None);
     };
-    let loaded = match cold::read_link_controlled(&selected.value.dir, &mut budget)? {
-        Some(file) => Generation::open_linked_controlled(
+    let loaded = match link::read_link_with(&selected.value.dir, &mut budget)? {
+        Some(file) => Generation::open_linked_with(
             &selected.value.dir,
             &selected.value.name,
             root,
             file,
+            true,
             cache,
             &mut budget,
         )?,
-        None => Generation::open_sealed_controlled(
+        None => Generation::open_sealed_with(
             &selected.value.dir,
             &selected.value.name,
             None,
@@ -1100,7 +1101,7 @@ pub(in crate::store) fn cold_commit_snapshot_limited(
     };
     let generation_bytes = loaded.charge;
     let generation = Arc::new(loaded.value);
-    let terms = generation.dvocab.len_limited(&budget.owned_limit()?)?;
+    let terms = generation.dvocab.len_with(&budget)?;
     let mut wal_config = None;
     let target = if seq == selected.value.base.seq {
         wal::WalPoint { seq, offset: 0 }

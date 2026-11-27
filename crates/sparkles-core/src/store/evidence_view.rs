@@ -1339,7 +1339,7 @@ impl HistoryOrigin {
             let gen_bytes = if Arc::ptr_eq(&cached.generation, &live.generation) {
                 0
             } else {
-                cached.generation.retained_bytes_limited(&limit)?
+                cached.generation.retained_bytes_with(&limit)?
             };
             (
                 cached,
@@ -1352,21 +1352,19 @@ impl HistoryOrigin {
             let (generation, gen_bytes) = if owner == current_gen {
                 (live.generation.clone(), 0u64)
             } else {
-                let loaded = match cold::read_link_controlled(&entry.dir, &mut budget)? {
-                    Some(file) => Generation::open_linked_controlled(
+                let loaded = match link::read_link_with(&entry.dir, &mut budget)? {
+                    Some(file) => Generation::open_linked_with(
                         &entry.dir,
                         &entry.name,
                         root,
                         file,
+                        true,
                         cache,
                         &mut budget,
                     )?,
-                    None => Generation::open_sealed_controlled(
-                        &entry.dir,
-                        &entry.name,
-                        None,
-                        &mut budget,
-                    )?,
+                    None => {
+                        Generation::open_sealed_with(&entry.dir, &entry.name, None, &mut budget)?
+                    }
                 };
                 (Arc::new(loaded.value), loaded.charge)
             };
@@ -1410,7 +1408,7 @@ impl HistoryOrigin {
             }
             let delta_bytes = history_limited::preparation_delta_bytes(&delta)
                 .max(history_limited::SHARED_SNAPSHOT_BYTES);
-            let dvocab_len = generation.dvocab.len_limited(&limit)?;
+            let dvocab_len = generation.dvocab.len_with(&limit)?;
             let built = Arc::new(
                 SnapshotBuilder::of_generation(
                     snapshot::Shared {

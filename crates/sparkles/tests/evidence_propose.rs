@@ -3507,6 +3507,7 @@ fn proposing_passages_against_an_existing_rendition_verifies_revision_and_text()
     configured(&ds);
     let unicode_text = "naïve café 🦀 release 1.2 is affected.";
     let rev_input = SourceRevisionInput {
+        was_revision_of: None,
         version: RecordVersion::V1,
         key: key("rev"),
         source: iri("urn:bulletin"),
@@ -3932,6 +3933,7 @@ fn referencing_an_existing_passage_verifies_its_revision_and_rendition() {
         &ds,
         &EvidenceInput {
             revisions: vec![SourceRevisionInput {
+                was_revision_of: None,
                 version: RecordVersion::V1,
                 key: key("rev2"),
                 source: iri("urn:bulletin-2"),
@@ -4202,6 +4204,7 @@ fn structured_references_verify_against_existing_and_non_json_revisions() {
         &EvidenceInput {
             revisions: vec![
                 SourceRevisionInput {
+                    was_revision_of: None,
                     version: RecordVersion::V1,
                     key: key("json-rev"),
                     source: iri("urn:advisory:json"),
@@ -4216,6 +4219,7 @@ fn structured_references_verify_against_existing_and_non_json_revisions() {
                     lineage: Default::default(),
                 },
                 SourceRevisionInput {
+                    was_revision_of: None,
                     version: RecordVersion::V1,
                     key: key("text-rev"),
                     source: iri("urn:advisory:text"),
@@ -4230,6 +4234,7 @@ fn structured_references_verify_against_existing_and_non_json_revisions() {
                     lineage: Default::default(),
                 },
                 SourceRevisionInput {
+                    was_revision_of: None,
                     version: RecordVersion::V1,
                     key: key("bin-rev"),
                     source: iri("urn:advisory:bin"),
@@ -4246,6 +4251,7 @@ fn structured_references_verify_against_existing_and_non_json_revisions() {
                     lineage: Default::default(),
                 },
                 SourceRevisionInput {
+                    was_revision_of: None,
                     version: RecordVersion::V1,
                     key: key("dup-rev"),
                     source: iri("urn:advisory:dup"),
@@ -4260,6 +4266,7 @@ fn structured_references_verify_against_existing_and_non_json_revisions() {
                     lineage: Default::default(),
                 },
                 SourceRevisionInput {
+                    was_revision_of: None,
                     version: RecordVersion::V1,
                     key: key("meta-rev"),
                     source: iri("urn:advisory:meta"),
@@ -4351,6 +4358,7 @@ fn structured_references_verify_against_existing_and_non_json_revisions() {
         &ds,
         &EvidenceInput {
             revisions: vec![SourceRevisionInput {
+                was_revision_of: None,
                 version: RecordVersion::V1,
                 key: key("json-rev"),
                 source: iri("urn:advisory:json"),
@@ -4502,6 +4510,7 @@ fn structured_references_verify_against_existing_and_non_json_revisions() {
             &ds,
             &EvidenceInput {
                 revisions: vec![SourceRevisionInput {
+                    was_revision_of: None,
                     version: RecordVersion::V1,
                     key: key("local-text"),
                     source: iri("urn:local:text"),
@@ -4537,6 +4546,7 @@ fn structured_references_verify_against_existing_and_non_json_revisions() {
             &ds,
             &EvidenceInput {
                 revisions: vec![SourceRevisionInput {
+                    was_revision_of: None,
                     version: RecordVersion::V1,
                     key: key("local-meta"),
                     source: iri("urn:local:meta"),
@@ -4620,6 +4630,7 @@ fn structured_references_verify_against_existing_and_non_json_revisions() {
         &ds,
         &EvidenceInput {
             revisions: vec![SourceRevisionInput {
+                was_revision_of: None,
                 version: RecordVersion::V1,
                 key: key("big-rev"),
                 source: iri("urn:advisory:big"),
@@ -4686,6 +4697,7 @@ fn propose_masked_and_metadata_only_selections_match_missing_and_deduplicate_pas
         &EvidenceInput {
             revisions: vec![
                 SourceRevisionInput {
+                    was_revision_of: None,
                     version: RecordVersion::V1,
                     key: key("rev1"),
                     source: iri("urn:doc:1"),
@@ -4700,6 +4712,7 @@ fn propose_masked_and_metadata_only_selections_match_missing_and_deduplicate_pas
                     lineage: Default::default(),
                 },
                 SourceRevisionInput {
+                    was_revision_of: None,
                     version: RecordVersion::V1,
                     key: key("rev2"),
                     source: iri("urn:doc:2"),
@@ -4993,6 +5006,7 @@ fn propose_mixed_batches_preserve_masked_vs_missing_parity_and_input_order() {
         &EvidenceInput {
             revisions: vec![
                 SourceRevisionInput {
+                    was_revision_of: None,
                     version: RecordVersion::V1,
                     key: key("rev1"),
                     source: iri("urn:doc:mix-1"),
@@ -5007,6 +5021,7 @@ fn propose_mixed_batches_preserve_masked_vs_missing_parity_and_input_order() {
                     lineage: Default::default(),
                 },
                 SourceRevisionInput {
+                    was_revision_of: None,
                     version: RecordVersion::V1,
                     key: key("rev-meta"),
                     source: iri("urn:doc:mix-meta"),
@@ -5460,6 +5475,7 @@ fn propose_same_iri_selection_precedes_incompatible_kind_constraint() {
         &ds,
         &EvidenceInput {
             revisions: vec![SourceRevisionInput {
+                was_revision_of: None,
                 version: RecordVersion::V1,
                 key: key("rev-other"),
                 source: iri("urn:doc:same-other"),
@@ -5484,6 +5500,7 @@ fn propose_same_iri_selection_precedes_incompatible_kind_constraint() {
         &EvidenceInput {
             revisions: vec![
                 SourceRevisionInput {
+                    was_revision_of: None,
                     version: RecordVersion::V1,
                     key: key("rev1"),
                     source: iri("urn:doc:same-1"),
@@ -5498,6 +5515,7 @@ fn propose_same_iri_selection_precedes_incompatible_kind_constraint() {
                     lineage: Default::default(),
                 },
                 SourceRevisionInput {
+                    was_revision_of: None,
                     version: RecordVersion::V1,
                     key: key("rev-meta"),
                     source: iri("urn:doc:same-meta"),

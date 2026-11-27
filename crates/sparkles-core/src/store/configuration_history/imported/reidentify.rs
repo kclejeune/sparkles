@@ -840,7 +840,7 @@ fn read_disk_original_base(
         memory: Some(allowance),
         held: 0,
     })?;
-    let physical = crate::commit::decode_gen_commit_bytes_controlled(
+    let physical = crate::commit::decode_gen_commit_bytes_with(
         Path::new("original-primary/commit.json"),
         &commit.value,
         &mut budget,
@@ -2430,7 +2430,7 @@ pub(in crate::store) fn reidentify_activated_dir_with(
             memory: Some(allowance),
             held: 0,
         })?;
-        crate::commit::decode_gen_commit_bytes_controlled(
+        crate::commit::decode_gen_commit_bytes_with(
             &gen_dir.join("commit.json"),
             &src_commit_bytes.value,
             &mut budget,
@@ -2684,7 +2684,7 @@ fn compute_wal_suffix_interval_bounded(
     let mut reader = std::io::BufReader::new(file.try_clone()?);
     let extent = wal::probe::committed_bound(&mut reader, file_len, &budget)?;
     let vocab = cold::head_vocabulary_controlled(gen_dir, root, &mut budget)?;
-    let terms = vocab.value.len_limited(&budget.owned_limit()?)?;
+    let terms = vocab.value.len_with(&budget)?;
     let annotations = crate::annotations::seqs_controlled(root, old_id, &mut budget)?;
     let mut first_seq = None;
     let mut first_start = None;

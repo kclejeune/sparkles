@@ -123,6 +123,7 @@ fn propose_in(
 ) -> (NamedNode, Sha256Digest) {
     let input = EvidenceInput {
         revisions: vec![SourceRevisionInput {
+            was_revision_of: None,
             version: RecordVersion::V1,
             key: key("rev"),
             source: iri(&format!("urn:source:{source_key}")),
@@ -393,6 +394,7 @@ fn supporting_evidence_links_and_stored_facts_must_be_readable() {
     let text = "Release is affected by cve-3.";
     let pass_input = EvidenceInput {
         revisions: vec![SourceRevisionInput {
+            was_revision_of: None,
             version: RecordVersion::V1,
             key: key("rev-b"),
             source: iri("urn:source:secret-doc"),
@@ -489,6 +491,7 @@ fn supporting_evidence_links_and_stored_facts_must_be_readable() {
 
     let claim_with_secret_passage = EvidenceInput {
         revisions: vec![SourceRevisionInput {
+            was_revision_of: None,
             version: RecordVersion::V1,
             key: key("rev-a"),
             source: iri("urn:source:pub-doc"),
@@ -1059,6 +1062,7 @@ fn stored_fact_enforces_branch_retention_blank_anchor_and_recursive_projection_v
     let propose_with_fact = |occurrence: &str, prop: Triple, fact: StoredFactRef| {
         let input = EvidenceInput {
             revisions: vec![SourceRevisionInput {
+                was_revision_of: None,
                 version: RecordVersion::V1,
                 key: key("rev"),
                 source: iri(&format!("urn:source:{occurrence}")),
@@ -1590,6 +1594,7 @@ fn triple_protections_on_projection_receipt_and_passage_selector_withhold_suppor
     // Propose a claim backed by a passage (which writes `<passage>#selector` with `oa:start`).
     let pass_input = EvidenceInput {
         revisions: vec![SourceRevisionInput {
+            was_revision_of: None,
             version: RecordVersion::V1,
             key: key("rev-p"),
             source: iri("urn:source:pass-doc"),
@@ -1781,6 +1786,7 @@ fn dual_role_boundary_graph_keeps_evidence_link_check_after_losing_proposal_role
     let ca = propose_in(&ds, SOURCES_A, CLAIMS_A, "src-a", "a1", affected());
     let link_input = EvidenceInput {
         revisions: vec![SourceRevisionInput {
+            was_revision_of: None,
             version: RecordVersion::V1,
             key: key("rev-b"),
             source: iri("urn:source:secret-b"),
@@ -1941,6 +1947,7 @@ fn propose_fact_in(
 ) -> (NamedNode, Sha256Digest, NamedNode) {
     let input = EvidenceInput {
         revisions: vec![SourceRevisionInput {
+            was_revision_of: None,
             version: RecordVersion::V1,
             key: key("rev"),
             source: iri(&format!("urn:source:{occurrence}")),

@@ -440,6 +440,7 @@ async fn matching_policy_resolves_cluster_claims_and_alone_omits_claims() {
         &ds,
         &EvidenceInput {
             revisions: vec![SourceRevisionInput {
+                was_revision_of: None,
                 version: RecordVersion::V1,
                 key: key("rev-alias"),
                 source: iri("urn:source:alias-reg"),
@@ -1618,10 +1619,7 @@ fn mcp_tool_with_cfg(
     };
     m.insert("dataset".into(), "org".into());
     let server = crate::mcp::McpServer::new(st.clone(), cfg);
-    Ok(match server.run_now(name, m, &mut call)? {
-        crate::mcp::Outcome::Structured(v) => v,
-        crate::mcp::Outcome::Text(t) => serde_json::from_str(&t).unwrap_or(Value::String(t)),
-    })
+    Ok(server.run_now(name, m, &mut call)?.into_json_value())
 }
 
 /// D1: `community_reports` applies `reviewPolicy` before search bounds and rank fusion,

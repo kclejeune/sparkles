@@ -1256,6 +1256,9 @@ pub(crate) fn reidentified_generation_bytes_with_base(
     })?;
     let label = Path::new("original-import/commit.json");
     let mut file = parse_gen_commit_with(label, bytes, &mut budget)?.value;
+    if parse_rfc3339_ms(&file.commit.timestamp).is_none() {
+        return Err(Error::Corrupt(format!("{}: timestamp", label.display())));
+    }
     if file.dataset_id != old {
         return Err(Error::Corrupt(
             "original generation belongs to another physical source".into(),

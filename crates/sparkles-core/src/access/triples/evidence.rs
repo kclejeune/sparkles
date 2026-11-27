@@ -17,6 +17,7 @@ use super::{Limits, too_many};
 use crate::access::preparation::{Buffer, Map, Text};
 use crate::access::{GraphAccess, GraphGuard, GraphRule, Graphs, Preparation, Reservation};
 use crate::evidence::review::{MAX_EVIDENCE, NONCE_PREDICATES, policy_iri};
+use crate::evidence::write::Reads;
 use crate::evidence::{Policy, Settings};
 use crate::history::ConfigurationIdentity;
 use crate::id::{Id, Tag};
@@ -769,8 +770,9 @@ impl<'a> Evaluator<'a> {
         }))
     }
 
-    /// Match C25's `State::check_projection` and enforce caller visibility of each
-    /// `ev:Projection` record and its `ev:Operation` receipt in `supports`.
+    /// Enforce caller visibility of each active `ev:Projection` record and its
+    /// `ev:Operation` receipt in `supports`. Authenticated revisions end the
+    /// activity of superseded records of this policy.
     fn projection_authenticates(
         &self,
         policy_iri_id: Id,
@@ -795,33 +797,54 @@ impl<'a> Evaluator<'a> {
         else {
             return Ok(false);
         };
-        let mut records = Buffer::new(self.prep)?;
+        let predecessor = self
+            .prep
+            .lookup_iri(self.snap, &format!("{PROV}wasRevisionOf"))?;
+        let mut records = Map::new(self.prep)?;
+        let mut superseded = Map::new(self.prep)?;
         let mut more = false;
-        self.prep
-            .scan(self.snap, Perm::Pos, &[rdf_type.0, proj_class.0], |q| {
-                self.prep.check()?;
-                if q[3] != supports.id {
-                    return Ok(true);
-                }
+        Reads::new(self.prep, self.snap).for_each_pos_intersection_in_graph(
+            supports.id,
+            &[(rdf_type, proj_class), (review_policy, policy_iri_id)],
+            |rec| {
                 if records.len() == MAX_EVIDENCE {
                     more = true;
                     return Ok(false);
                 }
-                records.push(q[0])?;
-                Ok(true)
-            })?;
+                let authenticated = self.is_authenticated(rec, supports)?;
+                records.insert(rec, authenticated)?;
+                if authenticated && let Some(pred) = predecessor {
+                    let mut edges = 0;
+                    self.prep.scan(
+                        self.snap,
+                        Perm::Gspo,
+                        &[supports.id.0, rec.0, pred.0],
+                        |q| {
+                            if edges == MAX_EVIDENCE {
+                                more = true;
+                                return Ok(false);
+                            }
+                            edges += 1;
+                            superseded.insert(q[2], ())?;
+                            Ok(true)
+                        },
+                    )?;
+                }
+                Ok(!more)
+            },
+        )?;
         if more {
             return Ok(false);
         }
         let nonce_preds = [dec_p, sup_p, out_p];
         let mut found = false;
-        for &rec in records.iter() {
+        for (&rec, &authenticated) in records.iter() {
             self.prep.check()?;
-            if !self.contains_quad(rec, review_policy, policy_iri_id, supports.id)? {
+            if superseded.contains_key(&rec) {
                 continue;
             }
             found = true;
-            if !self.is_authenticated(rec, supports)? {
+            if !authenticated {
                 return Ok(false);
             }
             if self.record_or_receipt_masked(rec, supports)? {

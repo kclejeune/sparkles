@@ -2053,6 +2053,7 @@ datasets = {{ ev = "read" }}
     let propose_claim = |src_g: &str, clm_g: &str, src_k: &str, occ: &str, cve: &str| {
         let input = EvidenceInput {
             revisions: vec![SourceRevisionInput {
+                was_revision_of: None,
                 version: RecordVersion::V1,
                 key: RecordKey::new("rev").unwrap(),
                 source: iri(&format!("urn:source:{src_k}")),
@@ -2471,6 +2472,7 @@ graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"
     );
     let input = EvidenceInput {
         revisions: vec![SourceRevisionInput {
+            was_revision_of: None,
             version: RecordVersion::V1,
             key: RecordKey::new("rev-a").unwrap(),
             source: iri("urn:source:a"),
@@ -3049,6 +3051,7 @@ level = "read"
         .collect();
     let input = EvidenceInput {
         revisions: vec![SourceRevisionInput {
+            was_revision_of: None,
             version: RecordVersion::V1,
             key: RecordKey::new("rev-a").unwrap(),
             source: iri("urn:source:a"),
@@ -3349,6 +3352,7 @@ level = "read"
             &d.dataset,
             &EvidenceInput {
                 revisions: vec![SourceRevisionInput {
+                    was_revision_of: None,
                     version: RecordVersion::V1,
                     key: RecordKey::new("rev-ask").unwrap(),
                     source: iri("urn:source:ask"),
@@ -3684,6 +3688,7 @@ level = "read"
         &ds_live.dataset,
         &EvidenceInput {
             revisions: vec![SourceRevisionInput {
+                was_revision_of: None,
                 version: RecordVersion::V1,
                 key: RecordKey::new("rev-live").unwrap(),
                 source: iri("urn:source:live"),

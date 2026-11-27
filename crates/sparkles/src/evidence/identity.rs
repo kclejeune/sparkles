@@ -1746,6 +1746,7 @@ fn rebuild_inner(
             payload_digest: payload,
             principal: options.principal.clone(),
             idempotency_key: options.idempotency_key.clone(),
+            used: None,
             graphs: Vec::new(),
             records: Vec::new(),
         };
@@ -2223,6 +2224,7 @@ fn rebuild_inner(
             payload_digest: payload,
             principal: options.principal.clone(),
             idempotency_key: options.idempotency_key.clone(),
+            used: None,
             graphs: vec![m.maps.0.clone()],
             records: vec![record],
         };

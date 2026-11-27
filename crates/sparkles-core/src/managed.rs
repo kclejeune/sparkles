@@ -1095,6 +1095,11 @@ fn decode_inner(
         }
         installed.settings.insert(*owner, Arc::from(found));
     }
+    installed.evidence_visibility =
+        crate::access::triples::evidence::ProjectionConfig::from_installed_parts(
+            &installed.graphs,
+            &installed.settings,
+        );
     Ok(installed)
 }
 

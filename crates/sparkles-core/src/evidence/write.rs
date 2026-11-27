@@ -3028,7 +3028,7 @@ impl<'a> Reads<'a> {
     /// clause in `clauses`, using range-seeking leapfrog intersection across `Perm::Pos`
     /// and `Perm::Gspo[g_id]`. All seeks and exact fallbacks stay inside bounded
     /// `Preparation`.
-    fn for_each_pos_intersection_in_graph(
+    pub(crate) fn for_each_pos_intersection_in_graph(
         &self,
         g_id: Id,
         clauses: &[(Id, Id)],

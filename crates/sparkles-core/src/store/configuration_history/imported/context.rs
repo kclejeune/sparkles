@@ -385,7 +385,7 @@ impl Retained {
             held: 0,
         })?;
         let vocabulary = cold::head_vocabulary_controlled(gen_dir, &self.root, &mut budget)?;
-        let terms = vocabulary.value.len_limited(&budget.owned_limit()?)?;
+        let terms = vocabulary.value.len_with(&budget)?;
         let annotations =
             crate::annotations::seqs_controlled(&self.root, actual.dataset_id, &mut budget)?;
         let wal_path = gen_dir.join("wal.log");

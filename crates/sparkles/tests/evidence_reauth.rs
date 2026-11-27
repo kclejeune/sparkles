@@ -165,6 +165,7 @@ fn rich_batch(tag: &str) -> EvidenceInput {
     );
     EvidenceInput {
         revisions: vec![SourceRevisionInput {
+            was_revision_of: None,
             version: RecordVersion::V1,
             key: key("rev"),
             source: iri("https://example.org/bulletin"),
@@ -315,6 +316,7 @@ fn rich_batch(tag: &str) -> EvidenceInput {
 fn small_batch(tag: &str, rev_key: &str) -> EvidenceInput {
     EvidenceInput {
         revisions: vec![SourceRevisionInput {
+            was_revision_of: None,
             version: RecordVersion::V1,
             key: key("rev"),
             source: iri("https://example.org/bulletin"),
@@ -816,6 +818,7 @@ fn selective_reauthentication_and_partial_operation_replay_safety() {
 
     let batch = EvidenceInput {
         revisions: vec![SourceRevisionInput {
+            was_revision_of: None,
             version: RecordVersion::V1,
             key: key("rev"),
             source: iri("https://example.org/bulletin"),
@@ -1578,6 +1581,7 @@ fn multi_detach_partial_reconciliation_works_in_any_order_and_rejects_unrelated_
         configure(&ds);
         let batch = EvidenceInput {
             revisions: vec![SourceRevisionInput {
+                was_revision_of: None,
                 version: RecordVersion::V1,
                 key: key("rev"),
                 source: iri("https://example.org/bulletin"),
@@ -2046,6 +2050,7 @@ fn reauthenticate_handles_multi_mib_retained_bytes_and_json_structured_reference
     let batch = EvidenceInput {
         revisions: vec![
             SourceRevisionInput {
+                was_revision_of: None,
                 version: RecordVersion::V1,
                 key: key("binrev"),
                 source: iri("https://example.org/bin"),
@@ -2060,6 +2065,7 @@ fn reauthenticate_handles_multi_mib_retained_bytes_and_json_structured_reference
                 lineage: SourceLineage::default(),
             },
             SourceRevisionInput {
+                was_revision_of: None,
                 version: RecordVersion::V1,
                 key: key("jsonrev"),
                 source: iri("https://example.org/json"),

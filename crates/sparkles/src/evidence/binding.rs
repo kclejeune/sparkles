@@ -748,6 +748,7 @@ struct RevisionJson {
     upstream_revisions: Vec<RefJson>,
     #[serde(default)]
     families: Vec<String>,
+    was_revision_of: Option<RefJson>,
 }
 
 #[derive(Deserialize)]
@@ -1669,6 +1670,14 @@ fn propose_req(
             charge_decoded(&mut decoded_bytes, f.len())?;
             families.push(named(&format!("{at}.families[{j}]"), f)?);
         }
+        let was_revision_of = v
+            .was_revision_of
+            .as_ref()
+            .map(|predecessor| {
+                charge_ref(&mut decoded_bytes, predecessor)?;
+                reference(&format!("{at}.wasRevisionOf"), predecessor)
+            })
+            .transpose()?;
         input.revisions.push(SourceRevisionInput {
             version: RecordVersion::V1,
             key: record_key(&format!("{at}.key"), &v.key)?,
@@ -1692,6 +1701,7 @@ fn propose_req(
                 upstream_revisions: upstream,
                 families,
             },
+            was_revision_of,
         });
     }
     for (i, v) in r.renditions.into_iter().enumerate() {
