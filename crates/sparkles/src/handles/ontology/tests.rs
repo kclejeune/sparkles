@@ -2614,9 +2614,22 @@ mod classification {
         assert_eq!(j["incompleteCount"], json!(cl.incomplete.len()));
         let consistency = j["consistency"].as_str().unwrap();
         // A deadline that stops the modules' pass after the saturation answers in full
-        // for the axioms it took, with every class open and the consistency unknown, so
-        // it is checked as a stopped answer.
-        if cl.complete_for_taken && !cl.stats.coverage_stopped {
+        // for the axioms it took, with every class open and the consistency unknown. It
+        // is answered but not partial.
+        if cl.complete_for_taken && cl.stats.coverage_stopped {
+            assert!(!part.complete());
+            assert_eq!(consistency, "unknown");
+            for x in full.classification.taxonomy.classes() {
+                if *x != Class::thing() && *x != Class::nothing() {
+                    assert!(
+                        cl.incomplete.binary_search(x).is_ok(),
+                        "{x:?} is complete after a stopped modules' pass"
+                    );
+                }
+            }
+            return (false, "unknown");
+        }
+        if cl.complete_for_taken {
             assert!(everything || got == want);
             assert!(part.complete());
             assert_eq!(j["incomplete"], json!([]));
