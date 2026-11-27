@@ -7311,6 +7311,54 @@ pub(super) fn column_rows_split(
     Ok((map_rows(ctx, t.len(), par, f)?, None))
 }
 
+/// [`column_rows_split`] for the misses of an optional cache, such as cursor BIND reuse.
+/// A refusal to intern a computed result is returned as `Ok(None)` instead of being
+/// recorded as the query's memory failure, so the caller can release its optional state
+/// and evaluate the rows the ordinary way, which then charges the same results again.
+/// The rows after a refusal are not evaluated.
+pub(super) fn column_rows_split_optional(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    par: bool,
+) -> Result<Option<(Vec<Id>, Option<Split>)>> {
+    let nested = super::exists::nested(ctx, t, &[e])?;
+    let exists = nested.as_ref().map(|n| &n.answers);
+    let dec = decode_for(ctx, t, &[e])?;
+    let map = t.var_map(ctx.nvars());
+    let refused = std::sync::atomic::AtomicBool::new(false);
+    let f = |i: usize| {
+        if refused.load(AtomicOrdering::Relaxed) {
+            return Id::UNDEF;
+        }
+        match eval(
+            e,
+            &Row {
+                table: t,
+                i,
+                map: &map,
+                dec: Decoded::cols(&dec),
+                exists,
+            },
+            ctx,
+        ) {
+            Ok(Val::V(v)) => ctx.try_intern_value(&v).unwrap_or_else(|_| {
+                refused.store(true, AtomicOrdering::Relaxed);
+                Id::UNDEF
+            }),
+            Ok(v) => v.into_id(ctx),
+            Err(_) => Id::UNDEF,
+        }
+    };
+    let par = par && e.parallel();
+    let values = if t.len() <= PAR_THRESHOLD {
+        map_batch_split(ctx, t.len(), batch_may_split(t.len()) && par, f)?
+    } else {
+        (map_rows(ctx, t.len(), par, f)?, None)
+    };
+    Ok((!refused.into_inner()).then_some(values))
+}
+
 #[cfg(test)]
 mod column_tests {
     use super::*;

@@ -4,7 +4,7 @@
 //! distinct count, and weak repetition of a parallel-capable expression must also pass
 //! a cost guard. Map misses and the ordinary evaluation share one split controller that
 //! retries the pool after a cooldown. Optional cache entries never weaken query budgets.
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::id::{Id, PAYLOAD_MASK, Tag};
 use crate::index::{O, P, Perm, S};
 use crate::sparql::ctx::RetainedCharge;
@@ -474,8 +474,13 @@ pub(super) struct Reuse {
     /// Completed probe window `(rows, repeats, batch_rows)` waiting for the batch's
     /// fallback observation so at most one weak decision is counted per batch.
     batch_probe_window: Option<(usize, usize, usize)>,
-    /// Consecutive completed batch decisions passing the weak cost guard.
+    /// Consecutive completed probe windows passing the weak cost guard. A batch that
+    /// completes no window leaves the count alone.
     weak_confirmations: u8,
+    /// Consecutive exact within-batch counts passing the weak cost guard. A batch's count
+    /// says nothing about repetition across batches, so its failure resets only this
+    /// count and never the probe windows' confirmations.
+    counted_confirmations: u8,
     /// Last two usable fallback column-evaluation rates in one size bucket.
     cost: CostHistory,
     /// Rows, and those answered without an evaluation, since the map's last check.
@@ -535,6 +540,7 @@ impl Reuse {
             window: (0, 0),
             batch_probe_window: None,
             weak_confirmations: 0,
+            counted_confirmations: 0,
             cost: CostHistory::default(),
             map_window: (0, 0),
             map_rows: 0,
@@ -595,11 +601,12 @@ impl Reuse {
     }
 
     /// Whether the controlled fallback should time full column evaluation for cost-guarded
-    /// admission. Restricted to `>= MIN_ROWS` evaluations while admission is still open
-    /// on parallel-capable expressions.
+    /// admission. Restricted to `>= MIN_ROWS` evaluations of parallel-capable expressions
+    /// while the map probes, since only a probing map records the rates. A batch that
+    /// leaves the map in its pilot, such as sparse inline integers, takes no clock reads.
     pub(super) fn want_cost_timing(&self, evaluated_rows: usize, expr: &Expr) -> bool {
         evaluated_rows >= crate::sparql::exprcache::MIN_ROWS
-            && matches!(self.mode, Mode::Pilot | Mode::Probe)
+            && self.mode == Mode::Probe
             && expr.parallel()
             && rayon::current_num_threads() > 1
     }
@@ -705,36 +712,29 @@ impl Reuse {
             batch_rows
         };
 
-        let probe_dec = probe_win
-            .map(|(n, r, _)| self.weak_decision(n, r, bucket_rows, true))
-            .unwrap_or(WeakDecision::Fail);
-        let exact_dec = exact_signal
-            .map(|(n, r)| self.weak_decision(n, r, bucket_rows, true))
-            .unwrap_or(WeakDecision::Fail);
-        let probe_ok = probe_dec.passed();
-        let exact_ok = exact_dec.passed();
-        let fast_admit = matches!(probe_dec, WeakDecision::FastAdmit)
-            || matches!(exact_dec, WeakDecision::FastAdmit);
-
-        let admit_reason = if probe_ok || exact_ok {
-            self.weak_confirmations = self.weak_confirmations.saturating_add(1);
-            if self.weak_confirmations >= WEAK_CONFIRMATIONS {
-                Some(if exact_ok {
-                    "counted_weak"
-                } else {
-                    "probe_weak"
-                })
-            } else if fast_admit {
-                Some(if matches!(exact_dec, WeakDecision::FastAdmit) {
-                    "counted_weak_fast"
-                } else {
-                    "probe_weak_fast"
-                })
-            } else {
-                None
-            }
+        // Each signal confirms at most once a batch and keeps its own chain, so a batch
+        // that completes no probe window, whose keys may all be distinct, cannot undo a
+        // window's confirmation of repetition across batches.
+        let probe_dec = probe_win.map(|(n, r, _)| self.weak_decision(n, r, bucket_rows, true));
+        let exact_dec = exact_signal.map(|(n, r)| self.weak_decision(n, r, bucket_rows, true));
+        let confirm = |chain: &mut u8, decision: Option<WeakDecision>| match decision {
+            Some(decision) if decision.passed() => *chain = chain.saturating_add(1),
+            Some(_) => *chain = 0,
+            None => {}
+        };
+        confirm(&mut self.weak_confirmations, probe_dec);
+        confirm(&mut self.counted_confirmations, exact_dec);
+        let fast =
+            |decision: Option<WeakDecision>| matches!(decision, Some(WeakDecision::FastAdmit));
+        let admit_reason = if self.counted_confirmations >= WEAK_CONFIRMATIONS {
+            Some("counted_weak")
+        } else if self.weak_confirmations >= WEAK_CONFIRMATIONS {
+            Some("probe_weak")
+        } else if fast(exact_dec) {
+            Some("counted_weak_fast")
+        } else if fast(probe_dec) {
+            Some("probe_weak_fast")
         } else {
-            self.weak_confirmations = 0;
             None
         };
         if let Some(reason) = admit_reason {
@@ -841,6 +841,7 @@ impl Reuse {
         self.sketch = Default::default();
         self.exhausted = false;
         self.weak_confirmations = 0;
+        self.counted_confirmations = 0;
         self.batch_probe_window = None;
         self.map_window = (0, 0);
         self.map_rows = 0;
@@ -858,12 +859,21 @@ impl Reuse {
         self.values = Default::default();
         self.exhausted = false;
         self.weak_confirmations = 0;
+        self.counted_confirmations = 0;
         self.batch_probe_window = None;
         self.cost = CostHistory::default();
         if let Some(charge) = &mut self.charge {
             // A shrink only releases.
             let _ = charge.resize(512);
         }
+    }
+
+    /// Release the map, the sketch and their retained charge once the operator produces
+    /// no more rows, so that the operators above it have that memory for their remaining
+    /// work. The counters stay for EXPLAIN, and a later batch evaluates the ordinary way.
+    pub(super) fn release(&mut self) {
+        self.decline();
+        self.charge = None;
     }
 
     /// The first batch: substantial exact repetition, or a repeated key with the
@@ -907,23 +917,33 @@ impl Reuse {
         self.mode = Mode::Probe;
         self.max_entries = MAP_ENTRIES;
         drop(seen);
-        self.observe(ctx, &keys[sample..])?;
-        // The pilot's own rows enter the sketch without a window: their repetition was
-        // counted exactly above and did not admit.
+        // The pilot's own rows enter the sketch first and without a window, since their
+        // repetition was counted exactly above and did not admit. The rest of the batch
+        // then counts its repeats of pilot keys as well as of its own.
         let window = self.window;
         self.observe(ctx, &keys[..sample])?;
         self.window = window;
+        self.observe(ctx, &keys[sample..])?;
         Ok(false)
     }
 
     /// Later batches: admit once a window of sampled rows repeats enough to pay. A sketch
     /// that fills without admitting marks itself exhausted, and the next batch declines.
     fn probe(&mut self, ctx: &Ctx, keys: &[Id], expr: &Expr) -> Result<bool> {
-        self.observe(ctx, keys)?;
         let parallel_capable = expr.parallel() && rayon::current_num_threads() > 1;
         if keys.len() < crate::sparql::exprcache::MIN_ROWS && parallel_capable {
+            // A small batch only feeds the sketch. Its rows stay out of the window, which
+            // the cost guard judges by the size of the batch that completes it, and a
+            // sketch it fills ends the probe like any other.
+            let window = self.window;
+            self.observe(ctx, keys)?;
+            self.window = window;
+            if self.sketch.len() >= SKETCH_KEYS {
+                self.exhausted = true;
+            }
             return Ok(false);
         }
+        self.observe(ctx, keys)?;
         let (rows, repeats) = self.window;
         if rows < WINDOW {
             return Ok(false);
@@ -1092,6 +1112,8 @@ impl Reuse {
         // `ENTRY_BYTES` an entry covers its existing entries in both the old and the new
         // table while the table grows or shrinks.
         let Ok(_scratch) = ctx.charge(n as u64 * SCRATCH_BYTES + 256) else {
+            // Optional state yields its memory to the ordinary evaluation of the batch.
+            self.decline();
             return Ok(false);
         };
         let mut output = Vec::with_capacity(n);
@@ -1127,10 +1149,18 @@ impl Reuse {
                 MapSplitPolicy::Iri(bucket) => self.iri_split.allow(bucket),
                 MapSplitPolicy::Default => self.allow_map_split(misses.len(), expr),
             };
-            let values = match exec::column_rows_split(ctx, &misses, expr, par)
+            // A result the budget cannot intern while the map and the batch's scratch
+            // hold their charges releases both, and the ordinary evaluation of the batch
+            // interns it instead, so that the optional map never refuses a query that
+            // ordinary evaluation fits.
+            let values = match exec::column_rows_split_optional(ctx, &misses, expr, par)
                 .and_then(|values| ctx.check().map(|()| values))
             {
-                Ok((values, split)) => {
+                Ok(None) => {
+                    self.decline();
+                    return Ok(false);
+                }
+                Ok(Some((values, split))) => {
                     #[cfg(test)]
                     {
                         self.last_miss_dispatch = Some((par, split));
@@ -1147,6 +1177,16 @@ impl Reuse {
                 }
                 Err(error) => {
                     self.decline();
+                    // Another refusal of memory that nothing latched, such as a charge of
+                    // the evaluation beside the map, yields to ordinary evaluation too.
+                    ctx.check()?;
+                    if matches!(
+                        &error,
+                        Error::BudgetExceeded(budget)
+                            if matches!(budget.kind, crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory)
+                    ) {
+                        return Ok(false);
+                    }
                     return Err(error);
                 }
             };
@@ -2579,11 +2619,24 @@ mod tests {
             ..Default::default()
         };
         let mut rows = 0;
+        let released = |operator: &super::super::Operator| {
+            let reuse = operator.bind_reuse.as_ref().unwrap();
+            reuse.charge.is_none() && reuse.values.is_empty() && reuse.sketch.is_empty()
+        };
         while let Some(batch) = operator.next(&ctx, &options, 1024).unwrap() {
             rows += batch.table.len;
             assert_eq!(batch.table.cols[1], batch.table.cols[2]);
+            assert_eq!(
+                released(&operator),
+                operator.done,
+                "the pull that ends the input releases the optional map with its last rows"
+            );
         }
         assert_eq!(rows, 4096);
+        assert!(
+            released(&operator),
+            "an exhausted BIND keeps no optional memory for the operators above it"
+        );
         assert_eq!(
             operator.bind_reuse.as_ref().unwrap().evaluations,
             3000,
@@ -3599,5 +3652,270 @@ mod tests {
             both.weak_decision(4096, 512, 4096, true),
             WeakDecision::FastAdmit
         );
+    }
+
+    /// Item 293 round 1: a result that the budget cannot intern while the map and its
+    /// batch scratch hold their charges releases the optional state, and the ordinary
+    /// evaluation of the batch, which fits the same budget, answers it.
+    #[test]
+    fn optional_map_yields_to_ordinary_evaluation_that_fits_the_budget() {
+        let single = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        single.install(|| {
+            let store = Store::in_memory(StoreOptions::default());
+            let keys: Vec<Id> = (0..1024)
+                .map(|row| Id::from_i64(1000 + (row % 512) as i64).unwrap())
+                .collect();
+            let expr_for = |ctx: &Ctx| {
+                let input = ctx.var("input");
+                (
+                    input,
+                    ctx.var("bound"),
+                    Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]),
+                )
+            };
+            let strings = |ctx: &Ctx, values: &[Id]| -> Vec<Option<Term>> {
+                values.iter().map(|id| ctx.term(*id)).collect()
+            };
+            // Ordinary evaluation alone fits the budget.
+            let ordinary = cursor_context(&store, 100 << 10);
+            let (input, _, expr) = expr_for(&ordinary);
+            let values = exec::column_rows(&ordinary, &batch(input, &keys), &expr).unwrap();
+            ordinary.check().unwrap();
+            let expected = strings(&ordinary, &values);
+            assert_eq!(
+                expected[0],
+                Some(Term::Literal(Literal::new_simple_literal("1000")))
+            );
+
+            let ctx = cursor_context(&store, 100 << 10);
+            let (input, target, expr) = expr_for(&ctx);
+            let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+            let mut table = batch(input, &keys);
+            let reused = reuse
+                .apply(&ctx, &mut table, target, &expr)
+                .expect("the optional map must not refuse a batch that ordinary evaluation fits");
+            ctx.check().unwrap();
+            let values = if reused {
+                table.cols[1].clone()
+            } else {
+                assert_eq!(reuse.mode, Mode::Off);
+                assert!(reuse.values.is_empty());
+                // The cursor's own fallback, with the expression cache's batch pass.
+                let mut report = crate::sparql::exprcache::Report::default();
+                exec::compute_column_controlled(
+                    &ctx,
+                    &table,
+                    &expr,
+                    &mut report,
+                    |n| reuse.allow_fallback_split(n, &expr),
+                    |n| reuse.want_cost_timing(n, &expr),
+                )
+                .unwrap()
+                .0
+            };
+            ctx.check().unwrap();
+            assert_eq!(strings(&ctx, &values), expected);
+        });
+    }
+
+    /// Item 293 round 1: an admitted map whose batch scratch the budget refuses releases
+    /// its retained entries before the batch falls back to ordinary evaluation.
+    #[test]
+    fn a_refused_batch_scratch_releases_the_admitted_map() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 4 << 20);
+        let input = ctx.var("input");
+        let target = ctx.var("bound");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let keys: Vec<Id> = (0..4096)
+            .map(|row| Id::from_i64((row % 1024) as i64).unwrap())
+            .collect();
+        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+        assert!(
+            reuse
+                .apply(&ctx, &mut batch(input, &keys), target, &expr)
+                .unwrap()
+        );
+        assert_eq!(reuse.mode, Mode::Map);
+        assert_eq!(reuse.values.len(), 1024);
+        let held = reuse.charge.as_ref().unwrap().bytes();
+        assert!(held > 512);
+        let before = ctx.live_bytes();
+        // Leave less room than the batch's scratch of 68 bytes a row.
+        let _other = ctx
+            .charge(ctx.memory_remaining().saturating_sub(64 << 10))
+            .unwrap();
+        assert!(
+            !reuse
+                .apply(&ctx, &mut batch(input, &keys), target, &expr)
+                .unwrap()
+        );
+        assert_eq!(reuse.mode, Mode::Off);
+        assert!(reuse.values.is_empty());
+        assert!(reuse.charge.as_ref().unwrap().bytes() <= 512);
+        drop(_other);
+        assert!(ctx.live_bytes() < before, "the map's entries are released");
+        ctx.check().unwrap();
+    }
+
+    /// Item 293 round 1: with batches whose keys are all distinct, a batch that completes
+    /// no probe window keeps the confirmation of the window before it, so two windows in
+    /// the 50 to 100 ns a row band admit across an intermediate batch.
+    #[test]
+    fn a_batch_without_a_probe_window_keeps_the_previous_window_confirmation() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("value");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+        reuse.mode = Mode::Probe;
+        reuse.cost.record(2048, 2048 * 300);
+        reuse.cost.record(2048, 2048 * 300);
+        let eval = ColumnEval {
+            evaluated_rows: 2048,
+            elapsed_nanos: None,
+            split: None,
+            parallel_allowed: true,
+        };
+        // One sampled row in four repeats: a 75 ns a row saving, which needs two windows.
+        assert_eq!(reuse.weak_decision(256, 64, 2048, true), WeakDecision::Pass);
+        reuse.batch_index = 2;
+        reuse.batch_probe_window = Some((256, 64, 2048));
+        reuse.observe_fallback_with(2048, eval, Some((2048, 2048)), true, true);
+        assert_eq!(reuse.mode, Mode::Probe);
+        reuse.batch_index = 3;
+        reuse.observe_fallback_with(2048, eval, Some((2048, 2048)), true, true);
+        assert_eq!(reuse.mode, Mode::Probe);
+        reuse.batch_index = 4;
+        reuse.batch_probe_window = Some((256, 64, 2048));
+        reuse.observe_fallback_with(2048, eval, Some((2048, 2048)), true, true);
+        assert_eq!(reuse.mode, Mode::Map);
+        assert_eq!(reuse.admitted, Some((4, "probe_weak")));
+
+        // A failed window still resets the window chain.
+        let mut failed = new_reuse(&ctx, &expr, None).unwrap();
+        failed.mode = Mode::Probe;
+        failed.cost.record(2048, 2048 * 300);
+        failed.cost.record(2048, 2048 * 300);
+        failed.batch_probe_window = Some((256, 64, 2048));
+        failed.observe_fallback_with(2048, eval, Some((2048, 2048)), true, true);
+        failed.batch_probe_window = Some((256, 8, 2048));
+        failed.observe_fallback_with(2048, eval, Some((2048, 2048)), true, true);
+        failed.batch_probe_window = Some((256, 64, 2048));
+        failed.observe_fallback_with(2048, eval, Some((2048, 2048)), true, true);
+        assert_eq!(failed.mode, Mode::Probe);
+    }
+
+    /// Item 293 round 1: a sparse inline integer batch leaves the map in its pilot, which
+    /// records no rates, so its fallback takes no clock reads.
+    #[test]
+    fn a_map_in_its_pilot_takes_no_cost_timing() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("value");
+        let target = ctx.var("bound");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+            let keys: Vec<Id> = (0..4096)
+                .map(|row| Id::from_i64(row * 1000).unwrap())
+                .collect();
+            assert!(
+                !reuse
+                    .apply(&ctx, &mut batch(input, &keys), target, &expr)
+                    .unwrap()
+            );
+            assert_eq!(reuse.mode, Mode::Pilot);
+            assert!(!reuse.want_cost_timing(4096, &expr));
+            reuse.mode = Mode::Probe;
+            assert!(reuse.want_cost_timing(4096, &expr));
+        });
+    }
+
+    /// Item 293 round 1: small batches of a parallel-capable expression feed the sketch
+    /// without growing the window, and a sketch they fill ends the probe.
+    #[test]
+    fn small_parallel_batches_feed_only_the_sketch_and_can_exhaust_it() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("value");
+        let target = ctx.var("bound");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+            reuse.mode = Mode::Probe;
+            reuse.max_entries = MAP_ENTRIES;
+            let strings = local_strings(&ctx, 0..(SKETCH_KEYS * 24));
+            let sampled_keys: Vec<Id> = strings
+                .iter()
+                .copied()
+                .filter(|id| sampled(*id))
+                .take(SKETCH_KEYS + 512)
+                .collect();
+            assert_eq!(sampled_keys.len(), SKETCH_KEYS + 512);
+            for chunk in sampled_keys.chunks(512) {
+                assert!(
+                    !reuse
+                        .apply(&ctx, &mut batch(input, chunk), target, &expr)
+                        .unwrap()
+                );
+                assert_eq!(reuse.window, (0, 0));
+                if reuse.exhausted {
+                    break;
+                }
+            }
+            assert!(reuse.exhausted, "a full sketch ends the probe");
+            assert!(
+                !reuse
+                    .apply(&ctx, &mut batch(input, &sampled_keys[..512]), target, &expr)
+                    .unwrap()
+            );
+            assert_eq!(reuse.mode, Mode::Off);
+        });
+    }
+
+    /// Item 293 round 1: the pilot seeds the sketch with its sampled keys before it
+    /// observes the rest of a large first batch, whose repeats of pilot keys count.
+    #[test]
+    fn the_pilot_counts_repeats_of_its_keys_in_the_rest_of_the_batch() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("value");
+        let target = ctx.var("bound");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let strings = local_strings(&ctx, 0..8192);
+            let mut keys = strings[..4096].to_vec();
+            keys.extend_from_slice(&strings[..4096]);
+            let pilot_sampled = keys[..4096].iter().filter(|id| sampled(**id)).count() as u32;
+            assert!(pilot_sampled > 0);
+            let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+            assert!(
+                !reuse
+                    .apply(&ctx, &mut batch(input, &keys), target, &expr)
+                    .unwrap()
+            );
+            assert_eq!(reuse.mode, Mode::Probe);
+            assert_eq!(
+                reuse.window,
+                (pilot_sampled, pilot_sampled),
+                "every sampled row after the pilot repeats a pilot key"
+            );
+        });
     }
 }

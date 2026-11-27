@@ -4854,6 +4854,9 @@ impl Operator {
             State::View(view) => view.release(),
             _ => {}
         }
+        if let Some(reuse) = &mut self.bind_reuse {
+            reuse.release();
+        }
         if let Some(ahead) = &mut self.ahead {
             ahead.pending = None;
             ahead.at = 0;
@@ -5867,6 +5870,13 @@ impl Operator {
                     b.reconcile()?;
                     drop(scratch);
                     self.done = self.children[0].done;
+                    if self.done
+                        && let Some(reuse) = &mut self.bind_reuse
+                    {
+                        // The pull that ends the input returns before the next one
+                        // would release the operator's working sets.
+                        reuse.release();
+                    }
                     let mut out = Some(b);
                     if let Some(ahead) = &mut self.ahead {
                         let b = out.as_ref().expect("a filtered batch");

@@ -9864,8 +9864,9 @@ fn directional_string_function_compatibility_and_results() {
 
 /// Cursor BIND reuse across batches answers what the eager executor answers, whether the
 /// keys repeat only across batches (sparse), within every batch (dense) or never (cheap
-/// and unique), with or without the expression cache, and a tight memory budget either
-/// gives the same rows or refuses the query with a memory budget error.
+/// and unique), with or without the expression cache. A tight memory budget either gives the
+/// same rows or refuses the query with a memory budget error, and the expression cache,
+/// which BIND reuse needs, never refuses a query that ordinary evaluation fits.
 #[test]
 fn bind_reuse_across_batches_matches_eager_for_sparse_dense_and_unique_keys() {
     const ROWS: usize = 40_960;
@@ -9897,6 +9898,7 @@ fn bind_reuse_across_batches_matches_eager_for_sparse_dense_and_unique_keys() {
             .application_rows();
         assert_eq!(eager.len(), ROWS, "{text}");
         let eager = bag(eager);
+        let mut ordinary_fits = false;
         for cache in [false, true] {
             let optimizations = Some(sparkles_core::sparql::Optimizations {
                 expr_cache: cache,
@@ -9930,8 +9932,17 @@ fn bind_reuse_across_batches_matches_eager_for_sparse_dense_and_unique_keys() {
                     Ok(rows)
                 });
             match outcome {
-                Ok(rows) => assert_eq!(bag(rows), eager, "{text} cache={cache} under 1 MiB"),
-                Err(Error::BudgetExceeded(b)) => assert_eq!(b.kind, BudgetKind::Memory),
+                Ok(rows) => {
+                    assert_eq!(bag(rows), eager, "{text} cache={cache} under 1 MiB");
+                    ordinary_fits |= !cache;
+                }
+                Err(Error::BudgetExceeded(b)) => {
+                    assert_eq!(b.kind, BudgetKind::Memory);
+                    assert!(
+                        !(cache && ordinary_fits),
+                        "{text}: BIND reuse refused a query that ordinary evaluation fits"
+                    );
+                }
                 Err(other) => panic!("{text} cache={cache} under 1 MiB: {other}"),
             }
         }
