@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sparkles_memory_import::vocab::{self, MEM, XSD_DATETIME};
-use sparkles_memory_import::{Fact, FileImport, Obj, Scan};
+use sparkles_memory_import::{Fact, FileImport, FileKind, Obj, Scan};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -618,9 +618,17 @@ pub fn sync(
         .map(|p| sparkles_memory_import::project::absolute(p));
     let scanned: HashMap<&str, &FileImport> =
         scan.files.iter().map(|f| (f.graph.as_str(), f)).collect();
-    // sources that lost their file: under a scanned area and not in the scan
+    // Sources that lost their file: under a scanned area and absent from the scan.
     let mut gone: BTreeSet<String> = BTreeSet::new();
     if only.is_none() {
+        let refusals: Vec<_> = scan
+            .skipped
+            .iter()
+            .filter_map(|s| {
+                let source = s.prior_source.as_ref()?;
+                Some((source, cache.files.get(s.path.to_string_lossy().as_ref())))
+            })
+            .collect();
         for (g, l) in &listed {
             // a transcript stays when the harness deletes its file
             if l.deleted || scanned.contains_key(g.as_str()) || g.contains("/sessions/") {
@@ -628,6 +636,12 @@ pub fn sync(
             }
             let in_area = scan.areas.iter().any(|a| g.starts_with(a.as_str()));
             if !in_area || (opts.instructions_only && !g.contains("/instructions/")) {
+                continue;
+            }
+            if refusals.iter().any(|((prefix, path), cached)| {
+                cached.is_some_and(|entry| &entry.graph == g)
+                    || (g.starts_with(prefix) && l.file_path.as_deref() == Some(path.as_str()))
+            }) {
                 continue;
             }
             gone.insert(g.clone());
@@ -672,16 +686,16 @@ pub fn sync(
         };
         let stamp = stamp(&f.path);
         let server = listed.get(&f.graph);
-        let cached = cache.files.get(&path_key);
         let expected = source_digest(f);
-        // unchanged: the server has this digest and a rendition, and the source was not
-        // deleted
-        if let Some(l) = server
-            && !l.deleted
-            && l.rendition.is_some()
-            && l.digest == expected
-            && l.file_path.as_deref() == Some(f.rel_path.as_str())
-        {
+        let unchanged = server.is_some_and(|l| {
+            !l.deleted
+                && l.rendition.is_some()
+                && l.digest == expected
+                && l.file_path.as_deref() == Some(f.rel_path.as_str())
+        });
+        // An index also depends on the identities of its linked files. Diff its
+        // facts even when its own text and path match the stored source.
+        if unchanged && f.kind != FileKind::Index {
             rep.status = "unchanged".into();
             if !opts.dry_run {
                 cache.files.insert(path_key, entry(f, stamp));
@@ -689,7 +703,6 @@ pub fn sync(
             reports.push(rep);
             continue;
         }
-        let _ = cached;
         let message = format!(
             "sparkles memory sync: {} ({})",
             f.rel_path,
@@ -728,6 +741,10 @@ pub fn sync(
                     }
                     let current = current_facts(conn, &f.graph)?;
                     let ch = diff(f, &current, fresh, Some(&spans));
+                    if unchanged && ch.adds.is_empty() && ch.retracts.is_empty() {
+                        rep.status = "unchanged".into();
+                        return Ok(());
+                    }
                     rep.status = if l.deleted { "new" } else { "edited" }.into();
                     rep.added = ch.adds.len() - ch.replaced;
                     rep.replaced = ch.replaced;
@@ -889,10 +906,32 @@ pub fn sync(
     Ok(reports)
 }
 
+/// Local change detection includes the linked identities that produce index facts.
+fn cache_digest(f: &FileImport) -> String {
+    if f.kind != FileKind::Index {
+        return f.digest.clone();
+    }
+    let mut hash = Sha256::new();
+    hash.update(f.digest.as_bytes());
+    for fact in &f.facts {
+        if matches!(
+            fact.p.strip_prefix(MEM),
+            Some("indexPosition" | "indexText")
+        ) {
+            for term in [&fact.s, &fact.p, &fact.o.sparql()] {
+                hash.update(term.as_bytes());
+                hash.update([0]);
+            }
+        }
+    }
+    let hex: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    format!("sha256:{hex}")
+}
+
 fn entry(f: &FileImport, stamp: Option<(i128, u64)>) -> CacheEntry {
     let (mtime, len) = stamp.unwrap_or((0, 0));
     CacheEntry {
-        digest: f.digest.clone(),
+        digest: cache_digest(f),
         body_digest: f.body_digest.clone(),
         graph: f.graph.clone(),
         mtime,
@@ -903,12 +942,18 @@ fn entry(f: &FileImport, stamp: Option<(i128, u64)>) -> CacheEntry {
 /// Whether the cache says no scanned file changed since the last sync, so a sync may
 /// skip the server entirely (files only; deletions are found by the listing).
 pub fn unchanged_by_cache(scan: &Scan, cache: &Cache) -> bool {
-    scan.files.iter().all(|f| {
-        cache
-            .files
-            .get(&f.path.display().to_string())
-            .is_some_and(|e| e.digest == f.digest && Some((e.mtime, e.len)) == stamp(&f.path))
-    }) && cache.files.keys().all(|p| Path::new(p).exists())
+    scan.skipped.iter().all(|s| s.prior_source.is_none())
+        && scan.files.iter().all(|f| {
+            cache
+                .files
+                .get(&f.path.display().to_string())
+                .is_some_and(|e| {
+                    e.graph == f.graph
+                        && e.digest == cache_digest(f)
+                        && Some((e.mtime, e.len)) == stamp(&f.path)
+                })
+        })
+        && cache.files.keys().all(|p| Path::new(p).exists())
 }
 
 /// The lock of a sync: a held lock marks `again` and returns `None`.

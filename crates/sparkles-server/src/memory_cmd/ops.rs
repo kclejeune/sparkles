@@ -1448,13 +1448,19 @@ fn harness_filter(h: Option<&str>) -> Result<Option<Harness>, CmdError> {
     }
 }
 
-/// A project directory or key, as a key.
-fn project_key_of(p: &str) -> String {
+/// Use the same project identity as an import under the configured policy.
+fn import_project_key(env: &Env, settings: &Value, project: &Project) -> Result<String, CmdError> {
+    let policy = redaction_policy(env, settings, &ImportFlags::default())?;
+    Ok(project.redacted_key(&policy).into_owned())
+}
+
+/// Resolve a directory through the import policy. An explicit key is already an identity.
+fn project_key_of(env: &Env, settings: &Value, p: &str) -> Result<String, CmdError> {
     let path = Path::new(p);
     if path.is_dir() {
-        Project::of(&sparkles_memory_import::project::absolute(path)).key
+        import_project_key(env, settings, &Project::of(path))
     } else {
-        p.to_string()
+        Ok(p.to_string())
     }
 }
 
@@ -1589,8 +1595,8 @@ fn structural_predicates() -> Vec<String> {
     v
 }
 
-fn base_of(conn: &Conn) -> Result<String, CmdError> {
-    conn.memory_settings()?["imports"]["base"]
+fn base_of(conn: &Conn, settings: &Value) -> Result<String, CmdError> {
+    settings["imports"]["base"]
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| {
@@ -1612,9 +1618,13 @@ fn sources(
     deleted: bool,
 ) -> Result<i32, CmdError> {
     let h = harness_filter(harness.as_deref())?;
-    let pk = project.as_deref().map(project_key_of);
     let conn = env.connect()?;
-    let base = base_of(&conn)?;
+    let settings = conn.memory_settings()?;
+    let base = base_of(&conn, &settings)?;
+    let pk = project
+        .as_deref()
+        .map(|p| project_key_of(env, &settings, p))
+        .transpose()?;
     let all = list_all_sources(&conn, &base)?;
     let list: Vec<Value> = all
         .into_iter()
@@ -1861,7 +1871,7 @@ struct BriefArgs {
     write: Option<PathBuf>,
 }
 
-fn brief_request(b: &BriefArgs) -> Result<Value, CmdError> {
+fn brief_request(env: &Env, conn: &Conn, b: &BriefArgs) -> Result<Value, CmdError> {
     let mut a = json!({
         "includeUnreviewed": b.include_unreviewed,
         "maxChars": b.max_chars,
@@ -1877,7 +1887,11 @@ fn brief_request(b: &BriefArgs) -> Result<Value, CmdError> {
         a["scope"] = "project".into();
         let key = match &b.project_key {
             Some(k) => k.clone(),
-            None => project_of(b.project.as_deref())?.key,
+            None => import_project_key(
+                env,
+                &conn.memory_settings()?,
+                &project_of(b.project.as_deref())?,
+            )?,
         };
         a["projectKey"] = key.into();
     }
@@ -1901,8 +1915,8 @@ fn brief(env: &Env, b: BriefArgs) -> Result<i32, CmdError> {
             ),
         ));
     }
-    let a = brief_request(&b)?;
     let conn = env.connect()?;
+    let a = brief_request(env, &conn, &b)?;
     let j = conn.tool("memory/brief", &a)?;
     let text = j["text"].as_str().unwrap_or("").to_string();
     if let Some(w) = &b.write {
@@ -1935,8 +1949,8 @@ fn brief_hook(env: &Env, _harness: &str, mut b: BriefArgs) -> i32 {
     b.max_chars = b.max_chars.min(9500);
     b.write = None;
     let run = || -> Result<Value, CmdError> {
-        let a = brief_request(&b)?;
         let conn = env.connect()?;
+        let a = brief_request(env, &conn, &b)?;
         conn.tool("memory/brief", &a)
     };
     if let Ok(r) = run()
@@ -2199,10 +2213,14 @@ fn forget(
         ));
     }
     let conn = env.connect()?;
-    let base = base_of(&conn)?;
+    let settings = conn.memory_settings()?;
+    let base = base_of(&conn, &settings)?;
     let mut graphs: Vec<String> = sources.clone();
     if project.is_some() || h.is_some() || sessions {
-        let pk = project.as_deref().map(project_key_of);
+        let pk = project
+            .as_deref()
+            .map(|p| project_key_of(env, &settings, p))
+            .transpose()?;
         for s in list_all_sources(&conn, &base)? {
             let g = s["source"].as_str().unwrap_or("").to_string();
             let ok = h.is_none_or(|h| s["harness"] == h.segment())
@@ -2539,25 +2557,29 @@ fn item_id(graph: &str, f: &Value) -> String {
 }
 
 /// `GET /$/memory/{ds}/inbox`: the facts as items and the review branches, filtered.
-fn inbox_items(conn: &Conn, flt: &InboxFilter) -> Result<(Vec<Item>, Vec<Value>, Value), CmdError> {
+fn inbox_items(
+    env: &Env,
+    conn: &Conn,
+    flt: &InboxFilter,
+) -> Result<(Vec<Item>, Vec<Value>, Value), CmdError> {
     let j = conn.get_json(&format!(
         "/$/memory/{}/inbox?limit={}",
         enc(&conn.dataset),
         flt.limit.clamp(1, 500)
     ))?;
-    let base = conn.memory_settings()?["imports"]["base"]
-        .as_str()
-        .map(str::to_string);
+    let settings = conn.memory_settings()?;
+    let base = settings["imports"]["base"].as_str();
     let seg = |s: &str| format!("/{}/", sparkles_memory_import::ids::segment(s));
-    let project = flt.project.as_deref().map(|p| {
-        seg(&sparkles_memory_import::project::segment_of(
-            &project_key_of(p),
-        ))
-    });
+    let project = flt
+        .project
+        .as_deref()
+        .map(|p| project_key_of(env, &settings, p))
+        .transpose()?
+        .map(|key| seg(&sparkles_memory_import::project::segment_of(&key)));
     let mut items = Vec::new();
     for s in j["sessions"].as_array().into_iter().flatten() {
         let graph = strip_iri(s["graph"].as_str().unwrap_or(""));
-        let kind = if base.as_deref().is_some_and(|b| graph.starts_with(b)) {
+        let kind = if base.is_some_and(|b| graph.starts_with(b)) {
             "import"
         } else {
             "session"
@@ -2681,7 +2703,7 @@ fn fact_refs(items: &[Item]) -> Value {
 
 fn inbox(env: &Env, flt: InboxFilter) -> Result<i32, CmdError> {
     let conn = env.connect()?;
-    let (items, branches, j) = inbox_items(&conn, &flt)?;
+    let (items, branches, j) = inbox_items(env, &conn, &flt)?;
     let out = json!({
         "dataset": conn.dataset,
         "facts": items.iter().map(item_json).collect::<Vec<_>>(),
@@ -2792,7 +2814,7 @@ fn promote(
         limit: 500,
         ..Default::default()
     };
-    let (items, _, _) = inbox_items(&conn, &flt)?;
+    let (items, _, _) = inbox_items(env, &conn, &flt)?;
     let mut chosen = resolve_items(&items, &ids)?;
     if all_that_pass {
         for it in &items {
@@ -2836,7 +2858,7 @@ fn reject(env: &Env, ids: Vec<String>, message: Option<String>) -> Result<i32, C
         limit: 500,
         ..Default::default()
     };
-    let (items, _, _) = inbox_items(&conn, &flt)?;
+    let (items, _, _) = inbox_items(env, &conn, &flt)?;
     let chosen = resolve_items(&items, &ids)?;
     let out = reject_items(&conn, &chosen, message.as_deref())?;
     env.out(&out, || format!("{} facts rejected", chosen.len()));
@@ -2849,7 +2871,7 @@ fn reject(env: &Env, ids: Vec<String>, message: Option<String>) -> Result<i32, C
 fn review(env: &Env, flt: InboxFilter, into: Option<String>) -> Result<i32, CmdError> {
     use std::io::BufRead;
     let conn = env.connect()?;
-    let (items, _, _) = inbox_items(&conn, &flt)?;
+    let (items, _, _) = inbox_items(env, &conn, &flt)?;
     let mut promote: Vec<Item> = Vec::new();
     let mut reject: Vec<Item> = Vec::new();
     let stdin = std::io::stdin();
@@ -3036,15 +3058,15 @@ fn export(env: &Env, a: ExportArgs) -> Result<i32, CmdError> {
     }
     let h = harness_filter(a.harness.as_deref())?;
     let conn = env.connect()?;
-    let (ctx, _) = context(&conn)?;
+    let (ctx, settings) = context(&conn)?;
     let prefix = format!(
         "{}{}/",
         ctx.base,
         sparkles_memory_import::ids::segment(&ctx.principal)
     );
     let key = match &a.project {
-        Some(p) => project_key_of(p),
-        None => project_of(None)?.key,
+        Some(p) => project_key_of(env, &settings, p)?,
+        None => import_project_key(env, &settings, &project_of(None)?)?,
     };
     let lit = sparkles_memory_import::quoted;
     let q = format!(

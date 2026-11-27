@@ -3399,6 +3399,61 @@ async fn preview_registration_refuses_a_write_between_read_and_commit() {
 }
 
 #[tokio::test]
+async fn preview_approval_keeps_resolved_destinations_after_prefix_rebind() {
+    for extract in [false, true] {
+        let model = proposals_mock();
+        let (st, app) = app(Some([&model.url(), &model.url()]));
+        enable(&app).await;
+        let (status, v) = send(
+            &app,
+            req(
+                "PATCH",
+                "/$/settings/org/prefixes",
+                json!({"doc": "urn:approved:"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let v = ingest(
+            &app,
+            req(
+                "POST",
+                "/$/ingest/org",
+                json!({
+                    "text": NOTES, "mode": "preview", "extract": extract,
+                    "iri": "doc:source", "graph": "doc:graph"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(v["status"], "awaiting-approval", "{v}");
+        assert_eq!(v["result"]["prefixes"]["doc"], "urn:approved:", "{v}");
+        assert_eq!(v["result"]["source"], "doc:source", "{v}");
+        assert_eq!(v["result"]["graph"], "doc:graph", "{v}");
+        let before = head(&st);
+        let (status, changed) = send(
+            &app,
+            req(
+                "PATCH",
+                "/$/settings/org/prefixes",
+                json!({"doc": "urn:redirected:"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{changed}");
+        assert_eq!(head(&st), before);
+        let uri = format!("/$/ingest/org/{}/approve", v["id"].as_str().unwrap());
+        let (status, approved) = send(&app, req("POST", &uri, Value::Null)).await;
+        assert!(status.is_success(), "{approved}");
+        assert!(ask(&app, "ASK { GRAPH <urn:approved:graph> { <urn:approved:source> <urn:x-sparkles:rendition> ?r } }").await);
+        assert!(!ask(&app, "ASK { GRAPH <urn:redirected:graph> { ?s ?p ?o } }").await);
+        if extract {
+            assert!(ask(&app, "ASK { GRAPH <urn:approved:graph> { ?r <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ?t } }").await);
+        }
+    }
+}
+
+#[tokio::test]
 async fn automatic_ingestion_keeps_a_caller_named_branch() {
     let (st, app) = app(None);
     let (status, v) = send(
@@ -3425,7 +3480,7 @@ async fn automatic_ingestion_keeps_a_caller_named_branch() {
 }
 
 #[test]
-fn automatic_cleanup_keeps_a_commit_made_after_the_merge() {
+fn automatic_cleanup_keeps_a_commit_made_during_deletion() {
     use super::pipeline::{Ctx, Quiet, Run, Usage, cleanup_merged_branch};
 
     let (st, _) = app(None);
@@ -3473,7 +3528,21 @@ fn automatic_cleanup_keeps_a_commit_made_after_the_merge() {
         None,
     )
     .unwrap();
-    insert("after-merge");
+    let branch_dataset = Arc::clone(&review);
+    ds.store.set_failpoint(
+        "branch-delete-head-checked",
+        Some(Arc::new(move |store| {
+            store.set_failpoint("branch-delete-head-checked", None);
+            branch_dataset
+                .store
+                .load(&[Source::from_bytes(
+                    b"<urn:during-delete> <urn:write> <urn:kept> .".to_vec(),
+                    RdfFormat::NTriples,
+                    None,
+                )])
+                .unwrap();
+        })),
+    );
     let mut result = json!({"review": branch});
     cleanup_merged_branch(&r, branch, &mut result);
     assert_eq!(result["review"], branch);

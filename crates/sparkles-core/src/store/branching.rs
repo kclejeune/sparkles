@@ -2776,7 +2776,7 @@ impl Store {
             ));
         }
         self.check_branch_writer(&set, e.id)?;
-        if !o.force && !set.broken.lock().contains(&e.id) {
+        let checked = if !o.force && !set.broken.lock().contains(&e.id) {
             let store = set.open_store(e.id)?;
             let head = store.head_commit().seq;
             if head > e.from.seq {
@@ -2802,7 +2802,11 @@ impl Store {
                     ));
                 }
             }
-        }
+            Some((store, head))
+        } else {
+            None
+        };
+        self.failpoint("branch-delete-head-checked");
         let retire = !children.is_empty();
         // The source holds that name the branch go first, durably, when the caller
         // releases them. A failure after that leaves the branch without its holds. The
@@ -2810,9 +2814,31 @@ impl Store {
         // history lock while an acquisition holds the holds' lock.
         // Released with the holds' lock, before any cleanup below takes a writer.
         let publishing = self.family.holds.publishing.write();
+        // The ancestry check can take the upstream writer. Recheck the source head
+        // under its writer here, with no upstream writer held. Never wait for it
+        // while excluding hold publications: a writer can itself publish a hold.
+        let mut writer = match &checked {
+            Some((store, head)) => {
+                let writer = store.writer.try_lock().ok_or(Error::WriterBusy)?;
+                if writer.head.seq != *head || store.group.as_ref().is_some_and(|g| !g.idle()) {
+                    return Err(branch::conflict(
+                        "unmerged",
+                        format!("branch {name} advanced during deletion; check its head and retry"),
+                    ));
+                }
+                Some(writer)
+            }
+            None => None,
+        };
         let mut holds = self.family.holds.state.lock();
         // the commit point: the table without the name
         let mut t = set.table.lock();
+        if t.by_name(name).is_none_or(|entry| entry.id != e.id) {
+            return Err(branch::conflict(
+                "branch-changed",
+                format!("branch {name} changed during deletion; check it and retry"),
+            ));
+        }
         let records = match &*holds {
             crate::holds::HoldsState::Ready(r) => r,
             crate::holds::HoldsState::Unavailable(reason) => {
@@ -2862,6 +2888,13 @@ impl Store {
         let pruned = next.prune_retired();
         set.save(&next)?;
         *t = next;
+        if let Some(writer) = writer.as_mut()
+            && !retire
+        {
+            // A caller may still hold this store or be waiting on its writer.
+            // Refuse writes after the branch's storage has been dropped from the table.
+            writer.poisoned = true;
+        }
         drop(t);
         drop(holds);
         drop(publishing);
@@ -2873,6 +2906,8 @@ impl Store {
                 s.branching.protected.store(true, Ordering::Relaxed);
             }
         }
+        drop(writer);
+        drop(checked);
         let mut gone: Vec<uuid::Uuid> = pruned;
         if !retire {
             gone.insert(0, e.id);

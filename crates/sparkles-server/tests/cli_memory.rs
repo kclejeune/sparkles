@@ -327,6 +327,178 @@ fn report<'a>(j: &'a Value, path_end: &str) -> &'a Value {
 const G: &str = "https://example.org/memory/import/ana/claude-code/github.com.acme.shop";
 
 #[test]
+fn memory_redaction_refusal_keeps_an_existing_source_without_a_cache() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let args = ["import", "claude-code", "--project", p.to_str().unwrap()];
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let (status, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+    assert_eq!(status, 200);
+    settings["redaction"] = json!({"patterns": [{"name": "budget", "regex": "budget-marker"}]});
+    let (status, output) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(status, 200, "{output:#}");
+    f.write_mem(
+        "staging-db.md",
+        "---\nname: staging-postgres\ndescription: The staging database runs on port 5433\n---\nUse the staging database.\n",
+    );
+    let first = mem_json(&f, &s, "ana", &args);
+    let source = report(&first, "staging-db.md");
+    assert_eq!(source["status"], "new", "{first:#}");
+    let graph = source["graph"].as_str().unwrap();
+    let retained = format!(
+        "ASK {{ GRAPH <{graph}> {{ <{graph}> <urn:x-sparkles:rendition> ?r . \
+         ?m <http://schema.org/description> \"The staging database runs on port 5433\" . \
+         FILTER NOT EXISTS {{ <{graph}> <http://www.w3.org/ns/prov#invalidatedAtTime> ?t }} }} }}"
+    );
+    assert!(s.ask(&retained));
+    let before = s.head();
+    std::fs::remove_dir_all(f.state()).unwrap();
+    f.write_mem("staging-db.md", &"budget-marker ".repeat(32_769));
+    let again = mem_json(&f, &s, "ana", &args);
+    let skipped = report(&again, "staging-db.md");
+    assert_eq!(skipped["status"], "skipped", "{again:#}");
+    assert_eq!(skipped["reason"], "redaction-too-large", "{again:#}");
+    assert_eq!(
+        report(&again, "MEMORY.md")["reason"],
+        "linked-redaction-too-large"
+    );
+    assert!(s.ask(&retained));
+    assert_eq!(s.head(), before);
+}
+
+#[test]
+fn memory_project_commands_resolve_the_imported_redacted_identity() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let p = p.to_str().unwrap();
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let (status, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+    assert_eq!(status, 200);
+    settings["redaction"] =
+        json!({"patterns": [{"name": "project", "regex": "github[.]com/acme/shop"}]});
+    let (status, output) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(status, 200, "{output:#}");
+    let import = mem_json(&f, &s, "ana", &["import", "claude-code", "--project", p]);
+    assert_eq!(import["failed"], 0, "{import:#}");
+    let graph = report(&import, "staging-db.md")["graph"].as_str().unwrap();
+    assert!(graph.contains("/redacted-project."), "{graph}");
+    let sources = mem_json(&f, &s, "ana", &["sources", "--project", p]);
+    let source = sources["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["source"] == graph)
+        .unwrap_or_else(|| panic!("{sources:#}"));
+    let key = source["project"].as_str().unwrap();
+    assert!(key.starts_with("redacted-project."), "{source:#}");
+    assert_eq!(
+        mem_json(&f, &s, "ana", &["sources", "--project", key]),
+        sources
+    );
+    let inbox = mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "inbox",
+            "--project",
+            p,
+            "--kind",
+            "import",
+            "--limit",
+            "500",
+        ],
+    );
+    assert!(
+        inbox["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|fact| fact["graph"] == graph),
+        "{inbox:#}"
+    );
+    let brief = mem_json(
+        &f,
+        &s,
+        "ana",
+        &["brief", "--project", p, "--include-unreviewed"],
+    );
+    assert!(
+        brief["text"].as_str().unwrap().contains("port 5433"),
+        "{brief:#}"
+    );
+    let out = f.dir.path().join("export-redacted");
+    let export = mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "export",
+            "--sources",
+            "--to",
+            "claude-code",
+            "--out",
+            out.to_str().unwrap(),
+            "--project",
+            p,
+        ],
+    );
+    assert!(out.join("staging-db.md").is_file(), "{export:#}");
+}
+
+#[test]
+fn memory_reimport_reconciles_index_facts_without_changing_its_text() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let args = ["import", "claude-code", "--project", p.to_str().unwrap()];
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let first = mem_json(&f, &s, "ana", &args);
+    let graph = report(&first, "MEMORY.md")["graph"].as_str().unwrap();
+    let index = || {
+        s.select(&format!(
+            "SELECT ?m ?pos ?text ?r WHERE {{ GRAPH <{graph}> {{ \
+         ?m <urn:x-sparkles:mem:indexPosition> ?pos ; <urn:x-sparkles:mem:indexText> ?text . \
+         <{graph}> <urn:x-sparkles:rendition> ?r }} }}"
+        ))
+    };
+    let before = index();
+    assert_eq!(before.len(), 1, "{before:?}");
+    f.write_mem(
+        "staging-db.md",
+        "---\nname: staging-postgres\n---\nThe same file now has a different key.\n",
+    );
+    let second = mem_json(&f, &s, "ana", &args);
+    assert_eq!(second["failed"], 0, "{second:#}");
+    assert_eq!(
+        report(&second, "MEMORY.md")["status"],
+        "edited",
+        "{second:#}"
+    );
+    let after = index();
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert_ne!(after[0]["m"], before[0]["m"]);
+    for field in ["pos", "text", "r"] {
+        assert_eq!(after[0][field], before[0][field]);
+    }
+    let subject = after[0]["m"]["value"].as_str().unwrap();
+    let memory = report(&second, "staging-db.md")["graph"].as_str().unwrap();
+    assert!(s.ask(&format!(
+        "ASK {{ GRAPH <{memory}> {{ <{subject}> <urn:x-sparkles:mem:file> <{memory}> }} }}"
+    )));
+    let head = s.head();
+    let third = mem_json(&f, &s, "ana", &args);
+    assert_eq!(
+        report(&third, "MEMORY.md")["status"],
+        "unchanged",
+        "{third:#}"
+    );
+    assert_eq!(s.head(), head);
+}
+
+#[test]
 fn memory_import_sync_and_brief() {
     let s = start_server(&["--mem", DS]);
     let f = Fixture::new();

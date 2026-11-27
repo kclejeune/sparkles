@@ -281,3 +281,46 @@ test('an OCR retry keeps requesting facts and offers explicit storage if ingesti
   await expect(task).toContainText('Registered as a source');
   expect(requests[2]).toEqual({ extract: 'false', partial: 'true' });
 });
+
+for (const error of ['needs-ocr', 'no-model']) {
+  test(`selecting an older ${error} task in Recent cannot retry the newer upload`, async ({
+    page,
+  }) => {
+    const tasks: Array<{
+      id: string;
+      dataset: string;
+      input: { name: string; mode: string };
+      status: string;
+      progress: number;
+      error?: { code: string; message: string };
+    }> = [];
+    await page.route('**/$/ingest/org', async (route) => {
+      if (route.request().method() === 'GET') {
+        return route.fulfill({ json: { tasks, capabilities: { pdf: true } } });
+      }
+      const first = tasks.length === 0;
+      const t = {
+        id: first ? 'older-task' : 'newer-task',
+        dataset: 'org',
+        input: first ? { name: 'older.pdf', mode: 'branch' } : { name: 'newer.md', mode: 'auto' },
+        status: first ? 'failed' : 'done',
+        progress: 1,
+        error: first ? { code: error, message: 'This document needs a retry.' } : undefined,
+      };
+      tasks.unshift(t);
+      await route.fulfill({ status: 202, json: t });
+    });
+    const retry = error === 'needs-ocr' ? 'Ingest the readable pages' : 'Store without facts…';
+    await page.goto('/ui/datasets/org');
+    const panel = page.getByRole('region', { name: 'Ingest' });
+    const task = await ingest(page, 'older.pdf', 'application/pdf', 'branch');
+    await expect(task.getByRole('alert')).toContainText(error);
+    await expect(task.getByRole('button', { name: retry })).toBeVisible();
+    await ingest(page, 'newer.md', 'text/markdown', 'auto');
+    await expect(task).toContainText('newer.md');
+    await panel.getByRole('button', { name: 'older.pdf', exact: true }).click();
+    await expect(task.getByRole('alert')).toContainText(error);
+    await expect(task.getByRole('button', { name: retry })).toHaveCount(0);
+    expect(tasks).toHaveLength(2);
+  });
+}

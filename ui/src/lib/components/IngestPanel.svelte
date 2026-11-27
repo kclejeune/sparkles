@@ -37,7 +37,7 @@
     partial: boolean;
     extract?: boolean;
   };
-  let lastUpload = $state<Upload | null>(null);
+  let lastUpload = $state<{ id: string; upload: Upload } | null>(null);
   let storeOnly = $state<Upload | null>(null);
   let statusPanel: ReturnType<typeof ServerIngestStatus> | undefined = $state();
   /** The task this panel follows. */
@@ -100,7 +100,7 @@
         task = next;
       }
       if (draftOf(task?.result, 0)?.mapping) mappingText = mappingOf(task?.result);
-      if (task?.error?.code === 'no-model' && lastUpload?.extract) void statusPanel?.load();
+      if (task?.error?.code === 'no-model' && retryUpload?.extract) void statusPanel?.load();
     } catch (e) {
       if (!(e instanceof DOMException && e.name === 'AbortError'))
         toasts.error('Could not get the ingestion status', e);
@@ -129,7 +129,7 @@
         allowPartial: upload.partial || undefined,
         extract: upload.extract,
       });
-      lastUpload = upload;
+      lastUpload = { id: t.id, upload };
       void follow(t);
     } catch (e) {
       toasts.error('Could not start the ingestion', e);
@@ -201,6 +201,7 @@
   const pct = $derived(task ? Math.round(task.progress * 100) : 0);
   const r = $derived(task?.result);
   const err = $derived(task?.error);
+  const retryUpload = $derived(lastUpload?.id === task?.id ? lastUpload?.upload : undefined);
   /** The table to upload with the mapping: the file, or a workbook's sheet as CSV. */
   const tableFile = $derived.by(() => {
     if (r?.outcome !== 'mapping-drafts') return file;
@@ -323,8 +324,8 @@
                 </ul>
               {/if}
             </div>
-            {#if lastUpload}
-              {@const upload = lastUpload}
+            {#if retryUpload}
+              {@const upload = retryUpload}
               {#if err.code === 'needs-ocr'}
                 <div class="row">
                   <button

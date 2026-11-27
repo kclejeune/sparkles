@@ -150,8 +150,11 @@ pub struct Request<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Skipped {
     pub path: PathBuf,
-    /// `generated`, `too-large`, `not-utf8` or `unreadable`
+    /// Why the file was skipped, including when redaction refused a linked file.
     pub reason: String,
+    /// For a redaction refusal, the source's graph prefix and redacted relative path.
+    /// A memory's full graph can depend on frontmatter that the scan could not redact.
+    pub prior_source: Option<(String, String)>,
 }
 
 /// The files of one scan.
@@ -367,11 +370,14 @@ impl Scanner<'_> {
     }
 
     /// Read a file: the size limit, UTF-8, the generated marker, then redaction.
-    fn read(&mut self, path: &Path) -> Option<Read> {
+    fn read(&mut self, path: &Path, graph_prefix: &str, rel_path: &str) -> Option<Read> {
         let skip = |me: &mut Self, reason: &str| {
+            let prior_source = (reason == "redaction-too-large")
+                .then(|| (graph_prefix.to_owned(), me.redact(rel_path).text));
             me.out.skipped.push(Skipped {
                 path: path.to_path_buf(),
                 reason: reason.into(),
+                prior_source,
             });
             None
         };
@@ -550,7 +556,12 @@ impl Scanner<'_> {
         project_segment: &str,
         generated: bool,
     ) {
-        let Some(read) = self.read(path) else { return };
+        let area = self
+            .ctx()
+            .graph(harness.segment(), project_segment, "memory/");
+        let Some(read) = self.read(path, &area, &rel_path) else {
+            return;
+        };
         let doc = frontmatter::parse(&read.text);
         let name = doc
             .scalar("name")
@@ -560,11 +571,7 @@ impl Scanner<'_> {
             Some((n, _)) if !norm_name(n).is_empty() => norm_name(n),
             _ => self.path_key(&rel_path),
         };
-        let graph = self.ctx().graph(
-            harness.segment(),
-            project_segment,
-            &format!("memory/{}", ids::segment(&key)),
-        );
+        let graph = format!("{area}{}", ids::segment(&key));
         let m = self.ctx().memory_iri(harness.segment(), project_key, &key);
         let mut facts = Vec::new();
         facts.push(fact(&m, RDF_TYPE, Obj::Iri(mem("Memory")), None));
@@ -677,11 +684,14 @@ impl Scanner<'_> {
     fn index(&mut self, path: &Path, memdir: &Path, project_key: &str, project_segment: &str) {
         static LINK: LazyLock<Regex> =
             LazyLock::new(|| Regex::new(r"\[([^\]]*)\]\(([^)\s]+)\)").expect("regex"));
-        let Some(read) = self.read(path) else { return };
         let harness = Harness::ClaudeCode;
         let graph = self
             .ctx()
             .graph(harness.segment(), project_segment, "index");
+        let rel_path = rel(path, memdir);
+        let Some(read) = self.read(path, &graph, &rel_path) else {
+            return;
+        };
         let mut facts = Vec::new();
         let mut position = 0usize;
         let mut done = HashSet::new();
@@ -708,6 +718,21 @@ impl Scanner<'_> {
             let file = project::normalize(&memdir.join(target));
             if !file.starts_with(memdir) {
                 continue;
+            }
+            if self
+                .out
+                .skipped
+                .iter()
+                .any(|s| s.prior_source.is_some() && s.path == file)
+            {
+                // A refused target might have had a different imported key. Keep
+                // the prior index until the target can be read again.
+                self.out.skipped.push(Skipped {
+                    path: path.to_path_buf(),
+                    reason: "linked-redaction-too-large".into(),
+                    prior_source: Some((graph, self.redact(&rel_path).text)),
+                });
+                return;
             }
             position += 1;
             let fallback;
@@ -743,7 +768,6 @@ impl Scanner<'_> {
                 facts.push(fact(&m, &mem("indexText"), Obj::lit(text), Some(quote)));
             }
         }
-        let rel_path = rel(path, memdir);
         self.source_facts(&graph, harness, path, &rel_path, &read, true, &mut facts);
         self.push(
             Adapter::ClaudeCode,
@@ -808,7 +832,7 @@ impl Scanner<'_> {
             if self.seen.contains(&graph) {
                 continue;
             }
-            let Some(read) = self.read(&path) else {
+            let Some(read) = self.read(&path, &graph, &rel_path) else {
                 continue;
             };
             let doc = frontmatter::parse(&read.text);
@@ -1184,6 +1208,7 @@ impl Scanner<'_> {
                 self.out.skipped.push(Skipped {
                     path: p,
                     reason: "unreadable".into(),
+                    prior_source: None,
                 });
                 continue;
             }

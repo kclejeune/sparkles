@@ -695,14 +695,6 @@ fn literal(l: &Lit) -> String {
     s
 }
 
-/// An IRI as the tools return it, bare: `<…>` loses its brackets.
-fn bare(s: &str) -> String {
-    s.strip_prefix('<')
-        .and_then(|x| x.strip_suffix('>'))
-        .unwrap_or(s)
-        .to_string()
-}
-
 /// What linking decided for one entity (§7.5).
 #[derive(Clone, Debug)]
 pub(super) enum Link {
@@ -911,8 +903,13 @@ pub fn propose(
         ..
     } = link(r, ex, if preview { None } else { branch })?;
     r.ctx.progress.status(super::Status::Writing, 0.9, None);
-    let rendition = bare(registered["rendition"].as_str().unwrap_or(""));
-    let graph = registered["graph"].as_str().unwrap_or("").to_string();
+    let rendition = super::pipeline::registered_iri(registered, "rendition");
+    let graph = super::pipeline::registered_iri(registered, "graph");
+    // Preserve the idempotency keys of earlier extraction calls.
+    let rendition_key = registered["rendition"]
+        .as_str()
+        .unwrap_or("")
+        .trim_matches(['<', '>']);
     let label = |text: &str| match &v.language {
         Some(l) => literal(&Lit {
             value: text.to_string(),
@@ -1050,7 +1047,7 @@ pub fn propose(
             } else {
                 let key = format!(
                     "ingest:{}:{batch_no}",
-                    crate::mcp::memory::ingest::digest(&format!("{rendition}\0{}", fs.len()))
+                    crate::mcp::memory::ingest::digest(&format!("{rendition_key}\0{}", fs.len()))
                         .trim_start_matches("sha256:")
                         .chars()
                         .take(40)

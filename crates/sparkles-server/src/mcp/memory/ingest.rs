@@ -1306,6 +1306,15 @@ impl Tools<'_> {
             "textKept": settings.keep_text,
             "originalKept": original_term.is_some(),
         });
+        if converted.is_some() {
+            // Ingestion reuses these terms for proposals and preview approval. Display
+            // terms can be shortened or depend on the current prefix configuration.
+            out["resolved"] = json!({
+                "source": source.to_string(),
+                "graph": graph.to_string(),
+                "rendition": rendition.to_string(),
+            });
+        }
         // the same text: nothing to write unless the bytes behind it changed
         let same = current.contains(&rendition);
         let same_bytes = old_digests.len() == 1

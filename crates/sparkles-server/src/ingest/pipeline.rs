@@ -709,6 +709,15 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         }
         return Ok(out);
     }
+    if req.mode == Mode::Preview {
+        // Keep explicit locators in the form resolved by the dry run. Omitted
+        // locators are derived deterministically from the text and these IRIs.
+        for (arg, field) in [("iri", "source"), ("graph", "graph")] {
+            if let Some(value) = reg.get_mut(arg) {
+                *value = registered_iri(&registered, field).into();
+            }
+        }
+    }
     let rendition = registered["rendition"].as_str().unwrap_or("").to_string();
     let mut out = json!({
         "outcome": "registered",
@@ -899,6 +908,16 @@ pub(super) fn cleanup_merged_branch(r: &Run, branch: &str, out: &mut Value) {
     {
         o.remove("review");
     }
+}
+
+/// A registration result's IRI as a SPARQL term independent of the live prefixes.
+pub(super) fn registered_iri(registered: &Value, field: &str) -> String {
+    registered["resolved"][field]
+        .as_str()
+        // Existing sources pass their already resolved terms directly.
+        .or_else(|| registered[field].as_str())
+        .expect("registration returns IRIs")
+        .to_owned()
 }
 
 /// An IRI as a tool returned it, `<…>` or a prefixed name of `prefixes`, made bare.
