@@ -50,6 +50,29 @@ impl Dataset {
             .branch(name)?
             .shared()
             .expect("non-main branch");
+        let ds = self.open_branch_store(store, upstream.as_ref().unwrap_or(self))?;
+        self.cache_branch(&mut branches, name, &ds);
+        Ok(ds)
+    }
+
+    fn cache_branch(
+        &self,
+        branches: &mut std::collections::BTreeMap<String, Dataset>,
+        name: &str,
+        ds: &Dataset,
+    ) {
+        self.state()
+            .branch_handles
+            .lock()
+            .push(ds.state_reference());
+        branches.insert(name.to_string(), ds.clone());
+    }
+
+    fn open_branch_store(
+        &self,
+        store: std::sync::Arc<crate::store::Store>,
+        source: &Dataset,
+    ) -> Result<Dataset> {
         let ds = Dataset::from_shared(
             store,
             crate::DatasetOptions {
@@ -61,7 +84,6 @@ impl Dataset {
             },
         )?;
         if ds.store().root().is_none() {
-            let source = upstream.as_ref().unwrap_or(self);
             ds.state().inherit_reasoning(source.state())?;
             *ds.state().rdfs.write() = source.state().rdfs.read().as_ref().map(|r| {
                 std::sync::Arc::new(crate::sparql::rdfs::RdfsOnRead::new(r.source.clone()))
@@ -89,11 +111,6 @@ impl Dataset {
                 .transpose()?;
             ds.set_write_guard(guard);
         }
-        self.state()
-            .branch_handles
-            .lock()
-            .push(ds.state_reference());
-        branches.insert(name.to_string(), ds.clone());
         Ok(ds)
     }
 
@@ -147,11 +164,26 @@ impl Dataset {
 
     /// Create branch `name` (see [`Store::create_branch`](crate::store::Store::create_branch)).
     pub fn create_branch(&self, name: &str, o: &BranchOptions) -> Result<BranchInfo> {
-        let info = self.store().create_branch(name, o)?;
-        if self.store().root().is_none() {
-            self.branch(name)?;
-        }
-        Ok(info)
+        let _use = self
+            .inner
+            .reference
+            .link
+            .enter()
+            .ok_or_else(|| crate::Error::invalid("the dataset is closed"))?;
+        self.store()
+            .create_branch_with_memory_init(name, o, |upstream, store| {
+                let source = self.branch(&upstream.branch_name())?;
+                if source.store().branch_id() != upstream.branch_id() {
+                    return Err(crate::Error::invalid(
+                        "the upstream branch changed during creation",
+                    ));
+                }
+                let ds = self.open_branch_store(store, &source)?;
+                // Keep racing opens behind the cache lock from core publication
+                // until they can see the fully initialized handle.
+                let mut branches = self.state().branches.lock();
+                Ok(move || self.cache_branch(&mut branches, name, &ds))
+            })
     }
 
     /// Relink a persistent linked branch to main's current immutable index without

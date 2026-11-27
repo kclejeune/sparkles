@@ -2062,3 +2062,222 @@ fn delayed_materialization_cannot_replace_a_later_record_at_the_same_commit() {
         ["urn:import"]
     );
 }
+
+fn without_imports() -> ReasonRequest {
+    let mut request = ReasonRequest::default();
+    request.inputs.imports = sparkles::reasoning::reasoner::ImportMode::None;
+    request
+}
+
+fn leave_import_pending(ds: &Dataset, request: &ReasonRequest) {
+    let mut refused = import_warning_request(ds);
+    refused
+        .inputs
+        .location_mapping
+        .names
+        .extend(request.inputs.location_mapping.names.clone());
+    assert!(is_server_memory(&ds.reasoning().run(&refused).unwrap_err()));
+    ds.update("DELETE DATA { <urn:o> <http://www.w3.org/2002/07/owl#imports> <urn:missing> }")
+        .unwrap();
+}
+
+#[test]
+fn overlapping_publications_keep_pending_imports_for_refresh() {
+    use sparkles::task::{Control, Progress};
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let source = dir.path().join("import.ttl");
+    let ds = Dataset::open_with(
+        &root,
+        DatasetOptions {
+            pool: Some(QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap()),
+            closure_cache_triples: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let req = mapped_import(&ds, &source, "urn:import");
+    leave_import_pending(&ds, &req);
+    std::thread::scope(|threads| {
+        // A and B commit in order, then A and B publish in the same order.
+        let timeout = Duration::from_secs(10);
+        let pause = || {
+            let (ready, committed) = mpsc::channel();
+            let (resume, release) = mpsc::channel();
+            let release = Mutex::new(release);
+            let ctl = Control {
+                progress: Progress::new(move |_, phase| {
+                    if phase == "done" {
+                        ready.send(()).unwrap();
+                        release
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(timeout)
+                            .expect("publication was not released");
+                    }
+                }),
+                ..Control::none()
+            };
+            (committed, resume, ctl)
+        };
+        let (a_committed, publish_a, first) = pause();
+        let (b_committed, publish_b, second) = pause();
+        let ds = &ds;
+        let req = &req;
+        let first = threads.spawn(move || ds.reasoning().run_with(req, &first));
+        a_committed
+            .recv_timeout(timeout)
+            .expect("first run did not commit");
+        let second = threads.spawn(move || ds.reasoning().run_with(&without_imports(), &second));
+        b_committed
+            .recv_timeout(timeout)
+            .expect("second run did not commit");
+        publish_a.send(()).unwrap();
+        let first = first.join().unwrap();
+        publish_b.send(()).unwrap();
+        assert_eq!(first.unwrap().record.fetched_imports, ["urn:import"]);
+        assert!(
+            second
+                .join()
+                .unwrap()
+                .unwrap()
+                .record
+                .fetched_imports
+                .is_empty()
+        );
+    });
+    drop(ds);
+    assert_refreshed(&Dataset::open(&root).unwrap(), req, &source, "urn:import");
+}
+
+#[test]
+fn materialization_keeps_the_import_record_it_observed_before_loading() {
+    use sparkles::task::{Control, Progress};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let source = dir.path().join("import.ttl");
+    let ds = Dataset::open(&root).unwrap();
+    let req = mapped_import(&ds, &source, "urn:import");
+    assert_eq!(
+        ds.reasoning().run(&req).unwrap().record.fetched_imports,
+        ["urn:import"]
+    );
+    let racing = ds.clone();
+    let ctl = Control {
+        progress: Progress::new(move |_, phase| {
+            if phase == "loading triples" {
+                racing.reasoning().run(&without_imports()).unwrap();
+            }
+        }),
+        ..Control::none()
+    };
+    ds.reasoning().run_with(&req, &ctl).unwrap();
+    drop(ctl);
+    drop(ds);
+    assert_refreshed(&Dataset::open(&root).unwrap(), req, &source, "urn:import");
+}
+
+#[test]
+fn inherited_import_fits_with_both_records_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let iri = format!("urn:import:{}", "x".repeat(16 << 10));
+    for publish_source_first in [true, false] {
+        for clear_source_first in [true, false] {
+            let pool = QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap();
+            let ds = memory_with_reasoning_pool(pool.clone());
+            let source = dir.path().join("import.ttl");
+            let req = mapped_import(&ds, &source, &iri);
+            leave_import_pending(&ds, &req);
+            ds.create_branch("copy", &Default::default()).unwrap();
+            let branch = ds.branch("copy").unwrap();
+            let ordered = |source_first| {
+                if source_first {
+                    [&ds, &branch]
+                } else {
+                    [&branch, &ds]
+                }
+            };
+            let [first, second] = ordered(publish_source_first);
+            assert_eq!(
+                first.reasoning().run(&req).unwrap().record.fetched_imports,
+                [iri.as_str()]
+            );
+            assert_eq!(pool.domain_stats().work_reserved, iri.len() as u64);
+            assert_refreshed(second, req, &source, &iri);
+            assert_eq!(
+                second.reasoning().record().unwrap().fetched_imports,
+                [iri.as_str()]
+            );
+            assert_eq!(pool.domain_stats().work_reserved, iri.len() as u64);
+            let [first, last] = ordered(clear_source_first);
+            first.reasoning().clear().unwrap();
+            assert_eq!(pool.domain_stats().work_reserved, 0);
+            assert_eq!(
+                last.reasoning().record().unwrap().fetched_imports,
+                [iri.as_str()]
+            );
+            last.reasoning().clear().unwrap();
+            assert_eq!(pool.domain_stats().retained_reserved, 0);
+        }
+    }
+}
+
+#[test]
+fn refused_journal_inheritance_leaves_the_branch_name_available() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap();
+    let ds = memory_with_reasoning_pool(pool.clone());
+    let req = mapped_import(&ds, &dir.path().join("import.ttl"), "urn:import");
+    leave_import_pending(&ds, &req);
+    let blocker = pool
+        .retained_parent()
+        .reserve((24 << 10) - pool.domain_stats().retained_reserved)
+        .unwrap();
+    assert!(is_server_memory(
+        &ds.create_branch("copy", &Default::default()).unwrap_err()
+    ));
+    assert!(
+        ds.branches()
+            .unwrap()
+            .iter()
+            .all(|branch| branch.name != "copy")
+    );
+    drop(blocker);
+    ds.create_branch("copy", &Default::default()).unwrap();
+    assert_eq!(
+        ds.branch("copy")
+            .unwrap()
+            .reasoning()
+            .run(&req)
+            .unwrap()
+            .record
+            .fetched_imports,
+        ["urn:import"]
+    );
+}
+
+#[test]
+fn clearing_reasoning_supersedes_a_committed_unpublished_run() {
+    use sparkles::task::{Control, Progress};
+    let ds = Dataset::memory();
+    let racing = ds.clone();
+    let ctl = Control {
+        progress: Progress::new(move |_, phase| {
+            if phase == "done" {
+                racing.reasoning().clear().unwrap();
+            }
+        }),
+        ..Control::none()
+    };
+    let err = ds
+        .reasoning()
+        .run_with(&ReasonRequest::default(), &ctl)
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Component(ref e) if e.code == sparkles::reasoning::run::SUPERSEDED),
+        "{err:?}"
+    );
+    assert!(ds.reasoning().record().is_none());
+}

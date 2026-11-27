@@ -2189,6 +2189,19 @@ impl Store {
     /// [`StoreOptions::max_branch_depth`] log segments, the branch's index is built
     /// instead.
     pub fn create_branch(&self, name: &str, o: &BranchOptions) -> Result<BranchInfo> {
+        self.create_branch_with_memory_init(name, o, |_, _| Ok(|| {}))
+    }
+
+    /// Prepare a facade handle for a memory branch before publishing the store.
+    /// The initializer receives the resolved upstream and the private new store.
+    /// Its infallible completion publishes the handle once the table contains it.
+    #[doc(hidden)]
+    pub fn create_branch_with_memory_init<F: FnOnce()>(
+        &self,
+        name: &str,
+        o: &BranchOptions,
+        prepare: impl FnOnce(&Store, Arc<Store>) -> Result<F>,
+    ) -> Result<BranchInfo> {
         let _family = self.shared_family(&Default::default())?;
         branch::check_name(name)?;
         if o.note.as_ref().is_some_and(|n| n.len() > 1024) {
@@ -2197,7 +2210,7 @@ impl Store {
         let set = self.owned_set()?.clone();
         let _fork = set.forks.read();
         if set.memory {
-            return self.create_memory_branch(name, o, &set);
+            return self.create_memory_branch(name, o, &set, prepare);
         }
         let root = set.root.clone();
         {
@@ -2341,11 +2354,12 @@ impl Store {
         self.branch_info(name)
     }
 
-    fn create_memory_branch(
+    fn create_memory_branch<F: FnOnce()>(
         &self,
         name: &str,
         o: &BranchOptions,
         set: &Arc<BranchSet>,
+        prepare: impl FnOnce(&Store, Arc<Store>) -> Result<F>,
     ) -> Result<BranchInfo> {
         let source = self.branch(&o.from)?;
         let preparation = super::managed_history::administrative_preparation()?;
@@ -2448,6 +2462,8 @@ impl Store {
         if let (Some(src), Some(dst)) = (&up.mem_history, &store.mem_history) {
             dst.lock().retention = src.lock().retention;
         }
+        let store = Arc::new(store);
+        let publish = prepare(&up, store.clone())?;
         let mut t = set.table.lock();
         // another creation may have taken the name or the last slot meanwhile
         admit(&t, false)?;
@@ -2464,7 +2480,6 @@ impl Store {
             base_hold: Some(from),
             scratch: None,
         });
-        let store = Arc::new(store);
         let mut bases = set.memory_bases.lock();
         bases.insert((owner_id, root.seq), (resolved.commit, snap));
         bases.insert((id, root.seq), (root, store.snapshot()));
@@ -2472,6 +2487,7 @@ impl Store {
         set.register_opening(&store);
         set.stores.lock().insert(id, store.clone());
         drop(t);
+        publish();
         self.branching
             .next_ordinal
             .fetch_max(next as u64, Ordering::Relaxed);

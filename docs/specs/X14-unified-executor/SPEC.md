@@ -256,9 +256,11 @@ retained pool when configured and otherwise draws exact credit from the dataset'
 work pool, if any. When a pending import and its final record would exceed the
 retained limit together, the active materialization budget admits the transfer
 bookkeeping and the overlapping IRI copy before the inference commit. Each
-in-memory branch has its own journal links and shares the pending names. A
-shared name keeps its retained credit until the last owner releases it. Work
-credit for the duplicate ends when either copy is released. A catalog save
+in-memory branch admits its journal links before publication and shares the
+pending names. One retained reservation backs each shared name. Each additional
+live copy has its own work credit, including copies in other branches' records.
+Releasing a copy returns its overlap credit. The last owner releases the
+retained reservation. A catalog save
 streams the existing registry bytes for records that the pool refused.
 In-memory branches share the record and its reservation, and
 reopened datasets admit the saved record before publishing it. Runtime checkpoints

@@ -29,8 +29,8 @@ struct PendingName {
     _overhead: Option<MemoryLease>,
 }
 
-/// One retained payload reservation follows the name until both the pending
-/// string and its published copy are gone. Actual overlap has its own work lease.
+/// One retained payload reservation follows the name until its last copy is
+/// gone. Each overlapping copy has its own work lease.
 struct NameAccount {
     _retained: Option<MemoryLease>,
     #[cfg(feature = "reasoning")]
@@ -41,16 +41,63 @@ struct NameAccount {
 #[cfg(feature = "reasoning")]
 #[derive(Default)]
 struct Transfer {
-    claimed: bool,
+    // The retained lease backs one live IRI. Every additional copy has an
+    // equal payload charge, so releasing any copy can return the newest lease.
     overlap: Option<MemoryLease>,
+    extra: Option<Box<ExtraCopy>>,
+}
+
+#[cfg(feature = "reasoning")]
+struct ExtraCopy {
+    older: Option<Box<ExtraCopy>>,
+    credit: MemoryLease,
+}
+
+#[cfg(feature = "reasoning")]
+impl NameAccount {
+    fn add_copy(
+        &self,
+        bytes: usize,
+        work: &mut sparkles_reasoner::PreparationMemory<'_>,
+    ) -> Result<()> {
+        let mut transfer = self.transfer.lock();
+        let extra = transfer.overlap.is_some();
+        let bytes = bytes + if extra { size_of::<ExtraCopy>() } else { 0 };
+        let credit = work
+            .reserve(bytes)
+            .map_err(super::parent_error)?
+            .expect("pooled import transfer");
+        if extra {
+            transfer.extra = Some(Box::new(ExtraCopy {
+                older: transfer.extra.take(),
+                credit,
+            }));
+        } else {
+            transfer.overlap = Some(credit);
+        }
+        Ok(())
+    }
+
+    fn release_copy(&self) {
+        let credit = {
+            let mut transfer = self.transfer.lock();
+            if let Some(extra) = transfer.extra.take() {
+                let ExtraCopy { older, credit } = *extra;
+                transfer.extra = older;
+                Some(credit)
+            } else {
+                transfer.overlap.take()
+            }
+        };
+        drop(credit);
+    }
 }
 
 #[cfg(feature = "reasoning")]
 impl Drop for PendingName {
     fn drop(&mut self) {
         drop(std::mem::take(&mut self.iri));
-        let overlap = self.account.transfer.lock().overlap.take();
-        drop(overlap);
+        self.account.release_copy();
     }
 }
 
@@ -63,7 +110,7 @@ impl Serialize for PendingName {
 #[cfg(feature = "reasoning")]
 pub(crate) struct NameClaim {
     pending: Arc<PendingName>,
-    work: Option<MemoryLease>,
+    owner: RecordedImport,
 }
 
 #[cfg(feature = "reasoning")]
@@ -72,45 +119,32 @@ pub(crate) struct RecordedImport(Arc<NameAccount>);
 #[cfg(feature = "reasoning")]
 impl NameClaim {
     pub fn bytes(&self) -> u64 {
-        self.work.as_ref().expect("unpublished claim").bytes()
+        self.pending.iri.len() as u64
     }
 
     pub fn is_exclusive(&self) -> bool {
-        Arc::strong_count(&self.pending) == 1 && Arc::strong_count(&self.pending.account) == 1
+        Arc::strong_count(&self.pending) == 1 && Arc::strong_count(&self.owner.0) == 2
     }
 
-    pub fn into_exclusive(mut self) -> MemoryLease {
-        let name = Arc::get_mut(&mut self.pending).expect("retired private name");
-        Arc::get_mut(&mut name.account)
+    pub fn into_exclusive(self) -> MemoryLease {
+        let Self { pending, mut owner } = self;
+        drop(pending);
+        Arc::get_mut(&mut owner.0)
             .expect("private account")
             ._retained
             .take()
             .expect("pooled transfer")
     }
 
-    pub fn publish(mut self) -> RecordedImport {
-        self.pending.account.transfer.lock().overlap = self.work.take();
-        RecordedImport(self.pending.account.clone())
-    }
-}
-
-#[cfg(feature = "reasoning")]
-impl Drop for NameClaim {
-    fn drop(&mut self) {
-        if self.work.is_some() {
-            self.pending.account.transfer.lock().claimed = false;
-        }
+    pub fn publish(self) -> RecordedImport {
+        self.owner
     }
 }
 
 #[cfg(feature = "reasoning")]
 impl Drop for RecordedImport {
     fn drop(&mut self) {
-        let mut transfer = self.0.transfer.lock();
-        transfer.claimed = false;
-        let overlap = transfer.overlap.take();
-        drop(transfer);
-        drop(overlap);
+        self.0.release_copy();
     }
 }
 
@@ -236,19 +270,10 @@ impl PendingImports {
         let Some(entry) = self.entries().find(|e| e.name.iri == iri) else {
             return Ok(None);
         };
-        let account = &entry.name.account;
-        let mut transfer = account.transfer.lock();
-        if transfer.claimed {
-            return Ok(None);
-        }
-        let memory = work
-            .reserve(iri.len())
-            .map_err(super::parent_error)?
-            .expect("pooled import transfer");
-        transfer.claimed = true;
+        entry.name.account.add_copy(iri.len(), work)?;
         Ok(Some(NameClaim {
             pending: entry.name.clone(),
-            work: Some(memory),
+            owner: RecordedImport(entry.name.account.clone()),
         }))
     }
 
@@ -366,6 +391,9 @@ pub(crate) struct ImportJournal {
     publishing: Vec<Arc<PendingName>>,
     #[cfg(feature = "reasoning")]
     next_run: u64,
+    /// Each run keeps a reference while its inputs can still change before preparation.
+    #[cfg(feature = "reasoning")]
+    pub(super) collecting: Arc<()>,
     #[cfg(feature = "reasoning")]
     pub(crate) published_run: u64,
 }
@@ -545,6 +573,13 @@ impl ImportJournal {
             .checked_add(1)
             .expect("materialization sequence exhausted");
         self.next_run
+    }
+
+    #[cfg(feature = "reasoning")]
+    pub(crate) fn can_retire(&self, run: u64) -> bool {
+        // A later writer or a run still collecting inputs can publish a record
+        // that omits these names. Leave its recovery source in the journal.
+        run == self.next_run && Arc::strong_count(&self.collecting) == 1
     }
 
     #[cfg(feature = "reasoning")]

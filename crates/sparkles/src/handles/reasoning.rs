@@ -52,7 +52,7 @@ impl Reasoning {
     /// that yields to a write ([`ReasonRequest::yield_to_writers`]) fails with a
     /// `reasoner` component error whose code is
     /// [`SUPERSEDED`](crate::reasoning::run::SUPERSEDED). A run whose record was
-    /// superseded by a later materialization after commit also returns this code.
+    /// superseded by a later materialization or clear after commit also returns this code.
     ///
     /// [`ReasonRequest::yield_to_writers`]: crate::reasoning::ReasonRequest::yield_to_writers
     #[cfg(feature = "reasoning")]

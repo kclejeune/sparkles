@@ -76,7 +76,7 @@ pub struct ReasonOutcome {
     pub record: ReasoningRecord,
 }
 
-/// The error code of a run superseded by a later publication or a waiting write
+/// The error code of a run superseded by a later publication, a clear or a waiting write
 /// ([`ReasonRequest::yield_to_writers`]).
 pub const SUPERSEDED: &str = "superseded";
 
@@ -91,51 +91,53 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
     let state = ds.state();
     let store: &Store = &state.store;
     let cancel = ctl.cancel.flag();
-    let (fetched, fetch_memory) = if req.inputs.imports == ImportMode::Fetch || req.refresh_imports
-    {
-        ctl.progress.report(0.02, "fetching imports");
-        let mut qopts = req.load.clone();
-        qopts.cancel = Some(cancel.clone());
-        qopts.deadline = ctl.deadline.into_iter().chain(qopts.deadline).min();
-        qopts.max_memory_bytes = req
-            .max_memory
-            .map(|bytes| bytes as u64)
-            .into_iter()
-            .chain(qopts.max_memory_bytes)
-            .min();
-        if qopts.pool.is_none() && qopts.grant.is_none() {
-            qopts.pool = state.pool.clone();
-        }
-        let (previous, pending) = if req.refresh_imports {
-            let journal = state.pending_imports.lock();
-            (
-                Some(state.recorded_reasoning()),
-                journal.loaded.refresh_names(&mut qopts)?,
+    let collecting = state.pending_imports.lock().collecting.clone();
+    let (fetched, fetch_memory, initial) =
+        if req.inputs.imports == ImportMode::Fetch || req.refresh_imports {
+            ctl.progress.report(0.02, "fetching imports");
+            let mut qopts = req.load.clone();
+            qopts.cancel = Some(cancel.clone());
+            qopts.deadline = ctl.deadline.into_iter().chain(qopts.deadline).min();
+            qopts.max_memory_bytes = req
+                .max_memory
+                .map(|bytes| bytes as u64)
+                .into_iter()
+                .chain(qopts.max_memory_bytes)
+                .min();
+            if qopts.pool.is_none() && qopts.grant.is_none() {
+                qopts.pool = state.pool.clone();
+            }
+            let (initial, pending) = {
+                let journal = state.pending_imports.lock();
+                let pending = if req.refresh_imports {
+                    journal.loaded.refresh_names(&mut qopts)?
+                } else {
+                    Default::default()
+                };
+                (state.recorded_reasoning(), pending)
+            };
+            let recorded = initial
+                .value
+                .as_ref()
+                .filter(|_| req.refresh_imports)
+                .map_or(&[][..], |r| r.fetched_imports.as_slice());
+            let refresh = recorded.iter().map(String::as_str).chain(
+                pending
+                    .names()
+                    .filter(|name| !recorded.iter().any(|iri| iri == name)),
+            );
+            let (fetched, memory) = sparkles_reasoner::inputs::fetch_imports_with_names(
+                store,
+                &req.inputs,
+                refresh,
+                &qopts,
+                |iri, update, opts| ds.load_reasoning_import(iri, update, opts),
             )
+            .map_err(|e| from_anyhow(e.context("fetching imports")))?;
+            (fetched, Some(memory), initial)
         } else {
-            (None, Default::default())
+            (Fetched::default(), None, state.recorded_reasoning())
         };
-        let recorded = previous
-            .as_ref()
-            .and_then(|owner| owner.value.as_ref())
-            .map_or(&[][..], |record| record.fetched_imports.as_slice());
-        let refresh = recorded.iter().map(String::as_str).chain(
-            pending
-                .names()
-                .filter(|name| !recorded.iter().any(|iri| iri == name)),
-        );
-        let (fetched, memory) = sparkles_reasoner::inputs::fetch_imports_with_names(
-            store,
-            &req.inputs,
-            refresh,
-            &qopts,
-            |iri, update, opts| ds.load_reasoning_import(iri, update, opts),
-        )
-        .map_err(|e| from_anyhow(e.context("fetching imports")))?;
-        (fetched, Some(memory))
-    } else {
-        (Fetched::default(), None)
-    };
     ctl.progress.report(0.05, "loading triples");
     // the reasoner reports progress only once it holds the writer lock
     let locked = Arc::new(AtomicBool::new(false));
@@ -208,19 +210,22 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
             |resolved, warnings, work| {
                 let mut journal = state.pending_imports.lock();
                 let current = state.recorded_reasoning();
-                let previous = current
-                    .value
-                    .as_ref()
-                    .map_or(&[][..], |r| r.fetched_imports.as_slice());
+                let recorded = [&initial, &current].map(|owner| {
+                    owner
+                        .value
+                        .as_ref()
+                        .map_or(&[][..], |r| r.fetched_imports.as_slice())
+                });
                 let strings = prepare_record_strings(
                     state.pool.as_ref(),
                     resolved,
-                    previous,
+                    recorded,
                     &journal.loaded,
                     &fetched,
                     warnings,
                     work,
                 )?;
+                drop(collecting);
                 prepared = Some((journal.prepare_run(), strings));
                 Ok(())
             },
@@ -246,6 +251,7 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
             return Err(from_anyhow(e));
         }
     };
+    drop(initial);
     drop(fetched);
     drop(fetch_memory);
     let (
@@ -283,7 +289,7 @@ struct PreparedRecordStrings {
 fn prepare_record_strings(
     pool: Option<&Arc<crate::sparql::pool::QueryPool>>,
     resolved: &sparkles_reasoner::inputs::Resolved,
-    previous: &[String],
+    recorded: [&[String]; 2],
     pending: &super::imports::PendingImports,
     fetched: &Fetched,
     warnings: &[String],
@@ -296,7 +302,7 @@ fn prepare_record_strings(
         .iter()
         .filter(|i| {
             i.graph.is_some()
-                && (previous.contains(&i.iri)
+                && (recorded.iter().any(|names| names.contains(&i.iri))
                     || fetched.fetched.contains(&i.iri)
                     || pending.contains(&i.iri))
         })
