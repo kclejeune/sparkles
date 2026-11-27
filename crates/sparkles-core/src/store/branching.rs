@@ -1662,6 +1662,27 @@ impl Store {
         Ok(self.owned_set()?.entry(name)?.id)
     }
 
+    /// The name of branch `name`'s nearest listed upstream branch, read from the
+    /// branch table without opening any branch store or taking any writer lock (`None`
+    /// for `main` or when no listed upstream remains).
+    pub fn branch_upstream_name(&self, name: &str) -> Result<Option<String>> {
+        if name == MAIN {
+            return Ok(None);
+        }
+        let set = self.owned_set()?;
+        let t = set.table.lock();
+        let e = t
+            .by_name(name)
+            .ok_or_else(|| branch::no_such_branch(name))?;
+        let Some(upstream_id) = set.upstream_in(&t, e.id) else {
+            return Ok(None);
+        };
+        if upstream_id == set.dataset_id {
+            return Ok(Some(MAIN.to_string()));
+        }
+        Ok(t.by_id(upstream_id).map(|u| u.name.clone()))
+    }
+
     /// The ids of the listed branches, read from the branch table without taking any
     /// writer. Empty for a store without branches.
     pub fn listed_branch_ids(&self) -> Vec<uuid::Uuid> {
@@ -1669,6 +1690,19 @@ impl Store {
             return Vec::new();
         };
         set.table.lock().branches.iter().map(|b| b.id).collect()
+    }
+
+    /// The ids and current names of `main` and every listed branch, read from the
+    /// branch table without opening any branch store or taking any writer lock.
+    pub fn listed_branch_names(&self) -> HashMap<uuid::Uuid, String> {
+        let mut names = HashMap::new();
+        names.insert(self.owner_dataset_id(), MAIN.to_string());
+        if let SetRef::Owner(set) = &self.branching.set {
+            for b in &set.table.lock().branches {
+                names.insert(b.id, b.name.clone());
+            }
+        }
+        names
     }
 
     /// Enumerate the listed branch IDs under reconciliation's lock-wait policy.

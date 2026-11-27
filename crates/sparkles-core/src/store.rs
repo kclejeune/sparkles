@@ -3900,13 +3900,24 @@ impl Store {
         head: CommitInfo,
         limit: &C,
     ) -> Result<crate::history::Resolved> {
+        self.resolve_in_seq(at, head.seq, limit)
+    }
+
+    /// [`resolve`](Self::resolve) against a captured committed head sequence `head_seq`,
+    /// under `limit`.
+    pub(super) fn resolve_in_seq<C: crate::budgeted::Control>(
+        &self,
+        at: &crate::history::At,
+        head_seq: u64,
+        limit: &C,
+    ) -> Result<crate::history::Resolved> {
         use crate::history::At;
         let seq = match at {
-            At::Head => head.seq,
+            At::Head => head_seq,
             At::Commit(n) => *n,
             At::Time(ms) => {
                 let cat = limit.lock(&self.catalog)?;
-                match cat.at_time(*ms) {
+                match cat.at_time_up_to(*ms, head_seq) {
                     Some(c) => c.seq,
                     None if self.branching.ident.is_some() => {
                         drop(cat);
@@ -3935,10 +3946,9 @@ impl Store {
                 found.ok_or_else(|| Error::NotFound(format!("no snapshot '{name}'")))?
             }
         };
-        if seq > head.seq {
+        if seq > head_seq {
             return Err(Error::NotFound(format!(
-                "no commit {seq} (head is {})",
-                head.seq
+                "no commit {seq} (head is {head_seq})"
             )));
         }
         // a branch shares the commits before its starting commit with its upstream
@@ -3971,16 +3981,16 @@ impl Store {
             };
             return Err(match &self.history {
                 Some(h) => {
-                    self.history_gone_with(&*limit.lock(h)?, seq, head.seq, snapshot, None, limit)?
+                    self.history_gone_with(&*limit.lock(h)?, seq, head_seq, snapshot, None, limit)?
                 }
-                None => self.mem_gone_with(seq, head.seq, snapshot, None, limit)?,
+                None => self.mem_gone_with(seq, head_seq, snapshot, None, limit)?,
             });
         };
         limit.check(0)?;
         Ok(crate::history::Resolved {
             at: at.clone(),
             commit,
-            head: head.seq,
+            head: head_seq,
             historical: seq != self.snapshot().commit,
         })
     }
@@ -4197,6 +4207,20 @@ impl Store {
         crate::history::Resolved,
         history_limited::SnapshotCharge,
     )> {
+        self.snapshot_at_inner_mode(at, o, memory, false)
+    }
+
+    pub(super) fn snapshot_at_inner_mode(
+        &self,
+        at: &crate::history::At,
+        o: &dyn crate::history::ReadControl,
+        memory: Option<u64>,
+        committed_only: bool,
+    ) -> Result<(
+        Arc<Snapshot>,
+        crate::history::Resolved,
+        history_limited::SnapshotCharge,
+    )> {
         let capacity = self
             .opts
             .shared
@@ -4205,15 +4229,16 @@ impl Store {
                 scope.caches.history().capacity()
             });
         match memory {
-            Some(memory) => self.snapshot_at_with(
+            Some(memory) => self.snapshot_at_with_mode(
                 at,
                 crate::history::ReadLimit {
                     options: o,
                     memory: Some(memory.min(capacity)),
                     held: crate::history::READ_METADATA_BYTES,
                 },
+                committed_only,
             ),
-            None => self.snapshot_at_with(
+            None => self.snapshot_at_with_mode(
                 at,
                 HistoryCeiling {
                     limit: crate::history::ReadLimit {
@@ -4223,6 +4248,7 @@ impl Store {
                     },
                     ceiling: u64::MAX,
                 },
+                committed_only,
             ),
         }
     }
@@ -4230,18 +4256,25 @@ impl Store {
     /// A historical read under `limit`. An accounting control, a read with a memory cap,
     /// takes the bounded form of each step. A stride control checks cancellation and the
     /// deadline as it goes and refuses a state larger than the history cache.
-    fn snapshot_at_with<C: HistoryRead>(
+    fn snapshot_at_with_mode<C: HistoryRead>(
         &self,
         at: &crate::history::At,
         limit: C,
+        committed_only: bool,
     ) -> Result<(
         Arc<Snapshot>,
         crate::history::Resolved,
         history_limited::SnapshotCharge,
     )> {
         limit.check(0)?;
-        let r = self.resolve_under(at, &limit)?;
-        let live = self.snapshot();
+        let (r, live) = if committed_only {
+            let live = self.snapshot();
+            let r = self.resolve_committed_limited(at, live.commit, &limit.read_limit())?;
+            (r, live)
+        } else {
+            let r = self.resolve_under(at, &limit)?;
+            (r, self.snapshot())
+        };
         self.snapshot_at_resolved(at, limit, r, live)
     }
 

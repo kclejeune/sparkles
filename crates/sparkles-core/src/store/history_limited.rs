@@ -73,8 +73,20 @@ impl Store {
 
     /// An unresolved time has no honest commit number after catalog pruning.
     pub(super) fn unresolved_time_limited(&self, ms: i64, limit: &ReadLimit<'_>) -> Result<Error> {
-        let writer = limit.lock(&self.writer)?;
-        let head = writer.head.seq;
+        self.unresolved_time_limited_mode(ms, limit, false)
+    }
+
+    pub(super) fn unresolved_time_limited_mode(
+        &self,
+        ms: i64,
+        limit: &ReadLimit<'_>,
+        committed_only: bool,
+    ) -> Result<Error> {
+        let head = if committed_only {
+            self.snapshot().commit
+        } else {
+            limit.lock(&self.writer)?.head.seq
+        };
         let current = commit::generation_number(&self.snapshot().generation.name);
         let reconstructable = if let Some(history) = &self.history {
             limit
@@ -105,15 +117,31 @@ impl Store {
     /// materializes its head just to decide whether time inheritance is legitimate.
     pub(super) fn origin_timestamp_limited(
         &self,
+        commit: crate::branch::CommitRef,
+        limit: &ReadLimit<'_>,
+    ) -> Result<i64> {
+        self.origin_timestamp_limited_mode(commit, limit, false)
+    }
+
+    pub(super) fn origin_timestamp_limited_mode(
+        &self,
         mut commit: crate::branch::CommitRef,
         limit: &ReadLimit<'_>,
+        committed_only: bool,
     ) -> Result<i64> {
         use branching::readonly::{OriginRead, Purpose};
         for _ in 0..1024 {
             limit.check(0)?;
             commit = self.owned_set()?.normalize_with(commit, limit)?;
+            let resolve_store = |s: &Store, seq: u64| {
+                if committed_only {
+                    s.resolve_committed_limited(&At::Commit(seq), s.snapshot().commit, limit)
+                } else {
+                    s.resolve_under(&At::Commit(seq), limit)
+                }
+            };
             let result = if commit.branch_id == self.dataset_id {
-                self.resolve_under(&At::Commit(commit.seq), limit)
+                resolve_store(self, commit.seq)
                     .map(|resolved| OriginRead::Clock(resolved.commit.timestamp_ms))
             } else {
                 match self.readonly_branch_read_limited(
@@ -122,8 +150,7 @@ impl Store {
                     Purpose::Clock,
                     limit,
                 )? {
-                    OriginRead::Resident(store) => store
-                        .resolve_under(&At::Commit(commit.seq), limit)
+                    OriginRead::Resident(store) => resolve_store(store.as_ref(), commit.seq)
                         .map(|resolved| OriginRead::Clock(resolved.commit.timestamp_ms)),
                     value => Ok(value),
                 }
@@ -168,6 +195,22 @@ impl Store {
         // Capture the same writer head as resolve(), but do not wait without control.
         let head = limit.lock(&self.writer)?.head;
         self.resolve_in(at, head, limit)
+    }
+
+    /// [`resolve_under`](Self::resolve_under) against an already-published committed
+    /// snapshot sequence `head_seq`, without locking `self.writer`.
+    pub(super) fn resolve_committed_limited(
+        &self,
+        at: &At,
+        head_seq: u64,
+        limit: &ReadLimit<'_>,
+    ) -> Result<Resolved> {
+        if let At::Snapshot(name) = at
+            && !crate::history::valid_name(name)
+        {
+            return Err(Error::invalid("invalid snapshot name"));
+        }
+        self.resolve_in_seq(at, head_seq, limit)
     }
 
     pub(super) fn cache_limited_snapshot(
@@ -266,6 +309,23 @@ impl Store {
         options: &HistoryOptions,
         max_memory_bytes: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
+        self.snapshot_at_with_branch_limited_charged_mode(
+            store,
+            at,
+            options,
+            max_memory_bytes,
+            false,
+        )
+    }
+
+    pub(crate) fn snapshot_at_with_branch_limited_charged_mode(
+        &self,
+        store: &Store,
+        at: &At,
+        options: &HistoryOptions,
+        max_memory_bytes: u64,
+        committed_only: bool,
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
         let limit = ReadLimit {
             options,
             memory: Some(max_memory_bytes),
@@ -277,7 +337,7 @@ impl Store {
                 "the pinned branch belongs to a different dataset family",
             ));
         }
-        self.snapshot_pinned_limited(store, at, options, max_memory_bytes)
+        self.snapshot_pinned_limited_mode(store, at, options, max_memory_bytes, committed_only)
     }
 
     pub(super) fn snapshot_at_prepared(
@@ -408,11 +468,23 @@ impl Store {
         options: &dyn ReadControl,
         memory: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
-        self.snapshot_from_limited(
+        self.snapshot_pinned_limited_mode(store, at, options, memory, false)
+    }
+
+    fn snapshot_pinned_limited_mode(
+        &self,
+        store: &Store,
+        at: &At,
+        options: &dyn ReadControl,
+        memory: u64,
+        committed_only: bool,
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
+        self.snapshot_from_limited_mode(
             PinnedSource::Resident(branching::BranchStore::Main(store)),
             at,
             options,
             memory,
+            committed_only,
         )
     }
 
@@ -422,6 +494,17 @@ impl Store {
         at: &At,
         options: &dyn ReadControl,
         memory: u64,
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
+        self.snapshot_from_limited_mode(start, at, options, memory, false)
+    }
+
+    fn snapshot_from_limited_mode(
+        &self,
+        start: PinnedSource<'_>,
+        at: &At,
+        options: &dyn ReadControl,
+        memory: u64,
+        committed_only: bool,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
         use PinnedSource as Source;
         use branching::readonly::OriginRead;
@@ -453,7 +536,7 @@ impl Store {
                 Source::Resident(store) => (
                     store.branch_id(),
                     store
-                        .snapshot_at_inner(requested, options, Some(memory))
+                        .snapshot_at_inner_mode(requested, options, Some(memory), committed_only)
                         .map(|(snapshot, resolved, charge)| {
                             OriginRead::View(snapshot, resolved, charge)
                         }),
@@ -490,12 +573,12 @@ impl Store {
                 }
                 OriginRead::Inherited(commit) => {
                     if let At::Time(ms) = at {
-                        let fork = self.origin_timestamp_limited(commit, &limit)?;
+                        let fork =
+                            self.origin_timestamp_limited_mode(commit, &limit, committed_only)?;
                         if *ms >= fork {
                             return match &selected {
-                                Source::Resident(store) => {
-                                    Err(store.unresolved_time_limited(*ms, &limit)?)
-                                }
+                                Source::Resident(store) => Err(store
+                                    .unresolved_time_limited_mode(*ms, &limit, committed_only)?),
                                 Source::Cold(id) => match self.readonly_branch_read_limited(
                                     *id,
                                     at,
@@ -503,9 +586,12 @@ impl Store {
                                     &limit,
                                 ) {
                                     Err(error) => Err(error),
-                                    Ok(OriginRead::Resident(store)) => {
-                                        Err(store.unresolved_time_limited(*ms, &limit)?)
-                                    }
+                                    Ok(OriginRead::Resident(store)) => Err(store
+                                        .unresolved_time_limited_mode(
+                                            *ms,
+                                            &limit,
+                                            committed_only,
+                                        )?),
                                     _ => Err(Error::Corrupt(
                                         "missing branch time produced a data view".into(),
                                     )),

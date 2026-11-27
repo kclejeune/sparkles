@@ -50,20 +50,8 @@ def _resolve(tree: ast.Module, name: str) -> None:
 
 # Keys whose Python binding is deliberately deferred.
 DEFERRED = {
-    "evidence.acquire_hold",
-    "evidence.configure",
-    "evidence.detach",
-    "evidence.find_dependents",
-    "evidence.holds",
-    "evidence.propose",
     "evidence.reauthenticate",
     "evidence.rebuild_resolution_map",
-    "evidence.release_hold",
-    "evidence.resolve",
-    "evidence.resolve_entities",
-    "evidence.review",
-    "evidence.settings",
-    "evidence.withdraw",
     "jobs.cancel",
     "jobs.claim",
     "jobs.configure",
@@ -92,8 +80,7 @@ def test_python_binding_names_resolve() -> None:
     for key, entry in bindings.items():
         name = entry["python"]
         if name.startswith("planned:"):
-            # The evidence operations reach the bindings with the typed evidence operations of
-            # roadmap item 81, as spec C25 decides. No other key may be planned.
+            # Only explicitly deferred roadmap items may carry a planned Python binding.
             assert key in DEFERRED, f"`{key}` still has a planned Python binding"
             assert name.split(":", 1)[1].strip(), f"`{key}` needs a reason"
             continue

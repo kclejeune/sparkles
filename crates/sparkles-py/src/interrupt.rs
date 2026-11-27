@@ -552,7 +552,20 @@ pub fn controlled<T: Send + 'static>(
     timeout: Option<f64>,
     f: impl FnOnce(sparkles::task::Control) -> sparkles::Result<T> + Send + 'static,
 ) -> PyResult<T> {
-    controlled_stream(py, flag(token)?, None, callback, timeout, f)
+    controlled_inner(py, flag(token)?, None, callback, timeout, false, f)
+}
+
+/// Like [`controlled`], but preserves a committed `Ok(result)` even if cancellation or
+/// timeout fires after the write published (for example while waiting on a post-commit
+/// family barrier).
+pub fn controlled_write<T: Send + 'static>(
+    py: Python<'_>,
+    token: Option<&Bound<'_, PyAny>>,
+    callback: Option<&Bound<'_, PyAny>>,
+    timeout: Option<f64>,
+    f: impl FnOnce(sparkles::task::Control) -> sparkles::Result<T> + Send + 'static,
+) -> PyResult<T> {
+    controlled_inner(py, flag(token)?, None, callback, timeout, true, f)
 }
 
 /// [`controlled`] with the cancellation flag `cancel`, run by [`run_stream`] when the
@@ -563,6 +576,18 @@ pub fn controlled_stream<T: Send + 'static>(
     signals: Option<Arc<StreamSignals>>,
     callback: Option<&Bound<'_, PyAny>>,
     timeout: Option<f64>,
+    f: impl FnOnce(sparkles::task::Control) -> sparkles::Result<T> + Send + 'static,
+) -> PyResult<T> {
+    controlled_inner(py, cancel, signals, callback, timeout, false, f)
+}
+
+fn controlled_inner<T: Send + 'static>(
+    py: Python<'_>,
+    cancel: Arc<AtomicBool>,
+    signals: Option<Arc<StreamSignals>>,
+    callback: Option<&Bound<'_, PyAny>>,
+    timeout: Option<f64>,
+    preserve_outcome: bool,
     f: impl FnOnce(sparkles::task::Control) -> sparkles::Result<T> + Send + 'static,
 ) -> PyResult<T> {
     use sparkles::task::{Control, Progress};
@@ -628,9 +653,13 @@ pub fn controlled_stream<T: Send + 'static>(
     let job = move || {
         ctl.check()?;
         let result = f(ctl.clone())?;
-        ctl.check()?;
+        if !preserve_outcome {
+            ctl.check()?;
+        }
         ctl.progress.report(1.0, "completed");
-        ctl.check()?;
+        if !preserve_outcome {
+            ctl.check()?;
+        }
         Ok(result)
     };
     let result = match &signals {

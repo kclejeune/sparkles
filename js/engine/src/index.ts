@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import {
   Administration,
   adminResult,
+  evidenceResult,
   type AdminCall,
   type DatasetInfo,
   type Configuration,
@@ -555,6 +556,10 @@ export class Dataset extends Queryable {
   get validation() {
     return this.administration.validation;
   }
+  /** Evidence settings, holds, reference resolution, proposals, reviews and withdrawals (spec C25). */
+  get evidence() {
+    return this.administration.evidence;
+  }
   private async admin<T>(
     op: string,
     args: Configuration = {},
@@ -573,7 +578,9 @@ export class Dataset extends Queryable {
         (cancel) =>
           this.handle.admin(
             op,
-            JSON.stringify(args, (_, v) => (typeof v === 'bigint' ? v.toString() : v)),
+            typeof args === 'string'
+              ? args
+              : JSON.stringify(args, (_, v) => (typeof v === 'bigint' ? v.toString() : v)),
             wireOptions(options),
             cancel,
           ),
@@ -582,6 +589,7 @@ export class Dataset extends Queryable {
     );
     if (op === 'graphql.execute') return value as T;
     if (op === 'history.prune' || op === 'reasoning.clear') return BigInt(value) as T;
+    if (op.startsWith('evidence.')) return evidenceResult(value) as T;
     return adminResult(value) as T;
   }
 

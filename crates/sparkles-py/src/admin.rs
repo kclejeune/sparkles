@@ -22,10 +22,15 @@ fn json(py: Python<'_>) -> PyResult<(&Bound<'_, PyAny>, &Bound<'_, PyAny>)> {
     Ok((dumps.bind(py), loads.bind(py)))
 }
 
+/// Serialize a Python value (dicts, lists, str, numbers) to a JSON string.
+pub fn dumps_py(ob: &Bound<'_, PyAny>) -> PyResult<String> {
+    let (dumps, _) = json(ob.py())?;
+    dumps.call1((ob,))?.extract()
+}
+
 /// A Python value (dicts, lists, str, numbers) as an engine configuration.
 pub fn from_py<T: DeserializeOwned>(ob: &Bound<'_, PyAny>, what: &str) -> PyResult<T> {
-    let (dumps, _) = json(ob.py())?;
-    let text: String = dumps.call1((ob,))?.extract()?;
+    let text = dumps_py(ob)?;
     serde_json::from_str(&text).map_err(|e| PyValueError::new_err(format!("invalid {what}: {e}")))
 }
 

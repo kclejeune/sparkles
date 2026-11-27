@@ -31,9 +31,9 @@ impl Dataset {
             return Ok(ds);
         }
         let upstream = if self.store().root().is_none() {
-            self.branch_info(name)?
-                .upstream
-                .filter(|n| n != "main")
+            self.store()
+                .branch_upstream_name(name)?
+                .filter(|n| n != crate::branch::MAIN)
                 .map(|n| self.branch(&n))
                 .transpose()?
         } else {

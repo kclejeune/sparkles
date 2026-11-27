@@ -24,28 +24,29 @@ private val POSITION = Regex("""(\d+):(\d+)""")
 internal fun mapError(e: FfiException.Engine): RuntimeException {
     val kind = e.kind.name.lowercase().split('_').joinToString("") { it.replaceFirstChar(Char::uppercase) }
     val msg = e.detail
+    val code = e.code
     return when (e.kind) {
         ErrorKind.SPARQL_SYNTAX -> {
             val m = POSITION.find(msg)
             val line = m?.groupValues?.get(1)?.toIntOrNull() ?: -1
             val col = m?.groupValues?.get(2)?.toIntOrNull() ?: -1
-            SparklesQueryParseException(kind, msg, line, col)
+            SparklesQueryParseException(kind, msg, line, col, code)
         }
-        ErrorKind.RDF_PARSE -> SparklesRiotException(kind, msg)
+        ErrorKind.RDF_PARSE -> SparklesRiotException(kind, msg, code)
         ErrorKind.TIMEOUT, ErrorKind.CANCELLED -> QueryCancelledException()
         ErrorKind.BUDGET_EXCEEDED ->
-            SparklesBudgetExceededException(kind, msg, e.budget, e.limit?.toLong(), e.requested?.toLong())
-        ErrorKind.UNSUPPORTED, ErrorKind.HISTORY_UNSUPPORTED -> SparklesUnsupportedException(kind, msg)
-        ErrorKind.INVALID, ErrorKind.MALFORMED -> SparklesInvalidException(kind, msg)
+            SparklesBudgetExceededException(kind, msg, e.budget, e.limit?.toLong(), e.requested?.toLong(), code)
+        ErrorKind.UNSUPPORTED, ErrorKind.HISTORY_UNSUPPORTED -> SparklesUnsupportedException(kind, msg, code)
+        ErrorKind.INVALID, ErrorKind.MALFORMED -> SparklesInvalidException(kind, msg, code)
         ErrorKind.CONFLICT, ErrorKind.WRITER_BUSY, ErrorKind.PRECONDITION_FAILED, ErrorKind.TRANSACTION_ENDED ->
-            SparklesTransactionException(kind, msg)
-        ErrorKind.REJECTED, ErrorKind.GUARD_MISSING -> SparklesWriteRejectedException(kind, msg)
-        ErrorKind.NOT_FOUND, ErrorKind.HISTORY_GONE -> SparklesNotFoundException(kind, msg)
-        ErrorKind.NOT_PERMITTED -> SparklesNotPermittedException(kind, msg)
+            SparklesTransactionException(kind, msg, code)
+        ErrorKind.REJECTED, ErrorKind.GUARD_MISSING -> SparklesWriteRejectedException(kind, msg, code)
+        ErrorKind.NOT_FOUND, ErrorKind.HISTORY_GONE -> SparklesNotFoundException(kind, msg, code)
+        ErrorKind.NOT_PERMITTED -> SparklesNotPermittedException(kind, msg, code)
         ErrorKind.SERVICE -> QueryExecException(msg)
-        ErrorKind.CORRUPT, ErrorKind.POISONED, ErrorKind.STORAGE_FULL, ErrorKind.IO -> SparklesStorageException(kind, msg)
-        ErrorKind.LOCKED -> SparklesDatasetLockedException(kind, msg)
-        ErrorKind.OTHER -> SparklesInternalException(kind, msg)
+        ErrorKind.CORRUPT, ErrorKind.POISONED, ErrorKind.STORAGE_FULL, ErrorKind.IO -> SparklesStorageException(kind, msg, code)
+        ErrorKind.LOCKED -> SparklesDatasetLockedException(kind, msg, code)
+        ErrorKind.OTHER -> SparklesInternalException(kind, msg, code)
     }
 }
 

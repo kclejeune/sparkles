@@ -1815,6 +1815,14 @@ impl Catalog {
         i.checked_sub(1).and_then(|i| self.records.get(i).copied())
     }
 
+    /// The last retained commit at or before `ms` whose sequence does not exceed `max_seq`.
+    pub fn at_time_up_to(&self, ms: i64, max_seq: u64) -> Option<CommitInfo> {
+        let i = self
+            .records
+            .partition_point(|c| c.timestamp_ms <= ms && c.seq <= max_seq);
+        i.checked_sub(1).and_then(|i| self.records.get(i).copied())
+    }
+
     /// The first retained commit made at or after `ms` (timestamps never decrease).
     pub fn first_at_or_after(&self, ms: i64) -> Option<u64> {
         let i = self.records.partition_point(|c| c.timestamp_ms < ms);

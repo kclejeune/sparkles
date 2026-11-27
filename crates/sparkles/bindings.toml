@@ -432,34 +432,39 @@ jvm = "Jena UpdateAction.parseExecute / UpdateExec.dataset(ds)"
 node = "Dataset.update"
 
 ["evidence.acquire_hold"]
-python = "planned: evidence holds in the bindings with the typed evidence operations"
-jvm = "planned: evidence holds in the bindings with the typed evidence operations"
-node = "planned: evidence holds in the bindings with the typed evidence operations"
+python = "Dataset.evidence.acquire_hold"
+jvm = "DatasetGraphSparkles.evidence().acquireHold"
+node = "Dataset.evidence.acquireHold"
+
+["evidence.claim_states"]
+python = "Dataset.evidence.claim_states"
+jvm = "DatasetGraphSparkles.evidence().claimStates"
+node = "Dataset.evidence.claimStates"
 
 ["evidence.configure"]
-python = "planned: evidence settings in the bindings with the typed evidence operations"
-jvm = "planned: evidence settings in the bindings with the typed evidence operations"
-node = "planned: evidence settings in the bindings with the typed evidence operations"
+python = "Dataset.evidence.configure"
+jvm = "DatasetGraphSparkles.evidence().configure"
+node = "Dataset.evidence.configure"
 
 ["evidence.detach"]
-python = "planned: evidence settings in the bindings with the typed evidence operations"
-jvm = "planned: evidence settings in the bindings with the typed evidence operations"
-node = "planned: evidence settings in the bindings with the typed evidence operations"
+python = "Dataset.evidence.detach"
+jvm = "DatasetGraphSparkles.evidence().detach"
+node = "Dataset.evidence.detach"
 
 ["evidence.find_dependents"]
-python = "planned: evidence dependents in the bindings with the typed evidence operations"
-jvm = "planned: evidence dependents in the bindings with the typed evidence operations"
-node = "planned: evidence dependents in the bindings with the typed evidence operations"
+python = "Dataset.evidence.find_dependents"
+jvm = "DatasetGraphSparkles.evidence().findDependents"
+node = "Dataset.evidence.findDependents"
 
 ["evidence.holds"]
-python = "planned: evidence holds in the bindings with the typed evidence operations"
-jvm = "planned: evidence holds in the bindings with the typed evidence operations"
-node = "planned: evidence holds in the bindings with the typed evidence operations"
+python = "Dataset.evidence.holds"
+jvm = "DatasetGraphSparkles.evidence().holds"
+node = "Dataset.evidence.holds"
 
 ["evidence.propose"]
-python = "planned: evidence proposals in the bindings with the typed evidence operations"
-jvm = "planned: evidence proposals in the bindings with the typed evidence operations"
-node = "planned: evidence proposals in the bindings with the typed evidence operations"
+python = "Dataset.evidence.propose"
+jvm = "DatasetGraphSparkles.evidence().propose"
+node = "Dataset.evidence.propose"
 
 ["evidence.rebuild_resolution_map"]
 python = "planned: identity resolution map rebuild in the bindings with the typed evidence operations"
@@ -472,29 +477,29 @@ jvm = "planned: evidence re-authentication in the bindings with the typed eviden
 node = "planned: evidence re-authentication in the bindings with the typed evidence operations"
 
 ["evidence.release_hold"]
-python = "planned: evidence holds in the bindings with the typed evidence operations"
-jvm = "planned: evidence holds in the bindings with the typed evidence operations"
-node = "planned: evidence holds in the bindings with the typed evidence operations"
+python = "Dataset.evidence.release_hold"
+jvm = "DatasetGraphSparkles.evidence().releaseHold"
+node = "Dataset.evidence.releaseHold"
 
 ["evidence.resolve"]
-python = "planned: evidence resolution in the bindings with the typed evidence operations"
-jvm = "planned: evidence resolution in the bindings with the typed evidence operations"
-node = "planned: evidence resolution in the bindings with the typed evidence operations"
+python = "Dataset.evidence.resolve"
+jvm = "DatasetGraphSparkles.evidence().resolve"
+node = "Dataset.evidence.resolve"
 
 ["evidence.resolve_entities"]
-python = "planned: identity resolution in the bindings with the typed evidence operations"
-jvm = "planned: identity resolution in the bindings with the typed evidence operations"
-node = "planned: identity resolution in the bindings with the typed evidence operations"
+python = "Dataset.evidence.resolve_entities"
+jvm = "DatasetGraphSparkles.evidence().resolveEntities"
+node = "Dataset.evidence.resolveEntities"
 
 ["evidence.review"]
-python = "planned: evidence reviews in the bindings with the typed evidence operations"
-jvm = "planned: evidence reviews in the bindings with the typed evidence operations"
-node = "planned: evidence reviews in the bindings with the typed evidence operations"
+python = "Dataset.evidence.review"
+jvm = "DatasetGraphSparkles.evidence().review"
+node = "Dataset.evidence.review"
 
 ["evidence.settings"]
-python = "planned: evidence settings in the bindings with the typed evidence operations"
-jvm = "planned: evidence settings in the bindings with the typed evidence operations"
-node = "planned: evidence settings in the bindings with the typed evidence operations"
+python = "Dataset.evidence.settings"
+jvm = "DatasetGraphSparkles.evidence().settings"
+node = "Dataset.evidence.settings"
 
 ["jobs.settings"]
 python = "planned: job handles in the bindings under roadmap item 901"
@@ -557,9 +562,9 @@ jvm = "planned: job handles in the bindings under roadmap item 901"
 node = "planned: job handles in the bindings under roadmap item 901"
 
 ["evidence.withdraw"]
-python = "planned: evidence withdrawals in the bindings with the typed evidence operations"
-jvm = "planned: evidence withdrawals in the bindings with the typed evidence operations"
-node = "planned: evidence withdrawals in the bindings with the typed evidence operations"
+python = "Dataset.evidence.withdraw"
+jvm = "DatasetGraphSparkles.evidence().withdraw"
+node = "Dataset.evidence.withdraw"
 
 ["fmt.format"]
 python = "skip: formatter and linter remain CLI tools"

@@ -2721,6 +2721,38 @@ reads, detached projections failing closed while historical snapshots retain the
 configuration, bounded preparation memory refusal, and end-to-end SPARQL, Graph Store,
 Recall and Ask queries.
 
+### Evidence operations in the bindings
+
+Roadmap item 509 exposes the thirteen typed evidence operations in Python
+(`Dataset.evidence`), Node.js (`Dataset.evidence`) and the JVM
+(`DatasetGraphSparkles.evidence()`). Each binding delegates to the shared
+JSON codec in `sparkles::evidence::binding` over the same Rust operations that
+the HTTP server uses, covering settings reads, configuration, graph detachment,
+source hold listing, acquisition and release, exact stored-fact and record
+resolution, claim and identity proposals, reviews, withdrawals, policy claim-state
+reads, matching-policy entity resolution and dependent assessment lookups.
+
+Embedded callers are trusted and run without an HTTP authentication layer. When a
+proposal, review or withdrawal omits a principal, the bindings record
+`urn:x-sparkles:principal:local`, and call-level `branch`, `principal` or `author`
+arguments override values in the JSON body. Single-dataset binding resolution passes
+no catalog, so a stored-fact reference naming another dataset returns
+`evidence-unavailable`. Hold acquisition returns `{ created, hold }` and hold release
+returns a boolean, replacing the HTTP status distinctions. Policy claim-state reads
+require activated configuration history when an explicit `at` selector is given and fall
+back to a coherent live-head read under the current managed settings when `at` is
+omitted on a store without configuration history.
+
+Managed-boundary and branch refusals map globally to the bindings' typed exception
+classes and carry the stable machine code (`e.code` in Python and the JVM,
+`e.details.code` in Node.js), including `profile-managed-graph` refusals on ordinary
+writes (`ConflictError` in Python and Node.js and `SparklesTransactionException` on
+the JVM, replacing the earlier unmapped catch-all fallbacks). Closed-dataset and
+family-wide active-transaction guards refuse writes before taking the store writer
+lock, while hold listing reads only the branch table without taking writer locks. All
+thirteen `evidence.*` entries in `crates/sparkles/bindings.toml` name their concrete
+binding paths, and the Python parity test no longer defers any evidence operation.
+
 ### Scope changes
 
 **Probabilistic reasoning through external engines.** The scope statement in §1 excluded probabilistic reasoning. Probabilistic reasoning through external engines, as integration only, is now planned under [ROADMAP](../ROADMAP.md) item 463 and [F28](F28-ml-and-probabilistic-integration/README.md). Sparkles still defines no probabilistic reasoner of its own.
