@@ -635,11 +635,21 @@ impl Resolver {
         expected_content_digest: Option<&Sha256Digest>,
     ) -> Result<(VerifiedRecord, Reservation)> {
         let (view_key, index) = self.prepare_record_view(key, main, logical, access)?;
-        let mut held = self.preparation.reserve(std::mem::size_of::<VerifiedRecord>() as u64)
+        let mut held = self
+            .preparation
+            .reserve(std::mem::size_of::<VerifiedRecord>() as u64)
             .map_err(|e| classify(key, e))?;
         let (record, _) = self.record_in_view(
-            key, view_key, index, main, iri, kinds, expected_content_digest,
-            SelectionRequirements::default(), None, Some(&mut held),
+            key,
+            view_key,
+            index,
+            main,
+            iri,
+            kinds,
+            expected_content_digest,
+            SelectionRequirements::default(),
+            None,
+            Some(&mut held),
         )?;
         Ok((record, held))
     }
@@ -966,7 +976,8 @@ impl Resolver {
                 .get(&(view_key, index))
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let mut lookups = Lookups::new(&self.preparation, &cached.view).map_err(|e| classify(key, e))?;
+            let mut lookups =
+                Lookups::new(&self.preparation, &cached.view).map_err(|e| classify(key, e))?;
             let preparation = &self.preparation;
             lookups
                 .one_text(
@@ -1087,7 +1098,8 @@ impl Resolver {
             let rg = self.record_graphs.as_ref().expect("prepared");
             let (graphs, _filtered) =
                 readable_record_graphs(&self.preparation, &cached.view, &rg.graphs, key)?;
-            let mut lookups = Lookups::new(&self.preparation, &cached.view).map_err(|e| classify(key, e))?;
+            let mut lookups =
+                Lookups::new(&self.preparation, &cached.view).map_err(|e| classify(key, e))?;
             let Some((graph, kind)) = find_record(&mut lookups, &graphs, iri, key)? else {
                 return Err(unavailable(key));
             };
@@ -1235,7 +1247,8 @@ impl Resolver {
             let rg = self.record_graphs.as_ref().expect("prepared");
             let (graphs, _filtered) =
                 readable_record_graphs(&self.preparation, &cached.view, &rg.graphs, key)?;
-            let mut lookups = Lookups::new(&self.preparation, &cached.view).map_err(|e| classify(key, e))?;
+            let mut lookups =
+                Lookups::new(&self.preparation, &cached.view).map_err(|e| classify(key, e))?;
             let Some((graph, kind)) = find_record(&mut lookups, &graphs, iri, key)? else {
                 return Err(unavailable(key));
             };
@@ -1736,8 +1749,11 @@ impl Resolver {
                 held.grow_by(span.rendition.as_str().len() as u64)
                     .map_err(|e| classify(key, e))?;
             }
-            NamedNode::new_unchecked(self.preparation.copy_string(iri.as_str(), held)
-                .map_err(|e| classify(key, e))?)
+            NamedNode::new_unchecked(
+                self.preparation
+                    .copy_string(iri.as_str(), held)
+                    .map_err(|e| classify(key, e))?,
+            )
         } else {
             iri.clone()
         };
@@ -1931,7 +1947,16 @@ impl Resolver {
                 }
             };
             let protections = &rg.protections;
-            let mut lookups = Lookups::new(&self.preparation, &cached.view).map_err(|e| classify(key, e))?;
+            let mut lookups = match Lookups::new(&self.preparation, &cached.view) {
+                Ok(lookups) => lookups,
+                Err(e) => {
+                    return Phase2Outcome {
+                        result: Err(classify(target_key, e)),
+                        shape_confirmed: false,
+                        failed_req_idx: None,
+                    };
+                }
+            };
             let auth = match authenticate_record(
                 &mut lookups,
                 &graphs,
@@ -2424,7 +2449,8 @@ impl Resolver {
             let rg = self.record_graphs.as_ref().expect("prepared");
             let (graphs, _filtered) =
                 readable_record_graphs(&self.preparation, &cached.view, &rg.graphs, target_key)?;
-            let mut lookups = Lookups::new(&self.preparation, &cached.view).map_err(|e| classify(key, e))?;
+            let mut lookups =
+                Lookups::new(&self.preparation, &cached.view).map_err(|e| classify(key, e))?;
             let cached_hit = rg
                 .verified_passages
                 .get(&(view_key, index))
@@ -2614,7 +2640,16 @@ impl Resolver {
                 }
             };
             let protections = &rg.protections;
-            let mut lookups = Lookups::new(&self.preparation, &cached.view).map_err(|e| classify(key, e))?;
+            let mut lookups = match Lookups::new(&self.preparation, &cached.view) {
+                Ok(lookups) => lookups,
+                Err(e) => {
+                    return Phase2Outcome {
+                        result: Err(classify(target_key, e)),
+                        shape_confirmed: false,
+                        failed_req_idx: None,
+                    };
+                }
+            };
             let auth = match authenticate_record(
                 &mut lookups,
                 &graphs,
@@ -3902,16 +3937,25 @@ fn receipt(
     let Some(receipt_pred) = lookups.iri(&receipt_pred).map_err(classify_error)? else {
         return Err(origin(key));
     };
-    let receipt_id = match lookups.object_ids(iri_id, receipt_pred, graph_id).map_err(classify_error)?.as_slice() {
+    let receipt_id = match lookups
+        .object_ids(iri_id, receipt_pred, graph_id)
+        .map_err(classify_error)?
+        .as_slice()
+    {
         [id] => *id,
-        [] if lookups.has_hidden_object(iri_id, receipt_pred, graph_id).map_err(classify_error)? => {
+        [] if lookups
+            .has_hidden_object(iri_id, receipt_pred, graph_id)
+            .map_err(classify_error)? =>
+        {
             return Err(unavailable(key));
         }
         _ => return Err(origin(key)),
     };
 
     let uuid = |term: Option<&Term>| match term {
-        Some(Term::Literal(l)) if l.datatype().as_str() == XSD_STRING => Uuid::parse_str(l.value()).ok(),
+        Some(Term::Literal(l)) if l.datatype().as_str() == XSD_STRING => {
+            Uuid::parse_str(l.value()).ok()
+        }
         _ => None,
     };
     // Keep the receipt as an ID until its nonce and publication metadata authenticate.
@@ -3929,7 +3973,9 @@ fn receipt(
             return Ok(None);
         };
         match lookups.object_ids(subject, predicate, graph)?.as_slice() {
-            [id] => lookups.preparation.with_term(lookups.snap(), *id, |t| Ok(parse(t))),
+            [id] => lookups
+                .preparation
+                .with_term(lookups.snap(), *id, |t| Ok(parse(t))),
             [] => {
                 *masked |= lookups.has_hidden_object(subject, predicate, graph)?;
                 Ok(None)
@@ -3938,24 +3984,60 @@ fn receipt(
         }
     }
     let protection = format!("{EV}graphProtection");
-    let record_nonce = field(lookups, iri_id, &protection, graph_id, &mut masked, uuid)
+    let record_nonce =
+        field(lookups, iri_id, &protection, graph_id, &mut masked, uuid).map_err(classify_error)?;
+    let receipt_nonce = field(
+        lookups,
+        receipt_id,
+        &protection,
+        graph_id,
+        &mut masked,
+        uuid,
+    )
+    .map_err(classify_error)?;
+    let dataset = field(
+        lookups,
+        receipt_id,
+        &format!("{EV}datasetId"),
+        graph_id,
+        &mut masked,
+        uuid,
+    )
+    .map_err(classify_error)?;
+    let branch = field(
+        lookups,
+        receipt_id,
+        &format!("{EV}branchId"),
+        graph_id,
+        &mut masked,
+        uuid,
+    )
+    .map_err(classify_error)?;
+    let commit = field(
+        lookups,
+        receipt_id,
+        &format!("{EV}commit"),
+        graph_id,
+        &mut masked,
+        |term| match term {
+            Some(Term::Literal(l)) => integer(l),
+            _ => None,
+        },
+    )
+    .map_err(classify_error)?;
+    let operation_type = lookups
+        .iri(&format!("{EV}Operation"))
         .map_err(classify_error)?;
-    let receipt_nonce = field(lookups, receipt_id, &protection, graph_id, &mut masked, uuid)
-        .map_err(classify_error)?;
-    let dataset = field(lookups, receipt_id, &format!("{EV}datasetId"), graph_id, &mut masked, uuid)
-        .map_err(classify_error)?;
-    let branch = field(lookups, receipt_id, &format!("{EV}branchId"), graph_id, &mut masked, uuid)
-        .map_err(classify_error)?;
-    let commit = field(lookups, receipt_id, &format!("{EV}commit"), graph_id, &mut masked, |term| match term {
-        Some(Term::Literal(l)) => integer(l),
-        _ => None,
-    }).map_err(classify_error)?;
-    let operation_type = lookups.iri(&format!("{EV}Operation")).map_err(classify_error)?;
     let type_pred = lookups.iri(RDF_TYPE).map_err(classify_error)?;
     let is_operation = if let (Some(p), Some(o)) = (type_pred, operation_type) {
         let quad = [receipt_id, p, o, graph_id];
         let visible = lookups.snap().contains(&quad).map_err(classify_error)?;
-        masked |= !visible && lookups.snap().mask.as_deref().is_some_and(|m| m.hides(&quad.map(|id| id.0)));
+        masked |= !visible
+            && lookups
+                .snap()
+                .mask
+                .as_deref()
+                .is_some_and(|m| m.hides(&quad.map(|id| id.0)));
         visible
     } else {
         false
@@ -3977,10 +4059,20 @@ fn receipt(
         scratch = lookups.preparation.reserve(0).map_err(classify_error)?;
         &mut scratch
     };
-    let receipt_iri = lookups.preparation.with_iri(lookups.snap(), receipt_id, |text| {
-        text.map(|text| lookups.preparation.copy_string(text, held)).transpose()
-    }).map_err(classify_error)?.ok_or_else(|| origin(key))?;
-    Ok(Receipt { iri: NamedNode::new_unchecked(receipt_iri), dataset, branch, commit })
+    let receipt_iri = lookups
+        .preparation
+        .with_iri(lookups.snap(), receipt_id, |text| {
+            text.map(|text| lookups.preparation.copy_string(text, held))
+                .transpose()
+        })
+        .map_err(classify_error)?
+        .ok_or_else(|| origin(key))?;
+    Ok(Receipt {
+        iri: NamedNode::new_unchecked(receipt_iri),
+        dataset,
+        branch,
+        commit,
+    })
 }
 
 /// A non-negative `xsd:integer` value, also from a stored inline literal.
@@ -4037,7 +4129,8 @@ fn authenticate_record_body(
     mut result_held: Option<&mut Reservation>,
 ) -> Result<AuthenticatedRecord> {
     if let Some(held) = result_held.as_deref_mut() {
-        held.grow_by(graph.as_str().len() as u64).map_err(|e| classify(key, e))?;
+        held.grow_by(graph.as_str().len() as u64)
+            .map_err(|e| classify(key, e))?;
     }
     let rec = receipt(
         lookups,

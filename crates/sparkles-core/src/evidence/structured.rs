@@ -81,7 +81,11 @@ fn select_json_lexical_utf8_batch_with<'a>(
     preparation: Option<&crate::access::Preparation>,
 ) -> Result<Vec<SelectedJsonValue<'a>>> {
     let selected = select_json_lexical_utf8_batch_optional_with(
-        source, pointers, memory_limit, control, preparation,
+        source,
+        pointers,
+        memory_limit,
+        control,
+        preparation,
     )?;
     selected
         .into_iter()

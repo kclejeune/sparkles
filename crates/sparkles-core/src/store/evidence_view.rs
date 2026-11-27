@@ -750,7 +750,9 @@ impl Store {
             drop(temporary);
             match result {
                 OriginRead::Resident(store) => source = ConfigurationSource::Resident(store),
-                OriginRead::Inherited(parent) => source = ConfigurationSource::Cold(parent.branch_id),
+                OriginRead::Inherited(parent) => {
+                    source = ConfigurationSource::Cold(parent.branch_id)
+                }
                 OriginRead::Configuration {
                     binding,
                     first_bound_own,
@@ -1468,10 +1470,9 @@ impl HistoryOrigin {
             held: 0,
         };
         let mut budget = cold::ColdBudget::new(limit)?;
-        let physical =
-            commit::read_gen_commit_controlled(&entry.dir, &mut budget)?.ok_or_else(|| {
-                managed_history::unavailable("retained generation has no commit identity")
-            })?;
+        let physical = commit::read_gen_commit_with(&entry.dir, &mut budget)?.ok_or_else(|| {
+            managed_history::unavailable("retained generation has no commit identity")
+        })?;
         if physical.value.commit.seq == seq {
             return Ok(physical.value.configuration);
         }

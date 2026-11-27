@@ -1769,7 +1769,9 @@ impl<'a> Reads<'a> {
         let Some(g) = self.id(g)? else {
             return Ok((Vec::new(), false));
         };
-        let _clauses = self.preparation.reserve((clauses.len() as u64).saturating_mul(std::mem::size_of::<(Id, Id)>() as u64))?;
+        let _clauses = self.preparation.reserve(
+            (clauses.len() as u64).saturating_mul(std::mem::size_of::<(Id, Id)>() as u64),
+        )?;
         let mut resolved = Vec::with_capacity(clauses.len());
         for (p, o) in clauses {
             let Some(p) = self.id(p)? else {

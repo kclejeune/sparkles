@@ -12,9 +12,9 @@
 //! capability.
 
 pub use sparkles_core::evidence::resolve::{
-    GraphNodes, MAX_REFERENCES, MEMORY_BYTES, SingleObject, Phase2Outcome, ProposedPassage, ProposedStructured, Receipt,
-    RecordRequest, SelectionProbe, SelectionRequirements, VerifiedFact, VerifiedRecord,
-    VerifiedSpan, check_anchor, kind_iri, unavailable,
+    GraphNodes, MAX_REFERENCES, MEMORY_BYTES, Phase2Outcome, ProposedPassage, ProposedStructured,
+    Receipt, RecordRequest, SelectionProbe, SelectionRequirements, SingleObject, VerifiedFact,
+    VerifiedRecord, VerifiedSpan, check_anchor, kind_iri, unavailable,
 };
 pub use sparkles_core::evidence::{BlankAnchor, GraphIdentity, RecordKind, StoredFactRef};
 

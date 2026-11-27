@@ -345,7 +345,6 @@ async fn refused_policies_cost_no_model_call() {
         assert_eq!(out["error"]["code"], "bad-argument", "{out}");
     }
     assert!(m.requests().is_empty());
-
 }
 
 /// Matching policy alone reports its resolution map without adding null claims or

@@ -621,7 +621,8 @@ impl Store {
             ));
         }
         options.check()?;
-        let _managed_change = super::branching::controlled_lock(&self.family.managed_change, options)?;
+        let _managed_change =
+            super::branching::controlled_lock(&self.family.managed_change, options)?;
         let w = self.lock_writer(options)?;
         if w.poisoned {
             return Err(Error::Poisoned);

@@ -591,8 +591,6 @@ pub(crate) fn dataset_identity_and_reader_bytes_with<C: crate::budgeted::BudgetC
     Ok(identity)
 }
 
-}
-
 /// Exercise the actual closed scalar reader with caller-attributed allocation
 /// instrumentation. This returns no source, access or managed-admission authority.
 #[doc(hidden)]

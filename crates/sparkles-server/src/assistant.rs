@@ -1034,7 +1034,9 @@ pub fn answer_access(
     branch: Option<&str>,
     principal: &str,
 ) -> AnswerAccess {
-    answer_access_for(snap, view, caller, dataset, branch, principal, "query", false)
+    answer_access_for(
+        snap, view, caller, dataset, branch, principal, "query", false,
+    )
 }
 
 /// [`answer_access`] for a named endpoint (`"query"` or `"info"`).

@@ -2523,6 +2523,7 @@ fn record_digest_distinguishes_duplicate_isomorphic_blank_expected_triples() {
     );
 }
 
+#[test]
 fn source_revision_predecessor_writes_prov_was_revision_of_and_rejects_cycles() {
     let s = settings(&["urn:s"], &["urn:c"]);
     let base = input("o1", "urn:o");
