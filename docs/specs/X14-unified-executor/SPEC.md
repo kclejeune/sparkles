@@ -2317,7 +2317,10 @@ snapshot hint admit at once as before, and so does a batch whose exact count rep
 its rows. An admitted map evaluates its misses once per distinct key, holds a pending
 entry for a missed key until then, and is released when it answers fewer than one row in
 sixteen. The sketch, the map and each batch's scratch are charged to the query's memory
-budget, a refused charge falls back to ordinary evaluation, and every loop checks
+budget. A refused charge, or a result that the budget cannot intern while the map and the
+batch's scratch hold their charges, releases the sketch and the map and evaluates the
+batch the ordinary way, so the map never refuses a query that ordinary evaluation fits.
+A BIND that ends its input releases them for the operators above it, and every loop checks
 cancellation. The batch charge is a bound sized by the batch, so the memory audit's
 `bind` fixture allows its ledger to stand above its heap until item 1320 tightens it.
 
@@ -2325,8 +2328,10 @@ Weak repetition, from one repeated row in eight up to one in two, admits a
 parallel-capable expression on more than one worker only when it pays for the map. The
 guard keeps the last two timed fallback evaluations of at least 1,024 rows in one size
 bucket and estimates the saving from the lower of their rates. A saving of at least
-100 ns a row admits on one window, at least 50 ns needs two consecutive windows, and less
-declines. Sustained split losses in the bucket count as a pass, because contended
+100 ns a row admits on one window, at least 50 ns needs two consecutive windows or two
+consecutive exact batch counts, and less declines. A batch that completes no window leaves
+the windows' confirmations alone, since its exact count says nothing about repetition
+across batches. Sustained split losses in the bucket count as a pass, because contended
 parallel evaluation is then the cost that the map saves. A single worker and expressions
 that cannot run in parallel keep the plain one-in-eight rule.
 
@@ -2346,23 +2351,36 @@ The policy was chosen on forge, an Intel i5-13500, at 13,320,192 triples from
 cache. Each of the A,B,B,A and B,A,A,B orders ran six rounds of four fresh processes with
 eight timed requests a query, and every answer matched. The prototype `b71512f1`, which
 has the policy above, ran against its own build with the 100 ns rule and the IRI cooldown
-turned off. It also ran against the earlier lane state `224caadc`, which kept map misses
+turned off. It also ran against the earlier prototype `d2a50e43`, which kept map misses
 serial after their first unpaid split and admitted at one in eight without a cost guard,
 and against the base `fd47b7ae`. Against the switched-off build it took 0.779 of the time
 on joined SHA256 with random repeats at 65,536 rows, 0.838 and 0.905 on moderate IRI
-repetition and 0.927 to 0.930 on SHA256 with a stride of 8. Against `224caadc` it took
+repetition and 0.927 to 0.930 on SHA256 with a stride of 8. Against `d2a50e43` it took
 0.54 to 0.59 on unique and low-repeat IRIs and 0.74 to 0.79 on unique and low-repeat
 SHA256. It removed that state's 1.21 to 1.24 times regressions on dates and strings with a
 stride of 8 and its 1.105 on joined strings with random repeats. It gave up 7.9% to 12.1%
-against `224caadc` on SHA256 with a stride of 8, whose map misses split on every batch,
+against `d2a50e43` on SHA256 with a stride of 8, whose map misses split on every batch,
 8.0% and 5.3% on joined SHA256 and strings with global repeats and 5.5% on strings with a
 stride of 8 at 262,144 rows.
 Against the base, the three 65,536-row repairs measured 1.018 on dates with an interval
 that reaches 1.0, 1.014 on strings and 1.037 on joined strings with random repeats, which
-add 0.15 ms and 0.25 ms. Item 1319 holds those two costs. The matrix has no paired
-comparison against the base on the cheap inputs, the 2,048-row inputs or the small eager
-and dense-string queries, so item 293 stays open until the landed build is confirmed
-against its base.
+add 0.15 ms and 0.25 ms. The matrix has no paired comparison against the base on the
+cheap inputs, the 2,048-row inputs or the small eager and dense-string queries, so item
+293 stays open until the landed build is confirmed against its base.
+
+Item 1319 holds the two real costs, one line each. Neither cause is isolated, because the
+base also lacks the shared split controller and the fallback's timing, so each recovery
+names a hypothesis to test first.
+
+- On forge at 13.3M triples with 17 query threads, `b71512f1` against `fd47b7ae` takes
+  1.037 times as long on `join-str-random-60-65536`, 0.25 ms more with an interval above
+  1.0. The query admits its map at the sixth batch, and the hypothesis is that the map
+  costs more than it saves on this cheap expression. The recovery weighs the map's
+  lookup cost against the measured saving in the cost guard, by 2026-12-11.
+- On forge at 13.3M triples with 17 query threads, `b71512f1` against `fd47b7ae` takes
+  1.014 times as long on `str-stride-8-65536`, 0.15 ms more with an interval above 1.0.
+  The query never admits its map, and the hypothesis is the cost of the probe. The
+  recovery is item 1083's bound on the probe, by 2026-12-11.
 
 The rejected arms are recorded in PERFORMANCE-EXPERIMENTS. A diagnostic arm in `cd5561af`
 gave the map misses of `SHA256(STR(input))` a separate first-unpaid cooldown, to test
@@ -2374,11 +2392,19 @@ The confirmation builds the landed tip and its base `17674a34` as release binari
 build host with the same compiler and profile. The commands below run on forge from the
 candidate checkout in a named terminal with `BASE_BIN` and `TIP_BIN` set. Each pair
 runs beside a same-binary control. The streamed pairs cover the 166 queries at all
-threads and the cheap and 2,048-row queries at one thread, and the eager pair covers the
-2,048-row and string queries at all threads, since the eager executor shares the batch
-evaluation that the split timing changes. The build passes when every answer matches and no query is
-10% or more slower after the flagged rerun. A ratio whose interval stays above 1.0 and
-adds more than 0.5 µs is a real cost that gets its own line in item 1319.
+threads and the cheap and 2,048-row queries at one thread. The eager pair runs
+`execution=eager` on the 2,048-row and string queries at all threads, since the eager
+executor shares the batch evaluation that the split timing changes. The largest deviation
+from parity of a query's same-binary control, across its pooled and per-round ratios, is
+that query's noise. A query 10% or more slower in the first pass of any arm runs again in
+that arm with 12 rounds of 16 requests, and so does a candidate query that is slower in
+every round, beyond its control's noise and by more than 0.5 µs. The analysis then takes
+each query's rerun when it has one and computes a 95% bootstrap interval of the median of
+the candidate's per-round ratios. The block exits with an error when a summary is invalid,
+an answer differs, or a candidate or its control stays 10% or more slower. A rerun
+candidate query whose interval lies above 1.0, whose ratio exceeds its control's noise and
+which adds more than 0.5 µs is a real cost. The block writes each one to `costs.txt`, and
+each gets its own line in item 1319 with the host and the two revisions.
 
 ```bash
 export BASE_BIN TIP_BIN
@@ -2390,6 +2416,39 @@ runs="$repo/.artifacts/bench-bind-reuse-293/$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$runs"
 python3 scripts/gen-bind-reuse.py data | zstd -q -o "$runs/data.nt.zst"
 python3 scripts/gen-bind-reuse.py queries "$runs/queries"
+
+# Times the queries staged in $1 with $2 rounds of $3 requests a query and server, for
+# the binaries and settings of the current arm.
+run_pass() {
+    local out=$1 rounds=$2 reps=$3
+    install -m 755 "$a" "$out/bin-A"
+    install -m 755 "$b" "$out/bin-B"
+    {
+        printf 'host: %s\nA: %s\nB: %s\n' "$(hostname)" "$a" "$b"
+        sha256sum "$a" "$b" "$runs/data.nt.zst"
+        readelf -p .comment "$a" "$b"
+    } >"$out/manifest.txt"
+    cp "$runs/data.nt.zst" "$out/"
+    cp scripts/nsc-bench-remote.sh "$out/"
+    cat >"$out/run.env" <<ENV
+ROUNDS=$rounds
+REPS=$reps
+WARMUP=3
+ORDERS="A B B A;B A A B"
+BINARY_OF_A=A
+BINARY_OF_B=B
+RAYON_THREADS=$threads
+SERVER_CPU=$server_cpu
+CLIENT_CPU=$client_cpu
+SPIN=$spin
+EXECUTION=$execution
+PORT=31943
+ENV
+    env -u BINARY_OF_A -u BINARY_OF_B -u EXPECTED_ANSWER_CHANGE -u EXPECTED_ANSWER_CHANGE_REASON \
+        bash "$out/nsc-bench-remote.sh"
+    python3 scripts/nsc-bench-summary.py "$out" >"$out/summary.md"
+}
+
 status=0
 for arm in all-control all-candidate one-control one-candidate eager-control eager-candidate; do
     a=$BASE_BIN b=$TIP_BIN threads=default server_cpu=0-10,12-19 client_cpu=11 spin=0
@@ -2407,41 +2466,110 @@ for arm in all-control all-candidate one-control one-candidate eager-control eag
                 "$runs"/queries/*-stride-16-*.rq "$runs"/queries/*-unique-*.rq "$out/queries/"
             ;;
         eager-*)
-            execution=
+            execution=eager
             cp "$runs"/queries/*-2048.rq "$runs"/queries/str-*.rq "$runs"/queries/join-str-*.rq \
                 "$out/queries/"
             ;;
     esac
-    install -m 755 "$a" "$out/bin-A"
-    install -m 755 "$b" "$out/bin-B"
-    {
-        printf 'host: %s\nA: %s\nB: %s\n' "$(hostname)" "$a" "$b"
-        sha256sum "$a" "$b" "$runs/data.nt.zst"
-        readelf -p .comment "$a" "$b"
-    } >"$out/manifest.txt"
-    cp "$runs/data.nt.zst" "$out/"
-    cp scripts/nsc-bench-remote.sh "$out/"
-    cat >"$out/run.env" <<ENV
-ROUNDS=6
-REPS=8
-WARMUP=3
-ORDERS="A B B A;B A A B"
-BINARY_OF_A=A
-BINARY_OF_B=B
-EXPECTED_ANSWER_CHANGE=0
-EXPECTED_ANSWER_CHANGE_REASON=""
-RAYON_THREADS=$threads
-SERVER_CPU=$server_cpu
-CLIENT_CPU=$client_cpu
-SPIN=$spin
-EXECUTION=$execution
-PORT=31943
-ENV
-    env -u BINARY_OF_A -u BINARY_OF_B -u EXPECTED_ANSWER_CHANGE -u EXPECTED_ANSWER_CHANGE_REASON \
-        bash "$out/nsc-bench-remote.sh"
-    python3 scripts/nsc-bench-summary.py "$out" >"$out/summary.md"
-    python3 scripts/nsc-bench-summary.py --check "$out/summary.json" first || status=1
+    run_pass "$out" 6 8
+    if ! python3 scripts/nsc-bench-summary.py --check "$out/summary.json" first; then
+        status=1
+        continue
+    fi
+    flagged=$(python3 -c '
+import json, sys
+queries = json.load(open(sys.argv[1]))["queries"]
+control = json.load(open(sys.argv[2]))["queries"] if sys.argv[3].endswith("-candidate") else {}
+
+
+def flag(query, measured):
+    stats = measured.get("exec_ms")
+    if stats is None:
+        return False
+    if stats["ratio"] >= 1.10:
+        return True
+    same = control.get(query, {}).get("exec_ms")
+    if same is None:
+        return False
+    bound = max(max(r, 1 / r) for r in [same["ratio"], *same["rounds"]])
+    added_us = (stats["b"] - stats["a"]) * 1000
+    return all(r > 1 for r in stats["rounds"]) and stats["ratio"] > bound and added_us > 0.5
+
+
+print(" ".join(q for q, m in queries.items() if flag(q, m)))
+' "$out/summary.json" "$runs/${arm%-*}-control/summary.json" "$arm")
+    if [ -n "$flagged" ]; then
+        mkdir -p "$out/rerun/queries"
+        for query in $flagged; do
+            cp "$out/queries/$query.rq" "$out/rerun/queries/"
+        done
+        run_pass "$out/rerun" 12 16
+        python3 scripts/nsc-bench-summary.py --check "$out/rerun/summary.json" rerun "$flagged" ||
+            status=1
+    fi
 done
+python3 - "$runs" <<'PY' || status=1
+import json
+import random
+import statistics
+import sys
+from pathlib import Path
+
+runs = Path(sys.argv[1])
+
+
+def interval(ratios, n=10000):
+    if len(ratios) < 2:
+        return float("nan"), float("nan")
+    rng = random.Random(42)
+    boots = sorted(statistics.median(rng.choices(ratios, k=len(ratios))) for _ in range(n))
+    return boots[int(0.025 * n)], boots[int(0.975 * n) - 1]
+
+
+def measured(name):
+    """Each query's execution times in arm `name`, from its rerun when it has one, and
+    the queries that the arm ran again."""
+    path = runs / name / "summary.json"
+    if not path.exists():
+        return None, set()
+    queries = json.loads(path.read_text())["queries"]
+    rerun_path = runs / name / "rerun" / "summary.json"
+    rerun = json.loads(rerun_path.read_text())["queries"] if rerun_path.exists() else {}
+    return {query: rerun.get(query, m).get("exec_ms") for query, m in queries.items()}, set(rerun)
+
+
+failures, costs = [], []
+for pair in ("all", "one", "eager"):
+    (control, _), (candidate, reran) = measured(f"{pair}-control"), measured(f"{pair}-candidate")
+    if control is None or candidate is None:
+        failures.append(f"{pair}: no summary")
+        continue
+    for query in sorted(candidate):
+        same, stats = control.get(query), candidate[query]
+        if same is None or stats is None:
+            failures.append(f"{pair} {query}: no execution times")
+            continue
+        # The same-binary control's largest deviation from parity is the query's noise.
+        bound = max(max(r, 1 / r) for r in [same["ratio"], *same["rounds"]])
+        low, high = interval(stats["rounds"])
+        added_us = (stats["b"] - stats["a"]) * 1000
+        line = (
+            f"{pair} {query}: {stats['ratio']:.4f}x, 95% interval {low:.4f} to {high:.4f}, "
+            f"{added_us:+.1f} us, control within {bound:.4f}x"
+        )
+        print(line)
+        if same["ratio"] >= 1.10:
+            failures.append(f"{line}, the control is 10% or more slower after the rerun")
+        elif stats["ratio"] >= 1.10:
+            failures.append(f"{line}, 10% or more slower after the rerun")
+        elif query in reran and low > 1.0 and stats["ratio"] > bound and added_us > 0.5:
+            costs.append(line)
+(runs / "costs.txt").write_text("".join(f"{line}\n" for line in costs))
+for line in costs:
+    print(f"real cost: {line}")
+if failures:
+    sys.exit("\n".join(failures))
+PY
 exit "$status"
 SH
 ```

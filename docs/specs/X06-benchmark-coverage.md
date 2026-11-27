@@ -1688,8 +1688,8 @@ also decide admission and parallel evaluation.
 
 The matrix behind the policy ran on `atlas` with synthetic inputs of dates, integers,
 strings, IRIs and SHA1 keys of 2,048 to 262,144 rows. Its reuse shapes are unique keys,
-one early duplicate, low and moderate repetition, strides of 8 and 16, random repeats of
-60, repetition that starts after one period of 65,536 keys, and hot keys late in the
+one early duplicate, low and moderate repetition, strides of 8 and 16, uniform draws from a
+domain of 60% of the rows, about half of them distinct, repetition that starts after one period of 65,536 keys, and hot keys late in the
 input. Every comparison ran A,B,B,A rounds in one binary through its experiment
 switches, with one server core and one Rayon thread unless noted, and every answer
 agreed. Against the one-shot pilot, a period of 65,536 keys repeated over 262,144 rows

@@ -161,17 +161,25 @@ earlier implementation and always apply. `EXPLAIN` shows which fast paths ran.
 
   The planner accounts for sorting an unsorted column so a single filtered pattern picks the
   permutation sorted on the filtered variable. A cursor BIND can retain cached results
-  across batches in a map keyed by exact input IDs. Its first batch admits the map when
-  one row in eight repeats, or when a key repeats and unchanged-snapshot statistics
-  estimate the input domain below 80% of rows, walking at most 64 plan nodes. Later
+  across batches in a map keyed by exact input IDs. A batch of dense inline integers
+  admits the map at once, and so does a first batch in which a key repeats while
+  unchanged-snapshot statistics estimate the input domain below 80% of rows, walking at
+  most 64 plan nodes. Otherwise the first batch admits the map when one row in eight
+  repeats on one worker or for an expression that cannot run in parallel, and when half
+  its rows repeat for a parallel-capable expression on more than one worker. Later
   batches feed a sketch of one key in sixteen and the exact distinct count of each
-  batch, and on more than one worker weak repetition of a parallel-capable expression
-  also needs a measured evaluation rate that pays for the map. The map's misses and the
-  ordinary evaluation share one split controller that keeps a contended expression
-  serial for a cooldown and then retries the pool. The per-query cache caps at 65,536 entries (charged conservatively at
-  about 6 MiB; dense inline integers cap at 16,384 entries); budget refusals or a full cache
-  fall back to ordinary evaluation. Identity copies, volatile expressions and application
-  callbacks never enter this cache.
+  batch. On more than one worker, weaker repetition of a parallel-capable expression
+  admits only when a measured evaluation rate shows that the map pays, or when
+  sustained split losses show that parallel evaluation contends. The map's misses and
+  the ordinary evaluation share one split controller that keeps a contended expression
+  serial for a cooldown and then retries the pool. The per-query cache caps at 65,536
+  entries, charged at about 6 MiB, and dense inline integers cap at 16,384 entries. A
+  full cache still answers the keys it holds and evaluates each distinct missed key once
+  for the batch without keeping it. A budget refusal of the cache's memory, including a
+  result that cannot be interned while the cache holds its charges, releases the cache
+  and evaluates the batch the ordinary way, and an operator that ends its input releases
+  the cache too. Identity copies, volatile expressions and application callbacks never
+  enter this cache.
 * **Numeric range scans.** A FILTER comparing a scan's sort column with numeric constants
   reads only matching ID ranges (`IndexRangeScan`). Inline integers and single-scale inline
   decimals sort by value within their ID segments, so binary search finds each segment's

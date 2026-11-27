@@ -1034,16 +1034,21 @@ of an `in`.
 
 A cursor BIND keeps observing repetition after its first batch, through a sampled sketch
 of its input keys and the exact distinct count of each batch, and admits its map of
-results when one row in eight repeats. Before, a first batch without enough repetition
+results when one row in eight repeats, or half the rows of a parallel-capable expression's
+first batch on more than one worker. Before, a first batch without enough repetition
 ended reuse for the query, so an input whose keys repeated only after 65,536 rows
 evaluated every row. A map that stops paying is released, and the sketch and the map are
-charged to the query's memory budget, about 128 KiB and 6 MiB when full. On more than one
+charged to the query's memory budget, about 128 KiB and 6 MiB when full. A refused charge,
+or a result that the budget cannot intern beside the map, releases them and evaluates the
+batch the ordinary way, and a BIND that ends its input releases them for the operators
+above it. On more than one
 worker, weak repetition of a parallel-capable expression admits the map only when the
 measured evaluation rate says it pays. The map's misses and the ordinary evaluation share
 one split controller, which keeps a contended expression serial for a cooldown and then
 retries the pool, in place of disabling parallel evaluation for the rest of the query.
-Roadmap item 293 stays open for its confirmation on forge, and items 1082, 1083 and 1319
-follow the remaining costs.
+Roadmap item 293 stays open for its confirmation on forge, items 1082, 1083 and 1319
+follow the remaining costs, and item 1320 follows the charges that stand above the map's
+heap.
 
 ### One plan in every execution mode
 
