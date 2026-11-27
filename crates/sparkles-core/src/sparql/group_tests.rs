@@ -65,6 +65,101 @@ fn results(ctx: &Ctx, acc: &mut dyn Accumulator, groups: usize) -> Vec<String> {
 }
 
 #[test]
+fn decimal_avg_rounds_after_merging_partial_sums() {
+    use oxrdf::vocab::xsd;
+
+    let ctx = ctx();
+    let agg = agg(AggregateFunction::Avg, true, false);
+    let decimal = |s| ctx.intern_value(&Value::from_typed(s, xsd::DECIMAL.as_str()));
+    let zero = int(&ctx, 0);
+    let cases = [
+        ([decimal("1"), zero, zero], "0.333333333333333333333333"),
+        ([decimal("-2"), zero, zero], "-0.666666666666666666666667"),
+        (
+            [
+                decimal("80000000000000000000"),
+                decimal("80000000000000000000"),
+                zero,
+            ],
+            "53333333333333333333.333333333333333333333333",
+        ),
+    ];
+    for (values, expected) in cases {
+        for split in 0..=values.len() {
+            let (mut left, mut right) = (Running::new(&agg, true), Running::new(&agg, true));
+            left.init(1);
+            right.init(1);
+            let (l, r) = values.split_at(split);
+            fold(&ctx, &mut left, l, &[0; 3][..l.len()]);
+            fold(&ctx, &mut right, r, &[0; 3][..r.len()]);
+            left.merge(&ctx, &mut right, &[0], &mut |_| Ok(())).unwrap();
+            assert_eq!(results(&ctx, &mut left, 1), [expected], "split {split}");
+        }
+    }
+}
+
+#[test]
+fn maintained_integer_avg_with_wide_subtotal_respects_scratch_budget() {
+    use super::bignum::FIXED_AVG_SCRATCH_BYTES;
+
+    let mut ctx = ctx();
+    let mut acc = retractable(&agg(AggregateFunction::Avg, true, false), 1).unwrap();
+    acc.init(1);
+    let value = int(&ctx, 1 << 62);
+    fold(&ctx, acc.as_mut(), &[value, value], &[0, 0]);
+
+    // The subtotal exceeds i64::MAX. Only the exact result term needs admission.
+    ctx.mem_limit = ctx.live_bytes() + 512;
+    let exact = acc.read(&ctx, 0).unwrap();
+
+    let zero = int(&ctx, 0);
+    fold(&ctx, acc.as_mut(), &[zero], &[0]);
+    // A repeating quotient needs division scratch for the same i128 subtotal.
+    ctx.mem_limit = ctx.live_bytes() + FIXED_AVG_SCRATCH_BYTES + 256;
+    let repeating = acc.read(&ctx, 0).unwrap();
+
+    // Inspect the result ids outside the budget under test.
+    ctx.mem_limit = u64::MAX;
+    let Some(Value::Decimal(avg)) = ctx.value(exact) else {
+        panic!("expected an exact decimal average");
+    };
+    assert_eq!(avg, oxsdatatypes::Decimal::from(1_i64 << 62));
+    assert_eq!(
+        ctx.value(repeating).unwrap().lexical().unwrap().as_ref(),
+        "3074457345618258602.666666666666666666666667"
+    );
+}
+
+#[test]
+fn wide_integer_sum_finish_memory_covers_interning_scratch() {
+    use super::bignum::intern_scratch_bytes;
+    use super::exec::{AggState, SumAcc};
+
+    let ctx = ctx();
+    let agg = agg(AggregateFunction::Sum, true, false);
+    let zero = Id::from_i64(0).unwrap();
+    for (base, delta, lexical_len) in [(i64::MAX, 1, 19), (i64::MIN, -1, 20)] {
+        let mut state = AggState::new(&agg);
+        for n in [base, delta, 0] {
+            state
+                .add(&ctx, &agg, Some(int(&ctx, n)), &mut |_| Ok(()))
+                .unwrap();
+        }
+        assert!(matches!(
+            state,
+            AggState::Sum {
+                acc: SumAcc::Int128(_),
+                ..
+            }
+        ));
+        let scratch = intern_scratch_bytes(lexical_len);
+        assert_eq!(state.finish_memory(&agg).scratch, scratch);
+        assert!(state.retract(Some(zero), 1));
+        assert_eq!(state.finish_memory(&agg).scratch, scratch);
+    }
+}
+
+#[test]
 fn merging_two_passes_gives_one_pass() {
     let ctx = ctx();
     let values: Vec<Id> = [5, 3, 9, 3, 7, 1, 8, 2, 6, 4]
@@ -351,7 +446,7 @@ fn running_decimal_avg_uses_the_final_subtotal_precision() {
         let mut acc = Running::new(&avg, false);
         acc.init(1);
         fold(&ctx, &mut acc, &inputs, &[0; 6]);
-        assert_eq!(results(&ctx, &mut acc, 1), ["0"]);
+        assert_eq!(results(&ctx, &mut acc, 1), ["0.000000000000000000166667"]);
     }
 }
 
@@ -666,8 +761,8 @@ fn big_avg_finalization_charges_division_scratch_deferred_and_direct() {
 
     let big_str = format!("1{}1", "0".repeat(3_998));
 
-    // Direct (non-deferred) AVG finalization of a 4,000-digit integer over 3 rows takes
-    // the non-terminating BigDec::checked_div path and must charge division scratch.
+    // Finalizing a 4,000-digit AVG charges arbitrary-precision division scratch,
+    // including when the quotient terminates.
     let mut ctx_direct = ctx();
     ctx_direct.mem_limit = 512 << 10;
     let big = ctx_direct.intern_value(&Value::from_typed(
@@ -3750,20 +3845,20 @@ fn hash_assembly_sort_and_key_only_group_poll_cancellation_and_timeout() {
     let err = super::group::par::sort_order_map(&cancel_ctx, &mut map, max_row).unwrap_err();
     assert!(matches!(err, crate::error::Error::Cancelled));
 
-    // 2. `finish_intern_bytes` scans poll in bounded chunks and abort on cancellation.
+    // 2. `finish_memory` scans poll in bounded chunks and abort on cancellation.
     let groups = 20_000usize;
     let avg_agg = agg(AggregateFunction::Avg, true, false);
     let mut run_acc = Running::new(&avg_agg, false);
     run_acc.init(groups);
     let before = super::ctx::CHECKS.with(std::cell::Cell::get);
-    let _ = run_acc.finish_intern_bytes(&ctx_ok).unwrap();
+    let _ = run_acc.finish_memory(&ctx_ok).unwrap();
     let run_checks = super::ctx::CHECKS.with(std::cell::Cell::get) - before;
     assert!(
         run_checks >= groups / 1024,
-        "expected Running::finish_intern_bytes to poll in chunks, got {run_checks}"
+        "expected Running::finish_memory to poll in chunks, got {run_checks}"
     );
     assert!(matches!(
-        run_acc.finish_intern_bytes(&cancel_ctx),
+        run_acc.finish_memory(&cancel_ctx),
         Err(crate::error::Error::Cancelled)
     ));
 
@@ -3777,14 +3872,14 @@ fn hash_assembly_sort_and_key_only_group_poll_cancellation_and_timeout() {
     let mut concat_acc = Concat::new(&concat_agg);
     concat_acc.init(groups);
     let before = super::ctx::CHECKS.with(std::cell::Cell::get);
-    let _ = concat_acc.finish_intern_bytes(&ctx_ok).unwrap();
+    let _ = concat_acc.finish_memory(&ctx_ok).unwrap();
     let concat_checks = super::ctx::CHECKS.with(std::cell::Cell::get) - before;
     assert!(
         concat_checks >= groups / 1024,
-        "expected Concat::finish_intern_bytes to poll in chunks, got {concat_checks}"
+        "expected Concat::finish_memory to poll in chunks, got {concat_checks}"
     );
     assert!(matches!(
-        concat_acc.finish_intern_bytes(&cancel_ctx),
+        concat_acc.finish_memory(&cancel_ctx),
         Err(crate::error::Error::Cancelled)
     ));
 
@@ -3811,7 +3906,7 @@ fn hash_assembly_sort_and_key_only_group_poll_cancellation_and_timeout() {
             super::group::whole(&ctx_ok, &table, &[0], &avg_aggs, false, true, &mut rep).unwrap();
         super::ctx::CHECKS.with(std::cell::Cell::get) - before
     });
-    // Coordinator thread runs Pass 3 (finish_intern_bytes + order_map build + gather + finish).
+    // Coordinator thread runs Pass 3 (finish_memory + order_map build + gather + finish).
     assert!(
         asm_checks >= (n / 1024) * 3,
         "expected Pass 3 coordinator polling across estimate, build, gather, and finish, got {asm_checks}"

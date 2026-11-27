@@ -1601,13 +1601,19 @@ reading comes from `QueryOptions::aggregate_errors`, else the dataset's setting 
 The `jena` reading was fixed by running ARQ 6.2.0 on every aggregate, with and without
 DISTINCT and over a variable and an expression, for groups with unbound values, type
 errors, only errors and no rows. The fixture `tests/fixtures/aggregate-errors/` keeps
-that output, and the `jena` reading gives every answer in it apart from SAMPLE's choice
-and the digits beyond 18 of a decimal AVG, which item 1084 holds. Jena's rule turned out
-wider than the three cases of the item only where the engine already agreed, so an error
-makes SUM, AVG, MIN, MAX and GROUP_CONCAT unbound and COUNT and SAMPLE pass over it. The
-one further difference was `GROUP_CONCAT(DISTINCT …)` over no rows, which ARQ makes
+that output, and the `jena` reading gives every answer in it apart from SAMPLE's choice.
+An error makes SUM, AVG, MIN, MAX and GROUP_CONCAT unbound, and COUNT and SAMPLE pass
+over it. The one further difference was `GROUP_CONCAT(DISTINCT …)` over no rows, which ARQ makes
 unbound and the `jena` reading follows. The planner's shortcuts were audited, and only
 the COUNT plans assume anything about errors, which every reading shares.
+
+Item 1084 gives AVG of integers and decimals the same division as ARQ under all three
+readings. Eager queries, cursors and maintained views divide the exact subtotal by the
+count. Partial groups merge their subtotals before dividing. A terminating quotient
+stays exact, and a repeating quotient rounds to 24 fractional digits using half-even
+rounding. A quotient outside the numeric bounds is unbound. The view compiler
+fingerprint changed so checkpoints that store results at the previous precision are
+rebuilt from the data.
 
 Materialized and incrementally maintained state follows the dataset's reading, else the
 server's. Views and live queries run under it, switch when it changes as they switch on

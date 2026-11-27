@@ -48,6 +48,9 @@ pub(crate) const AGG_SUM_PAYLOAD_BYTES: u64 =
 /// Transient scratch for one arbitrary-precision `SUM`/`AVG` addition or `AVG` division
 /// (operand alignment or scaling, Knuth division buffers, result, and normalization).
 pub(crate) const AGG_SUM_SCRATCH_BYTES: u64 = 5 * AGG_SUM_PAYLOAD_BYTES;
+/// Division and interning scratch for AVG from a fixed-width subtotal. Scaling an
+/// i128 coefficient by at most 63 decimal places needs at most 12 base-10^9 limbs.
+pub(crate) const FIXED_AVG_SCRATCH_BYTES: u64 = 1024;
 /// Transient decimal-string scratch for converting a [`BigInt`] or [`BigDec`] to `f32`.
 pub(crate) const TO_F32_SCRATCH_BYTES: u64 = 256;
 /// Transient decimal-string scratch for converting a [`BigInt`] or [`BigDec`] to `f64`.
@@ -63,6 +66,8 @@ pub(crate) fn intern_scratch_bytes(lexical_len: usize) -> u64 {
 /// Minimum fractional digits produced by a non-terminating [`BigDec`] division, matching
 /// `oxsdatatypes::Decimal`.
 const MIN_DIV_SCALE: u32 = 18;
+/// Fractional scale for a non-terminating Jena ARQ average.
+const AVG_DIV_SCALE: u32 = 24;
 /// Raw scale of `oxsdatatypes::Decimal` (`raw * 10^-18`).
 const OXS_DEC_SCALE: u32 = 18;
 
@@ -1489,6 +1494,44 @@ impl BigDec {
         Self::normalize(self.mantissa.neg != rhs.mantissa.neg, q, out_scale)
     }
 
+    /// Divide an exact aggregate subtotal by its row count as ARQ does.
+    /// Terminating quotients stay exact. Repeating quotients round to 24 fractional
+    /// digits with half-even rounding. The normalized result must fit the value limits.
+    pub(crate) fn checked_avg(&self, rows: u64) -> Option<Self> {
+        if rows == 0 {
+            return None;
+        }
+        let twos = rows.trailing_zeros();
+        let mut rest = rows >> twos;
+        let mut fives = 0;
+        while rest.is_multiple_of(5) {
+            rest /= 5;
+            fives += 1;
+        }
+        // This many extra powers of ten remove all factors of 2 and 5 from the
+        // denominator. A nonzero remainder then proves the quotient repeats.
+        let scale = (self.scale + twos.max(fives)).max(AVG_DIV_SCALE + 1);
+        let numerator = shift_mag_pow10(&self.mantissa.limbs, (scale - self.scale) as usize);
+        let denominator = BigInt::from_u64(rows);
+        let (quotient, remainder) = div_rem_mag(&numerator, &denominator.limbs);
+        drop(numerator);
+        if remainder.is_empty() {
+            return Self::normalize(self.mantissa.neg, quotient, scale);
+        }
+
+        let discarded = (scale - AVG_DIV_SCALE) as usize;
+        let digits = limbs_digits(&quotient);
+        // An exact halfway value terminates, so a discarded 5 here has a nonzero
+        // digit after it. Rounding the magnitude works for both signs.
+        let round_up =
+            digits >= discarded && digit_from_msb(&quotient, digits, digits - discarded) >= 5;
+        let (mut rounded, _) = div_rem_mag_pow10(&quotient, discarded);
+        if round_up {
+            rounded = add_mag(&rounded, &[1]);
+        }
+        Self::normalize(self.mantissa.neg, rounded, AVG_DIV_SCALE)
+    }
+
     /// `fn:numeric-mod` on decimals: remainder of truncating division.
     pub fn checked_rem(&self, rhs: &Self) -> Option<Self> {
         if rhs.is_zero() {
@@ -1873,6 +1916,54 @@ mod tests {
         assert_eq!(q2.to_string(), "999999999");
         assert_eq!(r2.to_string(), "499999999999999999000000000");
         assert_eq!(q2.checked_mul(&v2).unwrap().checked_add(&r2).unwrap(), u2);
+    }
+
+    #[test]
+    fn decimal_avg_rounds_repeating_quotients_and_keeps_terminating_ones_exact() {
+        for (sum, rows, expected) in [
+            ("1", 3, "0.333333333333333333333333"),
+            ("2", 3, "0.666666666666666666666667"),
+            ("-2", 3, "-0.666666666666666666666667"),
+            ("0.0000000000000000000000014", 3, "0"),
+            (
+                "0.0000000000000000000000016",
+                3,
+                "0.000000000000000000000001",
+            ),
+            (
+                "0.000000000000000000000001",
+                2,
+                "0.0000000000000000000000005",
+            ),
+            ("2.9999999999999999999999999", 3, "1"),
+            ("1", 10_000_000_000, "0.0000000001"),
+            ("1", u64::MAX, "0.00000000000000000005421"),
+        ] {
+            assert_eq!(
+                BigDec::parse(sum).unwrap().checked_avg(rows),
+                BigDec::parse(expected),
+                "{sum} / {rows}"
+            );
+        }
+        assert_eq!(BigDec::from_i64(1).checked_avg(0), None);
+    }
+
+    #[test]
+    fn decimal_avg_checks_bounds_after_dividing_and_normalizing() {
+        let tiny = format!("0.{}1", "0".repeat(MAX_SCALE as usize - 1));
+        let tiny = BigDec::parse(&tiny).unwrap();
+        let twice = tiny.checked_mul(&BigDec::from_i64(2)).unwrap();
+        assert_eq!(twice.checked_avg(2), Some(tiny.clone()));
+        assert_eq!(tiny.checked_avg(2), None);
+        assert_eq!(tiny.checked_avg(3), Some(BigDec::zero()));
+
+        let max = BigDec::parse(&"9".repeat(MAX_DIGITS)).unwrap();
+        let subtotal = max
+            .checked_add_with_limit(&max, AGG_MAX_DEC_DIGITS)
+            .unwrap();
+        assert!(!subtotal.fits_limits());
+        assert_eq!(subtotal.checked_avg(2), Some(max.clone()));
+        assert_eq!(max.checked_avg(7), None);
     }
 
     #[test]

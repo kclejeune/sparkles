@@ -2665,7 +2665,7 @@ fn sum_view_rebuilds_a_phase2_4_checkpoint() {
 }
 
 #[test]
-fn maintained_numeric_aggregates_keep_fixed_avg_and_staged_float_promotion() {
+fn maintained_numeric_aggregates_use_arq_avg_and_staged_float_promotion() {
     let s = Store::in_memory(StoreOptions::default());
     upd(
         &s,
@@ -2703,9 +2703,91 @@ fn maintained_numeric_aggregates_keep_fixed_avg_and_staged_float_promotion() {
         read(&rt, &s, "numeric", None).unwrap(),
         [
             "cancelled 1 0.2",
-            "decimal 0.000000000000000001 0",
+            "decimal 0.000000000000000001 0.000000000000000000166667",
             "fixed 1 0.3333333333333333",
             "float INF INF",
         ]
     );
+}
+
+#[test]
+fn maintained_integer_avg_fits_tight_view_budget() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "INSERT DATA { :a :v 4611686018427387904 . :b :v 4611686018427387904 }",
+    );
+    let rt = runtime(&s, None);
+    let mut def = ViewDef::table(q("SELECT (AVG(?v) AS ?a) WHERE { ?x :v ?v }"));
+    def.memory_bytes = 16 * 1024;
+    rt.put(&s, "integer-avg", def).unwrap();
+    rt.round(&s);
+    assert_eq!(
+        read(&rt, &s, "integer-avg", None).unwrap(),
+        ["4611686018427387904"]
+    );
+
+    upd(&s, "INSERT DATA { :c :v 0 }");
+    rt.round(&s);
+    assert_eq!(
+        read(&rt, &s, "integer-avg", None).unwrap(),
+        ["3074457345618258602.666666666666666666666667"]
+    );
+}
+
+#[test]
+fn maintained_decimal_avg_updates_retracts_and_rebuilds_old_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let query = q("SELECT (AVG(?v) AS ?a) WHERE { ?x :v ?v }");
+    {
+        let s = persistent(dir.path(), true);
+        upd(&s, "INSERT DATA { :a :v -2.0 . :b :v 0 . :c :v 0 }");
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.put(&s, "decimal-avg", ViewDef::table(&query)).unwrap();
+        rt.round(&s);
+        assert_eq!(
+            read(&rt, &s, "decimal-avg", None).unwrap(),
+            ["-0.666666666666666666666667"]
+        );
+        upd(&s, "DELETE DATA { :c :v 0 }");
+        rt.round(&s);
+        assert_eq!(read(&rt, &s, "decimal-avg", None).unwrap(), ["-1"]);
+        upd(&s, "INSERT DATA { :c :v 0 }");
+        rt.round(&s);
+        rt.close(&s);
+    }
+
+    {
+        let s = persistent(dir.path(), true);
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.round(&s);
+        assert_eq!(rt.stats(&s).loaded, 1);
+        assert_eq!(
+            read(&rt, &s, "decimal-avg", None).unwrap(),
+            ["-0.666666666666666666666667"]
+        );
+        rt.close(&s);
+    }
+
+    let files = super::persist::list(&dir.path().join("views/decimal-avg/main"));
+    let latest = &files.first().unwrap().1;
+    let raw = std::fs::read(latest).unwrap();
+    let (mut header, body) = super::persist::decode_as(super::persist::VIEW, &raw).unwrap();
+    let parsed = spargebra::SparqlParser::new().parse_query(&query).unwrap();
+    let old_fingerprint =
+        super::runtime::checkpoint_fingerprint_for_compiler("f13-phase2-6", &parsed, &query);
+    assert_ne!(header.fingerprint, old_fingerprint);
+    header.fingerprint = old_fingerprint;
+    let old_bytes = super::persist::encode_as(super::persist::VIEW, &header, body);
+    std::fs::write(latest, old_bytes).unwrap();
+
+    let s = persistent(dir.path(), true);
+    let rt = runtime(&s, Some(dir.path().to_path_buf()));
+    rt.round(&s);
+    assert_eq!(rt.stats(&s).loaded, 0);
+    assert_eq!(
+        read(&rt, &s, "decimal-avg", None).unwrap(),
+        ["-0.666666666666666666666667"]
+    );
+    rt.close(&s);
 }
