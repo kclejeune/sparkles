@@ -2280,11 +2280,12 @@ of C22 §2.3 read the stored citations and carry no more than the reports hold.
 A report's footprint of C22 §6.2 also lists the policy's decisions and supports graphs
 and each configured proposal graph that the principal may read, besides the graphs its
 projection read. The stored citations name claims and decisions from those graphs, and
-their visibility was decided there, so a reader is admitted only when it may read every
-one of them under the same protections as the principal. A report therefore never shows
-a reader a claim or decision that its own view hides, and the coverage rules of C22 §6.3
-and the guard apply unchanged. The source-record graphs stay out of the footprint,
-because no field of a stored report is read from them.
+their visibility was decided there. The footprint records those graphs and their
+protections, but cannot prove access to the transitive dependencies of support-aware
+visibility. Reports built under a review policy or from a support-gated graph require
+unrestricted read access under the C22 §6.3 guard. The same guard applies to dependent
+report lookups. The source-record graphs stay out of the footprint because no field of
+a stored report is read from them.
 
 #### Refresh
 

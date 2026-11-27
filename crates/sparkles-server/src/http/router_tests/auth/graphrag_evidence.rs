@@ -1575,9 +1575,8 @@ async fn claims_dependents_finds_guarded_reports_and_enforces_disclosure_guard()
     withdraw(&ds, &a);
     let body = serde_json::json!({ "changed": [a.0.as_str()], "transitive": true }).to_string();
 
-    // 1. Unrestricted admin (`rad`) and proven restricted reader (`rhide`) both see
-    //    `x_orig` and its human edit `x_edit`, and never the unrelated `y_report`.
-    for user in ["rad", "rp", "rhide"] {
+    // 1. Unrestricted readers see the policy-built report and its human edit.
+    for user in ["rad", "rp"] {
         let res = call(
             &e.s.app,
             "POST",
@@ -1615,7 +1614,7 @@ async fn claims_dependents_finds_guarded_reports_and_enforces_disclosure_guard()
             "POST",
             "/ev/claims/dependents",
             &[
-                ("authorization", &b("rhide")),
+                ("authorization", &b("rad")),
                 ("content-type", "application/json"),
             ],
             &serde_json::json!({ "changed": [changed_iri], "transitive": false }).to_string(),
@@ -1647,9 +1646,9 @@ async fn claims_dependents_finds_guarded_reports_and_enforces_disclosure_guard()
     assert_eq!(res.status, StatusCode::OK, "{}", res.text());
     assert_eq!(res.json()["reports"], serde_json::json!([]));
 
-    // 4. Unauthorized callers failing the C22 §6 disclosure guard (`rnoclaims` missing
-    //    CLAIMS, `rnodec` missing DECISIONS) see `reports: []` and no leak.
-    for user in ["rnoclaims", "rnodec"] {
+    // 4. Evidence-aware footprints require unrestricted read access, even for
+    //    `rhide` with grants on all currently used graphs.
+    for user in ["rnoclaims", "rnodec", "rhide"] {
         let res = call(
             &e.s.app,
             "POST",
@@ -1675,7 +1674,7 @@ async fn claims_dependents_finds_guarded_reports_and_enforces_disclosure_guard()
     let (mcp_proven, mcp_unproven) = tokio::task::spawn_blocking(move || {
         let args = serde_json::json!({ "changed": [claim_iri], "transitive": true });
         (
-            tool_as(&e_mcp.s, "rhide", "find_evidence_dependents", args.clone()),
+            tool_as(&e_mcp.s, "rad", "find_evidence_dependents", args.clone()),
             tool_as(&e_mcp.s, "rnoclaims", "find_evidence_dependents", args),
         )
     })
@@ -1686,7 +1685,7 @@ async fn claims_dependents_finds_guarded_reports_and_enforces_disclosure_guard()
         "POST",
         "/ev/claims/dependents",
         &[
-            ("authorization", &b("rhide")),
+            ("authorization", &b("rad")),
             ("content-type", "application/json"),
         ],
         &body,
@@ -1696,8 +1695,7 @@ async fn claims_dependents_finds_guarded_reports_and_enforces_disclosure_guard()
     assert_eq!(mcp_proven, http_proven);
     assert_eq!(mcp_unproven["reports"], serde_json::json!([]));
 
-    // 6. Removing the disclosure footprint immediately hides reports from restricted
-    //    readers (`rhide`) while unrestricted admin (`rad`) retains access (C22 §6.3).
+    // 6. A missing footprint preserves access for unrestricted readers only.
     e.dataset()
         .update(&format!(
             "CLEAR GRAPH <{}>",
@@ -1815,13 +1813,26 @@ graphs = ["{ORG}", "{CLAIMS}", "{DECISIONS}", "{SUPPORTS}", "{ACCEPTED}"]
     decide(&e.dataset(), &a, Disposition::Accepted, 1);
 
     let e2 = e.clone();
-    let o =
-        tokio::task::spawn_blocking(move || e2.run(settings(serde_json::json!({})), Mode::Build))
-            .await
-            .unwrap()
-            .unwrap();
+    let o = tokio::task::spawn_blocking(move || {
+        e2.run(
+            settings(serde_json::json!({"reviewPolicy": null})),
+            Mode::Build,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(o.stopped, None, "{o:?}");
     let x = e.report_of("http://ex/x0");
+    // Keep an ordinary disclosure footprint so the caller and graph grants
+    // are what decide whether the stored provenance is visible.
+    e.dataset()
+        .update(&format!(
+            "INSERT {{ GRAPH <{REPORTS}> {{ ?activity <{PROV}used> <{}> }} }} \
+             WHERE {{ GRAPH <{REPORTS}> {{ <{x}> <{PROV}wasGeneratedBy> ?activity }} }}",
+            a.0.as_str()
+        ))
+        .unwrap();
     let body = serde_json::json!({ "changed": [a.0.as_str()], "transitive": true }).to_string();
 
     // Build principal `rp` matches the footprint and has the REPORTS grant -> sees `x`.
@@ -1869,6 +1880,29 @@ graphs = ["{ORG}", "{CLAIMS}", "{DECISIONS}", "{SUPPORTS}", "{ACCEPTED}"]
             "{user} must not see protected reports"
         );
     }
+
+    e.dataset()
+        .update(&format!(
+            "CLEAR GRAPH <{}>",
+            crate::graphrag::guard::DISCLOSURE_GRAPH
+        ))
+        .unwrap();
+    let rp_without_footprint = call(
+        &e.s.app,
+        "POST",
+        "/ev/claims/dependents",
+        &[
+            ("authorization", &b("rp")),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(rp_without_footprint.status, StatusCode::OK);
+    assert_eq!(
+        rp_without_footprint.json()["reports"],
+        serde_json::json!([])
+    );
 }
 
 /// Item 810: Router-level HTTP and MCP `claims/dependents` return a higher-level parent
@@ -1920,7 +1954,7 @@ async fn claims_dependents_transitive_parent_report_through_http_and_mcp() {
         "POST",
         "/ev/claims/dependents",
         &[
-            ("authorization", &b("rhide")),
+            ("authorization", &b("rad")),
             ("content-type", "application/json"),
         ],
         &direct_body,
@@ -1934,8 +1968,7 @@ async fn claims_dependents_transitive_parent_report_through_http_and_mcp() {
     assert_eq!(direct_reports[0]["depth"], 0);
 
     // Transitive query (`transitive: true`) returns both `leaf` (depth 0) and `parent`
-    // (depth 1, `on: leaf`) via HTTP and MCP for proven reader `rhide`, and nothing for
-    // unproven reader `rnoclaims`.
+    // (depth 1, `on: leaf`) via HTTP and MCP for unrestricted reader `rad`.
     let trans_body =
         serde_json::json!({ "changed": [a.0.as_str()], "transitive": true }).to_string();
     let http_proven = call(
@@ -1943,7 +1976,7 @@ async fn claims_dependents_transitive_parent_report_through_http_and_mcp() {
         "POST",
         "/ev/claims/dependents",
         &[
-            ("authorization", &b("rhide")),
+            ("authorization", &b("rad")),
             ("content-type", "application/json"),
         ],
         &trans_body,
@@ -1968,8 +2001,8 @@ async fn claims_dependents_transitive_parent_report_through_http_and_mcp() {
     let (mcp_proven, mcp_unproven) = tokio::task::spawn_blocking(move || {
         let args = serde_json::json!({ "changed": [claim_iri], "transitive": true });
         (
-            tool_as(&e_mcp.s, "rhide", "find_evidence_dependents", args.clone()),
-            tool_as(&e_mcp.s, "rnoclaims", "find_evidence_dependents", args),
+            tool_as(&e_mcp.s, "rad", "find_evidence_dependents", args.clone()),
+            tool_as(&e_mcp.s, "rhide", "find_evidence_dependents", args),
         )
     })
     .await

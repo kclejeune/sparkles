@@ -592,18 +592,14 @@ fn note_private(st: &AppState, ds: &Dataset, e: &super::evidence::Evidence, w: &
 /// policy or added a withdrawal to a proposal graph, or may have when the feed cannot
 /// list it.
 fn evidence_changed(ds: &Dataset, e: &super::evidence::Evidence, after: u64, head: u64) -> bool {
-    use sparkles::access::{GraphAccess, GraphRule, Graphs};
-    let mut names: Vec<&str> = vec![&e.policy.decisions, &e.policy.supports];
-    names.extend(e.proposals.iter().map(String::as_str));
+    // The private watcher checks raw history. The caller's view is enforced when
+    // the report is rebuilt, and a restricted change feed cannot observe evidence.
     let o = ChangesOptions {
         max_commits: PAGE_COMMITS,
         max_quads: PAGE_QUADS,
         cancel: None,
         deadline: Some(Instant::now() + FEED_DEADLINE),
-        graphs: Some(Arc::new(GraphAccess::graphs(
-            Graphs::Only(GraphRule::new(names, &[])),
-            Graphs::none(),
-        ))),
+        graphs: None,
     };
     let mut after = after;
     while after < head {
@@ -625,7 +621,8 @@ fn evidence_changed(ds: &Dataset, e: &super::evidence::Evidence, after: u64, hea
                 if g == e.policy.decisions || g == e.policy.supports {
                     return true;
                 }
-                if q.predicate.as_str() == super::store::RDF_TYPE
+                if e.proposals.iter().any(|proposal| proposal == g)
+                    && q.predicate.as_str() == super::store::RDF_TYPE
                     && matches!(&q.object, Term::NamedNode(o) if o.as_str() == WITHDRAWAL)
                 {
                     return true;

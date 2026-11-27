@@ -989,8 +989,6 @@ async fn global_answer_filters_by_review_policy_and_resolves_report_identities()
 
     const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
     const IDENTITIES: &str = "urn:ev:identities";
-    const MAPS: &str = "urn:ev:maps";
-    const MAP: &str = "urn:ev:map";
     const EMPTY_MAPS: &str = "urn:ev:empty-maps";
     const EMPTY_MAP: &str = "urn:ev:empty-map";
     const OTHER_DEC: &str = "urn:ev:other-decisions";
@@ -1073,14 +1071,9 @@ async fn global_answer_filters_by_review_policy_and_resolves_report_identities()
     let mut cfg = settings();
     cfg.decisions.extend([OTHER_DEC.into(), UNUSED_DEC.into()]);
     cfg.supports.extend([OTHER_SUP.into(), UNUSED_SUP.into()]);
-    cfg.projections.extend([
-        OTHER_OUT.into(),
-        UNUSED_OUT.into(),
-        MAP.into(),
-        EMPTY_MAP.into(),
-    ]);
-    cfg.identity
-        .extend([IDENTITIES.into(), MAPS.into(), EMPTY_MAPS.into()]);
+    cfg.projections
+        .extend([OTHER_OUT.into(), UNUSED_OUT.into(), EMPTY_MAP.into()]);
+    cfg.identity.push(EMPTY_MAPS.into());
     cfg.policies.insert(
         "other".into(),
         Policy {
@@ -1105,16 +1098,6 @@ async fn global_answer_filters_by_review_policy_and_resolves_report_identities()
             decisions: UNUSED_DEC.into(),
             supports: UNUSED_SUP.into(),
             output: UNUSED_OUT.into(),
-        },
-    );
-    cfg.matching_policies.insert(
-        "people".into(),
-        MatchingPolicy {
-            version: 1,
-            boundary: vec![IDENTITIES.into()],
-            decisions: "urn:ev:decisions".into(),
-            maps: MAPS.into(),
-            output: MAP.into(),
         },
     );
     cfg.matching_policies.insert(
@@ -1841,11 +1824,10 @@ async fn policy_scoped_search_excludes_off_policy_hits_from_slots_and_scores() {
 ///   `503 projection-unavailable` before any model call.
 #[tokio::test(flavor = "multi_thread")]
 async fn auto_mode_ignores_report_entity_cap_for_local_and_enforces_global_limits() {
-    use sparkles::evidence::{IdentityInput, IdentityRelation, MatchingPolicy, MethodRef};
+    use sparkles::evidence::{IdentityInput, IdentityRelation, MethodRef};
 
     const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
     const IDENTITIES: &str = "urn:ev:identities";
-    const MAPS: &str = "urn:ev:maps";
     const MAP: &str = "urn:ev:map";
 
     let hook: Arc<Hook> = Arc::new(OnceLock::new());
@@ -1897,21 +1879,6 @@ async fn auto_mode_ignores_report_entity_cap_for_local_and_enforces_global_limit
 
     let (st, app) = app(&m.url()).await;
     let ds = dataset(&st);
-
-    let mut cfg = settings();
-    cfg.projections.push(MAP.into());
-    cfg.identity.extend([IDENTITIES.into(), MAPS.into()]);
-    cfg.matching_policies.insert(
-        "people".into(),
-        MatchingPolicy {
-            version: 1,
-            boundary: vec![IDENTITIES.into()],
-            decisions: "urn:ev:decisions".into(),
-            maps: MAPS.into(),
-            output: MAP.into(),
-        },
-    );
-    evidence::configure(&ds, &cfg, &Control::none()).unwrap();
 
     // Accept one identity match so the matching map has a live revision to check/detach.
     let mut po = ProposeOptions::new(iri("urn:principal:matcher"));
@@ -2656,32 +2623,15 @@ async fn auto_ask_handles_draft_time_report_disappearance_and_replacement() {
 /// `identities` array.
 #[tokio::test(flavor = "multi_thread")]
 async fn community_reports_bounds_shared_cluster_across_chunks_and_reports() {
-    use sparkles::evidence::{IdentityInput, IdentityRelation, MatchingPolicy, MethodRef};
+    use sparkles::evidence::{IdentityInput, IdentityRelation, MethodRef};
 
     const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
     const IDENTITIES: &str = "urn:ev:identities";
-    const MAPS: &str = "urn:ev:maps";
-    const MAP: &str = "urn:ev:map";
     const CLUSTER_SIZE: usize = 105; // > MAX_RESOLVE (100) so ResolutionDoc::read spans 2 chunks
 
     let m = mock(Arc::new(OnceLock::new()));
     let (st, _app) = app(&m.url()).await;
     let ds = dataset(&st);
-
-    let mut cfg = settings();
-    cfg.projections.push(MAP.into());
-    cfg.identity.extend([IDENTITIES.into(), MAPS.into()]);
-    cfg.matching_policies.insert(
-        "people".into(),
-        MatchingPolicy {
-            version: 1,
-            boundary: vec![IDENTITIES.into()],
-            decisions: "urn:ev:decisions".into(),
-            maps: MAPS.into(),
-            output: MAP.into(),
-        },
-    );
-    evidence::configure(&ds, &cfg, &Control::none()).unwrap();
 
     // Propose and accept one 105-member cluster linked to m000.
     let rep_iri = iri("http://example.org/cluster/m000");
