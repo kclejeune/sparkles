@@ -17,6 +17,9 @@ pub(crate) const FILE: &str = "reasoning-imports.json";
 pub(crate) struct PendingImports(Option<Box<Entry>>);
 
 struct Entry {
+    // Local to this journal. Reopened and inherited links precede its first run.
+    #[cfg(feature = "reasoning")]
+    loaded_after: u64,
     name: Arc<PendingName>,
     older: PendingImports,
     _credit: Option<MemoryLease>,
@@ -186,6 +189,8 @@ impl Entry {
     fn link(name: Arc<PendingName>, pool: Option<&Arc<QueryPool>>) -> Result<Box<Self>> {
         let bytes = size_of::<Self>() + 4 * size_of::<usize>();
         Ok(Box::new(Self {
+            #[cfg(feature = "reasoning")]
+            loaded_after: 0,
             name,
             older: PendingImports::default(),
             _credit: RecordedReasoning::reserve(pool, bytes as u64)?,
@@ -398,14 +403,6 @@ pub(crate) struct ImportJournal {
     pub(crate) published_run: u64,
 }
 
-/// A clear owns the journal boundary it observed while holding the RDF writer.
-/// Subsequent LOADs prepend entries and keep their recovery provenance.
-#[cfg(feature = "reasoning")]
-pub(crate) struct PreparedClear {
-    pub(crate) run: u64,
-    first: Option<Arc<PendingName>>,
-}
-
 impl From<PendingImports> for ImportJournal {
     fn from(loaded: PendingImports) -> Self {
         Self {
@@ -532,7 +529,7 @@ impl crate::Dataset {
                 };
                 if loaded {
                     if !journal.loaded.contains(iri) {
-                        journal.loaded.push(entry);
+                        journal.record_load(entry);
                     }
                 } else {
                     // Drop the refused intent from the durable list as well. A crash
@@ -585,19 +582,16 @@ impl ImportJournal {
     }
 
     #[cfg(feature = "reasoning")]
-    pub(crate) fn prepare_clear(&mut self) -> PreparedClear {
-        PreparedClear {
-            run: self.prepare_run(),
-            first: self.loaded.0.as_ref().map(|entry| entry.name.clone()),
-        }
+    fn record_load(&mut self, mut entry: Box<Entry>) {
+        entry.loaded_after = self.next_run;
+        self.loaded.push(entry);
     }
 
     #[cfg(feature = "reasoning")]
-    pub(crate) fn finish_clear(&mut self, store: &Store, clear: PreparedClear) -> Result<()> {
-        if let Some(first) = clear.first {
-            self.clear_loaded_from(store, |entry| Arc::ptr_eq(&entry.name, &first))?;
-        }
-        Ok(())
+    pub(crate) fn finish_clear(&mut self, store: &Store, run: u64) -> Result<()> {
+        // LOADs prepend under this lock. Retiring individual links between
+        // preparation and publication preserves the order of the survivors.
+        self.clear_loaded_from(store, |entry| entry.loaded_after < run)
     }
 
     #[cfg(feature = "reasoning")]
@@ -657,14 +651,12 @@ mod tests {
         let ds = crate::Dataset::open(dir.path()).unwrap();
         let mut journal = ImportJournal::default();
         for iri in ["old", "also-old"] {
-            journal.loaded.push(Entry::prepare(iri, None).unwrap());
+            journal.record_load(Entry::prepare(iri, None).unwrap());
         }
-        let first_clear = journal.prepare_clear();
-        journal
-            .loaded
-            .push(Entry::prepare("between", None).unwrap());
-        let second_clear = journal.prepare_clear();
-        journal.loaded.push(Entry::prepare("new", None).unwrap());
+        let first_clear = journal.prepare_run();
+        journal.record_load(Entry::prepare("between", None).unwrap());
+        let second_clear = journal.prepare_run();
+        journal.record_load(Entry::prepare("new", None).unwrap());
         journal.finish_clear(ds.store(), first_clear).unwrap();
         assert!(journal.loaded.contains("between"));
         assert!(!journal.loaded.contains("old"));

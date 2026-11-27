@@ -385,23 +385,18 @@ impl DatasetState {
     }
 
     #[cfg(feature = "reasoning")]
-    pub(crate) fn finish_reasoning_clear(
-        &self,
-        clear: crate::reasoning::imports::PreparedClear,
-        cache_generation: u64,
-    ) -> Result<()> {
+    pub(crate) fn finish_reasoning_clear(&self, run: u64, cache_generation: u64) -> Result<()> {
         crate::sparql::pool::QueryPool::with_deferred_release_wakes(move || {
             let mut journal = self.pending_imports.lock();
-            if clear.run < journal.published_run {
-                return Ok(());
+            if run >= journal.published_run {
+                // RDF clear has succeeded. Reject older publications even if writing
+                // the metadata fails. Newer preparations keep their own sequence.
+                self.closure
+                    .clear_at_generation((!journal.is_latest(run)).then_some(cache_generation));
+                journal.published_run = run;
+                self.write_reasoning(RecordedReasoning::default(), Arc::new)?;
             }
-            // RDF clear has succeeded. Reject older publications even if writing
-            // the metadata fails. Newer preparations keep their own sequence.
-            self.closure
-                .clear_at_generation((!journal.is_latest(clear.run)).then_some(cache_generation));
-            journal.published_run = clear.run;
-            self.write_reasoning(RecordedReasoning::default(), Arc::new)?;
-            journal.finish_clear(&self.store, clear)
+            journal.finish_clear(&self.store, run)
         })
     }
 

@@ -2444,59 +2444,77 @@ fn assert_inference_visible(ds: &Dataset, expected: bool) {
     assert_eq!(ds.reasoning().record().is_some(), expected);
 }
 
-#[test]
-fn delayed_clear_preserves_a_newer_materialization() {
+fn run_during_clear(
+    ds: &Dataset,
+    request: &ReasonRequest,
+    clear_publishes_first: bool,
+    after_clear_commit: impl FnOnce(),
+) -> u64 {
     use sparkles::task::{Control, Progress};
     use std::sync::{Mutex, mpsc};
     use std::time::Duration;
     let timeout = Duration::from_secs(10);
+    let (ready, committed) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    let wait = Mutex::new(wait);
+    ds.store().set_failpoint(
+        "reasoning-clear-committed",
+        Some(Arc::new(move |_| {
+            ready.send(()).unwrap();
+            wait.lock().unwrap().recv_timeout(timeout).unwrap();
+        })),
+    );
+    let removed = std::thread::scope(|threads| {
+        let (finished, cleared) = mpsc::channel();
+        let clear = threads.spawn(move || {
+            let result = ds.reasoning().clear();
+            finished.send(()).unwrap();
+            result
+        });
+        committed.recv_timeout(timeout).unwrap();
+        after_clear_commit();
+        let ctl = if clear_publishes_first {
+            let release = release.clone();
+            let cleared = Mutex::new(cleared);
+            Control {
+                progress: Progress::new(move |_, phase| {
+                    if phase == "done" {
+                        release.send(()).unwrap();
+                        cleared.lock().unwrap().recv_timeout(timeout).unwrap();
+                    }
+                }),
+                ..Control::none()
+            }
+        } else {
+            Control::none()
+        };
+        let result = ds.reasoning().run_with(request, &ctl);
+        if !clear_publishes_first {
+            release.send(()).unwrap();
+        }
+        let removed = clear.join().unwrap().unwrap();
+        result.unwrap();
+        removed
+    });
+    ds.store().set_failpoint("reasoning-clear-committed", None);
+    removed
+}
+
+#[test]
+fn delayed_clear_preserves_a_newer_materialization() {
     for had_inferences in [false, true] {
         for clear_before_publication in [true, false] {
             let ds = inference_fixture();
             if had_inferences {
                 ds.reasoning().run(&ReasonRequest::default()).unwrap();
             }
-            let (ready, committed) = mpsc::channel();
-            let (release, wait) = mpsc::channel();
-            let wait = Mutex::new(wait);
-            ds.store().set_failpoint(
-                "reasoning-clear-committed",
-                Some(Arc::new(move |_| {
-                    ready.send(()).unwrap();
-                    wait.lock().unwrap().recv_timeout(timeout).unwrap();
-                })),
+            let removed = run_during_clear(
+                &ds,
+                &ReasonRequest::default(),
+                clear_before_publication,
+                || {},
             );
-            std::thread::scope(|threads| {
-                let (finished, cleared) = mpsc::channel();
-                let ds = &ds;
-                let clear = threads.spawn(move || {
-                    let result = ds.reasoning().clear();
-                    finished.send(()).unwrap();
-                    result
-                });
-                committed.recv_timeout(timeout).unwrap();
-                let ctl = if clear_before_publication {
-                    let release = release.clone();
-                    let cleared = Mutex::new(cleared);
-                    Control {
-                        progress: Progress::new(move |_, phase| {
-                            if phase == "done" {
-                                release.send(()).unwrap();
-                                cleared.lock().unwrap().recv_timeout(timeout).unwrap();
-                            }
-                        }),
-                        ..Control::none()
-                    }
-                } else {
-                    Control::none()
-                };
-                let result = ds.reasoning().run_with(&ReasonRequest::default(), &ctl);
-                if !clear_before_publication {
-                    release.send(()).unwrap();
-                }
-                assert_eq!(clear.join().unwrap().unwrap() > 0, had_inferences);
-                result.unwrap();
-            });
+            assert_eq!(removed > 0, had_inferences);
             assert_inference_visible(&ds, true);
             assert_eq!(
                 ds.state().closure.kept().unwrap().1,
@@ -2515,4 +2533,104 @@ fn refused_clear_preserves_the_materialized_closure() {
     assert!(ds.reasoning().clear().is_err());
     assert_inference_visible(&ds, true);
     assert_eq!(ds.state().closure.kept(), Some(kept));
+}
+
+#[test]
+fn delayed_clear_retires_pre_clear_imports_after_reopen() {
+    for clear_publishes_first in [true, false] {
+        for retire_head in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("db");
+            let source = dir.path().join("import.ttl");
+            let ds = Dataset::open_with(
+                &root,
+                DatasetOptions {
+                    pool: Some(QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap()),
+                    closure_cache_triples: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            let leave_unreferenced = |iri: &str| {
+                let request = mapped_import(&ds, &source, iri);
+                leave_import_pending(&ds, &request);
+                ds.update(&format!(
+                    "DELETE DATA {{ <urn:o> <http://www.w3.org/2002/07/owl#imports> <{iri}> }}"
+                ))
+                .unwrap();
+            };
+            leave_unreferenced("urn:old");
+            let head = mapped_import(&ds, &source, "urn:head");
+            leave_import_pending(&ds, &head);
+            let request = if retire_head { head } else { without_imports() };
+            let expected = if retire_head {
+                vec!["urn:head"]
+            } else {
+                vec![]
+            };
+            run_during_clear(&ds, &request, clear_publishes_first, || {
+                leave_unreferenced("urn:post");
+            });
+            assert_eq!(ds.reasoning().record().unwrap().fetched_imports, expected);
+            drop(ds);
+
+            let reopened = Dataset::open(&root).unwrap();
+            assert_eq!(
+                reopened.reasoning().record().unwrap().fetched_imports,
+                expected
+            );
+            let journal: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(root.join("reasoning-imports.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                journal["imports"],
+                serde_json::json!(["urn:post"]),
+                "clear first {clear_publishes_first}, retire head {retire_head}"
+            );
+            assert_eq!(journal["publishing"], serde_json::json!([]));
+            let post = mapped_import(&reopened, &source, "urn:post");
+            assert_refreshed(&reopened, post, &source, "urn:post");
+        }
+    }
+}
+
+#[test]
+fn post_commit_progress_can_wait_for_a_query_wake() {
+    use sparkles::sparql::pool::GRANULE;
+    use sparkles::task::{Control, Progress};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let pool = QueryPool::new(16 * MIB);
+    let ds = memory_with_reasoning_pool(pool.clone());
+    let (done, observed) = mpsc::channel();
+    let ctl = Control {
+        progress: Progress::new(move |_, phase| {
+            if phase == "done" {
+                let blocker = pool
+                    .work_parent()
+                    .reserve(pool.capacity() - pool.granted() - GRANULE + 1)
+                    .unwrap();
+                let (wake, signal) = mpsc::channel();
+                let mut ticket = pool.enter(
+                    GRANULE,
+                    Some(Arc::new(move || {
+                        let _ = wake.send(());
+                    })),
+                );
+                assert!(ticket.poll().is_none());
+                drop(blocker);
+                let woke = signal.recv_timeout(Duration::from_secs(2)).is_ok();
+                done.send(woke && ticket.poll().is_some()).unwrap();
+            }
+        }),
+        ..Control::none()
+    };
+    ds.reasoning().run_with(&without_imports(), &ctl).unwrap();
+    assert!(
+        observed.try_recv().expect("missing done callback"),
+        "done deferred the query wake"
+    );
 }

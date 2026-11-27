@@ -217,8 +217,8 @@ impl Drop for Permit {
 }
 
 thread_local! {
-    /// The addresses of the reasoning pools whose admission this thread holds or works
-    /// for: the thread that admitted a run, and the threads of that run's own pool.
+    /// Pools this thread cannot reenter while it admits a run, works on one
+    /// of its workers, or reports its completion.
     static HOLDING: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -246,6 +246,13 @@ impl Drop for Holding {
             }
         });
     }
+}
+
+/// The completion callback runs after admission and deferred query wakes have
+/// been released. Keep the same reentry rule as every other run callback.
+pub(super) fn report_done(pool: Option<&Arc<ReasoningPool>>, callback: &crate::ProgressFn) {
+    let _holding = pool.map(|p| Holding::new(mark(p)));
+    callback(1.0, "done");
 }
 
 /// A pool built for one run, whose drop waits for its threads to exit.

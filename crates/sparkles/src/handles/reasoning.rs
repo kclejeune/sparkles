@@ -120,7 +120,7 @@ impl Reasoning {
         let (n, (clear, cache_generation)) =
             crate::sparql::pool::QueryPool::with_deferred_release_wakes(|| {
                 sparkles_reasoner::clear_prepared(&state.store, || {
-                    let clear = state.pending_imports.lock().prepare_clear();
+                    let clear = state.pending_imports.lock().prepare_run();
                     (clear, state.closure.generation())
                 })
             })

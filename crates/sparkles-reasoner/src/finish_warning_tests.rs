@@ -57,61 +57,63 @@ fn invoke_finish(
     resolved_warnings: Vec<String>,
     opts: &ReasonOptions,
 ) -> anyhow::Result<ReasonReport> {
-    let mut txn = store.write();
-    let snap = txn.base().clone();
-    let mut resolved = inputs::resolve(&snap, &Inputs::default());
-    resolved.warnings = resolved_warnings;
-    let mut ids = [Id::UNDEF; 4];
-    for (slot, iri) in ids
-        .iter_mut()
-        .zip(["urn:new", "urn:q", "urn:b", INFERRED_GRAPH])
-    {
-        *slot = txn
-            .intern(&Term::NamedNode(NamedNode::new_unchecked(iri)))
-            .unwrap();
-    }
-    assert!(
-        txn.insert(ids).unwrap(),
-        "an actual new inference is pending"
-    );
-    let prior = snap
-        .lookup_iri(INFERRED_GRAPH)
-        .map_or(0, |g| snap.scan_keys(Perm::Gspo, &[g.0]).unwrap().len());
-    let done = Done {
-        rule_groups: Vec::new(),
-        closure: None,
-        witnesses: None,
-        budget: budget.clone(),
-        base_scans: 0,
-        threads: 1,
-        generalized: FxHashSet::default(),
-        generalized_saved: None,
-        written: Written {
-            added: 1,
-            inferred: prior as u64 + 1,
-            ..Default::default()
-        },
-        rules: 1,
-        iterations: 1,
-        warnings,
-        method: Method::Full,
-        fallback: None,
-        changes: None,
-    };
-    finish(
-        store,
-        txn,
-        &snap,
-        &Profile::RdfsSimple,
-        0,
-        &resolved,
-        Incremental { since: None, cache },
-        opts,
-        Instant::now(),
-        done,
-        Laps::new(Instant::now()),
-        |_, _, _| Ok(()),
-    )
+    run_materialization(opts, |_| {
+        let mut txn = store.write();
+        let snap = txn.base().clone();
+        let mut resolved = inputs::resolve(&snap, &Inputs::default());
+        resolved.warnings = resolved_warnings;
+        let mut ids = [Id::UNDEF; 4];
+        for (slot, iri) in ids
+            .iter_mut()
+            .zip(["urn:new", "urn:q", "urn:b", INFERRED_GRAPH])
+        {
+            *slot = txn
+                .intern(&Term::NamedNode(NamedNode::new_unchecked(iri)))
+                .unwrap();
+        }
+        assert!(
+            txn.insert(ids).unwrap(),
+            "an actual new inference is pending"
+        );
+        let prior = snap
+            .lookup_iri(INFERRED_GRAPH)
+            .map_or(0, |g| snap.scan_keys(Perm::Gspo, &[g.0]).unwrap().len());
+        let done = Done {
+            rule_groups: Vec::new(),
+            closure: None,
+            witnesses: None,
+            budget: budget.clone(),
+            base_scans: 0,
+            threads: 1,
+            generalized: FxHashSet::default(),
+            generalized_saved: None,
+            written: Written {
+                added: 1,
+                inferred: prior as u64 + 1,
+                ..Default::default()
+            },
+            rules: 1,
+            iterations: 1,
+            warnings,
+            method: Method::Full,
+            fallback: None,
+            changes: None,
+        };
+        finish(
+            store,
+            txn,
+            &snap,
+            &Profile::RdfsSimple,
+            0,
+            &resolved,
+            Incremental { since: None, cache },
+            opts,
+            Instant::now(),
+            done,
+            Laps::new(Instant::now()),
+            |_, _, _| Ok(()),
+        )
+    })
 }
 
 fn assert_unpublished(

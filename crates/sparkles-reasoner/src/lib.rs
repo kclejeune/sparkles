@@ -1340,16 +1340,27 @@ pub fn materialize_incremental_prepared_with_memory(
     opts.inputs.validate()?;
     refuse_query_only(profile)?;
     let t0 = Instant::now();
+    run_materialization(opts, |exec| {
+        materialize_admitted(exec, store, profile, extras, inc, opts, t0, prepare)
+    })
+}
+
+fn run_materialization(
+    opts: &ReasonOptions,
+    materialize: impl FnOnce(&pool::Exec) -> anyhow::Result<ReasonReport> + Send,
+) -> anyhow::Result<ReasonReport> {
     pool::Exec::refuse_own_threads(opts.pool.as_ref())?;
     pool::off_rayon(|| {
         // A rejected preparation can release a copy lease under both the
         // import journal and RDF writer. Drain callbacks on their owning
         // thread after rollback (or commit) and reasoning permit release.
-        sparkles_core::sparql::pool::QueryPool::with_deferred_release_wakes(|| {
-            with_permit(opts, |exec| {
-                materialize_admitted(exec, store, profile, extras, inc, opts, t0, prepare)
-            })
-        })
+        let report = sparkles_core::sparql::pool::QueryPool::with_deferred_release_wakes(|| {
+            with_permit(opts, materialize)
+        })?;
+        if let Some(callback) = &opts.progress {
+            pool::report_done(opts.pool.as_ref(), callback);
+        }
+        Ok(report)
     })
 }
 
@@ -1789,7 +1800,6 @@ fn finish(
     laps.lap("checks");
     let receipt = txn.commit()?;
     laps.lap("commit");
-    progress(opts, 1.0, "done");
     let graphs = resolved.graph_set();
     let mut kept = false;
     let witness_report = done.witnesses.as_ref().map(|w| w.report.clone());
