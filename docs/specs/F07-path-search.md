@@ -280,9 +280,11 @@ one-ended Pareto-pruned search. When a reverse search for an unbound source enco
 weights or overflow, it finishes the reverse search to record each node's minimum backward
 edge distance and the shortest budget admitting two simple suffixes with distinct first
 edges. A suffix that returns to the node it would extend is deferred until the search can
-check for an exit that avoids that node. The postpass uses the shortest-hop tree and keeps
-extra hop information at branches. The query memory budget covers those hops and the
-postpass frontier. A source reconstructs directly when its reverse tree path has no
+check for an exit that avoids that node. The postpass uses shortest-hop subtree intervals
+to test ancestry and skip subtrees with no exit. Each exit walk marks its visited nodes
+with the source's interval number. The query memory budget covers the branch hops,
+interval index and postpass frontier. A reverse search with weights known to be constant
+and too small to overflow skips collecting branch hops. A source reconstructs directly when its reverse tree path has no
 competing suffix within the remaining edge budget. The other sources run bounded searches
 in source order, pruned by the minimum backward edge distances. Weighted `path:allShortest`
 with `path:maxLength` requires both ends bound because it enumerates tied short paths through
@@ -961,7 +963,11 @@ both the eager engine and the streaming cursor reader.
   or overflow with `maxLength > 1`, both engines retain the minimum backward edge
   distances and record in `direct_multi` the shortest budget admitting two simple suffixes
   with distinct first edges. The postpass follows deferred hops through the reverse
-  search's topology to find exits that avoid the node the hop would revisit. A source's
+  search's topology to find exits that avoid the node the hop would revisit. Subtree
+  intervals bound ancestry checks and rule out closed subtrees before a walk starts.
+  Each walk uses source-specific visit marks, so earlier marks need no clearing.
+  Both engines skip collecting branch hops when the planner knows all weights are
+  constant and too small to overflow. A source's
   reverse tree path reconstructs directly when no competing suffix fits the remaining
   edge budget. The other sources run bounded searches in source order, pruned by the
   minimum backward edge distances. Eager direct reconstruction transfers its edge-buffer
@@ -985,7 +991,9 @@ both the eager engine and the streaming cursor reader.
   cross-form ranking, visit-budget preservation on unique-route reverse wide-weight graphs
   (separate single-edge paths, a 500-edge chain, and a chain beside a wide-weight diamond),
   self-loops and cycles within tight visit budgets, deferred backtracks with a valid exit,
-  remaining edge budgets on shared prefixes, eager edge-buffer charge transfer, streaming
+  remaining edge budgets on shared prefixes, first-row work on a bidirectional chain,
+  memory admission for dense branches with fixed default weights, visit marks across
+  large and small exit walks, eager edge-buffer charge transfer, streaming
   eager weight lookups on a 5,000-reifier edge, eager frontier memory
   pre-admission and release across repeated pairs, single-visit `VIRT` pruning, and eager
   mid-relaxation cancellation.

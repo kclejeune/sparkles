@@ -173,6 +173,24 @@ impl PathSearchSpec {
     fn weighted(&self) -> bool {
         self.weight.is_some()
     }
+
+    fn fixed_weight(&self) -> Option<f64> {
+        match (self.weight, self.reifies) {
+            (None, _) => Some(1.0),
+            (Some(Some(_)), Some(_)) => None,
+            _ => Some(self.default_weight),
+        }
+    }
+
+    fn track_reverse_wide(&self, forward: bool, max_len: u32) -> bool {
+        // Equal weights have a ratio of one. Leave headroom for the overflow check
+        // when a fixed weight is large enough to approach the limit of Cost.
+        !forward
+            && max_len > 1
+            && self
+                .fixed_weight()
+                .is_none_or(|w| w > (f64::MAX / 2.0) / f64::from(max_len))
+    }
 }
 
 // ----------------------------------------------------------------- planning ------
@@ -1423,6 +1441,7 @@ impl ReverseAlternatives {
         };
         let mut direct_multi = HbMap::default();
         let mut seeds = Vec::new();
+        let mut index = None;
         let mut cur_base = base.saturating_add(self.bytes);
         for (&y, hops) in &self.hops {
             poll()?;
@@ -1431,9 +1450,25 @@ impl ReverseAlternatives {
             for &u in hops {
                 poll()?;
                 let len = tree.dist[&u] + 1;
-                if tree.returns_to(u, y, &mut poll)? {
-                    cur_base = push_vec(&mut seeds, (y, u), charge, cur_base)?;
-                } else if shortest.is_none_or(|first| len < first) {
+                if y != VIRT && tree.dist[&u] > tree.dist[&y] {
+                    let index = match &mut index {
+                        Some(index) => index,
+                        slot => {
+                            let (new, next_base) = ReverseHopIndex::new(
+                                tree, &self.hops, charge, cur_base, &mut poll,
+                            )?;
+                            cur_base = next_base;
+                            slot.insert(new)
+                        }
+                    };
+                    if index.returns_to(u, y) {
+                        if index.nodes[&y].may_escape && len <= max_len {
+                            cur_base = push_vec(&mut seeds, (y, u), charge, cur_base)?;
+                        }
+                        continue;
+                    }
+                }
+                if shortest.is_none_or(|first| len < first) {
                     second = shortest;
                     shortest = Some(len);
                 } else {
@@ -1444,16 +1479,19 @@ impl ReverseAlternatives {
                 (_, cur_base) = insert_hb_map(&mut direct_multi, y, len, charge, cur_base)?;
             }
         }
-        propagate_reverse_backtracks(
-            max_len,
-            tree,
-            &self.hops,
-            &seeds,
-            &mut direct_multi,
-            charge,
-            cur_base,
-            &mut poll,
-        )?;
+        if let Some(mut index) = index {
+            propagate_reverse_backtracks(
+                max_len,
+                tree,
+                &mut index,
+                &self.hops,
+                &seeds,
+                &mut direct_multi,
+                charge,
+                cur_base,
+                &mut poll,
+            )?;
+        }
         drop(seeds);
         drop(self);
         charge.resize(base.saturating_add(map_bytes(&direct_multi)))?;
@@ -1462,30 +1500,132 @@ impl ReverseAlternatives {
 }
 
 struct ReverseHopTree<'a> {
+    root: u64,
     parent: &'a HbMap<(u64, u32), Parent>,
     dist: &'a HbMap<u64, u32>,
 }
 
-impl ReverseHopTree<'_> {
-    /// A minimum-length label's parent has minimum distance one less, so only
-    /// the ancestor at the forbidden node's depth can match it.
-    fn returns_to(
-        &self,
-        mut node: u64,
-        forbidden: u64,
+struct ReverseHopNode {
+    first_child: Option<u64>,
+    next_sibling: Option<u64>,
+    start: usize,
+    end: usize,
+    min_hop: usize,
+    max_hop: usize,
+    may_escape: bool,
+    seen_from: usize,
+}
+
+impl Default for ReverseHopNode {
+    fn default() -> Self {
+        Self {
+            first_child: None,
+            next_sibling: None,
+            start: 0,
+            end: 0,
+            min_hop: usize::MAX,
+            max_hop: 0,
+            may_escape: false,
+            seen_from: 0,
+        }
+    }
+}
+
+struct ReverseHopIndex {
+    nodes: HbMap<u64, ReverseHopNode>,
+}
+
+impl ReverseHopIndex {
+    fn new<C: ByteCharge>(
+        tree: &ReverseHopTree<'_>,
+        hops: &HbMap<u64, Vec<u64>>,
+        charge: &mut C,
+        mut base: u64,
         poll: &mut impl FnMut() -> Result<()>,
-    ) -> Result<bool> {
-        if forbidden == VIRT {
-            return Ok(false);
-        }
-        let mut len = self.dist[&node];
-        let depth = self.dist[&forbidden];
-        while len > depth {
+    ) -> Result<(Self, u64)> {
+        let mut nodes = HbMap::<u64, ReverseHopNode>::default();
+        for &node in tree.dist.keys() {
             poll()?;
-            node = self.parent[&(node, len)].node;
-            len -= 1;
+            (_, base) = insert_hb_map(&mut nodes, node, ReverseHopNode::default(), charge, base)?;
         }
-        Ok(node == forbidden)
+        for (&node, &depth) in tree.dist {
+            poll()?;
+            if depth > 0 {
+                let parent = tree.parent[&(node, depth)].node;
+                let sibling = nodes.get_mut(&parent).unwrap().first_child.replace(node);
+                nodes.get_mut(&node).unwrap().next_sibling = sibling;
+            }
+        }
+
+        // A depth-first preorder puts each subtree in a contiguous interval. Walk
+        // the linked children and climb the existing parents without recursion.
+        let mut preorder = Vec::new();
+        let mut node = tree.root;
+        'walk: loop {
+            poll()?;
+            let entry = nodes.get_mut(&node).unwrap();
+            entry.start = preorder.len() + 1;
+            entry.end = entry.start + 1;
+            base = push_vec(&mut preorder, node, charge, base)?;
+            if let Some(child) = entry.first_child {
+                node = child;
+                continue;
+            }
+            while node != tree.root {
+                poll()?;
+                if let Some(sibling) = nodes[&node].next_sibling {
+                    node = sibling;
+                    continue 'walk;
+                }
+                node = tree.parent[&(node, tree.dist[&node])].node;
+            }
+            break;
+        }
+
+        // Accumulate the extreme destinations of hops from strict descendants.
+        // A walk that avoids the forbidden node cannot leave its subtree if all
+        // those destinations are inside the interval. Tree edges to parents stay
+        // inside every strict ancestor's subtree and need no entry here.
+        for &node in preorder.iter().rev() {
+            poll()?;
+            let depth = tree.dist[&node];
+            if depth == 0 {
+                break;
+            }
+            let parent = tree.parent[&(node, depth)].node;
+            let entry = &nodes[&node];
+            let (end, mut min_hop, mut max_hop) = (entry.end, entry.min_hop, entry.max_hop);
+            let may_escape = min_hop < entry.start || max_hop >= end;
+            if let Some(next_hops) = hops.get(&node) {
+                for &dest in next_hops {
+                    poll()?;
+                    if dest != parent {
+                        let start = nodes[&dest].start;
+                        min_hop = min_hop.min(start);
+                        max_hop = max_hop.max(start);
+                    }
+                }
+            }
+            nodes.get_mut(&node).unwrap().may_escape = may_escape;
+            let entry = nodes.get_mut(&parent).unwrap();
+            entry.end = entry.end.max(end);
+            entry.min_hop = entry.min_hop.min(min_hop);
+            entry.max_hop = entry.max_hop.max(max_hop);
+        }
+        base = base.saturating_sub(vec_bytes::<u64>(preorder.capacity()));
+        drop(preorder);
+        charge.resize(base)?;
+        Ok((Self { nodes }, base))
+    }
+
+    fn returns_to(&self, node: u64, forbidden: u64) -> bool {
+        let entry = &self.nodes[&forbidden];
+        (entry.start..entry.end).contains(&self.nodes[&node].start)
+    }
+
+    fn mark_seen(&mut self, node: u64, source_mark: usize) -> bool {
+        let entry = self.nodes.get_mut(&node).unwrap();
+        std::mem::replace(&mut entry.seen_from, source_mark) != source_mark
     }
 }
 
@@ -1498,6 +1638,7 @@ impl ReverseHopTree<'_> {
 fn propagate_reverse_backtracks<C: ByteCharge>(
     max_len: u32,
     tree: &ReverseHopTree<'_>,
+    index: &mut ReverseHopIndex,
     hops: &HbMap<u64, Vec<u64>>,
     seeds: &[(u64, u64)],
     direct_multi: &mut HbMap<u64, u32>,
@@ -1506,25 +1647,20 @@ fn propagate_reverse_backtracks<C: ByteCharge>(
     poll: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     let mut queue = Vec::new();
-    let mut seen = HbSet::default();
     let mut seeds = seeds.iter().copied().peekable();
     while let Some(&(y, _)) = seeds.peek() {
         queue.clear();
-        seen.clear();
+        // The source's preorder number is unique, so old marks need no reset.
+        let source_mark = index.nodes[&y].start;
         let mut alt = direct_multi.get(&y).copied();
-        let mut walk_base = base
-            .saturating_add(vec_bytes::<(u64, u32)>(queue.capacity()))
-            .saturating_add(set_bytes(&seen));
         while let Some((_, u)) = seeds.next_if(|&(source, _)| source == y) {
             poll()?;
             let lower = tree.dist[&u] + 1;
             if lower > max_len || alt.is_some_and(|len| lower >= len) {
                 continue;
             }
-            let (new, next_base) = insert_hb_set(&mut seen, u, charge, walk_base)?;
-            walk_base = next_base;
-            if new {
-                walk_base = push_vec(&mut queue, (u, 1u32), charge, walk_base)?;
+            if index.mark_seen(u, source_mark) {
+                base = push_vec(&mut queue, (u, 1u32), charge, base)?;
             }
         }
         let mut i = 0;
@@ -1538,7 +1674,7 @@ fn propagate_reverse_backtracks<C: ByteCharge>(
             if lower > max_len || alt.is_some_and(|len| lower >= len) {
                 continue;
             }
-            if !tree.returns_to(u, y, poll)? {
+            if !index.returns_to(u, y) {
                 alt = Some(lower);
                 continue;
             }
@@ -1548,24 +1684,17 @@ fn propagate_reverse_backtracks<C: ByteCharge>(
                 .map_or(std::slice::from_ref(&parent), Vec::as_slice);
             for &v in next_hops {
                 poll()?;
-                if v != y {
-                    let (new, next_base) = insert_hb_set(&mut seen, v, charge, walk_base)?;
-                    walk_base = next_base;
-                    if new {
-                        walk_base = push_vec(&mut queue, (v, prefix + 1), charge, walk_base)?;
-                    }
+                if v != y && index.mark_seen(v, source_mark) {
+                    base = push_vec(&mut queue, (v, prefix + 1), charge, base)?;
                 }
             }
         }
         if let Some(len) = alt {
-            (_, walk_base) = insert_hb_map(direct_multi, y, len, charge, walk_base)?;
+            (_, base) = insert_hb_map(direct_multi, y, len, charge, base)?;
         }
-        base = walk_base
-            .saturating_sub(vec_bytes::<(u64, u32)>(queue.capacity()))
-            .saturating_sub(set_bytes(&seen));
     }
+    base = base.saturating_sub(vec_bytes::<(u64, u32)>(queue.capacity()));
     drop(queue);
-    drop(seen);
     charge.resize(base)?;
     Ok(())
 }
@@ -2439,18 +2568,14 @@ impl<'a> Engine<'a> {
     /// The weight of an edge: the smallest value of the weight property on a reifier of
     /// its triple term, else the default.
     fn weight(&self, e: &Edge) -> Result<f64> {
-        let Some(w) = self.spec.weight else {
-            return Ok(1.0);
-        };
-        // no reifier or no weight property in the store: every edge has the default
-        if w.is_none() || self.spec.reifies.is_none() {
-            return Ok(self.spec.default_weight);
+        if let Some(w) = self.spec.fixed_weight() {
+            return Ok(w);
         }
         let key = e.triple();
         if let Some(&x) = self.weights.borrow().get(&key) {
             return Ok(x);
         }
-        let x = self.lookup_weight(w, key)?;
+        let x = self.lookup_weight(self.spec.weight.flatten(), key)?;
         self.charge.add(NODE_BYTES)?;
         self.weights.borrow_mut().insert(key, x);
         Ok(x)
@@ -3391,7 +3516,7 @@ impl<'a> Engine<'a> {
         let mut best_virt: Option<(Cost, u32)> = None;
         let (mut wmin, mut wmax) = (f64::INFINITY, 0.0f64);
         let mut wide = false;
-        let track_reverse_wide = !forward && max_len > 1;
+        let track_reverse_wide = self.spec.track_reverse_wide(forward, max_len);
         let local_bytes = |best_len: &HbMap<u64, u32>,
                            dist: &HbMap<u64, Vec<(u32, Cost)>>,
                            dist_vec_bytes: u64,
@@ -3580,6 +3705,7 @@ impl<'a> Engine<'a> {
                 .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
                 .saturating_add(map_bytes(&best_len));
             let tree = ReverseHopTree {
+                root,
                 parent: &parent,
                 dist: &best_len,
             };
@@ -6893,17 +7019,14 @@ impl SearchContext {
         charge: &mut super::ctx::OwnedCharge,
         outer_bytes: u64,
     ) -> Result<f64> {
-        let Some(w) = spec.weight else {
-            return Ok(1.0);
-        };
-        if w.is_none() || spec.reifies.is_none() {
-            return Ok(spec.default_weight);
+        if let Some(w) = spec.fixed_weight() {
+            return Ok(w);
         }
         let key = e.triple();
         if let Some(&x) = self.weights.get(&key) {
             return Ok(x);
         }
-        let x = lookup_weight_charged(ctx, spec, w, key)?;
+        let x = lookup_weight_charged(ctx, spec, spec.weight.flatten(), key)?;
         let w_base = outer_bytes.saturating_add(self.retained_bytes());
         let _ = insert_hb_map(&mut self.weights, key, x, charge, w_base)?;
         Ok(x)
@@ -8200,7 +8323,7 @@ impl SearchContext {
         let mut best_virt: Option<(Cost, u32)> = None;
         let (mut wmin, mut wmax) = (f64::INFINITY, 0.0f64);
         let mut wide = false;
-        let track_reverse_wide = !forward && max_len > 1;
+        let track_reverse_wide = spec.track_reverse_wide(forward, max_len);
         let local_bytes = |best_len: &HbMap<u64, u32>,
                            dist: &HbMap<u64, Vec<(u32, Cost)>>,
                            dist_vec_bytes: u64,
@@ -8406,6 +8529,7 @@ impl SearchContext {
                         .saturating_add(map_bytes(&best_len)),
                 );
             let tree = ReverseHopTree {
+                root,
                 parent: &parent,
                 dist: &best_len,
             };
@@ -14321,8 +14445,202 @@ mod tree_tests {
         );
     }
 
+    fn reverse_first_rows(
+        ttl: String,
+        query_body: &str,
+        memory: Option<u64>,
+    ) -> [(Term, usize); 2] {
+        use crate::io::Source;
+        use crate::sparql::{CursorOptions, FallbackPolicy, QueryOptions, query, select_cursor};
+        use crate::store::{Store, StoreOptions};
+        use oxrdfio::RdfFormat;
+
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let q = format!(
+            "PREFIX ex: <http://example.org/> PREFIX path: <urn:x-sparkles:path#> {query_body}"
+        );
+        let opts = QueryOptions {
+            no_cache: true,
+            max_memory_bytes: memory,
+            ..Default::default()
+        };
+        let checks = || super::super::ctx::CHECKS.with(Cell::get);
+        let eager_start = checks();
+        let result = query(snap.clone(), &q, &opts).expect("eager first row");
+        let eager_checks = checks() - eager_start;
+        let rows = result.rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        let eager = rows.iter().next().unwrap().values()[0].clone().unwrap();
+
+        let cursor_opts = CursorOptions {
+            batch_rows: 1,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let mut cursor = select_cursor(snap, &q, &opts, &cursor_opts).unwrap();
+        let cursor_start = checks();
+        let batch = cursor.next_batch().expect("cursor first pull").unwrap();
+        let cursor_checks = checks() - cursor_start;
+        let streamed = batch.row(0).unwrap().values()[0].clone().unwrap();
+        [(eager, eager_checks), (streamed, cursor_checks)]
+    }
+
     #[test]
-    fn reverse_backtracks_poll_across_short_walks() {
+    fn reverse_chain_first_row_does_not_rewalk_closed_subtrees() {
+        use std::fmt::Write as _;
+
+        let n = 1024;
+        let mut ttl = String::from(
+            "@prefix ex: <http://example.org/> . \
+             ex:a ex:p ex:x0 {| ex:w 0.5e0 |} . \
+             ex:b ex:p ex:x0 {| ex:w 1e12 |} . ",
+        );
+        for i in 1..=n {
+            write!(ttl, "ex:x{i} ex:p ex:x{} . ", i - 1).unwrap();
+            if i < n {
+                write!(ttl, "ex:x{i} ex:p ex:x{} . ", i + 1).unwrap();
+            }
+        }
+        let q = format!(
+            "SELECT ?src {{ SERVICE path:search {{ [] path:source ?src ; path:target ex:x0 ; \
+             path:predicate ex:p ; path:weight ex:w ; path:limit 1 ; \
+             path:maxLength {} ; path:maxVisited {} }} }}",
+            n + 1,
+            n + 3
+        );
+        let expected = Term::NamedNode(oxrdf::NamedNode::new("http://example.org/a").unwrap());
+        // Both graphs do the same reverse traversal. Only the wide graph runs
+        // the postpass. Replaying every closed subtree exceeds this check budget
+        // even with constant-time ancestry tests.
+        let narrow = ttl.replace("ex:w 1e12", "ex:w 2.0e0");
+        let wide_rows = reverse_first_rows(ttl, &q, None);
+        let narrow_rows = reverse_first_rows(narrow, &q, None);
+        for ((first, wide_checks), (narrow_first, narrow_checks)) in
+            wide_rows.into_iter().zip(narrow_rows)
+        {
+            assert_eq!(first, expected);
+            assert_eq!(narrow_first, expected);
+            assert!(
+                wide_checks <= narrow_checks + 32,
+                "first row took {wide_checks} checks with wide weights and {narrow_checks} with narrow weights"
+            );
+        }
+    }
+
+    #[test]
+    fn reverse_narrow_default_weights_fit_dense_branches_under_a_memory_cap() {
+        use std::fmt::Write as _;
+
+        let n = 256;
+        let mut ttl = String::from(
+            "@prefix ex: <http://example.org/> . \
+             ex:a ex:q ex:b {| ex:unrelated 1 |} . ",
+        );
+        for i in 0..n {
+            write!(ttl, "ex:d{i} ex:p ex:t . ").unwrap();
+            for j in 0..n {
+                write!(ttl, "ex:s{j} ex:p ex:d{i} . ").unwrap();
+            }
+        }
+        let q = "SELECT ?src { SERVICE path:search { [] path:source ?src ; path:target ex:t ; \
+                 path:predicate ex:p ; path:weight ex:absent ; path:maxLength 2 ; path:limit 1 } }";
+        // The branch destinations alone would take at least 8 * n^2 bytes.
+        for (first, _) in reverse_first_rows(ttl, q, Some(320 * 1024)) {
+            let Term::NamedNode(source) = first else {
+                panic!("expected an IRI, got {first}");
+            };
+            assert!(source.as_str().starts_with("http://example.org/d"));
+        }
+    }
+
+    #[test]
+    fn reverse_backtrack_walks_keep_old_marks_without_reusing_them() {
+        let store = crate::store::Store::in_memory(crate::store::StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let (root, large, exit) = (0, 1, 100);
+        let small = 2..66;
+        let large_leaves = 1000..3048;
+        let mut dist = HbMap::default();
+        let mut parent = HbMap::default();
+        let mut link = |node, depth, p| {
+            dist.insert(node, depth);
+            parent.insert(
+                (node, depth),
+                Parent {
+                    node: p,
+                    p: 0,
+                    rev: false,
+                },
+            );
+        };
+        link(root, 0, root);
+        link(exit, 1, root);
+        link(large, 1, root);
+        let mut hops = HbMap::default();
+        let mut seeds = Vec::new();
+        for leaf in large_leaves.clone() {
+            link(leaf, 2, large);
+            seeds.push((large, leaf));
+        }
+        hops.insert(large_leaves.start, vec![large, exit]);
+        for source in small.clone() {
+            let leaf = source + 100;
+            link(source, 1, root);
+            link(leaf, 2, source);
+            seeds.push((source, leaf));
+            hops.insert(leaf, vec![source, exit]);
+        }
+
+        let tree = ReverseHopTree {
+            root,
+            parent: &parent,
+            dist: &dist,
+        };
+        let mut charge = ctx.charge(0).unwrap();
+        let (mut index, base) =
+            ReverseHopIndex::new(&tree, &hops, &mut charge, 0, &mut || Ok(())).unwrap();
+        let mut lengths = HbMap::default();
+        let mut steps = 0;
+        propagate_reverse_backtracks(
+            3,
+            &tree,
+            &mut index,
+            &hops,
+            &seeds,
+            &mut lengths,
+            &mut charge,
+            base,
+            &mut || {
+                steps += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(lengths.len(), 1 + small.clone().count());
+        assert!(lengths.values().all(|&length| length == 3));
+        assert_eq!(
+            steps,
+            3 * large_leaves.clone().count() + 2 + 5 * small.clone().count()
+        );
+        assert_eq!(
+            index.nodes[&exit].seen_from,
+            index.nodes[&(small.end - 1)].start
+        );
+        for leaf in large_leaves {
+            assert_eq!(index.nodes[&leaf].seen_from, index.nodes[&large].start);
+        }
+    }
+
+    #[test]
+    fn reverse_backtrack_index_polls_on_closed_subtrees() {
         use std::sync::atomic::Ordering;
 
         let store = crate::store::Store::in_memory(crate::store::StoreOptions::default());
@@ -14344,6 +14662,7 @@ mod tree_tests {
             parent.insert((u, 2), link(y));
         }
         let tree = ReverseHopTree {
+            root,
             parent: &parent,
             dist: &dist,
         };
@@ -14356,8 +14675,8 @@ mod tree_tests {
                 .unwrap();
         }
 
-        // Each of the 512 branches contributes four steps to seed collection and
-        // four to seed starts and walks. Cancellation must reach the shared poll.
+        // Even when the index rules out every walk, cancellation must reach
+        // the shared poll during the index build or seed collection.
         ctx.cancel.store(true, Ordering::Relaxed);
         assert!(matches!(
             alternatives.competing_lengths(&ctx, 3, &tree, &mut charge, base),
