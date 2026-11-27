@@ -417,6 +417,8 @@ struct PairStatus {
 /// The providers, the role lists and their state.
 pub struct Models {
     pub config: ModelsConfig,
+    /// An opaque identity for this installed model configuration.
+    pub(crate) revision: uuid::Uuid,
     secrets: BTreeMap<String, SecretSource>,
     outbound: sparkles::outbound::OutboundPolicy,
     /// shared with the views that [`Models::with_secrets`] makes
@@ -482,6 +484,7 @@ impl Models {
         }
         Models {
             config,
+            revision: uuid::Uuid::new_v4(),
             secrets,
             outbound,
             runtime: Arc::new(runtime),
@@ -555,6 +558,7 @@ impl Models {
     pub fn with_secrets(&self, secrets: BTreeMap<String, SecretSource>) -> Models {
         Models {
             config: self.config.clone(),
+            revision: self.revision,
             secrets,
             outbound: self.outbound.clone(),
             runtime: self.runtime.clone(),
@@ -640,6 +644,19 @@ impl Models {
             return Err(format!("secret {name:?} is empty"));
         }
         Ok(k)
+    }
+
+    /// The values of all readable secrets configured on these models, for exact-value
+    /// redaction before text leaves the server (C18 item 77). Values are never logged
+    /// or returned in responses.
+    pub fn known_secret_values(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for name in self.secrets.keys() {
+            if let Ok(v) = self.read_secret(name) {
+                out.push(v);
+            }
+        }
+        out
     }
 
     /// The key of provider `name`, read now: `Ok(None)` when it names none.
@@ -840,6 +857,15 @@ impl Models {
                 rec,
             );
         };
+        if !p.allows(&pair.model) {
+            return fail(
+                StepError::UnknownPair(format!(
+                    "provider {} does not allow model {:?}",
+                    pair.provider, pair.model
+                )),
+                rec,
+            );
+        }
         if p.kind == Kind::Local {
             return fail(
                 StepError::UnknownPair(format!(

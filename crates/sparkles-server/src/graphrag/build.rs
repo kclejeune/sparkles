@@ -2047,9 +2047,8 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
     let system = system_text(&r.settings.language);
     let memory = crate::assist::memory_settings(r.st, &r.ds);
     let patterns: Vec<(String, String)> = memory
-        .imports
-        .iter()
-        .flat_map(|i| i.secret_patterns.iter())
+        .effective_secret_patterns()
+        .into_iter()
         .map(|p| (p.name.clone(), p.regex.clone()))
         .collect();
     let secret = report::secret_checker(&patterns);

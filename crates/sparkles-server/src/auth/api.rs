@@ -39,6 +39,7 @@ pub fn cors_layer(st: &AppState, expose: Vec<HeaderName>) -> CorsLayer {
             crate::obs::X_REQUEST_ID.clone(),
             header::IF_MATCH,
             header::IF_NONE_MATCH,
+            header::HeaderName::from_static("if-ingest-confirmation"),
             header::HeaderName::from_static("sparkles-commit-message"),
             header::HeaderName::from_static("sparkles-dry-run"),
             // the Streamable HTTP transport of `/$/mcp`

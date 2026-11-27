@@ -1198,6 +1198,29 @@ patterns, is in
   facts with the mock provider; with `assistant.send` locked to `rows` in the settings
   file, the panel shows the lock and no button; with `ingest` declared `false`, the
   button is replaced by a link to the field; turning it off patches `ingest` only.
+* **Outcome (delivered for item 77).** `GET /$/assistant/{ds}` now includes
+  `status.ingest` and `status.extract` so dataset readers and admins see whether server
+  ingestion is active and which `extract` providers receive document text. Both
+  `IngestPanel.svelte` and `IngestSettings.svelte` embed `ServerIngestStatus.svelte`,
+  which reads `/$/settings/{ds}/assistant` and `/$/assistant/{ds}`, states whether server
+  ingestion is on or off (naming the active `extract` providers or the blocking field and
+  source), lets dataset admins turn server ingestion on under the §8.1 default-only patch
+  rule after a confirmation dialog (or links directly to the blocking field in the
+  Settings tab when declared, locked, or runtime settings keep it off), and lets admins
+  turn it off by patching `ingest: false`. When server ingestion is off, uploading a
+  non-table document in `IngestPanel.svelte` asks for confirmation before sending
+  `extract: false` to store the document as a source without facts. Source-only
+  previews still wait for approval, and automatic uploads run the merge checks.
+  Document uploads that expect facts send `extract: true`, and retries keep that
+  choice. If the server has no extraction model, the panel refreshes its status and
+  offers a source-only upload with a separate confirmation.
+  The UI retries a stale enable write only while the displayed fields, recipients and
+  model configuration revision agree with the approved proposal. The server checks
+  the same conditions under the write locks. Both Rust
+  (`memory_cmd::ops::plan_enable_ingest`) and TypeScript (`ui/src/lib/settings.ts`
+  `planEnableIngest` and `enableIngest`) are verified against the shared fixture
+  `testsuite/settings/enable-ingest.json`, alongside Vitest tests and Playwright
+  coverage in `ui/tests/e2e/settings.spec.ts` and `ui/tests/mock/ingest.spec.ts`.
 
 **Landed for item 57: `memory.scratchBranches.ttl`.** The `memory` kind gained the
 member `scratchBranches` with the field `ttl`, which sets how long a scratch branch of

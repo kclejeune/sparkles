@@ -48,6 +48,11 @@ export const DECLARED_DATASET = 'declared-e2e';
 /** A dataset the settings tests create; the settings file declares values for it. */
 export const SETTINGS_DATASET = 'settings-e2e';
 
+export const INGEST_SETTINGS_DATASET = 'ingest-settings-e2e';
+export const INGEST_LOCKED_DATASET = 'ingest-locked-e2e';
+export const INGEST_DECLARED_DATASET = 'ingest-declared-e2e';
+export const INGEST_QUOTE = 'Ana Lima moved to the payments team this week.';
+
 /** The dataset whose prefixes the settings file declares and locks (spec C20). */
 export const PREFIXES_DATASET = 'prefixes-e2e';
 export const KCLJ = 'https://kclj.io/sparkles/';
@@ -65,6 +70,11 @@ export const SETTINGS = {
       },
       locked: ['assistant.send'],
     },
+    [INGEST_LOCKED_DATASET]: {
+      assistant: { send: 'rows' },
+      locked: ['assistant.send'],
+    },
+    [INGEST_DECLARED_DATASET]: { assistant: { ingest: false } },
     [PREFIXES_DATASET]: {
       prefixes: {
         kclj: KCLJ,
@@ -81,8 +91,8 @@ export const SETTINGS = {
 };
 
 /**
- * The model configuration of the server without auth (`--model-config`). Listing the
- * providers contacts none of them, and the tests call none.
+ * The baseline model configuration of the server without auth (`--model-config`).
+ * Global setup adds the local test provider for document extraction.
  */
 export const MODELS = {
   models: {

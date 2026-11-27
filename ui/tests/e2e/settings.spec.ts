@@ -3,7 +3,15 @@
 // the read-only tab of a user without admin, memory maintenance, and declared datasets
 // that offer no delete.
 
-import { DATASET, DECLARED_DATASET, SETTINGS_DATASET } from './data';
+import {
+  DATASET,
+  DECLARED_DATASET,
+  INGEST_DECLARED_DATASET,
+  INGEST_LOCKED_DATASET,
+  INGEST_QUOTE,
+  INGEST_SETTINGS_DATASET,
+  SETTINGS_DATASET,
+} from './data';
 import { expect, open, test } from './fixtures';
 
 const row = (page: import('@playwright/test').Page, field: string) =>
@@ -135,3 +143,82 @@ test('a user without admin reads the settings', async ({ page }) => {
     page.getByTestId('maintenance-consolidation').getByRole('button', { name: 'Run now' }),
   ).toHaveCount(0);
 });
+
+open(
+  'the Ingest panel confirms recipients, enables extraction and turns off ingest only',
+  async ({ page, request }) => {
+    const ds = INGEST_SETTINGS_DATASET;
+    const created = await request.post('/$/datasets', { data: { dbName: ds, dbType: 'mem' } });
+    expect(created.ok()).toBe(true);
+    await page.goto(`/ui/datasets/${ds}`);
+    const panel = page.getByRole('region', { name: 'Ingest' });
+    const status = panel.getByTestId('server-ingest-status');
+    await status.getByRole('button', { name: 'Turn on server ingestion' }).click();
+    const dialog = page.getByRole('dialog', { name: 'Turn on server ingestion' });
+    await expect(dialog).toContainText('ingest-test/m');
+    await expect(dialog.getByText(/per-provider limit/)).toHaveCount(0);
+    const url = `/$/settings/${ds}/assistant`;
+    const enabling = page.waitForRequest((r) => r.url().endsWith(url) && r.method() === 'PATCH');
+    await dialog.getByRole('button', { name: 'Turn on server ingestion' }).click();
+    const headers = (await enabling).headers();
+    expect(headers['if-match']).toBeTruthy();
+    expect(JSON.parse(decodeURIComponent(headers['if-ingest-confirmation']))).toMatchObject({
+      recipients: [['ingest-test', 'm']],
+    });
+    await expect(status).toContainText('documents go to ingest-test/m');
+    let settings = await (await request.get(url)).json();
+    expect(settings.runtime).toEqual({ enabled: true, ingest: true, send: 'documents' });
+
+    // Give the extraction profile known types, a predicate and two already linked entities.
+    const graph = await request.post(`/${ds}/data`, {
+      headers: { 'Content-Type': 'text/turtle' },
+      data: `@prefix ex: <http://example.org/> .
+      @prefix org: <http://www.w3.org/ns/org#> .
+      @prefix schema: <http://schema.org/> .
+      @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+      ex:ana a schema:Person ; rdfs:label "Ana Lima" .
+      ex:kai a schema:Person ; org:memberOf ex:pay .
+      ex:pay a org:OrganizationalUnit ; rdfs:label "payments team" .`,
+    });
+    expect(graph.ok()).toBe(true);
+    await panel.getByLabel('Document to ingest').setInputFiles({
+      name: 'notes.md',
+      mimeType: 'text/markdown',
+      buffer: Buffer.from(INGEST_QUOTE + '\n'),
+    });
+    await panel.getByRole('button', { name: 'Ingest', exact: true }).click();
+    await expect(panel.getByRole('group', { name: 'Ingestion task' })).toContainText(
+      '1 fact proposed',
+    );
+
+    const disabling = page.waitForRequest((r) => r.url().endsWith(url) && r.method() === 'PATCH');
+    await status.getByRole('button', { name: 'Turn off server ingestion' }).click();
+    expect((await disabling).postDataJSON()).toEqual({ ingest: false });
+    await expect(status).toContainText('Server ingestion is off');
+    settings = await (await request.get(url)).json();
+    expect(settings.runtime).toEqual({ enabled: true, ingest: false, send: 'documents' });
+  },
+);
+
+for (const [ds, field, reason] of [
+  [INGEST_LOCKED_DATASET, 'send', 'locked in'],
+  [INGEST_DECLARED_DATASET, 'ingest', 'declared in'],
+]) {
+  open(
+    `the Ingest panel links to the ${field} setting when it is ${reason} server config`,
+    async ({ page, request }) => {
+      const created = await request.post('/$/datasets', { data: { dbName: ds, dbType: 'mem' } });
+      expect(created.ok()).toBe(true);
+      await page.goto(`/ui/datasets/${ds}`);
+      const status = page
+        .getByRole('region', { name: 'Ingest' })
+        .getByTestId('server-ingest-status');
+      await expect(status).toContainText(reason);
+      await expect(status.getByRole('button', { name: 'Turn on server ingestion' })).toHaveCount(0);
+      await expect(status.getByRole('link', { name: `Open ${field} in Settings` })).toHaveAttribute(
+        'href',
+        `/ui/datasets/${ds}?tab=settings#setting-assistant-${field}`,
+      );
+    },
+  );
+}

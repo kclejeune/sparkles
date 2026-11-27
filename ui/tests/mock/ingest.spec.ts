@@ -60,7 +60,267 @@ test('a preview waits for its approval', async ({ page }) => {
 
 test('a table gets a mapping draft', async ({ page }) => {
   await page.goto('/ui/datasets/org');
+  let body: string | null = null;
+  await page.route('**/$/ingest/org', async (route) => {
+    if (route.request().method() === 'POST') body = route.request().postData();
+    await route.continue();
+  });
   const task = await ingest(page, 'people.csv', 'text/csv');
+  expect(body).toContain('name="file"');
+  expect(body).not.toContain('name="extract"');
   await expect(task).toContainText('Mapping draft (by the model): 3 rows become 6 triples');
   await expect(task.getByLabel('Mapping')).toHaveValue(/tableSchema/);
+  await expect(task).toContainText('Redacted in the sample sent to the model: email (1)');
 });
+
+test('a table can get a mapping draft without sending a model sample when ingestion is off', async ({
+  page,
+}) => {
+  await page.goto('/ui/datasets/foaf');
+  let body: string | null = null;
+  await page.route('**/$/ingest/foaf', async (route) => {
+    if (route.request().method() === 'POST') body = route.request().postData();
+    await route.continue();
+  });
+  const task = await ingest(page, 'people.csv', 'text/csv');
+  await expect(task.getByLabel('Mapping')).toHaveValue(/tableSchema/);
+  expect(body).toMatch(/name="extract"\r?\n\r?\nfalse/);
+});
+
+test('when server ingestion is off, panel states so and asks before storing without facts', async ({
+  page,
+}) => {
+  await page.goto('/ui/datasets/foaf');
+  const panel = page.getByRole('region', { name: 'Ingest' });
+  const status = panel.getByTestId('server-ingest-status');
+  await expect(status).toContainText(
+    'Server ingestion is off: uploaded documents are stored as sources without facts',
+  );
+  // Uploading a document asks for confirmation and sends extract=false
+  let extractField: string | null = null;
+  await page.route('**/$/ingest/foaf', async (route) => {
+    if (route.request().method() === 'POST') {
+      const body = route.request().postData() ?? '';
+      const m = body.match(/name="extract"\r?\n\r?\n([^\r\n]+)/);
+      extractField = m ? m[1] : null;
+    }
+    await route.continue();
+  });
+  await panel.getByLabel('Document to ingest').setInputFiles({
+    name: 'memo.md',
+    mimeType: 'text/markdown',
+    buffer: Buffer.from('# Memo\n\nJust notes.\n'),
+  });
+  await panel.getByRole('button', { name: 'Ingest', exact: true }).click();
+  const dialog = page.getByRole('dialog', {
+    name: 'Store this document as a source without facts?',
+  });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole('button', { name: 'Store without facts' }).click();
+  const task = panel.getByRole('group', { name: 'Ingestion task' });
+  await expect(task).toContainText('Registered as a source');
+  expect(extractField).toBe('false');
+
+  // Admin can turn server ingestion on from the panel after seeing what changes and which providers receive documents
+  await status.getByRole('button', { name: 'Turn on server ingestion' }).click();
+  const enableDialog = page.getByRole('dialog', { name: 'Turn on server ingestion' });
+  await expect(enableDialog).toContainText('enabled');
+  await expect(enableDialog).toContainText('ingest');
+  await expect(enableDialog).toContainText('send');
+  await expect(enableDialog).toContainText('mock/small');
+  await expect(enableDialog.getByText(/per-provider limit/)).toHaveCount(0);
+  await expect(enableDialog).toContainText('query result rows');
+  await enableDialog.getByRole('button', { name: 'Turn on server ingestion' }).click();
+  await expect(status).toContainText(
+    'Server ingestion is on: documents go to mock/small, mock/large',
+  );
+
+  // Turning it off patches ingest=false and links back to Settings
+  await status.getByRole('button', { name: 'Turn off server ingestion' }).click();
+  await expect(status).toContainText('Server ingestion is off');
+  await expect(status.getByRole('link', { name: 'Open ingest in Settings' })).toHaveAttribute(
+    'href',
+    /\/datasets\/foaf\?tab=settings#setting-assistant-ingest$/,
+  );
+});
+
+test('a locked send setting explains why server ingestion is off and links to Settings', async ({
+  page,
+}) => {
+  await page.goto('/ui/datasets/scratch');
+  const panel = page.getByRole('region', { name: 'Ingest' });
+  const status = panel.getByTestId('server-ingest-status');
+  await expect(status).toContainText('Server ingestion is off');
+  await expect(status).toContainText("locked in the server's settings file");
+  await expect(status.getByRole('button', { name: 'Turn on server ingestion' })).toHaveCount(0);
+  await expect(status.getByRole('link', { name: 'Open send in Settings' })).toHaveAttribute(
+    'href',
+    /\/datasets\/scratch\?tab=settings#setting-assistant-send$/,
+  );
+});
+
+test('documents wait for ingestion status and require a store-only choice if it fails', async ({
+  page,
+}) => {
+  let release!: () => void;
+  const wait = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route('**/$/assistant/org', async (route) => {
+    await wait;
+    await route.fulfill({ status: 503, json: { error: 'unavailable' } });
+  });
+  await page.route('**/$/settings/org/assistant', (route) => route.fulfill({ status: 503 }));
+  await page.goto('/ui/datasets/org');
+  const panel = page.getByRole('region', { name: 'Ingest' });
+  await panel.getByLabel('Document to ingest').setInputFiles({
+    name: 'scanned.pdf',
+    mimeType: 'application/pdf',
+    buffer: Buffer.from('%PDF-1.4\n'),
+  });
+  const start = panel.getByRole('button', { name: 'Ingest', exact: true });
+  await expect(start).toBeDisabled();
+  const extracts: (string | undefined)[] = [];
+  await page.route('**/$/ingest/org', async (route) => {
+    if (route.request().method() === 'POST') {
+      extracts.push(
+        route
+          .request()
+          .postData()
+          ?.match(/name="extract"\r?\n\r?\n([^\r\n]+)/)?.[1],
+      );
+    }
+    await route.continue();
+  });
+  release();
+  await expect(panel.getByTestId('server-ingest-status')).toContainText('status is unavailable');
+  await panel.getByLabel('Review mode').selectOption('preview');
+  await start.click();
+  const dialog = page.getByRole('dialog', {
+    name: 'Store this document as a source without facts?',
+  });
+  await expect(dialog).toContainText('stored on main after approval');
+  await dialog.getByRole('button', { name: 'Store without facts' }).click();
+  const task = panel.getByRole('group', { name: 'Ingestion task' });
+  await task.getByRole('button', { name: 'Ingest the readable pages' }).click();
+  await expect(task).toContainText('Source preview');
+  expect(extracts).toEqual(['false', 'false']);
+});
+
+test('an enabled status uses the assistant response when layered settings are unavailable', async ({
+  page,
+}) => {
+  await page.route('**/$/settings/org/assistant', (route) => route.fulfill({ status: 503 }));
+  await page.route('**/$/assistant/org', async (route) => {
+    const response = await route.fetch();
+    const data = await response.json();
+    data.status.extract = [data.status.extract[0], data.status.extract[0]];
+    await route.fulfill({ response, json: data });
+  });
+  await page.goto('/ui/datasets/org');
+  const status = page.getByRole('region', { name: 'Ingest' }).getByTestId('server-ingest-status');
+  await expect(status).toContainText('documents go to mock/small, mock/small');
+});
+
+test('an OCR retry keeps requesting facts and offers explicit storage if ingestion was disabled', async ({
+  page,
+}) => {
+  let disabled = false;
+  const requests: { extract?: string; partial?: string }[] = [];
+  await page.route('**/$/assistant/org', async (route) => {
+    const response = await route.fetch();
+    const data = await response.json();
+    if (disabled) {
+      data.ingest = false;
+      data.status.ingest = false;
+    }
+    await route.fulfill({ response, json: data });
+  });
+  await page.route('**/$/ingest/org', async (route) => {
+    if (route.request().method() !== 'POST') return route.continue();
+    const body = route.request().postData() ?? '';
+    const extract = body.match(/name="extract"\r?\n\r?\n([^\r\n]+)/)?.[1];
+    const partial = body.match(/name="allowPartial"\r?\n\r?\n([^\r\n]+)/)?.[1];
+    requests.push({ extract, partial });
+    if (disabled && extract === 'true') {
+      return route.fulfill({
+        status: 202,
+        json: {
+          id: 'stale-model',
+          dataset: 'org',
+          input: { mode: 'branch' },
+          status: 'failed',
+          progress: 1,
+          error: { code: 'no-model', message: 'The dataset has no extraction model.' },
+        },
+      });
+    }
+    await route.continue();
+  });
+  await page.goto('/ui/datasets/org');
+  const panel = page.getByRole('region', { name: 'Ingest' });
+  const status = panel.getByTestId('server-ingest-status');
+  await expect(status).toContainText('Server ingestion is on');
+  const task = await ingest(page, 'scanned-report.pdf', 'application/pdf');
+  await expect(task.getByRole('alert')).toContainText('needs-ocr');
+  disabled = true;
+  await task.getByRole('button', { name: 'Ingest the readable pages' }).click();
+  await expect(task.getByRole('alert')).toContainText('no-model');
+  await expect(status).toContainText('Server ingestion is off');
+  expect(requests).toEqual([
+    { extract: 'true', partial: undefined },
+    { extract: 'true', partial: 'true' },
+  ]);
+
+  await task.getByRole('button', { name: 'Store without facts…' }).click();
+  const dialog = page.getByRole('dialog', {
+    name: 'Store this document as a source without facts?',
+  });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole('button', { name: 'Store without facts' }).click();
+  await expect(task).toContainText('Registered as a source');
+  expect(requests[2]).toEqual({ extract: 'false', partial: 'true' });
+});
+
+for (const error of ['needs-ocr', 'no-model']) {
+  test(`selecting an older ${error} task in Recent cannot retry the newer upload`, async ({
+    page,
+  }) => {
+    const tasks: Array<{
+      id: string;
+      dataset: string;
+      input: { name: string; mode: string };
+      status: string;
+      progress: number;
+      error?: { code: string; message: string };
+    }> = [];
+    await page.route('**/$/ingest/org', async (route) => {
+      if (route.request().method() === 'GET') {
+        return route.fulfill({ json: { tasks, capabilities: { pdf: true } } });
+      }
+      const first = tasks.length === 0;
+      const t = {
+        id: first ? 'older-task' : 'newer-task',
+        dataset: 'org',
+        input: first ? { name: 'older.pdf', mode: 'branch' } : { name: 'newer.md', mode: 'auto' },
+        status: first ? 'failed' : 'done',
+        progress: 1,
+        error: first ? { code: error, message: 'This document needs a retry.' } : undefined,
+      };
+      tasks.unshift(t);
+      await route.fulfill({ status: 202, json: t });
+    });
+    const retry = error === 'needs-ocr' ? 'Ingest the readable pages' : 'Store without facts…';
+    await page.goto('/ui/datasets/org');
+    const panel = page.getByRole('region', { name: 'Ingest' });
+    const task = await ingest(page, 'older.pdf', 'application/pdf', 'branch');
+    await expect(task.getByRole('alert')).toContainText(error);
+    await expect(task.getByRole('button', { name: retry })).toBeVisible();
+    await ingest(page, 'newer.md', 'text/markdown', 'auto');
+    await expect(task).toContainText('newer.md');
+    await panel.getByRole('button', { name: 'older.pdf', exact: true }).click();
+    await expect(task.getByRole('alert')).toContainText(error);
+    await expect(task.getByRole('button', { name: retry })).toHaveCount(0);
+    expect(tasks).toHaveLength(2);
+  });
+}

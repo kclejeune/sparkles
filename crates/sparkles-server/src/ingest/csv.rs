@@ -88,14 +88,16 @@ pub fn draft(
 ) -> Result<Value, Failed> {
     let tsv = format == Format::Tsv;
     let name = name.unwrap_or(if tsv { "table.tsv" } else { "table.csv" });
+    let redaction = super::pipeline::Redaction::new(r, ds);
+    let (name, _) = redaction.text(r, name)?;
     let table = Table {
         bytes: &req.bytes,
         tsv,
         format: format.name(),
-        name,
+        name: &name.text,
         base: None,
     };
-    draft_table(r, req, ds, table)
+    draft_table(r, req, ds, table, &redaction)
 }
 
 /// The most CSV text a workbook's result carries inline, over all its sheets.
@@ -150,6 +152,10 @@ pub fn workbook(
             "the workbook has no visible sheet with data",
         ));
     }
+    let redaction = super::pipeline::Redaction::new(r, ds);
+    let (name, _) = redaction.text(r, name)?;
+    let name = name.text.as_str();
+    let mut redactions = std::collections::BTreeMap::<String, u64>::new();
     let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
     let mut drafts: Vec<Value> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
@@ -163,7 +169,8 @@ pub fn workbook(
     }
     for sh in sheets.into_iter().take(MAX_SHEETS) {
         r.check()?;
-        let mut slug = super::pipeline::slug(&sh.name);
+        let (safe_sheet, _) = redaction.text(r, &sh.name)?;
+        let mut slug = super::pipeline::slug(&safe_sheet.text);
         if slug.is_empty() {
             slug = format!("sheet{}", sh.index);
         }
@@ -183,9 +190,12 @@ pub fn workbook(
             name: &file,
             base,
         };
-        match draft_table(r, req, ds, table) {
+        match draft_table(r, req, ds, table, &redaction) {
             Ok(mut d) => {
-                d["sheet"] = sh.name.clone().into();
+                for (detector, count) in d["redactions"].as_object().into_iter().flatten() {
+                    *redactions.entry(detector.clone()).or_default() += count.as_u64().unwrap_or(0);
+                }
+                d["sheet"] = safe_sheet.text.clone().into();
                 d["index"] = sh.index.into();
                 if inline + sh.csv.len() <= INLINE_CSV_BYTES {
                     inline += sh.csv.len();
@@ -193,7 +203,7 @@ pub fn workbook(
                 } else {
                     notes.push(format!(
                         "the sheet {:?} is too long to send with its draft: convert it to CSV and upload that",
-                        sh.name
+                        safe_sheet.text
                     ));
                 }
                 drafts.push(d);
@@ -203,7 +213,7 @@ pub fn workbook(
                 if matches!(code, "cancelled" | "timeout" | "budget-exceeded") {
                     return Err(f);
                 }
-                drafts.push(json!({ "sheet": sh.name, "index": sh.index, "error": f.0 }));
+                drafts.push(json!({ "sheet": safe_sheet.text, "index": sh.index, "error": f.0 }));
             }
         }
     }
@@ -216,6 +226,9 @@ pub fn workbook(
         "file": name,
         "sheets": drafts,
     });
+    if !redactions.is_empty() {
+        out["redactions"] = json!(redactions);
+    }
     if !notes.is_empty() {
         out["notes"] = notes.into();
     }
@@ -234,7 +247,13 @@ struct Table<'a> {
 
 /// Draft the mapping of a table given as bytes: a CSV or TSV upload, or one sheet of a
 /// workbook as CSV.
-fn draft_table(r: &mut Run, req: &Request, ds: &Dataset, table: Table) -> Result<Value, Failed> {
+fn draft_table(
+    r: &mut Run,
+    req: &Request,
+    ds: &Dataset,
+    table: Table,
+    redaction: &super::pipeline::Redaction,
+) -> Result<Value, Failed> {
     let Table {
         bytes,
         tsv,
@@ -259,6 +278,9 @@ fn draft_table(r: &mut Run, req: &Request, ds: &Dataset, table: Table) -> Result
         .clone()
         .or_else(|| base.map(str::to_string))
         .unwrap_or_else(|| default_base(name));
+    if let Some(base) = &req.base {
+        redaction.check_locator(r, base)?;
+    }
     oxiri::Iri::parse(base.as_str())
         .map_err(|e| Failed::new("bad-argument", format!("base {base:?} is not an IRI: {e}")))?;
     ctx.progress.status(super::Status::Converting, 0.05, None);
@@ -294,12 +316,15 @@ fn draft_table(r: &mut Run, req: &Request, ds: &Dataset, table: Table) -> Result
     }
     let mut notes: Vec<String> = Vec::new();
     let mut pair_used = None;
+    let mut redactions = std::collections::BTreeMap::new();
     let (mut metadata, specs) = if use_model && columns.len() <= MAX_COLUMNS {
         let profile = req.profile.clone().unwrap_or_else(|| "default".into());
         let vocab = Vocabulary::read(r, &profile)?;
         let models = ctx.models.expect("pairs need models");
         let sample = sample_lines(bytes, SAMPLE_ROWS + 1);
-        let user = prompt(&vocab, &sample, tsv);
+        let (redacted, _) = redaction.text(r, &sample)?;
+        redactions = redacted.counts();
+        let user = prompt(&vocab, &redacted.text, tsv);
         let out_schema = OutputSchema {
             name: "TableMapping",
             schema: schema(&vocab),
@@ -458,6 +483,9 @@ fn draft_table(r: &mut Run, req: &Request, ds: &Dataset, table: Table) -> Result
     }
     if !notes.is_empty() {
         out["notes"] = notes.into();
+    }
+    if !redactions.is_empty() {
+        out["redactions"] = json!(redactions);
     }
     Ok(out)
 }

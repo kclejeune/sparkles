@@ -11,7 +11,7 @@ use super::{PdfRuntime, Status, Task};
 use crate::auth::{Level, Principal};
 use crate::mcp::errors::ToolError;
 use crate::mcp::{Call, McpServer};
-use crate::models::{Models, Pair, Role, StepRecord};
+use crate::models::{Models, Pair, StepRecord};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -319,11 +319,15 @@ pub fn slug(s: &str) -> String {
     }
 }
 
-/// The name a file or URL gives a document, without its directories.
-pub(super) fn base_name(s: &str) -> &str {
-    let s = s.split(['?', '#']).next().unwrap_or(s);
-    let s = s.trim_end_matches('/');
-    s.rsplit('/').next().unwrap_or(s)
+/// The last path segment of a fetch URL can supply a file name for format detection.
+pub(super) fn url_name(raw: &str) -> Option<String> {
+    let url = url::Url::parse(raw).ok()?;
+    let name = url.path_segments()?.rfind(|s| !s.is_empty())?;
+    Some(
+        percent_encoding::percent_decode_str(name)
+            .decode_utf8_lossy()
+            .into_owned(),
+    )
 }
 
 /// Run one ingestion. The value is the result; the usage is reported either way.
@@ -337,6 +341,185 @@ pub fn run(ctx: &Ctx, req: &Request) -> (Result<Value, Value>, Value) {
     let out = run_inner(&mut r, req).map_err(|f| f.0);
     let usage = r.usage.json(started);
     (out, usage)
+}
+
+/// The policy for one ingestion, shared by its text and retained metadata.
+pub(crate) struct Redaction {
+    mode: crate::assist::ServerIngestRedaction,
+    policy: sparkles_memory_import::redact::Policy,
+}
+
+impl Redaction {
+    pub fn new(r: &Run, ds: &crate::state::Dataset) -> Self {
+        Self::for_dataset(&r.ctx.server.state, ds, r.ctx.principal)
+    }
+
+    pub(crate) fn for_dataset(
+        st: &crate::state::AppState,
+        ds: &crate::state::Dataset,
+        principal: &Principal,
+    ) -> Self {
+        let memory = crate::assist::memory_settings(st, ds);
+        let mode = memory.server_ingest_redaction();
+        let known = if mode != crate::assist::ServerIngestRedaction::Off
+            && memory.redaction_known_values()
+        {
+            crate::settings::secrets::known_values(st, principal)
+        } else {
+            Vec::new()
+        };
+        Self {
+            mode,
+            policy: memory.redaction_policy(known, "server-secret"),
+        }
+    }
+
+    fn first_match(&self, r: &Run, text: &str) -> Result<Option<(String, usize)>, Failed> {
+        if self.mode == crate::assist::ServerIngestRedaction::Off {
+            return Ok(None);
+        }
+        self.policy.first_match_checked(text, || r.check())
+    }
+
+    fn refusal(text: &str, name: &str, at: usize) -> Failed {
+        let offset = text[..at].chars().count();
+        Failed(json!({
+            "code": "secret-detected",
+            "status": 422,
+            "message": format!(
+                "the text matches the secret pattern {name} at character {offset}; nothing was written"
+            ),
+            "detector": name,
+            "pattern": name,
+            "offset": offset,
+        }))
+    }
+
+    /// Keep the stored rendition and extraction coordinates identical.
+    pub fn check_existing(&self, r: &Run, text: &str) -> Result<(), Failed> {
+        if let Some((name, at)) = self.first_match(r, text)? {
+            if self.mode == crate::assist::ServerIngestRedaction::Refuse {
+                return Err(Self::refusal(text, &name, at));
+            }
+            return Err(Refusal::new(
+                "redaction-required",
+                422,
+                "the stored rendition requires redaction: ingest a new, redacted rendition before extracting facts",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    pub fn text(
+        &self,
+        r: &Run,
+        text: &str,
+    ) -> Result<
+        (
+            sparkles_memory_import::redact::Redacted,
+            Vec<sparkles_memory_import::redact::Edit>,
+        ),
+        Failed,
+    > {
+        use crate::assist::ServerIngestRedaction::{Redact, Refuse};
+        if self.mode == Redact {
+            return self.policy.redact_bounded(text, convert::MAX_TEXT_BYTES, || r.check(), || {
+                Refusal::new(
+                    "too-large",
+                    413,
+                    "redaction would exceed the rendition's size or replacement limit: split the document",
+                ).into()
+            });
+        }
+        if self.mode == Refuse
+            && let Some((name, at)) = self.first_match(r, text)?
+        {
+            return Err(Self::refusal(text, &name, at));
+        }
+        Ok((
+            sparkles_memory_import::redact::Redacted {
+                text: text.to_string(),
+                names: Vec::new(),
+            },
+            Vec::new(),
+        ))
+    }
+
+    pub fn document(
+        &self,
+        r: &Run,
+        converted: &mut Converted,
+        title: Option<&str>,
+    ) -> Result<(Option<String>, std::collections::BTreeMap<String, usize>), Failed> {
+        let (redacted, edits) = self.text(r, &converted.text)?;
+        let mut counts = redacted.counts();
+        converted.replace_text(redacted.text, &edits);
+        let title = if let Some(t) = title {
+            let (redacted, _) = self.text(r, t)?;
+            for (k, v) in redacted.counts() {
+                *counts.entry(k).or_default() += v;
+            }
+            Some(redacted.text)
+        } else {
+            None
+        };
+        Ok((title, counts))
+    }
+
+    pub fn check_locator(&self, r: &Run, value: &str) -> Result<(), Failed> {
+        if self.matches_locator(r, value)? {
+            return Err(Refusal::new(
+                "sensitive-locator",
+                422,
+                "a source or graph IRI matches the redaction policy: use a different IRI",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn matches_locator(&self, r: &Run, value: &str) -> Result<bool, Failed> {
+        self.matches_locator_checked(value, || r.check())
+    }
+
+    pub(crate) fn matches_locator_checked<E>(
+        &self,
+        value: &str,
+        mut check: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        if self.mode == crate::assist::ServerIngestRedaction::Off {
+            return Ok(false);
+        }
+        if self
+            .policy
+            .first_match_checked(value, &mut check)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        let decoded = percent_encoding::percent_decode_str(value).decode_utf8_lossy();
+        Ok(decoded != value && self.policy.first_match_checked(&decoded, check)?.is_some())
+    }
+
+    /// Fetch URLs with userinfo or query strings may identify private resources.
+    /// Use a generated source IRI when retaining a URL would disclose that metadata.
+    pub fn fetched_locator(&self, r: &Run, url: Option<&str>) -> Result<Option<String>, Failed> {
+        let Some(raw) = url else { return Ok(None) };
+        let Ok(url) = url::Url::parse(raw) else {
+            return Ok(None);
+        };
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || self.matches_locator(r, raw)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(raw.to_string()))
+    }
 }
 
 /// The dataset's `ingest.json` members of Phase 4.
@@ -370,7 +553,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     let name = req
         .name
         .clone()
-        .or_else(|| req.url.as_deref().map(|u| base_name(u).to_string()));
+        .or_else(|| req.url.as_deref().and_then(url_name));
     let format = Format::detect(req.media_type.as_deref(), name.as_deref(), &req.bytes)?;
     if matches!(format, Format::Csv | Format::Tsv) {
         return super::csv::draft(r, req, &ds, format, name.as_deref());
@@ -412,7 +595,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     // 1. conversion
     ctx.progress.status(Status::Converting, 0.05, None);
     r.check()?;
-    let converted = convert::convert(
+    let mut converted = convert::convert(
         &req.bytes,
         format,
         &convert::Options {
@@ -425,16 +608,18 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         },
     )?;
     r.check()?;
-    let title = req
+    let raw_title = req
         .title
         .clone()
         .or_else(|| converted.title.clone())
         .or_else(|| name.clone());
-    let iri = req.iri.clone().or_else(|| {
-        req.url
-            .clone()
-            .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
-    });
+    let redaction = Redaction::new(r, &ds);
+    let (title, redactions) = redaction.document(r, &mut converted, raw_title.as_deref())?;
+    for locator in [&req.iri, &req.graph].into_iter().flatten() {
+        redaction.check_locator(r, locator)?;
+    }
+    let locator = redaction.fetched_locator(r, req.url.as_deref())?;
+    let iri = req.iri.as_ref().or(locator.as_ref());
     let profile = req.profile.clone().unwrap_or_else(|| "default".into());
     let ingest = crate::mcp::memory::ingest::ingest_settings(st, &ds);
     let limits = Limits {
@@ -468,7 +653,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     if let Some(g) = &req.graph {
         reg.insert("graph".into(), g.clone().into());
     }
-    if let Some(i) = &iri {
+    if let Some(i) = iri {
         reg.insert("iri".into(), i.clone().into());
     }
     if let Some(t) = &title {
@@ -508,7 +693,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     };
     if registered["alreadyRegistered"] == true {
         discard_branch(r, req, branch.as_deref());
-        return Ok(json!({
+        let mut out = json!({
             "outcome": "already-registered",
             "format": format.name(),
             "source": registered["source"],
@@ -518,7 +703,20 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
             "length": registered["length"],
             "message": "the same text is already registered in this graph; nothing was written",
             "prefixes": registered["prefixes"],
-        }));
+        });
+        if !redactions.is_empty() {
+            out["redactions"] = json!(redactions);
+        }
+        return Ok(out);
+    }
+    if req.mode == Mode::Preview {
+        // Keep explicit locators in the form resolved by the dry run. Omitted
+        // locators are derived deterministically from the text and these IRIs.
+        for (arg, field) in [("iri", "source"), ("graph", "graph")] {
+            if let Some(value) = reg.get_mut(arg) {
+                *value = registered_iri(&registered, field).into();
+            }
+        }
     }
     let rendition = registered["rendition"].as_str().unwrap_or("").to_string();
     let mut out = json!({
@@ -533,6 +731,9 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         "chunks": chunks.len(),
         "profile": profile,
     });
+    if !redactions.is_empty() {
+        out["redactions"] = json!(redactions);
+    }
     if let Some(b) = &branch {
         out["branch"] = b.clone().into();
         out["review"] = review_link(&ds.name, b).into();
@@ -556,6 +757,23 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
             out["notes"] = json!([
                 "no fact was extracted: the dataset's assistant does not let ingestion use a provider"
             ]);
+        }
+        match req.mode {
+            Mode::Preview => {
+                out["outcome"] = "preview".into();
+                out["head"] = base_head.into();
+                ctx.progress.approval(Approval {
+                    register: reg,
+                    asserts: Vec::new(),
+                    head: base_head,
+                });
+            }
+            Mode::Auto => {
+                let b = branch.as_deref().expect("auto has a branch");
+                let message = format!("Ingest {}", title.as_deref().unwrap_or("a document"));
+                merge_if(r, b, &message, None, req.branch.is_none(), &mut out)?;
+            }
+            Mode::Branch | Mode::Memory | Mode::Claims => {}
         }
         return Ok(out);
     };
@@ -594,7 +812,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
             let b = branch.as_deref().expect("auto has a branch");
             let message = format!("Ingest {}", title.as_deref().unwrap_or("a document"));
             let why = auto_blocker(&proposals, &limits);
-            merge_if(r, b, &message, why, &mut out)?;
+            merge_if(r, b, &message, why, req.branch.is_none(), &mut out)?;
         }
         Mode::Branch | Mode::Memory | Mode::Claims => {}
     }
@@ -638,12 +856,14 @@ pub(super) fn confirm_estimate(
 }
 
 /// Merge `branch` into `main` when nothing blocks it and the merge preview finds no
-/// conflict or guard finding, then delete it. Otherwise say why in `autoFallback`.
+/// conflict or guard finding. Clean up a task-created branch if its commits were
+/// all merged. Otherwise report why the merge was skipped in `autoFallback`.
 pub(crate) fn merge_if(
     r: &Run,
     branch: &str,
     message: &str,
     mut why: Option<String>,
+    cleanup: bool,
     out: &mut Value,
 ) -> Result<(), Failed> {
     // the merge preview: the guard of main and conflicts keep the branch
@@ -668,15 +888,10 @@ pub(crate) fn merge_if(
                         "expect": p["expect"] }),
                 None,
             )?;
-            let _ = r.tool(
-                "delete_branch",
-                json!({ "name": branch, "force": true }),
-                None,
-            );
             out["outcome"] = "merged".into();
             out["merge"] = m;
-            if let Some(o) = out.as_object_mut() {
-                o.remove("review");
+            if cleanup {
+                cleanup_merged_branch(r, branch, out);
             }
         }
         (w, _) => {
@@ -684,6 +899,25 @@ pub(crate) fn merge_if(
         }
     }
     Ok(())
+}
+
+pub(super) fn cleanup_merged_branch(r: &Run, branch: &str, out: &mut Value) {
+    if r.tool("delete_branch", json!({ "name": branch }), None)
+        .is_ok()
+        && let Some(o) = out.as_object_mut()
+    {
+        o.remove("review");
+    }
+}
+
+/// A registration result's IRI as a SPARQL term independent of the live prefixes.
+pub(super) fn registered_iri(registered: &Value, field: &str) -> String {
+    registered["resolved"][field]
+        .as_str()
+        // Existing sources pass their already resolved terms directly.
+        .or_else(|| registered[field].as_str())
+        .expect("registration returns IRIs")
+        .to_owned()
 }
 
 /// An IRI as a tool returned it, `<…>` or a prefixed name of `prefixes`, made bare.
@@ -752,10 +986,15 @@ fn run_existing(r: &mut Run, req: &Request, source: &str) -> Result<Value, Faile
         chunks,
         ..
     } = read_source(r, source, None)?;
-    let title = req
+    let raw_title = req
         .title
         .clone()
         .or_else(|| found["title"].as_str().map(str::to_string));
+    let redaction = Redaction::new(r, &ds);
+    redaction.check_existing(r, &text)?;
+    let title = raw_title
+        .map(|title| redaction.text(r, &title).map(|(value, _)| value.text))
+        .transpose()?;
     if req.mode == Mode::Memory && !crate::assist::memory_settings(st, &ds).is_agent_graph(&graph) {
         return Err(Failed::new(
             "not-agent-memory",
@@ -843,7 +1082,7 @@ fn run_existing(r: &mut Run, req: &Request, source: &str) -> Result<Value, Faile
         let b = branch.as_deref().expect("auto has a branch");
         let message = format!("Ingest {}", title.as_deref().unwrap_or("a source"));
         let why = auto_blocker(&proposals, &limits);
-        merge_if(r, b, &message, why, &mut out)?;
+        merge_if(r, b, &message, why, req.branch.is_none(), &mut out)?;
     }
     ctx.progress.status(Status::Writing, 0.99, None);
     Ok(out)
@@ -977,14 +1216,9 @@ pub(super) fn rendition_extras(c: &Converted) -> Value {
 
 fn pages_json(c: &Converted, out: &mut Value) {
     if !c.page_starts.is_empty() {
-        let map = convert::PageMap::new(&c.text, &c.page_starts);
-        out["pages"] = c
-            .page_starts
-            .iter()
-            .filter_map(|s| {
-                let page = map.page_of(*s)?;
-                Some(json!({ "page": page, "start": s }))
-            })
+        out["pages"] = convert::PageMap::new(&c.text, &c.page_starts)
+            .entries()
+            .map(|(start, page)| json!({ "page": page, "start": start }))
             .collect::<Vec<_>>()
             .into();
     }
@@ -1008,11 +1242,7 @@ pub fn extract_pairs(
     if !s.enabled || !s.ingest {
         return Vec::new();
     }
-    let lists = crate::assistant::lists(models, s);
-    lists
-        .get(&Role::Extract)
-        .cloned()
-        .unwrap_or_default()
+    crate::assistant::configured_extract_pairs(models, s)
         .into_iter()
         .filter(|p| s.send_to(&p.provider) >= crate::assistant::Send::Documents)
         .collect()
@@ -1118,7 +1348,7 @@ fn discard_branch(r: &Run, req: &Request, branch: Option<&str>) {
     if let Some(b) = branch
         && req.branch.as_deref() != Some(b)
     {
-        let _ = r.tool("delete_branch", json!({ "name": b, "force": true }), None);
+        let _ = r.tool("delete_branch", json!({ "name": b }), None);
     }
 }
 
@@ -1130,24 +1360,10 @@ pub fn approve(ctx: &Ctx, dataset: &str, a: &Approval) -> Result<Value, Value> {
         dataset: dataset.to_string(),
         usage: Usage::default(),
     };
-    let ds = ctx
-        .server
-        .dataset(ctx.principal, Some(dataset))
-        .map_err(|e| Failed::from(e).0)?;
-    let head = ds.store.snapshot().commit;
-    if head != a.head {
-        return Err(json!({
-            "code": "conflict",
-            "status": 409,
-            "message": format!("the dataset changed since the preview (head {} then, {head} now): ingest the document again", a.head),
-        }));
-    }
+    let mut args = a.register.clone();
+    args.insert("ifHead".into(), a.head.into());
     let reg = r
-        .tool(
-            "register_converted",
-            Value::Object(a.register.clone()),
-            None,
-        )
+        .tool("register_converted", Value::Object(args), None)
         .map_err(|e| Failed::from(e).0)?;
     let mut commits = Vec::new();
     for call in &a.asserts {

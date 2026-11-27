@@ -21,7 +21,7 @@
 use super::conn::{CmdError, Conn, val};
 use super::sync::{self, Cache, CacheEntry, FileReport, RegisterText, SyncOpts, count, normalize};
 use serde_json::Value;
-use sparkles_memory_import::redact::{self, Pattern};
+use sparkles_memory_import::redact;
 use sparkles_memory_import::transcripts::{self, Format, Session, render, split};
 use sparkles_memory_import::vocab::{self, XSD_DATETIME, XSD_INTEGER, mem};
 use sparkles_memory_import::{Ctx, Fact, FileImport, FileKind, Harness, Obj, Project, Roots};
@@ -234,7 +234,7 @@ pub struct Run<'a> {
     pub roots: &'a Roots,
     pub project: &'a Project,
     pub harnesses: Vec<Harness>,
-    pub patterns: &'a [Pattern],
+    pub policy: &'a redact::Policy,
     /// the graph of each scanned memory or instruction file, by path
     pub file_graphs: HashMap<PathBuf, String>,
     pub opts: Opts,
@@ -298,8 +298,8 @@ pub fn sync(run: &Run, cache: &mut Cache) -> Result<Vec<FileReport>, CmdError> {
     let digests = session_digests(run.conn, &run.sync.prefix)?;
     let mut reports = Vec::new();
     let mut budget = run.opts.max_bytes;
-    let seg = run.project.segment();
-    let project_iri = run.ctx.project_iri(&run.project.key);
+    let project_key = run.project.redacted_key(run.policy);
+    let seg = sparkles_memory_import::project::segment_of(&project_key);
     for f in found {
         let path_key = f.path.display().to_string();
         let mut rep = FileReport {
@@ -390,7 +390,7 @@ pub fn sync(run: &Run, cache: &mut Cache) -> Result<Vec<FileReport>, CmdError> {
         let turns: Vec<String> = turns
             .into_iter()
             .map(|t| {
-                let r = redact::redact(&t, run.patterns);
+                let r = run.policy.redact(&t);
                 names.extend(r.names);
                 normalize(&r.text)
             })
@@ -475,7 +475,7 @@ pub fn sync(run: &Run, cache: &mut Cache) -> Result<Vec<FileReport>, CmdError> {
                 run,
                 &s,
                 &graph,
-                &project_iri,
+                &project_key,
                 f.harness,
                 &f.path,
                 names.len(),
@@ -491,6 +491,7 @@ pub fn sync(run: &Run, cache: &mut Cache) -> Result<Vec<FileReport>, CmdError> {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default(),
+                local_path_digest: None,
                 key: id.clone(),
                 graph: graph.clone(),
                 entity: Some(run.ctx.session_iri(f.harness.segment(), &id)),
@@ -551,12 +552,13 @@ fn session_facts(
     run: &Run,
     s: &Session,
     graph: &str,
-    project_iri: &str,
+    project_key: &str,
     harness: Harness,
     path: &Path,
     redactions: usize,
 ) -> Vec<Fact> {
     let id = s.id.clone().unwrap_or_default();
+    let project_iri = &run.ctx.project_iri(project_key);
     let sess = run.ctx.session_iri(harness.segment(), &id);
     let mut f = vec![
         fact(graph, &mem("harness"), Obj::Iri(harness.iri())),
@@ -577,11 +579,7 @@ fn session_facts(
         ),
         fact(graph, vocab::PROV_GENERATED_BY, Obj::Iri(sess.clone())),
         fact(project_iri, vocab::RDF_TYPE, Obj::Iri(mem("Project"))),
-        fact(
-            project_iri,
-            vocab::RDFS_LABEL,
-            Obj::lit(run.project.key.clone()),
-        ),
+        fact(project_iri, vocab::RDFS_LABEL, Obj::lit(project_key)),
         fact(&sess, vocab::RDF_TYPE, Obj::Iri(mem("Session"))),
         fact(&sess, &mem("sessionId"), Obj::lit(id.clone())),
         fact(&sess, &mem("harness"), Obj::Iri(harness.iri())),

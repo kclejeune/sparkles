@@ -5943,7 +5943,16 @@ export interface components {
                     model: string;
                     provider: string;
                 }[];
+                /** @description The effective `extract` role list for this dataset (dataset override or server list). */
+                extract?: {
+                    model: string;
+                    provider: string;
+                }[];
                 historyDays: number;
+                /** @description Whether server-side document ingestion can extract facts with an `extract` provider. */
+                ingest?: boolean;
+                /** @description Opaque revision of the installed model configuration for ingestion enable confirmation. */
+                modelRevision?: string;
                 models: boolean;
                 reason?: string;
                 /** @description Whether an answer can carry a summary. */
@@ -6321,6 +6330,8 @@ export interface components {
             entity?: string;
             /** @description The age at which a fact's weight halves, 90 by default. */
             halfLifeDays?: number;
+            /** @description Include readable imports under both the project key and its redacted alias in a project brief. */
+            includeProjectAliases?: boolean;
             includeUnreviewed?: boolean;
             /** @description 500 to 100,000, 8000 by default. */
             maxChars?: number;
@@ -9417,14 +9428,14 @@ export interface components {
             };
             finishedAt?: string;
             id: string;
-            /** @description What was ingested: its name, format, size, URL or source and mode. A maintenance task has `kind` `consolidation` or `retention`, and `scheduled`. */
+            /** @description The request mode, format and size when supplied. A maintenance task has `kind` `consolidation` or `retention`, and `scheduled`. */
             input: {
                 [key: string]: unknown;
             };
             message?: string;
             /** @description From 0 to 1. */
             progress: number;
-            /** @description The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `already-proposed`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, a table's mapping draft and preview, or a workbook's drafts for each sheet. A `claims` ingestion reports the evidence operation, commit, first availability, revision, records and their counts by kind, the claims, failed facts, flagged entities, `factGuard` `not-run`, and `previousRevision` (the linked prior evidence `SourceRevision` IRI, distinct from the C18 `previousRendition`, omitted when no predecessor evidence revision is linked, when the recorded link is hidden from the caller or on `already-proposed`). A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted. */
+            /** @description The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `already-proposed`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, `redactions` counts by detector when text was redacted, a table's mapping draft and preview, or a workbook's drafts and redaction counts for each sheet. A `claims` ingestion reports the evidence operation, commit, first availability, revision, records and their counts by kind, the claims, failed facts, flagged entities, `factGuard` `not-run`, and `previousRevision` (the linked prior evidence `SourceRevision` IRI, distinct from the C18 `previousRendition`, omitted when no predecessor evidence revision is linked, when the recorded link is hidden from the caller or on `already-proposed`). A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted. */
             result?: {
                 [key: string]: unknown;
             };
@@ -10161,6 +10172,34 @@ export interface components {
                 }[];
                 /** @description Whether transcripts may be imported (Phase 3m-b). */
                 transcripts?: boolean;
+            };
+            /** @description Redaction policy for agent memory imports, `register_source` and server-side document ingestion. Written as `format` 4 of `memory.json`. */
+            redaction?: {
+                /** @description Regular expressions whose matched spans are never redacted. */
+                allow?: string[];
+                /** @description High-entropy token detector for assignments, headers, query parameters and quoted values. Off when omitted. */
+                entropy?: {
+                    /** @description Minimum Shannon entropy in bits per character, 0.0 to 8.0, 4.0 by default. */
+                    minBitsPerChar?: number;
+                    /** @description Minimum token length in characters, 8 to 1024, 20 by default. */
+                    minLength?: number;
+                };
+                /** @description Apply the `secret-detected` check of `register_source` to every graph of the dataset, not only `imports.base`. `false` by default. */
+                everywhere?: boolean;
+                /** @description Enable exact matching against the server secret inventory for server administrators and the local operator, or against sensitive environment variables in the CLI. `true` by default. */
+                knownValues?: boolean;
+                /** @description Extra regular-expression redaction patterns, merged with `imports.secretPatterns`. */
+                patterns?: {
+                    name: string;
+                    regex: string;
+                }[];
+                /** @description Opt-in personal data detectors. */
+                personal?: ("email" | "phone" | "payment-card" | "iban" | "ip")[];
+                /**
+                 * @description How server-side document ingestion handles detected secrets: `redact` replaces them before storage and model calls (default), `refuse` fails the task with `secret-detected`, and `off` leaves text untouched. A stored rendition requiring redaction must be replaced before extraction.
+                 * @enum {string}
+                 */
+                serverIngest?: "redact" | "refuse" | "off";
             };
             /** @description The retention of session graphs, off without it. */
             retention?: {
@@ -25673,6 +25712,8 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
+                /** @description For an assistant ingestion enable patch, percent-encoded JSON naming the approved settings fields, document recipients, and the modelRevision from assistant status. A changed proposal returns 412. */
+                "If-Ingest-Confirmation"?: string;
                 /** @description The `etag` of the runtime layer the change is based on. */
                 "If-Match"?: string;
             };

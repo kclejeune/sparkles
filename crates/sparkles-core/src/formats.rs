@@ -827,7 +827,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("graphql.json", 1),
     named(ds("restore.json", 1), "restoreFormat"),
     ds("assistant.json", 1),
-    ds("memory.json", 3),
+    ds("memory.json", 4),
     ds("ingest.json", 1),
     ds("asks.json", 3),
     ds("query-suggestions.json", 1),
@@ -1097,15 +1097,20 @@ fn settings_max_format(s: &SettingsFile, v: &serde_json::Value) -> u32 {
 /// this build writes, except that a file whose content an older release reads keeps
 /// that older version, so only a file that uses a newer feature is refused by older
 /// releases. `memory.json` is format 2 when it holds `scratchBranches` with `ttl` only,
-/// and format 3 when `scratchBranches` holds `maxPerPrincipal` or `notifyBefore`.
+/// format 3 when `scratchBranches` holds `maxPerPrincipal` or `notifyBefore`, and
+/// format 4 when it holds `redaction`.
 fn settings_stamp_format(s: &SettingsFile, v: &serde_json::Value) -> u32 {
     if s.name == "memory.json" {
+        if v.get("redaction").is_some() {
+            return 4;
+        }
         let Some(sb) = v.get("scratchBranches") else {
             return 1;
         };
         if sb.get("maxPerPrincipal").is_none() && sb.get("notifyBefore").is_none() {
             return 2;
         }
+        return 3;
     }
     settings_max_format(s, v)
 }
@@ -1554,7 +1559,7 @@ mod tests {
     #[test]
     fn memory_format_two_needs_scratch_branches() {
         use serde_json::json;
-        assert_eq!(settings_file("memory.json").unwrap().writes, 3);
+        assert_eq!(settings_file("memory.json").unwrap().writes, 4);
         let mut plain = json!({"agentGraphs": ["urn:x:a/*"]});
         stamp_settings("memory.json", &mut plain);
         assert_eq!(plain["format"], 1, "older releases keep reading it");
@@ -1565,7 +1570,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(v["format"], 2);
         assert!(check_settings("memory.json", &v).is_ok());
-        let e = check_settings("memory.json", &json!({"format": 4})).unwrap_err();
+        let e = check_settings("memory.json", &json!({"format": 5})).unwrap_err();
         assert!(matches!(e, Error::Unsupported(_)), "{e}");
     }
 
@@ -1586,6 +1591,15 @@ mod tests {
         let mut v = json!({"scratchBranches": {"ttl": "1d"}});
         stamp_settings("memory.json", &mut v);
         assert_eq!(v["format"], 2);
+    }
+
+    #[test]
+    fn memory_format_four_needs_redaction() {
+        use serde_json::json;
+        let mut v = json!({"redaction": {"serverIngest": "refuse"}});
+        stamp_settings("memory.json", &mut v);
+        assert_eq!(v["format"], 4, "{v}");
+        assert!(check_settings("memory.json", &v).is_ok());
     }
 
     #[test]

@@ -55,6 +55,8 @@ struct BriefArgs {
     dataset: Option<String>,
     scope: Option<String>,
     project_key: Option<String>,
+    #[serde(default)]
+    include_project_aliases: bool,
     entity: Option<String>,
     query: Option<String>,
     include_unreviewed: Option<bool>,
@@ -63,6 +65,11 @@ struct BriefArgs {
     half_life_days: Option<f64>,
     unreviewed_weight: Option<f64>,
     timeout_seconds: Option<f64>,
+}
+
+struct ProjectScope<'a> {
+    key: &'a str,
+    include_aliases: bool,
 }
 
 /// One fact of the brief, from one graph.
@@ -239,9 +246,20 @@ impl Tools<'_> {
                     .map(str::trim)
                     .filter(|k| !k.is_empty() && k.len() <= 500)
                     .ok_or_else(|| ToolError::bad_argument("the project scope needs projectKey"))?;
+                let project = ProjectScope {
+                    key,
+                    include_aliases: a.include_project_aliases,
+                };
                 let cands = match memory.imports.as_ref() {
                     Some(im) => self
-                        .project_facts(&r, &im.base, key, &mut terms, &mut heads, &mut graph_iris)
+                        .project_facts(
+                            &r,
+                            &im.base,
+                            project,
+                            &mut terms,
+                            &mut heads,
+                            &mut graph_iris,
+                        )
                         .map_err(eng)?,
                     None => Vec::new(),
                 };
@@ -712,37 +730,52 @@ impl Tools<'_> {
         &self,
         r: &Reader,
         base: &str,
-        key: &str,
+        project: ProjectScope<'_>,
         terms: &mut Terms,
         heads: &mut HashMap<String, Head>,
         graph_iris: &mut HashMap<String, String>,
     ) -> Result<Vec<Cand>, Error> {
-        let seg = key.replace('/', ".");
-        let encoded: String = seg
-            .bytes()
-            .map(|b| {
-                if b.is_ascii_alphanumeric() || b"-._~@".contains(&b) {
-                    (b as char).to_string()
-                } else {
-                    format!("%{b:02X}")
-                }
-            })
-            .collect();
-        // the sources under the base, then those of the project
+        let segment_of = |key: &str| {
+            sparkles_memory_import::ids::segment(&sparkles_memory_import::project::segment_of(key))
+        };
+        let segment = segment_of(project.key);
+        // Explicit keys also find older graphs by their segment. For a directory with
+        // mixed imports, match the recorded project labels before applying the budget.
+        let selection = if project.include_aliases {
+            let digest = sparkles_memory_import::ids::digest(project.key.as_bytes());
+            let hash = project
+                .key
+                .strip_prefix("redacted-project.")
+                .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                .unwrap_or_else(|| digest.trim_start_matches("sha256:"));
+            format!(
+                "?g <{MEM}project> ?project . ?project <{RDFS_LABEL}> ?key . \
+                FILTER(?key = {} || SHA256(STR(?key)) = {})",
+                Literal::new_simple_literal(format!("redacted-project.{hash}")),
+                Literal::new_simple_literal(hash)
+            )
+        } else {
+            String::new()
+        };
         let q = format!(
-            "SELECT DISTINCT ?g WHERE {{ GRAPH ?g {{ ?g <{SPK}contentDigest> ?d }} FILTER(STRSTARTS(STR(?g), {})) }} LIMIT {}",
+            "SELECT DISTINCT ?g ?key WHERE {{ GRAPH ?g {{ ?g <{SPK}contentDigest> ?d . {selection} }} FILTER(STRSTARTS(STR(?g), {})) }} LIMIT {}",
             Literal::new_simple_literal(base),
             MAX_GRAPHS * 4
         );
         let mut graphs: Vec<NamedNode> = Vec::new();
         for row in r.rows(&q, Vec::new())? {
-            if let Some(Some(Term::NamedNode(g))) = row.into_iter().next() {
-                let rest = &g.as_str()[base.len().min(g.as_str().len())..];
-                // <principal>/<harness>/<project>/…
-                let mut parts = rest.splitn(4, '/');
-                let (_, _, p) = (parts.next(), parts.next(), parts.next());
-                if p == Some(encoded.as_str()) && graphs.len() < MAX_GRAPHS {
-                    graphs.push(g);
+            let [Some(Term::NamedNode(g)), key] = row.as_slice() else {
+                continue;
+            };
+            let recorded = match key {
+                Some(Term::Literal(label)) => Some(segment_of(label.value())),
+                _ => None,
+            };
+            let rest = &g.as_str()[base.len().min(g.as_str().len())..];
+            if rest.split('/').nth(2) == Some(recorded.as_deref().unwrap_or(&segment)) {
+                graphs.push(g.clone());
+                if graphs.len() == MAX_GRAPHS {
+                    break;
                 }
             }
         }

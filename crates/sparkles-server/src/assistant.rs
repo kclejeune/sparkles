@@ -15,9 +15,7 @@
 use crate::assist::{read_file, write_file};
 use crate::auth::Principal;
 use crate::http::{AdminBody, ApiResult, blocking, dataset, err, err_code};
-#[cfg(feature = "mcp")]
-use crate::models::Models;
-use crate::models::{Pair, Role};
+use crate::models::{Models, Pair, Role};
 use crate::settings::{Providers, Typed};
 use crate::state::{AppState, Dataset};
 use axum::extract::{Path, Query, State};
@@ -1626,17 +1624,47 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/$/models/usage", get(usage))
 }
 
-/// The settings, with a `status` that says whether asking works and why not.
+/// The extract role before send limits, filtered against the current provider allow-lists.
+pub(crate) fn configured_extract_pairs(models: &Models, s: &AssistantSettings) -> Vec<Pair> {
+    let mut pairs = s
+        .roles
+        .get(&Role::Extract)
+        .cloned()
+        .unwrap_or_else(|| models.pairs(Role::Extract));
+    pairs.retain(|p| {
+        models
+            .provider(&p.provider)
+            .is_some_and(|provider| provider.allows(&p.model))
+    });
+    pairs
+}
+
+/// The settings, with a `status` that says whether asking and ingestion work and which
+/// pairs they use.
 fn settings_json(st: &AppState, s: &AssistantSettings) -> Value {
     let mut v = serde_json::to_value(s).unwrap_or_default();
+    let models = st.models();
     let mut status = json!({
-        "models": st.models().is_some(),
+        "models": models.is_some(),
         "historyDays": s.history_days(st),
     });
+    if let Some(m) = &models {
+        status["modelRevision"] = m.revision.to_string().into();
+        let extract = configured_extract_pairs(m, s);
+        status["extract"] = serde_json::to_value(&extract).unwrap_or_default();
+        status["ingest"] = (s.enabled
+            && s.ingest
+            && extract
+                .iter()
+                .any(|p| s.send_to(&p.provider) >= Send::Documents))
+        .into();
+    } else {
+        status["ingest"] = false.into();
+    }
     match ask_status(st, s) {
         Ok(()) => {
             status["ask"] = true.into();
-            if let Some(m) = st.models() {
+            if let Some(m) = &models {
                 let mut draft = s
                     .roles
                     .get(&Role::Draft)

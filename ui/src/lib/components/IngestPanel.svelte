@@ -4,6 +4,8 @@
   // file gets a mapping draft, which a dry run and then an upload apply. A workbook gets one
   // draft for each sheet, and uploads the sheet as CSV.
   import Icon from './Icon.svelte';
+  import Modal from './Modal.svelte';
+  import ServerIngestStatus from './ServerIngestStatus.svelte';
   import { base } from '$app/paths';
   import * as api from '$lib/api';
   import { toasts } from '$lib/app.svelte';
@@ -28,6 +30,16 @@
   let mode = $state<review.IngestMode>('branch');
   let allowPartial = $state(false);
   let busy = $state(false);
+  let ingestStatus = $state({ on: false, known: false, loading: true });
+  type Upload = {
+    file: File;
+    mode: review.IngestMode;
+    partial: boolean;
+    extract?: boolean;
+  };
+  let lastUpload = $state<{ id: string; upload: Upload } | null>(null);
+  let storeOnly = $state<Upload | null>(null);
+  let statusPanel: ReturnType<typeof ServerIngestStatus> | undefined = $state();
   /** The task this panel follows. */
   let task = $state<review.IngestTask | null>(null);
   /** The mapping draft as editable JSON, and what its dry run said. */
@@ -88,6 +100,7 @@
         task = next;
       }
       if (draftOf(task?.result, 0)?.mapping) mappingText = mappingOf(task?.result);
+      if (task?.error?.code === 'no-model' && retryUpload?.extract) void statusPanel?.load();
     } catch (e) {
       if (!(e instanceof DOMException && e.name === 'AbortError'))
         toasts.error('Could not get the ingestion status', e);
@@ -97,14 +110,26 @@
     }
   }
 
-  async function start(partial = allowPartial) {
-    if (!file) return;
+  const isTableFile = (f: File | null) => f != null && /\.(csv|tsv|xlsx|ods)$/i.test(f.name);
+
+  function requestStart() {
+    if (!file || ingestStatus.loading) return;
+    const upload = { file, mode, partial: allowPartial };
+    if (isTableFile(file)) void start({ ...upload, extract: ingestStatus.on ? undefined : false });
+    else if (ingestStatus.on) void start({ ...upload, extract: true });
+    else storeOnly = upload;
+  }
+
+  async function start(upload: Upload) {
     busy = true;
+    storeOnly = null;
     try {
-      const t = await review.startIngest(ds, file, {
-        mode,
-        allowPartial: partial || undefined,
+      const t = await review.startIngest(ds, upload.file, {
+        mode: upload.mode,
+        allowPartial: upload.partial || undefined,
+        extract: upload.extract,
       });
+      lastUpload = { id: t.id, upload };
       void follow(t);
     } catch (e) {
       toasts.error('Could not start the ingestion', e);
@@ -125,13 +150,13 @@
           what === 'confirm'
             ? await review.confirmIngest(ds, task.id)
             : await review.approveIngest(ds, task.id);
-        if (what === 'approve') toasts.push('success', 'Wrote the facts to main');
+        if (what === 'approve') toasts.push('success', 'Wrote to main');
         void follow(t);
       }
     } catch (e) {
       toasts.error(
         what === 'approve'
-          ? 'Could not write the facts'
+          ? 'Could not write to main'
           : what === 'confirm'
             ? 'Could not continue the ingestion'
             : 'Could not cancel the ingestion',
@@ -176,12 +201,18 @@
   const pct = $derived(task ? Math.round(task.progress * 100) : 0);
   const r = $derived(task?.result);
   const err = $derived(task?.error);
+  const retryUpload = $derived(lastUpload?.id === task?.id ? lastUpload?.upload : undefined);
   /** The table to upload with the mapping: the file, or a workbook's sheet as CSV. */
   const tableFile = $derived.by(() => {
     if (r?.outcome !== 'mapping-drafts') return file;
     const d = r.sheets?.[sheet];
     return d?.csv ? new File([d.csv], `${d.sheet}.csv`, { type: 'text/csv' }) : null;
   });
+  const showRedactions = (counts: Record<string, number>) =>
+    Object.entries(counts)
+      .map(([detector, count]) => `${detector} (${count})`)
+      .join(', ');
+
   const label = (t: review.IngestTask) => t.input.name ?? t.input.url ?? t.id;
 </script>
 
@@ -189,12 +220,23 @@
   <section class="panel" aria-label="Ingest" hidden={!canWrite}>
     <div class="panel-head"><h2>Ingest a document</h2></div>
     <div class="panel-body ingest">
+      <ServerIngestStatus
+        bind:this={statusPanel}
+        {ds}
+        {canAdmin}
+        onstate={(s) => (ingestStatus = s)}
+      />
       <p class="faint small">
         Markdown, HTML, text{caps.pdf ? ', PDF' : ''}{caps.office
           ? ', Word, PowerPoint, OpenDocument'
-          : ''}, CSV, TSV{caps.office ? ' or Excel' : ''}. Documents are registered as sources, and
-        the model proposes facts from them. Tables and sheets get a draft mapping instead.{caps.pdf &&
-        !caps.ocr
+          : ''}, CSV, TSV{caps.office ? ' or Excel' : ''}.
+        {#if ingestStatus.known && ingestStatus.on}
+          Documents are registered as sources, and the model proposes facts from them.
+        {:else if ingestStatus.known}
+          Documents are registered as sources without extracting facts while server ingestion is
+          off.
+        {/if}
+        Tables and sheets get a draft mapping instead.{caps.pdf && !caps.ocr
           ? ' Scanned PDF pages are not read.'
           : ''}
       </p>
@@ -223,8 +265,10 @@
           <label><input type="checkbox" bind:checked={allowPartial} /> Skip unreadable pages</label>
         {/if}
         <span class="spacer"></span>
-        <button class="btn primary sm" disabled={!file || busy} onclick={() => start()}
-          >Ingest</button
+        <button
+          class="btn primary sm"
+          disabled={!file || busy || ingestStatus.loading}
+          onclick={requestStart}>Ingest</button
         >
       </div>
 
@@ -280,12 +324,22 @@
                 </ul>
               {/if}
             </div>
-            {#if err.code === 'needs-ocr' && file}
-              <div class="row">
-                <button class="btn sm" disabled={busy} onclick={() => start(true)}
-                  >Ingest the readable pages</button
+            {#if retryUpload}
+              {@const upload = retryUpload}
+              {#if err.code === 'needs-ocr'}
+                <div class="row">
+                  <button
+                    class="btn sm"
+                    disabled={busy}
+                    onclick={() => start({ ...upload, partial: true })}
+                    >Ingest the readable pages</button
+                  >
+                </div>
+              {:else if err.code === 'no-model' && upload.extract}
+                <button class="btn sm" disabled={busy} onclick={() => (storeOnly = upload)}
+                  >Store without facts…</button
                 >
-              </div>
+              {/if}
             {/if}
           {/if}
 
@@ -319,6 +373,11 @@
                 {(d.rows ?? 0) === 1 ? 'becomes' : 'become'}
                 {fmtCount(d.triples ?? 0, 'triple')}.
               </p>
+              {#if d.redactions && Object.keys(d.redactions).length}
+                <p class="msg">
+                  Redacted in the sample sent to the model: {showRedactions(d.redactions)}.
+                </p>
+              {/if}
               <label class="small"
                 >Mapping (CSVW)
                 <textarea class="input mono" rows="8" aria-label="Mapping" bind:value={mappingText}
@@ -383,6 +442,10 @@
             <p class="msg">
               {#if r.outcome === 'already-registered'}
                 This source is already registered. Nothing was written.
+              {:else if r.outcome === 'preview' && r.proposed == null}
+                Source preview. Approve to register it on main.
+              {:else if r.outcome === 'merged' && r.proposed == null}
+                Source registered on main.
               {:else if r.outcome === 'merged'}
                 {r.proposed} fact{r.proposed === 1 ? '' : 's'} merged into main.
               {:else if r.outcome === 'approved'}
@@ -403,9 +466,14 @@
               </p>
             {/if}
             {#if r.autoFallback}<p class="msg">Kept for review: {r.autoFallback}.</p>{/if}
+            {#if r.redactions && Object.keys(r.redactions).length}
+              <p class="msg">
+                Redacted before storage and extraction: {showRedactions(r.redactions)}.
+              </p>
+            {/if}
             {#each r.notes ?? [] as n (n)}<p class="msg">{n}</p>{/each}
             <div class="row">
-              {#if r.branch}
+              {#if r.branch && r.outcome !== 'merged'}
                 <a class="btn primary sm" href={reviewHref(base, ds, r.branch)}>Review proposals</a>
               {/if}
               {#if task.status === 'awaiting-approval'}
@@ -437,6 +505,44 @@
       {/if}
     </div>
   </section>
+
+  <Modal
+    bind:open={
+      () => storeOnly !== null,
+      (open) => {
+        if (!open) storeOnly = null;
+      }
+    }
+    title="Store this document as a source without facts?"
+    width={440}
+    closeDisabled={busy}
+  >
+    <p class="small">
+      {storeOnly?.extract
+        ? 'No model was available to extract facts from this document.'
+        : ingestStatus.known
+          ? 'Server ingestion is off for this dataset.'
+          : 'Server ingestion status is unavailable.'}
+      <code class="mono">{storeOnly?.file.name}</code>
+      {#if storeOnly?.mode === 'preview'}
+        will be previewed and stored on main after approval.
+      {:else if storeOnly?.mode === 'auto'}
+        will be stored on main when the merge checks pass, or kept on a review branch.
+      {:else}
+        will be stored on a review branch.
+      {/if}
+      No model will run.
+    </p>
+    {#snippet actions()}
+      <button class="btn sm" disabled={busy} onclick={() => (storeOnly = null)}>Cancel</button>
+      <button
+        class="btn primary sm"
+        disabled={busy}
+        onclick={() => storeOnly && start({ ...storeOnly, extract: false })}
+        >Store without facts</button
+      >
+    {/snippet}
+  </Modal>
 {/if}
 
 <style>

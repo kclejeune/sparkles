@@ -358,7 +358,7 @@ fn consolidate_inner(r: &mut Run, req: &ConsolidateRequest) -> Result<Value, Fai
         } else {
             None
         };
-        merge_if(r, &branch, &message, why, &mut out)?;
+        merge_if(r, &branch, &message, why, true, &mut out)?;
     }
     ctx.progress.status(Status::Writing, 0.99, None);
     Ok(out)

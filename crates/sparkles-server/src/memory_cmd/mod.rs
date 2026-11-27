@@ -108,6 +108,9 @@ pub struct ImportFlags {
     /// Extra redaction patterns: one `name regex` per line
     #[arg(long, value_name = "FILE")]
     pub redact_patterns: Option<PathBuf>,
+    /// Extra known secret values to redact: one value per line (at least 8 characters)
+    #[arg(long, value_name = "FILE")]
+    pub redact_known_values: Option<PathBuf>,
     /// Show what would be written without writing
     #[arg(long)]
     pub dry_run: bool,

@@ -4309,11 +4309,32 @@ the facts that cite the old text to the place their quote now occurs. A fact who
 quote is gone is retracted. A moved file changes only its path, and a deleted file's
 facts are retracted while its source keeps its text and the time it went. A file
 renamed with its body unchanged gets a new graph that `dcterms:replaces` the old one,
-and the facts an agent extracted from it move along. Secrets that the built-in
-patterns, the dataset's `secretPatterns` or `--redact-patterns FILE` recognize are
-replaced by `[redacted:NAME]` before anything leaves the machine, and the server
-refuses a text under the import base in which it still finds one (`secret-detected`).
-Redaction is pattern matching and cannot find every secret.
+and the facts an agent extracted from it move along. The import replaces matches with
+`[redacted:NAME]` in source text, titles and file paths before sending them. Built-in
+patterns and the dataset's `memory.redaction.patterns` always apply, including legacy
+`imports.secretPatterns`. Local patterns come from `--redact-patterns FILE` or
+`memory.toml`. The dataset can also enable entropy and personal data detectors and
+allow specific matches. See [Memory redaction](API.md#memory-redaction) for the settings.
+
+By default the CLI also matches exact values of local environment variables whose
+names contain `KEY`, `SECRET`, `TOKEN` or `PASSWORD`. Set `redaction.knownValues` to
+false in the dataset settings to turn off environment matching. To add local values
+explicitly, pass `--redact-known-values FILE` or set
+`known-values = ["path/to/values.txt"]` in `memory.toml`. Each file holds one value per
+line. Blank lines, comments beginning with `#` and values shorter than eight characters
+are skipped. Directory selectors include sources published under either the original or the
+redacted project key, including imports that used a per-run flag. Status and export
+use the caller's own imports. Status matches each source to its stored file path. It
+reports `ambiguous` when several files could own the source or the stored path cannot
+establish ownership. A redaction refusal can also leave ownership uncertain when the
+scanner cannot read a file or follow its instruction imports. If two sources export to the same path, select one
+with its explicit project key. When a file exceeds the redaction budget, sync keeps
+existing sources whose ownership or absence it cannot establish. The next complete
+sync checks the server again before recording deletions.
+
+A direct registration under the import base, or in any graph when
+`redaction.everywhere` is true, fails with `secret-detected` when the server detects a
+match. Redaction coverage depends on the configured detectors.
 
 The prose of a memory becomes facts when an agent extracts them. `sparkles memory
 sources --needs-extraction` lists the files whose current text no extraction has cited
@@ -4498,10 +4519,12 @@ rows go to the `summarize` providers for summaries, and the output says so. An o
 who wants no document text to leave the server locks `assistant.send` in the settings
 file, and `memory init` then reports the lock. On NixOS,
 [`services.sparkles.settings`](#declarative-dataset-settings) declares the settings
-file. In the web UI, a dataset admin turns them on in the dataset page's **Settings**
-tab, which [The Settings tab](#the-settings-tab) describes. The UI's **Ingest** section
-uploads documents and configures source retention and ingest profiles, but it does not
-turn on the assistant.
+file. In the web UI, the dataset's **Ingest** panel and the memory page's ingest
+settings show the active document recipients. A dataset admin can turn on ingestion
+after confirming the proposed changes and recipients. A changed proposal requires
+another confirmation. A setting from server config or a prior runtime change can
+block enablement, in which case the panel links to that field in **Settings**.
+Turning ingestion off changes only the `ingest` field.
 
 The server keeps the fields changed at runtime in `assistant.json` in a persistent
 dataset's database directory. With the
@@ -4534,8 +4557,20 @@ end the review branch, such as `ingest.standup-1`, with the number of facts prop
 of entities linked and created. The review page of that branch shows each fact next to
 its passage. A task whose estimate is above the dataset's `confirmTokens` waits for
 `POST /$/ingest/org/{task}/confirm`, and `mode=preview` holds the facts in the task
-until `POST /$/ingest/org/{task}/approve`. Without a model, or with `extract=false`, the
-task registers the text on the branch and proposes no facts.
+until `POST /$/ingest/org/{task}/approve`. When ingestion is off, the panel asks before
+sending `extract: false`. The selected mode still controls where the source is written.
+Branch mode writes to the review branch. Preview requires approval to write to main.
+Automatic mode merges the source into main when the merge checks pass.
+
+The server applies `memory.redaction.serverIngest` to converted text before it
+stores a source or contacts an extraction provider. The default `redact` replaces
+matches and reports counts by detector. `refuse` stops on a match and `off` passes
+the text through. Exact matching against the server's secret inventory applies to
+server-wide administrators and the local operator. Dataset principals use the
+configured patterns and other detectors. A stored rendition that needs redaction
+must be replaced before it can be used for extraction. Table mapping drafts report
+counts for the model's sample. The mapping preview and the subsequent table upload
+operate on the original rows.
 
 On the dataset page of the web UI, the **Ingest** section uploads a document with the
 same options, shows the task's progress, asks for the confirmation or the approval when
