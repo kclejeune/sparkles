@@ -1409,9 +1409,51 @@ fn native_path_search_1122_1123_forms_hold_exact_ledger() {
             ),
         ),
         (
+            "shortest const weighted maxLength",
+            format!(
+                "{P}SELECT ?i ?c {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target <urn:d:8> ; path:predicate <urn:d> ; path:weight <urn:w> ; path:maxLength 16 ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
+            "shortest variable target weighted maxLength",
+            format!(
+                "{P}SELECT ?t ?c ?l {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target ?t ; path:predicate <urn:d> ; path:weight <urn:w> ; path:maxLength 6 ; path:cost ?c ; path:length ?l }} }}"
+            ),
+        ),
+        (
+            "shortest variable source weighted maxLength",
+            format!(
+                "{P}SELECT ?s ?c ?l {{ SERVICE path:search {{ [] path:source ?s ; path:target <urn:d:8> ; path:predicate <urn:d> ; path:weight <urn:w> ; path:maxLength 6 ; path:cost ?c ; path:length ?l }} }}"
+            ),
+        ),
+        (
+            "kShortest const weighted maxLength",
+            format!(
+                "{P}SELECT ?p ?i ?c {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target <urn:d:3> ; path:predicate <urn:d> ; path:algorithm path:kShortest ; path:k 6 ; path:weight <urn:w> ; path:maxLength 6 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
             "allShortest wide-weight fallback",
             format!(
                 "{P}SELECT ?p ?i ?c {{ SERVICE path:search {{ [] path:source <urn:w:0> ; path:target <urn:w:2> ; path:predicate <urn:we> ; path:algorithm path:allShortest ; path:weight <urn:w> ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
+            "shortest const weighted maxLength wide-weight fallback",
+            format!(
+                "{P}SELECT ?i ?c {{ SERVICE path:search {{ [] path:source <urn:w:0> ; path:target <urn:w:2> ; path:predicate <urn:we> ; path:weight <urn:w> ; path:maxLength 3 ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
+            "allShortest const weighted maxLength wide-weight fallback",
+            format!(
+                "{P}SELECT ?p ?i ?c {{ SERVICE path:search {{ [] path:source <urn:w:0> ; path:target <urn:w:2> ; path:predicate <urn:we> ; path:algorithm path:allShortest ; path:weight <urn:w> ; path:maxLength 3 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
+            "shortest variable source weighted maxLength wide-weight fallback",
+            format!(
+                "{P}SELECT ?s ?i ?c {{ SERVICE path:search {{ [] path:source ?s ; path:target <urn:w:2> ; path:predicate <urn:we> ; path:weight <urn:w> ; path:maxLength 3 ; path:edgeIndex ?i ; path:cost ?c }} }}"
             ),
         ),
         (
@@ -1501,6 +1543,24 @@ fn native_path_search_1122_1123_forms_hold_exact_ledger() {
         }
     }
     assert!(found.is_empty(), "{}", found.join("\n"));
+
+    // Eager bounded high-reifier weight lookup (`path:limit`) reduces reifiers in place
+    // without allocating `Vec<Key>` or `Vec<u64>` proportional to the 2,000 reifiers.
+    let eager_reifier_q = format!(
+        "{P}SELECT ?c {{ SERVICE path:search {{ [] path:source <urn:mr:0> ; path:target <urn:mr:1> ; path:predicate <urn:mre> ; path:weight <urn:w> ; path:maxLength 2 ; path:limit 10 ; path:cost ?c }} }}"
+    );
+    let snap = s.snapshot();
+    let opts = QueryOptions {
+        no_cache: true,
+        ..Default::default()
+    };
+    let _ = sparkles_core::sparql::query(snap.clone(), &eager_reifier_q, &opts).unwrap();
+    let (_, eager_peak) =
+        heap::peak(|| sparkles_core::sparql::query(snap.clone(), &eager_reifier_q, &opts).unwrap());
+    assert!(
+        eager_peak < 64 * 1024,
+        "eager bounded high-reifier weight lookup allocated {eager_peak} bytes (expected O(1) scratch < 64 KiB)"
+    );
 }
 
 #[test]

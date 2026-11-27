@@ -7674,7 +7674,7 @@ described under "Edges from a pattern" below.
   node the source reaches, and one with a target and no source gets the paths from every
   node that reaches the target. A search whose source and target are both unbound fails
   with `400`. `path:kShortest` needs both ends bound, and so does a weighted search with
-  `path:maxLength` in the shortest modes.
+  `path:maxLength` in `path:allShortest`.
 * **Weights.** `path:weight ex:km` reads the weight of the edge `(s p o)` from the
   reifiers of the triple term `<<( s p o )>>`, which is what the Turtle annotation
   `ex:a ex:road ex:b {| ex:km 12 |}` writes. The smallest value counts when there are
@@ -7682,6 +7682,9 @@ described under "Edges from a pattern" below.
   modes then use Dijkstra's algorithm and `path:kShortest` uses Yen's algorithm with
   Dijkstra's. The cheapest path of one pair, every cheapest path of one pair, the cheapest
   cycles through a node and Yen's spur searches between two nodes run from both ends.
+  With `path:maxLength`, weighted `path:shortest` and Yen's weighted spurs search over
+  `(node, length)` pairs and prune labels dominated in both cost and length instead of
+  enumerating longer paths.
   Weights are added with about twice the precision of a double, so two paths whose
   weights have equal sums tie whatever order the weights come in, as long as the weights
   lie within a factor of 2^28 of each other. With weights further apart, the sums are

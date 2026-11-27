@@ -27,8 +27,8 @@
 //!
 //! The searches: bidirectional breadth-first search for one unweighted pair, one
 //! breadth-first search per source (or per target) for several or unbound ends,
-//! Dijkstra's algorithm with weights, from both ends for the cheapest path of one pair and
-//! for the spur searches of Yen's algorithm for the k shortest paths, and a
+//! Dijkstra's algorithm with weights (from both ends for one pair and for Yen's spurs,
+//! and Pareto-pruned over `(node, length)` pairs when `path:maxLength` is set), and a
 //! depth-first enumeration pruned by the distance to the targets for all paths.
 
 use super::ctx::{Charge, Ctx};
@@ -172,6 +172,24 @@ impl PathSearchSpec {
 
     fn weighted(&self) -> bool {
         self.weight.is_some()
+    }
+
+    fn fixed_weight(&self) -> Option<f64> {
+        match (self.weight, self.reifies) {
+            (None, _) => Some(1.0),
+            (Some(Some(_)), Some(_)) => None,
+            _ => Some(self.default_weight),
+        }
+    }
+
+    fn track_reverse_wide(&self, forward: bool, max_len: u32) -> bool {
+        // Equal weights have a ratio of one. Leave headroom for the overflow check
+        // when a fixed weight is large enough to approach the limit of Cost.
+        !forward
+            && max_len > 1
+            && self
+                .fixed_weight()
+                .is_none_or(|w| w > (f64::MAX / 2.0) / f64::from(max_len))
     }
 }
 
@@ -1246,6 +1264,703 @@ fn without_loops(s: u64, edges: Vec<Edge>) -> Vec<Edge> {
     out
 }
 
+/// Locate where `(len, cost)` belongs in a Pareto frontier sorted by strictly increasing
+/// `len` and strictly decreasing `cost`. Returns `None` when an existing label has
+/// `l <= len` and `c <= cost`, `Some((pos, true))` to replace `v[pos]` (same length,
+/// strictly cheaper), or `Some((pos, false))` to insert at `pos`.
+fn pareto_locate(v: &[(u32, Cost)], len: u32, cost: Cost) -> Option<(usize, bool)> {
+    let pos = v.partition_point(|&(l, _)| l < len);
+    if pos > 0 && v[pos - 1].1 <= cost {
+        return None;
+    }
+    if pos < v.len() && v[pos].0 == len {
+        return (cost < v[pos].1).then_some((pos, true));
+    }
+    Some((pos, false))
+}
+
+/// Insert `(len, cost)` into a Pareto frontier, pruning any longer labels with cost
+/// `>= cost`. Returns `true` when the label is not dominated and was kept.
+#[cfg(test)]
+fn pareto_insert(v: &mut Vec<(u32, Cost)>, len: u32, cost: Cost) -> bool {
+    let Some((pos, replace)) = pareto_locate(v, len, cost) else {
+        return false;
+    };
+    if replace {
+        v[pos].1 = cost;
+        let mut end = pos + 1;
+        while end < v.len() && v[end].1 >= cost {
+            end += 1;
+        }
+        if end > pos + 1 {
+            v.drain(pos + 1..end);
+        }
+        return true;
+    }
+    let mut end = pos;
+    while end < v.len() && v[end].1 >= cost {
+        end += 1;
+    }
+    if end > pos {
+        v[pos] = (len, cost);
+        if end > pos + 1 {
+            v.drain(pos + 1..end);
+        }
+    } else {
+        v.insert(pos, (len, cost));
+    }
+    true
+}
+
+/// The cheapest label in a Pareto frontier with length `<= max_l`. Because lengths
+/// strictly increase and costs strictly decrease, this is the last entry with `l <= max_l`.
+#[inline]
+fn pareto_best_within(v: &[(u32, Cost)], max_l: u32) -> Option<(u32, Cost)> {
+    let pos = v.partition_point(|&(l, _)| l <= max_l);
+    (pos > 0).then(|| v[pos - 1])
+}
+
+#[inline]
+fn opt_cost_min(a: Option<Cost>, b: Option<Cost>) -> Option<Cost> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+#[inline]
+fn opt_cost_add(a: Option<Cost>, b: Option<Cost>) -> Option<Cost> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.add(y)),
+        _ => None,
+    }
+}
+
+/// Accumulated prefix cost and positive weight bounds carried into a length-bounded
+/// pair or Yen spur search so wide-weight detection and source-order fallback match the
+/// full path from the original source.
+#[derive(Clone, Copy)]
+struct PrefixCost {
+    cost: Cost,
+    wmin: f64,
+    wmax: f64,
+    total_max_len: u32,
+}
+
+impl PrefixCost {
+    const fn zero(total_max_len: u32) -> Self {
+        Self {
+            cost: Cost::ZERO,
+            wmin: f64::INFINITY,
+            wmax: 0.0,
+            total_max_len,
+        }
+    }
+}
+
+/// Outcome of a one-ended length-bounded weighted search: either a Pareto-pruned parent
+/// tree or, for a reverse search where wide weights or overflow occurred alongside at least
+/// one branch, the reverse tree together with minimum backward edge distances and
+/// recorded branch hops for checking competing routes as rows are requested. Unique-route sources
+/// reconstruct directly while sources with a competing route within `max_len` re-solve
+/// in source order.
+enum BoundedTreeOutcome {
+    Tree(ChargedBoundedTree),
+    ReverseWide {
+        order: Vec<(u64, u32)>,
+        parent: HbMap<(u64, u32), Parent>,
+        bwd_dist: HbMap<u64, u32>,
+        alternatives: ReverseAlternatives,
+    },
+}
+
+/// Whether the ratio of positive edge weights or the budget `max_len` can make
+/// double-double `Cost::add` round differently across bidirectional split points.
+#[inline]
+fn bounded_weights_too_wide(max_len: u32, wmin: f64, wmax: f64) -> bool {
+    if max_len <= 1 || wmax <= 0.0 || !wmin.is_finite() {
+        return false;
+    }
+    let ratio = wmax / wmin;
+    ratio > WIDE_WEIGHTS || (max_len as f64) * ratio > ((1u64 << 51) as f64)
+}
+
+/// Outgoing hops collected from the first reverse expansion of each destination.
+/// A node with only one hop already has it in the reverse tree. At a branch, retain
+/// each distinct edge's destination, including repeated destinations for parallel edges.
+#[derive(Default)]
+struct ReverseAlternatives {
+    branches: HbMap<u64, ReverseBranch>,
+    bytes: u64,
+}
+
+struct ReverseBranch {
+    hops: Vec<u64>,
+    /// Filled on first use. A cached None means no competing route fits the query.
+    competing: std::cell::OnceCell<Option<u32>>,
+}
+
+impl ReverseAlternatives {
+    fn record<C: ByteCharge>(
+        &mut self,
+        y: u64,
+        u: u64,
+        first_hop: Option<u64>,
+        charge: &mut C,
+        base: u64,
+    ) -> Result<()> {
+        let Some(first_hop) = first_hop else {
+            return Ok(());
+        };
+        let next_base = if let Some(branch) = self.branches.get_mut(&y) {
+            push_vec(&mut branch.hops, u, charge, base)?
+        } else {
+            let mut hops = Vec::new();
+            let next_base = push_vec(&mut hops, first_hop, charge, base)?;
+            let next_base = push_vec(&mut hops, u, charge, next_base)?;
+            let branch = ReverseBranch {
+                hops,
+                competing: Default::default(),
+            };
+            insert_hb_map(&mut self.branches, y, branch, charge, next_base)?.1
+        };
+        self.bytes = self.bytes.saturating_add(next_base.saturating_sub(base));
+        Ok(())
+    }
+
+    /// Compute a branch's competing length only when a requested path passes through it.
+    /// Cache the length against the whole query budget, since later paths can arrive at
+    /// the same branch with a different remaining budget.
+    fn chain_has_multi<C>(
+        &self,
+        ctx: &Ctx,
+        tree: &mut ReverseHopTree<'_, C>,
+        mut node: u64,
+        mut length: u32,
+        max_len: u32,
+    ) -> Result<bool> {
+        ctx.check()?;
+        let mut steps = 0usize;
+        let mut poll = || {
+            #[cfg(test)]
+            test_hooks::REVERSE_SUFFIX_STEPS.with(|count| count.set(count.get() + 1));
+            steps += 1;
+            if steps.is_multiple_of(4096) {
+                #[cfg(any(test, feature = "failpoints"))]
+                test_hooks::fire_traversal_poll();
+                ctx.check()?;
+            }
+            Ok(())
+        };
+        let mut remaining = max_len;
+        while length > 0 {
+            poll()?;
+            if let Some(branch) = self.branches.get(&node) {
+                let competing = match branch.competing.get() {
+                    Some(&cached) => cached,
+                    None => {
+                        let len =
+                            self.competing_length(ctx, tree, node, branch, max_len, &mut poll)?;
+                        branch.competing.set(len).expect("branch resolved once");
+                        len
+                    }
+                };
+                if competing.is_some_and(|len| len <= remaining) {
+                    return Ok(true);
+                }
+            }
+            node = tree.parent[&(node, length)].node;
+            length -= 1;
+            remaining -= 1;
+        }
+        Ok(false)
+    }
+
+    fn competing_length<C>(
+        &self,
+        ctx: &Ctx,
+        tree: &mut ReverseHopTree<'_, C>,
+        source: u64,
+        branch: &ReverseBranch,
+        max_len: u32,
+        poll: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Option<u32>> {
+        let depth = tree.dist[&source];
+        let mut shortest = None;
+        let mut second = None;
+        let parents = tree.parent;
+        // A shortest-hop suffix descends one level per step. Only a larger
+        // depth gap needs the ancestry index to tell whether it revisits source.
+        let cheap_certificate = |v, suffix| {
+            if source == VIRT || suffix <= depth {
+                Some(true)
+            } else if suffix - 1 == depth {
+                Some(parents[&(v, suffix)].node != source)
+            } else {
+                None
+            }
+        };
+        let mut unresolved_min: Option<u32> = None;
+        let mut first_deep = None;
+        for (i, &u) in branch.hops.iter().enumerate() {
+            poll()?;
+            let suffix = tree.dist[&u];
+            let len = suffix + 1;
+            if len > max_len || second.is_some_and(|best| best <= len) {
+                continue;
+            }
+            match cheap_certificate(u, suffix) {
+                Some(true) => {
+                    if shortest.is_none_or(|best| len < best) {
+                        second = shortest;
+                        shortest = Some(len);
+                    } else {
+                        second = Some(len);
+                    }
+                }
+                Some(false) => {
+                    if self.branches.contains_key(&u) {
+                        // Every returning child is one level below source.
+                        unresolved_min = Some(len);
+                    }
+                }
+                None => {
+                    first_deep.get_or_insert(i);
+                }
+            }
+        }
+
+        // Two cheap certificates beat every deferred hop, regardless of hop
+        // order. Otherwise the real source's minimum-hop parent already gives
+        // the shortest route, so a certified deep hop competes for second.
+        // A returning child has a smaller lower bound than every deep hop.
+        // When present, let the walk explore it before checking intervals.
+        if let Some(start) = first_deep.filter(|_| second.is_none() && unresolved_min.is_none()) {
+            for &u in &branch.hops[start..] {
+                poll()?;
+                let suffix = tree.dist[&u];
+                let len = suffix + 1;
+                if suffix.saturating_sub(depth) <= 1
+                    || len > max_len
+                    || second.is_some_and(|best| best <= len)
+                {
+                    continue;
+                }
+                if tree.suffix_avoids(ctx, u, source, poll)? {
+                    second = Some(len);
+                } else {
+                    unresolved_min = Some(unresolved_min.map_or(len, |old| old.min(len)));
+                }
+            }
+        }
+        let Some(lower_bound) = unresolved_min else {
+            return Ok(second);
+        };
+        if second.is_some_and(|len| len <= lower_bound) {
+            return Ok(second);
+        }
+
+        // The shortest first edge leads to a shallower node. Search the other
+        // edges that can improve the threshold, forbidding the source. Cutting
+        // loops from a completed suffix preserves its distinct first edge.
+        let mut scratch = ctx.charge(0)?;
+        // A prefix plus its minimum suffix is a lower bound for every exit
+        // reachable through it. This bound never decreases along an edge.
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        enum Work {
+            Visit,
+            TreeChildren,
+            IndexedReturns,
+            CheckIntervals,
+        }
+        let mut queue = BinaryHeap::new();
+        let mut intervals = BinaryHeap::new();
+        // Visits run first. Groups at the same bound take turns dispatching them.
+        // Different suffix depths need separate return groups even at one node.
+        let mut return_runs = Vec::new();
+        let mut dispatched_visit = None;
+        let mut next_runs = HbMap::default();
+        let mut turn = 0u64;
+        let mut tie_budget = tree.dist.len();
+        let mut prefixes = HbMap::default();
+        let mut base = push_heap(
+            &mut queue,
+            Reverse((depth, (0, 0), Work::Visit, source, 0u32, (0, usize::MAX))),
+            &mut scratch,
+            0,
+        )?;
+        loop {
+            let mut charged_scan = false;
+            let ready = dispatched_visit.as_ref().or_else(|| queue.peek());
+            let take_ready = match (ready, intervals.peek()) {
+                (
+                    Some(Reverse((bound, _, work, u, _, (start, end)))),
+                    Some(Reverse((check, _, _, _, _, _))),
+                ) if bound == check => {
+                    // Below a child of this depth even the shallowest neighbor
+                    // needs intervals. Otherwise allow cheap scans up to the
+                    // cost of one index, counting the pop and its whole slice.
+                    let can_exit =
+                        *work != Work::TreeChildren || tree.dist[u].saturating_sub(depth) < 2;
+                    let hops = self.branches.get(u).map_or(1, |b| b.hops.len());
+                    let pop_cost = usize::from(dispatched_visit.is_none());
+                    if tree.ancestry.is_none()
+                        && can_exit
+                        && let Some(left) =
+                            tie_budget.checked_sub(pop_cost + (hops.min(*end) - start))
+                    {
+                        tie_budget = left;
+                        charged_scan = true;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                (Some(Reverse((bound, ..))), Some(Reverse((check, ..)))) => bound < check,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            let next = if take_ready {
+                dispatched_visit.take().or_else(|| queue.pop())
+            } else {
+                if let Some(visit) = dispatched_visit.take() {
+                    // The interval can schedule other work before this visit.
+                    base = push_heap(&mut queue, visit, &mut scratch, base)?;
+                }
+                intervals.pop()
+            };
+            let Some(Reverse((bound, _, work, u, prefix, (start, end)))) = next else {
+                break;
+            };
+            poll()?;
+            if second.is_some_and(|len| len <= bound) {
+                break;
+            }
+            if prefixes.get(&u).is_some_and(|&best| best < prefix) {
+                continue;
+            }
+            let parent = parents[&(u, tree.dist[&u])].node;
+            let hops = self
+                .branches
+                .get(&u)
+                .map_or(std::slice::from_ref(&parent), |b| b.hops.as_slice());
+            let next_prefix = prefix + 1;
+            // Keep the first and last possible hop of each group. Recheck
+            // the bound and the shortest known prefix when dispatching it.
+            let mut children = None;
+            let mut deferred = None;
+            let mut indexed_returns: Option<(u32, usize, usize)> = None;
+            let record_group = |group: &mut Option<(u32, usize, usize)>, lower: u32, offset| {
+                let (min, _, end) = group.get_or_insert((lower, offset, offset + 1));
+                *min = (*min).min(lower);
+                *end = offset + 1;
+            };
+            for (offset, &v) in hops.iter().enumerate().take(end).skip(start) {
+                poll()?;
+                if v == source {
+                    continue;
+                }
+                let suffix = tree.dist[&v];
+                let Some(lower) = next_prefix.checked_add(suffix) else {
+                    continue;
+                };
+                if lower > max_len || second.is_some_and(|len| len <= lower) {
+                    continue;
+                }
+                let cheap = cheap_certificate(v, suffix);
+                let child = cheap.is_none() && parents[&(v, suffix)].node == u;
+                let needs_index = cheap.is_none() && !child && v != parent;
+                let avoids = match work {
+                    Work::Visit if child => {
+                        record_group(&mut children, lower, offset);
+                        continue;
+                    }
+                    Work::Visit if needs_index && tree.ancestry.is_none() => {
+                        record_group(&mut deferred, lower, offset);
+                        continue;
+                    }
+                    Work::Visit | Work::CheckIntervals if needs_index => {
+                        if tree.suffix_avoids(ctx, v, source, poll)? {
+                            true
+                        } else {
+                            // A later exit in this slice may prune all returns.
+                            if let Some(run) = indexed_returns
+                                && run.0 != lower
+                            {
+                                base = push_vec(&mut return_runs, run, &mut scratch, base)?;
+                                indexed_returns = None;
+                            }
+                            record_group(&mut indexed_returns, lower, offset);
+                            continue;
+                        }
+                    }
+                    Work::Visit => cheap.unwrap_or(false),
+                    Work::TreeChildren if child => false,
+                    // Every indexed exit in this slice already set or tied
+                    // the threshold. Only returning hops survive the bound.
+                    Work::IndexedReturns if needs_index && lower == bound => false,
+                    _ => continue,
+                };
+                if avoids {
+                    // Shallow first edges were counted by the initial scan.
+                    if u != source || needs_index {
+                        if lower == bound || lower == lower_bound {
+                            return Ok(Some(lower));
+                        }
+                        second = Some(lower);
+                    }
+                } else if (cheap != Some(false) || self.branches.contains_key(&v))
+                    && prefixes.get(&v).is_none_or(|&best| next_prefix < best)
+                {
+                    #[cfg(test)]
+                    test_hooks::REVERSE_WALK_ENQUEUES.with(|count| count.set(count.get() + 1));
+                    (_, base) = insert_hb_map(&mut prefixes, v, next_prefix, &mut scratch, base)?;
+                    let visit =
+                        Reverse((lower, (0, 0), Work::Visit, v, next_prefix, (0, usize::MAX)));
+                    if charged_scan && work == Work::TreeChildren && offset + 1 < end {
+                        // All tree children have the group's bound. Its visit
+                        // precedes every ready group, including the continuation.
+                        // Hand it directly to the next turn to save a heap pop.
+                        dispatched_visit = Some(visit);
+                    } else {
+                        base = push_heap(&mut queue, visit, &mut scratch, base)?;
+                    }
+                    let remainder = match work {
+                        Work::TreeChildren => &mut children,
+                        Work::IndexedReturns => &mut indexed_returns,
+                        _ => continue,
+                    };
+                    if offset + 1 < end {
+                        if charged_scan {
+                            // Admission reserved the full slice. Its continuation
+                            // will reserve the unscanned hops on its own turn.
+                            tie_budget += end - (offset + 1);
+                        }
+                        *remainder = Some((bound, offset + 1, end));
+                    }
+                    break;
+                }
+            }
+            if work == Work::IndexedReturns
+                && indexed_returns.is_none()
+                && let Some((start, end)) = next_runs.remove(&(u, prefix, end))
+            {
+                indexed_returns = Some((bound, start, end));
+            }
+
+            // Reverse settlement order can interleave suffix depths. Link
+            // disjoint runs of the same bound so only one is ready at a time
+            // and resuming it never rescans runs belonging to other depths.
+            // Size the table for this scan. Enumerating later groups must not
+            // traverse the spare capacity left by an earlier high-degree node.
+            let mut runs_by_bound = HbMap::default();
+            if !return_runs.is_empty() {
+                for (lower, start, end) in return_runs.drain(..).chain(indexed_returns.take()) {
+                    poll()?;
+                    if second.is_some_and(|len| len <= lower) {
+                        continue;
+                    }
+                    if let Some((_, last_end)) = runs_by_bound.get_mut(&lower) {
+                        (_, base) = insert_hb_map(
+                            &mut next_runs,
+                            (u, prefix, *last_end),
+                            (start, end),
+                            &mut scratch,
+                            base,
+                        )?;
+                        *last_end = end;
+                    } else {
+                        (_, base) = insert_hb_map(
+                            &mut runs_by_bound,
+                            lower,
+                            (start..end, end),
+                            &mut scratch,
+                            base,
+                        )?;
+                    }
+                }
+            }
+            // Start the narrower of two new slices first. In particular, a
+            // singleton can expose its exit before a tied clique grows the heap.
+            turn = turn.saturating_add(1);
+            let groups = [
+                (Work::TreeChildren, children),
+                (Work::IndexedReturns, indexed_returns),
+                (Work::CheckIntervals, deferred),
+            ];
+            let mixed_bounds = !runs_by_bound.is_empty();
+            #[cfg(test)]
+            test_hooks::REVERSE_BOUND_SLOTS
+                .with(|count| count.set(count.get() + runs_by_bound.capacity()));
+            let bound_bytes = map_bytes(&runs_by_bound);
+            let other_groups = runs_by_bound
+                .into_iter()
+                .map(|(lower, (run, _))| (Work::IndexedReturns, Some((lower, run.start, run.end))));
+            for (kind, group) in groups.into_iter().chain(other_groups) {
+                if let Some((lower, start, end)) = group
+                    && second.is_none_or(|len| lower < len)
+                {
+                    if mixed_bounds {
+                        poll()?;
+                    }
+                    base = push_heap(
+                        if kind == Work::CheckIntervals {
+                            &mut intervals
+                        } else {
+                            &mut queue
+                        },
+                        Reverse((lower, (turn, end - start), kind, u, prefix, (start, end))),
+                        &mut scratch,
+                        base,
+                    )?;
+                }
+            }
+            if mixed_bounds {
+                base -= bound_bytes;
+                scratch.resize(base)?;
+            }
+        }
+        Ok(second)
+    }
+}
+
+struct ReverseHopTree<'a, C> {
+    parent: &'a HbMap<(u64, u32), Parent>,
+    dist: &'a HbMap<u64, u32>,
+    ancestry: &'a mut Option<ReverseAncestry<C>>,
+    charge_index: &'a dyn Fn(u64) -> Result<C>,
+}
+
+struct ReverseAncestry<C> {
+    intervals: HbMap<u64, std::ops::Range<usize>>,
+    _charge: C,
+}
+
+impl<C> ReverseAncestry<C> {
+    fn avoids(&self, node: u64, source: u64) -> bool {
+        !self.intervals[&source].contains(&self.intervals[&node].start)
+    }
+}
+
+impl<C> ReverseHopTree<'_, C> {
+    fn suffix_avoids(
+        &mut self,
+        ctx: &Ctx,
+        node: u64,
+        source: u64,
+        poll: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        if let Some(index) = self.ancestry.as_ref() {
+            return Ok(index.avoids(node, source));
+        }
+
+        #[cfg(test)]
+        test_hooks::REVERSE_ANCESTRY_BUILDS.with(|count| count.set(count.get() + 1));
+
+        // Thread the real children into sibling lists. The virtual endpoint
+        // cannot appear on a suffix. Its label need not be a minimum-hop label.
+        let count = self.dist.len() - usize::from(self.dist.contains_key(&VIRT));
+        let scratch = super::charged::table_bound(count, size_of::<(u64, [u64; 2])>());
+        let _scratch = ctx.charge(scratch)?;
+        let mut links = HbMap::with_capacity_and_hasher(count, Default::default());
+        let mut root = VIRT;
+        for (&child, &depth) in self.dist {
+            poll()?;
+            if depth == 0 {
+                root = child;
+            } else if child != VIRT {
+                let parent = self.parent[&(child, depth)].node;
+                let [first_child, _] = links.entry(parent).or_insert([VIRT; 2]);
+                let sibling = std::mem::replace(first_child, child);
+                links.entry(child).or_insert([VIRT; 2])[1] = sibling;
+            }
+        }
+
+        // A preorder gives each subtree a contiguous half-open interval.
+        // Traverse iteratively so that depth is limited only by the query.
+        let bytes = super::charged::table_bound(count, size_of::<(u64, std::ops::Range<usize>)>());
+        let charge = (self.charge_index)(bytes)?;
+        let mut intervals = HbMap::with_capacity_and_hasher(count, Default::default());
+        let mut cur = root;
+        'visit: loop {
+            poll()?;
+            let start = intervals.len();
+            intervals.insert(cur, start..start);
+            let child = links[&cur][0];
+            if child != VIRT {
+                cur = child;
+                continue;
+            }
+            loop {
+                poll()?;
+                let end = intervals.len();
+                intervals.get_mut(&cur).unwrap().end = end;
+                if cur == root {
+                    break 'visit;
+                }
+                let sibling = links[&cur][1];
+                if sibling != VIRT {
+                    cur = sibling;
+                    continue 'visit;
+                }
+                cur = self.parent[&(cur, self.dist[&cur])].node;
+            }
+        }
+        let index = self.ancestry.insert(ReverseAncestry {
+            intervals,
+            _charge: charge,
+        });
+        Ok(index.avoids(node, source))
+    }
+}
+
+/// Reconstruct a single path of `len` edges from `(m, len)` back to `(root, 0)` in a
+/// length-indexed parent map, mapping `VIRT` back to `root`.
+fn reconstruct_bounded(
+    ctx: &Ctx,
+    root: u64,
+    forward: bool,
+    parent: &HbMap<(u64, u32), Parent>,
+    m: u64,
+    len: u32,
+) -> Result<Vec<Edge>> {
+    let real = |x: u64| if x == VIRT { root } else { x };
+    let mut edges = Vec::with_capacity(len as usize);
+    let mut cur = m;
+    let mut l = len;
+    let mut steps = 0usize;
+    while l > 0 {
+        steps += 1;
+        if steps.is_multiple_of(4096) {
+            ctx.check()?;
+        }
+        let q = parent[&(cur, l)];
+        let e = if forward {
+            Edge {
+                from: q.node,
+                to: cur,
+                p: q.p,
+                rev: q.rev,
+            }
+        } else {
+            Edge {
+                from: cur,
+                to: q.node,
+                p: q.p,
+                rev: q.rev,
+            }
+        };
+        edges.push(e.map(real));
+        cur = q.node;
+        l -= 1;
+    }
+    if forward {
+        edges.reverse();
+    }
+    Ok(edges)
+}
+
 /// One index range that holds edges: `perm` with the predicate fixed or not, or the
 /// edges of a nested pattern (`pattern`).
 #[derive(Clone, Copy)]
@@ -1339,6 +2054,10 @@ struct Bans<'b> {
 
 /// The neighbours of each node (and direction) a search looked up.
 type Neighbours = FxHashMap<(u64, bool), Rc<[Step]>>;
+/// Min-heap of `(cost, len, node)` labels for Pareto-pruned bounded search.
+type BoundedHeap = BinaryHeap<Reverse<(Cost, u32, u64)>>;
+/// One spur path returned by `Engine::spur`, with its cost and optional search-scoped charge.
+type SpurPath<'a> = (Vec<Edge>, f64, Option<Charge<'a>>);
 
 /// A path found: its ends, edges and cost.
 struct Found {
@@ -1659,6 +2378,14 @@ impl<'a> Engine<'a> {
 
     /// Count `n` more visited nodes against `path:maxVisited` and the memory budget.
     fn visit(&self, n: u64) -> Result<()> {
+        self.visit_count(n)?;
+        self.charge.add(n * NODE_BYTES)
+    }
+
+    /// Count `n` more visited nodes against `path:maxVisited` without charging the
+    /// call-wide estimate (for searches that pre-admit their working set on a
+    /// search-scoped `Charge`).
+    fn visit_count(&self, n: u64) -> Result<()> {
         let v = self.visited.get() + n;
         self.visited.set(v);
         self.visited_total.set(self.visited_total.get() + n);
@@ -1668,7 +2395,7 @@ impl<'a> Engine<'a> {
                 self.spec.max_visited
             )));
         }
-        self.charge.add(n * NODE_BYTES)
+        Ok(())
     }
 
     /// The neighbours of every node of a sorted, duplicate-free frontier, as
@@ -1729,6 +2456,104 @@ impl<'a> Engine<'a> {
                 out.truncate(w);
             }
         }
+        self.ctx.check()
+    }
+
+    /// Expand one node with pre-admitted growth of `out` on `work`.
+    fn expand_one_charged(
+        &self,
+        x: u64,
+        succ: bool,
+        out: &mut Vec<(u64, Step)>,
+        work: &mut Charge<'a>,
+        outer_bytes: u64,
+    ) -> Result<()> {
+        if self.spec.max_degree.is_some() || self.sinks {
+            if self.sink(x, succ) {
+                return Ok(());
+            }
+            if self.blocked(x)? {
+                self.skipped_hubs.set(self.skipped_hubs.get() + 1);
+                return Ok(());
+            }
+        }
+        self.expand_one_all_charged(x, succ, out, work, outer_bytes)
+    }
+
+    /// [`expand_one_charged`](Self::expand_one_charged) without hub or literal filtering.
+    fn expand_one_all_charged(
+        &self,
+        x: u64,
+        succ: bool,
+        out: &mut Vec<(u64, Step)>,
+        work: &mut Charge<'a>,
+        outer_bytes: u64,
+    ) -> Result<()> {
+        let sides = if succ { &self.succ } else { &self.pred };
+        let mut sweeps = self.sweeps.get();
+        for s in sides {
+            let start = out.len();
+            if s.lane.pattern {
+                let map = if s.lane.subject_side {
+                    &self.pattern.by_start
+                } else {
+                    &self.pattern.by_end
+                };
+                let mut cur_base =
+                    outer_bytes.saturating_add(vec_bytes::<(u64, Step)>(out.capacity()));
+                let mut scanned = 0usize;
+                for &node in map.get(&x).map_or(&[][..], Vec::as_slice) {
+                    scanned += 1;
+                    if scanned.is_multiple_of(4096) {
+                        self.ctx.check()?;
+                    }
+                    if !(s.skip_self && node == x) {
+                        cur_base = push_vec(
+                            out,
+                            (
+                                x,
+                                Step {
+                                    node,
+                                    p: 0,
+                                    rev: s.rev,
+                                },
+                            ),
+                            work,
+                            cur_base,
+                        )?;
+                    }
+                }
+            } else {
+                scan_lane_charged(
+                    self.dedup,
+                    &mut sweeps,
+                    self.ctx,
+                    self.spec,
+                    &s.lane,
+                    &[x],
+                    s.rev,
+                    s.skip_self,
+                    out,
+                    usize::MAX,
+                    Some((work, outer_bytes)),
+                )?;
+            }
+            if !succ && (s.lane.pattern || s.lane.subject_side) {
+                let snap = &self.ctx.snap;
+                let mut w = start;
+                for r in start..out.len() {
+                    if r.is_multiple_of(4096) {
+                        self.ctx.check()?;
+                    }
+                    if snap.term_kind(Id(out[r].1.node)) != crate::store::TermKind::Literal {
+                        out[w] = out[r];
+                        w += 1;
+                    }
+                }
+                out.truncate(w);
+            }
+        }
+        self.sweeps.set(sweeps);
         self.ctx.check()
     }
 
@@ -1889,21 +2714,49 @@ impl<'a> Engine<'a> {
         Ok(steps)
     }
 
+    /// Cached neighbours of one node with pre-admitted scan scratch on `work` and
+    /// pre-admitted cache storage on `self.charge`.
+    fn neighbours_charged(
+        &self,
+        x: u64,
+        succ: bool,
+        work: &mut Charge<'a>,
+        outer_bytes: u64,
+    ) -> Result<Rc<[Step]>> {
+        if self.sink(x, succ) {
+            return Ok(Rc::from(Vec::new()));
+        }
+        if self.blocked(x)? {
+            self.skipped_hubs.set(self.skipped_hubs.get() + 1);
+            return Ok(Rc::from(Vec::new()));
+        }
+        if let Some(n) = self.cache.borrow().get(&(x, succ)) {
+            return Ok(n.clone());
+        }
+        let mut out = Vec::new();
+        self.expand_one_all_charged(x, succ, &mut out, work, outer_bytes)?;
+        let rc_bytes = (out.len() as u64)
+            .saturating_mul(size_of::<Step>() as u64)
+            .saturating_add((2 * size_of::<usize>()) as u64);
+        self.charge.add(rc_bytes.saturating_add(NODE_BYTES))?;
+        let steps: Rc<[Step]> = out.into_iter().map(|(_, s)| s).collect();
+        work.resize(outer_bytes)?;
+        self.cache.borrow_mut().insert((x, succ), steps.clone());
+        Ok(steps)
+    }
+
     /// The weight of an edge: the smallest value of the weight property on a reifier of
     /// its triple term, else the default.
     fn weight(&self, e: &Edge) -> Result<f64> {
-        let Some(w) = self.spec.weight else {
-            return Ok(1.0);
-        };
-        // no reifier or no weight property in the store: every edge has the default
-        if w.is_none() || self.spec.reifies.is_none() {
-            return Ok(self.spec.default_weight);
+        if let Some(w) = self.spec.fixed_weight() {
+            return Ok(w);
         }
         let key = e.triple();
         if let Some(&x) = self.weights.borrow().get(&key) {
             return Ok(x);
         }
-        let x = self.lookup_weight(w, key)?;
+        let x = self.lookup_weight(self.spec.weight.flatten(), key)?;
+        self.charge.add(NODE_BYTES)?;
         self.weights.borrow_mut().insert(key, x);
         Ok(x)
     }
@@ -1936,35 +2789,97 @@ impl<'a> Engine<'a> {
             tt
         };
         let graph = &self.spec.graph;
-        let mut reifiers = Vec::new();
-        for k in ctx.snap.scan_keys(Perm::Pos, &[reifies, tt.0])? {
-            if graph.accepts(k[3]) {
-                reifiers.push(k[2]);
-            }
-        }
         let mut best: Option<f64> = None;
-        for r in reifiers {
-            for k in ctx.snap.scan_keys(Perm::Pso, &[w, r])? {
-                if !graph.accepts(k[3]) {
-                    continue;
+        let mut last_reifier: Option<u64> = None;
+        let mut scanned = 0usize;
+        let scan_weights = |reifier: u64, best: &mut Option<f64>| -> Result<()> {
+            let mut inner_scanned = 0usize;
+            let mut handle_weight = |val_id: u64, g: u64| -> Result<()> {
+                if !graph.accepts(g) {
+                    return Ok(());
                 }
                 let v = ctx
-                    .value_checked(Id(k[2]))?
+                    .value_checked(Id(val_id))?
                     .as_ref()
                     .and_then(super::value::approx_f64);
                 match v {
                     Some(v) if v >= 0.0 && v.is_finite() => {
-                        best = Some(best.map_or(v, |b: f64| b.min(v)));
+                        *best = Some(best.map_or(v, |b: f64| b.min(v)));
+                        Ok(())
                     }
                     _ => {
                         let t = ctx
-                            .plan_term(Id(k[2]))
+                            .plan_term(Id(val_id))
                             .map_or_else(|| "?".to_string(), |t| t.to_string());
-                        return Err(bad(format!("the weight {t} is not a non-negative number")));
+                        Err(bad(format!("the weight {t} is not a non-negative number")))
                     }
                 }
-            }
-        }
+            };
+            ctx.snap.scan_checked(
+                Perm::Pso,
+                &[w, reifier],
+                || ctx.check(),
+                |c| {
+                    match c {
+                        Chunk::Block(b, s_idx, e_idx) => {
+                            for i in s_idx..e_idx {
+                                inner_scanned += 1;
+                                if inner_scanned.is_multiple_of(4096) {
+                                    ctx.check()?;
+                                }
+                                handle_weight(b.cols[2][i], b.cols[3][i])?;
+                            }
+                        }
+                        Chunk::Row(k) => {
+                            inner_scanned += 1;
+                            if inner_scanned.is_multiple_of(4096) {
+                                ctx.check()?;
+                            }
+                            handle_weight(k[2], k[3])?;
+                        }
+                    }
+                    Ok(true)
+                },
+            )
+        };
+        ctx.snap.scan_checked(
+            Perm::Pos,
+            &[reifies, tt.0],
+            || ctx.check(),
+            |c| {
+                match c {
+                    Chunk::Block(b, s_idx, e_idx) => {
+                        for i in s_idx..e_idx {
+                            scanned += 1;
+                            if scanned.is_multiple_of(4096) {
+                                ctx.check()?;
+                            }
+                            if graph.accepts(b.cols[3][i]) {
+                                let r = b.cols[2][i];
+                                if last_reifier != Some(r) {
+                                    last_reifier = Some(r);
+                                    scan_weights(r, &mut best)?;
+                                }
+                            }
+                        }
+                    }
+                    Chunk::Row(k) => {
+                        scanned += 1;
+                        if scanned.is_multiple_of(4096) {
+                            ctx.check()?;
+                        }
+                        if graph.accepts(k[3]) {
+                            let r = k[2];
+                            if last_reifier != Some(r) {
+                                last_reifier = Some(r);
+                                scan_weights(r, &mut best)?;
+                            }
+                        }
+                    }
+                }
+                Ok(true)
+            },
+        )?;
         Ok(best.unwrap_or(default))
     }
 
@@ -2748,8 +3663,802 @@ impl<'a> Engine<'a> {
         Ok(true)
     }
 
+    /// Pareto-pruned weighted shortest paths of at most `max_len` edges from `root`
+    /// (`forward`) or into `root` (`!forward`) to every reachable node (ROADMAP item 275).
+    /// Labels are popped in non-decreasing `(cost, len)` order and kept only when no
+    /// already-settled label at the node is shorter or equal in length (since it is also
+    /// cheaper or equal in cost). Because lengths strictly increase along every edge,
+    /// parent links form a DAG and each node's first settled label yields a simple path of
+    /// minimum cost within `max_len`. Working memory is pre-admitted on a search-scoped
+    /// `Charge` that stays live for the returned `(order, parent)` tree.
+    fn dijkstra_bounded(
+        &self,
+        root: u64,
+        forward: bool,
+        max_len: u32,
+    ) -> Result<(BoundedTreeOutcome, Charge<'a>)> {
+        self.set_roots(&[root]);
+        let mut work = self.ctx.charge(0)?;
+        if max_len == 0 {
+            return Ok((
+                BoundedTreeOutcome::Tree((Vec::new(), HbMap::default())),
+                work,
+            ));
+        }
+        let real = |x: u64| if x == VIRT { root } else { x };
+        let mut best_len: HbMap<u64, u32> = HbMap::default();
+        let mut dist: HbMap<u64, Vec<(u32, Cost)>> = HbMap::default();
+        let mut dist_vec_bytes = 0u64;
+        let mut parent: HbMap<(u64, u32), Parent> = HbMap::default();
+        let mut order: Vec<(u64, u32)> = Vec::new();
+        let mut heap: BoundedHeap = BinaryHeap::new();
+        let mut alternatives = ReverseAlternatives::default();
+        let mut best_virt: Option<(Cost, u32)> = None;
+        let (mut wmin, mut wmax) = (f64::INFINITY, 0.0f64);
+        let mut wide = false;
+        let track_reverse_wide = self.spec.track_reverse_wide(forward, max_len);
+        let local_bytes = |best_len: &HbMap<u64, u32>,
+                           dist: &HbMap<u64, Vec<(u32, Cost)>>,
+                           dist_vec_bytes: u64,
+                           parent: &HbMap<(u64, u32), Parent>,
+                           order: &Vec<(u64, u32)>,
+                           heap: &BoundedHeap,
+                           alternative_bytes: u64| {
+            map_bytes(best_len)
+                .saturating_add(map_bytes(dist))
+                .saturating_add(dist_vec_bytes)
+                .saturating_add(map_bytes(parent))
+                .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
+                .saturating_add(vec_bytes::<Reverse<(Cost, u32, u64)>>(heap.capacity()))
+                .saturating_add(alternative_bytes)
+        };
+        let mut base = 0u64;
+        (_, base) = pareto_insert_charged(
+            &mut dist,
+            &mut dist_vec_bytes,
+            root,
+            0,
+            Cost::ZERO,
+            &mut work,
+            base,
+        )?;
+        let _ = push_heap(&mut heap, Reverse((Cost::ZERO, 0, root)), &mut work, base)?;
+        let mut n = 0u64;
+        while let Some(Reverse((d, l, u))) = heap.pop() {
+            n += 1;
+            if n.is_multiple_of(4096) {
+                self.ctx.check()?;
+            }
+            if best_len.get(&u).is_some_and(|&bl| u == VIRT || l >= bl) {
+                continue;
+            }
+            let cur_base = local_bytes(
+                &best_len,
+                &dist,
+                dist_vec_bytes,
+                &parent,
+                &order,
+                &heap,
+                alternatives.bytes,
+            );
+            let (prev, next_base) = insert_hb_map(&mut best_len, u, l, &mut work, cur_base)?;
+            if prev.is_none() && u != root {
+                let _ = push_vec(&mut order, (u, l), &mut work, next_base)?;
+            }
+            self.visit_count(1)?;
+            if u == VIRT || l >= max_len {
+                continue;
+            }
+            let loc = local_bytes(
+                &best_len,
+                &dist,
+                dist_vec_bytes,
+                &parent,
+                &order,
+                &heap,
+                alternatives.bytes,
+            );
+            let mut out_steps = Vec::new();
+            self.expand_one_charged(u, forward, &mut out_steps, &mut work, loc)?;
+            let out_bytes = vec_bytes::<(u64, Step)>(out_steps.capacity());
+            // Re-expanding a shorter label sees the same edges. A boundary label
+            // is counted as settled but does not expand.
+            let record_hops = track_reverse_wide && prev.is_none_or(|len| len == max_len);
+            let nl = l + 1;
+            for (idx, (_, st)) in out_steps.iter().copied().enumerate() {
+                if idx.is_multiple_of(4096) {
+                    #[cfg(any(test, feature = "failpoints"))]
+                    test_hooks::fire_traversal_poll();
+                    self.ctx.check()?;
+                }
+                let y = if st.node == root { VIRT } else { st.node };
+                if y == u {
+                    continue;
+                }
+                if record_hops {
+                    let cur_base = local_bytes(
+                        &best_len,
+                        &dist,
+                        dist_vec_bytes,
+                        &parent,
+                        &order,
+                        &heap,
+                        alternatives.bytes,
+                    )
+                    .saturating_add(out_bytes);
+                    let first_len = if y == VIRT {
+                        best_virt.map(|(_, len)| len)
+                    } else {
+                        dist.get(&y).and_then(|v| v.first()).map(|&(len, _)| len)
+                    };
+                    let first_hop = first_len.map(|len| parent[&(y, len)].node);
+                    alternatives.record(y, u, first_hop, &mut work, cur_base)?;
+                }
+                if best_len.get(&y).is_some_and(|&bl| y == VIRT || nl >= bl) {
+                    continue;
+                }
+                let e = if forward {
+                    Edge {
+                        from: u,
+                        to: y,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                } else {
+                    Edge {
+                        from: y,
+                        to: u,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                };
+                let wv = self.weight(&e.map(real))?;
+                if track_reverse_wide && !wide && wv > 0.0 {
+                    wmin = wmin.min(wv);
+                    wmax = wmax.max(wv);
+                    if bounded_weights_too_wide(max_len, wmin, wmax) {
+                        wide = true;
+                    }
+                }
+                let nd = d.add(Cost::of(wv));
+                if track_reverse_wide && !wide && nd.hi.is_infinite() {
+                    wide = true;
+                }
+                let mut cur_base = local_bytes(
+                    &best_len,
+                    &dist,
+                    dist_vec_bytes,
+                    &parent,
+                    &order,
+                    &heap,
+                    alternatives.bytes,
+                )
+                .saturating_add(out_bytes);
+                if y == VIRT {
+                    if best_virt.is_some_and(|(bc, bl)| (nd, nl) >= (bc, bl)) {
+                        continue;
+                    }
+                    best_virt = Some((nd, nl));
+                } else {
+                    let (kept, next_base) = pareto_insert_charged(
+                        &mut dist,
+                        &mut dist_vec_bytes,
+                        y,
+                        nl,
+                        nd,
+                        &mut work,
+                        cur_base,
+                    )?;
+                    if !kept {
+                        continue;
+                    }
+                    cur_base = next_base;
+                }
+                (_, cur_base) = insert_hb_map(
+                    &mut parent,
+                    (y, nl),
+                    Parent {
+                        node: u,
+                        p: st.p,
+                        rev: st.rev,
+                    },
+                    &mut work,
+                    cur_base,
+                )?;
+                let _ = push_heap(&mut heap, Reverse((nd, nl, y)), &mut work, cur_base)?;
+            }
+            drop(out_steps);
+            work.resize(local_bytes(
+                &best_len,
+                &dist,
+                dist_vec_bytes,
+                &parent,
+                &order,
+                &heap,
+                alternatives.bytes,
+            ))?;
+        }
+        drop(dist);
+        drop(heap);
+        if wide && !alternatives.branches.is_empty() {
+            let base = map_bytes(&parent)
+                .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
+                .saturating_add(map_bytes(&best_len));
+            work.resize(base.saturating_add(alternatives.bytes))?;
+            return Ok((
+                BoundedTreeOutcome::ReverseWide {
+                    order,
+                    parent,
+                    bwd_dist: best_len,
+                    alternatives,
+                },
+                work,
+            ));
+        }
+        drop(alternatives);
+        drop(best_len);
+        work.resize(map_bytes(&parent).saturating_add(vec_bytes::<(u64, u32)>(order.capacity())))?;
+        Ok((BoundedTreeOutcome::Tree((order, parent)), work))
+    }
+
+    /// One cheapest simple path from `from` to `to` of at most `max_len` edges by
+    /// bidirectional Pareto-pruned search over `(node, length)` pairs (ROADMAP item 275).
+    /// When `to == VIRT` the path closes a cycle at `virt`, and the returned edges keep
+    /// `VIRT` as the final target. Each side searches up to half the length budget
+    /// (`max_f = ceil(max_len / 2)`, `max_b = floor(max_len / 2)`), keeping a label only
+    /// when no other label at the node is both cheaper-or-equal and shorter-or-equal.
+    /// Labels at a side's half-length boundary are never expanded and never enter its heap;
+    /// `bounds[side]` records the least cost relaxed at that boundary so the lower bound
+    /// `min(top[0] + min(top[1], bound[1]), top[1] + min(top[0], bound[0]))` remains exact
+    /// while `Cost::add` is exact. When wide weights or overflow could make split sums
+    /// disagree with source-order sums, falls back to [`dijkstra_pair_bounded_forward`].
+    #[allow(clippy::too_many_arguments)]
+    fn dijkstra_pair_bounded(
+        &self,
+        from: u64,
+        to: u64,
+        virt: u64,
+        banned_nodes: Option<&FxHashSet<u64>>,
+        banned_edges: Option<&FxHashSet<Edge>>,
+        max_len: u32,
+        prefix: PrefixCost,
+    ) -> Result<Option<(Vec<Edge>, Charge<'a>)>> {
+        debug_assert!(from != to);
+        let cycle = to == VIRT;
+        let real = |x: u64| if x == VIRT { virt } else { x };
+        self.set_roots(&[from, real(to)]);
+        if max_len == 0 {
+            return Ok(None);
+        }
+        if prefix.total_max_len > 1
+            && (prefix.cost.hi.is_infinite()
+                || bounded_weights_too_wide(prefix.total_max_len, prefix.wmin, prefix.wmax))
+        {
+            return self.dijkstra_pair_bounded_forward(
+                from,
+                to,
+                virt,
+                banned_nodes,
+                banned_edges,
+                max_len,
+                prefix.cost,
+                None,
+            );
+        }
+        let max_side = [max_len.div_ceil(2), max_len / 2];
+        let mut work = self.ctx.charge(0)?;
+        let mut dist: [HbMap<u64, Vec<(u32, Cost)>>; 2] = Default::default();
+        let mut dist_vec_bytes = [0u64; 2];
+        let mut best_len: [HbMap<u64, u32>; 2] = Default::default();
+        let mut parent: [HbMap<(u64, u32), Parent>; 2] = Default::default();
+        let mut heaps: [BoundedHeap; 2] = Default::default();
+        let mut bounds: [Option<Cost>; 2] = [None, None];
+        let local_bytes = |dist: &[HbMap<u64, Vec<(u32, Cost)>>; 2],
+                           dist_vec_bytes: &[u64; 2],
+                           best_len: &[HbMap<u64, u32>; 2],
+                           parent: &[HbMap<(u64, u32), Parent>; 2],
+                           heaps: &[BoundedHeap; 2]| {
+            map_bytes(&dist[0])
+                .saturating_add(map_bytes(&dist[1]))
+                .saturating_add(dist_vec_bytes[0])
+                .saturating_add(dist_vec_bytes[1])
+                .saturating_add(map_bytes(&best_len[0]))
+                .saturating_add(map_bytes(&best_len[1]))
+                .saturating_add(map_bytes(&parent[0]))
+                .saturating_add(map_bytes(&parent[1]))
+                .saturating_add(vec_bytes::<Reverse<(Cost, u32, u64)>>(heaps[0].capacity()))
+                .saturating_add(vec_bytes::<Reverse<(Cost, u32, u64)>>(heaps[1].capacity()))
+        };
+        let mut base = 0u64;
+        for (i, r) in [from, to].into_iter().enumerate() {
+            (_, base) = pareto_insert_charged(
+                &mut dist[i],
+                &mut dist_vec_bytes[i],
+                r,
+                0,
+                Cost::ZERO,
+                &mut work,
+                base,
+            )?;
+            if max_side[i] > 0 {
+                base = push_heap(&mut heaps[i], Reverse((Cost::ZERO, 0, r)), &mut work, base)?;
+            } else {
+                (_, base) = insert_hb_map(&mut best_len[i], r, 0, &mut work, base)?;
+                bounds[i] = Some(Cost::ZERO);
+            }
+        }
+        let mut best: Option<(Cost, u64, (u32, u32))> = None;
+        let mut n = 0u64;
+        let (mut wmin, mut wmax) = (prefix.wmin, prefix.wmax);
+        let mut wide = false;
+        'search: loop {
+            let mut tops: [Option<Cost>; 2] = [None, None];
+            for i in 0..2 {
+                while let Some(&Reverse((_, l, u))) = heaps[i].peek() {
+                    if best_len[i].get(&u).is_none_or(|&bl| l < bl) {
+                        break;
+                    }
+                    heaps[i].pop();
+                    n += 1;
+                    if n.is_multiple_of(4096) {
+                        self.ctx.check()?;
+                    }
+                }
+                tops[i] = heaps[i].peek().map(|r| r.0.0);
+            }
+            let lb = opt_cost_min(
+                opt_cost_add(tops[0], opt_cost_min(tops[1], bounds[1])),
+                opt_cost_add(tops[1], opt_cost_min(tops[0], bounds[0])),
+            );
+            let Some(lb) = lb else {
+                break;
+            };
+            if prefix.total_max_len > 1
+                && (lb.hi.is_infinite() || prefix.cost.add(lb).hi.is_infinite())
+            {
+                wide = true;
+                break;
+            }
+            if best.is_some_and(|(mu, _, _)| lb >= mu) {
+                break;
+            }
+            let side = if heaps[0].is_empty() || heaps[1].is_empty() {
+                usize::from(heaps[0].is_empty())
+            } else {
+                usize::from(heaps[0].len() > heaps[1].len())
+            };
+            let forward = side == 0;
+            let other = 1 - side;
+            let Reverse((d, l, u)) = heaps[side].pop().unwrap();
+            let loc = local_bytes(&dist, &dist_vec_bytes, &best_len, &parent, &heaps);
+            let _ = insert_hb_map(&mut best_len[side], u, l, &mut work, loc)?;
+            self.visit_count(1)?;
+            n += 1;
+            if n.is_multiple_of(4096) {
+                self.ctx.check()?;
+            }
+            let my_root = if forward { from } else { to };
+            let other_root = if forward { to } else { from };
+            if u == other_root {
+                continue;
+            }
+            let scan = real(u);
+            let loc = local_bytes(&dist, &dist_vec_bytes, &best_len, &parent, &heaps);
+            let mut cached_steps: Option<Rc<[Step]>> = None;
+            let mut out_steps: Vec<(u64, Step)> = Vec::new();
+            if banned_nodes.is_some() {
+                cached_steps = Some(self.neighbours_charged(scan, forward, &mut work, loc)?);
+            } else {
+                self.expand_one_charged(scan, forward, &mut out_steps, &mut work, loc)?;
+            }
+            let out_bytes = vec_bytes::<(u64, Step)>(out_steps.capacity());
+            let step_count = cached_steps.as_ref().map_or(out_steps.len(), |s| s.len());
+            let nl = l + 1;
+            let at_boundary = nl == max_side[side];
+            for idx in 0..step_count {
+                if idx.is_multiple_of(4096) {
+                    #[cfg(any(test, feature = "failpoints"))]
+                    test_hooks::fire_traversal_poll();
+                    self.ctx.check()?;
+                }
+                let st = match &cached_steps {
+                    Some(s) => s[idx],
+                    None => out_steps[idx].1,
+                };
+                let y = if forward && cycle && st.node == virt {
+                    VIRT
+                } else {
+                    st.node
+                };
+                if y == my_root || banned_nodes.is_some_and(|b| b.contains(&y)) {
+                    continue;
+                }
+                if max_side[other] == 0 && y != other_root {
+                    continue;
+                }
+                if best_len[side].get(&y).is_some_and(|&bl| nl >= bl) {
+                    continue;
+                }
+                let e = if forward {
+                    Edge {
+                        from: u,
+                        to: y,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                } else {
+                    Edge {
+                        from: y,
+                        to: u,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                };
+                if banned_edges.is_some_and(|b| b.contains(&e)) {
+                    continue;
+                }
+                let wv = self.weight(&e.map(real))?;
+                if wv > 0.0 {
+                    wmin = wmin.min(wv);
+                    wmax = wmax.max(wv);
+                    if bounded_weights_too_wide(prefix.total_max_len, wmin, wmax) {
+                        wide = true;
+                        break 'search;
+                    }
+                }
+                let nd = d.add(Cost::of(wv));
+                if prefix.total_max_len > 1
+                    && (nd.hi.is_infinite() || prefix.cost.add(nd).hi.is_infinite())
+                {
+                    wide = true;
+                    break 'search;
+                }
+                let cur_base = local_bytes(&dist, &dist_vec_bytes, &best_len, &parent, &heaps)
+                    .saturating_add(out_bytes);
+                let (kept, mut cur_base) = pareto_insert_charged(
+                    &mut dist[side],
+                    &mut dist_vec_bytes[side],
+                    y,
+                    nl,
+                    nd,
+                    &mut work,
+                    cur_base,
+                )?;
+                if !kept {
+                    continue;
+                }
+                (_, cur_base) = insert_hb_map(
+                    &mut parent[side],
+                    (y, nl),
+                    Parent {
+                        node: u,
+                        p: st.p,
+                        rev: st.rev,
+                    },
+                    &mut work,
+                    cur_base,
+                )?;
+                if y != other_root {
+                    if !at_boundary {
+                        let _ =
+                            push_heap(&mut heaps[side], Reverse((nd, nl, y)), &mut work, cur_base)?;
+                    } else {
+                        bounds[side] = opt_cost_min(bounds[side], Some(nd));
+                    }
+                }
+                if let Some(other_v) = dist[other].get(&y)
+                    && let Some((l_other, c_other)) = pareto_best_within(other_v, max_len - nl)
+                {
+                    let total = if forward {
+                        nd.add(c_other)
+                    } else {
+                        c_other.add(nd)
+                    };
+                    if prefix.total_max_len > 1
+                        && (total.hi.is_infinite() || prefix.cost.add(total).hi.is_infinite())
+                    {
+                        wide = true;
+                        break 'search;
+                    }
+                    if best.is_none_or(|(mu, _, _)| total < mu)
+                        && (y == from || y == to || !(self.sink(y, true) || self.blocked(y)?))
+                    {
+                        let lens = if forward {
+                            (nl, l_other)
+                        } else {
+                            (l_other, nl)
+                        };
+                        best = Some((total, y, lens));
+                    }
+                }
+            }
+            drop(out_steps);
+            drop(cached_steps);
+            work.resize(local_bytes(
+                &dist,
+                &dist_vec_bytes,
+                &best_len,
+                &parent,
+                &heaps,
+            ))?;
+        }
+        drop(dist);
+        drop(best_len);
+        drop(heaps);
+        if wide {
+            drop(parent);
+            drop(work);
+            return self.dijkstra_pair_bounded_forward(
+                from,
+                to,
+                virt,
+                banned_nodes,
+                banned_edges,
+                max_len,
+                prefix.cost,
+                None,
+            );
+        }
+        let Some((_, m, (lf, lb))) = best else {
+            drop(parent);
+            return Ok(None);
+        };
+        let combined_len = (lf as usize).saturating_add(lb as usize);
+        let parent_bytes = map_bytes(&parent[0]).saturating_add(map_bytes(&parent[1]));
+        work.resize(parent_bytes.saturating_add(vec_bytes::<Edge>(combined_len)))?;
+        let mut a = Vec::with_capacity(combined_len);
+        let mut cur = m;
+        let mut l = lf;
+        let mut steps = 0usize;
+        while l > 0 {
+            steps += 1;
+            if steps.is_multiple_of(4096) {
+                self.ctx.check()?;
+            }
+            let q = parent[0][&(cur, l)];
+            a.push(Edge {
+                from: q.node,
+                to: cur,
+                p: q.p,
+                rev: q.rev,
+            });
+            cur = q.node;
+            l -= 1;
+        }
+        a.reverse();
+        let mut cur = m;
+        let mut l = lb;
+        while l > 0 {
+            steps += 1;
+            if steps.is_multiple_of(4096) {
+                self.ctx.check()?;
+            }
+            let q = parent[1][&(cur, l)];
+            a.push(Edge {
+                from: cur,
+                to: q.node,
+                p: q.p,
+                rev: q.rev,
+            });
+            cur = q.node;
+            l -= 1;
+        }
+        drop(parent);
+        let path = without_loops_charged(self.ctx, from, a, &mut work, 0)?;
+        work.resize(vec_bytes::<Edge>(path.capacity()))?;
+        Ok(Some((path, work)))
+    }
+
+    /// Source-order one-ended bounded Pareto search used as a fallback from
+    /// [`dijkstra_pair_bounded`] and reverse [`dijkstra_bounded`] when wide weights or
+    /// overflow could make split or reverse sums disagree with source-order accumulation.
+    /// `init_cost` seeds `from` with an already-accumulated Yen prefix cost, and
+    /// `bwd_dist`, when provided, prunes interior nodes that cannot reach `to` within the
+    /// remaining edge budget.
+    #[allow(clippy::too_many_arguments)]
+    fn dijkstra_pair_bounded_forward(
+        &self,
+        from: u64,
+        to: u64,
+        virt: u64,
+        banned_nodes: Option<&FxHashSet<u64>>,
+        banned_edges: Option<&FxHashSet<Edge>>,
+        max_len: u32,
+        init_cost: Cost,
+        bwd_dist: Option<&HbMap<u64, u32>>,
+    ) -> Result<Option<(Vec<Edge>, Charge<'a>)>> {
+        debug_assert!(from != to);
+        let cycle = to == VIRT;
+        let real = |x: u64| if x == VIRT { virt } else { x };
+        self.set_roots(&[from, real(to)]);
+        if max_len == 0 {
+            return Ok(None);
+        }
+        let mut work = self.ctx.charge(0)?;
+        let mut dist: HbMap<u64, Vec<(u32, Cost)>> = HbMap::default();
+        let mut dist_vec_bytes = 0u64;
+        let mut best_len: HbMap<u64, u32> = HbMap::default();
+        let mut parent: HbMap<(u64, u32), Parent> = HbMap::default();
+        let mut heap: BoundedHeap = BinaryHeap::new();
+        let mut best_to: Option<(Cost, u32)> = None;
+        let local_bytes = |dist: &HbMap<u64, Vec<(u32, Cost)>>,
+                           dist_vec_bytes: u64,
+                           best_len: &HbMap<u64, u32>,
+                           parent: &HbMap<(u64, u32), Parent>,
+                           heap: &BoundedHeap| {
+            map_bytes(dist)
+                .saturating_add(dist_vec_bytes)
+                .saturating_add(map_bytes(best_len))
+                .saturating_add(map_bytes(parent))
+                .saturating_add(vec_bytes::<Reverse<(Cost, u32, u64)>>(heap.capacity()))
+        };
+        let mut base = 0u64;
+        (_, base) = pareto_insert_charged(
+            &mut dist,
+            &mut dist_vec_bytes,
+            from,
+            0,
+            init_cost,
+            &mut work,
+            base,
+        )?;
+        let _ = push_heap(&mut heap, Reverse((init_cost, 0, from)), &mut work, base)?;
+        let mut n = 0u64;
+        let mut found_len: Option<u32> = None;
+        while let Some(Reverse((d, l, u))) = heap.pop() {
+            n += 1;
+            if n.is_multiple_of(4096) {
+                self.ctx.check()?;
+            }
+            if best_len.get(&u).is_some_and(|&bl| u == to || l >= bl) {
+                continue;
+            }
+            let loc = local_bytes(&dist, dist_vec_bytes, &best_len, &parent, &heap);
+            let _ = insert_hb_map(&mut best_len, u, l, &mut work, loc)?;
+            self.visit_count(1)?;
+            if u == to {
+                found_len = Some(l);
+                break;
+            }
+            if l >= max_len {
+                continue;
+            }
+            let scan = real(u);
+            let loc = local_bytes(&dist, dist_vec_bytes, &best_len, &parent, &heap);
+            let mut cached_steps: Option<Rc<[Step]>> = None;
+            let mut out_steps: Vec<(u64, Step)> = Vec::new();
+            if banned_nodes.is_some() {
+                cached_steps = Some(self.neighbours_charged(scan, true, &mut work, loc)?);
+            } else {
+                self.expand_one_charged(scan, true, &mut out_steps, &mut work, loc)?;
+            }
+            let out_bytes = vec_bytes::<(u64, Step)>(out_steps.capacity());
+            let step_count = cached_steps.as_ref().map_or(out_steps.len(), |s| s.len());
+            let nl = l + 1;
+            for idx in 0..step_count {
+                if idx.is_multiple_of(4096) {
+                    #[cfg(any(test, feature = "failpoints"))]
+                    test_hooks::fire_traversal_poll();
+                    self.ctx.check()?;
+                }
+                let st = match &cached_steps {
+                    Some(s) => s[idx],
+                    None => out_steps[idx].1,
+                };
+                let y = if cycle && st.node == virt {
+                    VIRT
+                } else {
+                    st.node
+                };
+                if y == from || banned_nodes.is_some_and(|b| b.contains(&y)) {
+                    continue;
+                }
+                if nl == max_len && y != to {
+                    continue;
+                }
+                if y != to
+                    && let Some(bd) = bwd_dist
+                    && bd
+                        .get(&y)
+                        .is_none_or(|&rem| nl.saturating_add(rem) > max_len)
+                {
+                    continue;
+                }
+                if best_len.get(&y).is_some_and(|&bl| y == to || nl >= bl) {
+                    continue;
+                }
+                let e = Edge {
+                    from: u,
+                    to: y,
+                    p: st.p,
+                    rev: st.rev,
+                };
+                if banned_edges.is_some_and(|b| b.contains(&e)) {
+                    continue;
+                }
+                let nd = d.add(Cost::of(self.weight(&e.map(real))?));
+                let mut cur_base = local_bytes(&dist, dist_vec_bytes, &best_len, &parent, &heap)
+                    .saturating_add(out_bytes);
+                if y == to {
+                    if best_to.is_some_and(|(bc, bl)| (nd, nl) >= (bc, bl)) {
+                        continue;
+                    }
+                    best_to = Some((nd, nl));
+                } else {
+                    let (kept, next_base) = pareto_insert_charged(
+                        &mut dist,
+                        &mut dist_vec_bytes,
+                        y,
+                        nl,
+                        nd,
+                        &mut work,
+                        cur_base,
+                    )?;
+                    if !kept {
+                        continue;
+                    }
+                    cur_base = next_base;
+                }
+                (_, cur_base) = insert_hb_map(
+                    &mut parent,
+                    (y, nl),
+                    Parent {
+                        node: u,
+                        p: st.p,
+                        rev: st.rev,
+                    },
+                    &mut work,
+                    cur_base,
+                )?;
+                let _ = push_heap(&mut heap, Reverse((nd, nl, y)), &mut work, cur_base)?;
+            }
+            drop(out_steps);
+            drop(cached_steps);
+            work.resize(local_bytes(
+                &dist,
+                dist_vec_bytes,
+                &best_len,
+                &parent,
+                &heap,
+            ))?;
+        }
+        drop(dist);
+        drop(best_len);
+        drop(heap);
+        let Some(len) = found_len else {
+            drop(parent);
+            return Ok(None);
+        };
+        let parent_bytes = map_bytes(&parent);
+        work.resize(parent_bytes.saturating_add(vec_bytes::<Edge>(len as usize)))?;
+        let mut a = Vec::with_capacity(len as usize);
+        let mut cur = to;
+        let mut l = len;
+        let mut steps = 0usize;
+        while l > 0 {
+            steps += 1;
+            if steps.is_multiple_of(4096) {
+                self.ctx.check()?;
+            }
+            let q = parent[&(cur, l)];
+            a.push(Edge {
+                from: q.node,
+                to: cur,
+                p: q.p,
+                rev: q.rev,
+            });
+            cur = q.node;
+            l -= 1;
+        }
+        a.reverse();
+        drop(parent);
+        work.resize(vec_bytes::<Edge>(a.capacity()))?;
+        Ok(Some((a, work)))
+    }
+
     /// The shortest path from `from` to `to` (forward) that avoids the banned nodes and
-    /// edges, of at most `budget` edges without weights: Yen's spur search.
+    /// edges, of at most `budget` edges: Yen's spur search.
+    #[allow(clippy::too_many_arguments)]
     fn spur(
         &self,
         from: u64,
@@ -2758,11 +4467,27 @@ impl<'a> Engine<'a> {
         banned_nodes: &FxHashSet<u64>,
         banned_edges: &FxHashSet<Edge>,
         budget: Option<u32>,
-    ) -> Result<Option<(Vec<Edge>, f64)>> {
-        if self.spec.weighted() && to != VIRT && from != to {
-            return self.dijkstra_pair(from, to, Some(banned_nodes), Some(banned_edges));
-        }
+        prefix: PrefixCost,
+    ) -> Result<Option<SpurPath<'a>>> {
         if self.spec.weighted() {
+            if let Some(max) = budget {
+                return Ok(self
+                    .dijkstra_pair_bounded(
+                        from,
+                        to,
+                        virt,
+                        Some(banned_nodes),
+                        Some(banned_edges),
+                        max,
+                        prefix,
+                    )?
+                    .map(|(p, work)| (p, 0.0, Some(work))));
+            }
+            if to != VIRT && from != to {
+                return Ok(self
+                    .dijkstra_pair(from, to, Some(banned_nodes), Some(banned_edges))?
+                    .map(|(p, c)| (p, c, None)));
+            }
             // a spur that closes a cycle searches from one end
             let close = to == VIRT;
             let targets: FxHashSet<u64> = [if close { virt } else { to }].into_iter().collect();
@@ -2782,7 +4507,7 @@ impl<'a> Engine<'a> {
             return Ok(tree
                 .paths(to, false, 1, None, &|| self.ctx.check())?
                 .pop()
-                .map(|p| (p, c)));
+                .map(|p| (p, c, None)));
         }
         // bidirectional breadth-first search around the banned nodes and edges
         let bans = Bans {
@@ -2794,7 +4519,7 @@ impl<'a> Engine<'a> {
             .pop()
             .map(|p| {
                 let c = p.len() as f64;
-                (p, c)
+                (p, c, None)
             }))
     }
 
@@ -2825,10 +4550,14 @@ impl<'a> Engine<'a> {
         let max = self.spec.max_len;
         let none_n = FxHashSet::default();
         let none_e = FxHashSet::default();
-        let budget = if self.spec.weighted() { None } else { max };
-        let Some((first, _)) = self.spur(s, tt, s, &none_n, &none_e, budget)? else {
+        let budget = max;
+        let init_prefix = PrefixCost::zero(budget.unwrap_or(0));
+        let Some((first, _, first_charge)) =
+            self.spur(s, tt, s, &none_n, &none_e, budget, init_prefix)?
+        else {
             return Ok(());
         };
+        let _first_charge = first_charge;
         // candidates are ranked by their whole cost in double-double, never by the
         // spur's rounded cost plus the root's, so that two equally cheap candidates
         // cannot rank apart by the order their weights were added in
@@ -2847,7 +4576,23 @@ impl<'a> Engine<'a> {
                 return Ok(());
             }
             let nodes: Vec<u64> = std::iter::once(s).chain(cur.iter().map(|e| e.to)).collect();
+            let track_prefix = self.spec.weighted() && budget.is_some();
+            let mut prefix_cost = Cost::ZERO;
+            let (mut prefix_wmin, mut prefix_wmax) = (f64::INFINITY, 0.0f64);
             for i in 0..cur.len() {
+                let step_budget = match budget {
+                    Some(m) if m <= i as u32 => break,
+                    Some(m) => Some(m - i as u32),
+                    None => None,
+                };
+                if i > 0 && track_prefix {
+                    let w = self.weight(&cur[i - 1].map(real))?;
+                    if w > 0.0 {
+                        prefix_wmin = prefix_wmin.min(w);
+                        prefix_wmax = prefix_wmax.max(w);
+                    }
+                    prefix_cost = prefix_cost.add(Cost::of(w));
+                }
                 let root = &cur[..i];
                 let mut banned_edges = FxHashSet::default();
                 for (p, _) in &a {
@@ -2856,14 +4601,21 @@ impl<'a> Engine<'a> {
                     }
                 }
                 let banned_nodes: FxHashSet<u64> = nodes[..i].iter().copied().collect();
-                let budget = match budget {
-                    Some(m) if m <= i as u32 => continue,
-                    Some(m) => Some(m - i as u32),
-                    None => None,
+                let prefix = PrefixCost {
+                    cost: prefix_cost,
+                    wmin: prefix_wmin,
+                    wmax: prefix_wmax,
+                    total_max_len: budget.unwrap_or(0),
                 };
-                if let Some((sp, _)) =
-                    self.spur(nodes[i], tt, s, &banned_nodes, &banned_edges, budget)?
-                {
+                if let Some((sp, _, sp_charge)) = self.spur(
+                    nodes[i],
+                    tt,
+                    s,
+                    &banned_nodes,
+                    &banned_edges,
+                    step_budget,
+                    prefix,
+                )? {
                     let mut path = root.to_vec();
                     path.extend(sp);
                     if seen.insert(path.clone()) {
@@ -2874,6 +4626,7 @@ impl<'a> Engine<'a> {
                         seq += 1;
                         self.charge.add(len as u64 * 32)?;
                     }
+                    drop(sp_charge);
                 }
             }
             let Some(Reverse((_, _, id))) = heap.pop() else {
@@ -3092,7 +4845,8 @@ pub fn run(
                    end: u64,
                    edges: Vec<Edge>,
                    len: Option<usize>,
-                   fwd: bool|
+                   fwd: bool,
+                   mut edge_charge: Option<Charge<'_>>|
      -> Result<bool> {
         if !eng.take() {
             return Ok(false);
@@ -3101,7 +4855,13 @@ pub fn run(
         let i = found.len() as u32;
         let len = len.unwrap_or(edges.len());
         let edges = if need_edges { edges } else { Vec::new() };
-        eng.charge.add(edges.len() as u64 * 32 + 64)?;
+        let need = (edges.len() as u64).saturating_mul(32).saturating_add(64);
+        if let Some(ref ec) = edge_charge {
+            ec.resize(need)?;
+            eng.charge.adopt_charge(&mut edge_charge)?;
+        } else {
+            eng.charge.add(need)?;
+        }
         found.push(Found {
             start,
             end,
@@ -3123,10 +4883,12 @@ pub fn run(
         Ok(true)
     };
     let cap = |eng: &Engine| eng.left.get();
-    // the shortest modes with weights and a length limit enumerate in cost order
-    let yen_shortest = weighted
-        && spec.max_len.is_some()
-        && matches!(spec.algorithm, Algorithm::Shortest | Algorithm::AllShortest);
+    let bounded_weighted_shortest =
+        weighted && spec.max_len.is_some() && matches!(spec.algorithm, Algorithm::Shortest);
+    // weighted `allShortest` with a length limit enumerates optimal short paths via Yen
+    // whose spurs run the length-bounded Pareto-pruned search
+    let yen_all_shortest =
+        weighted && spec.max_len.is_some() && matches!(spec.algorithm, Algorithm::AllShortest);
     'sources: for (&s, targets) in &forward {
         if eng.full() {
             break;
@@ -3135,16 +4897,82 @@ pub fn run(
         want_pairs.set(!targets.set.is_empty());
         want_sources.set(targets.any);
         match spec.algorithm {
-            Algorithm::Shortest | Algorithm::AllShortest if yen_shortest => {
+            Algorithm::Shortest if bounded_weighted_shortest => {
+                let max = spec.max_len.unwrap();
+                if targets.any {
+                    eng.begin();
+                    if spec.min_len == 0 && !add(&mut found, s, s, Vec::new(), None, true, None)? {
+                        break 'sources;
+                    }
+                    if eng.full() {
+                        break 'sources;
+                    }
+                    let (outcome, tree_charge) = eng.dijkstra_bounded(s, true, max)?;
+                    let BoundedTreeOutcome::Tree((order, parent)) = outcome else {
+                        unreachable!("forward bounded Dijkstra never takes reverse wide fallback");
+                    };
+                    let _tree_charge = tree_charge;
+                    for (m, l) in order {
+                        if eng.full() {
+                            break 'sources;
+                        }
+                        if spec.min_len == 0 && m == VIRT {
+                            continue;
+                        }
+                        let end = if m == VIRT { s } else { m };
+                        let edge_charge = eng.charge.part();
+                        edge_charge.resize(vec_bytes::<Edge>(l as usize))?;
+                        let p = reconstruct_bounded(eng.ctx, s, true, &parent, m, l)?;
+                        if !add(&mut found, s, end, p, None, true, Some(edge_charge))? {
+                            break 'sources;
+                        }
+                    }
+                } else {
+                    for &t in &targets.set {
+                        if eng.full() {
+                            break 'sources;
+                        }
+                        eng.begin();
+                        if spec.min_len == 0 && s == t {
+                            if !add(&mut found, s, t, Vec::new(), None, true, None)? {
+                                break 'sources;
+                            }
+                            continue;
+                        }
+                        let tt = if s == t { VIRT } else { t };
+                        let real = |x: u64| if x == VIRT { s } else { x };
+                        if let Some((mut p, path_charge)) = eng.dijkstra_pair_bounded(
+                            s,
+                            tt,
+                            s,
+                            None,
+                            None,
+                            max,
+                            PrefixCost::zero(max),
+                        )? {
+                            for e in &mut p {
+                                *e = e.map(real);
+                            }
+                            if !add(&mut found, s, t, p, None, true, Some(path_charge))? {
+                                break 'sources;
+                            }
+                        }
+                    }
+                }
+            }
+            Algorithm::AllShortest if yen_all_shortest => {
                 if targets.any {
                     return Err(bad(
-                        "path:maxLength with path:weight needs a bound target in the shortest modes",
+                        "path:maxLength with path:weight needs a bound target in path:allShortest",
                     ));
                 }
                 for &t in &targets.set {
+                    if eng.full() {
+                        break 'sources;
+                    }
                     eng.begin();
                     if spec.min_len == 0 && s == t {
-                        if !add(&mut found, s, t, Vec::new(), None, true)? {
+                        if !add(&mut found, s, t, Vec::new(), None, true, None)? {
                             break 'sources;
                         }
                         continue;
@@ -3165,10 +4993,10 @@ pub fn run(
                             best = Some(c);
                         }
                         out.push(p.to_vec());
-                        Ok(all)
+                        Ok(out.len() < cap(&eng))
                     })?;
                     for p in out {
-                        if !add(&mut found, s, t, p, None, true)? {
+                        if !add(&mut found, s, t, p, None, true, None)? {
                             break 'sources;
                         }
                     }
@@ -3180,11 +5008,11 @@ pub fn run(
                     let t = *targets.set.first().unwrap();
                     eng.begin();
                     if spec.min_len == 0 && s == t {
-                        add(&mut found, s, t, Vec::new(), None, true)?;
+                        add(&mut found, s, t, Vec::new(), None, true, None)?;
                         continue;
                     }
                     for p in eng.bidirectional(s, t, all, if all { cap(&eng) } else { 1 })? {
-                        if !add(&mut found, s, t, p, None, true)? {
+                        if !add(&mut found, s, t, p, None, true, None)? {
                             break 'sources;
                         }
                     }
@@ -3198,14 +5026,14 @@ pub fn run(
                     let t = t0.unwrap();
                     eng.begin();
                     if spec.min_len == 0 && s == t {
-                        if !add(&mut found, s, t, Vec::new(), None, true)? {
+                        if !add(&mut found, s, t, Vec::new(), None, true, None)? {
                             break 'sources;
                         }
                         continue;
                     }
                     let mut stop = false;
                     let answered = eng.dijkstra_pair_all(s, t, all, &mut |p| {
-                        let more = add(&mut found, s, t, p, None, true)?;
+                        let more = add(&mut found, s, t, p, None, true, None)?;
                         stop = !more;
                         // path:shortest keeps the first cheapest cycle
                         Ok(more && all)
@@ -3224,7 +5052,7 @@ pub fn run(
                     let t = t0.unwrap();
                     eng.begin();
                     if let Some((p, _)) = eng.dijkstra_pair(s, t, None, None)?
-                        && !add(&mut found, s, t, p, None, true)?
+                        && !add(&mut found, s, t, p, None, true, None)?
                     {
                         break 'sources;
                     }
@@ -3265,7 +5093,7 @@ pub fn run(
                 // the empty one, not a cycle
                 if spec.min_len == 0 && close {
                     ends.retain(|&m| m != VIRT);
-                    if !add(&mut found, s, s, Vec::new(), None, true)? {
+                    if !add(&mut found, s, s, Vec::new(), None, true, None)? {
                         break 'sources;
                     }
                 }
@@ -3273,7 +5101,15 @@ pub fn run(
                     let end = if m == VIRT { s } else { m };
                     if by_level && !weighted {
                         if let Some(&(_, level)) = tree.first.get(&m)
-                            && !add(&mut found, s, end, Vec::new(), Some(level as usize), true)?
+                            && !add(
+                                &mut found,
+                                s,
+                                end,
+                                Vec::new(),
+                                Some(level as usize),
+                                true,
+                                None,
+                            )?
                         {
                             break 'sources;
                         }
@@ -3285,7 +5121,7 @@ pub fn run(
                             .into_iter()
                             .map(|e| e.map(|x| if x == VIRT { s } else { x }))
                             .collect();
-                        if !add(&mut found, s, end, p, None, true)? {
+                        if !add(&mut found, s, end, p, None, true, None)? {
                             break 'sources;
                         }
                     }
@@ -3296,13 +5132,19 @@ pub fn run(
                     return Err(bad("path:kShortest needs a bound target"));
                 }
                 for &t in &targets.set {
+                    if eng.full() {
+                        break 'sources;
+                    }
                     eng.begin();
                     let mut n = 0usize;
                     if spec.min_len == 0 && s == t {
-                        if !add(&mut found, s, t, Vec::new(), None, true)? {
+                        if !add(&mut found, s, t, Vec::new(), None, true, None)? {
                             break 'sources;
                         }
                         n += 1;
+                    }
+                    if eng.full() {
+                        break 'sources;
                     }
                     if n >= spec.k {
                         continue;
@@ -3318,7 +5160,7 @@ pub fn run(
                         Ok(n < spec.k && out.len() < cap(&eng))
                     })?;
                     for p in out {
-                        if !add(&mut found, s, t, p, None, true)? {
+                        if !add(&mut found, s, t, p, None, true, None)? {
                             break 'sources;
                         }
                     }
@@ -3328,7 +5170,7 @@ pub fn run(
                 eng.begin();
                 let mut stop = false;
                 eng.all_paths(s, true, (!targets.any).then_some(&tset), &mut |p, end| {
-                    if !add(&mut found, s, end, p.to_vec(), None, true)? {
+                    if !add(&mut found, s, end, p.to_vec(), None, true, None)? {
                         stop = true;
                         return Ok(false);
                     }
@@ -3348,10 +5190,118 @@ pub fn run(
         match spec.algorithm {
             Algorithm::KShortest => return Err(bad("path:kShortest needs a bound source")),
             Algorithm::Shortest | Algorithm::AllShortest => {
-                if yen_shortest {
+                if yen_all_shortest {
                     return Err(bad(
-                        "path:maxLength with path:weight needs a bound source in the shortest modes",
+                        "path:maxLength with path:weight needs a bound source in path:allShortest",
                     ));
+                }
+                if bounded_weighted_shortest {
+                    if spec.min_len == 0 && !add(&mut found, t, t, Vec::new(), None, false, None)? {
+                        break 'targets;
+                    }
+                    if eng.full() {
+                        break 'targets;
+                    }
+                    let max = spec.max_len.unwrap();
+                    match eng.dijkstra_bounded(t, false, max)? {
+                        (BoundedTreeOutcome::Tree((order, parent)), tree_charge) => {
+                            let _tree_charge = tree_charge;
+                            for (m, l) in order {
+                                if eng.full() {
+                                    break 'targets;
+                                }
+                                if spec.min_len == 0 && m == VIRT {
+                                    continue;
+                                }
+                                let start = if m == VIRT { t } else { m };
+                                let edge_charge = eng.charge.part();
+                                edge_charge.resize(vec_bytes::<Edge>(l as usize))?;
+                                let p = reconstruct_bounded(eng.ctx, t, false, &parent, m, l)?;
+                                if !add(&mut found, start, t, p, None, false, Some(edge_charge))? {
+                                    break 'targets;
+                                }
+                            }
+                        }
+                        (
+                            BoundedTreeOutcome::ReverseWide {
+                                order,
+                                parent,
+                                bwd_dist,
+                                alternatives,
+                            },
+                            tree_charge,
+                        ) => {
+                            let _tree_charge = tree_charge;
+                            let mut ancestry = None;
+                            for (m, l) in order {
+                                if eng.full() {
+                                    break 'targets;
+                                }
+                                if spec.min_len == 0 && m == VIRT {
+                                    continue;
+                                }
+                                let start = if m == VIRT { t } else { m };
+                                if !alternatives.chain_has_multi(
+                                    eng.ctx,
+                                    &mut ReverseHopTree {
+                                        parent: &parent,
+                                        dist: &bwd_dist,
+                                        ancestry: &mut ancestry,
+                                        charge_index: &|bytes| eng.ctx.charge(bytes),
+                                    },
+                                    m,
+                                    l,
+                                    max,
+                                )? {
+                                    let edge_charge = eng.charge.part();
+                                    edge_charge.resize(vec_bytes::<Edge>(l as usize))?;
+                                    let p = reconstruct_bounded(eng.ctx, t, false, &parent, m, l)?;
+                                    if !add(
+                                        &mut found,
+                                        start,
+                                        t,
+                                        p,
+                                        None,
+                                        false,
+                                        Some(edge_charge),
+                                    )? {
+                                        break 'targets;
+                                    }
+                                    continue;
+                                }
+                                let to = if m == VIRT { VIRT } else { t };
+                                let real = |x: u64| if x == VIRT { start } else { x };
+                                if let Some((mut p, path_charge)) = eng
+                                    .dijkstra_pair_bounded_forward(
+                                        start,
+                                        to,
+                                        start,
+                                        None,
+                                        None,
+                                        max,
+                                        Cost::ZERO,
+                                        Some(&bwd_dist),
+                                    )?
+                                {
+                                    for e in &mut p {
+                                        *e = e.map(real);
+                                    }
+                                    if !add(
+                                        &mut found,
+                                        start,
+                                        t,
+                                        p,
+                                        None,
+                                        false,
+                                        Some(path_charge),
+                                    )? {
+                                        break 'targets;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
                 }
                 let (tree, cost) = if weighted {
                     let (tree, cost) = eng.dijkstra(t, false, None, all, true, None, None, t)?;
@@ -3361,7 +5311,7 @@ pub fn run(
                     (tree, None)
                 };
                 let prune = eng.prune(&tree, cost.as_ref(), all)?;
-                if spec.min_len == 0 && !add(&mut found, t, t, Vec::new(), None, false)? {
+                if spec.min_len == 0 && !add(&mut found, t, t, Vec::new(), None, false, None)? {
                     break 'targets;
                 }
                 let mut starts: Vec<u64> = tree.order.iter().map(|e| e.0).collect();
@@ -3379,6 +5329,7 @@ pub fn run(
                                 Vec::new(),
                                 Some(level as usize),
                                 false,
+                                None,
                             )?
                         {
                             break 'targets;
@@ -3391,7 +5342,7 @@ pub fn run(
                             .into_iter()
                             .map(|e| e.map(|x| if x == VIRT { t } else { x }))
                             .collect();
-                        if !add(&mut found, start, t, p, None, false)? {
+                        if !add(&mut found, start, t, p, None, false, None)? {
                             break 'targets;
                         }
                     }
@@ -3400,7 +5351,7 @@ pub fn run(
             Algorithm::All => {
                 let mut stop = false;
                 eng.all_paths(t, false, None, &mut |p, start| {
-                    if !add(&mut found, start, t, p.to_vec(), None, false)? {
+                    if !add(&mut found, start, t, p.to_vec(), None, false, None)? {
                         stop = true;
                         return Ok(false);
                     }
@@ -3557,6 +5508,8 @@ pub(crate) fn stream_eligible(spec: &PathSearchSpec) -> bool {
 
 type HbMap<K, V> = hashbrown::HashMap<K, V, FxBuildHasher>;
 type HbSet<T> = hashbrown::HashSet<T, FxBuildHasher>;
+/// Pre-admitted `(order, parent)` result of `SearchContext::run_dijkstra_bounded`.
+type ChargedBoundedTree = (Vec<(u64, u32)>, HbMap<(u64, u32), Parent>);
 
 #[inline]
 fn vec_bytes<T>(cap: usize) -> u64 {
@@ -3661,12 +5614,27 @@ fn sort_dedup_u64_checked(v: &mut Vec<u64>, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-fn push_vec<T>(
-    v: &mut Vec<T>,
-    item: T,
-    charge: &mut super::ctx::OwnedCharge,
-    base: u64,
-) -> Result<u64> {
+/// Resizable memory charge shared by streaming (`OwnedCharge`) and eager search-scoped
+/// (`Charge<'_>`) pre-admission helpers.
+trait ByteCharge {
+    fn resize(&mut self, bytes: u64) -> Result<()>;
+}
+
+impl ByteCharge for super::ctx::OwnedCharge {
+    #[inline]
+    fn resize(&mut self, bytes: u64) -> Result<()> {
+        super::ctx::OwnedCharge::resize(self, bytes)
+    }
+}
+
+impl ByteCharge for Charge<'_> {
+    #[inline]
+    fn resize(&mut self, bytes: u64) -> Result<()> {
+        Charge::resize(self, bytes)
+    }
+}
+
+fn push_vec<T, C: ByteCharge>(v: &mut Vec<T>, item: T, charge: &mut C, base: u64) -> Result<u64> {
     if v.len() == v.capacity() {
         let old_bytes = vec_bytes::<T>(v.capacity());
         let new_cap = vec_grown(v.capacity(), v.len(), 1, size_of::<T>());
@@ -3683,10 +5651,10 @@ fn push_vec<T>(
     }
 }
 
-fn push_heap<T: Ord>(
+fn push_heap<T: Ord, C: ByteCharge>(
     h: &mut BinaryHeap<T>,
     item: T,
-    charge: &mut super::ctx::OwnedCharge,
+    charge: &mut C,
     base: u64,
 ) -> Result<u64> {
     if h.len() == h.capacity() {
@@ -3705,10 +5673,10 @@ fn push_heap<T: Ord>(
     }
 }
 
-fn insert_hb_set<T: Eq + std::hash::Hash>(
+fn insert_hb_set<T: Eq + std::hash::Hash, C: ByteCharge>(
     s: &mut HbSet<T>,
     item: T,
-    charge: &mut super::ctx::OwnedCharge,
+    charge: &mut C,
     base: u64,
 ) -> Result<(bool, u64)> {
     if s.contains(&item) {
@@ -3734,11 +5702,11 @@ fn insert_hb_set<T: Eq + std::hash::Hash>(
     }
 }
 
-fn insert_hb_map<K: Eq + std::hash::Hash, V>(
+fn insert_hb_map<K: Eq + std::hash::Hash, V, C: ByteCharge>(
     m: &mut HbMap<K, V>,
     key: K,
     val: V,
-    charge: &mut super::ctx::OwnedCharge,
+    charge: &mut C,
     base: u64,
 ) -> Result<(Option<V>, u64)> {
     if let Some(slot) = m.get_mut(&key) {
@@ -3764,12 +5732,12 @@ fn insert_hb_map<K: Eq + std::hash::Hash, V>(
     }
 }
 
-fn push_hb_map_vec<K: Eq + std::hash::Hash, V>(
+fn push_hb_map_vec<K: Eq + std::hash::Hash, V, C: ByteCharge>(
     m: &mut HbMap<K, Vec<V>>,
     vec_bytes_total: &mut u64,
     key: K,
     val: V,
-    charge: &mut super::ctx::OwnedCharge,
+    charge: &mut C,
     base: u64,
 ) -> Result<u64> {
     if let Some(v) = m.get_mut(&key) {
@@ -3812,6 +5780,83 @@ fn push_hb_map_vec<K: Eq + std::hash::Hash, V>(
             .saturating_add(actual_v);
         charge.resize(next)?;
         Ok(next)
+    }
+}
+
+fn pareto_insert_charged<C: ByteCharge>(
+    m: &mut HbMap<u64, Vec<(u32, Cost)>>,
+    vec_bytes_total: &mut u64,
+    key: u64,
+    len: u32,
+    cost: Cost,
+    charge: &mut C,
+    base: u64,
+) -> Result<(bool, u64)> {
+    if let Some(v) = m.get_mut(&key) {
+        let Some((pos, replace)) = pareto_locate(v, len, cost) else {
+            return Ok((false, base));
+        };
+        if replace {
+            v[pos].1 = cost;
+            let mut end = pos + 1;
+            while end < v.len() && v[end].1 >= cost {
+                end += 1;
+            }
+            if end > pos + 1 {
+                v.drain(pos + 1..end);
+            }
+            return Ok((true, base));
+        }
+        let mut end = pos;
+        while end < v.len() && v[end].1 >= cost {
+            end += 1;
+        }
+        if end > pos {
+            v[pos] = (len, cost);
+            if end > pos + 1 {
+                v.drain(pos + 1..end);
+            }
+            return Ok((true, base));
+        }
+        if v.len() == v.capacity() {
+            let old_v = vec_bytes::<(u32, Cost)>(v.capacity());
+            let new_cap = vec_grown(v.capacity(), v.len(), 1, size_of::<(u32, Cost)>());
+            let new_v = vec_bytes::<(u32, Cost)>(new_cap);
+            charge.resize(base.saturating_add(new_v))?;
+            v.insert(pos, (len, cost));
+            let actual_v = vec_bytes::<(u32, Cost)>(v.capacity());
+            *vec_bytes_total = vec_bytes_total
+                .saturating_sub(old_v)
+                .saturating_add(actual_v);
+            let next = base.saturating_sub(old_v).saturating_add(actual_v);
+            charge.resize(next)?;
+            Ok((true, next))
+        } else {
+            v.insert(pos, (len, cost));
+            Ok((true, base))
+        }
+    } else {
+        let old_m = map_bytes(m);
+        let m_growth = hb_growth_for_one::<(u64, Vec<(u32, Cost)>)>(m.len(), m.capacity(), old_m);
+        let v_cap = vec_grown(0, 0, 1, size_of::<(u32, Cost)>());
+        let new_v = vec_bytes::<(u32, Cost)>(v_cap);
+        charge.resize(base.saturating_add(m_growth).saturating_add(new_v))?;
+        let mut v = Vec::with_capacity(v_cap);
+        v.push((len, cost));
+        let actual_v = vec_bytes::<(u32, Cost)>(v.capacity());
+        m.insert(key, v);
+        let actual_m = map_bytes(m);
+        debug_assert!(
+            actual_m <= old_m.max(m_growth),
+            "hashbrown pareto map grew to {actual_m} bytes beyond predicted {m_growth}"
+        );
+        *vec_bytes_total = vec_bytes_total.saturating_add(actual_v);
+        let next = base
+            .saturating_sub(old_m)
+            .saturating_add(actual_m)
+            .saturating_add(actual_v);
+        charge.resize(next)?;
+        Ok((true, next))
     }
 }
 
@@ -4271,11 +6316,11 @@ impl TreePathIter {
 }
 
 /// Pre-admitted `without_loops` cutting out zero-weight cycles from joined halves.
-fn without_loops_charged(
+fn without_loops_charged<C: ByteCharge>(
     ctx: &Ctx,
     s: u64,
     edges: Vec<Edge>,
-    charge: &mut super::ctx::OwnedCharge,
+    charge: &mut C,
     base_excluding_edges: u64,
 ) -> Result<Vec<Edge>> {
     let edges_bytes = vec_bytes::<Edge>(edges.capacity());
@@ -4333,11 +6378,11 @@ struct StreamBans<'b> {
 
 trait ChargedSink {
     const CHECKS: bool;
-    fn put(
+    fn put<C: ByteCharge>(
         &mut self,
         x: u64,
         step: Step,
-        charge: Option<(&mut super::ctx::OwnedCharge, u64)>,
+        charge: Option<(&mut C, u64)>,
     ) -> Result<()>;
     fn len(&self) -> usize;
 }
@@ -4345,11 +6390,11 @@ trait ChargedSink {
 impl ChargedSink for Vec<(u64, Step)> {
     const CHECKS: bool = false;
     #[inline]
-    fn put(
+    fn put<C: ByteCharge>(
         &mut self,
         x: u64,
         step: Step,
-        charge: Option<(&mut super::ctx::OwnedCharge, u64)>,
+        charge: Option<(&mut C, u64)>,
     ) -> Result<()> {
         if let Some((charge, base_excluding_out)) = charge {
             let base = base_excluding_out.saturating_add(vec_bytes::<(u64, Step)>(self.capacity()));
@@ -4368,12 +6413,7 @@ impl ChargedSink for Vec<(u64, Step)> {
 impl ChargedSink for Count {
     const CHECKS: bool = true;
     #[inline]
-    fn put(
-        &mut self,
-        _: u64,
-        _: Step,
-        _: Option<(&mut super::ctx::OwnedCharge, u64)>,
-    ) -> Result<()> {
+    fn put<C: ByteCharge>(&mut self, _: u64, _: Step, _: Option<(&mut C, u64)>) -> Result<()> {
         self.0 += 1;
         Ok(())
     }
@@ -4384,7 +6424,7 @@ impl ChargedSink for Count {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn scan_lane_charged<O: ChargedSink>(
+fn scan_lane_charged<O: ChargedSink, C: ByteCharge>(
     dedup: bool,
     sweeps: &mut u64,
     ctx: &Ctx,
@@ -4395,7 +6435,7 @@ fn scan_lane_charged<O: ChargedSink>(
     skip_self: bool,
     out: &mut O,
     cap: usize,
-    mut charge: Option<(&mut super::ctx::OwnedCharge, u64)>,
+    mut charge: Option<(&mut C, u64)>,
 ) -> Result<()> {
     let snap = &ctx.snap;
     let (kc, nc, pc) = lane.cols();
@@ -4910,7 +6950,7 @@ impl SearchContext {
                     s.skip_self,
                     &mut out,
                     cap,
-                    None,
+                    None::<(&mut super::ctx::OwnedCharge, u64)>,
                 )?;
             }
             if out.0 >= cap {
@@ -5155,17 +7195,14 @@ impl SearchContext {
         charge: &mut super::ctx::OwnedCharge,
         outer_bytes: u64,
     ) -> Result<f64> {
-        let Some(w) = spec.weight else {
-            return Ok(1.0);
-        };
-        if w.is_none() || spec.reifies.is_none() {
-            return Ok(spec.default_weight);
+        if let Some(w) = spec.fixed_weight() {
+            return Ok(w);
         }
         let key = e.triple();
         if let Some(&x) = self.weights.get(&key) {
             return Ok(x);
         }
-        let x = lookup_weight_charged(ctx, spec, w, key)?;
+        let x = lookup_weight_charged(ctx, spec, spec.weight.flatten(), key)?;
         let w_base = outer_bytes.saturating_add(self.retained_bytes());
         let _ = insert_hb_map(&mut self.weights, key, x, charge, w_base)?;
         Ok(x)
@@ -6437,6 +8474,892 @@ impl SearchContext {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn run_dijkstra_bounded(
+        &mut self,
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        root: u64,
+        forward: bool,
+        max_len: u32,
+        charge: &mut super::ctx::OwnedCharge,
+        outer_bytes: u64,
+    ) -> Result<BoundedTreeOutcome> {
+        self.set_roots(spec, &[root], charge, outer_bytes)?;
+        if max_len == 0 {
+            return Ok(BoundedTreeOutcome::Tree((Vec::new(), HbMap::default())));
+        }
+        let real = |x: u64| if x == VIRT { root } else { x };
+        let mut best_len: HbMap<u64, u32> = HbMap::default();
+        let mut dist: HbMap<u64, Vec<(u32, Cost)>> = HbMap::default();
+        let mut dist_vec_bytes = 0u64;
+        let mut parent: HbMap<(u64, u32), Parent> = HbMap::default();
+        let mut order: Vec<(u64, u32)> = Vec::new();
+        let mut heap: BoundedHeap = BinaryHeap::new();
+        let mut alternatives = ReverseAlternatives::default();
+        let mut best_virt: Option<(Cost, u32)> = None;
+        let (mut wmin, mut wmax) = (f64::INFINITY, 0.0f64);
+        let mut wide = false;
+        let track_reverse_wide = spec.track_reverse_wide(forward, max_len);
+        let local_bytes = |best_len: &HbMap<u64, u32>,
+                           dist: &HbMap<u64, Vec<(u32, Cost)>>,
+                           dist_vec_bytes: u64,
+                           parent: &HbMap<(u64, u32), Parent>,
+                           order: &Vec<(u64, u32)>,
+                           heap: &BoundedHeap,
+                           alternative_bytes: u64| {
+            map_bytes(best_len)
+                .saturating_add(map_bytes(dist))
+                .saturating_add(dist_vec_bytes)
+                .saturating_add(map_bytes(parent))
+                .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
+                .saturating_add(vec_bytes::<Reverse<(Cost, u32, u64)>>(heap.capacity()))
+                .saturating_add(alternative_bytes)
+        };
+        let mut base = self.retained_bytes().saturating_add(outer_bytes);
+        (_, base) = pareto_insert_charged(
+            &mut dist,
+            &mut dist_vec_bytes,
+            root,
+            0,
+            Cost::ZERO,
+            charge,
+            base,
+        )?;
+        let _ = push_heap(&mut heap, Reverse((Cost::ZERO, 0, root)), charge, base)?;
+        let mut n = 0u64;
+        while let Some(Reverse((d, l, u))) = heap.pop() {
+            n += 1;
+            if n.is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            if best_len.get(&u).is_some_and(|&bl| u == VIRT || l >= bl) {
+                continue;
+            }
+            let cur_base = self
+                .retained_bytes()
+                .saturating_add(outer_bytes)
+                .saturating_add(local_bytes(
+                    &best_len,
+                    &dist,
+                    dist_vec_bytes,
+                    &parent,
+                    &order,
+                    &heap,
+                    alternatives.bytes,
+                ));
+            let (prev, next_base) = insert_hb_map(&mut best_len, u, l, charge, cur_base)?;
+            if prev.is_none() && u != root {
+                let _ = push_vec(&mut order, (u, l), charge, next_base)?;
+            }
+            self.visit(spec, 1)?;
+            if u == VIRT || l >= max_len {
+                continue;
+            }
+            let loc = outer_bytes.saturating_add(local_bytes(
+                &best_len,
+                &dist,
+                dist_vec_bytes,
+                &parent,
+                &order,
+                &heap,
+                alternatives.bytes,
+            ));
+            let mut out_steps: Vec<(u64, Step)> = Vec::new();
+            self.expand(ctx, spec, &[u], forward, &mut out_steps, charge, loc)?;
+            let out_bytes = vec_bytes::<(u64, Step)>(out_steps.capacity());
+            // Re-expanding a shorter label sees the same edges. A boundary label
+            // is counted as settled but does not expand.
+            let record_hops = track_reverse_wide && prev.is_none_or(|len| len == max_len);
+            let nl = l + 1;
+            for (idx, (_, st)) in out_steps.iter().copied().enumerate() {
+                if idx.is_multiple_of(4096) {
+                    #[cfg(any(test, feature = "failpoints"))]
+                    test_hooks::fire_traversal_poll();
+                    ctx.check()?;
+                }
+                let y = if st.node == root { VIRT } else { st.node };
+                if y == u {
+                    continue;
+                }
+                if record_hops {
+                    let cur_base = self
+                        .retained_bytes()
+                        .saturating_add(outer_bytes)
+                        .saturating_add(local_bytes(
+                            &best_len,
+                            &dist,
+                            dist_vec_bytes,
+                            &parent,
+                            &order,
+                            &heap,
+                            alternatives.bytes,
+                        ))
+                        .saturating_add(out_bytes);
+                    let first_len = if y == VIRT {
+                        best_virt.map(|(_, len)| len)
+                    } else {
+                        dist.get(&y).and_then(|v| v.first()).map(|&(len, _)| len)
+                    };
+                    let first_hop = first_len.map(|len| parent[&(y, len)].node);
+                    alternatives.record(y, u, first_hop, charge, cur_base)?;
+                }
+                if best_len.get(&y).is_some_and(|&bl| y == VIRT || nl >= bl) {
+                    continue;
+                }
+                let e = if forward {
+                    Edge {
+                        from: u,
+                        to: y,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                } else {
+                    Edge {
+                        from: y,
+                        to: u,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                };
+                let step_outer = outer_bytes
+                    .saturating_add(local_bytes(
+                        &best_len,
+                        &dist,
+                        dist_vec_bytes,
+                        &parent,
+                        &order,
+                        &heap,
+                        alternatives.bytes,
+                    ))
+                    .saturating_add(out_bytes);
+                let w = self.weight(ctx, spec, &e.map(real), charge, step_outer)?;
+                if track_reverse_wide && !wide && w > 0.0 {
+                    wmin = wmin.min(w);
+                    wmax = wmax.max(w);
+                    if bounded_weights_too_wide(max_len, wmin, wmax) {
+                        wide = true;
+                    }
+                }
+                let nd = d.add(Cost::of(w));
+                if track_reverse_wide && !wide && nd.hi.is_infinite() {
+                    wide = true;
+                }
+                let mut cur_base = self.retained_bytes().saturating_add(step_outer);
+                if y == VIRT {
+                    if best_virt.is_some_and(|(bc, bl)| (nd, nl) >= (bc, bl)) {
+                        continue;
+                    }
+                    best_virt = Some((nd, nl));
+                } else {
+                    let (kept, next_base) = pareto_insert_charged(
+                        &mut dist,
+                        &mut dist_vec_bytes,
+                        y,
+                        nl,
+                        nd,
+                        charge,
+                        cur_base,
+                    )?;
+                    if !kept {
+                        continue;
+                    }
+                    cur_base = next_base;
+                }
+                (_, cur_base) = insert_hb_map(
+                    &mut parent,
+                    (y, nl),
+                    Parent {
+                        node: u,
+                        p: st.p,
+                        rev: st.rev,
+                    },
+                    charge,
+                    cur_base,
+                )?;
+                let _ = push_heap(&mut heap, Reverse((nd, nl, y)), charge, cur_base)?;
+            }
+            drop(out_steps);
+            charge.resize(
+                self.retained_bytes()
+                    .saturating_add(outer_bytes)
+                    .saturating_add(local_bytes(
+                        &best_len,
+                        &dist,
+                        dist_vec_bytes,
+                        &parent,
+                        &order,
+                        &heap,
+                        alternatives.bytes,
+                    )),
+            )?;
+        }
+        drop(dist);
+        drop(heap);
+        if wide && !alternatives.branches.is_empty() {
+            let base = self
+                .retained_bytes()
+                .saturating_add(outer_bytes)
+                .saturating_add(
+                    map_bytes(&parent)
+                        .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
+                        .saturating_add(map_bytes(&best_len)),
+                );
+            charge.resize(base.saturating_add(alternatives.bytes))?;
+            return Ok(BoundedTreeOutcome::ReverseWide {
+                order,
+                parent,
+                bwd_dist: best_len,
+                alternatives,
+            });
+        }
+        drop(alternatives);
+        drop(best_len);
+        charge.resize(
+            self.retained_bytes()
+                .saturating_add(outer_bytes)
+                .saturating_add(map_bytes(&parent))
+                .saturating_add(vec_bytes::<(u64, u32)>(order.capacity())),
+        )?;
+        Ok(BoundedTreeOutcome::Tree((order, parent)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_dijkstra_pair_bounded(
+        &mut self,
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        from: u64,
+        to: u64,
+        virt: u64,
+        banned_nodes: Option<&HbSet<u64>>,
+        banned_edges: Option<&HbSet<Edge>>,
+        max_len: u32,
+        prefix: PrefixCost,
+        charge: &mut super::ctx::OwnedCharge,
+        outer_bytes: u64,
+    ) -> Result<Option<Vec<Edge>>> {
+        debug_assert!(from != to);
+        let cycle = to == VIRT;
+        let real = |x: u64| if x == VIRT { virt } else { x };
+        self.set_roots(spec, &[from, real(to)], charge, outer_bytes)?;
+        if max_len == 0 {
+            return Ok(None);
+        }
+        if prefix.total_max_len > 1
+            && (prefix.cost.hi.is_infinite()
+                || bounded_weights_too_wide(prefix.total_max_len, prefix.wmin, prefix.wmax))
+        {
+            return self.run_dijkstra_pair_bounded_forward(
+                ctx,
+                spec,
+                from,
+                to,
+                virt,
+                banned_nodes,
+                banned_edges,
+                max_len,
+                prefix.cost,
+                None,
+                charge,
+                outer_bytes,
+            );
+        }
+        let max_side = [max_len.div_ceil(2), max_len / 2];
+        let mut dist: [HbMap<u64, Vec<(u32, Cost)>>; 2] = Default::default();
+        let mut dist_vec_bytes = [0u64; 2];
+        let mut best_len: [HbMap<u64, u32>; 2] = Default::default();
+        let mut parent: [HbMap<(u64, u32), Parent>; 2] = Default::default();
+        let mut heaps: [BoundedHeap; 2] = Default::default();
+        let mut bounds: [Option<Cost>; 2] = [None, None];
+        let local_bytes = |dist: &[HbMap<u64, Vec<(u32, Cost)>>; 2],
+                           dist_vec_bytes: &[u64; 2],
+                           best_len: &[HbMap<u64, u32>; 2],
+                           parent: &[HbMap<(u64, u32), Parent>; 2],
+                           heaps: &[BoundedHeap; 2]| {
+            map_bytes(&dist[0])
+                .saturating_add(map_bytes(&dist[1]))
+                .saturating_add(dist_vec_bytes[0])
+                .saturating_add(dist_vec_bytes[1])
+                .saturating_add(map_bytes(&best_len[0]))
+                .saturating_add(map_bytes(&best_len[1]))
+                .saturating_add(map_bytes(&parent[0]))
+                .saturating_add(map_bytes(&parent[1]))
+                .saturating_add(vec_bytes::<Reverse<(Cost, u32, u64)>>(heaps[0].capacity()))
+                .saturating_add(vec_bytes::<Reverse<(Cost, u32, u64)>>(heaps[1].capacity()))
+        };
+        let mut base = self.retained_bytes().saturating_add(outer_bytes);
+        for (i, r) in [from, to].into_iter().enumerate() {
+            (_, base) = pareto_insert_charged(
+                &mut dist[i],
+                &mut dist_vec_bytes[i],
+                r,
+                0,
+                Cost::ZERO,
+                charge,
+                base,
+            )?;
+            if max_side[i] > 0 {
+                base = push_heap(&mut heaps[i], Reverse((Cost::ZERO, 0, r)), charge, base)?;
+            } else {
+                (_, base) = insert_hb_map(&mut best_len[i], r, 0, charge, base)?;
+                bounds[i] = Some(Cost::ZERO);
+            }
+        }
+        let mut best: Option<(Cost, u64, (u32, u32))> = None;
+        let mut n = 0u64;
+        let (mut wmin, mut wmax) = (prefix.wmin, prefix.wmax);
+        let mut wide = false;
+        'search: loop {
+            let mut tops: [Option<Cost>; 2] = [None, None];
+            for i in 0..2 {
+                while let Some(&Reverse((_, l, u))) = heaps[i].peek() {
+                    if best_len[i].get(&u).is_none_or(|&bl| l < bl) {
+                        break;
+                    }
+                    heaps[i].pop();
+                    n += 1;
+                    if n.is_multiple_of(4096) {
+                        ctx.check()?;
+                    }
+                }
+                tops[i] = heaps[i].peek().map(|r| r.0.0);
+            }
+            let lb = opt_cost_min(
+                opt_cost_add(tops[0], opt_cost_min(tops[1], bounds[1])),
+                opt_cost_add(tops[1], opt_cost_min(tops[0], bounds[0])),
+            );
+            let Some(lb) = lb else {
+                break;
+            };
+            if prefix.total_max_len > 1
+                && (lb.hi.is_infinite() || prefix.cost.add(lb).hi.is_infinite())
+            {
+                wide = true;
+                break;
+            }
+            if best.is_some_and(|(mu, _, _)| lb >= mu) {
+                break;
+            }
+            let side = if heaps[0].is_empty() || heaps[1].is_empty() {
+                usize::from(heaps[0].is_empty())
+            } else {
+                usize::from(heaps[0].len() > heaps[1].len())
+            };
+            let forward = side == 0;
+            let other = 1 - side;
+            let Reverse((d, l, u)) = heaps[side].pop().unwrap();
+            base = self
+                .retained_bytes()
+                .saturating_add(outer_bytes)
+                .saturating_add(local_bytes(
+                    &dist,
+                    &dist_vec_bytes,
+                    &best_len,
+                    &parent,
+                    &heaps,
+                ));
+            let _ = insert_hb_map(&mut best_len[side], u, l, charge, base)?;
+            self.visit(spec, 1)?;
+            n += 1;
+            if n.is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            let my_root = if forward { from } else { to };
+            let other_root = if forward { to } else { from };
+            if u == other_root {
+                continue;
+            }
+            let scan = real(u);
+            let loc = outer_bytes.saturating_add(local_bytes(
+                &dist,
+                &dist_vec_bytes,
+                &best_len,
+                &parent,
+                &heaps,
+            ));
+            let mut cached_steps: Option<std::sync::Arc<[Step]>> = None;
+            let mut out_steps: Vec<(u64, Step)> = Vec::new();
+            if banned_nodes.is_some() {
+                cached_steps = Some(self.neighbours(ctx, spec, scan, forward, charge, loc)?);
+            } else {
+                self.expand(ctx, spec, &[scan], forward, &mut out_steps, charge, loc)?;
+            }
+            let out_bytes = vec_bytes::<(u64, Step)>(out_steps.capacity());
+            let step_count = cached_steps.as_ref().map_or(out_steps.len(), |s| s.len());
+            let nl = l + 1;
+            let at_boundary = nl == max_side[side];
+            for idx in 0..step_count {
+                if idx.is_multiple_of(4096) {
+                    #[cfg(any(test, feature = "failpoints"))]
+                    test_hooks::fire_traversal_poll();
+                    ctx.check()?;
+                }
+                let st = match &cached_steps {
+                    Some(s) => s[idx],
+                    None => out_steps[idx].1,
+                };
+                let y = if forward && cycle && st.node == virt {
+                    VIRT
+                } else {
+                    st.node
+                };
+                if y == my_root || banned_nodes.is_some_and(|b| b.contains(&y)) {
+                    continue;
+                }
+                if max_side[other] == 0 && y != other_root {
+                    continue;
+                }
+                if best_len[side].get(&y).is_some_and(|&bl| nl >= bl) {
+                    continue;
+                }
+                let e = if forward {
+                    Edge {
+                        from: u,
+                        to: y,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                } else {
+                    Edge {
+                        from: y,
+                        to: u,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                };
+                if banned_edges.is_some_and(|b| b.contains(&e)) {
+                    continue;
+                }
+                let step_outer = outer_bytes
+                    .saturating_add(local_bytes(
+                        &dist,
+                        &dist_vec_bytes,
+                        &best_len,
+                        &parent,
+                        &heaps,
+                    ))
+                    .saturating_add(out_bytes);
+                let w = self.weight(ctx, spec, &e.map(real), charge, step_outer)?;
+                if w > 0.0 {
+                    wmin = wmin.min(w);
+                    wmax = wmax.max(w);
+                    if bounded_weights_too_wide(prefix.total_max_len, wmin, wmax) {
+                        wide = true;
+                        break 'search;
+                    }
+                }
+                let nd = d.add(Cost::of(w));
+                if prefix.total_max_len > 1
+                    && (nd.hi.is_infinite() || prefix.cost.add(nd).hi.is_infinite())
+                {
+                    wide = true;
+                    break 'search;
+                }
+                let mut cur_base = self.retained_bytes().saturating_add(step_outer);
+                let (kept, next_base) = pareto_insert_charged(
+                    &mut dist[side],
+                    &mut dist_vec_bytes[side],
+                    y,
+                    nl,
+                    nd,
+                    charge,
+                    cur_base,
+                )?;
+                if !kept {
+                    continue;
+                }
+                cur_base = next_base;
+                (_, cur_base) = insert_hb_map(
+                    &mut parent[side],
+                    (y, nl),
+                    Parent {
+                        node: u,
+                        p: st.p,
+                        rev: st.rev,
+                    },
+                    charge,
+                    cur_base,
+                )?;
+                if y != other_root {
+                    if !at_boundary {
+                        let _ =
+                            push_heap(&mut heaps[side], Reverse((nd, nl, y)), charge, cur_base)?;
+                    } else {
+                        bounds[side] = opt_cost_min(bounds[side], Some(nd));
+                    }
+                }
+                if let Some(other_v) = dist[other].get(&y)
+                    && let Some((l_other, c_other)) = pareto_best_within(other_v, max_len - nl)
+                {
+                    let total = if forward {
+                        nd.add(c_other)
+                    } else {
+                        c_other.add(nd)
+                    };
+                    if prefix.total_max_len > 1
+                        && (total.hi.is_infinite() || prefix.cost.add(total).hi.is_infinite())
+                    {
+                        wide = true;
+                        break 'search;
+                    }
+                    if best.is_none_or(|(mu, _, _)| total < mu) {
+                        let block_outer = outer_bytes
+                            .saturating_add(local_bytes(
+                                &dist,
+                                &dist_vec_bytes,
+                                &best_len,
+                                &parent,
+                                &heaps,
+                            ))
+                            .saturating_add(out_bytes);
+                        let pass = y == from
+                            || y == to
+                            || !(self.sink(ctx, y, true)
+                                || self.blocked(ctx, spec, y, charge, block_outer)?);
+                        if pass {
+                            let lens = if forward {
+                                (nl, l_other)
+                            } else {
+                                (l_other, nl)
+                            };
+                            best = Some((total, y, lens));
+                        }
+                    }
+                }
+            }
+            drop(out_steps);
+            drop(cached_steps);
+            charge.resize(
+                self.retained_bytes()
+                    .saturating_add(outer_bytes)
+                    .saturating_add(local_bytes(
+                        &dist,
+                        &dist_vec_bytes,
+                        &best_len,
+                        &parent,
+                        &heaps,
+                    )),
+            )?;
+        }
+        drop(dist);
+        drop(best_len);
+        drop(heaps);
+        if wide {
+            drop(parent);
+            charge.resize(self.retained_bytes().saturating_add(outer_bytes))?;
+            return self.run_dijkstra_pair_bounded_forward(
+                ctx,
+                spec,
+                from,
+                to,
+                virt,
+                banned_nodes,
+                banned_edges,
+                max_len,
+                prefix.cost,
+                None,
+                charge,
+                outer_bytes,
+            );
+        }
+        let Some((_, m, (lf, lb))) = best else {
+            drop(parent);
+            charge.resize(self.retained_bytes().saturating_add(outer_bytes))?;
+            return Ok(None);
+        };
+        let combined_len = (lf as usize).saturating_add(lb as usize);
+        let parent_bytes = map_bytes(&parent[0]).saturating_add(map_bytes(&parent[1]));
+        let base_no_parent = self.retained_bytes().saturating_add(outer_bytes);
+        charge.resize(
+            base_no_parent
+                .saturating_add(parent_bytes)
+                .saturating_add(vec_bytes::<Edge>(combined_len)),
+        )?;
+        let mut a = Vec::with_capacity(combined_len);
+        let mut cur = m;
+        let mut l = lf;
+        let mut steps = 0usize;
+        while l > 0 {
+            steps += 1;
+            if steps.is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            let q = parent[0][&(cur, l)];
+            a.push(Edge {
+                from: q.node,
+                to: cur,
+                p: q.p,
+                rev: q.rev,
+            });
+            cur = q.node;
+            l -= 1;
+        }
+        a.reverse();
+        let mut cur = m;
+        let mut l = lb;
+        while l > 0 {
+            steps += 1;
+            if steps.is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            let q = parent[1][&(cur, l)];
+            a.push(Edge {
+                from: cur,
+                to: q.node,
+                p: q.p,
+                rev: q.rev,
+            });
+            cur = q.node;
+            l -= 1;
+        }
+        drop(parent);
+        let path = without_loops_charged(ctx, from, a, charge, base_no_parent)?;
+        charge.resize(base_no_parent.saturating_add(vec_bytes::<Edge>(path.capacity())))?;
+        Ok(Some(path))
+    }
+
+    /// Source-order one-ended bounded Pareto search used as a fallback from
+    /// [`run_dijkstra_pair_bounded`] and reverse [`run_dijkstra_bounded`] when wide weights
+    /// or overflow could make split or reverse sums disagree with source-order accumulation.
+    #[allow(clippy::too_many_arguments)]
+    fn run_dijkstra_pair_bounded_forward(
+        &mut self,
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        from: u64,
+        to: u64,
+        virt: u64,
+        banned_nodes: Option<&HbSet<u64>>,
+        banned_edges: Option<&HbSet<Edge>>,
+        max_len: u32,
+        init_cost: Cost,
+        bwd_dist: Option<&HbMap<u64, u32>>,
+        charge: &mut super::ctx::OwnedCharge,
+        outer_bytes: u64,
+    ) -> Result<Option<Vec<Edge>>> {
+        debug_assert!(from != to);
+        let cycle = to == VIRT;
+        let real = |x: u64| if x == VIRT { virt } else { x };
+        self.set_roots(spec, &[from, real(to)], charge, outer_bytes)?;
+        if max_len == 0 {
+            return Ok(None);
+        }
+        let mut dist: HbMap<u64, Vec<(u32, Cost)>> = HbMap::default();
+        let mut dist_vec_bytes = 0u64;
+        let mut best_len: HbMap<u64, u32> = HbMap::default();
+        let mut parent: HbMap<(u64, u32), Parent> = HbMap::default();
+        let mut heap: BoundedHeap = BinaryHeap::new();
+        let mut best_to: Option<(Cost, u32)> = None;
+        let local_bytes = |dist: &HbMap<u64, Vec<(u32, Cost)>>,
+                           dist_vec_bytes: u64,
+                           best_len: &HbMap<u64, u32>,
+                           parent: &HbMap<(u64, u32), Parent>,
+                           heap: &BoundedHeap| {
+            map_bytes(dist)
+                .saturating_add(dist_vec_bytes)
+                .saturating_add(map_bytes(best_len))
+                .saturating_add(map_bytes(parent))
+                .saturating_add(vec_bytes::<Reverse<(Cost, u32, u64)>>(heap.capacity()))
+        };
+        let mut base = self.retained_bytes().saturating_add(outer_bytes);
+        (_, base) = pareto_insert_charged(
+            &mut dist,
+            &mut dist_vec_bytes,
+            from,
+            0,
+            init_cost,
+            charge,
+            base,
+        )?;
+        let _ = push_heap(&mut heap, Reverse((init_cost, 0, from)), charge, base)?;
+        let mut n = 0u64;
+        let mut found_len: Option<u32> = None;
+        while let Some(Reverse((d, l, u))) = heap.pop() {
+            n += 1;
+            if n.is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            if best_len.get(&u).is_some_and(|&bl| u == to || l >= bl) {
+                continue;
+            }
+            let cur_base = self
+                .retained_bytes()
+                .saturating_add(outer_bytes)
+                .saturating_add(local_bytes(
+                    &dist,
+                    dist_vec_bytes,
+                    &best_len,
+                    &parent,
+                    &heap,
+                ));
+            let _ = insert_hb_map(&mut best_len, u, l, charge, cur_base)?;
+            self.visit(spec, 1)?;
+            if u == to {
+                found_len = Some(l);
+                break;
+            }
+            if l >= max_len {
+                continue;
+            }
+            let scan = real(u);
+            let loc = outer_bytes.saturating_add(local_bytes(
+                &dist,
+                dist_vec_bytes,
+                &best_len,
+                &parent,
+                &heap,
+            ));
+            let mut cached_steps: Option<std::sync::Arc<[Step]>> = None;
+            let mut out_steps: Vec<(u64, Step)> = Vec::new();
+            if banned_nodes.is_some() {
+                cached_steps = Some(self.neighbours(ctx, spec, scan, true, charge, loc)?);
+            } else {
+                self.expand(ctx, spec, &[scan], true, &mut out_steps, charge, loc)?;
+            }
+            let out_bytes = vec_bytes::<(u64, Step)>(out_steps.capacity());
+            let step_count = cached_steps.as_ref().map_or(out_steps.len(), |s| s.len());
+            let nl = l + 1;
+            for idx in 0..step_count {
+                if idx.is_multiple_of(4096) {
+                    #[cfg(any(test, feature = "failpoints"))]
+                    test_hooks::fire_traversal_poll();
+                    ctx.check()?;
+                }
+                let st = match &cached_steps {
+                    Some(s) => s[idx],
+                    None => out_steps[idx].1,
+                };
+                let y = if cycle && st.node == virt {
+                    VIRT
+                } else {
+                    st.node
+                };
+                if y == from || banned_nodes.is_some_and(|b| b.contains(&y)) {
+                    continue;
+                }
+                if nl == max_len && y != to {
+                    continue;
+                }
+                if y != to
+                    && let Some(bd) = bwd_dist
+                    && bd
+                        .get(&y)
+                        .is_none_or(|&rem| nl.saturating_add(rem) > max_len)
+                {
+                    continue;
+                }
+                if best_len.get(&y).is_some_and(|&bl| y == to || nl >= bl) {
+                    continue;
+                }
+                let e = Edge {
+                    from: u,
+                    to: y,
+                    p: st.p,
+                    rev: st.rev,
+                };
+                if banned_edges.is_some_and(|b| b.contains(&e)) {
+                    continue;
+                }
+                let step_outer = outer_bytes
+                    .saturating_add(local_bytes(
+                        &dist,
+                        dist_vec_bytes,
+                        &best_len,
+                        &parent,
+                        &heap,
+                    ))
+                    .saturating_add(out_bytes);
+                let w = self.weight(ctx, spec, &e.map(real), charge, step_outer)?;
+                let nd = d.add(Cost::of(w));
+                let mut cur_base = self.retained_bytes().saturating_add(step_outer);
+                if y == to {
+                    if best_to.is_some_and(|(bc, bl)| (nd, nl) >= (bc, bl)) {
+                        continue;
+                    }
+                    best_to = Some((nd, nl));
+                } else {
+                    let (kept, next_base) = pareto_insert_charged(
+                        &mut dist,
+                        &mut dist_vec_bytes,
+                        y,
+                        nl,
+                        nd,
+                        charge,
+                        cur_base,
+                    )?;
+                    if !kept {
+                        continue;
+                    }
+                    cur_base = next_base;
+                }
+                (_, cur_base) = insert_hb_map(
+                    &mut parent,
+                    (y, nl),
+                    Parent {
+                        node: u,
+                        p: st.p,
+                        rev: st.rev,
+                    },
+                    charge,
+                    cur_base,
+                )?;
+                let _ = push_heap(&mut heap, Reverse((nd, nl, y)), charge, cur_base)?;
+            }
+            drop(out_steps);
+            drop(cached_steps);
+            charge.resize(
+                self.retained_bytes()
+                    .saturating_add(outer_bytes)
+                    .saturating_add(local_bytes(
+                        &dist,
+                        dist_vec_bytes,
+                        &best_len,
+                        &parent,
+                        &heap,
+                    )),
+            )?;
+        }
+        drop(dist);
+        drop(best_len);
+        drop(heap);
+        let base_no_parent = self.retained_bytes().saturating_add(outer_bytes);
+        let Some(len) = found_len else {
+            drop(parent);
+            charge.resize(base_no_parent)?;
+            return Ok(None);
+        };
+        let parent_bytes = map_bytes(&parent);
+        charge.resize(
+            base_no_parent
+                .saturating_add(parent_bytes)
+                .saturating_add(vec_bytes::<Edge>(len as usize)),
+        )?;
+        let mut a = Vec::with_capacity(len as usize);
+        let mut cur = to;
+        let mut l = len;
+        let mut steps = 0usize;
+        while l > 0 {
+            steps += 1;
+            if steps.is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            let q = parent[&(cur, l)];
+            a.push(Edge {
+                from: q.node,
+                to: cur,
+                p: q.p,
+                rev: q.rev,
+            });
+            cur = q.node;
+            l -= 1;
+        }
+        a.reverse();
+        drop(parent);
+        charge.resize(base_no_parent.saturating_add(vec_bytes::<Edge>(a.capacity())))?;
+        Ok(Some(a))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn run_spur(
         &mut self,
         ctx: &Ctx,
@@ -6447,22 +9370,40 @@ impl SearchContext {
         banned_nodes: &HbSet<u64>,
         banned_edges: &HbSet<Edge>,
         budget: Option<u32>,
+        prefix: PrefixCost,
         charge: &mut super::ctx::OwnedCharge,
         outer_bytes: u64,
     ) -> Result<Option<(Vec<Edge>, f64)>> {
-        if spec.weighted() && to != VIRT && from != to {
-            return self.run_dijkstra_pair(
-                ctx,
-                spec,
-                from,
-                to,
-                Some(banned_nodes),
-                Some(banned_edges),
-                charge,
-                outer_bytes,
-            );
-        }
         if spec.weighted() {
+            if let Some(max) = budget {
+                return Ok(self
+                    .run_dijkstra_pair_bounded(
+                        ctx,
+                        spec,
+                        from,
+                        to,
+                        virt,
+                        Some(banned_nodes),
+                        Some(banned_edges),
+                        max,
+                        prefix,
+                        charge,
+                        outer_bytes,
+                    )?
+                    .map(|p| (p, 0.0)));
+            }
+            if to != VIRT && from != to {
+                return self.run_dijkstra_pair(
+                    ctx,
+                    spec,
+                    from,
+                    to,
+                    Some(banned_nodes),
+                    Some(banned_edges),
+                    charge,
+                    outer_bytes,
+                );
+            }
             let close = to == VIRT;
             let target_id = if close { virt } else { to };
             let (tree, dist) = self.run_dijkstra(
@@ -7364,12 +10305,9 @@ impl BidiWeightedAllJob {
     }
 }
 
-/// Resumable Yen's algorithm for `path:kShortest` and weighted `path:shortest` /
-/// `path:allShortest` with `path:maxLength`.
+/// Resumable Yen's algorithm for `path:kShortest` and weighted `path:allShortest` with
+/// `path:maxLength`.
 enum YenMode {
-    Shortest {
-        max_len: u32,
-    },
     AllShortest {
         max_len: u32,
         best: Option<Cost>,
@@ -7457,9 +10395,6 @@ impl YenJob {
     fn open(spec: &PathSearchSpec, search: &mut SearchContext, s: u64, t: u64) -> Self {
         search.begin();
         let mode = match spec.algorithm {
-            Algorithm::Shortest => YenMode::Shortest {
-                max_len: spec.max_len.unwrap_or(u32::MAX),
-            },
             Algorithm::AllShortest => YenMode::AllShortest {
                 max_len: spec.max_len.unwrap_or(u32::MAX),
                 best: None,
@@ -7469,7 +10404,9 @@ impl YenJob {
                 emitted: 0,
                 k: spec.k,
             },
-            Algorithm::All => unreachable!("YenJob handles Shortest, AllShortest and KShortest"),
+            Algorithm::Shortest | Algorithm::All => {
+                unreachable!("YenJob handles AllShortest and KShortest")
+            }
         };
         let pending_zero = spec.min_len == 0 && s == t;
         Self {
@@ -7520,7 +10457,7 @@ impl YenJob {
         if self.pending_zero {
             self.pending_zero = false;
             match &mut self.mode {
-                YenMode::Shortest { .. } | YenMode::AllShortest { .. } => {
+                YenMode::AllShortest { .. } => {
                     self.done = true;
                 }
                 YenMode::KShortest { emitted, k, .. } => {
@@ -7542,14 +10479,24 @@ impl YenJob {
         let s = self.s;
         let tt = self.tt;
         let real = |x: u64| if x == VIRT { s } else { x };
-        let budget = if spec.weighted() { None } else { spec.max_len };
+        let budget = spec.max_len;
         if !self.initialized {
             self.initialized = true;
             let none_n = HbSet::default();
             let none_e = HbSet::default();
             let spur_outer = outer_bytes.saturating_add(self.retained_bytes());
             let Some((first, _)) = search.run_spur(
-                ctx, spec, s, tt, s, &none_n, &none_e, budget, charge, spur_outer,
+                ctx,
+                spec,
+                s,
+                tt,
+                s,
+                &none_n,
+                &none_e,
+                budget,
+                PrefixCost::zero(budget.unwrap_or(0)),
+                charge,
+                spur_outer,
             )?
             else {
                 self.done = true;
@@ -7602,13 +10549,33 @@ impl YenJob {
                     nodes.push(e.to);
                 }
                 let nodes_cap_bytes = vec_bytes::<u64>(nodes.capacity());
+                let track_prefix = spec.weighted() && budget.is_some();
+                let mut prefix_cost = Cost::ZERO;
+                let (mut prefix_wmin, mut prefix_wmax) = (f64::INFINITY, 0.0f64);
                 for i in 0..cur_len {
                     ctx.check()?;
                     let step_budget = match budget {
-                        Some(m) if m <= i as u32 => continue,
+                        Some(m) if m <= i as u32 => break,
                         Some(m) => Some(m - i as u32),
                         None => None,
                     };
+                    if i > 0 && track_prefix {
+                        let edge = self.a.last().unwrap().0[i - 1].map(real);
+                        let w = search.weight(
+                            ctx,
+                            spec,
+                            &edge,
+                            charge,
+                            outer_bytes
+                                .saturating_add(self.retained_bytes())
+                                .saturating_add(nodes_cap_bytes),
+                        )?;
+                        if w > 0.0 {
+                            prefix_wmin = prefix_wmin.min(w);
+                            prefix_wmax = prefix_wmax.max(w);
+                        }
+                        prefix_cost = prefix_cost.add(Cost::of(w));
+                    }
                     let mut banned_edges: HbSet<Edge> = HbSet::default();
                     let mut banned_nodes: HbSet<u64> = HbSet::default();
                     let mut loop_base = search
@@ -7635,6 +10602,12 @@ impl YenJob {
                         .saturating_add(nodes_cap_bytes)
                         .saturating_add(set_bytes(&banned_edges))
                         .saturating_add(set_bytes(&banned_nodes));
+                    let prefix = PrefixCost {
+                        cost: prefix_cost,
+                        wmin: prefix_wmin,
+                        wmax: prefix_wmax,
+                        total_max_len: budget.unwrap_or(0),
+                    };
                     let sp = search.run_spur(
                         ctx,
                         spec,
@@ -7644,6 +10617,7 @@ impl YenJob {
                         &banned_nodes,
                         &banned_edges,
                         step_budget,
+                        prefix,
                         charge,
                         spur_outer,
                     )?;
@@ -7753,12 +10727,6 @@ impl YenJob {
             self.need_expand = true;
             let len_u32 = cur_len as u32;
             match &mut self.mode {
-                YenMode::Shortest { max_len } => {
-                    if len_u32 < self.min_len || len_u32 > *max_len {
-                        continue;
-                    }
-                    self.done = true;
-                }
                 YenMode::AllShortest { max_len, best } => {
                     if let Some(b) = *best
                         && cur_cost > b
@@ -8211,11 +11179,299 @@ impl AllPathsJob {
 }
 
 /// Active resumable search stream for one scheduled job.
+enum BoundedShortestState {
+    Tree {
+        parent: HbMap<(u64, u32), Parent>,
+        order: Vec<(u64, u32)>,
+        idx: usize,
+    },
+    ReverseWide {
+        parent: HbMap<(u64, u32), Parent>,
+        order: Vec<(u64, u32)>,
+        bwd_dist: HbMap<u64, u32>,
+        alternatives: ReverseAlternatives,
+        ancestry: Option<ReverseAncestry<Option<super::ctx::RetainedCharge>>>,
+        idx: usize,
+        max_len: u32,
+    },
+}
+
+/// Resumable job for length-bounded weighted `path:shortest` with an unbound end
+/// (ROADMAP item 275): runs one Pareto-pruned search (and, for reverse wide weights with
+/// multi-route nodes, re-solves only multi-route sources and sources whose reverse tree
+/// path passes through one within the remaining length budget in source order pruned by
+/// the reverse search's minimum edge distances) and emits each reached node's optimal path
+/// within `max_len` on demand.
+struct BoundedShortestJob {
+    root: u64,
+    forward: bool,
+    state: BoundedShortestState,
+    pending_zero: bool,
+    skip_virt: bool,
+    need_edges: bool,
+}
+
+impl BoundedShortestJob {
+    #[allow(clippy::too_many_arguments)]
+    fn open(
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        search: &mut SearchContext,
+        root: u64,
+        forward: bool,
+        max_len: u32,
+        charge: &mut super::ctx::OwnedCharge,
+        outer_bytes: u64,
+    ) -> Result<Self> {
+        search.begin();
+        let state = match search.run_dijkstra_bounded(
+            ctx,
+            spec,
+            root,
+            forward,
+            max_len,
+            charge,
+            outer_bytes,
+        )? {
+            BoundedTreeOutcome::Tree((order, parent)) => BoundedShortestState::Tree {
+                parent,
+                order,
+                idx: 0,
+            },
+            BoundedTreeOutcome::ReverseWide {
+                order,
+                parent,
+                bwd_dist,
+                alternatives,
+            } => BoundedShortestState::ReverseWide {
+                parent,
+                order,
+                bwd_dist,
+                alternatives,
+                ancestry: None,
+                idx: 0,
+                max_len,
+            },
+        };
+        let pending_zero = spec.min_len == 0;
+        Ok(Self {
+            root,
+            forward,
+            state,
+            pending_zero,
+            skip_virt: pending_zero,
+            need_edges: spec.per_edge() || spec.weighted(),
+        })
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        match &self.state {
+            BoundedShortestState::Tree { parent, order, .. } => {
+                map_bytes(parent).saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
+            }
+            BoundedShortestState::ReverseWide {
+                parent,
+                order,
+                bwd_dist,
+                alternatives,
+                ..
+            } => map_bytes(parent)
+                .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
+                .saturating_add(map_bytes(bwd_dist))
+                .saturating_add(alternatives.bytes),
+        }
+    }
+
+    fn next_path(
+        &mut self,
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        search: &mut SearchContext,
+        charge: &mut super::ctx::OwnedCharge,
+        outer_bytes: u64,
+    ) -> Result<Option<Found>> {
+        if self.pending_zero {
+            self.pending_zero = false;
+            search.paths_found += 1;
+            return Ok(Some(Found {
+                start: self.root,
+                end: self.root,
+                edges: Vec::new(),
+                len: 0,
+                cost: 0.0,
+            }));
+        }
+        let job_outer = outer_bytes.saturating_add(self.retained_bytes());
+        match &mut self.state {
+            BoundedShortestState::Tree { parent, order, idx } => {
+                while *idx < order.len() {
+                    let (m, len) = order[*idx];
+                    *idx += 1;
+                    if self.skip_virt && m == VIRT {
+                        continue;
+                    }
+                    let real = |x: u64| if x == VIRT { self.root } else { x };
+                    let base = search.retained_bytes().saturating_add(job_outer);
+                    charge.resize(base.saturating_add(vec_bytes::<Edge>(len as usize)))?;
+                    let mut edges = Vec::with_capacity(len as usize);
+                    let mut cur = m;
+                    let mut l = len;
+                    let mut steps = 0usize;
+                    while l > 0 {
+                        steps += 1;
+                        if steps.is_multiple_of(4096) {
+                            ctx.check()?;
+                        }
+                        let q = parent[&(cur, l)];
+                        let e = if self.forward {
+                            Edge {
+                                from: q.node,
+                                to: cur,
+                                p: q.p,
+                                rev: q.rev,
+                            }
+                        } else {
+                            Edge {
+                                from: cur,
+                                to: q.node,
+                                p: q.p,
+                                rev: q.rev,
+                            }
+                        };
+                        edges.push(e.map(real));
+                        cur = q.node;
+                        l -= 1;
+                    }
+                    if self.forward {
+                        edges.reverse();
+                    }
+                    let cost = search.path_cost(
+                        ctx,
+                        spec,
+                        &edges,
+                        charge,
+                        job_outer.saturating_add(vec_bytes::<Edge>(edges.capacity())),
+                    )?;
+                    let edges = if self.need_edges { edges } else { Vec::new() };
+                    charge.resize(
+                        search
+                            .retained_bytes()
+                            .saturating_add(job_outer)
+                            .saturating_add(vec_bytes::<Edge>(edges.capacity())),
+                    )?;
+                    let other = real(m);
+                    let (start, end) = if self.forward {
+                        (self.root, other)
+                    } else {
+                        (other, self.root)
+                    };
+                    search.paths_found += 1;
+                    return Ok(Some(Found {
+                        start,
+                        end,
+                        edges,
+                        len: len as usize,
+                        cost,
+                    }));
+                }
+                Ok(None)
+            }
+            BoundedShortestState::ReverseWide {
+                parent,
+                order,
+                bwd_dist,
+                alternatives,
+                ancestry,
+                idx,
+                max_len,
+            } => {
+                while *idx < order.len() {
+                    let (m, len) = order[*idx];
+                    *idx += 1;
+                    if self.skip_virt && m == VIRT {
+                        continue;
+                    }
+                    let start = if m == VIRT { self.root } else { m };
+                    let (edges, len) = if !alternatives.chain_has_multi(
+                        ctx,
+                        &mut ReverseHopTree {
+                            parent,
+                            dist: bwd_dist,
+                            ancestry,
+                            charge_index: &|bytes| ctx.retained_charge(bytes),
+                        },
+                        m,
+                        len,
+                        *max_len,
+                    )? {
+                        let base = search.retained_bytes().saturating_add(job_outer);
+                        charge.resize(base.saturating_add(vec_bytes::<Edge>(len as usize)))?;
+                        let edges = reconstruct_bounded(ctx, self.root, false, parent, m, len)?;
+                        (edges, len as usize)
+                    } else {
+                        let to = if m == VIRT { VIRT } else { self.root };
+                        let real = |x: u64| if x == VIRT { start } else { x };
+                        let Some(mut edges) = search.run_dijkstra_pair_bounded_forward(
+                            ctx,
+                            spec,
+                            start,
+                            to,
+                            start,
+                            None,
+                            None,
+                            *max_len,
+                            Cost::ZERO,
+                            Some(bwd_dist),
+                            charge,
+                            job_outer,
+                        )?
+                        else {
+                            continue;
+                        };
+                        for (i, edge) in edges.iter_mut().enumerate() {
+                            if i.is_multiple_of(4096) {
+                                ctx.check()?;
+                            }
+                            *edge = edge.map(real);
+                        }
+                        let len = edges.len();
+                        (edges, len)
+                    };
+                    let cost = search.path_cost(
+                        ctx,
+                        spec,
+                        &edges,
+                        charge,
+                        job_outer.saturating_add(vec_bytes::<Edge>(edges.capacity())),
+                    )?;
+                    let edges = if self.need_edges { edges } else { Vec::new() };
+                    charge.resize(
+                        search
+                            .retained_bytes()
+                            .saturating_add(job_outer)
+                            .saturating_add(vec_bytes::<Edge>(edges.capacity())),
+                    )?;
+                    search.paths_found += 1;
+                    return Ok(Some(Found {
+                        start,
+                        end: self.root,
+                        edges,
+                        len,
+                        cost,
+                    }));
+                }
+                Ok(None)
+            }
+        }
+    }
+}
+
 enum ActiveJob {
     None,
     One(Option<Found>),
     All(Box<AllPathsJob>),
     Tree(Box<TreeStreamJob>),
+    BoundedShortest(Box<BoundedShortestJob>),
     BidiUnweighted(Box<BidiUnweightedJob>),
     BidiWeightedAll(Box<BidiWeightedAllJob>),
     Yen(Box<YenJob>),
@@ -8233,6 +11489,9 @@ impl ActiveJob {
             }
             ActiveJob::Tree(st) => {
                 (size_of::<TreeStreamJob>() as u64).saturating_add(st.retained_bytes())
+            }
+            ActiveJob::BoundedShortest(st) => {
+                (size_of::<BoundedShortestJob>() as u64).saturating_add(st.retained_bytes())
             }
             ActiveJob::BidiUnweighted(st) => {
                 (size_of::<BidiUnweightedJob>() as u64).saturating_add(st.retained_bytes())
@@ -8268,6 +11527,13 @@ impl ActiveJob {
                 search,
                 charge,
                 outer_bytes.saturating_add(size_of::<TreeStreamJob>() as u64),
+            ),
+            ActiveJob::BoundedShortest(st) => st.next_path(
+                ctx,
+                spec,
+                search,
+                charge,
+                outer_bytes.saturating_add(size_of::<BoundedShortestJob>() as u64),
             ),
             ActiveJob::BidiUnweighted(st) => st.next_path(
                 ctx,
@@ -8766,18 +12032,118 @@ impl Reader {
         let weighted = spec.weighted();
         let all = matches!(spec.algorithm, Algorithm::AllShortest);
         let need_edges = spec.per_edge() || weighted;
-        let yen_shortest = weighted
-            && spec.max_len.is_some()
-            && matches!(spec.algorithm, Algorithm::Shortest | Algorithm::AllShortest);
+        let bounded_weighted_shortest =
+            weighted && spec.max_len.is_some() && matches!(spec.algorithm, Algorithm::Shortest);
+        let yen_all_shortest =
+            weighted && spec.max_len.is_some() && matches!(spec.algorithm, Algorithm::AllShortest);
         if self.fwd_idx < self.forward.len() {
             self.active_is_forward = true;
             let s = self.forward[self.fwd_idx].source;
             let any = self.forward[self.fwd_idx].any;
             match spec.algorithm {
-                Algorithm::Shortest | Algorithm::AllShortest if yen_shortest => {
+                Algorithm::Shortest if bounded_weighted_shortest => {
+                    let max = spec.max_len.unwrap();
+                    if any {
+                        let old = std::mem::take(&mut self.forward[self.fwd_idx].targets);
+                        self.forward_target_bytes = self
+                            .forward_target_bytes
+                            .saturating_sub(vec_bytes::<u64>(old.capacity()));
+                        drop(old);
+                        self.fwd_idx += 1;
+                        self.fwd_target_idx = 0;
+                        let outer = self.fixed_bytes_excluding_active();
+                        self.charge
+                            .resize(self.search.retained_bytes().saturating_add(outer))?;
+                        let job = BoundedShortestJob::open(
+                            ctx,
+                            spec,
+                            &mut self.search,
+                            s,
+                            true,
+                            max,
+                            &mut self.charge,
+                            outer,
+                        )?;
+                        self.charge.resize(
+                            self.search
+                                .retained_bytes()
+                                .saturating_add(outer)
+                                .saturating_add(job.retained_bytes())
+                                .saturating_add(size_of::<BoundedShortestJob>() as u64),
+                        )?;
+                        self.active = ActiveJob::BoundedShortest(Box::new(job));
+                    } else {
+                        let t = self.forward[self.fwd_idx].targets[self.fwd_target_idx];
+                        self.fwd_target_idx += 1;
+                        if self.fwd_target_idx >= self.forward[self.fwd_idx].targets.len() {
+                            let old = std::mem::take(&mut self.forward[self.fwd_idx].targets);
+                            self.forward_target_bytes = self
+                                .forward_target_bytes
+                                .saturating_sub(vec_bytes::<u64>(old.capacity()));
+                            drop(old);
+                            self.fwd_idx += 1;
+                            self.fwd_target_idx = 0;
+                        }
+                        let outer = self.fixed_bytes_excluding_active();
+                        self.charge
+                            .resize(self.search.retained_bytes().saturating_add(outer))?;
+                        self.search.begin();
+                        if spec.min_len == 0 && s == t {
+                            self.search.paths_found += 1;
+                            self.active = ActiveJob::One(Some(Found {
+                                start: s,
+                                end: t,
+                                edges: Vec::new(),
+                                len: 0,
+                                cost: 0.0,
+                            }));
+                        } else {
+                            let tt = if s == t { VIRT } else { t };
+                            let real = |x: u64| if x == VIRT { s } else { x };
+                            if let Some(mut edges) = self.search.run_dijkstra_pair_bounded(
+                                ctx,
+                                spec,
+                                s,
+                                tt,
+                                s,
+                                None,
+                                None,
+                                max,
+                                PrefixCost::zero(max),
+                                &mut self.charge,
+                                outer,
+                            )? {
+                                for (idx, edge) in edges.iter_mut().enumerate() {
+                                    if idx.is_multiple_of(4096) {
+                                        ctx.check()?;
+                                    }
+                                    *edge = edge.map(real);
+                                }
+                                let cost = self.search.path_cost(
+                                    ctx,
+                                    spec,
+                                    &edges,
+                                    &mut self.charge,
+                                    outer.saturating_add(vec_bytes::<Edge>(edges.capacity())),
+                                )?;
+                                let len = edges.len();
+                                let edges = if need_edges { edges } else { Vec::new() };
+                                self.search.paths_found += 1;
+                                self.active = ActiveJob::One(Some(Found {
+                                    start: s,
+                                    end: t,
+                                    edges,
+                                    len,
+                                    cost,
+                                }));
+                            }
+                        }
+                    }
+                }
+                Algorithm::AllShortest if yen_all_shortest => {
                     if any {
                         return Err(bad(
-                            "path:maxLength with path:weight needs a bound target in the shortest modes",
+                            "path:maxLength with path:weight needs a bound target in path:allShortest",
                         ));
                     }
                     let t = self.forward[self.fwd_idx].targets[self.fwd_target_idx];
@@ -9167,10 +12533,32 @@ impl Reader {
                     return Err(bad("path:kShortest needs a bound source"));
                 }
                 Algorithm::Shortest | Algorithm::AllShortest => {
-                    if yen_shortest {
+                    if yen_all_shortest {
                         return Err(bad(
-                            "path:maxLength with path:weight needs a bound source in the shortest modes",
+                            "path:maxLength with path:weight needs a bound source in path:allShortest",
                         ));
+                    }
+                    if bounded_weighted_shortest {
+                        let job = BoundedShortestJob::open(
+                            ctx,
+                            spec,
+                            &mut self.search,
+                            t,
+                            false,
+                            spec.max_len.unwrap(),
+                            &mut self.charge,
+                            outer,
+                        )?;
+                        self.charge.resize(
+                            self.search
+                                .retained_bytes()
+                                .saturating_add(outer)
+                                .saturating_add(job.retained_bytes())
+                                .saturating_add(size_of::<BoundedShortestJob>() as u64),
+                        )?;
+                        self.active = ActiveJob::BoundedShortest(Box::new(job));
+                        self.update_charge()?;
+                        return Ok(true);
                     }
                     let job = TreeStreamJob::open(
                         ctx,
@@ -9478,12 +12866,22 @@ impl Reader {
 #[doc(hidden)]
 #[cfg(any(test, feature = "failpoints"))]
 pub mod test_hooks {
+    #[cfg(test)]
+    use std::cell::Cell;
     use std::cell::RefCell;
 
     thread_local! {
         static ON_TRAVERSAL_POLL: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
         #[cfg(test)]
         static ON_PRUNE_POLL: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+        #[cfg(test)]
+        pub(super) static REVERSE_WALK_ENQUEUES: Cell<usize> = const { Cell::new(0) };
+        #[cfg(test)]
+        pub(super) static REVERSE_ANCESTRY_BUILDS: Cell<usize> = const { Cell::new(0) };
+        #[cfg(test)]
+        pub(super) static REVERSE_BOUND_SLOTS: Cell<usize> = const { Cell::new(0) };
+        #[cfg(test)]
+        pub(super) static REVERSE_SUFFIX_STEPS: Cell<usize> = const { Cell::new(0) };
     }
 
     /// Restores the thread-local traversal poll hook when dropped.
@@ -10328,7 +13726,7 @@ mod tree_tests {
             false,
             &mut out,
             usize::MAX,
-            None,
+            None::<(&mut super::super::ctx::OwnedCharge, u64)>,
         )
         .unwrap();
         let non_sweep_checks = super::super::ctx::CHECKS.with(Cell::get) - before;
@@ -10358,7 +13756,7 @@ mod tree_tests {
             false,
             &mut out,
             usize::MAX,
-            None,
+            None::<(&mut super::super::ctx::OwnedCharge, u64)>,
         )
         .unwrap();
         let sweep_checks = super::super::ctx::CHECKS.with(Cell::get) - before_sweep;
@@ -10382,7 +13780,7 @@ mod tree_tests {
                 false,
                 &mut out,
                 usize::MAX,
-                None,
+                None::<(&mut super::super::ctx::OwnedCharge, u64)>,
             ),
             Err(Error::Cancelled)
         ));
@@ -10398,7 +13796,7 @@ mod tree_tests {
                 false,
                 &mut out,
                 usize::MAX,
-                None,
+                None::<(&mut super::super::ctx::OwnedCharge, u64)>,
             ),
             Err(Error::Cancelled)
         ));
@@ -11173,5 +14571,1069 @@ mod tree_tests {
                 "run_dijkstra_pair_all(all={all}) stale heap pops must add polls: stale={all_stale_checks}, base={all_base_checks}"
             );
         }
+    }
+
+    #[test]
+    fn pareto_frontier_pruning_and_lookup() {
+        let mut v = Vec::new();
+        assert!(pareto_insert(&mut v, 3, Cost::of(10.0)));
+        assert_eq!(v, vec![(3, Cost::of(10.0))]);
+
+        // Dominated: longer and equal/more expensive.
+        assert!(!pareto_insert(&mut v, 3, Cost::of(10.0)));
+        assert!(!pareto_insert(&mut v, 3, Cost::of(12.0)));
+        assert!(!pareto_insert(&mut v, 5, Cost::of(10.0)));
+        assert!(!pareto_insert(&mut v, 5, Cost::of(15.0)));
+
+        // Shorter and more expensive: kept on frontier.
+        assert!(pareto_insert(&mut v, 1, Cost::of(20.0)));
+        assert_eq!(v, vec![(1, Cost::of(20.0)), (3, Cost::of(10.0))]);
+
+        // Longer and strictly cheaper: kept on frontier.
+        assert!(pareto_insert(&mut v, 5, Cost::of(4.0)));
+        assert_eq!(
+            v,
+            vec![(1, Cost::of(20.0)), (3, Cost::of(10.0)), (5, Cost::of(4.0))]
+        );
+
+        // Lookup cheapest within length budget.
+        assert_eq!(pareto_best_within(&v, 0), None);
+        assert_eq!(pareto_best_within(&v, 1), Some((1, Cost::of(20.0))));
+        assert_eq!(pareto_best_within(&v, 2), Some((1, Cost::of(20.0))));
+        assert_eq!(pareto_best_within(&v, 3), Some((3, Cost::of(10.0))));
+        assert_eq!(pareto_best_within(&v, 4), Some((3, Cost::of(10.0))));
+        assert_eq!(pareto_best_within(&v, 5), Some((5, Cost::of(4.0))));
+        assert_eq!(pareto_best_within(&v, 99), Some((5, Cost::of(4.0))));
+
+        // Shorter and cheaper than several longer entries prunes them all.
+        assert!(pareto_insert(&mut v, 2, Cost::of(4.0)));
+        assert_eq!(v, vec![(1, Cost::of(20.0)), (2, Cost::of(4.0))]);
+
+        // Same-length improvement replaces in place and prunes dominated tail.
+        assert!(pareto_insert(&mut v, 4, Cost::of(2.0)));
+        assert!(pareto_insert(&mut v, 2, Cost::of(1.5)));
+        assert_eq!(v, vec![(1, Cost::of(20.0)), (2, Cost::of(1.5))]);
+    }
+
+    #[test]
+    fn opt_cost_lower_bound_handles_empty_and_infinite() {
+        assert_eq!(opt_cost_min(None, None), None);
+        assert_eq!(opt_cost_min(Some(Cost::of(3.0)), None), Some(Cost::of(3.0)));
+        assert_eq!(opt_cost_min(None, Some(Cost::of(2.0))), Some(Cost::of(2.0)));
+        assert_eq!(
+            opt_cost_min(Some(Cost::of(3.0)), Some(Cost::of(2.0))),
+            Some(Cost::of(2.0))
+        );
+        assert_eq!(opt_cost_add(None, Some(Cost::of(1.0))), None);
+        assert_eq!(
+            opt_cost_add(Some(Cost::of(1.0)), Some(Cost::INFINITE)),
+            Some(Cost::INFINITE)
+        );
+        assert_eq!(
+            opt_cost_min(Some(Cost::INFINITE), Some(Cost::of(5.0))),
+            Some(Cost::of(5.0))
+        );
+    }
+
+    struct FirstBatchWork {
+        bound_slots: usize,
+        ancestry_builds: usize,
+        steps: usize,
+        enqueues: usize,
+    }
+
+    fn reverse_first_rows(
+        ttl: String,
+        properties: &str,
+        memory: Option<u64>,
+    ) -> [(Term, usize); 2] {
+        reverse_first_batches(ttl, properties, memory, 1)
+            .map(|(rows, work)| (rows.unwrap().pop().unwrap(), work.steps))
+    }
+
+    fn reverse_first_batches(
+        ttl: String,
+        properties: &str,
+        memory: Option<u64>,
+        batch_rows: usize,
+    ) -> [(Result<Vec<Term>>, FirstBatchWork); 2] {
+        use crate::io::Source;
+        use crate::sparql::{CursorOptions, FallbackPolicy, QueryOptions, query, select_cursor};
+        use crate::store::{Store, StoreOptions};
+        use oxrdfio::RdfFormat;
+
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let query_text = |limit: &str| {
+            format!(
+                "PREFIX ex: <http://example.org/> PREFIX path: <urn:x-sparkles:path#> \
+                 SELECT ?src {{ SERVICE path:search {{ [] {properties}{limit} }} }}"
+            )
+        };
+        let opts = QueryOptions {
+            no_cache: true,
+            max_memory_bytes: memory,
+            ..Default::default()
+        };
+        let mut last_enqueues = 0;
+        let mut last_builds = 0;
+        let mut take_work = || {
+            let total = test_hooks::REVERSE_WALK_ENQUEUES.with(|count| count.get());
+            let builds = test_hooks::REVERSE_ANCESTRY_BUILDS.with(|count| count.get());
+            let work = FirstBatchWork {
+                bound_slots: test_hooks::REVERSE_BOUND_SLOTS.with(|count| count.replace(0)),
+                ancestry_builds: builds - last_builds,
+                steps: test_hooks::REVERSE_SUFFIX_STEPS.with(|count| count.replace(0)),
+                enqueues: total - last_enqueues,
+            };
+            last_builds = builds;
+            last_enqueues = total;
+            work
+        };
+        take_work();
+        let limit = format!(" ; path:limit {batch_rows}");
+        let eager = query(snap.clone(), &query_text(&limit), &opts).and_then(|result| {
+            let rows = result.rows()?;
+            assert_eq!(rows.len(), batch_rows);
+            Ok(rows
+                .iter()
+                .map(|row| row.values()[0].clone().unwrap())
+                .collect())
+        });
+        let eager_work = take_work();
+
+        let cursor_opts = CursorOptions {
+            batch_rows,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let mut cursor = select_cursor(snap, &query_text(""), &opts, &cursor_opts).unwrap();
+        let mut plans = vec![cursor.plan()];
+        let path_plan = loop {
+            let plan = plans.pop().expect("path-search operator in cursor plan");
+            if plan.operator.operator == "PathSearch" {
+                break plan;
+            }
+            plans.extend(&plan.children);
+        };
+        assert!(
+            !path_plan.materializes
+                && !path_plan.full_input_before_output
+                && path_plan
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("streams matching paths")),
+            "{path_plan:?}"
+        );
+        let streamed = cursor.next_batch().map(|batch| {
+            let batch = batch.expect("cursor first batch");
+            assert_eq!(batch.len(), batch_rows);
+            (0..batch.len())
+                .map(|i| batch.row(i).unwrap().values()[0].clone().unwrap())
+                .collect()
+        });
+        [(eager, eager_work), (streamed, take_work())]
+    }
+
+    #[test]
+    fn reverse_chain_first_row_does_not_rewalk_closed_subtrees() {
+        use std::fmt::Write as _;
+
+        let n = 1024;
+        let mut ttl = String::from(
+            "@prefix ex: <http://example.org/> . \
+             ex:a ex:p ex:x0 {| ex:w 0.5e0 |} . \
+             ex:b ex:p ex:x0 {| ex:w 1e12 |} . ",
+        );
+        for i in 1..=n {
+            write!(ttl, "ex:x{i} ex:p ex:x{} . ", i - 1).unwrap();
+            if i < n {
+                write!(ttl, "ex:x{i} ex:p ex:x{} . ", i + 1).unwrap();
+            }
+        }
+        // The r -> xN edge wins the equal-length parent choice.
+        let mut sibling_chain = String::new();
+        for i in 1..=n {
+            let prev = if i == 1 {
+                "x0".to_owned()
+            } else {
+                format!("z{}", i - 1)
+            };
+            write!(sibling_chain, "ex:z{i} ex:p ex:{prev} . ").unwrap();
+        }
+        let sibling_exit =
+            format!("{sibling_chain}ex:r ex:p ex:x{n} . ex:r ex:p ex:z{n} {{| ex:w 2.0e0 |}} . ");
+        let sibling_entry = format!("{sibling_exit}ex:z{n} ex:p ex:r . ");
+        let external_entry = format!("{sibling_exit}ex:b ex:p ex:r {{| ex:w 1e12 |}} . ");
+        let ancestor_entry = format!("{sibling_exit}ex:x1 ex:p ex:r . ");
+        let long_exit = format!("{sibling_chain}ex:x{n} ex:p ex:z{n} {{| ex:w 2.0e0 |}} . ");
+        let target_cycle = format!(
+            "ex:x0 ex:p ex:x{n} . ex:x0 ex:p ex:a {{| ex:w {}e0 |}} . ",
+            n + 2
+        );
+        let expected = Term::NamedNode(oxrdf::NamedNode::new("http://example.org/a").unwrap());
+        let mut regressions = Vec::new();
+        for (case, extra, max_visited) in [
+            ("closed chain", "", n + 3),
+            ("unreachable sibling exit", sibling_exit.as_str(), 2 * n + 4),
+            ("sibling entry", sibling_entry.as_str(), 2 * n + 4),
+            ("external entry", external_entry.as_str(), 2 * n + 4),
+            ("ancestor entry", ancestor_entry.as_str(), 2 * n + 4),
+            ("out-of-budget exit", long_exit.as_str(), 2 * n + 3),
+            ("target cycle", target_cycle.as_str(), n + 4),
+        ] {
+            let properties = format!(
+                "path:source ?src ; path:target ex:x0 ; path:predicate ex:p ; \
+                 path:weight ex:w ; path:maxLength {} ; path:maxVisited {max_visited}",
+                n + 2
+            );
+            // The cheapest source has no branches. Its one suffix check must be
+            // independent of every unrelated branch on either chain.
+            let rows = reverse_first_rows(format!("{ttl}{extra}"), &properties, None);
+            for (engine, (first, steps)) in ["eager", "cursor"].into_iter().zip(rows) {
+                assert_eq!(first, expected);
+                if steps != 1 {
+                    regressions.push(format!(
+                        "{engine} {case} took {steps} suffix steps for {max_visited} settled nodes"
+                    ));
+                }
+            }
+        }
+        assert!(regressions.is_empty(), "{regressions:#?}");
+
+        // Make the branching x1 the first row. Its only exit via xN is too
+        // long. One walk can examine the chain, even under the exact visit cap.
+        ttl.push_str("ex:x1 ex:p ex:x0 {| ex:w 0.25e0 |} . ");
+        let properties = format!(
+            "path:source ?src ; path:target ex:x0 ; path:predicate ex:p ; \
+             path:weight ex:w ; path:maxLength {} ; path:maxVisited {}",
+            n + 2,
+            2 * n + 3
+        );
+        for (source, steps) in reverse_first_rows(format!("{ttl}{long_exit}"), &properties, None) {
+            assert_eq!(
+                source,
+                Term::NamedNode(oxrdf::NamedNode::new("http://example.org/x1").unwrap())
+            );
+            assert!(
+                (n..=5 * n).contains(&steps),
+                "branch took {steps} suffix steps"
+            );
+        }
+    }
+
+    #[test]
+    fn reverse_first_row_settles_shallow_hops_before_indexing() {
+        // The reverse search records a's hops in cost order: t, then h, then y.
+        // The route through y settles the competing length without indexing h.
+        assert_shallow_first_row(
+            "ex:a ex:p ex:t {| ex:w 0.5e0 |} . ex:a ex:p ex:h, ex:y . \
+             ex:h ex:p ex:z . ex:z ex:p ex:w . ex:w ex:p ex:t . \
+             ex:y ex:p ex:t {| ex:w 10e0 |} . ",
+            4,
+            8,
+            8,
+        );
+    }
+
+    #[test]
+    fn reverse_walk_settles_shallow_hops_before_indexing() {
+        // At u the walk sees the return to a, then the deep exit through h,
+        // then the exit through z that attains the three-edge lower bound.
+        assert_shallow_first_row(
+            "ex:a ex:p ex:t {| ex:w 0.5e0 |} . ex:a ex:p ex:u {| ex:w 2e0 |} . \
+             ex:u ex:p ex:a, ex:z . ex:u ex:p ex:h {| ex:w 2e0 |} . \
+             ex:h ex:p ex:c . ex:c ex:p ex:d . ex:d ex:p ex:t . \
+             ex:z ex:p ex:t {| ex:w 10e0 |} . ",
+            5,
+            9,
+            12,
+        );
+    }
+
+    #[test]
+    fn reverse_walk_sibling_exit_precedes_deep_certificate() {
+        assert_shallow_first_row(
+            "ex:a ex:p ex:t {| ex:w 0.5e0 |} . ex:u1 ex:p ex:a {| ex:w 0.8e0 |} . \
+             ex:u2 ex:p ex:a, ex:z . ex:h ex:p ex:c . ex:c ex:p ex:d . ex:d ex:p ex:t . \
+             ex:a ex:p ex:u1 {| ex:w 2e0 |}, ex:u2 {| ex:w 2e0 |} . \
+             ex:u1 ex:p ex:h {| ex:w 2e0 |} . ex:z ex:p ex:t {| ex:w 10e0 |} . ",
+            5,
+            10,
+            20,
+        );
+    }
+
+    #[test]
+    fn reverse_walk_descendant_exit_precedes_deep_certificate() {
+        assert_shallow_first_row(
+            "ex:a ex:p ex:t {| ex:w 0.5e0 |} . ex:u ex:p ex:a . ex:w ex:p ex:u, ex:z . \
+             ex:h ex:p ex:c1 . ex:c1 ex:p ex:c2 . ex:c2 ex:p ex:c3 . ex:c3 ex:p ex:t . \
+             ex:z ex:p ex:y . ex:a ex:p ex:u {| ex:w 2e0 |} . \
+             ex:u ex:p ex:w {| ex:w 2e0 |}, ex:h {| ex:w 2e0 |} . ex:y ex:p ex:t {| ex:w 10e0 |} . ",
+            6,
+            12,
+            24,
+        );
+    }
+
+    #[test]
+    fn reverse_walk_deep_exit_prunes_dense_descendants() {
+        assert_dense_first_row(
+            "ex:a ex:p ex:b {| ex:w 2e0 |} . ex:b ex:p ex:a, ex:u . ex:u ex:p ex:b, ex:h . \
+             ex:h ex:p ex:c . ex:c ex:p ex:d . ex:d ex:p ex:t . ",
+            "u",
+            1024,
+            7,
+            10,
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn reverse_walk_tied_deep_children_yield_to_intervals() {
+        assert_dense_first_row(
+            "ex:a ex:p ex:b {| ex:w 2e0 |} . ex:b ex:p ex:a, ex:u . ex:u ex:p ex:b, ex:h . \
+             ex:h ex:p ex:c1 {| ex:w 0.1e0 |} . ex:c1 ex:p ex:c2 . ex:c2 ex:p ex:d . ex:d ex:p ex:t . ",
+            "u",
+            128,
+            7,
+            11,
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn reverse_walk_indexed_return_reaches_exit_before_tied_children() {
+        // At u the shortest suffix through v returns via r, b and a. Visiting
+        // v exposes the exit through z before any tied clique child expands.
+        assert_dense_first_row(
+            "ex:a ex:p ex:u {| ex:w 2e0 |} . ex:u ex:p ex:b, ex:v . ex:b ex:p ex:a . \
+             ex:v ex:p ex:r, ex:z . ex:r ex:p ex:b . ex:z ex:p ex:y . ex:y ex:p ex:x . \
+             ex:x ex:p ex:t {| ex:w 10e0 |} . ",
+            "u",
+            128,
+            6,
+            12,
+            Some(3),
+        );
+    }
+
+    #[test]
+    fn reverse_walk_tree_child_reaches_exit_before_tied_indexed_returns() {
+        // At u the clique suffixes return through r. The tree child v can
+        // instead take the exit through z at the same six-edge bound.
+        assert_dense_first_row(
+            "ex:a ex:p ex:u {| ex:w 2e0 |} . ex:u ex:p ex:b, ex:v . ex:b ex:p ex:a . \
+             ex:v ex:p ex:u, ex:z . ex:r ex:p ex:b . ex:z ex:p ex:y . ex:y ex:p ex:x . \
+             ex:x ex:p ex:t {| ex:w 10e0 |} . ",
+            "r",
+            128,
+            6,
+            12,
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn reverse_walk_tied_clique_yields_after_one_visit() {
+        // The reverse costs put the clique between the two indexed returns
+        // in u's hop list. Its shorter slice starts first, then yields to v.
+        assert_dense_first_row(
+            "ex:a ex:p ex:u {| ex:w 2e0 |} . ex:u ex:p ex:b, ex:v, ex:s . ex:b ex:p ex:a . \
+             ex:v ex:p ex:r {| ex:w 0.25e0 |}, ex:z . ex:s ex:p ex:r {| ex:w 2e0 |} . \
+             ex:r ex:p ex:b . ex:z ex:p ex:y . ex:y ex:p ex:x . ex:x ex:p ex:t {| ex:w 10e0 |} . ",
+            "u",
+            128,
+            6,
+            13,
+            Some(4),
+        );
+    }
+
+    #[test]
+    fn reverse_walk_mixed_bound_clique_waits_for_tied_tree_exit() {
+        // The return through s has six edges. Each clique return ties the
+        // seven-edge exit through the tree child x.
+        let edges = "ex:b1 ex:p ex:a . ex:b2 ex:p ex:b1 . ex:r2 ex:p ex:b1 . \
+                     ex:u ex:p ex:b2, ex:s, ex:x . ex:r3 ex:p ex:r2 . ex:s ex:p ex:r2 {| ex:w 1.1e0 |} . \
+                     ex:x ex:p ex:u, ex:z . ex:z ex:p ex:y1 . ex:y1 ex:p ex:y2 . ex:y2 ex:p ex:y3 . \
+                     ex:y3 ex:p ex:t {| ex:w 10e0 |} . ex:a ex:p ex:u {| ex:w 2e0 |} . ";
+        assert_dense_first_row(edges, "r3", 128, 7, 16, Some(5));
+
+        // Reverse cost puts this second six-edge return after the entire
+        // seven-edge clique. Resuming it reaches y1 before x can run.
+        let interleaved = format!(
+            "{edges} ex:u ex:p ex:late . ex:r2b ex:p ex:b1 . \
+             ex:late ex:p ex:r2b {{| ex:w 2.5e0 |}}, ex:y1 . "
+        );
+        assert_dense_first_row(&interleaved, "r3", 128, 7, 18, Some(6));
+    }
+
+    #[test]
+    fn reverse_walk_pre_index_clique_yields_to_returning_interval() {
+        // Checking v's interval finds a return via r. Visiting v then
+        // exposes the exit through z at the same bound as the clique.
+        assert_dense_first_row(
+            "ex:u ex:p ex:a, ex:v . ex:r ex:p ex:a . ex:a ex:p ex:u {| ex:w 2e0 |} . \
+             ex:v ex:p ex:r, ex:z . ex:z ex:p ex:y . ex:y ex:p ex:t {| ex:w 10e0 |} . ",
+            "u",
+            128,
+            5,
+            10,
+            Some(4),
+        );
+    }
+
+    #[test]
+    fn reverse_walk_tied_shallow_children_have_bounded_work() {
+        assert_dense_first_row(
+            "ex:a ex:p ex:u {| ex:w 2e0 |} . ex:u ex:p ex:a, ex:h . \
+             ex:h ex:p ex:c {| ex:w 0.1e0 |} . ex:c ex:p ex:d . ex:d ex:p ex:t . ",
+            "u",
+            128,
+            5,
+            9,
+            None,
+        );
+    }
+
+    #[test]
+    fn reverse_walk_tied_sparse_child_can_settle_without_intervals() {
+        assert_shallow_first_row(
+            "ex:a ex:p ex:t {| ex:w 0.5e0 |} . ex:u ex:p ex:a . ex:w ex:p ex:u, ex:z . \
+             ex:h ex:p ex:c . ex:c ex:p ex:d . ex:d ex:p ex:t . ex:z ex:p ex:y . \
+             ex:a ex:p ex:u {| ex:w 2e0 |} . ex:u ex:p ex:w, ex:h . ex:y ex:p ex:t {| ex:w 10e0 |} . ",
+            5,
+            11,
+            24,
+        );
+    }
+
+    #[test]
+    fn reverse_walk_sparse_distinct_bounds_scan_only_current_groups() {
+        use std::fmt::Write as _;
+
+        let n = 128;
+        let mut ttl = String::from(
+            "@prefix ex: <http://example.org/> . ex:a ex:p ex:t {| ex:w 0.5e0 |} . \
+             ex:a ex:p ex:u {| ex:w 2e0 |} . ex:u ex:p ex:b2 . ex:b2 ex:p ex:b1 . \
+             ex:b1 ex:p ex:a . ex:r1 ex:p ex:a . ex:w ex:p ex:t {| ex:w 1e12 |} . ",
+        );
+        let mut detours = String::new();
+        for i in 2..=n + 2 {
+            write!(ttl, "ex:r{i} ex:p ex:r{} . ", i - 1).unwrap();
+            if i >= 3 {
+                write!(ttl, "ex:u ex:p ex:v{i} . ex:v{i} ex:p ex:r{i} . ").unwrap();
+                if i <= n {
+                    write!(detours, "ex:v{i} ex:p ex:r{}, ex:r{} . ", i + 1, i + 2).unwrap();
+                }
+            }
+        }
+        let properties = format!(
+            "path:source ?src ; path:target ex:t ; path:predicate ex:p ; \
+             path:weight ex:w ; path:maxLength {} ; path:maxVisited {}",
+            n + 6,
+            2 * n + 8
+        );
+        let expected = Term::NamedNode(oxrdf::NamedNode::new("http://example.org/a").unwrap());
+        // After u's N bounds, visits either have no mixed bounds or just two.
+        for (extra, max_slots) in [("", 2 * n), (detours.as_str(), 6 * n)] {
+            let rows = reverse_first_batches(format!("{ttl}{extra}"), &properties, None, 1);
+            for (batch, _) in &rows {
+                assert_eq!(batch.as_ref().unwrap(), std::slice::from_ref(&expected));
+            }
+            let slots = rows.each_ref().map(|(_, work)| work.bound_slots);
+            let steps = rows.map(|(_, work)| work.steps);
+            assert!(
+                slots.iter().all(|&count| (n..=max_slots).contains(&count)),
+                "eager and cursor bound-table slots {slots:?} for {n} distinct bounds"
+            );
+            assert!(
+                steps.iter().all(|&count| count <= 64 * n),
+                "eager and cursor suffix steps {steps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reverse_walk_sparse_two_child_tie_settles_without_intervals() {
+        let ttl = "@prefix ex: <http://example.org/> . ex:a ex:p ex:t {| ex:w 0.5e0 |} . \
+                   ex:a ex:p ex:u {| ex:w 2e0 |} . ex:u ex:p ex:a, ex:w1, ex:w2, ex:h . \
+                   ex:w1 ex:p ex:u, ex:w2, ex:h . ex:w2 ex:p ex:u {| ex:w 1.1e0 |}, ex:z . \
+                   ex:h ex:p ex:c . ex:c ex:p ex:d . ex:d ex:p ex:t . \
+                   ex:z ex:p ex:y . ex:y ex:p ex:t {| ex:w 1e12 |} . ";
+        let properties = "path:source ?src ; path:target ex:t ; path:predicate ex:p ; \
+                          path:weight ex:w ; path:maxLength 5";
+        let expected = Term::NamedNode(oxrdf::NamedNode::new("http://example.org/a").unwrap());
+        // A third child needs one hop and a two-unit visit. The two unrelated
+        // leaves keep the larger tree's tie allowance exactly sufficient.
+        let third = "ex:u ex:p ex:w0 . ex:w0 ex:p ex:u {| ex:w 0.9e0 |} . \
+                     ex:s1 ex:p ex:t {| ex:w 1e12 |} . ex:s2 ex:p ex:t {| ex:w 1e12 |} . ";
+        for extra in ["", third] {
+            let rows = reverse_first_batches(format!("{ttl}{extra}"), properties, None, 1);
+            for (batch, _) in &rows {
+                assert_eq!(batch.as_ref().unwrap(), std::slice::from_ref(&expected));
+            }
+            assert_eq!(rows.map(|(_, work)| work.ancestry_builds), [0, 0]);
+        }
+    }
+
+    #[test]
+    fn reverse_walk_cached_intervals_prune_returning_peers_before_enqueue() {
+        use std::fmt::Write as _;
+
+        let n = 1024;
+        let mut ttl = String::from(
+            "@prefix ex: <http://example.org/> . ex:a ex:p ex:t {| ex:w 0.5e0 |} . \
+             ex:a ex:p ex:u {| ex:w 2e0 |} . ex:b ex:p ex:a . ex:u ex:p ex:b, ex:z . \
+             ex:z ex:p ex:y . ex:y ex:p ex:t {| ex:w 10e0 |} . ex:w ex:p ex:t {| ex:w 1e12 |} . ",
+        );
+        for i in 0..n {
+            write!(ttl, "ex:u ex:p ex:v{i} . ex:v{i} ex:p ex:b . ").unwrap();
+        }
+        let properties = format!(
+            "path:source ?src ; path:target ex:t ; path:predicate ex:p ; \
+             path:weight ex:w ; path:maxLength 5 ; path:maxVisited {}",
+            n + 9
+        );
+        test_hooks::REVERSE_WALK_ENQUEUES.with(|count| count.set(0));
+        test_hooks::REVERSE_ANCESTRY_BUILDS.with(|count| count.set(0));
+        for (first, _) in reverse_first_rows(ttl, &properties, None) {
+            assert_eq!(
+                first,
+                Term::NamedNode(oxrdf::NamedNode::new("http://example.org/a").unwrap())
+            );
+        }
+        test_hooks::REVERSE_ANCESTRY_BUILDS.with(|count| assert_eq!(count.get(), 2));
+        // Both engines need only the prefix through u to find the exit at z.
+        test_hooks::REVERSE_WALK_ENQUEUES.with(|count| assert_eq!(count.get(), 2));
+    }
+
+    fn assert_dense_first_row(
+        edges: &str,
+        clique_parent: &str,
+        n: usize,
+        max_len: u32,
+        visits: usize,
+        enqueues: Option<usize>,
+    ) {
+        use std::fmt::Write as _;
+
+        let mut ttl = format!(
+            "@prefix ex: <http://example.org/> . ex:a ex:p ex:t {{| ex:w 0.5e0 |}} . \
+             ex:w ex:p ex:t {{| ex:w 1e12 |}} . {edges}"
+        );
+        for i in 0..n {
+            write!(ttl, "ex:u ex:p ex:v{i} . ex:v{i} ex:p ex:{clique_parent}").unwrap();
+            for j in 0..n {
+                if i != j {
+                    write!(ttl, ", ex:v{j}").unwrap();
+                }
+            }
+            ttl.push_str(" . ");
+        }
+        let properties = format!(
+            "path:source ?src ; path:target ex:t ; path:predicate ex:p ; \
+             path:weight ex:w ; path:maxLength {max_len} ; path:maxVisited {}",
+            n + visits
+        );
+        let rows = reverse_first_batches(ttl, &properties, None, 1);
+        let steps = rows.each_ref().map(|(_, work)| work.steps);
+        assert!(
+            steps.iter().all(|&count| count <= 6 * n + 64),
+            "eager and cursor suffix steps {steps:?} for {n} clique nodes"
+        );
+        for (batch, work) in rows {
+            assert_eq!(
+                batch.unwrap(),
+                [Term::NamedNode(
+                    oxrdf::NamedNode::new("http://example.org/a").unwrap()
+                )]
+            );
+            if let Some(expected) = enqueues {
+                assert_eq!(work.enqueues, expected);
+            }
+        }
+    }
+
+    fn assert_shallow_first_row(edges: &str, max_len: u32, visits: usize, max_steps: usize) {
+        use std::fmt::Write as _;
+
+        for n in [1, 1024] {
+            let mut ttl = format!("@prefix ex: <http://example.org/> . {edges}");
+            for i in 0..n {
+                write!(ttl, "ex:b{i} ex:p ex:t {{| ex:w 1e12 |}} . ").unwrap();
+            }
+            let properties = |cap| {
+                format!(
+                    "path:source ?src ; path:target ex:t ; path:predicate ex:p ; \
+                     path:weight ex:w ; path:maxLength {max_len} ; path:maxVisited {cap}"
+                )
+            };
+            let cap = n + visits;
+            // A competing route requires the forward ranking visits for a and t.
+            for (result, _) in reverse_first_batches(ttl.clone(), &properties(cap - 1), None, 1) {
+                let err = result.unwrap_err().to_string();
+                assert!(
+                    err.contains(&format!("visited more than {} nodes", cap - 1)),
+                    "{err}"
+                );
+            }
+            test_hooks::REVERSE_ANCESTRY_BUILDS.with(|count| count.set(0));
+            let rows = reverse_first_rows(ttl, &properties(cap), None);
+            test_hooks::REVERSE_ANCESTRY_BUILDS.with(|count| assert_eq!(count.get(), 0));
+            for (first, _) in &rows {
+                assert_eq!(
+                    first,
+                    &Term::NamedNode(oxrdf::NamedNode::new("http://example.org/a").unwrap())
+                );
+            }
+            let steps = rows.map(|(_, steps)| steps);
+            assert!(
+                steps.iter().all(|&count| count <= max_steps),
+                "eager and cursor suffix steps with {n} unrelated sources: {steps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reverse_batch_shared_deeper_neighbor_has_linear_suffix_work() {
+        assert_shared_neighbor_batch(0, false);
+    }
+
+    #[test]
+    fn reverse_batch_shared_distant_neighbor_has_linear_suffix_work() {
+        assert_shared_neighbor_batch(1, false);
+        assert_shared_neighbor_batch(1024, false);
+    }
+
+    #[test]
+    fn reverse_batch_certifies_shared_hub_after_returning_child() {
+        assert_shared_neighbor_batch(0, true);
+        assert_shared_neighbor_batch(1, true);
+    }
+
+    fn assert_shared_neighbor_batch(extra_depth: usize, returning_child: bool) {
+        use std::fmt::Write as _;
+
+        let n = 1024;
+        let mut ttl =
+            String::from("@prefix ex: <http://example.org/> . ex:b ex:p ex:t {| ex:w 1e12 |} . ");
+        let mut tail = "t".to_owned();
+        for j in 0..extra_depth {
+            write!(ttl, "ex:y{j} ex:p ex:{tail} . ").unwrap();
+            tail = format!("y{j}");
+        }
+        let mut expected = Vec::new();
+        for i in 0..n {
+            let entry = if returning_child {
+                write!(
+                    ttl,
+                    "ex:u{i} ex:p ex:a{i} . ex:a{i} ex:p ex:u{i} {{| ex:w 2e0 |}} . "
+                )
+                .unwrap();
+                format!("u{i}")
+            } else {
+                format!("a{i}")
+            };
+            write!(
+                ttl,
+                "ex:a{i} ex:p ex:t {{| ex:w 0.5e0 |}} . ex:{entry} ex:p ex:h {{| ex:w 2e0 |}} . \
+                 ex:h ex:p ex:z{i} . ex:z{i} ex:p ex:{tail} . "
+            )
+            .unwrap();
+            expected.push(format!("http://example.org/a{i}"));
+        }
+        expected.sort_unstable();
+
+        // Each returning child adds one reverse visit and one edge to the detour.
+        // Forward ranking settles only a_i and t per requested one-edge path.
+        let cap = (4 + usize::from(returning_child)) * n + 3 + extra_depth;
+        let max_len = 3 + usize::from(returning_child) + extra_depth;
+        let batch = |visits| {
+            let properties = format!(
+                "path:source ?src ; path:target ex:t ; path:predicate ex:p ; \
+                 path:weight ex:w ; path:maxLength {max_len} ; path:maxVisited {visits}"
+            );
+            reverse_first_batches(ttl.clone(), &properties, None, n)
+        };
+        for (result, _) in batch(cap - 1) {
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("visited more than {} nodes", cap - 1)),
+                "{err}"
+            );
+        }
+
+        let batches = batch(cap);
+        for (result, _) in &batches {
+            let mut sources: Vec<_> = result
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|term| {
+                    let Term::NamedNode(source) = term else {
+                        panic!("expected a source IRI: {term}")
+                    };
+                    source.as_str()
+                })
+                .collect();
+            sources.sort_unstable();
+            assert_eq!(sources, expected);
+        }
+        let steps = batches.map(|(_, work)| work.steps);
+        // Include the single linear ancestry build when the depth gap exceeds one.
+        let bound = if extra_depth == 0 {
+            8 * n
+        } else {
+            16 * (n + extra_depth)
+        };
+        // Through a returning child the walk also checks the source and child hops.
+        let bound = bound + if returning_child { 6 * n } else { 0 };
+        assert!(
+            steps.iter().all(|&count| (n..=bound).contains(&count)),
+            "eager and cursor suffix steps for {n} branches and {extra_depth} extra levels: {steps:?}"
+        );
+    }
+
+    #[test]
+    fn reverse_narrow_default_weights_fit_dense_branches_under_a_memory_cap() {
+        use std::fmt::Write as _;
+
+        let n = 256;
+        let mut ttl = String::from(
+            "@prefix ex: <http://example.org/> . \
+             ex:a ex:q ex:b {| ex:unrelated 1 |} . ",
+        );
+        for i in 0..n {
+            write!(ttl, "ex:d{i} ex:p ex:t . ").unwrap();
+            for j in 0..n {
+                write!(ttl, "ex:s{j} ex:p ex:d{i} . ").unwrap();
+            }
+        }
+        let properties = "path:source ?src ; path:target ex:t ; path:predicate ex:p ; \
+                          path:weight ex:absent ; path:maxLength 2";
+        // The branch destinations alone would take at least 8 * n^2 bytes.
+        for (first, steps) in reverse_first_rows(ttl, properties, Some(320 * 1024)) {
+            let Term::NamedNode(source) = first else {
+                panic!("expected an IRI, got {first}");
+            };
+            assert!(source.as_str().starts_with("http://example.org/d"));
+            assert_eq!(steps, 0);
+        }
+    }
+
+    #[test]
+    fn reverse_sparse_dead_backtrack_fits_under_a_memory_cap() {
+        use std::fmt::Write as _;
+
+        // Just past the 7/8 load factor of an 8192-bucket index. The cap admits
+        // the reverse search but cannot absorb the interval index.
+        let n = 7 * 8192 / 8 + 1;
+        let mut ttl = String::from("@prefix ex: <http://example.org/> . ex:x1 ex:p ex:x2 . ");
+        for i in 1..=n {
+            write!(ttl, "ex:x{i} ex:p ex:x{} . ", i - 1).unwrap();
+        }
+        let properties = format!(
+            "path:source ?src ; path:target ex:x0 ; path:predicate ex:p ; path:weight ex:absent ; \
+             path:defaultWeight 1e308 ; path:maxLength {} ; path:maxVisited {}",
+            n + 1,
+            n + 1
+        );
+        let expected = Term::NamedNode(oxrdf::NamedNode::new("http://example.org/x1").unwrap());
+        for (first, steps) in reverse_first_rows(ttl, &properties, Some(2700 * 1024)) {
+            assert_eq!(first, expected);
+            assert_eq!(steps, 3);
+        }
+    }
+
+    #[test]
+    fn reverse_uncertified_hop_can_beat_a_longer_certified_suffix() {
+        let store = crate::store::Store::in_memory(crate::store::StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let (root, source, exit) = (0, 1, 2);
+        let mut dist = HbMap::default();
+        let mut parent = HbMap::default();
+        let mut link = |node, depth, next| {
+            dist.insert(node, depth);
+            parent.insert(
+                (node, depth),
+                Parent {
+                    node: next,
+                    p: 0,
+                    rev: false,
+                },
+            );
+        };
+        link(root, 0, root);
+        link(source, 1, root);
+        link(exit, 1, root);
+        for node in 3..=6 {
+            link(node, node as u32 - 1, node - 1);
+        }
+
+        let mut alternatives = ReverseAlternatives::default();
+        let mut charge = ctx.charge(0).unwrap();
+        alternatives
+            .record(source, 6, Some(root), &mut charge, 0)
+            .unwrap();
+        let n = 128;
+        for leaf in 100..100 + n {
+            link(leaf, 2, source);
+            alternatives
+                .record(source, leaf, Some(root), &mut charge, alternatives.bytes)
+                .unwrap();
+            alternatives
+                .record(leaf, exit, Some(source), &mut charge, alternatives.bytes)
+                .unwrap();
+        }
+        let mut ancestry = None;
+        let mut tree = ReverseHopTree {
+            parent: &parent,
+            dist: &dist,
+            ancestry: &mut ancestry,
+            charge_index: &|bytes| ctx.charge(bytes),
+        };
+        // The deep hop could certify length six. A returning child reaches
+        // the length-three lower bound before the deep hop needs an index.
+        let mut steps = 0;
+        let threshold = alternatives
+            .competing_length(
+                &ctx,
+                &mut tree,
+                source,
+                &alternatives.branches[&source],
+                6,
+                &mut || {
+                    steps += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(threshold, Some(3));
+        assert!(ancestry.is_none());
+        assert!(steps < 6 * n + 50, "{steps} steps");
+    }
+
+    #[test]
+    fn reverse_competing_suffixes_are_cached_and_poll_during_a_walk() {
+        use std::sync::atomic::Ordering;
+
+        let store = crate::store::Store::in_memory(crate::store::StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let (root, source, exit, upstream) = (0, 1, 2, 3);
+        let mut dist = HbMap::default();
+        let mut parent = HbMap::default();
+        let mut link = |node, depth, p| {
+            dist.insert(node, depth);
+            parent.insert(
+                (node, depth),
+                Parent {
+                    node: p,
+                    p: 0,
+                    rev: false,
+                },
+            );
+        };
+        link(root, 0, root);
+        link(source, 1, root);
+        link(exit, 1, root);
+        link(upstream, 2, source);
+        let mut alternatives = ReverseAlternatives::default();
+        let mut charge = ctx.charge(0).unwrap();
+        for leaf in 1000..3048 {
+            link(leaf, 2, source);
+            alternatives
+                .record(source, leaf, Some(root), &mut charge, alternatives.bytes)
+                .unwrap();
+            // Each leaf can return to the forbidden source. Only the last can exit.
+            let dest = if leaf == 3047 { exit } else { source };
+            alternatives
+                .record(leaf, dest, Some(source), &mut charge, alternatives.bytes)
+                .unwrap();
+        }
+        let mut ancestry = None;
+        let mut tree = ReverseHopTree {
+            parent: &parent,
+            dist: &dist,
+            ancestry: &mut ancestry,
+            charge_index: &|bytes| ctx.charge(bytes),
+        };
+        // The first checkpoint during the walk must observe cancellation and
+        // release its scratch without caching a partial answer.
+        let cancel = ctx.cancel.clone();
+        let hook = test_hooks::on_traversal_poll(move || cancel.store(true, Ordering::Relaxed));
+        let retained = ctx.live_bytes();
+        assert!(matches!(
+            alternatives.chain_has_multi(&ctx, &mut tree, upstream, 2, 3),
+            Err(Error::Cancelled)
+        ));
+        assert!(alternatives.branches[&source].competing.get().is_none());
+        assert_eq!(ctx.live_bytes(), retained);
+        drop(hook);
+        ctx.cancel.store(false, Ordering::Relaxed);
+
+        let mut limited = Ctx::new(store.snapshot());
+        limited.mem_limit = 1024;
+        assert!(matches!(
+            alternatives.chain_has_multi(&limited, &mut tree, upstream, 2, 3),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert!(alternatives.branches[&source].competing.get().is_none());
+        assert_eq!(limited.live_bytes(), 0);
+
+        // The upstream prefix leaves only two hops. Cache the exact threshold
+        // of three so that a later request starting at the branch can use it.
+        assert!(
+            !alternatives
+                .chain_has_multi(&ctx, &mut tree, upstream, 2, 3)
+                .unwrap()
+        );
+        assert_eq!(
+            alternatives.branches[&source].competing.get(),
+            Some(&Some(3))
+        );
+        test_hooks::REVERSE_SUFFIX_STEPS.with(|count| count.set(0));
+        assert!(
+            alternatives
+                .chain_has_multi(&ctx, &mut tree, source, 1, 3)
+                .unwrap()
+        );
+        test_hooks::REVERSE_SUFFIX_STEPS.with(|count| assert_eq!(count.get(), 1));
+    }
+
+    /// Regression for Sol r4 P3: eager direct reconstruction in `ReverseWide` must transfer
+    /// the edge buffer credit into `eng.charge` instead of charging `len * size_of::<Edge>()`
+    /// on both the tree charge and `eng.charge` at the same time.
+    #[test]
+    fn eager_reverse_wide_direct_reconstruction_does_not_double_charge_edge_buffer() {
+        use crate::io::Source;
+        use crate::sparql::pool::QueryPool;
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        use oxrdfio::RdfFormat;
+
+        let chain_len = 400usize;
+        let mut ttl = String::from(
+            "@prefix ex: <http://example.org/> .\n\
+             ex:c1 ex:p ex:t {| ex:w 1.0e-12 |} .\n\
+             ex:b ex:p ex:t {| ex:w 1.0e0 |} .\n\
+             ex:b ex:p ex:x {| ex:w 5.0e-1 |} .\n\
+             ex:x ex:p ex:t {| ex:w 5.0e-1 |} .\n",
+        );
+        for i in 2..=chain_len {
+            ttl += &format!("ex:c{i} ex:p ex:c{} {{| ex:w 0.0e0 |}} .\n", i - 1);
+        }
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+
+        let p = snap.lookup_iri("http://example.org/p").unwrap();
+        let w = snap.lookup_iri("http://example.org/w").unwrap();
+        let t = snap.lookup_iri("http://example.org/t").unwrap();
+        let reifies = snap
+            .lookup_iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies")
+            .map(|id| id.0);
+        let spec = PathSearchSpec {
+            algorithm: Algorithm::Shortest,
+            source: PathEnd::Var(0),
+            target: PathEnd::Const(t),
+            predicates: Some(vec![p.0]),
+            directions: vec![Direction::Forward],
+            direction: Direction::Forward,
+            exclude: Vec::new(),
+            max_degree: None,
+            edge_pattern: None,
+            min_len: 1,
+            max_len: Some(chain_len as u32),
+            k: 1,
+            limit: Some(chain_len),
+            max_visited: 100_000,
+            weight: Some(Some(w.0)),
+            default_weight: 1.0,
+            reifies,
+            path_index: None,
+            edge_index: None,
+            edge_s: None,
+            edge_p: None,
+            edge_o: None,
+            edge: None,
+            length: None,
+            cost: None,
+            graph: GraphFilter::Default,
+        };
+
+        // Measure the exact retained tree charge and weight cache charge directly so the
+        // tight budget below depends on no magic constants.
+        let measure_ctx = Ctx::new(snap.clone());
+        let eng = Engine::new(&measure_ctx, &spec, None).unwrap();
+        let (outcome, tree_charge) = eng.dijkstra_bounded(t.0, false, chain_len as u32).unwrap();
+        assert!(
+            matches!(outcome, BoundedTreeOutcome::ReverseWide { .. }),
+            "fixture must exercise the ReverseWide direct-reconstruction arm"
+        );
+        let retained_tree = tree_charge.bytes();
+        let weight_cache = eng.charge.bytes();
+        let retained_results: u64 = (1..=chain_len as u64)
+            .map(|k| k * (size_of::<Edge>() as u64) + 64)
+            .sum();
+        drop(tree_charge);
+        drop(eng);
+        drop(measure_ctx);
+
+        // Allow retained tree + weight cache + all 400 retained results + 4 KiB headroom.
+        // The 400th path's edge buffer is `400 * 32 = 12_800` bytes, so double-charging it
+        // overflows this budget while single-charging via credit transfer fits cleanly.
+        let tight_limit = retained_tree
+            .saturating_add(weight_cache)
+            .saturating_add(retained_results)
+            .saturating_add(4 * 1024);
+
+        let mut fast_ctx = Ctx::new(snap.clone());
+        fast_ctx.mem_limit = tight_limit;
+        let (tbl, _) = super::run(&fast_ctx, &spec, None, None, &[0])
+            .expect("eager ReverseWide direct reconstruction must fit without double-charging");
+        assert_eq!(tbl.len(), chain_len);
+        assert!(
+            fast_ctx.mem_peak() <= tight_limit,
+            "fast peak {} exceeded tight limit {tight_limit}",
+            fast_ctx.mem_peak()
+        );
+        drop(tbl);
+        drop(fast_ctx);
+
+        // Also exercise the pooled ledger path end-to-end through `query`.
+        let q = format!(
+            "PREFIX ex: <http://example.org/>\n\
+             PREFIX path: <urn:x-sparkles:path#>\n\
+             SELECT ?src WHERE {{ SERVICE path:search {{ [] path:source ?src ; \
+              path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+              path:maxLength {chain_len} ; path:limit {chain_len} }} }}"
+        );
+        let pool = QueryPool::new(tight_limit.saturating_add(256 * 1024));
+        let pooled_opts = QueryOptions {
+            max_memory_bytes: Some(tight_limit.saturating_add(64 * 1024)),
+            pool: Some(pool.clone()),
+            no_cache: true,
+            ..Default::default()
+        };
+        let pooled_res = query(snap, &q, &pooled_opts)
+            .expect("pooled eager ReverseWide direct reconstruction must succeed");
+        drop(pooled_res);
+        assert_eq!(pool.granted(), 0);
     }
 }

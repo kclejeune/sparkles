@@ -815,6 +815,85 @@ fn path_search_item_1122_all_shortest_and_variable_end_parity() {
         true,
         false,
     );
+    // Weighted shortest / allShortest / kShortest with maxLength (item 275): const pairs,
+    // cycle, VALUES, unbound target, unbound source, minLength 0, maxLength 0 and 1.
+    assert_parity_batches(
+        &snap,
+        "SELECT ?i ?es ?eo ?c { SERVICE path:search { [] path:source ex:d0 ; path:target ex:d3 ; path:predicate ex:e ; path:weight ex:w ; path:maxLength 6 ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo ; path:cost ?c } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?i ?es ?eo ?c { SERVICE path:search { [] path:source ex:d0 ; path:target ex:d0 ; path:predicate ex:e ; path:weight ex:w ; path:maxLength 7 ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo ; path:cost ?c } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?t ?c ?len { SERVICE path:search { [] path:source ex:d0 ; path:target ?t ; path:predicate ex:e ; path:weight ex:w ; path:maxLength 4 ; path:cost ?c ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?t ?c ?len { SERVICE path:search { [] path:source ex:d0 ; path:target ?t ; path:predicate ex:e ; path:weight ex:w ; path:minLength 0 ; path:maxLength 2 ; path:cost ?c ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?t ?c ?len { SERVICE path:search { [] path:source ex:d0 ; path:target ?t ; path:predicate ex:e ; path:weight ex:w ; path:minLength 0 ; path:maxLength 0 ; path:cost ?c ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?s ?c ?len { SERVICE path:search { [] path:source ?s ; path:target ex:d3 ; path:predicate ex:e ; path:weight ex:w ; path:minLength 0 ; path:maxLength 0 ; path:cost ?c ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?c ?len { SERVICE path:search { [] path:source ex:d0 ; path:target ex:d0 ; path:predicate ex:e ; path:weight ex:w ; path:minLength 0 ; path:maxLength 0 ; path:cost ?c ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?t ?c ?len { SERVICE path:search { [] path:source ex:d0 ; path:target ?t ; path:predicate ex:e ; path:weight ex:w ; path:maxLength 1 ; path:cost ?c ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?s ?c ?len { SERVICE path:search { [] path:source ?s ; path:target ex:d3 ; path:predicate ex:e ; path:weight ex:w ; path:maxLength 4 ; path:cost ?c ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?s ?t ?c ?len { VALUES (?s ?t) { (ex:d0 ex:d2) (ex:d0 UNDEF) (ex:d1 ex:d3) } SERVICE path:search { [] path:source ?s ; path:target ?t ; path:predicate ex:e ; path:weight ex:w ; path:maxLength 3 ; path:cost ?c ; path:length ?len } }",
+        &opts,
+        true,
+        true,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?p ?i ?c { SERVICE path:search { [] path:source ex:d0 ; path:target ex:d3 ; path:predicate ex:e ; path:algorithm path:kShortest ; path:k 4 ; path:weight ex:w ; path:maxLength 6 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c } }",
+        &opts,
+        true,
+        false,
+    );
     assert_parity_batches(
         &snap,
         "SELECT ?p ?i ?c { SERVICE path:search { [] path:source ex:d0 ; path:target ex:d3 ; path:predicate ex:e ; path:algorithm path:allShortest ; path:weight ex:w ; path:maxLength 6 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c } }",
@@ -1143,35 +1222,35 @@ fn path_search_r1_parity_cancellation_and_release() {
         true,
         false,
     );
-    // `maxVisited 3`: both eager and streaming stop at cost 2 > best 1 and succeed with
-    // identical `visited` counters.
+    // `maxVisited 2`: bounded `maxLength 1` visits only `s` in each of the two spurs,
+    // so both eager and streaming succeed with identical `visited` counters.
     assert_parity_batches(
         &snap3,
-        "SELECT ?p ?c { SERVICE path:search { [] path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:algorithm path:allShortest ; path:weight ex:w ; path:maxLength 1 ; path:maxVisited 3 ; path:pathIndex ?p ; path:cost ?c } }",
+        "SELECT ?p ?c { SERVICE path:search { [] path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:algorithm path:allShortest ; path:weight ex:w ; path:maxLength 1 ; path:maxVisited 2 ; path:pathIndex ?p ; path:cost ?c } }",
         &opts,
         true,
         false,
     );
-    // `maxVisited 2`: both eager and streaming fail with the exact same `path:maxVisited`
+    // `maxVisited 1`: both eager and streaming fail with the exact same `path:maxVisited`
     // error on full drain.
-    let q_mv2 = format!(
-        "{P}SELECT ?p ?c {{ SERVICE path:search {{ [] path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:algorithm path:allShortest ; path:weight ex:w ; path:maxLength 1 ; path:maxVisited 2 ; path:pathIndex ?p ; path:cost ?c }} }}"
+    let q_mv1 = format!(
+        "{P}SELECT ?p ?c {{ SERVICE path:search {{ [] path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:algorithm path:allShortest ; path:weight ex:w ; path:maxLength 1 ; path:maxVisited 1 ; path:pathIndex ?p ; path:cost ?c }} }}"
     );
     let strict = CursorOptions {
         batch_rows: 1,
         fallback: FallbackPolicy::RejectMaterialization,
         ..Default::default()
     };
-    let eager_mv2 = query(snap3.clone(), &q_mv2, &opts)
+    let eager_mv1 = query(snap3.clone(), &q_mv1, &opts)
         .err()
         .expect("expected eager maxVisited error");
-    let stream_mv2 = select_cursor(snap3.clone(), &q_mv2, &opts, &strict)
+    let stream_mv1 = select_cursor(snap3.clone(), &q_mv1, &opts, &strict)
         .and_then(|mut c| {
             while c.next_batch()?.is_some() {}
             Ok(())
         })
         .unwrap_err();
-    assert_eq!(format!("{stream_mv2}"), format!("{eager_mv2}"));
+    assert_eq!(format!("{stream_mv1}"), format!("{eager_mv1}"));
 
     // 2. Grouped output with two VALUES rows binding the same source and two tied shortest
     //    paths: full multiset + `pathIndex` parity and exact ordered parity under ORDER BY.
@@ -1393,4 +1472,418 @@ fn path_search_r1_parity_cancellation_and_release() {
     );
     drop(c);
     assert_eq!(meter.live_bytes(), 0);
+
+    // 5. Bounded weighted cursor (item 275): early close, mid-pull cancellation, and
+    //    admission failure while frontier state is live all release charged memory to 0.
+    let star = Store::in_memory(StoreOptions::default());
+    let mut star_data = String::from("<urn:z> <urn:p> <urn:t> .\n");
+    for i in 0..400 {
+        star_data.push_str(&format!(
+            "<urn:s> <urn:p> <urn:l:{i}> .\n<urn:l:{i}> <urn:p> <urn:m:{i}> .\n"
+        ));
+    }
+    load(&star, &star_data, RdfFormat::Turtle);
+    let star_snap = star.snapshot();
+    let q_bounded_unbound = format!(
+        "{P}SELECT ?t ?c ?l {{ SERVICE path:search {{ [] path:source <urn:s> ; path:target ?t ; path:predicate <urn:p> ; path:weight <urn:w> ; path:maxLength 2 ; path:cost ?c ; path:length ?l }} }}"
+    );
+    let q_bounded_pair = format!(
+        "{P}SELECT ?c ?l {{ SERVICE path:search {{ [] path:source <urn:s> ; path:target <urn:t> ; path:predicate <urn:p> ; path:weight <urn:w> ; path:maxLength 2 ; path:cost ?c ; path:length ?l }} }}"
+    );
+
+    // 5a. Early close after one batch releases all bounded-search memory.
+    let mut c = select_cursor(star_snap.clone(), &q_bounded_unbound, &opts, &strict).unwrap();
+    let meter = c.memory_meter();
+    assert!(c.next_batch().unwrap().is_some());
+    drop(c);
+    assert_eq!(meter.live_bytes(), 0);
+
+    // 5b. True within-pull cancellation during bounded cursor relaxation (both one-ended
+    //     unbound-target and bidirectional pair searches): cancellation stays false until
+    //     traversal poll #2 inside the first `next_batch()` pull, proving bounded cursor
+    //     relaxation observes cancellation mid-pull and releases every charged byte.
+    let big_star = Store::in_memory(StoreOptions::default());
+    let mut big_star_data = String::from("<urn:z> <urn:p> <urn:t> .\n");
+    for i in 0..10_000 {
+        big_star_data.push_str(&format!("<urn:s> <urn:p> <urn:l:{i}> .\n"));
+    }
+    load(&big_star, &big_star_data, RdfFormat::Turtle);
+    let big_star_snap = big_star.snapshot();
+    let q_bounded_cancel_unbound = format!(
+        "{P}SELECT ?t ?c ?l {{ SERVICE path:search {{ [] path:source <urn:s> ; path:target ?t ; path:predicate <urn:p> ; path:weight <urn:w> ; path:maxLength 2 ; path:maxVisited 20000 ; path:cost ?c ; path:length ?l }} }}"
+    );
+    let q_bounded_cancel_pair = format!(
+        "{P}SELECT ?c ?l {{ SERVICE path:search {{ [] path:source <urn:s> ; path:target <urn:t> ; path:predicate <urn:p> ; path:weight <urn:w> ; path:maxLength 2 ; path:maxVisited 2 ; path:cost ?c ; path:length ?l }} }}"
+    );
+    for (label, q) in [
+        ("bounded unbound mid-pull cancel", &q_bounded_cancel_unbound),
+        ("bounded pair mid-pull cancel", &q_bounded_cancel_pair),
+    ] {
+        let b_cancel = Arc::new(AtomicBool::new(false));
+        let b_cancel_opts = QueryOptions {
+            no_cache: true,
+            cancel: Some(b_cancel.clone()),
+            ..Default::default()
+        };
+        let mut c = select_cursor(big_star_snap.clone(), q, &b_cancel_opts, &strict).unwrap();
+        let meter = c.memory_meter();
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_hook = polls.clone();
+        let cancel_hook = b_cancel.clone();
+        let _hook = sparkles_core::sparql::pathsearch::test_hooks::on_traversal_poll(move || {
+            let count = polls_hook.fetch_add(1, Ordering::Relaxed) + 1;
+            if count == 2 {
+                cancel_hook.store(true, Ordering::Release);
+            }
+        });
+        let res = c.next_batch().map(|b| b.is_some());
+        drop(_hook);
+        assert!(
+            matches!(res, Err(Error::Cancelled)),
+            "{label}: expected mid-pull cancellation inside first next_batch(), got {res:?}"
+        );
+        assert_eq!(
+            polls.load(Ordering::Relaxed),
+            2,
+            "{label}: expected immediate abort on traversal poll #2"
+        );
+        let ps_node = find_ps_node(c.plan()).expect("PathSearch node in cursor plan");
+        assert!(
+            !ps_node.complete,
+            "{label}: cancelled PathSearch must remain incomplete in cursor plan"
+        );
+        drop(c);
+        assert_eq!(
+            meter.live_bytes(),
+            0,
+            "{label}: live bytes not released after mid-pull cancellation"
+        );
+    }
+
+    // 5c. Admission failure while bounded Pareto frontier state is live (both pair and
+    //     one-ended searches) returns Memory BudgetExceeded and releases every charged byte.
+    for (label, q) in [
+        ("bounded pair", &q_bounded_pair),
+        ("bounded unbound", &q_bounded_unbound),
+    ] {
+        let probe = select_cursor(star_snap.clone(), q, &opts, &strict).unwrap();
+        let open_bytes = probe.memory_meter().live_bytes();
+        drop(probe);
+        let tight = QueryOptions {
+            no_cache: true,
+            max_memory_bytes: Some(open_bytes + 4096),
+            ..Default::default()
+        };
+        let mut c = select_cursor(star_snap.clone(), q, &tight, &strict).unwrap();
+        let meter = c.memory_meter();
+        let res = c.next_batch().map(|b| b.is_some());
+        assert!(
+            matches!(res, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+            "{label}: expected memory admission failure while frontier is live, got {res:?}"
+        );
+        drop(c);
+        assert_eq!(
+            meter.live_bytes(),
+            0,
+            "{label}: live bytes not released after admission failure"
+        );
+    }
+}
+
+/// Regression for Sol r3 P2 in the streaming cursor entry point: unique-route sources in a
+/// reverse wide-weight search stay within the reverse search's exact visit budget, preserve
+/// eager/streaming parity, and release every charged byte on completion and early close.
+#[test]
+fn bounded_weighted_reverse_wide_unique_routes_visit_budget() {
+    let opts = QueryOptions::default();
+    let strict = CursorOptions {
+        batch_rows: 16,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+
+    // Two separate single-edge paths with weights 1 and 1e12, maxLength 2, maxVisited 3.
+    let two_store = Store::in_memory(StoreOptions::default());
+    load(
+        &two_store,
+        "@prefix ex: <http://example.org/> .\n\
+         ex:a ex:p ex:t {| ex:w 1.0e0 |} .\n\
+         ex:b ex:p ex:t {| ex:w 1.0e12 |} .\n",
+        RdfFormat::Turtle,
+    );
+    let two_snap = two_store.snapshot();
+    let q_two = "SELECT ?src ?c ?l { SERVICE path:search { [] path:source ?src ; \
+        path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+        path:maxLength 2 ; path:maxVisited 3 ; path:cost ?c ; path:length ?l } }";
+    assert_parity(&two_snap, q_two, &opts, true);
+    let (rows_two, _, _) = drain_strict(&two_snap, &format!("{P}{q_two}"), &opts, 16);
+    assert_eq!(rows_two.len(), 2);
+
+    // Hybrid graph: 500-edge unique-route chain ending in 1e12 plus the wide-weight
+    // diamond on the same target `ex:t`.
+    let chain_len = 500usize;
+    let m = 2f64.powi(-53);
+    let d = 2f64.powi(-105);
+    let e = d / 2.0;
+    let dbl = |w: f64| format!("\"{w:?}\"^^<http://www.w3.org/2001/XMLSchema#double>");
+    let mut ttl = String::from(
+        "@prefix ex: <http://example.org/> .\n\
+         ex:c1 ex:p ex:t {| ex:w 1.0e12 |} .\n",
+    );
+    for i in 2..=chain_len {
+        ttl += &format!("ex:c{i} ex:p ex:c{} {{| ex:w 1.0e0 |}} .\n", i - 1);
+    }
+    ttl += &format!(
+        "ex:s ex:p ex:pnode {{| ex:w {} |}} . ex:pnode ex:p ex:v {{| ex:w {} |}} .\n\
+         ex:v ex:p2 ex:t {{| ex:w {} |}} .\n\
+         ex:v ex:p ex:x1 {{| ex:w {} |}} . ex:x1 ex:p ex:x2 {{| ex:w {} |}} .\n\
+         ex:x2 ex:p ex:t {{| ex:w {} |}} .\n",
+        dbl(1.0),
+        dbl(m),
+        dbl(d),
+        dbl(e),
+        dbl(e),
+        dbl(e),
+    );
+    let hybrid_store = Store::in_memory(StoreOptions::default());
+    load(&hybrid_store, &ttl, RdfFormat::Turtle);
+    let hybrid_snap = hybrid_store.snapshot();
+    let q_hybrid = format!(
+        "SELECT ?src ?c ?l {{ SERVICE path:search {{ [] path:source ?src ; \
+         path:target ex:t ; path:predicate ex:p , ex:p2 ; path:weight ex:w ; \
+         path:maxLength {chain_len} ; path:maxVisited 600 ; path:cost ?c ; path:length ?l }} }}"
+    );
+    assert_parity(&hybrid_snap, &q_hybrid, &opts, true);
+
+    // Early close while ReverseWide cursor state is live releases all operator bytes on
+    // cursor drop and returns every byte (including Ctx's value cache) to the pool on
+    // context drop.
+    let pool = sparkles_core::sparql::pool::QueryPool::new(1 << 24);
+    let early_opts = QueryOptions {
+        no_cache: true,
+        pool: Some(pool.clone()),
+        ..Default::default()
+    };
+    let mut c =
+        select_cursor(hybrid_snap, &format!("{P}{q_hybrid}"), &early_opts, &strict).unwrap();
+    let meter = c.memory_meter();
+    assert!(c.next_batch().unwrap().is_some());
+    let live_while_open = meter.live_bytes();
+    assert!(
+        live_while_open > 65_536,
+        "expected live ReverseWide state above value cache, got {live_while_open}"
+    );
+    drop(c);
+    let live_after_cursor_drop = meter.live_bytes();
+    assert!(
+        live_after_cursor_drop < live_while_open && live_after_cursor_drop <= 65_536,
+        "expected ReverseWide state released on early drop (open={live_while_open}, after={live_after_cursor_drop})"
+    );
+    drop(meter);
+    assert_eq!(pool.granted(), 0);
+}
+
+/// Regression for Sol r4 P2 in the streaming cursor entry point: self-loops, pure 2-cycles,
+/// and longer suffixes outside an upstream source's remaining length budget stay within
+/// tight `path:maxVisited` budgets and preserve eager/streaming parity.
+#[test]
+fn bounded_weighted_reverse_wide_self_loop_and_remaining_budget() {
+    let opts = QueryOptions::default();
+
+    // 1. Two-source wide-weight fixture with self-loop `a -> a`, maxLength 2, maxVisited 3.
+    let self_loop_store = Store::in_memory(StoreOptions::default());
+    load(
+        &self_loop_store,
+        "@prefix ex: <http://example.org/> .\n\
+         ex:a ex:p ex:t {| ex:w 1.0e0 |} .\n\
+         ex:a ex:p ex:a {| ex:w 1.0e0 |} .\n\
+         ex:b ex:p ex:t {| ex:w 1.0e12 |} .\n",
+        RdfFormat::Turtle,
+    );
+    let self_loop_snap = self_loop_store.snapshot();
+    for (lim, expected) in [("", 2usize), (" ; path:limit 1", 1)] {
+        let q = format!(
+            "SELECT ?src ?c ?l {{ SERVICE path:search {{ [] path:source ?src ; \
+             path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+             path:maxLength 2 ; path:maxVisited 3{lim} ; path:cost ?c ; path:length ?l }} }}"
+        );
+        assert_parity(&self_loop_snap, &q, &opts, true);
+        let (rows, _, _) = drain_strict(&self_loop_snap, &format!("{P}{q}"), &opts, 16);
+        assert_eq!(rows.len(), expected);
+    }
+
+    // 2. Three leaves + self-loop `a -> a`, maxLength 2, maxVisited 6, limit 1.
+    let leaves_store = Store::in_memory(StoreOptions::default());
+    load(
+        &leaves_store,
+        "@prefix ex: <http://example.org/> .\n\
+         ex:a ex:p ex:t {| ex:w 1.0e0 |} .\n\
+         ex:a ex:p ex:a {| ex:w 1.0e0 |} .\n\
+         ex:b ex:p ex:t {| ex:w 1.0e12 |} .\n\
+         ex:u1 ex:p ex:a {| ex:w 1.0e0 |} .\n\
+         ex:u2 ex:p ex:a {| ex:w 1.0e0 |} .\n\
+         ex:u3 ex:p ex:a {| ex:w 1.0e0 |} .\n",
+        RdfFormat::Turtle,
+    );
+    let leaves_snap = leaves_store.snapshot();
+    let q_leaves = "SELECT ?src ?c ?l { SERVICE path:search { [] path:source ?src ; \
+        path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+        path:maxLength 2 ; path:maxVisited 6 ; path:limit 1 ; path:cost ?c ; path:length ?l } }";
+    assert_parity(&leaves_snap, q_leaves, &opts, true);
+    let (rows_leaves, _, _) = drain_strict(&leaves_snap, &format!("{P}{q_leaves}"), &opts, 16);
+    assert_eq!(rows_leaves.len(), 1);
+
+    // 3. Pure 2-cycle `a <-> c`, maxLength 3, maxVisited 4.
+    let cycle_store = Store::in_memory(StoreOptions::default());
+    load(
+        &cycle_store,
+        "@prefix ex: <http://example.org/> .\n\
+         ex:a ex:p ex:t {| ex:w 1.0e0 |} .\n\
+         ex:b ex:p ex:t {| ex:w 1.0e12 |} .\n\
+         ex:c ex:p ex:a {| ex:w 1.0e0 |} .\n\
+         ex:a ex:p ex:c {| ex:w 1.0e0 |} .\n",
+        RdfFormat::Turtle,
+    );
+    let cycle_snap = cycle_store.snapshot();
+    let q_cycle = "SELECT ?src ?c ?l { SERVICE path:search { [] path:source ?src ; \
+        path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+        path:maxLength 3 ; path:maxVisited 4 ; path:cost ?c ; path:length ?l } }";
+    assert_parity(&cycle_snap, q_cycle, &opts, true);
+    let (rows_cycle, _, _) = drain_strict(&cycle_snap, &format!("{P}{q_cycle}"), &opts, 16);
+    assert_eq!(rows_cycle.len(), 3);
+
+    // 4. Diamond + upstream leaves outside remaining budget, maxLength 5, maxVisited 55.
+    let m = 2f64.powi(-53);
+    let d = 2f64.powi(-105);
+    let e = d / 2.0;
+    let dbl = |w: f64| format!("\"{w:?}\"^^<http://www.w3.org/2001/XMLSchema#double>");
+    let mut rem_ttl = format!(
+        "@prefix ex: <http://example.org/> .\n\
+         ex:s ex:p ex:pnode {{| ex:w {} |}} . ex:pnode ex:p ex:v {{| ex:w {} |}} .\n\
+         ex:v ex:p2 ex:t {{| ex:w {} |}} .\n\
+         ex:v ex:p ex:x1 {{| ex:w {} |}} . ex:x1 ex:p ex:x2 {{| ex:w {} |}} .\n\
+         ex:x2 ex:p ex:t {{| ex:w {} |}} .\n",
+        dbl(1.0),
+        dbl(m),
+        dbl(d),
+        dbl(e),
+        dbl(e),
+        dbl(e),
+    );
+    for i in 1..=20 {
+        rem_ttl += &format!("ex:u{i} ex:p ex:s {{| ex:w 1.0e0 |}} .\n");
+    }
+    let rem_store = Store::in_memory(StoreOptions::default());
+    load(&rem_store, &rem_ttl, RdfFormat::Turtle);
+    let rem_snap = rem_store.snapshot();
+    let q_rem = "SELECT ?src ?c ?l { SERVICE path:search { [] path:source ?src ; \
+        path:target ex:t ; path:predicate ex:p , ex:p2 ; path:weight ex:w ; \
+        path:maxLength 5 ; path:maxVisited 55 ; path:cost ?c ; path:length ?l } }";
+    assert_parity(&rem_snap, q_rem, &opts, true);
+    let (rows_rem, _, _) = drain_strict(&rem_snap, &format!("{P}{q_rem}"), &opts, 16);
+    assert_eq!(rows_rem.len(), 25);
+}
+
+#[test]
+fn bounded_weighted_reverse_parallel_backtrack_visit_budget() {
+    let store = Store::in_memory(StoreOptions::default());
+    load(
+        &store,
+        "@prefix ex: <http://example.org/> . \
+         ex:a ex:p ex:t {| ex:w 1.0e0 |} . \
+         ex:b ex:p ex:t {| ex:w 1.0e12 |} . \
+         ex:a ex:p ex:c {| ex:w 1.0e0 |} . \
+         ex:c ex:p ex:a {| ex:w 1.0e0 |} . \
+         ex:c ex:p2 ex:a {| ex:w 1.0e0 |} .",
+        RdfFormat::Turtle,
+    );
+    let q = "SELECT ?src ?l { SERVICE path:search { [] path:source ?src ; \
+        path:target ex:t ; path:predicate ex:p , ex:p2 ; path:weight ex:w ; \
+        path:maxLength 3 ; path:maxVisited 4 ; path:length ?l } }";
+    let snap = store.snapshot();
+    let opts = QueryOptions::default();
+    // The first source has one simple route. A later pull can spend visits on c,
+    // which has two distinct routes through its parallel predicates.
+    let cursor_opts = CursorOptions {
+        batch_rows: 1,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let mut cursor = select_cursor(snap, &format!("{P}{q}"), &opts, &cursor_opts).unwrap();
+    let batch = cursor.next_batch().unwrap().unwrap();
+    assert_eq!(
+        batch.row(0).unwrap().values(),
+        &[
+            Some(Term::NamedNode(
+                oxrdf::NamedNode::new("http://example.org/a").unwrap()
+            )),
+            Some(Term::Literal(1.into())),
+        ]
+    );
+}
+
+#[test]
+fn bounded_weighted_reverse_long_backtrack_visit_budget() {
+    let store = Store::in_memory(StoreOptions::default());
+    load(
+        &store,
+        "@prefix ex: <http://example.org/> . \
+         ex:a ex:p ex:t {| ex:w 1.0e0 |} . \
+         ex:b ex:p ex:t {| ex:w 1.0e12 |} . \
+         ex:a ex:p ex:d {| ex:w 1.0e0 |} . \
+         ex:d ex:p ex:c {| ex:w 1.0e0 |} . \
+         ex:c ex:p ex:a {| ex:w 1.0e0 |} .",
+        RdfFormat::Turtle,
+    );
+    let q = "SELECT ?src ?l { SERVICE path:search { [] path:source ?src ; \
+        path:target ex:t ; path:predicate ex:p , ex:p2 ; path:weight ex:w ; \
+        path:maxLength 4 ; path:maxVisited 5 ; path:length ?l } }";
+    let snap = store.snapshot();
+    let opts = QueryOptions::default();
+    let (rows, _, _) = drain_strict(&snap, &format!("{P}{q}"), &opts, 16);
+    assert_eq!(rows.len(), 4);
+    assert_parity(&snap, q, &opts, true);
+}
+
+#[test]
+fn bounded_weighted_reverse_backtrack_with_exit() {
+    // The reverse search prefers x1 -> v -> t to the three tiny edges via x2 and x3.
+    // The edge v -> x1 needs that longer exit to avoid returning to v. In source order
+    // the four tiny weights round away, so s must take the six-edge path.
+    let m = 2f64.powi(-53);
+    let d = 2f64.powi(-105);
+    let e = d / 2.0;
+    let dbl = |w: f64| format!("\"{w:?}\"^^<http://www.w3.org/2001/XMLSchema#double>");
+    let backtrack_exit_ttl = format!(
+        "@prefix ex: <http://example.org/> .\n\
+         ex:s ex:p ex:pnode {{| ex:w {} |}} . ex:pnode ex:p ex:v {{| ex:w {} |}} .\n\
+         ex:v ex:p2 ex:t {{| ex:w {} |}} .\n\
+         ex:x1 ex:p2 ex:v {{| ex:w {} |}} .\n\
+         ex:v ex:p ex:x1 {{| ex:w {} |}} . ex:x1 ex:p ex:x2 {{| ex:w {} |}} .\n\
+         ex:x2 ex:p ex:x3 {{| ex:w {} |}} . ex:x3 ex:p ex:t {{| ex:w {} |}} .\n",
+        dbl(1.0),
+        dbl(m),
+        dbl(d),
+        dbl(0.0),
+        dbl(e),
+        dbl(e),
+        dbl(e),
+        dbl(e),
+    );
+    let store = Store::in_memory(StoreOptions::default());
+    load(&store, &backtrack_exit_ttl, RdfFormat::Turtle);
+    let q = "SELECT ?src ?l { SERVICE path:search { [] path:source ?src ; \
+        path:target ex:t ; path:predicate ex:p , ex:p2 ; path:weight ex:w ; \
+        path:maxLength 6 ; path:length ?l } }";
+    let snap = store.snapshot();
+    let opts = QueryOptions::default();
+    let (rows, _, _) = drain_strict(&snap, &format!("{P}{q}"), &opts, 16);
+    let expected = bag(vec![vec![
+        Some(Term::NamedNode(
+            oxrdf::NamedNode::new("http://example.org/s").unwrap(),
+        )),
+        Some(Term::Literal(6.into())),
+    ]]);
+    assert!(rows.contains(&expected[0]), "{rows:?}");
+    assert_parity(&snap, q, &opts, true);
 }

@@ -266,10 +266,56 @@ triple term `<<( s p o )>>`. The weight is the value of `ex:w` on a reifier `r` 
 used. An edge without one has `path:defaultWeight`. A weight that is not a number, is
 negative or is NaN fails the query.
 
-With weights, `path:shortest` and `path:allShortest` use Dijkstra's algorithm and
-`path:kShortest` uses Yen's algorithm with Dijkstra's as its inner search. Lengths still
-count edges, and `path:maxLength` and `path:minLength` filter the paths the search
-enumerates in cost order.
+Without `path:maxLength`, `path:shortest` and `path:allShortest` use Dijkstra's algorithm
+and `path:kShortest` uses Yen's algorithm with Dijkstra's as its inner search, while
+`path:minLength` filters the paths enumerated in cost order. With `path:maxLength`,
+weighted `path:shortest` and Yen's weighted spurs in `path:kShortest` and `path:allShortest`
+run a Pareto-pruned search over `(node, length)` pairs that bounds each search by
+`path:maxLength` instead of enumerating longer paths. Single-pair searches and Yen's spurs
+split the edge budget into `ceil(L / 2)` forward and `floor(L / 2)` backward halves and
+fall back to a source-order bounded search when wide weights or overflow could affect
+ranking, with Yen's spurs carrying their accumulated prefix cost and weight range into that
+check and fallback. Unbound ends in weighted `path:shortest` with `path:maxLength` run a
+one-ended Pareto-pruned search. When a reverse search for an unbound source encounters wide
+weights or overflow, it retains minimum backward edge distances and the outgoing hops of
+each branch. As each source is requested, the search checks the branches on its parent
+chain. For each branch it caches the shortest budget admitting two simple suffixes with
+distinct first edges. A hop to a node at the same or a smaller minimum edge distance can
+follow that node's shortest suffix directly. For a hop one level deeper, the shortest
+suffix also avoids the branch if its first step reaches a different node at the branch's
+depth. The search checks these hops first. If two qualify, a hop with a larger depth
+gap cannot improve their threshold. The first deeper hop that still needs an ancestry
+check builds a preorder interval for each real node in the shortest-hop tree. Later
+checks take constant time. A neighbor outside the branch's interval has a shortest
+suffix that avoids it. The search walks the recorded hops only if an unresolved hop
+could supply a second route or improve the certified threshold. It excludes the branch
+and prunes over-budget prefixes. It orders pending work by the prefix length plus the
+minimum remaining distance. At equal bounds the walk uses an existing ancestry index immediately.
+Before building one, it allows visits and child scans that could reach a shallow exit
+to examine up to one hop or queue entry per node in the tree in total. It checks
+intervals first if the next scan would exceed that allowance or the children are
+too deep to reach a shallow exit. A child scan that yields partway through its slice
+can pass its visit directly to the next turn. The visit then costs only the hops
+it examines. If an interval takes that turn, the visit goes back on the heap.
+The walk keeps offsets into a node's hop list for its deeper tree children, pending
+interval checks and hops whose indexed suffix returns to the branch. It settles exits
+before enqueuing those returning hops, so a shorter exit can discard the whole group.
+It groups indexed returns by their exact lower bound and links offset ranges when
+other depths fall between them. The temporary table for grouping these ranges lasts
+for one scan of a node. When new tree children and indexed returns tie, the shorter
+slice starts first. Each group schedules one visit per turn, including tree children
+that run before the ancestry index exists.
+Each node expands at its shortest prefix. The walk stops when the remaining bounds cannot improve the threshold.
+The virtual endpoint represents a completed cycle and can only appear as a source of
+recorded hops. The query memory budget covers retained hops and intervals, the
+temporary child links used to build the intervals, the return ranges and their links,
+the queue and the shortest known prefixes. A reverse search skips collecting
+branch hops when the weights are known to be constant and too small to overflow. A
+source reconstructs directly when its reverse tree path has no competing suffix within
+the remaining edge budget. The other sources run bounded searches in source order, pruned by
+the minimum backward edge distances. Weighted `path:allShortest`
+with `path:maxLength` requires both ends bound because it enumerates tied short paths through
+Yen's algorithm. Lengths still count edges.
 
 The cost of a path is the sum of its weights, added in double-double arithmetic, and
 `path:cost` is that sum rounded to the nearest double. Two paths tie in the shortest modes
@@ -291,10 +337,15 @@ the ones a caller would get on a dataset that held only the visible triples.
 
 Each search counts the nodes it visits. A search that visits more than
 `path:maxVisited` fails with an error that names the parameter, rather than returning a
-partial answer. The visited sets and parent lists are charged to the query's memory
-budget, the rows to its row budgets, and the search checks the timeout and cancellation
-at every level of its frontier. Enumeration in `path:allShortest` and `path:all` can
-produce exponentially many paths, which `path:limit` and the row budget bound.
+partial answer. In a length-bounded weighted search, each settled `(node, length)` label
+counts as one visit, so a node can count more than once at distinct non-dominated lengths.
+Unexpanded half-length boundary labels in bidirectional pair searches are charged to the
+query's memory budget without counting as settled visits, while one-ended searches count
+each settled label up to `path:maxLength`. The visited sets, Pareto frontiers, and parent
+lists are charged to the query's memory budget, the rows to its row budgets, and the search
+checks the timeout and cancellation across frontier steps and edge relaxations. Enumeration
+in `path:allShortest` and `path:all` can produce exponentially many paths, which
+`path:limit` and the row budget bound.
 
 ### 4.8 Errors
 
@@ -907,3 +958,79 @@ this screen with a spread of 92 to 131% between server processes. A rerun of fou
 30 requests measured it 1.9% slower, at 1.20 and 1.23 ms, and the weighted cheapest pair
 0.5% slower, at 24.1 and 24.3 ms, so neither change is above the noise. Item 276 rechecks
 both on forge.
+
+### Weighted searches under a length limit (2026-11-26)
+
+[ROADMAP](../ROADMAP.md) item 275 replaced unbounded cost-order enumeration for weighted
+searches with `path:maxLength` with a Pareto-pruned search over `(node, length)` states in
+both the eager engine and the streaming cursor reader.
+
+* **Single pairs and Yen's spurs.** `Engine::dijkstra_pair_bounded` and
+  `SearchContext::run_dijkstra_pair_bounded` run a bidirectional Pareto-pruned search from
+  both ends, splitting the edge budget `L` into `ceil(L / 2)` forward and `floor(L / 2)`
+  backward halves, including cycles through the source via the virtual end id. Each side
+  keeps a node's reached `(length, cost)` labels sorted by strictly increasing length and
+  strictly decreasing cost, discarding any label when another label at the same node is
+  both cheaper-or-equal and shorter-or-equal. Labels at a side's half-length boundary
+  record their least cost in `bounds[side]` without entering that side's heap, and the
+  search stops once `min(top[0] + min(top[1], bound[1]), top[1] + min(top[0], bound[0]))`
+  reaches the cheapest valid meeting or becomes empty. When `L > 1` and edge weights
+  across the prefix and spur span more than 2²⁸, exceed the exact double-double span for
+  `L`, or overflow to infinity, both engines release their bidirectional state and fall
+  back to a source-order one-ended bounded Pareto search seeded with the prefix's
+  accumulated cost so candidate ranking agrees with Yen's source-order `exact_cost`.
+  `path:shortest` with bound ends runs this search directly, and Yen's algorithm passes the
+  remaining length `maxLength - i` and the prefix cost and weight range into this search
+  for every weighted spur in both `path:kShortest` and length-bounded `path:allShortest`.
+* **Unbound ends in `path:shortest`.** `Engine::dijkstra_bounded` and
+  `SearchContext::run_dijkstra_bounded` (streamed by `BoundedShortestJob`) run a
+  one-ended Pareto-pruned search over `(node, length)` up to `maxLength`, so weighted
+  `path:shortest` with `path:maxLength` now answers unbound targets and unbound sources as
+  well as bound pairs. When a reverse search for an unbound source encounters wide weights
+  or overflow with `maxLength > 1`, both engines retain the minimum backward edge
+  distances and the recorded hops at branches. Both engines resolve competing suffixes
+  when a source is requested and cache the result at each branch on its parent chain.
+  The first nonempty reverse path is a single edge from a neighbor of the target, so
+  its suffix check requires at most one walk over the recorded topology.
+  Branch hops remain live while the search emits rows. Each walk releases its scratch
+  before path reconstruction or source-order ranking.
+  Both engines skip collecting branch hops when the planner knows all weights are
+  constant and too small to overflow. A source's reverse tree path reconstructs directly
+  when no competing suffix fits the remaining edge budget. The other sources run bounded searches in source order, pruned by the
+  minimum backward edge distances. Eager direct reconstruction transfers its edge-buffer
+  charge to the result.
+  Weighted `path:allShortest` with `path:maxLength` continues to run Yen's algorithm with
+  length-bounded spurs and therefore still requires both ends bound.
+* **Tests.** `pathsearch.rs` adds unit tests for Pareto frontier pruning and lower-bound
+  arithmetic. In `crates/sparkles-core/tests/path_search.rs`,
+  `weighted_shortest_under_max_length_skips_many_cheap_long_paths` verifies that 262,144
+  cheap length-7 paths beside dearer short paths stay under `path:maxVisited 500`.
+  `weighted_bounded_edge_cases` covers `maxLength` 0 and 1, equal costs at different
+  lengths, zero-weight edges and cycles, `minLength > 1` in `kShortest`, unbound target
+  and reverse Pareto unbound-source queries, `minLength 0` with `path:limit 1` and
+  `path:maxVisited 1` across `shortest` and `kShortest`, negative weight refusal, and
+  `path:maxVisited` enforcement.
+  `random_weighted_bounded_against_brute_force` compares 45 random graphs across all
+  directions, excluded predicates, hubs, zero and decimal weights, and lengths 1 to 5
+  against brute-force enumeration for bound pairs, unbound targets, unbound sources,
+  `path:allShortest`, and `path:kShortest`. Additional regressions verify wide-weight
+  four-edge cycle ranking, shared-prefix Yen spur ranking, variable-source wide-weight
+  cross-form ranking, visit-budget preservation on unique-route reverse wide-weight graphs
+  (separate single-edge paths, a 500-edge chain, and a chain beside a wide-weight diamond),
+  self-loops and cycles within tight visit budgets, deferred backtracks with a valid exit,
+  remaining edge budgets on shared prefixes, and eager and streaming first-row work on
+  bidirectional chains with sibling entries, ancestor entries, long exits or a target cycle.
+  They cover memory admission for a sparse dead backtrack with overflow and dense branches
+  with fixed default weights, cancellation and reuse of a cached suffix threshold,
+  eager edge-buffer charge transfer, streaming
+  eager weight lookups on a 5,000-reifier edge, eager frontier memory
+  pre-admission and release across repeated pairs, single-visit `VIRT` pruning, and eager
+  mid-relaxation cancellation.
+  `crates/sparkles-core/tests/cursor_pathsearch.rs` verifies eager and streaming parity,
+  counter equality across `maxLength` 0 and 1, cycles, unbound ends, `VALUES`, `kShortest`,
+  and `allShortest`, visit-budget preservation on reverse wide-weight unique-route graphs,
+  and memory release after bounded weighted admission failure, early close, and within-pull
+  relaxation cancellation.
+  `crates/sparkles-core/tests/cursor_memory_audit.rs` audits bounded weighted `shortest` on
+  bound, unbound, and reverse wide-weight fallback forms and `kShortest` at
+  `Allowance::EXACT`, plus bounded scratch heap for eager high-reifier weight lookup.
