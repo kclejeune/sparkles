@@ -253,7 +253,10 @@ An import fetch reserves its report entry before a LOAD can commit and returns i
 scratch reservation when the report is ready. A dataset's reasoning record admits
 its warnings and fetched import names before the inference commit. It uses the
 retained pool when configured and otherwise draws exact credit from the dataset's
-work pool, if any. In-memory branches share the record and its reservation, and
+work pool, if any. When a pending import and its final record would exceed the
+retained limit together, work credit backs the overlapping copy while the record
+takes over the name's retained credit. A catalog save streams the existing registry
+bytes for records that the pool refused. In-memory branches share the record and its reservation, and
 reopened datasets admit the saved record before publishing it. Runtime checkpoints
 return scratch credit after their guards are released. WAL replay accounts for the
 overlap of growing tables and the conversion to materialization changes.

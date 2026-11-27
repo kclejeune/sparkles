@@ -1748,6 +1748,18 @@ pub fn fetch_imports_with_load<'a>(
     inputs: &Inputs,
     refresh: impl Iterator<Item = &'a String>,
     opts: &sparkles_core::sparql::QueryOptions,
+    execute: impl FnMut(&str, &str, &sparkles_core::sparql::QueryOptions) -> sparkles_core::Result<()>,
+) -> anyhow::Result<(Fetched, FetchMemory)> {
+    fetch_imports_with_names(store, inputs, refresh, opts, execute)
+}
+
+/// Fetch using names whose backing may be shared with a materialization record.
+#[doc(hidden)]
+pub fn fetch_imports_with_names(
+    store: &Store,
+    inputs: &Inputs,
+    refresh: impl Iterator<Item = impl AsRef<str>>,
+    opts: &sparkles_core::sparql::QueryOptions,
     mut execute: impl FnMut(
         &str,
         &str,
@@ -1864,6 +1876,7 @@ pub fn fetch_imports_with_load<'a>(
         }
     };
     for iri in refresh {
+        let iri = iri.as_ref();
         let ctrl = Control {
             budget: &budget,
             check: std::cell::RefCell::new(&mut check),

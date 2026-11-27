@@ -1,6 +1,8 @@
 //! Recover alias renames before opening any registered store. The durable registry
 //! selects the committed alias; the intent identifies the directory's dataset.
-use super::{DatasetKind, check_name, read_registry, sync_dir, write_file_atomic};
+#[cfg(test)]
+use super::read_registry;
+use super::{DatasetKind, check_name, sync_dir, write_file_atomic};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -21,7 +23,8 @@ pub(super) fn check_prepare(dir: &Path, from: &str) -> Result<()> {
             "an unfinished dataset rename needs recovery".into(),
         ));
     }
-    if !read_registry(dir)?
+    if !super::read_registry_identities(&super::RecoveryDir::open(dir)?)?
+        .unwrap_or_default()
         .datasets
         .iter()
         .any(|e| e.name == from && e.kind == DatasetKind::Persistent)
@@ -63,7 +66,7 @@ pub(super) fn recover(dir: &Path) -> Result<()> {
     if intent.from == intent.to {
         return Err(Error::Corrupt("rename aliases are identical".into()));
     }
-    let reg = read_registry(dir)?;
+    let reg = super::read_registry_identities(&super::RecoveryDir::open(dir)?)?.unwrap_or_default();
     let aliases: Vec<_> = reg
         .datasets
         .iter()

@@ -91,7 +91,10 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
     let state = ds.state();
     let store: &Store = &state.store;
     let cancel = ctl.cancel.flag();
-    let previous = state.recorded_reasoning();
+    let (previous, pending_before) = {
+        let journal = state.pending_imports.lock();
+        (state.recorded_reasoning(), journal.loaded.clone())
+    };
     let fetched_before = previous
         .value
         .as_ref()
@@ -111,12 +114,20 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
         if qopts.pool.is_none() && qopts.grant.is_none() {
             qopts.pool = state.pool.clone();
         }
-        let pending = state.pending_imports.lock().loaded.clone();
-        let refresh = fetched_before
-            .iter()
-            .chain(pending.names().filter(|iri| !fetched_before.contains(iri)))
-            .filter(|_| req.refresh_imports);
-        let (fetched, memory) = sparkles_reasoner::inputs::fetch_imports_with_load(
+        let refresh = req
+            .refresh_imports
+            .then(|| {
+                (0..fetched_before.len())
+                    .map(|index| super::imports::NameOwner::Recorded(previous.clone(), index))
+                    .chain(
+                        pending_before
+                            .names()
+                            .filter(|name| !fetched_before.iter().any(|iri| iri == name.as_ref())),
+                    )
+            })
+            .into_iter()
+            .flatten();
+        let (fetched, memory) = sparkles_reasoner::inputs::fetch_imports_with_names(
             store,
             &req.inputs,
             refresh,
@@ -128,6 +139,7 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
     } else {
         (Fetched::default(), None)
     };
+    drop(pending_before);
     ctl.progress.report(0.05, "loading triples");
     // the reasoner reports progress only once it holds the writer lock
     let locked = Arc::new(AtomicBool::new(false));
@@ -237,27 +249,18 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
     let PreparedRecordStrings {
         warnings,
         fetched_imports,
-        mut memory,
+        memory,
+        claims,
+        _claim_memory,
+        retirement,
     } = prepared.expect("materialization prepared its record before committing");
-    if let Some(lease) = &mut memory {
-        let bytes = [&warnings, &fetched_imports]
-            .into_iter()
-            .map(|strings| {
-                reasoning_strings_bytes(strings.capacity(), strings.iter().map(String::capacity))
-            })
-            .fold(0, u64::saturating_add);
-        lease
-            .shrink(lease.bytes() - bytes)
-            .expect("returned only unused record credit");
-    }
     let mut record = recorded_with_warnings(&req.profile, &req.extras, &report, store, warnings);
     record_input_metadata(&mut record, &req.inputs, &report);
     record.fetched_imports = fetched_imports;
     // a run keeps the dataset's automatic re-run setting
     record.auto = state.read_reasoning().as_ref().and_then(|r| r.auto.clone());
     let outcome = record.clone();
-    state.set_reasoning_admitted(record, memory)?;
-    state.forget_recorded_imports(&pending)?;
+    state.set_reasoning_admitted(record, memory, claims, retirement)?;
     ctl.progress.report(1.0, "materialized");
     Ok(ReasonOutcome {
         report,
@@ -269,6 +272,9 @@ struct PreparedRecordStrings {
     warnings: Vec<String>,
     fetched_imports: Vec<String>,
     memory: Option<sparkles_budget::MemoryLease>,
+    claims: Vec<super::imports::NameClaim>,
+    _claim_memory: Option<sparkles_budget::MemoryLease>,
+    retirement: Option<super::imports::Retirement>,
 }
 
 fn prepare_record_strings(
@@ -279,40 +285,85 @@ fn prepare_record_strings(
     fetched: &Fetched,
     warnings: &[String],
 ) -> Result<PreparedRecordStrings> {
-    let imported = |iri: &&String| {
-        resolved
-            .imports
-            .iter()
-            .any(|import| &import.iri == *iri && import.graph.is_some())
-    };
-    let names = previous
+    // The resolver supplies the names actually read. Only a previous record,
+    // committed journal entry or successful fetch establishes LOAD provenance.
+    let names = resolved
+        .imports
         .iter()
-        .chain(pending.names().filter(|iri| !previous.contains(iri)))
-        .chain(
-            fetched
-                .fetched
-                .iter()
-                .filter(|iri| !previous.contains(iri) && !pending.names().any(|p| p == *iri)),
-        )
-        .filter(imported);
+        .filter(|i| {
+            i.graph.is_some()
+                && (previous.contains(&i.iri)
+                    || fetched.fetched.contains(&i.iri)
+                    || pending.contains(&i.iri))
+        })
+        .map(|i| &i.iri);
     let warning_count = fetched.warnings.len() + warnings.len();
     let warnings = fetched.warnings.iter().chain(warnings);
-    let name_count = names.clone().count();
-    let bytes =
-        reasoning_strings_bytes(warning_count, warnings.clone().map(String::len)).saturating_add(
-            reasoning_strings_bytes(name_count, names.clone().map(String::len)),
-        );
-    let memory = RecordedReasoning::reserve(pool, bytes)?;
+    let count = names.clone().count();
+    let bytes = reasoning_strings_bytes(warning_count, warnings.clone().map(String::len))
+        + reasoning_strings_bytes(count, names.clone().map(String::len));
+    let mut claims = Vec::new();
+    let mut claim_memory = None;
+    let mut memory = match RecordedReasoning::reserve(pool, bytes) {
+        Ok(memory) => memory,
+        Err(error) => {
+            let Some(pool) = pool.filter(|p| p.domain_stats().retained_capacity != 0) else {
+                return Err(error);
+            };
+            if count == 0 {
+                return Err(error);
+            }
+            claim_memory = Some(
+                pool.work_parent()
+                    .reserve((count * size_of::<super::imports::NameClaim>()) as u64)
+                    .map_err(super::parent_error)?,
+            );
+            claims = Vec::with_capacity(count);
+            let mut reused = 0;
+            for name in names.clone() {
+                if let Some(claim) = pending.claim(name, pool)? {
+                    reused += claim.bytes();
+                    claims.push(claim);
+                }
+            }
+            if claims.is_empty() {
+                return Err(error);
+            }
+            RecordedReasoning::reserve(
+                Some(pool),
+                bytes - reused + (claims.len() * size_of::<sparkles_budget::MemoryLease>()) as u64,
+            )?
+        }
+    };
     let mut saved_warnings = Vec::with_capacity(warning_count);
     saved_warnings.extend(warnings.cloned());
-    let mut fetched_imports = Vec::with_capacity(name_count);
+    let mut fetched_imports = Vec::with_capacity(count);
     fetched_imports.extend(names.cloned());
     fetched_imports.sort_unstable();
     fetched_imports.dedup();
+    for claim in &mut claims {
+        claim.locate(&fetched_imports);
+    }
+    if let Some(lease) = &mut memory {
+        let actual = reasoning_strings_bytes(
+            saved_warnings.capacity(),
+            saved_warnings.iter().map(String::capacity),
+        ) + reasoning_strings_bytes(
+            fetched_imports.capacity(),
+            fetched_imports.iter().map(String::capacity),
+        );
+        lease
+            .shrink(bytes - actual)
+            .expect("unused duplicate name credit");
+    }
+    let retirement = pending.retirement(pool, &fetched_imports)?;
     Ok(PreparedRecordStrings {
         warnings: saved_warnings,
         fetched_imports,
         memory,
+        claims,
+        _claim_memory: claim_memory,
+        retirement,
     })
 }
 

@@ -1623,3 +1623,230 @@ fn public_owl_and_entailment_structs_allow_downstream_literals_and_patterns() {
     };
     assert_eq!(reconstructed.expression, request.expression);
 }
+
+fn mapped_import(ds: &Dataset, source: &std::path::Path, iri: &str) -> ReasonRequest {
+    use sparkles::reasoning::reasoner::ImportMode;
+    ds.update(&format!(
+        "INSERT DATA {{ <urn:o> <http://www.w3.org/2002/07/owl#imports> <{iri}> }}"
+    ))
+    .unwrap();
+    std::fs::write(source, "<urn:s> <urn:p> <urn:first> .").unwrap();
+    let mut request = ReasonRequest::default();
+    request.inputs.imports = ImportMode::Fetch;
+    request
+        .inputs
+        .location_mapping
+        .names
+        .insert(iri.into(), format!("file://{}", source.display()));
+    request
+}
+
+fn assert_refreshed(ds: &Dataset, mut request: ReasonRequest, source: &std::path::Path, iri: &str) {
+    std::fs::write(source, "<urn:s> <urn:p> <urn:updated> .").unwrap();
+    request.refresh_imports = true;
+    ds.reasoning().run(&request).unwrap();
+    for (object, expected) in [("first", false), ("updated", true)] {
+        assert_eq!(
+            ds.query(&format!(
+                "ASK {{ GRAPH <{iri}> {{ <urn:s> <urn:p> <urn:{object}> }} }}"
+            ))
+            .unwrap()
+            .boolean,
+            expected,
+            "{object}"
+        );
+    }
+}
+
+#[test]
+fn intervening_run_preserves_pending_import_across_reopen() {
+    use sparkles::reasoning::reasoner::ImportMode;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let source = dir.path().join("import.ttl");
+    let pool = QueryPool::with_retained_capacity(16 * MIB, MIB).unwrap();
+    let options = DatasetOptions {
+        pool: Some(pool.clone()),
+        closure_cache_triples: 0,
+        ..Default::default()
+    };
+    let ds = Dataset::open_with(&root, options.clone()).unwrap();
+    let mut request = import_warning_request(&ds);
+    request.inputs.location_mapping.names.extend(
+        mapped_import(&ds, &source, "urn:import")
+            .inputs
+            .location_mapping
+            .names,
+    );
+    let blocker = pool.retained_parent().reserve(MIB - 1024).unwrap();
+    assert!(is_server_memory(&ds.reasoning().run(&request).unwrap_err()));
+    assert!(
+        ds.query("ASK { GRAPH <urn:import> { <urn:s> <urn:p> <urn:first> } }")
+            .unwrap()
+            .boolean
+    );
+    drop(blocker);
+    let mut other = ReasonRequest::default();
+    other.inputs.imports = ImportMode::None;
+    ds.reasoning().run(&other).unwrap();
+    drop(ds);
+    let ds = Dataset::open_with(&root, options).unwrap();
+    assert_refreshed(&ds, request, &source, "urn:import");
+}
+
+#[test]
+fn fixed_retained_cap_admits_pending_import_into_record() {
+    for reopen_pending in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let source = dir.path().join("import.ttl");
+        let iri = format!("urn:import:{}", "x".repeat(16 << 10));
+        let pool = QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap();
+        let options = DatasetOptions {
+            pool: Some(pool.clone()),
+            closure_cache_triples: 0,
+            ..Default::default()
+        };
+        let ds = Dataset::open_with(&root, options.clone()).unwrap();
+        let req = mapped_import(&ds, &source, &iri);
+        let ds = if reopen_pending {
+            let mut refused = import_warning_request(&ds);
+            refused
+                .inputs
+                .location_mapping
+                .names
+                .extend(req.inputs.location_mapping.names.clone());
+            assert!(is_server_memory(&ds.reasoning().run(&refused).unwrap_err()));
+            assert!(
+                ds.query(&format!(
+                    "ASK {{ GRAPH <{iri}> {{ <urn:s> <urn:p> <urn:first> }} }}"
+                ))
+                .unwrap()
+                .boolean
+            );
+            drop(ds);
+            let ds = Dataset::open_with(&root, options).unwrap();
+            ds.update(
+                "DELETE DATA { <urn:o> <http://www.w3.org/2002/07/owl#imports> <urn:missing> }",
+            )
+            .unwrap();
+            ds
+        } else {
+            ds
+        };
+        if reopen_pending {
+            let before = pool.domain_stats().retained_reserved;
+            let tmp = root.join("reasoning.tmp");
+            std::fs::create_dir(&tmp).unwrap();
+            assert!(matches!(
+                ds.reasoning().run(&req),
+                Err(sparkles::Error::Io(_))
+            ));
+            assert!(root.join("reasoning-imports.json").exists());
+            assert_eq!(pool.domain_stats().work_reserved, 0);
+            assert_eq!(pool.domain_stats().retained_reserved, before);
+            std::fs::remove_dir(tmp).unwrap();
+        }
+        let record = ds.reasoning().run(&req).unwrap().record;
+        assert_eq!(record.fetched_imports, [iri]);
+        assert_eq!(
+            pool.domain_stats().retained_reserved,
+            reasoning_record_bytes(&ds) + size_of::<sparkles_budget::MemoryLease>() as u64
+        );
+        assert_eq!(pool.domain_stats().work_reserved, 0);
+        assert!(!root.join("reasoning-imports.json").exists());
+        drop(ds);
+        assert_eq!(pool.domain_stats().retained_reserved, 0);
+    }
+}
+
+#[cfg(feature = "backup")]
+fn backup_racing_import(memory: bool) {
+    use sparkles::backup::{CreateOptions, OpenEnv, RepoConfig, RestoreOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let source = dir.path().join("import.ttl");
+    let pool = QueryPool::with_retained_capacity(16 * MIB, MIB).unwrap();
+    let options = DatasetOptions {
+        pool: Some(pool.clone()),
+        closure_cache_triples: 0,
+        ..Default::default()
+    };
+    let ds = if memory {
+        memory_with_reasoning_pool(pool.clone())
+    } else {
+        Dataset::open_with(&root, options).unwrap()
+    };
+    let mut request = import_warning_request(&ds);
+    request.inputs.location_mapping.names.extend(
+        mapped_import(&ds, &source, "urn:import")
+            .inputs
+            .location_mapping
+            .names,
+    );
+    let blocker = pool.retained_parent().reserve(MIB - 1024).unwrap();
+    let point = if memory {
+        "reasoning-before-memory-capture"
+    } else {
+        "backup-capture-unlocked"
+    };
+    if !memory {
+        assert!(is_server_memory(&ds.reasoning().run(&request).unwrap_err()));
+        drop(blocker);
+    }
+    let racing = ds.clone();
+    let run = request.clone();
+    ds.store().set_failpoint(
+        point,
+        Some(Arc::new(move |_| {
+            if memory {
+                assert!(is_server_memory(&racing.reasoning().run(&run).unwrap_err()));
+            } else {
+                racing
+                    .update("INSERT DATA { <urn:later> <urn:p> <urn:o> }")
+                    .unwrap();
+                racing.reasoning().run(&run).unwrap();
+            }
+        })),
+    );
+    let config = RepoConfig::from_url(
+        "local",
+        &format!("file://{}", dir.path().join("repo").display()),
+    )
+    .unwrap();
+    let repo = sparkles::backup::open(&config, &OpenEnv::default()).unwrap();
+    ds.backups(&repo)
+        .create_with(
+            &CreateOptions {
+                name: "captured".into(),
+                dataset_name: "test".into(),
+                ..Default::default()
+            },
+            &sparkles::task::Control::none(),
+        )
+        .unwrap();
+    ds.store().set_failpoint(point, None);
+    let restored = dir.path().join("restored");
+    sparkles::backup::blocking(&repo)
+        .restore_to_dir("captured", &restored, &RestoreOptions::default())
+        .unwrap();
+    let copy = Dataset::open(&restored).unwrap();
+    assert!(
+        copy.query("ASK { GRAPH <urn:import> { <urn:s> <urn:p> <urn:first> } }")
+            .unwrap()
+            .boolean
+    );
+    assert_refreshed(&copy, request, &source, "urn:import");
+}
+
+#[cfg(feature = "backup")]
+#[test]
+fn persistent_backup_keeps_import_history_at_wal_cut() {
+    backup_racing_import(false);
+}
+
+#[cfg(feature = "backup")]
+#[test]
+fn memory_backup_keeps_import_history_at_snapshot() {
+    backup_racing_import(true);
+}

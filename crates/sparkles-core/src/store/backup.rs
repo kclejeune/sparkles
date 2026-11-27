@@ -1386,7 +1386,7 @@ const APPEND_FILES: [&str; 2] = ["wal.log", "delta.vocab"];
 
 /// Meta files at the root, besides `CURRENT`, `dataset.json` and `prefixes.json`, that a
 /// backup holds when present.
-const OPTIONAL_META: [&str; 17] = [
+const OPTIONAL_META: [&str; 16] = [
     crate::annotations::FILE,
     super::describe::DESCRIBE_FILE,
     super::aggregates::AGGREGATE_ERRORS_FILE,
@@ -1395,7 +1395,6 @@ const OPTIONAL_META: [&str; 17] = [
     "geo.json",
     "vector.json",
     "origin.json",
-    "reasoning-imports.json",
     crate::guard::config::CONFIG_FILE,
     crate::guard::config::SHACL_SHAPES_FILE,
     crate::guard::config::SHEX_SCHEMA_SHEXC_FILE,
@@ -1408,6 +1407,26 @@ const OPTIONAL_META: [&str; 17] = [
 ];
 
 impl Store {
+    /// Open the atomically replaced import journal at the WAL or snapshot cut.
+    /// The descriptor keeps that version readable throughout the upload.
+    #[doc(hidden)]
+    pub fn capture_import_journal(&self) -> Result<Option<CapturedFile>> {
+        let Some(root) = &self.root else {
+            return Ok(None);
+        };
+        let path = "reasoning-imports.json";
+        match File::open(root.join(path)) {
+            Ok(file) => Ok(Some(CapturedFile {
+                path: path.into(),
+                kind: FileKind::Meta,
+                len: file.metadata()?.len(),
+                src: FileSource::File(file),
+            })),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Capture the current commit for a backup labelled `label` (the backup name, shown
     /// as `backup:<label>` in the history status while the lease is held).
     ///
@@ -1434,6 +1453,17 @@ impl Store {
         label: &str,
         control: &crate::guard::WriteOptions,
     ) -> Result<BackupCapture> {
+        self.backup_capture_with_metadata(label, control, &mut || self.capture_import_journal())
+    }
+
+    /// Sample facade metadata and take its optional journal file under the writer at each attempted WAL cut.
+    #[doc(hidden)]
+    pub fn backup_capture_with_metadata(
+        &self,
+        label: &str,
+        control: &crate::guard::WriteOptions,
+        capture_metadata: &mut dyn FnMut() -> Result<Option<CapturedFile>>,
+    ) -> Result<BackupCapture> {
         if self.root.is_none() || self.history.is_none() {
             return Err(Error::unsupported(
                 "backups of in-memory datasets are not supported",
@@ -1446,11 +1476,11 @@ impl Store {
                 "a linked branch needs a materialized backup capture",
             ));
         }
-        if let Some(c) = self.capture_once(label, control)? {
+        if let Some(c) = self.capture_once(label, control, capture_metadata)? {
             return Ok(c);
         }
         // a compaction or bulk commit switched CURRENT right after the lock: once more
-        match self.capture_once(label, control)? {
+        match self.capture_once(label, control, capture_metadata)? {
             Some(c) => Ok(c),
             None => Err(Error::Conflict(
                 "the database's generation changed twice during the backup capture; retry".into(),
@@ -1515,7 +1545,20 @@ impl Store {
         label: &str,
         o: &MemoryCaptureOptions,
     ) -> Result<BackupCapture> {
-        self.materialized_capture_prepared(label, o, None)
+        self.materialized_backup_capture_with_metadata(label, o, &mut || {
+            self.capture_import_journal()
+        })
+    }
+
+    /// Sample facade metadata and take its optional journal file under the writer at the materialized snapshot cut.
+    #[doc(hidden)]
+    pub fn materialized_backup_capture_with_metadata(
+        &self,
+        label: &str,
+        o: &MemoryCaptureOptions,
+        capture_metadata: &mut dyn FnMut() -> Result<Option<CapturedFile>>,
+    ) -> Result<BackupCapture> {
+        self.materialized_capture_prepared(label, o, None, capture_metadata)
             .map(|(capture, _)| capture)
     }
 
@@ -1530,7 +1573,10 @@ impl Store {
         preparation: &crate::access::Preparation,
     ) -> Result<ConfigurationCapture> {
         preparation.check()?;
-        let (data, original) = self.materialized_capture_prepared(label, o, Some(preparation))?;
+        let (data, original) =
+            self.materialized_capture_prepared(label, o, Some(preparation), &mut || {
+                self.capture_import_journal()
+            })?;
         let original =
             original.ok_or_else(|| Error::Corrupt("original capture metadata missing".into()))?;
         preparation.check()?;
@@ -1542,6 +1588,7 @@ impl Store {
         label: &str,
         o: &MemoryCaptureOptions,
         preparation: Option<&crate::access::Preparation>,
+        capture_metadata: &mut dyn FnMut() -> Result<Option<CapturedFile>>,
     ) -> Result<(BackupCapture, Option<CapturedOriginal>)> {
         let check_preparation = || preparation.map_or(Ok(()), |preparation| preparation.check());
         check_preparation()?;
@@ -1569,6 +1616,7 @@ impl Store {
             managed_state,
             binding,
             mut original,
+            import_journal,
         ) = {
             let w = self.lock_writer(&control)?;
             check_preparation()?;
@@ -1610,6 +1658,7 @@ impl Store {
                     "configuration changed while capturing original binding".into(),
                 ));
             }
+            let import_journal = capture_metadata()?;
             (
                 self.snapshot().without_cache_fill(),
                 w.next_bnode,
@@ -1620,6 +1669,7 @@ impl Store {
                 state,
                 binding,
                 original,
+                import_journal,
             )
         };
         let lock_hold = t0.elapsed();
@@ -1782,6 +1832,7 @@ impl Store {
                 super::control_store::capture_checkpoint(state, self.dataset_id, head.seq, label)?,
             ));
         }
+        files.extend(import_journal);
         files.extend(history_files);
         files.push(meta_file(
             "prefixes.json",
@@ -1874,8 +1925,9 @@ impl Store {
         &self,
         label: &str,
         control: &crate::guard::WriteOptions,
+        capture_metadata: &mut dyn FnMut() -> Result<Option<CapturedFile>>,
     ) -> Result<Option<BackupCapture>> {
-        self.capture_once_prepared(label, control, None)
+        self.capture_once_prepared(label, control, None, capture_metadata)
             .map(|capture| capture.map(|(data, _)| data))
     }
 
@@ -1897,7 +1949,9 @@ impl Store {
         }
         for _ in 0..2 {
             if let Some((data, original)) =
-                self.capture_once_prepared(label, control, Some(preparation))?
+                self.capture_once_prepared(label, control, Some(preparation), &mut || {
+                    self.capture_import_journal()
+                })?
             {
                 let original = original
                     .ok_or_else(|| Error::Corrupt("original capture metadata missing".into()))?;
@@ -1915,6 +1969,7 @@ impl Store {
         label: &str,
         control: &crate::guard::WriteOptions,
         preparation: Option<&crate::access::Preparation>,
+        capture_metadata: &mut dyn FnMut() -> Result<Option<CapturedFile>>,
     ) -> Result<Option<(BackupCapture, Option<CapturedOriginal>)>> {
         let check_preparation = || preparation.map_or(Ok(()), |preparation| preparation.check());
         check_preparation()?;
@@ -1985,6 +2040,7 @@ impl Store {
                 CapturedOriginal::under_writer(self, &w, &managed_state, preparation)
             })
             .transpose()?;
+        let import_journal = capture_metadata()?;
         self.failpoint("backup-capture-locked");
         check_preparation()?;
         let lease_id = hist.lock().lease(gen_no, label);
@@ -2126,6 +2182,7 @@ impl Store {
                 super::control_store::capture_checkpoint(state, self.dataset_id, head.seq, label)?,
             ));
         }
+        files.extend(import_journal);
         files.extend(history_files);
         files.push(meta(
             "prefixes.json",

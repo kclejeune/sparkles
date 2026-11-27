@@ -244,6 +244,8 @@ pub(crate) struct RecordedReasoning {
     pub(crate) value: Option<ReasoningRecord>,
     // Release the reservation after its strings have been dropped.
     _memory: Option<sparkles_budget::MemoryLease>,
+    // Payload credit adopted from provisional import journal entries.
+    _imports: Vec<sparkles_budget::MemoryLease>,
 }
 
 pub(crate) fn reasoning_strings_bytes(capacity: usize, bytes: impl Iterator<Item = usize>) -> u64 {
@@ -272,6 +274,7 @@ impl RecordedReasoning {
         Ok(Self {
             value: record,
             _memory: Self::reserve(pool, bytes)?,
+            _imports: Vec::new(),
         })
     }
 
@@ -317,8 +320,10 @@ impl DatasetState {
 
     /// Branches share both the immutable record and the pool that backs it.
     pub(crate) fn inherit_reasoning(&self, source: &Self) {
+        let journal = source.pending_imports.lock();
         self.replace_reasoning(source.recorded_reasoning());
-        let pending = source.pending_imports.lock().loaded.clone();
+        let pending = journal.loaded.clone();
+        drop(journal);
         self.pending_imports.lock().loaded = pending;
     }
 
@@ -330,12 +335,14 @@ impl DatasetState {
     /// Update the reasoning record in memory and, for a persistent dataset, in its
     /// directory.
     pub fn set_reasoning(&self, record: Option<ReasoningRecord>) -> Result<()> {
-        let clear = record
-            .is_none()
-            .then(|| self.pending_imports.lock().loaded.clone());
-        self.write_reasoning(RecordedReasoning::admit(record, self.pool.as_ref())?)?;
-        if let Some(pending) = clear {
-            self.forget_recorded_imports(&pending)?;
+        let mut journal = self.pending_imports.lock();
+        let clear = record.is_none();
+        self.write_reasoning(
+            RecordedReasoning::admit(record, self.pool.as_ref())?,
+            Arc::new,
+        )?;
+        if clear {
+            journal.clear_loaded(&self.store)?;
         }
         Ok(())
     }
@@ -345,14 +352,34 @@ impl DatasetState {
         &self,
         record: ReasoningRecord,
         memory: Option<sparkles_budget::MemoryLease>,
+        claims: Vec<crate::reasoning::imports::NameClaim>,
+        retirement: Option<crate::reasoning::imports::Retirement>,
     ) -> Result<()> {
-        self.write_reasoning(RecordedReasoning {
+        let record = RecordedReasoning {
             value: Some(record),
             _memory: memory,
-        })
+            _imports: Vec::with_capacity(claims.len()),
+        };
+        let mut journal = self.pending_imports.lock();
+        self.write_reasoning(record, |mut record| {
+            let mut claims = claims;
+            record
+                ._imports
+                .extend(claims.iter_mut().map(|claim| claim.transfer()));
+            let published = Arc::new(record);
+            for claim in claims {
+                claim.publish(&published);
+            }
+            published
+        })?;
+        journal.retire(&self.store, self.pool.as_ref(), retirement)
     }
 
-    fn write_reasoning(&self, record: RecordedReasoning) -> Result<()> {
+    fn write_reasoning(
+        &self,
+        record: RecordedReasoning,
+        publish: impl FnOnce(RecordedReasoning) -> Arc<RecordedReasoning>,
+    ) -> Result<()> {
         // Save and replace under the same lock so concurrent writes publish in
         // file order. Release either reservation after unlocking.
         let retired = {
@@ -360,7 +387,8 @@ impl DatasetState {
             if let Some(root) = self.store.root() {
                 crate::reasoning::write_record(root, record.value.as_ref())?;
             }
-            std::mem::replace(&mut *current, Arc::new(record))
+            let published = publish(record);
+            std::mem::replace(&mut *current, published)
         };
         drop(retired);
         // views and live queries switch to the new default graph
@@ -476,18 +504,26 @@ impl Dataset {
         store: &Store,
         opts: &DatasetOptions,
     ) -> Result<(RecordedReasoning, crate::reasoning::imports::PendingImports)> {
-        let record = store.root().and_then(crate::reasoning::read_record);
+        let record = RecordedReasoning::admit(
+            store.root().and_then(crate::reasoning::read_record),
+            opts.pool.as_ref(),
+        )?;
         let pending = store
             .root()
             .map(|root| {
-                crate::reasoning::imports::PendingImports::read(root, store, opts.pool.as_ref())
+                crate::reasoning::imports::PendingImports::read(
+                    root,
+                    store,
+                    opts.pool.as_ref(),
+                    record
+                        .value
+                        .as_ref()
+                        .map_or(&[], |r| r.fetched_imports.as_slice()),
+                )
             })
             .transpose()?
             .unwrap_or_default();
-        Ok((
-            RecordedReasoning::admit(record, opts.pool.as_ref())?,
-            pending,
-        ))
+        Ok((record, pending))
     }
 
     fn from_store_and_record(

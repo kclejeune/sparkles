@@ -90,7 +90,8 @@ pub fn write_atomic_with(
     sync_dir(path.parent().unwrap_or(Path::new(".")))
 }
 
-fn replace_with(
+/// Stream and sync a replacement before renaming it. The caller syncs the directory.
+pub fn replace_with(
     path: &Path,
     tmp: &Path,
     write: impl FnOnce(&mut File) -> io::Result<()>,
