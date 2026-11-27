@@ -2353,7 +2353,9 @@ repetition and 0.927 to 0.930 on SHA256 with a stride of 8. Against `224caadc` i
 0.54 to 0.59 on unique and low-repeat IRIs and 0.74 to 0.79 on unique and low-repeat
 SHA256. It removed that state's 1.21 to 1.24 times regressions on dates and strings with a
 stride of 8 and its 1.105 on joined strings with random repeats. It gave up 7.9% to 12.1%
-against `224caadc` on SHA256 with a stride of 8, whose map misses split on every batch.
+against `224caadc` on SHA256 with a stride of 8, whose map misses split on every batch,
+8.0% and 5.3% on joined SHA256 and strings with global repeats and 5.5% on strings with a
+stride of 8 at 262,144 rows.
 Against the base, the three 65,536-row repairs measured 1.018 on dates with an interval
 that reaches 1.0, 1.014 on strings and 1.037 on joined strings with random repeats, which
 add 0.15 ms and 0.25 ms. Item 1319 holds those two costs. The matrix has no paired
@@ -2370,8 +2372,10 @@ remain deferred.
 The confirmation builds the landed tip and its base `17674a34` as release binaries on one
 build host with the same compiler and profile. The commands below run on forge from the
 candidate checkout in a named terminal with `BASE_BIN` and `TIP_BIN` set. Each pair
-covers the 166 queries at all threads and the cheap and 2,048-row queries at one thread,
-beside a same-binary control. The build passes when every answer matches and no query is
+runs beside a same-binary control. The streamed pairs cover the 166 queries at all
+threads and the cheap and 2,048-row queries at one thread, and the eager pair covers the
+2,048-row and string queries at all threads, since the eager executor shares the batch
+evaluation that the split timing changes. The build passes when every answer matches and no query is
 10% or more slower after the flagged rerun. A ratio whose interval stays above 1.0 and
 adds more than 0.5 µs is a real cost that gets its own line in item 1319.
 
@@ -2385,8 +2389,10 @@ runs="$repo/.artifacts/bench-bind-reuse-293/$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$runs"
 python3 scripts/gen-bind-reuse.py data | zstd -q -o "$runs/data.nt.zst"
 python3 scripts/gen-bind-reuse.py queries "$runs/queries"
-for arm in all-control all-candidate one-control one-candidate; do
+status=0
+for arm in all-control all-candidate one-control one-candidate eager-control eager-candidate; do
     a=$BASE_BIN b=$TIP_BIN threads=default server_cpu=0-10,12-19 client_cpu=11 spin=0
+    execution=streaming
     case "$arm" in
         *-control) b=$BASE_BIN ;;
     esac
@@ -2398,6 +2404,11 @@ for arm in all-control all-candidate one-control one-candidate; do
             threads=1 server_cpu=2 client_cpu=4 spin=1
             cp "$runs"/queries/*-2048.rq "$runs"/queries/*-low-repeat-*.rq \
                 "$runs"/queries/*-stride-16-*.rq "$runs"/queries/*-unique-*.rq "$out/queries/"
+            ;;
+        eager-*)
+            execution=
+            cp "$runs"/queries/*-2048.rq "$runs"/queries/str-*.rq "$runs"/queries/join-str-*.rq \
+                "$out/queries/"
             ;;
     esac
     install -m 755 "$a" "$out/bin-A"
@@ -2422,13 +2433,14 @@ RAYON_THREADS=$threads
 SERVER_CPU=$server_cpu
 CLIENT_CPU=$client_cpu
 SPIN=$spin
-EXECUTION=streaming
+EXECUTION=$execution
 PORT=31943
 ENV
     env -u BINARY_OF_A -u BINARY_OF_B -u EXPECTED_ANSWER_CHANGE -u EXPECTED_ANSWER_CHANGE_REASON \
         bash "$out/nsc-bench-remote.sh"
     python3 scripts/nsc-bench-summary.py "$out" >"$out/summary.md"
-    python3 scripts/nsc-bench-summary.py --check "$out/summary.json" first
+    python3 scripts/nsc-bench-summary.py --check "$out/summary.json" first || status=1
 done
+exit "$status"
 SH
 ```

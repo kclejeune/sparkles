@@ -1682,7 +1682,9 @@ a key, 128 KiB when full, and the map 96 bytes an entry, about 6 MiB when full. 
 charge also holds a fixed 512 bytes and grows in steps of a sixty-fourth of the query's
 memory limit, so it can exceed its entries by up to one step. A batch the map answers
 charges 68 bytes a row while it runs, which covers its vectors and the hash table of its
-pending entries.
+pending entries. On more than one worker, the cost guard and the shared split
+controller of the [X14 Outcome](X14-unified-executor/SPEC.md#cursor-bind-reuse-admission-item-293)
+also decide admission and parallel evaluation.
 
 The matrix behind the policy ran on `atlas` with synthetic inputs of dates, integers,
 strings, IRIs and SHA1 keys of 2,048 to 262,144 rows. Its reuse shapes are unique keys,

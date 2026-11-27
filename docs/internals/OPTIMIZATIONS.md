@@ -161,9 +161,14 @@ earlier implementation and always apply. `EXPLAIN` shows which fast paths ran.
 
   The planner accounts for sorting an unsorted column so a single filtered pattern picks the
   permutation sorted on the filtered variable. A cursor BIND can retain cached results
-  across batches when at least a quarter of a bounded pilot repeats exact input IDs (or
-  when unchanged-snapshot statistics estimate the input domain below 80% of rows, walking at
-  most 64 plan nodes). The per-query cache caps at 65,536 entries (charged conservatively at
+  across batches in a map keyed by exact input IDs. Its first batch admits the map when
+  one row in eight repeats, or when a key repeats and unchanged-snapshot statistics
+  estimate the input domain below 80% of rows, walking at most 64 plan nodes. Later
+  batches feed a sketch of one key in sixteen and the exact distinct count of each
+  batch, and on more than one worker weak repetition of a parallel-capable expression
+  also needs a measured evaluation rate that pays for the map. The map's misses and the
+  ordinary evaluation share one split controller that keeps a contended expression
+  serial for a cooldown and then retries the pool. The per-query cache caps at 65,536 entries (charged conservatively at
   about 6 MiB; dense inline integers cap at 16,384 entries); budget refusals or a full cache
   fall back to ordinary evaluation. Identity copies, volatile expressions and application
   callbacks never enter this cache.
