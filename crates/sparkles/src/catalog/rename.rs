@@ -104,6 +104,14 @@ pub(super) fn recover(dir: &Path) -> Result<()> {
     finish(dir)
 }
 
+pub(super) fn sync_registry(dir: &Path) -> Result<()> {
+    #[cfg(feature = "failpoints")]
+    if super::FAIL_NEXT_RENAME_REGISTRY_SYNC.replace(false) {
+        return Err(std::io::Error::other("injected rename registry sync failure").into());
+    }
+    sync_dir(dir)
+}
+
 #[cfg(test)]
 thread_local! {
     static CRASH_AFTER: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };

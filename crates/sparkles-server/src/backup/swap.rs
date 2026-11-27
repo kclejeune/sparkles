@@ -1,5 +1,5 @@
 //! HTTP request draining around the catalog's restore publication.
-use crate::state::{AppState, Dataset, Reservation};
+use crate::state::{AppState, Dataset, DbType, Reservation};
 use sparkles_backup::{BackupError, Code};
 use std::path::Path;
 use std::sync::Arc;
@@ -11,10 +11,11 @@ pub fn publish_new(
     restored: &Path,
 ) -> Result<Arc<Dataset>, BackupError> {
     let name = reservation.name().to_string();
-    st.catalog
+    let dataset = st
+        .catalog
         .publish_restored(reservation, restored)
         .map_err(super::ops::library_error)?;
-    Ok(st.get(&name).expect("published"))
+    Ok(st.cache_published(&name, DbType::Persistent, dataset))
 }
 
 pub fn replace_in_place(

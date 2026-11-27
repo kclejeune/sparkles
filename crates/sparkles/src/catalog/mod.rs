@@ -262,6 +262,12 @@ pub struct Catalog {
     pub(crate) inner: Arc<Inner>,
 }
 
+#[cfg(feature = "failpoints")]
+thread_local! {
+    static FAIL_NEXT_RENAME_REGISTRY_SYNC: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// Lifecycle notifications used by the server to reconcile store metrics.
 #[doc(hidden)]
 pub enum RenameEvent<'a> {
@@ -1335,7 +1341,7 @@ impl Catalog {
     ) -> Error {
         match self
             .verify_delete_parent()
-            .and_then(|()| self.reattach_locked_with_revision(name, Some(id), revision))
+            .and_then(|()| self.reattach_locked_with_revision(name, Some(id), revision, |_| {}))
         {
             Ok(()) => error,
             Err(reopen) => self.keep_closed_locked(
@@ -1380,6 +1386,14 @@ impl Catalog {
         Error::Corrupt(message)
     }
 
+    /// Fail the directory sync after the next persistent rename replaces the registry
+    /// on this thread.
+    #[cfg(feature = "failpoints")]
+    #[doc(hidden)]
+    pub fn fail_next_rename_registry_sync() {
+        FAIL_NEXT_RENAME_REGISTRY_SYNC.set(true);
+    }
+
     /// Rename an alias, retaining its UUID. Persistent datasets must have no live
     /// handles, including branch handles, so that the old store can be closed. As in
     /// [`delete`](Self::delete), the dataset's own views workers do not count.
@@ -1388,8 +1402,9 @@ impl Catalog {
     }
 
     /// Notify the server at the same managed close boundary as
-    /// [`Self::delete_observed`] and just before a committed alias becomes visible.
-    /// In-memory renames preserve their opening and only send the latter notification.
+    /// [`Self::delete_observed`] and just before the destination becomes visible,
+    /// including when recovery publishes it after an I/O error. In-memory renames
+    /// preserve their opening and only send the latter notification.
     #[doc(hidden)]
     pub fn rename_observed(
         &self,
@@ -1498,8 +1513,13 @@ impl Catalog {
                 )));
             }
         };
+        let original = Detached {
+            id: Some(id),
+            revision,
+            reasoning,
+        };
         if let Err(error) = rename::prepare(dir, from, to, id) {
-            return Err(self.roll_back_rename(from, to, id, revision, reasoning, error));
+            return Err(self.roll_back_rename(from, to, original, error, &mut observe));
         }
         let old = self.database_dir(from)?;
         let new = self.database_dir(to)?;
@@ -1525,22 +1545,14 @@ impl Catalog {
                     },
                 );
             }
-            self.save_locked()?;
+            self.replace_registry_locked(dir, &self.registry_locked())?;
+            rename::sync_registry(dir)?;
             observe(RenameEvent::Publishing(ds.state().open_id));
-            self.inner.entries.write().insert(
-                to.into(),
-                Entry {
-                    dataset: ds,
-                    kind: DatasetKind::Persistent,
-                    attached: false,
-                    revision,
-                },
-            );
-            self.inner.detached.lock().remove(to);
+            self.publish_reattached_with_revision(to, ds, revision);
             Ok(())
         });
         if let Err(e) = result {
-            return Err(self.roll_back_rename(from, to, id, revision, reasoning, e));
+            return Err(self.roll_back_rename(from, to, original, e, &mut observe));
         }
         rename::crash_point(3)?;
         rename::finish(dir)?;
@@ -1553,10 +1565,9 @@ impl Catalog {
         &self,
         from: &str,
         to: &str,
-        id: Uuid,
-        revision: Option<Uuid>,
-        reasoning: Option<crate::reasoning::ReasoningRecord>,
+        original: Detached,
         err: Error,
+        observe: &mut impl FnMut(RenameEvent<'_>),
     ) -> Error {
         let dir = self.dir().expect("persistent catalog");
         let registered = read_registry(dir).ok().and_then(|r| {
@@ -1566,13 +1577,17 @@ impl Catalog {
         });
         let reopened = (|| {
             rename::recover(dir)?;
-            let name = registered
+            let registration = registered
                 .as_ref()
-                .map(|r| r.name.clone())
                 .ok_or_else(|| Error::Corrupt("renamed dataset is unregistered".into()))?;
-            let rev = registered.as_ref().and_then(|r| r.revision).or(revision);
+            let name = &registration.name;
+            let rev = registration.revision.or(original.revision);
             rename::fail_point(rename::FAIL_ROLLBACK_REOPEN)?;
-            self.reattach_locked_with_revision(&name, Some(id), rev)
+            self.reattach_locked_with_revision(name, original.id, rev, |ds| {
+                if name == to {
+                    observe(RenameEvent::Publishing(ds.state().open_id));
+                }
+            })
         })();
         let mut detached = self.inner.detached.lock();
         detached.remove(from);
@@ -1580,18 +1595,18 @@ impl Catalog {
         match reopened {
             Ok(()) => err,
             Err(again) => {
-                let (name, rev, reasoning) = match registered {
-                    Some(r) => (r.name, r.revision.or(revision), r.reasoning),
-                    None => (from.to_string(), revision, reasoning),
+                let (name, registration) = match registered {
+                    Some(r) => (
+                        r.name,
+                        Detached {
+                            id: original.id,
+                            revision: r.revision.or(original.revision),
+                            reasoning: r.reasoning,
+                        },
+                    ),
+                    None => (from.to_string(), original),
                 };
-                detached.insert(
-                    name.clone(),
-                    Detached {
-                        id: Some(id),
-                        revision: rev,
-                        reasoning,
-                    },
-                );
+                detached.insert(name.clone(), registration);
                 Error::Corrupt(format!(
                     "renaming /{from} to /{to} failed: {err}; reopening the dataset failed too: \
                      {again}. config.json still registers it as /{name}, and opening the \
@@ -2080,13 +2095,14 @@ impl Catalog {
             .lock()
             .get(name)
             .and_then(|detached| detached.revision);
-        self.reattach_locked_with_revision(name, expected, revision)
+        self.reattach_locked_with_revision(name, expected, revision, |_| {})
     }
     fn reattach_locked_with_revision(
         &self,
         name: &str,
         expected: Option<Uuid>,
         revision: Option<Uuid>,
+        before_publish: impl FnOnce(&Dataset),
     ) -> Result<()> {
         self.require_determinate_registry(name)?;
         if self.get(name).is_some() {
@@ -2100,6 +2116,7 @@ impl Catalog {
                 .and_then(|detached| detached.id)
         });
         let ds = self.open_existing_dataset(name, expected)?;
+        before_publish(&ds);
         self.publish_reattached_with_revision(name, ds, revision);
         Ok(())
     }

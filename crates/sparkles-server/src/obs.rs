@@ -196,6 +196,8 @@ struct PendingStore {
     tokens: BTreeSet<u64>,
     contrib: Option<StoreCounters>,
     in_overflow: bool,
+    /// The alias that can be sampled while a memory rename finishes server cleanup.
+    published_alias: Option<String>,
 }
 
 #[derive(Default)]
@@ -1143,6 +1145,7 @@ impl Metrics {
                         tokens,
                         contrib,
                         in_overflow,
+                        published_alias: None,
                     },
                 );
             }
@@ -1243,9 +1246,14 @@ impl Metrics {
         if let Some(series) = w.remove(from) {
             w.insert(to.to_string(), series);
         }
-        if old_open_id == Some(new_open_id) && ledger.active_scrapes > 0 {
-            ledger.renamed_from.insert((from.to_string(), new_open_id));
-            ledger.renamed_from.remove(&(to.to_string(), new_open_id));
+        if old_open_id == Some(new_open_id) {
+            if let Some(pending) = ledger.pending.get_mut(&new_open_id) {
+                pending.published_alias = Some(to.to_string());
+            }
+            if ledger.active_scrapes > 0 {
+                ledger.renamed_from.insert((from.to_string(), new_open_id));
+                ledger.renamed_from.remove(&(to.to_string(), new_open_id));
+            }
         }
     }
 
@@ -1718,14 +1726,24 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         let mut live_ids = BTreeSet::new();
         for s in samples {
             if ledger.retired_ids.contains(&s.open_id)
-                || ledger.pending.contains_key(&s.open_id)
                 || (!ledger.renamed_from.is_empty()
                     && ledger.renamed_from.contains(&(s.name.clone(), s.open_id)))
             {
                 continue;
             }
-            if !live_ids.insert(s.open_id) {
+            let pending = ledger.pending.get_mut(&s.open_id);
+            if pending
+                .as_ref()
+                .is_some_and(|p| p.published_alias.as_deref() != Some(s.name.as_str()))
+                || !live_ids.insert(s.open_id)
+            {
                 continue;
+            }
+            // Merge the predecessor's overflow counters before resolving the new
+            // alias, which may have a named slot now.
+            if let Some(c) = pending.as_ref().and_then(|p| p.contrib.as_ref()) {
+                let entry = ledger.stores.entry(s.open_id).or_default();
+                entry.seen_under_other = entry.seen_under_other.max_with(c);
             }
             let label = st.metrics.series(Some(&s.name)).0;
             let is_other = label == OTHER;
@@ -1752,6 +1770,11 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
                     s.counters
                 }
             };
+            if let Some(pending) = pending {
+                // Scrapes that miss the destination still need the overflow total.
+                // Promotion to a named slot already moved it to retired counters.
+                pending.contrib = (is_other && effective.any()).then(|| effective.clone_counters());
+            }
             let g = out.entry(label).or_default();
             if !is_other {
                 g.instance_id = s.open_id;
@@ -1774,7 +1797,9 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         }
         let mut carried = ledger.retired.clone_counters();
         for (&id, entry) in &ledger.pending {
-            if let Some(c) = &entry.contrib {
+            if !live_ids.contains(&id)
+                && let Some(c) = &entry.contrib
+            {
                 let st_entry = ledger.stores.entry(id).or_default();
                 st_entry.seen_under_other = st_entry.seen_under_other.max_with(c);
                 carried.add_assign(&st_entry.seen_under_other);

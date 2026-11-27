@@ -130,14 +130,17 @@ async fn recreate_source_during_rename_cleanup_conflicts_before_publication() {
             .unwrap()
     };
     let conflict = send(&s.app, create()).await;
+    let reservation_conflict = s.state.reserve("a", "reserve-test").is_err();
     let published = s.state.catalog.get("a").is_some();
     let directory_created = s.state.data_dir.join("databases/a").exists();
     resume.send(()).unwrap();
     renaming.join().unwrap();
 
     assert_eq!(conflict.status, StatusCode::CONFLICT, "{}", conflict.text());
+    assert!(reservation_conflict);
     assert!(!published);
     assert!(!directory_created);
+    drop(s.state.reserve("a", "reserve-test").unwrap());
     let recreated = send(&s.app, create()).await;
     assert_eq!(
         recreated.status,
@@ -148,6 +151,62 @@ async fn recreate_source_during_rename_cleanup_conflicts_before_publication() {
     let id = s.state.get("a").unwrap().store.dataset_id();
     assert_ne!(id, original);
     assert_eq!(recreated.json()["id"], id.to_string());
+}
+
+#[tokio::test]
+async fn persistent_rename_recovery_moves_request_metrics_before_source_reuse() {
+    let s = server_with(|st| st.metrics = crate::obs::Metrics::new(true, 3));
+    let original = {
+        let a = s.state.create("a", DbType::Persistent).unwrap();
+        a.dataset
+            .update("INSERT DATA { <urn:original> <urn:p> 1 }")
+            .unwrap();
+        a.store.dataset_id()
+    };
+    let query =
+        |name| format!("/{name}/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D");
+    let series = |name| format!(r#"sparkles_rows_produced_total{{dataset="{name}"}}"#);
+    let peaks = |name| format!(r#"sparkles_query_memory_peak_bytes_count{{dataset="{name}"}}"#);
+    assert_eq!(get(&s.app, &query("a")).await.status, StatusCode::OK);
+    let before = metrics_once(&s.app, &peaks("a"), 1.0).await;
+    let original_rows = sample(&before, &series("a")).unwrap();
+    assert!(original_rows > 0.0);
+
+    sparkles::Catalog::fail_next_rename_registry_sync();
+    let error = s.state.rename("a", "b").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected rename registry sync failure")
+    );
+    assert!(s.state.get("a").is_none());
+    assert_eq!(s.state.get("b").unwrap().store.dataset_id(), original);
+
+    let recovered = metrics(&s.app).await;
+    assert_eq!(sample(&recovered, &series("b")), Some(original_rows));
+    assert_eq!(sample(&recovered, &peaks("b")), Some(1.0));
+    assert_eq!(sample(&recovered, &series("a")), None);
+    assert_eq!(get(&s.app, &query("b")).await.status, StatusCode::OK);
+    let queried = metrics_once(&s.app, &peaks("b"), 2.0).await;
+    let destination_rows = sample(&queried, &series("b")).unwrap();
+    assert!(destination_rows > original_rows);
+
+    {
+        let recreated = s.state.create("a", DbType::Persistent).unwrap();
+        assert_ne!(recreated.store.dataset_id(), original);
+        recreated
+            .dataset
+            .update("INSERT DATA { <urn:fresh> <urn:p> 2 }")
+            .unwrap();
+    }
+    let fresh = metrics(&s.app).await;
+    assert_eq!(sample(&fresh, &series("a")), Some(0.0));
+    assert_eq!(sample(&fresh, &peaks("a")), None);
+    assert_eq!(get(&s.app, &query("a")).await.status, StatusCode::OK);
+    let after = metrics_once(&s.app, &peaks("a"), 1.0).await;
+    assert!(sample(&after, &series("a")).unwrap() > 0.0);
+    assert_eq!(sample(&after, &series("b")), Some(destination_rows));
+    assert_eq!(sample(&after, &peaks("b")), Some(2.0));
 }
 
 async fn get(app: &Router, uri: &str) -> Resp {

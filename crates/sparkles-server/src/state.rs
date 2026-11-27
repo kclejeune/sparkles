@@ -403,7 +403,7 @@ struct LeavingNames {
     creating: BTreeSet<String>,
 }
 
-/// Keeps a create's alias stable until its routing object has been obtained.
+/// Excludes server mutations while creating or reserving an alias.
 struct Creating<'a> {
     st: &'a AppState,
     name: &'a str,
@@ -1309,20 +1309,21 @@ impl AppState {
         out
     }
 
+    fn begin_create<'a>(&'a self, name: &'a str) -> sparkles::Result<Creating<'a>> {
+        let mut names = self.leaving.lock();
+        if names.sources.contains(name)
+            || names.rename_targets.contains(name)
+            || !names.creating.insert(name.to_string())
+        {
+            return Err(sparkles::Error::Conflict(format!(
+                "dataset /{name} is being created, reserved, deleted or renamed"
+            )));
+        }
+        Ok(Creating { st: self, name })
+    }
+
     pub fn create(&self, name: &str, kind: DbType) -> Result<Arc<Dataset>> {
-        let _creating = {
-            let mut names = self.leaving.lock();
-            if names.sources.contains(name)
-                || names.rename_targets.contains(name)
-                || !names.creating.insert(name.to_string())
-            {
-                return Err(sparkles::Error::Conflict(format!(
-                    "dataset /{name} is being created, deleted or renamed"
-                ))
-                .into());
-            }
-            Creating { st: self, name }
-        };
+        let _creating = self.begin_create(name)?;
         self.catalog.set_defaults(sparkles::DatasetOptions {
             store: self.store_opts.clone(),
             closure_cache_triples: self.reason_cache_triples,
@@ -1335,14 +1336,27 @@ impl AppState {
                 ..Default::default()
             },
         )?;
+        Ok(self.cache_published(name, kind, dataset))
+    }
+
+    pub(crate) fn cache_published(
+        &self,
+        name: &str,
+        kind: DbType,
+        dataset: sparkles::Dataset,
+    ) -> Arc<Dataset> {
         let mut routing = self.routing.lock();
         if let Some(ds) = routing.get(name)
             && ds.open_id == dataset.state().open_id
         {
-            return Ok(ds.clone());
+            return ds.clone();
         }
-        Ok(self.wrap_and_cache(&mut routing, name, kind, dataset, false))
+        if self.leaving.lock().sources.contains(name) {
+            return self.wrap_dataset(name, kind, dataset, false);
+        }
+        self.wrap_and_cache(&mut routing, name, kind, dataset, false)
     }
+
     /// Startup attaches its datasets with [`attach_expected`](Self::attach_expected),
     /// so outside the tests only `sparkles ingest` (with `mcp`) attaches this way.
     #[cfg(any(test, feature = "mcp"))]
@@ -1711,58 +1725,52 @@ impl AppState {
         self.lifecycle_hooks
             .run(tests::HookPoint::BeforeMutation, from);
         use sparkles::catalog::RenameEvent;
+        let mut published = None;
         let result = self.catalog.rename_observed(from, to, |event| match event {
             RenameEvent::Closed(id, store) => leaving.observe_close(id, store),
             RenameEvent::Publishing(id) => {
                 self.metrics
                     .move_rename_series(from, to, leaving.open_id, id);
+                published = Some(id);
             }
         });
-        match result {
-            Ok(ds) => {
-                #[cfg(all(test, feature = "otel"))]
-                self.lifecycle_hooks
-                    .run(tests::HookPoint::RenamePublished, from);
-                self.metrics
-                    .finish_rename(leaving.open_id, ds.state().open_id);
-                leaving.disarm_metrics();
-                #[cfg(test)]
-                self.lifecycle_hooks
-                    .run(tests::HookPoint::RenameCleanup, from);
-                drop(ds);
-                self.volatile.rename(from, to);
-                self.compaction.rename(from, to);
-                if let Some(auto) = &self.auto_reason {
-                    auto.rename(from, to);
-                }
-                #[cfg(feature = "backup")]
-                if let Some(b) = &self.backup
-                    && let Err(e) = crate::backup::policies::rename_dataset(b, from, to)
-                {
-                    tracing::warn!("backup policies still name /{from}: {e:#}");
-                }
-                if let Some(ds) = self.get(to) {
-                    ds.offline.store(offline, Ordering::Relaxed);
-                }
-                Ok(())
+        let Some(open_id) = published else {
+            drop(leaving);
+            if let Some(ds) = self.get(from) {
+                ds.offline.store(offline, Ordering::Relaxed);
             }
-            Err(e) => {
-                drop(leaving);
-                if let Some(ds) = self.get(from) {
-                    ds.offline.store(offline, Ordering::Relaxed);
-                }
-                Err(e.into())
-            }
+            return result.map(drop).map_err(Into::into);
+        };
+        #[cfg(all(test, feature = "otel"))]
+        self.lifecycle_hooks
+            .run(tests::HookPoint::RenamePublished, from);
+        self.metrics.finish_rename(leaving.open_id, open_id);
+        leaving.disarm_metrics();
+        #[cfg(test)]
+        self.lifecycle_hooks
+            .run(tests::HookPoint::RenameCleanup, from);
+        let result = result.map(drop);
+        self.volatile.rename(from, to);
+        self.compaction.rename(from, to);
+        if let Some(auto) = &self.auto_reason {
+            auto.rename(from, to);
         }
+        #[cfg(feature = "backup")]
+        if let Some(b) = &self.backup
+            && let Err(e) = crate::backup::policies::rename_dataset(b, from, to)
+        {
+            tracing::warn!("backup policies still name /{from}: {e:#}");
+        }
+        if let Some(ds) = self.get(to) {
+            ds.offline.store(offline, Ordering::Relaxed);
+        }
+        result.map_err(Into::into)
     }
     pub fn reserved_by(&self, name: &str) -> Option<String> {
         self.catalog.reserved_by(name)
     }
-    pub fn reserve(
-        self: &Arc<Self>,
-        name: &str,
-        task: &str,
-    ) -> std::result::Result<Reservation, String> {
+    pub fn reserve(&self, name: &str, task: &str) -> std::result::Result<Reservation, String> {
+        let _creating = self.begin_create(name).map_err(|e| e.to_string())?;
         self.catalog
             .reserve(name, sparkles::catalog::ReservationKind::Clone, task)
             .map_err(|e| e.to_string())

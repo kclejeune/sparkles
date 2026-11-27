@@ -3899,8 +3899,15 @@ async fn check_successive_renames(cap: usize) {
     };
     published.wait();
     assert!(st.catalog.get("b").is_some());
-    // Consume the full response before the first rename can continue.
+    // Consume the full response and collect from all exporters while cleanup is paused.
     assert_eq!(call(&app, query("b")).await.0, StatusCode::OK);
+    assert_all_three_phase2_parity(&st, &cum, "b");
+    let during = crate::obs::metrics_json(&st);
+    let datasets = during["datasets"].as_array().unwrap();
+    assert_eq!(datasets.len(), 1, "cap {cap}: {during}");
+    assert_eq!(datasets[0]["name"], "b", "cap {cap}");
+    assert_eq!(datasets[0]["rowsProduced"], rows * 2, "cap {cap}");
+    assert_eq!(datasets[0]["queryMemoryPeak"]["count"], 2, "cap {cap}");
 
     let scrape = PausedHook::new(|hook| crate::obs::set_gauges_after_datasets_hook(&st, hook));
     let snapshot = {
