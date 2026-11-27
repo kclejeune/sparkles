@@ -1969,7 +1969,7 @@ mod partial_tests {
     }
 
     #[test]
-    fn explanation_root_lookup_admits_fsst_scratch_and_polls_controls() {
+    fn explanation_root_lookup_bounds_fsst_probes_and_polls_controls() {
         use sparkles_core::{
             builder::{BuildOptions, VocabCodec},
             io::{RdfFormat, Source},
@@ -2006,7 +2006,7 @@ mod partial_tests {
         assert!(snap.generation.vocab.is_fsst());
         assert_eq!(
             snap.generation.vocab.find(&sparkles_core::id::term_key(
-                &oxrdf::Literal::new_simple_literal(long).into()
+                &oxrdf::Literal::new_simple_literal(&long).into()
             )),
             Ok(1)
         );
@@ -2064,11 +2064,7 @@ mod partial_tests {
             peak < mat_baseline + 16_384,
             "materialized root miss allocated 64 KiB FSST suffix (peak={peak}, baseline={mat_baseline})"
         );
-        assert!(
-            res.unwrap_err()
-                .downcast_ref::<ExplainBudgetExceeded>()
-                .is_some()
-        );
+        res.unwrap();
         // 2. Materialized strict reasoner route on present short filler sorting after 64 KiB literal.
         let (res, peak) = crate::alloc_probe::peak_of(|| {
             explain(&mat_input, &[ex("s"), ex("p"), lit("~filler2")], &mat_opts)
@@ -2077,13 +2073,10 @@ mod partial_tests {
             peak < mat_baseline + 16_384,
             "materialized root hit allocated 64 KiB FSST suffix (peak={peak}, baseline={mat_baseline})"
         );
-        assert!(
-            res.unwrap_err()
-                .downcast_ref::<ExplainBudgetExceeded>()
-                .is_some()
-        );
+        res.unwrap();
 
-        // 3. Demand and why-not routes with 8 KiB left after demand session setup.
+        // 3. A predicate without rules isolates demand and why-not root lookup
+        // with 8 KiB left after session setup.
         let reasoner =
             QueryReasoner::new(profile.clone(), &extras, crate::Inputs::default()).unwrap();
         let demand_input = DemandInput {
@@ -2108,21 +2101,21 @@ mod partial_tests {
             ..Default::default()
         };
         let (res, peak) = crate::alloc_probe::peak_of(|| {
-            explain_demand(&demand_input, &[ex("s"), ex("q"), lit("b")], &demand_opts)
+            explain_demand(
+                &demand_input,
+                &[ex("s"), ex("absent"), lit("b")],
+                &demand_opts,
+            )
         });
         assert!(
             peak < demand_baseline + 16_384,
             "demand root miss allocated 64 KiB FSST suffix (peak={peak}, baseline={demand_baseline})"
         );
-        assert!(
-            res.unwrap_err()
-                .downcast_ref::<ExplainBudgetExceeded>()
-                .is_some()
-        );
+        assert!(matches!(res.unwrap(), Explained::NotFound));
         let (res, peak) = crate::alloc_probe::peak_of(|| {
             explain_demand(
                 &demand_input,
-                &[ex("s"), ex("q"), lit("~filler2")],
+                &[ex("s"), ex("absent"), lit("~filler2")],
                 &demand_opts,
             )
         });
@@ -2130,28 +2123,24 @@ mod partial_tests {
             peak < demand_baseline + 16_384,
             "demand root hit allocated 64 KiB FSST suffix (peak={peak}, baseline={demand_baseline})"
         );
-        assert!(
-            res.unwrap_err()
-                .downcast_ref::<ExplainBudgetExceeded>()
-                .is_some()
-        );
+        assert!(matches!(res.unwrap(), Explained::NotFound));
 
         let whynot_opts = crate::whynot::WhyNotOptions {
             explain: demand_opts,
             ..Default::default()
         };
         let (res, peak) = crate::alloc_probe::peak_of(|| {
-            crate::whynot::why_not(&demand_input, &[ex("s"), ex("q"), lit("b")], &whynot_opts)
+            crate::whynot::why_not(
+                &demand_input,
+                &[ex("s"), ex("absent"), lit("b")],
+                &whynot_opts,
+            )
         });
         assert!(
             peak < demand_baseline + 16_384,
             "why-not root miss allocated 64 KiB FSST suffix (peak={peak}, baseline={demand_baseline})"
         );
-        assert!(
-            res.unwrap_err()
-                .downcast_ref::<ExplainBudgetExceeded>()
-                .is_some()
-        );
+        res.unwrap();
 
         // Local-interning behavior on misses is preserved when budget allows.
         let found = explain_demand(
@@ -2169,8 +2158,8 @@ mod partial_tests {
         .unwrap();
         assert!(!matches!(wn, crate::whynot::WhyNot::Entailed));
 
-        // Direct strict term lookup with 8 KiB left after Terms::new_in refuses before
-        // allocating the 64 KiB FSST suffix, and polls live cancellation/deadline controls.
+        // Leave 8 KiB for encoding and interning short probes. A 64 KiB probe
+        // must still be refused before allocating its own key.
         let direct_probe = Budget::unlimited();
         let _direct_setup = Terms::new_in(snap.clone(), &direct_probe).unwrap();
         let direct_limit = direct_probe.used() + 8192;
@@ -2184,8 +2173,15 @@ mod partial_tests {
                 peak <= 8192,
                 "direct strict lookup for {term} allocated oversized FSST scratch (peak={peak})"
             );
-            assert!(BudgetFailure::from_anyhow(&res.unwrap_err()).is_some());
+            res.unwrap();
         }
+        let long_term = lit(&long);
+        let (refused, _, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            direct_terms.try_id_for_controlled(&long_term, || Ok(()))
+        });
+        assert!(BudgetFailure::from_anyhow(&refused.unwrap_err()).is_some());
+        assert!(largest <= 8192, "long probe allocated before admission");
+
         let mid_budget = Budget::unlimited();
         let mid_terms = Terms::new_in(snap.clone(), &mid_budget).unwrap();
         let polls = Cell::new(0usize);
@@ -2233,7 +2229,7 @@ mod partial_tests {
     }
 
     #[test]
-    fn explanation_rule_constant_lookup_admits_fsst_scratch_and_polls_controls() {
+    fn explanation_rule_constant_lookup_bounds_fsst_probes_and_polls_controls() {
         use sparkles_core::{
             builder::{BuildOptions, VocabCodec},
             io::{RdfFormat, Source},
@@ -2352,11 +2348,7 @@ mod partial_tests {
                 peak < mat_baseline + 16_384 && largest < 65_536,
                 "materialized rule constant \"b\" with root {root_obj} allocated 64 KiB FSST suffix (peak={peak}, baseline={mat_baseline}, largest={largest})"
             );
-            assert!(
-                res.unwrap_err()
-                    .downcast_ref::<ExplainBudgetExceeded>()
-                    .is_some()
-            );
+            res.unwrap();
         }
 
         // Program rules (uses_program == true) in materialized program_search.
@@ -2398,14 +2390,11 @@ mod partial_tests {
                 peak < prog_baseline + 16_384 && largest < 65_536,
                 "program rule constant \"b\" with root {root_obj} allocated 64 KiB FSST suffix (peak={peak}, baseline={prog_baseline}, largest={largest})"
             );
-            assert!(
-                res.unwrap_err()
-                    .downcast_ref::<ExplainBudgetExceeded>()
-                    .is_some()
-            );
+            res.unwrap();
         }
 
-        // Demand and why-not sessions compile rules in Session::new before root lookup.
+        // Demand and why-not sessions compile rules before a root lookup whose
+        // predicate has no applicable rules.
         let reasoner_a =
             QueryReasoner::new(jena_a.clone(), &extras, crate::Inputs::default()).unwrap();
         let demand_a_input = DemandInput {
@@ -2440,7 +2429,7 @@ mod partial_tests {
             let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
                 explain_demand(
                     &demand_b_input,
-                    &[ex("s"), ex("q"), root_obj.clone()],
+                    &[ex("s"), ex("absent"), root_obj.clone()],
                     &demand_opts,
                 )
             });
@@ -2448,11 +2437,7 @@ mod partial_tests {
                 peak < demand_baseline + 16_384 && largest < 65_536,
                 "demand rule constant \"b\" with root {root_obj} allocated 64 KiB FSST suffix (peak={peak}, baseline={demand_baseline}, largest={largest})"
             );
-            assert!(
-                res.unwrap_err()
-                    .downcast_ref::<ExplainBudgetExceeded>()
-                    .is_some()
-            );
+            res.unwrap();
         }
 
         let whynot_opts = crate::whynot::WhyNotOptions {
@@ -2460,17 +2445,17 @@ mod partial_tests {
             ..Default::default()
         };
         let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
-            crate::whynot::why_not(&demand_b_input, &[ex("s"), ex("q"), lit("b")], &whynot_opts)
+            crate::whynot::why_not(
+                &demand_b_input,
+                &[ex("s"), ex("absent"), lit("b")],
+                &whynot_opts,
+            )
         });
         assert!(
             peak < demand_baseline + 16_384 && largest < 65_536,
             "why-not rule constant \"b\" allocated 64 KiB FSST suffix (peak={peak}, baseline={demand_baseline}, largest={largest})"
         );
-        assert!(
-            res.unwrap_err()
-                .downcast_ref::<ExplainBudgetExceeded>()
-                .is_some()
-        );
+        res.unwrap();
 
         // Demand program rules (uses_program == true) in Session::new -> program_rules.
         let reasoner_prog_a =
@@ -2505,7 +2490,7 @@ mod partial_tests {
         let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
             explain_demand(
                 &demand_prog_b,
-                &[ex("s"), ex("q"), lit("b")],
+                &[ex("s"), ex("absent"), lit("b")],
                 &demand_prog_opts,
             )
         });
@@ -2513,14 +2498,31 @@ mod partial_tests {
             peak < demand_prog_baseline + 16_384 && largest < 65_536,
             "demand program constant \"b\" allocated 64 KiB FSST suffix (peak={peak}, baseline={demand_prog_baseline}, largest={largest})"
         );
-        assert!(
-            res.unwrap_err()
-                .downcast_ref::<ExplainBudgetExceeded>()
-                .is_some()
-        );
+        res.unwrap();
 
-        // Cancellation and expired deadline stop before rule/program compilation allocates
-        // the 64 KiB FSST suffix.
+        // A constant whose own key exceeds the remaining budget must still be
+        // refused during compilation, before allocating the probe.
+        let jena_long = Profile::Rules(format!(
+            "@prefix ex: <http://ex.org/> . [long: (?x ex:p \"{long}\") -> (?x ex:q \"a\")]"
+        ));
+        let parsed_long = crate::profile_rules(&jena_long, &extras).unwrap();
+        let tight_budget = Budget::new(Some(mat_limit));
+        let tight_terms = Terms::new_in(snap.clone(), &tight_budget).unwrap();
+        let mut tight_warnings = WorkingWarnings::new(&tight_budget);
+        let (refused, _, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            engine::compile_info_controlled(
+                &parsed_long,
+                &tight_terms,
+                &mut tight_warnings,
+                false,
+                &mut || Ok(()),
+            )
+        });
+        let err = refused.err().expect("long constant must exceed the budget");
+        assert!(BudgetFailure::from_anyhow(&err).is_some(), "{err:#}");
+        assert!(largest < 65_536, "long constant allocated before admission");
+
+        // The explanation entry points still honor cancellation and expired deadlines.
         let cancel_opts = ExplainOptions {
             cancel: Some(Arc::new(AtomicBool::new(true))),
             ..Default::default()
@@ -2560,8 +2562,7 @@ mod partial_tests {
             );
         }
 
-        // Mid-scan cancellation stops inside controlled Jena and program compilation
-        // before allocating the 64 KiB FSST suffix.
+        // The Jena and program compilers also poll controls after compilation starts.
         let parsed_b = crate::profile_rules(&jena_b, &extras).unwrap();
         let parsed_prog_b = crate::profile_rules(&prog_b, &extras).unwrap();
         let mid_budget = Budget::unlimited();

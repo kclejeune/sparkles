@@ -742,6 +742,9 @@ sparkles dump    --loc db --out dump.trig.gz  # syntax from the extension too, o
 sparkles dump    --loc db --format ttl --merge   # every graph as one Turtle graph
 sparkles dump    --loc db --format nt --graph http://ex.org/g   # one graph's triples
 sparkles dump    --server URL --dataset ds --out ds.rt   # a server's dataset, in RDF Thrift
+sparkles git write-tree --loc db --out tree/  # canonical per-graph Turtle/N-Quads tree (--branch, --at, --syntax)
+sparkles git verify     --dir tree/           # stream-verify manifest, layout, checksums and RDF (--no-checksums)
+sparkles git export     --loc db --out repo/  # export branch history to Git (--branch, --git-branch, --mode commits|squash)
 sparkles backup  --loc db --out backups/      # zstd; --compress gzip --level 9, --threads 8
 sparkles clone   --loc db --to sandbox        # independent copy (same blank nodes, new dataset id)
 sparkles clone   --loc db --to part --graph default --graph 'http://ex.org/g/*'   # some graphs only
@@ -2197,6 +2200,7 @@ and 2 when there are warnings only.
 | `text` | `text.json` parses. The index opens read-only, and every committed segment file exists and matches its checksum. The index's commit is compared with the WAL. An index that is behind is a warning, because open catches it up or rebuilds it. |
 | `geo` | `geo.json` parses and is a valid configuration. The current generation's index files (`geo/rtree.spkg`, `geo/column.spkg`) have a valid header and footer, belong to this generation and configuration, and match their index checksums. In full mode, the data checksums are checked too. A damaged file is a warning, because open rebuilds it. |
 | `patterns` | `patterns.bin` has a valid layout, and in full mode its checksum matches and every subject's pattern, the subjects of each pattern and the predicate totals match SPO. A pattern file of a version this release does not read is a warning, because queries then read the permutations. A missing file that `meta.json` records is a warning too. |
+| `reifiers` | `reifiers.bin` has a valid layout, and in full mode its checksum matches, its keys strictly increase and its entries match POS. A reifier index of a version this release does not read is a warning, because claim lookups then fall back to scanning until the next compaction. A missing file that `meta.json` records is a warning too. |
 | `reasoning` | `reasoning.json` parses and names an existing commit. |
 
 Errors are states that `Store::open` refuses, that lose acknowledged data or history, or
@@ -3834,8 +3838,17 @@ an MCP host such as Claude Desktop, Claude Code or an IDE agent:
 ```sh
 sparkles mcp --loc /data/books                 # a database directory (name: books)
 sparkles mcp --loc books=/data/books --loc films=/data/films
+sparkles mcp --loc /data/books --model-config models.json --model-secret openai=env:OPENAI_API_KEY
 sparkles mcp --data a.ttl b.nt --name demo     # files, in one in-memory dataset
 ```
+
+To enable the `ask` tool in a standalone stdio session, open a persistent database with
+`--loc` whose `assistant.json` sets `"enabled": true`, and pass `--model-config` (with
+any `--model-secret` sources its providers name). An in-memory `--data` dataset starts
+with its assistant disabled, and `--url` refuses `--model-config` and `--model-secret`
+because a bridged server uses its own model configuration. Without `--allow-update`, the
+session runs read-only and keeps Ask usage and retry state in memory without writing
+`asks.json`.
 
 Configure the host in `claude_desktop_config.json`, or in a project's `.mcp.json` for
 Claude Code. For Claude Code, `claude mcp add sparkles -- sparkles mcp --loc /data/books`
@@ -3901,6 +3914,11 @@ The tools are read-only unless the operator turns on the write tool:
   citation names the fact's graph and, when a reifier records it, the source, time,
   author, confidence and quote. Superseded facts are listed on request, and facts that
   two graphs disagree on are marked.
+* `ask` answers a plain-language question using the server's checked, self-repairing
+  question-to-SPARQL pipeline over the caller's view. It is listed only while model
+  providers are configured and a visible dataset has an enabled assistant with an allowed
+  draft pair, and carries `openWorldHint: true` because prompts go to configured model
+  providers.
 * `validate_shacl` and `validate_shex` check a shapes graph, or a ShEx schema with a
   shape map, against a snapshot. They return counts and the first 20 results with node,
   shape and reason. They do not follow imports. `validate_shacl` takes the shapes in
@@ -4786,6 +4804,23 @@ summary and the usage of each model call, and `--events` prints each step as a J
 as it happens. `--no-run` stops after the check, and `--no-summary` leaves the summary
 out.
 
+`--review-policy POLICY` and `--matching-policy POLICY` pass evidence claim policies to
+the asking pipeline, with the same checks and JSON output as `POST /{ds}/ask`
+([C25](specs/C25-evidence-and-assessments.md#recall-and-ask-with-claims)). Both options
+require a database whose configuration history is activated and refuse `--mode global`,
+unknown policies or wrong policy kinds before any model call. For policy-bearing
+questions, the summary step enforces the dataset's `send`, `sendByProvider` and
+`rowsForSummary` settings even when `--pair summarize=...` is given. With
+`--review-policy`, the summary step sees claim occurrences about the linked entities and
+may cite them as `[c1]`, and the human output prints a `# claims` section below the
+summary. With `--matching-policy`, linked entities expand across the policy's resolution
+map and the human output prints a `# resolution` line. When those human sections use
+compacted IRIs, a `# prefixes` line follows them with the matching namespace bindings. In
+`--json` and `--questions`, `--review-policy` adds `claims` (and `summary.claimCitations`
+when a summary runs) and `--matching-policy` adds `resolution`. In `--events`, those
+members appear on the `summary` event when a summary runs or on a terminal `policy` event
+when no summary runs.
+
 `--questions FILE` asks every question of a JSON-lines file in place of the question
 argument, or of standard input with `-`. Each line is `{"id", "question",
 "clarification"?, "tryHarder"?, "modelSecrets"?}`, and the command prints one JSON
@@ -5546,9 +5581,7 @@ opposite. `sparkles ask --mode global` and `"mode": "global"` in `POST /{ds}/ask
 same from the command line and the API. A caller who may not read the reports gets an
 answer from the data and a note that the summaries are unavailable.
 
-Agents read the reports with the MCP tool `community_reports`, and `recall` with
-`"communities": true` adds the report of each seed's community after its facts. A
-project brief lists the best rated reports of the coarsest level.
+Agents read the reports with the MCP tool `community_reports`, which also accepts `reviewPolicy` to restrict selection to reports built under that policy and `matchingPolicy` to resolve identities referenced by their findings. Global `POST /{ds}/ask` accepts the same two options. `recall` with `"communities": true` adds the report of each seed's community after its facts. A project brief lists the best rated reports of the coarsest level.
 
 ## Embedding the library
 

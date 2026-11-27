@@ -383,6 +383,39 @@ pub fn digest_hex(bytes: &[u8]) -> String {
     crate::managed::settings_digest(bytes)
 }
 
+/// Streaming lowercase-hex SHA-256 hasher for callers that hash files without buffering
+/// them in full.
+pub struct Sha256Stream(sha2::Sha256);
+
+impl Sha256Stream {
+    pub fn new() -> Self {
+        use sha2::Digest as _;
+        Self(sha2::Sha256::new())
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        use sha2::Digest as _;
+        self.0.update(bytes);
+    }
+
+    pub fn finalize_hex(self) -> String {
+        use sha2::Digest as _;
+        let sum = self.0.finalize();
+        let mut out = String::with_capacity(64);
+        for b in sum {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{b:02x}");
+        }
+        out
+    }
+}
+
+impl Default for Sha256Stream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A new random bearer lease token and its durable verifier. The token is 32 random
 /// bytes in URL-safe base64 without padding, and the verifier is `sha256:` and the hex
 /// digest of the token's bytes. Only the verifier is ever written.

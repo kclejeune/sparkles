@@ -189,7 +189,55 @@ pub(super) fn prove_prefix<R: Read + Seek>(
     annotated: Option<&[u64]>,
     path: &Path,
     budget: &mut crate::store::cold::ColdBudget<'_>,
-    visit: &mut dyn FnMut(wal::probe::WalCommitObservation) -> Result<()>,
+    visit: &mut dyn FnMut(
+        wal::probe::WalCommitObservation,
+        &crate::store::cold::ColdBudget<'_>,
+    ) -> Result<()>,
+) -> Result<(wal::probe::ProvenWal, R)> {
+    prove_prefix_inner(
+        input, spans, extent, base, target, dvocab_len, annotated, path, budget, visit, false,
+    )
+}
+
+/// Like [`prove_prefix`], stopping once commit `target` and every supplied span
+/// have been completely framed and hash-verified.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prove_prefix_through<R: Read + Seek>(
+    input: R,
+    spans: &[Span],
+    extent: u64,
+    base: u64,
+    target: u64,
+    dvocab_len: u64,
+    annotated: Option<&[u64]>,
+    path: &Path,
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+    visit: &mut dyn FnMut(
+        wal::probe::WalCommitObservation,
+        &crate::store::cold::ColdBudget<'_>,
+    ) -> Result<()>,
+) -> Result<(wal::probe::ProvenWal, R)> {
+    prove_prefix_inner(
+        input, spans, extent, base, target, dvocab_len, annotated, path, budget, visit, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_prefix_inner<R: Read + Seek>(
+    input: R,
+    spans: &[Span],
+    extent: u64,
+    base: u64,
+    target: u64,
+    dvocab_len: u64,
+    annotated: Option<&[u64]>,
+    path: &Path,
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+    visit: &mut dyn FnMut(
+        wal::probe::WalCommitObservation,
+        &crate::store::cold::ColdBudget<'_>,
+    ) -> Result<()>,
+    stop_at_target: bool,
 ) -> Result<(wal::probe::ProvenWal, R)> {
     let buffer = (budget.available() / 8).clamp(64, 64 << 10);
     let fixed = (std::mem::size_of::<RecordProof<'_>>()
@@ -203,21 +251,40 @@ pub(super) fn prove_prefix<R: Read + Seek>(
         let mut frames = FrameProof::new(spans, extent)?;
         let mut records = RecordProof::new(spans, extent)?;
         let mut reader = std::io::BufReader::with_capacity(buffer as usize, input);
-        let proof = wal::probe::prove_prefix_recording(
-            &mut reader,
-            extent,
-            base,
-            target,
-            dvocab_len,
-            annotated,
-            path,
-            budget,
-            &mut |observation| {
-                frames.observe(observation)?;
-                visit(observation)
-            },
-            &mut |offset, record| records.observe(offset, record),
-        )?;
+        let proof_budget: &crate::store::cold::ColdBudget<'_> = budget;
+        let proof = if stop_at_target {
+            wal::probe::prove_prefix_recording_through(
+                &mut reader,
+                extent,
+                base,
+                target,
+                dvocab_len,
+                annotated,
+                path,
+                proof_budget,
+                &mut |observation| {
+                    frames.observe(observation)?;
+                    visit(observation, proof_budget)
+                },
+                &mut |offset, record| records.observe(offset, record),
+            )?
+        } else {
+            wal::probe::prove_prefix_recording(
+                &mut reader,
+                extent,
+                base,
+                target,
+                dvocab_len,
+                annotated,
+                path,
+                proof_budget,
+                &mut |observation| {
+                    frames.observe(observation)?;
+                    visit(observation, proof_budget)
+                },
+                &mut |offset, record| records.observe(offset, record),
+            )?
+        };
         frames.finish()?;
         records.finish()?;
         let input = reader.into_inner();
@@ -431,7 +498,7 @@ mod tests {
             Some(&[]),
             Path::new("annotation-lookahead"),
             &mut budget,
-            &mut |_| Ok(()),
+            &mut |_, _| Ok(()),
         );
         assert_eq!(budget.used(), before);
         assert!(
@@ -496,7 +563,7 @@ mod tests {
             None,
             Path::new("disjoint-imports"),
             &mut budget,
-            &mut |_| Ok(()),
+            &mut |_, _| Ok(()),
         )
         .unwrap();
         assert_eq!(proof.head.seq, 4);
@@ -536,7 +603,7 @@ mod tests {
                 None,
                 Path::new("disjoint-imports"),
                 &mut budget,
-                &mut |_| Ok(())
+                &mut |_, _| Ok(())
             )
             .is_err()
         );
@@ -568,7 +635,7 @@ mod tests {
                 None,
                 Path::new("split-import"),
                 &mut budget,
-                &mut |_| Ok(())
+                &mut |_, _| Ok(())
             )
             .is_err()
         );
@@ -599,7 +666,7 @@ mod tests {
                 Some(&[]),
                 Path::new("missing-durability"),
                 &mut budget,
-                &mut |_| Ok(())
+                &mut |_, _| Ok(())
             )
             .is_err()
         );
@@ -639,7 +706,7 @@ mod tests {
                 None,
                 Path::new("buffer-pressure"),
                 &mut small,
-                &mut |_| Ok(())
+                &mut |_, _| Ok(())
             ),
             Err(Error::BudgetExceeded(_))
         ));
@@ -661,7 +728,7 @@ mod tests {
             None,
             Path::new("callback-refusal"),
             &mut budget,
-            &mut |_| {
+            &mut |_, _| {
                 observed += 1;
                 Err(Error::Cancelled)
             },

@@ -317,10 +317,14 @@ pub fn settings_at(dir: &std::path::Path) -> anyhow::Result<Option<AssistantSett
 }
 
 /// The role lists of a dataset (§3.5, §3.7): its overrides over the server's lists, with
-/// `summarize` limited to the providers that may receive rows.
+/// pairs filtered to active chat providers and allowed models, and `summarize` limited to
+/// the providers that may receive rows.
 #[cfg(feature = "mcp")]
 pub fn lists(models: &Models, s: &AssistantSettings) -> crate::ask::RoleLists {
     let mut l = crate::ask::resolve_lists(models, &s.roles);
+    for pairs in l.values_mut() {
+        pairs.retain(|p| models.allows_chat(p));
+    }
     if let Some(sum) = l.get_mut(&Role::Summarize) {
         sum.retain(|p| s.send_to(&p.provider) >= Send::Rows);
     }
@@ -367,7 +371,7 @@ pub fn ask_status(st: &AppState, s: &AssistantSettings) -> Result<(), &'static s
         .get(&Role::Draft)
         .cloned()
         .unwrap_or_else(|| m.pairs(Role::Draft));
-    if draft.is_empty() {
+    if !draft.iter().any(|p| m.allows_chat(p)) {
         return Err("no provider and model answers the draft role");
     }
     Ok(())
@@ -464,6 +468,45 @@ impl Runtime {
             .or_default() += tokens;
         *t.entry((d, dataset.to_string(), principal.to_string()))
             .or_default() += tokens;
+    }
+
+    /// Record late token usage reported by an in-flight provider HTTP request that
+    /// finished after its ask was cancelled or timed out. `budget_tokens` is the
+    /// incremental rounded budget charge for the step (not an independent re-rounding of
+    /// `usage`), while raw token counts and estimated cost are added in full.
+    #[allow(clippy::too_many_arguments)]
+    pub fn charge_abandoned(
+        &self,
+        dataset: &str,
+        principal: &str,
+        provider: &str,
+        model: &str,
+        usage: crate::models::admission::Usage,
+        budget_tokens: u64,
+        estimated_cost: Option<f64>,
+    ) {
+        if budget_tokens == 0 && usage == crate::models::admission::Usage::default() {
+            return;
+        }
+        if budget_tokens > 0 {
+            self.add_tokens(dataset, principal, budget_tokens);
+        }
+        let add = |c: &mut Counts| {
+            let t = c
+                .tokens
+                .entry((provider.to_string(), model.to_string()))
+                .or_default();
+            t.0 = t.0.plus(usage);
+            t.1 += estimated_cost.unwrap_or(0.0);
+            t.2 += budget_tokens;
+        };
+        {
+            let mut u = self.usage.lock();
+            let d = today();
+            u.retain(|k, _| k.0 + USAGE_DAYS > d);
+            add(u.entry((d, dataset.to_string())).or_default());
+        }
+        add(self.totals.lock().entry(dataset.to_string()).or_default());
     }
 
     /// Count the model calls of a step outside an ask, such as an explanation (C18
@@ -882,6 +925,29 @@ impl AskAbout {
 /// graphs keeps no footprint, and only unrestricted readers see that answer again.
 pub const MAX_ACCESS_GRAPHS: usize = 512;
 
+/// What grounding (`Endpoint::Info`) could read when an ask ran (format 3).
+///
+/// Legacy format-1 and format-2 records omit this field and deserialize as `Unknown`,
+/// which survives format-3 history rewrites and requires unrestricted `Endpoint::Info`
+/// access to reveal derived content.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InfoAccess {
+    /// Legacy record whose Info view was not recorded.
+    #[default]
+    Unknown,
+    /// Asker had no `Endpoint::Info` read grant when asking.
+    None,
+    /// Asker had `Endpoint::Info` read access with this footprint.
+    Footprint(Box<AnswerAccess>),
+}
+
+impl InfoAccess {
+    fn is_unknown(&self) -> bool {
+        matches!(self, InfoAccess::Unknown)
+    }
+}
+
 /// What an ask could read, so that its stored answer is shown again only to a reader
 /// who can read all of it under the same protections (C18 §6.4). The footprint is the
 /// disclosure guard's (C22 §6.2) over every graph the asker's view read; the guarded
@@ -900,11 +966,64 @@ pub struct AnswerAccess {
     /// the branch the ask read, `main` when absent
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// what the grounding (`Endpoint::Info`) could read (format 3); absent in legacy
+    /// format-1 and format-2 records (`Unknown`)
+    #[serde(default, skip_serializing_if = "InfoAccess::is_unknown")]
+    pub info_access: InfoAccess,
+}
+
+/// The Query and Info access record of an ask by `principal` over `snap`.
+pub fn ask_access(
+    snap: Option<&Arc<sparkles::store::Snapshot>>,
+    principal: &Principal,
+    dataset: &str,
+    branch: Option<&str>,
+    me: &str,
+    review_policy: bool,
+) -> AnswerAccess {
+    let view_name = match branch.filter(|b| *b != sparkles::branch::MAIN) {
+        Some(b) => format!("{dataset}@{b}"),
+        None => dataset.to_string(),
+    };
+    let mut access = answer_access_for(
+        snap,
+        principal
+            .view(&view_name, crate::auth::Endpoint::Query)
+            .as_ref(),
+        &principal.caller(),
+        dataset,
+        branch,
+        me,
+        "query",
+        review_policy,
+    );
+    access.info_access = if principal.can_at(
+        &view_name,
+        crate::auth::Endpoint::Info,
+        crate::auth::Level::Read,
+    ) {
+        InfoAccess::Footprint(Box::new(answer_access_for(
+            snap,
+            principal
+                .view(&view_name, crate::auth::Endpoint::Info)
+                .as_ref(),
+            &principal.caller(),
+            dataset,
+            branch,
+            me,
+            "info",
+            review_policy,
+        )))
+    } else {
+        InfoAccess::None
+    };
+    access
 }
 
 /// The access record of an ask over `snap`, the state its answer read (`None` when
 /// that state cannot be opened, which keeps no footprint), read through `view`
-/// (`None`: unrestricted) by `principal`.
+/// (`None`: unrestricted) by `principal` on the `query` endpoint.
+#[cfg(test)]
 pub fn answer_access(
     snap: Option<&Arc<sparkles::store::Snapshot>>,
     view: Option<&Arc<sparkles::access::GraphAccess>>,
@@ -912,6 +1031,23 @@ pub fn answer_access(
     dataset: &str,
     branch: Option<&str>,
     principal: &str,
+) -> AnswerAccess {
+    answer_access_for(
+        snap, view, caller, dataset, branch, principal, "query", false,
+    )
+}
+
+/// [`answer_access`] for a named endpoint (`"query"` or `"info"`).
+#[allow(clippy::too_many_arguments)]
+fn answer_access_for(
+    snap: Option<&Arc<sparkles::store::Snapshot>>,
+    view: Option<&Arc<sparkles::access::GraphAccess>>,
+    caller: &sparkles::access::Caller,
+    dataset: &str,
+    branch: Option<&str>,
+    principal: &str,
+    endpoint: &str,
+    review_policy: bool,
 ) -> AnswerAccess {
     use crate::graphrag::guard::{CaptureInput, capture, capture_guarded};
     use crate::graphrag::settings::is_guarded;
@@ -921,6 +1057,7 @@ pub fn answer_access(
             guarded: Vec::new(),
             guarded_footprint: None,
             branch: branch.map(str::to_string),
+            info_access: InfoAccess::Unknown,
         };
     };
     let bound = view.map(|v| v.bound(snap));
@@ -955,11 +1092,13 @@ pub fn answer_access(
             branch: branch.unwrap_or(sparkles::branch::MAIN),
             source_commit: snap.commit,
             principal,
-            endpoint: "query",
+            endpoint,
             view: bound.as_deref(),
             caller,
             graphs,
             reports: &[],
+            snap: Some(snap.as_ref()),
+            review_policy,
         };
         if of_guarded {
             capture_guarded(&i).ok()
@@ -983,6 +1122,7 @@ pub fn answer_access(
         guarded: if fits { guarded } else { Vec::new() },
         guarded_footprint,
         branch: branch.map(str::to_string),
+        info_access: InfoAccess::Unknown,
     }
 }
 
@@ -992,7 +1132,7 @@ pub fn answer_visible(
     view: Option<&Arc<sparkles::access::GraphAccess>>,
     snap: &Arc<sparkles::store::Snapshot>,
 ) -> bool {
-    use crate::graphrag::guard::{Decision, covers, unrestricted};
+    use crate::graphrag::guard::{Decision, covers_with_evidence, unrestricted};
     let bound = view.map(|v| v.bound(snap));
     if unrestricted(bound.as_deref()) {
         return true;
@@ -1000,7 +1140,8 @@ pub fn answer_visible(
     // an answer stored without what it read is seen only by unrestricted readers
     let Some(a) = access else { return false };
     let Some(fp) = &a.footprint else { return false };
-    if covers(bound.as_deref(), fp) != Decision::Proven {
+    let is_support_gated = |g: &str| snap.is_evidence_output_or_unavailable(g);
+    if covers_with_evidence(bound.as_deref(), fp, is_support_gated) != Decision::Proven {
         return false;
     }
     // the guarded graphs it read: each readable, under the protections the asker had
@@ -1015,9 +1156,9 @@ pub fn answer_visible(
         })
     });
     readable
-        && a.guarded_footprint
-            .as_ref()
-            .is_some_and(|g| covers(bound.as_deref(), g) == Decision::Proven)
+        && a.guarded_footprint.as_ref().is_some_and(|g| {
+            covers_with_evidence(bound.as_deref(), g, is_support_gated) == Decision::Proven
+        })
 }
 
 /// The most characters of a stored text, and the most items of a stored list.
@@ -1116,6 +1257,13 @@ pub fn stored_answer(out: &Value, ground: &Value) -> Option<Value> {
         }
         if let Some(u) = cut_list(&s["uncitedSentences"], cut) {
             gl["uncitedSentences"] = u;
+        }
+        if let Some(p) = out["global"].get("reviewPolicy").filter(|v| v.is_object()) {
+            gl["reviewPolicy"] = json!({
+                "name": cut(&p["name"]),
+                "iri": cut(&p["iri"]),
+                "version": p["version"].as_u64(),
+            });
         }
         put("global", Some(gl));
     }
@@ -1247,8 +1395,8 @@ pub(crate) fn store_history(st: &AppState, ds: &Dataset, list: &[AskRecord]) -> 
     )
 }
 
-/// The format of `asks.json` this release writes; it reads 1 and 2.
-pub const HISTORY_FORMAT: u32 = 2;
+/// The format of `asks.json` this release writes; it reads 1, 2 and 3.
+pub const HISTORY_FORMAT: u32 = 3;
 
 /// Entries older than `days` days.
 fn expired(r: &AskRecord, days: u32) -> bool {
@@ -1259,6 +1407,9 @@ fn expired(r: &AskRecord, days: u32) -> bool {
 
 /// Keep a finished ask in its principal's history, when the dataset keeps history.
 pub fn remember(st: &AppState, ds: &Dataset, rec: AskRecord) {
+    if st.read_only {
+        return;
+    }
     let days = settings(st, ds).history_days(st);
     if days == 0 {
         return;
@@ -1284,6 +1435,9 @@ pub fn remember(st: &AppState, ds: &Dataset, rec: AskRecord) {
 
 /// Delete the entries older than each dataset's retention (hourly, from `serve`).
 pub fn prune(st: &AppState) {
+    if st.read_only {
+        return;
+    }
     for ds in st.datasets().values() {
         let days = settings(st, ds).history_days(st);
         let _g = HISTORY_LOCK.lock();
@@ -1433,7 +1587,7 @@ pub fn feedback(
         .recent(id)
         .is_some_and(|r| r.principal == principal && r.dataset == ds.name);
     let mut in_history = false;
-    {
+    if !st.read_only {
         let _g = HISTORY_LOCK.lock();
         // a file this release cannot read keeps its entries as they are
         let mut list = history_of(st, ds).unwrap_or_else(|e| {
@@ -1511,17 +1665,19 @@ fn settings_json(st: &AppState, s: &AssistantSettings) -> Value {
         Ok(()) => {
             status["ask"] = true.into();
             if let Some(m) = &models {
-                let draft = s
+                let mut draft = s
                     .roles
                     .get(&Role::Draft)
                     .cloned()
                     .unwrap_or_else(|| m.pairs(Role::Draft));
+                draft.retain(|p| m.allows_chat(p));
                 status["draft"] = serde_json::to_value(&draft).unwrap_or_default();
-                let sum = s
+                let mut sum = s
                     .roles
                     .get(&Role::Summarize)
                     .cloned()
                     .unwrap_or_else(|| m.pairs(Role::Summarize));
+                sum.retain(|p| m.allows_chat(p));
                 status["summary"] = (s.send >= Send::Rows
                     && sum.iter().any(|p| s.send_to(&p.provider) >= Send::Rows))
                 .into();
@@ -1630,15 +1786,51 @@ async fn list_asks(
                     r.reports.clear();
                     r.reports_graph = None;
                 }
-                // C18 §6.4: the answer only to a reader whose view covers what it read,
-                // and a global answer's text only while its reports are readable
-                if r.answer.is_some() {
-                    let visible = !reports_hidden
-                        && reader_view(&st, &ds, &p, &opts, &snap, r.access.as_ref()).is_some_and(
-                            |(view, snap)| answer_visible(r.access.as_ref(), view.as_ref(), &snap),
-                        );
+                // C18 §6.4: derived content (the stored answer and generated query) only to a
+                // reader whose Query and grounding (Info) views cover what it read, and a global
+                // answer's text only while its reports are readable.
+                if r.answer.is_some() || r.query.is_some() {
+                    let query_visible = reader_view_at(
+                        &st,
+                        &ds,
+                        &p,
+                        &opts,
+                        &snap,
+                        r.access.as_ref(),
+                        crate::auth::Endpoint::Query,
+                    )
+                    .is_some_and(|(view, snap)| {
+                        answer_visible(r.access.as_ref(), view.as_ref(), &snap)
+                    });
+                    let info_visible = match r.access.as_ref().map(|a| &a.info_access) {
+                        Some(InfoAccess::None) => true,
+                        Some(InfoAccess::Footprint(info_access)) => reader_view_at(
+                            &st,
+                            &ds,
+                            &p,
+                            &opts,
+                            &snap,
+                            r.access.as_ref(),
+                            crate::auth::Endpoint::Info,
+                        )
+                        .is_some_and(|(view, snap)| {
+                            answer_visible(Some(info_access), view.as_ref(), &snap)
+                        }),
+                        None | Some(InfoAccess::Unknown) => reader_view_at(
+                            &st,
+                            &ds,
+                            &p,
+                            &opts,
+                            &snap,
+                            r.access.as_ref(),
+                            crate::auth::Endpoint::Info,
+                        )
+                        .is_some_and(|(view, snap)| answer_visible(None, view.as_ref(), &snap)),
+                    };
+                    let visible = !reports_hidden && query_visible && info_visible;
                     if !visible {
                         r.answer = None;
+                        r.query = None;
                     }
                     let mut v = record_json(&r);
                     if !visible {
@@ -1677,17 +1869,19 @@ fn record_json(r: &AskRecord) -> Value {
 }
 
 /// The reader's view of the branch a record's answer read (`None` in it:
-/// unrestricted), with that branch's current state, or `None` when the reader may not
-/// query the branch or it cannot be opened, which withholds the answer.
+/// unrestricted), on `endpoint`, with that branch's current state, or `None` when the
+/// reader may not read the branch on that endpoint or it cannot be opened, which
+/// withholds the answer.
 #[cfg_attr(not(feature = "auth"), allow(unused_variables))]
 #[allow(clippy::type_complexity)]
-fn reader_view(
+fn reader_view_at(
     st: &AppState,
     ds: &Arc<Dataset>,
     p: &Principal,
     opts: &sparkles::sparql::QueryOptions,
     snap: &Arc<sparkles::store::Snapshot>,
     access: Option<&AnswerAccess>,
+    endpoint: crate::auth::Endpoint,
 ) -> Option<(
     Option<Arc<sparkles::access::GraphAccess>>,
     Arc<sparkles::store::Snapshot>,
@@ -1697,14 +1891,15 @@ fn reader_view(
         .filter(|b| *b != sparkles::branch::MAIN);
     let Some(b) = branch else {
         #[cfg(feature = "auth")]
-        if st.auth.is_some()
-            && !p.can_at(
-                &ds.name,
-                crate::auth::Endpoint::Query,
-                crate::auth::Level::Read,
-            )
         {
-            return None;
+            if (st.auth.is_some() || !p.is_local())
+                && !p.can_at(&ds.name, endpoint, crate::auth::Level::Read)
+            {
+                return None;
+            }
+            if endpoint != crate::auth::Endpoint::Query {
+                return Some((p.view(&ds.name, endpoint), snap.clone()));
+            }
         }
         return Some((opts.graphs.clone(), snap.clone()));
     };
@@ -1714,16 +1909,12 @@ fn reader_view(
     let view = {
         let name = format!("{}@{b}", ds.name);
         // an ungranted branch has no view, which is not an unrestricted one
-        if st.auth.is_some()
-            && !p.can_at(
-                &name,
-                crate::auth::Endpoint::Query,
-                crate::auth::Level::Read,
-            )
+        if (st.auth.is_some() || !p.is_local())
+            && !p.can_at(&name, endpoint, crate::auth::Level::Read)
         {
             return None;
         }
-        p.view(&name, crate::auth::Endpoint::Query)
+        p.view(&name, endpoint)
     };
     #[cfg(not(feature = "auth"))]
     let view = opts.graphs.clone();

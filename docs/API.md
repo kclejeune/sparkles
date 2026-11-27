@@ -5814,7 +5814,11 @@ retained generation.
 
 **Access.** A caller sees the changes of the graphs it may read, without the triples its
 protections hide. A caller with a protection that depends on the data (classes or
-patterns) gets `403` for history queries, as for the change feed.
+patterns) gets `403` for history queries, as for the change feed. A restricted caller,
+including a graph-only reader without triple protections, also gets `403` when
+support-aware projection visibility applies to its view, when the dataset's managed
+evidence registry is unavailable, or when configuration history is activated and earlier
+change-log commits may hold projected triples from prior review policies.
 
 **The log.** The changes are written by a background thread shortly after each commit,
 so a commit does no extra I/O. The log is synced before a compaction or a bulk commit
@@ -11991,7 +11995,8 @@ runs as the HTTP request's caller (see [HTTP endpoint](#http-endpoint-mcp)).
 
 ```
 sparkles mcp (--loc [NAME=]PATH)... | (--data FILE... [--name NAME])
-             [--allow-update] [--allow-service] [--timeout SECS] [--query-memory-mb N]
+             [--allow-update] [--allow-service] [--model-config FILE]
+             [--model-secret NAME=SOURCE]... [--timeout SECS] [--query-memory-mb N]
              [--max-rows N] [--mcp-max-rows N] [--mcp-max-bytes N] [--max-concurrent N]
              [--disable-tool NAME]... [--profile NAME]... [--tools NAME,...]...
              [--no-stored-queries] [--schema-max-entries N] [--text]
@@ -12004,6 +12009,8 @@ sparkles mcp --url URL [--token TOKEN] [--insecure-http]
 | `--loc [NAME=]PATH` | | A database directory (repeatable). The name defaults to the directory's name. |
 | `--data FILE…`, `--name` | `data` | RDF files loaded into one in-memory dataset. |
 | `--text` | off | Indexes the `--data` dataset for `search_text`. A `--loc` database keeps the index it has (see `sparkles text-index`). |
+| `--model-config FILE` | | Model providers and role lists as JSON, as for `sparkles serve`. Applies with `--loc` databases whose assistant is enabled (`assistant.json` with `enabled: true`); `--data` creates an in-memory dataset with the assistant disabled, and `--url` refuses this flag. |
+| `--model-secret NAME=SOURCE` | | Secret source (`NAME=env:VAR` or `NAME=file:PATH`, repeatable) for API keys referenced by `--model-config`. Refused with `--url`. |
 | `--timeout SECS` | `60` | Largest `timeoutSeconds` a call may ask for. Calls default to 30. |
 | `--query-memory-mb N` | `2048` | Memory budget of every call's queries. `0` means unlimited. |
 | `--max-rows N` | `200000000` | Rows of any intermediate result. |
@@ -12110,7 +12117,7 @@ profiles are defined in one table of the server.
 | Profile | Tools |
 |---|---|
 | `all` | Every tool. |
-| `explore` | `list_datasets`, `describe_schema`, `draft_shapes`, `diff_schema`, `sparql_query`, `explain_query`, `describe_resource`, `find_paths`, `graph_algorithm`, `list_commits`, `list_changes`, `search_text`, `search_semantic`, `similar_entities`, `check_query`, `similar_queries`, `community_reports`, `why_empty`, `share_query`, `explain_inference` and `graphql_query`. |
+| `explore` | `list_datasets`, `describe_schema`, `draft_shapes`, `diff_schema`, `sparql_query`, `explain_query`, `describe_resource`, `find_paths`, `graph_algorithm`, `list_commits`, `list_changes`, `search_text`, `search_semantic`, `similar_entities`, `check_query`, `similar_queries`, `community_reports`, `why_empty`, `ask`, `share_query`, `explain_inference` and `graphql_query`. |
 | `memory` | `list_datasets`, `describe_schema`, `sparql_query`, `describe_resource`, `search_text`, `search_semantic`, `similar_entities`, `check_query`, `similar_queries`, `link_entities`, `recall`, `community_reports`, `read_chunks`, `list_sources`, `ingest_profile`, `assert_facts`, `register_source`, `propose_claims`, `withdraw_claims`, `resolve_evidence` and `find_evidence_dependents`. |
 | `admin` | `list_datasets`, `describe_schema`, `draft_shapes`, `diff_schema`, `sparql_query`, `explain_query`, `list_commits`, `list_changes`, `validate_shacl`, `validate_shex`, `format`, `lint`, `ontology_axioms`, `entailment_diff`, `review_claims`, `resolve_identities`, `sparql_update` and the branch tools. |
 
@@ -12133,7 +12140,9 @@ ones its grants allow.
 Tools appear in this order. All but `sparql_update`, `assert_facts`, `create_branch`,
 `merge_branch` and `delete_branch` are read-only
 (`annotations: {"readOnlyHint": true, "openWorldHint": false}`). `sparql_query` is
-open-world when SERVICE is allowed. The common arguments are:
+open-world when SERVICE is allowed, `search_semantic` is open-world because query text
+goes to the index's embedding provider, and `ask` is open-world because prompts go to the
+configured model providers. The common arguments are:
 
 * `dataset`: a name from `list_datasets`. It is optional when the server has one
   dataset.
@@ -12155,7 +12164,7 @@ open-world when SERVICE is allowed. The common arguments are:
 
 | Tool | Arguments (besides the common ones) | Result |
 |---|---|---|
-| `list_datasets` | none | `{datasets: [{name, quads, commit, modified, reasoning: null\|{profile, stale}, textSearch, writable, graphql?}], limits: {defaultMaxRows, maxRows, defaultMaxBytes, maxBytes, defaultTimeoutSeconds, maxTimeoutSeconds, service, updates}}`. `graphql: true` marks a dataset that `graphql_query` reads. |
+| `list_datasets` | none | `{datasets: [{name, quads, commit, modified, reasoning: null\|{profile, stale}, textSearch, writable, graphql?, ask?}], limits: {defaultMaxRows, maxRows, defaultMaxBytes, maxBytes, defaultTimeoutSeconds, maxTimeoutSeconds, service, updates}}`. `graphql: true` marks a dataset that `graphql_query` reads, and `ask: true` marks a dataset with an enabled assistant that `ask` queries. |
 | `describe_schema` | `section` (`summary`\|`classes`\|`predicates`\|`constraints`\|`profiles`), `graph` (`default`\|`union`\|IRI), `includeBuiltin`, `limit` (1–500; 25 for the summary, 100 for lists), `cursor`, `subjectClasses`, `shapes`, `classes` (IRIs, with `profiles`), `query` (1–2000 characters, with `summary`) | `{dataset, commit, graph, reasoning, section, totals: {triples, classes, predicates}, builtinClassesHidden, ontology?, roots?, classes?: [{iri, label?, instances, declared, superClasses?, superClassExpressions?}], predicates?: [{iri, label?, triples, distinctSubjects, distinctObjects, maxPerSubject, objects: ["iri 120", "xsd:string 98", "rdf:langString@en,de 12", …], domains?, ranges?, vector?, subjectClasses?: ["ex:Person 120", …, "untyped 3"]}], constraints?: [{source, graphs, mode?, threshold?, classes: [{class, closed?, properties: [{path, constraints: "min 1 · max 1 · datatype xsd:string", enforcement}]}]}], next, prefixes}`. The summary lists the largest classes and predicates. With `query`, it ranks every visible entry by words shared with its label or local name before applying the limit, using counts to break ties. `classes` and `predicates` page through all entries in IRI order. `subjectClasses: true` adds the ten classes of each predicate's subjects with the most triples. `constraints` lists the [constraints layer](#constraints-layer), from the write-time SHACL validation or from the sources in `shapes`. `profiles` lists the [class profiles](#class-profiles) of the classes with the most instances, or of those in `classes`: `profiles: [{class, instances, properties: [{predicate, instances, triples, valuesPerInstance: "1..2", objects: {iri?, "xsd:string"?: n, …}, objectClasses?}], incoming}]`, with at most 25 properties and 10 incoming predicates per class. |
 | `diff_schema` | `from` (a commit, or `time:…` / `snapshot:…`), `to` (the head), `graph`, `reasoning`, `limit` (50, at most 500 entries per list), `timeoutSeconds` | `{dataset, from, to, graph, reasoning, counts, report: [Change], classes: {added: [iri], removed: [iri], changed: [{iri, changes: [Change]}]}, predicates: {…}, truncated, prefixes}`: the [schema diff](#schema-diffs) between two readable states. `404` for a commit beyond the head and `410` for one whose history is gone. |
 | `draft_shapes` | `graph`, `language` (`shacl`\|`shex`), `shapesFormat` (`turtle`\|`shaclc`, for SHACL), `support` (1), `classes` (IRIs), `minInstances` (1), `maxIn` (10), `maxCount` (1), `maxInverse` (10), `closed` (false), `timeoutSeconds` (30). `reasoning` defaults to false here. | `{dataset, commit, graph, support, language, totals, shapes: [{class, shape, instances, properties, constraints, excluding: [{path, component, excluded}]}], shapesFormat?, shacl? \| shex?, shapeMap?}`: the [drafted shapes](#drafted-shapes) of the caller's visible graphs, as SHACL in Turtle or SHACLC, or as ShExC with its shape map. `excluding` lists the constraints that reject existing instances. Nothing is installed. |
@@ -12173,8 +12182,9 @@ open-world when SERVICE is allowed. The common arguments are:
 | `similar_queries` | `question` (required, ≤ 2000 characters), `k` (5, ≤ 20), `withText` (true), `embeddingIndex` (a vector index name), `timeoutSeconds` (30) | `{dataset, queries: [{name, tool?, description?, score, matchedBy, parameters: [{name, type, required, description?}], questions?, query?}], ranking, prefixes}`. The [stored queries](#stored-queries) the caller may run whose `mcp` is not `false`, ranked by BM25 over their description, parameters, the words of their IRIs and their `questions`. When the dataset has one vector index whose provider embeds query text, or `embeddingIndex` names one, the cosine similarity of embeddings is fused with BM25 by reciprocal rank (k = 60) and `ranking` is `hybrid`. If the provider fails, the ranking falls back to `text`. `tool` is the query's MCP tool name. |
 | `link_entities` | `mentions` (required, 1–20 of `{text (≤ 200 characters), types? (≤ 5 class IRIs), context? (≤ 500 characters)}`), `k` (5, ≤ 20), `labelPredicates` (≤ 20 IRIs, by default the label predicates of `describe_resource` and `skos:altLabel`), `graphs` (≤ 20 IRIs or `default`), `vectors` (true; false leaves the vector index out, so nothing is embedded), `evidence` (false), `popularity` (false), `timeoutSeconds` (30) | `{dataset, commit, mentions: [{text, verdict, candidates: [{iri, label?, altLabels?, types, score, typeMatch, matchedBy, sameAs?, triples, uses?}]}], search: {text, vector}, prefixes}`. Candidates come from exact label matches, labels equal after case folding and collapsing white space, `text:query` over the label predicates the full-text index covers, and `spk:vectorSearch` with the mention and its context on a vector index that embeds labels. `verdict` is `exact`, `ambiguous`, `candidates` or `none`, and it is advice. Candidates of a type in `types`, or of a subclass, come first. `triples` holds up to 5 sampled outgoing triples, and `sameAs` the other candidates linked by `owl:sameAs` or `skos:exactMatch`. With `popularity: true`, label matches of the same kind are ordered by how many triples of the caller's view name each one as their object, counted up to 2000, and each label match reports that count as `uses`. The verdict does not change. `search` says which indexes took part. With `evidence: true`, each mention adds version 1 evidence with `observedCandidates`, `poolTruncated`, `displayTruncated`, `exactStringLabelsComplete`, `typeHintLookupComplete`, `normalizedLabelsComplete` and `candidateUniverseComplete`. Each displayed candidate adds version 1 evidence with its full `iri`, up to 20 retained named `types`, `typesComplete`, up to 20 retained non-vector literal `labels` as `{predicate, term}`, and `labelsComplete`. Evidence type and predicate IRIs and escaped literal terms are unabridged. Completeness concerns the same snapshot and caller's query view, within the requested label predicates and graph selection. A cap, RDFS-on-read expansion or an unproven language/view scope gives incomplete evidence. Evidence-enabled structured content over `--mcp-max-bytes` is refused with `budget-result-bytes`, before MCP adds mirrored text and its envelope. The normalized and complete-universe flags are always false for the bounded searches, so this evidence never establishes unique intent. |
 | `recall` | `query` (≤ 2000 characters) or `seeds` (≤ 20 IRIs) or both, `types` (≤ 5 class IRIs), `graphs` (≤ 20 IRIs or `default`), `hops` (1, ≤ 2), `seedLimit` (10, ≤ 50), `maxTriples` (150, ≤ 1000), `maxBytes` (32768, ≤ `--mcp-max-bytes`), `includeSuperseded` (false), `statuses` (both), `unreviewedWeight` (0.7), `recency` (a half-life such as `90d`), `communities` (false), `communityLevel` (the finest), `format` (`text`\|`json`), `timeoutSeconds` (30) | One text block: the facts around the seeds with their citations, described below. No `structuredContent`. |
-| `community_reports` | `query` (≤ 2000 characters), `level` (the finest level with at most 100 reports), `reviewedOnly` (false), `limit` (10, ≤ 100), `findings` (true), `timeoutSeconds` (30) | `{dataset, available, reason?, message?, reportsGraph, level, levels: [{level, reports}], ranking, stale, reports: [{iri, community, level, title, summary, status, rating, memberCount, score?, findings: [{iri, text, cites}]}]}`, described below. |
+| `community_reports` | `query` (≤ 2000 characters), `level` (the finest level with at most 100 reports), `reviewedOnly` (false), `limit` (10, ≤ 100), `findings` (true), `reviewPolicy` (a review policy name), `matchingPolicy` (a matching policy name), `timeoutSeconds` (30) | `{dataset, available, reason?, message?, reportsGraph, level, levels: [{level, reports}], ranking, stale, reviewPolicy?, resolution?, reports: [{iri, community, level, title, summary, status, rating, memberCount, score?, reviewPolicy?, identities?, findings: [{iri, text, cites, about?, claims?, decisions?}]}]}`, described below. |
 | `why_empty` | `query` (required, ≤ 65536 characters), `timeoutSeconds` (30) | `{dataset, commit, empty, first?, steps, unchecked?, complete, message, prefixes}`, described in [Checking and explaining queries](#checking-and-explaining-queries). |
+| `ask` | `question` (required, 1–2000 characters), `context` (≤ 5 `{question, query}` turns), `clarification` (string or `{id?, value}`), `mode` (`auto`\|`local`\|`global`), `run` (true; false stops after `check_query` in local/auto mode and is rejected with `mode: "global"`), `summary` (true; local mode only), `maxRows` (1000, ≤ `--mcp-max-rows`), `reviewedOnly` (false), `query` (≤ 65536 characters), `tryHarder` (earlier `askId`), `explore`, `shapeCheck`, `drafts` (1–5), `typeHints`, `about` (`{iri, kind?, label?}`), `reviewPolicy`, `matchingPolicy`, `provider` and `model` (together; requires `serverModels` or dataset admin), `maxTokens` (≤ dataset `budget.perRequest`), `timeoutSeconds` (30, bounded by dataset `deadlineSecs` and `--timeout`) | `{outcome, mode, dataset, branch?, question, result?, summary?, clarify?, claims?, resolution?, points?, reports?, global?, attempts, notes, error?, usage}`. Runs the checked, self-repairing [Ask pipeline](#asking-in-the-server) as the caller over the caller's view, respecting grants, graph visibility, branches, MCP deadlines and cancellation, and Ask token and row-egress budgets. Listed only while models are configured and a visible dataset has an enabled assistant with an allowed draft pair, and open-world (`openWorldHint: true`) because prompts go to configured model providers. Read-only MCP sessions keep usage and retry state in memory without writing `asks.json`. |
 | `explain_inference` | `triple` (required, Turtle with the dataset's prefixes, such as `ex:tom a ex:Animal`), `mode` (`why` or `whyNot`), `maxTrees` (1, at most 10), `maxDepth` (32, at most 64), `timeoutSeconds` | The answer of [Explanations](#explanations) with `dataset`, `summaries` (one line per tree, such as `ex:tom a ex:Animal because ex:tom a ex:Cat (asserted) and ex:Cat rdfs:subClassOf ex:Animal (asserted), by rdfs9`) and `prefixes`. A triple with no derivation from facts the caller reads gives `entailed: false` and a `message`. Offered in builds with the `reasoning` feature. |
 | `entailment_diff` | `dataset`, `from` (required), `to` (`head`), `profile`, `rules`, `inputs`, `sampleLimit` (100, 1–100 per direction), `timeoutSeconds` (30, capped by server policy) | Complete entailment counts, bounded samples and new findings between two retained states. The tool is read-only and requires the reasoning feature. |
 | `share_query` | `query` (required, ≤ 65536 characters), `question` (≤ 2000 characters), `explanation` (≤ 400 characters), `assumptions` (≤ 5), `branch`, `atCommit` | `{url, dataset, commit, ok, issues, prefixes}`. The link opens the query in a new tab of the UI's query page with the question header. The query is checked and never run. Listed only when the server knows the UI's address, which is the request's own host over HTTP and `--ui-url` over stdio. A payload over 32 KiB is refused with `too-large`, and an update with `not-a-query`. |
@@ -12273,13 +12283,23 @@ the reports, the text says `# communities unavailable=off` or `unavailable=acces
 JSON says `communities: {unavailable, reports: []}`.
 
 `community_reports` lists the GraphRAG reports that match a text by full-text and
-vector search over the reports graph, a hit on a finding counting for its report, and
-fills the rest of `limit` with the best rated reports of the level. `ranking` says
-whether a search ranked them. Rejected and failed reports are never listed, and stale
-ones are listed and counted in `stale`. When the reports cannot be used, `available` is
-`false` and `reason` is `off`, `unavailable` (the caller's access does not cover the
-build's footprint) or `no-reports`, and `reports` is empty. Global answering in Ask
-selects its reports with this tool.
+vector search over the eligible reports of the chosen level, a hit on a finding counting
+for its report, and fills the rest of `limit` with the best rated reports of the level.
+`ranking` says whether a search ranked them. Rejected and failed reports are never
+listed, and stale ones are listed and counted in `stale`. When `reviewPolicy` is given,
+only reports recorded under that policy take part in counting, level selection, search
+ranking and results, and the response adds `reviewPolicy`, per-report `reviewPolicy`
+metadata and finding `claims` and `decisions`. When `matchingPolicy` is given, the server
+resolves the distinct entity IRIs referenced by returned findings through that policy's
+resolution map, adds finding `about`, per-report `identities` and top-level `resolution`,
+and shortens cluster `members` with `membersComplete: false` when needed to stay within
+the aggregate response budget. Naming either policy requires activated configuration
+history and caller read grants on the policy's graphs, refusing inactive history with
+`409`, unknown or unauthorized policies with `400`, unavailable projections or maps with
+`503` and selections over 10,000 distinct entities or the identity response budget with
+`422`. When the reports cannot be used, `available` is `false` and `reason` is `off`,
+`unavailable` (the caller's access does not cover the build's footprint) or `no-reports`,
+and `reports` is empty. Global answering in Ask selects its reports with this tool.
 
 The memory tools read as the caller, through the caller's graph grants and
 protections. A hidden entity is never a candidate, a seed or a fact, a citation never
@@ -13305,6 +13325,13 @@ nothing, every fact's confidence is at least `autoConfidence` and the merge prev
 no conflict. A source-only `auto` task runs the merge checks without fact checks.
 When a check blocks the merge, the task keeps the branch and reports `autoFallback`.
 
+A `claims` task publishes an evidence batch and reports the evidence `operation`,
+`revision`, `evidenceRendition`, `records` and `recordCounts`. Its `previousRevision`
+is the linked prior evidence `SourceRevision` IRI. The C18 `previousRendition` identifies a
+prior rendition. The task omits `previousRevision` when no predecessor evidence revision
+is linked, when the recorded link is hidden from the caller or when `outcome` is
+`already-proposed`.
+
 The review page's sources carry `pages` with each page's number and start, and
 `ocrPages` and `omittedPages`, so the UI shows the page of each fact.
 
@@ -13551,6 +13578,33 @@ profile does not protect is a `404`. A detach refuses with `503 managed-unavaila
 and changes nothing when this build cannot read the recorded settings. A registry that this build cannot enforce answers
 `503 managed-unavailable` on all three routes.
 
+`POST /$/evidence/{ds}/reauthenticate` needs `admin` on the dataset and target branch, and
+requires activated configuration history (`409 configuration-history-inactive` otherwise).
+After a graph is detached and protected again under a new nonce, records of the earlier
+protection answer `422 origin-not-reproduced` and their identities refuse new proposals.
+This route takes `{"graph": IRI}` with optional `branch` (`main` by default), `records`
+(an explicit list of `{"iri": IRI, "recordDigest"?: "sha256:…"}` entries, or omitted to
+reconcile up to 10,000 profile records in `graph`), `ifHead`, `idempotencyKey`,
+`dryRun` and `message`, capped at 4 MiB while streaming the request body. Only protected
+record-role graphs (`sourceRecords`, `proposals`, `decisions`, `supports` and `identity`)
+are accepted, and projection graphs are refused with `400`. Every stale candidate is
+verified against its retained, configuration-bound publication view (`BoundEvidenceView`)
+for original protection, receipt, digest and commit timestamp, as well as its recomputed
+`ev:recordDigest`, retained bytes or normalized text, passage span, structured selection
+and audit lineage within the 64 MiB preparation limit. Any tampered, unretained or
+mismatched record refuses the whole operation without writing
+(`409 immutable-record-conflict`, `409 target-changed`, `422 origin-not-reproduced`,
+`422 span-mismatch`, `422 evidence-unavailable` or `422 incomplete-evidence`). When all
+candidates pass, one atomic commit updates `ev:graphProtection` on the verified records
+and their receipt operations to the graph's current nonce, preserves the original receipts
+and timestamps, and writes an audit `ev:Operation`. Idempotency keys are checked across
+all configured record graphs before `ifHead`, and keyed whole-graph replays reproduce both
+renewed and already-authenticated records. It returns `409 evidence-settings-drift` while
+declared and recorded settings differ, `409 unsupported-profile` while the graph is
+detached, `409 head-changed` for a stale `ifHead`, `409 idempotency-conflict` for a reused
+key with another payload, and `503 authority-changed` when authorization changes before
+publication.
+
 With [`serve --settings`](#settings), put `evidence` under `defaults` or a named
 dataset. Lock the entire kind with `evidence`, a field such as `evidence.sourceRecords`,
 a policy such as `evidence.policies.advisories`, or a field such as
@@ -13740,7 +13794,11 @@ update endpoint and counts as an update. The design is in
 ```
 
 A record names another record of the batch as `{"key"}` and an existing authenticated
-record as `{"iri"}`. Content is `{"text"}`, `{"base64"}` or the `{"digest"}` of content
+record as `{"iri"}`. A source revision's optional `wasRevisionOf` names its predecessor
+`SourceRevision` the same way, is written as `prov:wasRevisionOf`, and is verified as an
+authenticated, caller-readable `SourceRevision` before publication. Self-links and cycles
+among batch revisions are refused, and a revision without `wasRevisionOf` keeps the record
+and payload digests it would have had before the field existed. Content is `{"text"}`, `{"base64"}` or the `{"digest"}` of content
 that is not retained. A proposition, scope value, rights term and conclusion is an
 N-Triples term without blank nodes. A stored fact has the form of
 [evidence resolution](#evidence-resolution). `ifHead`, `dryRun` and `message` have their
@@ -13830,7 +13888,7 @@ deleted, error}`, and holds nothing.
 | `409 hold-conflict` | An earlier attempt of the operation holds other commits. |
 | `409 holds-limit` | A referenced dataset cannot hold more commits. |
 | `409 unsupported-profile` | The profile is not enabled, or a written graph is detached. |
-| `422` | A reference does not verify, or the catalog identity or persistence check failed. A passage of an existing rendition and a structured value outside a retained JSON revision of the batch are `incomplete-evidence`. |
+| `422` | A reference or selection does not verify, with the codes of evidence resolution, or the catalog identity or persistence check failed. Unsupported structured normalization methods and exhausted resolution budgets answer `incomplete-evidence`. |
 | `503 holds-unavailable` | A referenced dataset could not confirm a durable hold. |
 | `503 authority-changed` | The caller's credential was revoked, expired or the access policy changed before the commit published. |
 
@@ -13946,10 +14004,33 @@ results that depend on them. A replay answers the first receipt with an empty
 | `409 idempotency-conflict` | The key was used with a different payload. |
 | `422 evidence-unavailable` | A target, or evidence that an acceptance must read, is missing, unreadable or outside the policy's boundary. |
 | `422 incomplete-evidence` | The acceptances need more than 10,000 evidence records. |
-| `503 projection-unavailable` | A graph of the policy's projection was detached and protected again, so its supports no longer authenticate, or its output holds triples without a projection record. |
+| `503 projection-unavailable` | A graph of the policy's projection was detached and protected again, so its supports no longer authenticate, or its output holds triples without a projection record. An administrator reconciles a review policy's projection through `POST /$/evidence/{ds}/projections/reconcile`. |
 | `503 authority-changed` | The caller's credential or the access policy changed before the commit published. |
 
 A refusal writes nothing. `GET /$/server` lists both routes in `capabilities.claims`.
+
+`POST /$/evidence/{ds}/projections/reconcile` needs `admin` on the dataset or selected
+branch (`?branch=NAME`, `main` by default), update grants on the policy's supports and
+output graphs and unmasked read grants on its decisions, supports and output graphs and
+on every configured proposal graph. Its body is
+`{"policy", "policyVersion"?, "ifHead"?, "idempotencyKey"?, "dryRun"?, "message"?}`. It
+rebuilds the review policy's output graph to hold exactly the triples owned by live
+acceptance supports that authenticate under the current protections, or empties it when
+none vouch, and records the new protection nonces in a fresh `ev:Projection` record in
+the supports graph that supersedes prior unsuperseded projection records of the policy,
+or reuses the active projection record when the protections and output already match.
+The answer is `{operation, committed, replayed, commit, branchId, policy,
+policyVersion, output, projection, vouchedSupports, changed}` with `dryRun` on a
+preview. Reconciling restores normal reviews, withdrawals and policy reads. It refuses
+with `400` for a malformed request, unknown policy or matching policy, `403` for a
+read-only server or missing or masked grants, `409` for `evidence-settings-drift`,
+`policy-changed`, `head-changed`, `idempotency-conflict`, `immutable-record-conflict`
+or `unsupported-profile` while a policy graph is still detached, `422
+incomplete-evidence` beyond the record or 64 MiB per-operation memory bounds, `503` for
+`managed-unavailable`, `projection-unavailable` when the supports, output or conflict mode
+changed without raising `policyVersion`, `authority-changed`, or temporary query memory
+pool exhaustion (with `Retry-After`), and `507` when the request exceeds the configured
+query memory pool.
 
 ### Evidence identities
 
@@ -14012,9 +14093,44 @@ it answers `422 incomplete-evidence`.
 A map follows the matches of the identity graphs it was built from. When one of them
 leaves the boundary, or is detached and protected again so that its proposals no longer
 authenticate, reviews and reads under the policy answer `503 projection-unavailable`
-until the boundary is restored. A graph added to the boundary keeps the map available.
-No operation rebuilds a map from its decisions after such a change, so a new matching
-policy with its own maps and output graphs starts a new map.
+until the boundary is restored or an administrator rebuilds the map. A new graph added
+to the boundary with no current accepted proposals keeps the map available for unmasked
+callers, while an added boundary graph that holds current accepted proposals answers
+`503 projection-unavailable` until rebuilt. A caller whose view masks triples also
+receives `503 projection-unavailable` whenever the boundary includes an added identity
+graph not yet recorded on the latest revision, so the map status never discloses
+whether a masked acceptance exists in the added graph.
+
+`POST /$/evidence/{ds}/identities/rebuild` rebuilds a matching policy's resolution map
+on `main` or on a selected `?branch=NAME`. It needs unrestricted `admin` on the dataset
+or branch and refuses when the server is read-only or when declared and recorded evidence
+settings differ (`409 evidence-settings-drift`). Its body is `{"policy", "policyVersion"?,
+"ifHead"?, "idempotencyKey"?, "dryRun"?, "message"?}`. The operation recomputes the
+clusters of the policy's current authenticated accepted decisions whose targets remain
+authenticated identity proposals in the current protected identity graphs of the boundary,
+checks all current effective separations, rewrites the output graph atomically to match
+those clusters and appends a fresh `ev:ResolutionMap` revision with the current graph
+and boundary protections. The answer is `{operation, committed, replayed, commit,
+branchId, policy, policyVersion, revision, number, previous, boundary, changed, dryRun?}`,
+where `changed` names the inserted and removed output triples and `changed.map` records
+the new revision, its predecessor, the decisions added and ended, and the entities whose
+selected representative changed. A replay with the same `idempotencyKey` and payload
+returns the first receipt with an empty `changed`. After the rebuild succeeds, reviews
+and `POST /{ds}/claims/identities` reads resume normally.
+
+| Status and code | Meaning |
+|---|---|
+| `400` | The body is malformed or names no matching policy. |
+| `403` | The server is read-only or the caller lacks unrestricted `admin` on the dataset or branch. |
+| `409 policy-changed` | `policyVersion` does not match the policy's current version. |
+| `409 head-changed` | `ifHead` is not the branch head, or the head moved while the rebuild read it. |
+| `409 identity-conflict` | The current effective accepted decisions would put two entities of an accepted separation in one cluster. |
+| `409 idempotency-conflict` | The idempotency key was used with a different payload. |
+| `409 immutable-record-conflict` | A target has multiple current decisions or the maps graph has a numbering gap or conflicting record identity. |
+| `409 unsupported-profile` | The evidence profile is disabled or a policy graph (`decisions`, `maps` or `output`) is detached. |
+| `409 evidence-settings-drift` | The declared and recorded evidence settings differ. |
+| `422 incomplete-evidence` | The policy's decisions, revision chain, identifiers or output graph exceed the operation's bounds. |
+| `503 authority-changed` | The caller's credential or the access policy changed before the commit published. |
 
 `POST /{ds}/claims/identities` with `{"policy", "entities"}` reads the current map. It
 needs `read` on the dataset or branch through the query endpoint and read grants on the
@@ -14036,7 +14152,7 @@ it.
 | `400` | The body is malformed or the policy is unknown. |
 | `403` | The caller may not read a graph of the policy. |
 | `422 incomplete-evidence` | A cluster's records exceed 10,000. |
-| `503 projection-unavailable` | A graph of the policy was detached and protected again, an identity graph the map was built from left the boundary, or the output holds a map without a revision. |
+| `503 projection-unavailable` | A graph of the policy was detached and protected again, an identity graph the map was built from left the boundary, an added boundary graph holds current accepted proposals or is unrecorded under a triple-masked view, or the output holds a map without a revision. |
 
 `GET /$/server` lists the route in `capabilities.claims.identities`.
 
@@ -14044,11 +14160,15 @@ it.
 
 `POST /{ds}/claims/dependents` with `{"changed", "transitive"}` finds the authenticated
 assessments whose `ev:target` or `prov:used` names one of 1 to 1,000 changed record
-identities, so that a maintained analysis built on them can be reviewed or recomputed.
-It decides nothing about the assessments, whose conclusions may still hold. With
-`transitive: true` it also finds the assessments that depend on a dependent. It needs
-`read` on the dataset or branch through the query endpoint and counts as a query. The
-design is in [C25 §6](specs/C25-evidence-and-assessments.md#6-identity-validity-and-correction).
+identities, together with the community reports in guarded reports graphs proven for the
+caller under the C22 §6 disclosure guard whose generating activity recorded `prov:used`
+for one of them, so that a maintained analysis built on them can be reviewed or
+recomputed. It decides nothing about the assessments or reports, whose conclusions may
+still hold. With `transitive: true` it also finds the assessments and higher-level
+reports that depend on a dependent. It needs `read` on the dataset or branch through the
+query endpoint and counts as a query. The design is in
+[C25 §6](specs/C25-evidence-and-assessments.md#6-identity-validity-and-correction) and
+[Reading reports](specs/C25-evidence-and-assessments.md#reading-reports).
 
 ```json
 {"changed": ["urn:uuid:5c0e…"], "transitive": true}
@@ -14058,17 +14178,26 @@ The changed identities of an operation are the claims it withdrew, the decisions
 superseded, the supports in `changed.supportsEnded`, and for a new resolution map
 revision the revision in `changed.map.previous` and the decisions in
 `changed.map.decisionsEnded`. `sparkles::evidence::Changed::identities` gathers those of
-`changed`. The answer is `{commit, dependents}`, and each dependent is `{assessment,
-graph, on, dependence, depth}`, where `on` is the changed record or, for a transitive
-dependent, the assessment it depends on, `dependence` is `target` or `used`, and `depth`
-is 0 for a direct dependent. Each assessment is reported once, at its smallest depth,
-sorted by depth and IRI. Only the proposal graphs the caller can read are searched, and a
-record any of whose triples the caller's view hides is neither reported nor followed.
+`changed`. The answer is `{commit, dependents, reports}`. Each assessment entry in
+`dependents` is `{assessment, graph, on, dependence, depth}`, where `on` is the changed
+record or, for a transitive dependent, the assessment it depends on, `dependence` is
+`target` or `used`, and `depth` is 0 for a direct dependent. Each report entry in
+`reports` is `{report, community, graph, on, dependence, depth}`, where `community` is
+the report's `gr:community` IRI or `null` when absent, `graph` is its guarded reports
+graph, `dependence` is `used`, `on` is the changed record or, for a transitive dependent,
+the assessment or report it depends on, and `depth` is 0 for a direct dependent. Person-edited
+reports linked through `gr:editOf` inherit the edited report's inputs at the same depth,
+while build replacements linked only by `prov:wasRevisionOf` are not followed. Each
+assessment and each report is reported once, at its smallest depth, sorted by depth and
+IRI. Only proposal graphs the caller can read and guarded reports graphs the caller's
+view both grants and proves at the read snapshot are searched, and a record or activity
+any of whose triples the caller's view hides is neither reported nor followed. Unproven
+or unreadable graphs do not count toward the 10,000-record bound.
 
 | Status and code | Meaning |
 |---|---|
 | `400` | The body is malformed or names no identity. |
-| `422 incomplete-evidence` | More than 10,000 candidate records would be read. |
+| `422 incomplete-evidence` | More than 10,000 visible candidate records would be read. |
 
 `GET /$/server` lists the route in `capabilities.claims.dependents`.
 
@@ -14444,6 +14573,8 @@ a term the caller cannot read.
 | `query` | A query to check, run and summarize without a draft, for a query that the caller edited. |
 | `thread` | The `threadId` of an earlier ask, for a follow-up in the same thread: 1 to 64 letters, digits, `_` or `-`. Without it the ask starts a thread under its own id. |
 | `about` | The resource the question is about, `{iri, kind?, label?}`, such as the class on the page it was asked from. The pipeline reads the question with ` (about <iri>)` after it, and the [history](#ask-history) keeps the question as written with `about` beside it. `iri` is an absolute IRI, `kind` holds at most 32 characters and `label` at most 200. |
+| `reviewPolicy` | A review policy of the dataset's evidence settings. In local answers, the summary reads and may cite claim occurrences about linked entities under that policy. In global answers, only community reports built under that policy are selected. Requires activated configuration history and read grants on the policy's graphs. |
+| `matchingPolicy` | A matching policy of the dataset's evidence settings. In local answers, it resolves linked entities for claims grounding. In global answers, it resolves the entity identities referenced by the selected community reports' findings and returns the map revision and mapped entities in `resolution` and per-report `identities`. |
 
 The answer is a stream of server-sent events. Each event's data is one JSON object.
 
@@ -14459,8 +14590,8 @@ The answer is a stream of server-sent events. Each event's data is one JSON obje
 | `result` | `{query, explanation, assumptions, terms, graph, commit, attempt, verdict, results}`. `results` has the `application/x-sparkles+json` form of `/{ds}/sparql`, with the rows, the plan and the timings. |
 | `summary` | `{text, citations, rowsSent, provider, model}`. Each `[n]` marker of `text` names a row of `results`, counted from 1. In a global answer each marker names a point, and `uncitedSentences` lists the sentences without one. |
 | `scope` | `{scope: "global", provider, model}` when the draft classified the question as global. |
-| `reports` | `{level, ranking, reports: [{iri, title, level, status, rating}]}`, the community reports a global answer reads. |
-| `global` | `{points: [{n, text, score, reports, findings}], reports: [{iri, title, level, status, rating, findings: [{iri, text, cites}]}], global: {level, ranking, reportsGraph, selected, batches}}`, sent before the summary of a global answer. |
+| `reports` | `{level, ranking, reports: [{iri, title, level, status, rating}]}`, the community reports a global answer reads. When the request names `reviewPolicy` or `matchingPolicy`, the event also carries top-level `reviewPolicy`, per-report `reviewPolicy` and the `resolution` header `{policy, version, revision, number}` when present. |
+| `global` | `{points: [{n, text, score, reports, findings}], reports: [{iri, title, level, status, rating, findings: [{iri, text, cites}]}], global: {level, ranking, reportsGraph, selected, batches}}`, sent before the summary of a global answer. With `reviewPolicy`, `global` also includes `reviewPolicy` and each report carries its `reviewPolicy` and finding `claims` and `decisions`. With `matchingPolicy`, the event also carries `resolution` and each report carries `identities` and finding `about`. |
 | `error` | `{code, message}`, such as `no-model`, `provider-unavailable`, `budget-exceeded` or `timeout`. A draft that says the data cannot answer ends with `unanswerable`, and a draft that still fails after its repairs ends with `no-valid-query` or the error of its last run. These two carry the last draft in `result`. |
 | `usage` | The last event. It holds the `outcome` of the ask, `askId`, `threadId`, the tokens, the estimated cost, the `complexity`, every model step with its pair, outcome and `signal`, the `escalations`, the `answeredBy` pair and `tryHarder`, which is `true` when the draft role has a later pair. |
 
@@ -14497,7 +14628,7 @@ answers plus one per batch. When the reports are off, missing, not readable by t
 caller, or more than half stale, or when the ask reads another branch or an earlier
 state, the ask answers with a query and says why in `notes`. A caller whose access the
 guard does not prove always gets the note that the summaries are unavailable to it.
-The history keeps the reports a global answer used, and `GET /$/asks/{ds}` lists them
+When `reviewPolicy` is supplied, global answers select only community reports whose stored `gr:reviewPolicy` matches that policy, excluding reports built under other policies or without a policy, while enforcing the reports graph's disclosure footprint and the policy's read grants. When `matchingPolicy` is supplied, the server resolves entity identities referenced by the selected reports' findings through that matching policy's resolution map, supplies the mapped cluster links to the map step as data without rewriting source IRIs, and returns `resolution` and per-report `identities`. Unknown, wrong-kind or unauthorized policies are refused with `400` before reading reports or calling a model, inactive configuration history answers `409`, and a change to caller authority, selected reports or the resolution map before publication withholds the answer with `403`. The history keeps the reports a global answer used, and `GET /$/asks/{ds}` lists them
 only while the caller may read their graph.
 
 A local question's grounding also holds the titles and summaries of the communities of
@@ -14668,21 +14799,24 @@ request and before each commit, and it fails without sending or committing when 
 them changed. It also fails when a review changed a report link while it ran. All
 branches of a dataset share its daily token ledger.
 
-With `refresh.mode` set to `auto`, the server starts a refresh itself. It looks at the
-dataset once a second, and a dataset is due after `refresh.debounceSeconds` without a
-new commit, or after ten debounce periods while commits continue. A due dataset reads
-the change feed from the commit of its last build or refresh, through the view of the
-settings' `principal`, and counts the changed facts of each community. A refresh starts
-when the changed facts of a community reach `refresh.minChangedFraction` of the facts
-its report was written from, when a link joins an entity outside every community to a
-member, or when the feed cannot list the changes. The task needs no confirmation, its
-message starts with `automatic refresh` and the reason, and its `detail` holds the
-reason as `trigger`. The daily token budget bounds it as it bounds any run. The server
-never starts a first build, follows main only, waits while another GraphRAG task of the
-dataset is queued or running, and retries a run that left pending communities once a
-day without waiting for a commit. Commits that GraphRAG made itself start nothing. A
-check or a refresh that fails is tried again after a backoff that starts at two
-debounce periods and doubles up to 64.
+With `refresh.mode` set to `auto`, the server starts a refresh itself. For each enabled
+dataset with a build on `main`, the server attaches an internal F13 accumulator circuit
+over the projection's graphs and predicates, read through the view of the settings'
+`principal`, and maintains per-community change counts incrementally on commits with
+checkpoints across restarts. It looks at the dataset once a second, and a dataset is due
+after `refresh.debounceSeconds` without a new commit, or after ten debounce periods while
+commits continue. A due dataset totals the accumulator's counts since the commit of its
+last build or refresh. A refresh starts when the changed facts of a community reach
+`refresh.minChangedFraction` of the facts its report was written from, when a link joins
+an entity outside every community to a member, or when the accumulator cannot cover every
+commit, such as after a bulk commit, a change-log gap, memory eviction or data-dependent
+protections on the principal's view. The task needs no confirmation, its message starts
+with `automatic refresh` and the reason, and its `detail` holds the reason as `trigger`.
+The daily token budget bounds it as it bounds any run. The server never starts a first
+build, follows main only, waits while another GraphRAG task of the dataset is queued or
+running, and retries a run that left pending communities once a day without waiting for a
+commit. Commits that GraphRAG made itself start nothing. A check or a refresh that fails
+is tried again after a backoff that starts at two debounce periods and doubles up to 64.
 
 ```json
 { "mode": "build", "sourceCommit": 41, "communities": 12, "written": 12, "kept": 0,
@@ -15374,10 +15508,14 @@ own id becomes the thread's `threadId`, which the `usage` event and the JSON ans
 `POST /{ds}/ask` carry. A follow-up sends it back as `thread`. An entry kept before
 threads is the thread of its own id.
 
-`asks.json` is format 2, and format 1 still reads. The list and delete routes refuse a
-file of a newer format, or one this server cannot parse, with `409`
-(`unsupported-format` or `unreadable-history`). An ask still answers and feedback on a
-recent ask still counts, but neither they nor the hourly prune write over such a file.
+`asks.json` is format 3, and formats 1 and 2 still read. Format 3 records both the Query
+view and the grounding Info view (or an explicit absence of Info access) so that answers
+and generated queries are withheld whenever either view narrows, and legacy format-1 and
+format-2 records require unrestricted Info access when their grounding footprint is
+unknown. The list and delete routes refuse a file of a newer format, or one this server
+cannot parse, with `409` (`unsupported-format` or `unreadable-history`). An ask still
+answers and feedback on a recent ask still counts, but neither they nor the hourly prune
+write over such a file.
 
 | Method and path | Needs | Effect |
 |---|---|---|

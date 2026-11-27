@@ -617,3 +617,2148 @@ fn static_graph_denials_hold_under_an_undecided_guard() {
         "incomplete-evidence"
     );
 }
+
+/// Helper: configure an in-memory store with evidence source/proposal graphs and insert
+/// authenticated records signed with the current graph protection nonce.
+fn configured_evidence_store() -> (Store, Uuid) {
+    let s = Store::in_memory(StoreOptions::default());
+    let settings = super::super::Settings {
+        enabled: true,
+        source_records: vec!["urn:ev:sources".into()],
+        proposals: vec!["urn:ev:claims".into()],
+        ..Default::default()
+    };
+    let canonical = settings.canonical(&Control::none()).unwrap();
+    let entry = crate::managed::OwnerEntry::for_settings(
+        settings.profile,
+        settings.managed_graphs(),
+        canonical.bytes(),
+    );
+    let graphs = s
+        .enable_managed_at(OwnerKind::Evidence, entry, canonical.bytes(), 0)
+        .unwrap();
+    let nonce = graphs.owners[&OwnerKind::Evidence].protections["urn:ev:sources"];
+    (s, nonce)
+}
+
+fn insert_managed_quads(s: &Store, quads: Vec<oxrdf::Quad>) {
+    let cap = s
+        .managed_writer(OwnerKind::Evidence, Uuid::new_v4())
+        .unwrap();
+    let mut txn = s
+        .try_write_with(crate::commit::CommitKind::Transaction, Default::default())
+        .unwrap();
+    txn.set_managed(cap).unwrap();
+    let mut labels = std::collections::HashMap::new();
+    for q in &quads {
+        let ids = txn.encode_quad(q, &mut labels).unwrap();
+        txn.insert(ids).unwrap();
+    }
+    txn.commit().unwrap();
+}
+
+#[test]
+fn existing_record_verifiers_enforce_memory_cancellation_and_triple_masks() {
+    let (s, nonce) = configured_evidence_store();
+    let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
+    let op = iri("urn:op:1");
+    let rev = iri("urn:rev:1");
+    let rend = iri("urn:rend:1");
+    let pass = iri("urn:pass:1");
+    let json_bytes = format!(r#"{{"payload":"{}"}}"#, "x".repeat(4096));
+    let json_digest = Sha256Digest::of_bytes(json_bytes.as_bytes(), &Control::none()).unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(json_bytes.as_bytes());
+    let rend_text = "alpha café beta".repeat(256);
+    let selected: String = rend_text.chars().skip(6).take(4).collect();
+    assert_eq!(selected, "café");
+    let span_digest = Sha256Digest::of_bytes(selected.as_bytes(), &Control::none()).unwrap();
+    let q =
+        |sub: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(sub.clone(), iri(p), o, sg.clone());
+    let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+    let int_lit =
+        |n: u64| Term::Literal(Literal::new_typed_literal(n.to_string(), iri(XSD_INTEGER)));
+    let sel = iri("urn:pass:1#selector");
+    insert_managed_quads(
+        &s,
+        vec![
+            q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+            q(
+                &op,
+                &format!("{EV}datasetId"),
+                lit(&s.dataset_id().to_string()),
+            ),
+            q(
+                &op,
+                &format!("{EV}branchId"),
+                lit(&s.branch_id().to_string()),
+            ),
+            q(&op, &format!("{EV}commit"), int_lit(1)),
+            q(
+                &op,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            // SourceRevision with retained JSON bytes
+            q(
+                &rev,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(&rev, &format!("{EV}availabilityReceipt"), op.clone().into()),
+            q(
+                &rev,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev,
+                &format!("{EV}contentDigest"),
+                lit(&json_digest.to_string()),
+            ),
+            q(
+                &rev,
+                &format!("{EV}retainedBytes"),
+                Term::Literal(Literal::new_typed_literal(b64, iri(XSD_BASE64_BINARY))),
+            ),
+            // Rendition with normalizedText
+            q(&rend, RDF_TYPE, iri(kind_iri(RecordKind::Rendition)).into()),
+            q(
+                &rend,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rend,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&rend, PROV_WAS_DERIVED_FROM, rev.clone().into()),
+            q(&rend, &format!("{EV}normalizedText"), lit(&rend_text)),
+            // Passage referencing rend and rev
+            q(&pass, RDF_TYPE, iri(kind_iri(RecordKind::Passage)).into()),
+            q(
+                &pass,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &pass,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&pass, &format!("{EV}sourceRevision"), rev.clone().into()),
+            q(&pass, &format!("{OA}hasSource"), rend.clone().into()),
+            q(&pass, &format!("{OA}hasSelector"), sel.clone().into()),
+            q(&sel, &format!("{OA}start"), int_lit(6)),
+            q(&sel, &format!("{OA}end"), int_lit(10)),
+            q(
+                &pass,
+                &format!("{EV}textDigest"),
+                lit(&span_digest.to_string()),
+            ),
+        ],
+    );
+
+    let val_digest = Sha256Digest::of_bytes(
+        format!(r#""{}""#, "x".repeat(4096)).as_bytes(),
+        &Control::none(),
+    )
+    .unwrap();
+
+    // Baseline verification succeeds in both Delta and compacted Vocab states.
+    for compacted in [false, true] {
+        if compacted {
+            s.compact().unwrap();
+        }
+        let mut r = resolver();
+        r.verify_proposed_passages(
+            &s,
+            &s,
+            Some(&all()),
+            &rend,
+            &[ProposedPassage {
+                key: "p1",
+                revision: &rev,
+                start: 6,
+                end: 10,
+                text_digest: span_digest,
+                quote: Some("café"),
+            }],
+        )
+        .unwrap();
+        r.verify_passage_reference("ref1", &s, &s, Some(&all()), &pass, &rev, &rend)
+            .unwrap();
+        r.verify_structured_references(
+            &s,
+            &s,
+            Some(&all()),
+            &rev,
+            &[ProposedStructured {
+                key: "s1",
+                pointer: "/payload",
+                value_digest: val_digest,
+            }],
+        )
+        .unwrap();
+    }
+
+    // Tight memory allowance refuses with incomplete-evidence (not unavailable).
+    let mut tight = Resolver::new(Control::none(), 16 * 1024).unwrap();
+    assert_eq!(
+        code(tight.verify_structured_references(
+            &s,
+            &s,
+            Some(&all()),
+            &rev,
+            &[ProposedStructured {
+                key: "s1",
+                pointer: "/payload",
+                value_digest: val_digest,
+            }],
+        )),
+        "incomplete-evidence"
+    );
+    let mut tight_p = Resolver::new(Control::none(), 12 * 1024).unwrap();
+    assert_eq!(
+        code(tight_p.verify_proposed_passages(
+            &s,
+            &s,
+            Some(&all()),
+            &rend,
+            &[ProposedPassage {
+                key: "p1",
+                revision: &rev,
+                start: 6,
+                end: 10,
+                text_digest: span_digest,
+                quote: Some("café"),
+            }],
+        )),
+        "incomplete-evidence"
+    );
+
+    // Cancellation propagates Error::Cancelled.
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut cancelled = Resolver::new(Control::with_cancel(flag.clone()), MEMORY_BYTES).unwrap();
+    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(matches!(
+        cancelled.verify_structured_references(
+            &s,
+            &s,
+            Some(&all()),
+            &rev,
+            &[ProposedStructured {
+                key: "s1",
+                pointer: "/payload",
+                value_digest: val_digest,
+            }],
+        ),
+        Err(Error::Cancelled)
+    ));
+
+    // Triple-level protections hiding retainedBytes, normalizedText, or sourceRevision
+    // answer identically with evidence-unavailable.
+    let hide_pred = |pred: &str| {
+        let protection = Protection {
+            name: "hidden".into(),
+            predicates: Some(vec![pred.to_string()]),
+            classes: None,
+            subclasses: false,
+            graphs: None,
+            pattern: None,
+            prefixes: Default::default(),
+            hide_inferences: false,
+        };
+        let rules = TripleRules {
+            rules: vec![Rule {
+                protection: Arc::new(protection),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Default::default(),
+            limits: Default::default(),
+        };
+        Arc::new(GraphAccess::with_triples(Graphs::All, Graphs::All, rules))
+    };
+    let mut r = resolver();
+    assert_eq!(
+        code(r.verify_structured_references(
+            &s,
+            &s,
+            Some(&hide_pred(&format!("{EV}retainedBytes"))),
+            &rev,
+            &[ProposedStructured {
+                key: "s1",
+                pointer: "/payload",
+                value_digest: val_digest,
+            }],
+        )),
+        "evidence-unavailable"
+    );
+    assert_eq!(
+        code(r.verify_proposed_passages(
+            &s,
+            &s,
+            Some(&hide_pred(&format!("{EV}normalizedText"))),
+            &rend,
+            &[ProposedPassage {
+                key: "p1",
+                revision: &rev,
+                start: 6,
+                end: 10,
+                text_digest: span_digest,
+                quote: Some("café"),
+            }],
+        )),
+        "evidence-unavailable"
+    );
+    assert_eq!(
+        code(r.verify_proposed_passages(
+            &s,
+            &s,
+            Some(&hide_pred(PROV_WAS_DERIVED_FROM)),
+            &rend,
+            &[ProposedPassage {
+                key: "p1",
+                revision: &rev,
+                start: 6,
+                end: 10,
+                text_digest: span_digest,
+                quote: Some("café"),
+            }],
+        )),
+        "evidence-unavailable"
+    );
+    assert_eq!(
+        code(r.verify_passage_reference(
+            "ref1",
+            &s,
+            &s,
+            Some(&hide_pred(&format!("{EV}sourceRevision"))),
+            &pass,
+            &rev,
+            &rend,
+        )),
+        "evidence-unavailable"
+    );
+    assert_eq!(
+        code(r.verify_structured_references(
+            &s,
+            &s,
+            Some(&hide_pred(&format!("{EV}contentDigest"))),
+            &rev,
+            &[ProposedStructured {
+                key: "s1",
+                pointer: "/payload",
+                value_digest: val_digest,
+            }],
+        )),
+        "evidence-unavailable"
+    );
+}
+
+#[test]
+fn masked_missing_and_metadata_only_selections_have_full_body_parity() {
+    let (s, nonce) = configured_evidence_store();
+    let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
+    let op = iri("urn:op:parity");
+    let rev1 = iri("urn:rev:1");
+    let rev2 = iri("urn:rev:2");
+    let rev_meta = iri("urn:rev:meta");
+    let rend1 = iri("urn:rend:1");
+    let rend2 = iri("urn:rend:2");
+    let rend_meta = iri("urn:rend:meta");
+    let pass1 = iri("urn:pass:1");
+    let sel1 = iri("urn:pass:1#sel");
+    let missing_iri = iri("urn:missing:target");
+
+    let json_bytes = r#"{"k":"v"}"#;
+    let json_digest = Sha256Digest::of_bytes(json_bytes.as_bytes(), &Control::none()).unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(json_bytes.as_bytes());
+    let val_digest = Sha256Digest::of_bytes(b"\"v\"", &Control::none()).unwrap();
+    let text = "hello world";
+    let span_digest = Sha256Digest::of_bytes(b"world", &Control::none()).unwrap();
+
+    let q =
+        |sub: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(sub.clone(), iri(p), o, sg.clone());
+    let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+    let int_lit =
+        |n: u64| Term::Literal(Literal::new_typed_literal(n.to_string(), iri(XSD_INTEGER)));
+    let auth = |sub: &NamedNode, kind: RecordKind| {
+        vec![
+            q(sub, RDF_TYPE, iri(kind_iri(kind)).into()),
+            q(sub, &format!("{EV}availabilityReceipt"), op.clone().into()),
+            q(
+                sub,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+        ]
+    };
+
+    let mut quads = vec![
+        q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+        q(
+            &op,
+            &format!("{EV}datasetId"),
+            lit(&s.dataset_id().to_string()),
+        ),
+        q(
+            &op,
+            &format!("{EV}branchId"),
+            lit(&s.branch_id().to_string()),
+        ),
+        q(&op, &format!("{EV}commit"), int_lit(1)),
+        q(
+            &op,
+            &format!("{EV}graphProtection"),
+            lit(&nonce.to_string()),
+        ),
+    ];
+    quads.extend(auth(&rev1, RecordKind::SourceRevision));
+    quads.push(q(
+        &rev1,
+        &format!("{EV}contentDigest"),
+        lit(&json_digest.to_string()),
+    ));
+    quads.push(q(
+        &rev1,
+        &format!("{EV}retainedBytes"),
+        Term::Literal(Literal::new_typed_literal(b64, iri(XSD_BASE64_BINARY))),
+    ));
+    quads.extend(auth(&rev2, RecordKind::SourceRevision));
+    quads.extend(auth(&rev_meta, RecordKind::SourceRevision));
+    quads.push(q(
+        &rev_meta,
+        &format!("{EV}contentDigest"),
+        lit(&json_digest.to_string()),
+    ));
+
+    quads.extend(auth(&rend1, RecordKind::Rendition));
+    quads.push(q(&rend1, PROV_WAS_DERIVED_FROM, rev1.clone().into()));
+    quads.push(q(&rend1, &format!("{EV}normalizedText"), lit(text)));
+
+    quads.extend(auth(&rend2, RecordKind::Rendition));
+    quads.push(q(&rend2, PROV_WAS_DERIVED_FROM, rev2.clone().into()));
+    quads.push(q(&rend2, &format!("{EV}normalizedText"), lit(text)));
+
+    quads.extend(auth(&rend_meta, RecordKind::Rendition));
+    quads.push(q(&rend_meta, PROV_WAS_DERIVED_FROM, rev1.clone().into()));
+
+    quads.extend(auth(&pass1, RecordKind::Passage));
+    quads.push(q(
+        &pass1,
+        &format!("{EV}sourceRevision"),
+        rev1.clone().into(),
+    ));
+    quads.push(q(&pass1, &format!("{OA}hasSource"), rend1.clone().into()));
+    quads.push(q(&pass1, &format!("{OA}hasSelector"), sel1.clone().into()));
+    quads.push(q(&sel1, &format!("{OA}start"), int_lit(6)));
+    quads.push(q(&sel1, &format!("{OA}end"), int_lit(11)));
+    quads.push(q(
+        &pass1,
+        &format!("{EV}textDigest"),
+        lit(&span_digest.to_string()),
+    ));
+    insert_managed_quads(&s, quads);
+
+    let hide_pred = |pred: &str| {
+        let protection = Protection {
+            name: "hidden".into(),
+            predicates: Some(vec![pred.to_string()]),
+            classes: None,
+            subclasses: false,
+            graphs: None,
+            pattern: None,
+            prefixes: Default::default(),
+            hide_inferences: false,
+        };
+        let rules = TripleRules {
+            rules: vec![Rule {
+                protection: Arc::new(protection),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Default::default(),
+            limits: Default::default(),
+        };
+        Arc::new(GraphAccess::with_triples(Graphs::All, Graphs::All, rules))
+    };
+
+    // 1. Proposed passage of existing rendition: absent vs metadata-only vs masked
+    //    ev:normalizedText / prov:wasDerivedFrom — both matching and MISMATCHED revisions.
+    let prop_err = |target: &NamedNode, rev: &NamedNode, access: Arc<GraphAccess>| {
+        let mut r = resolver();
+        let e = r
+            .verify_proposed_passages(
+                &s,
+                &s,
+                Some(&access),
+                target,
+                &[ProposedPassage {
+                    key: "p1",
+                    revision: rev,
+                    start: 6,
+                    end: 11,
+                    text_digest: span_digest,
+                    quote: Some("world"),
+                }],
+            )
+            .unwrap_err();
+        (
+            e.code().to_string(),
+            e.to_string().replace(target.as_str(), "TARGET"),
+        )
+    };
+    let absent_rend = prop_err(&missing_iri, &rev2, all());
+    assert_eq!(absent_rend.0, "evidence-unavailable");
+    assert_eq!(absent_rend.1, "evidence reference `TARGET` is unavailable");
+    for rev in [&rev1, &rev2] {
+        assert_eq!(prop_err(&rend_meta, rev, all()), absent_rend);
+        assert_eq!(
+            prop_err(&rend1, rev, hide_pred(&format!("{EV}normalizedText"))),
+            absent_rend
+        );
+        assert_eq!(
+            prop_err(&rend1, rev, hide_pred(PROV_WAS_DERIVED_FROM)),
+            absent_rend
+        );
+    }
+
+    // 2. Reference to existing passage: absent vs every required link/selector masked —
+    //    both with matching and MISMATCHED revision/rendition.
+    let pass_ref_err = |target: &NamedNode,
+                        exp_rev: &NamedNode,
+                        exp_rend: &NamedNode,
+                        access: Arc<GraphAccess>| {
+        let mut r = resolver();
+        let e = r
+            .verify_passage_reference("ref1", &s, &s, Some(&access), target, exp_rev, exp_rend)
+            .unwrap_err();
+        (
+            e.code().to_string(),
+            e.to_string().replace(target.as_str(), "TARGET"),
+        )
+    };
+    let absent_pass = pass_ref_err(&missing_iri, &rev2, &rend2, all());
+    assert_eq!(absent_pass.0, "evidence-unavailable");
+    assert_eq!(absent_pass.1, "evidence reference `TARGET` is unavailable");
+    for (exp_rev, exp_rend) in [(&rev1, &rend1), (&rev2, &rend1), (&rev1, &rend2)] {
+        for pred in [
+            format!("{OA}hasSource"),
+            format!("{OA}hasSelector"),
+            format!("{OA}start"),
+            format!("{OA}end"),
+            format!("{EV}textDigest"),
+            format!("{EV}sourceRevision"),
+            format!("{EV}normalizedText"),
+            PROV_WAS_DERIVED_FROM.to_string(),
+        ] {
+            assert_eq!(
+                pass_ref_err(&pass1, exp_rev, exp_rend, hide_pred(&pred)),
+                absent_pass,
+                "masking {pred} must match absent passage"
+            );
+        }
+    }
+
+    // 3. Structured reference: absent vs metadata-only vs masked retainedBytes/contentDigest.
+    let struct_err = |target: &NamedNode, access: Arc<GraphAccess>| {
+        let mut r = resolver();
+        let e = r
+            .verify_structured_references(
+                &s,
+                &s,
+                Some(&access),
+                target,
+                &[ProposedStructured {
+                    key: "s1",
+                    pointer: "/k",
+                    value_digest: val_digest,
+                }],
+            )
+            .unwrap_err();
+        (
+            e.code().to_string(),
+            e.to_string().replace(target.as_str(), "TARGET"),
+        )
+    };
+    let absent_rev = struct_err(&missing_iri, all());
+    assert_eq!(absent_rev.0, "evidence-unavailable");
+    assert_eq!(absent_rev.1, "evidence reference `TARGET` is unavailable");
+    assert_eq!(struct_err(&rev_meta, all()), absent_rev);
+    assert_eq!(
+        struct_err(&rev1, hide_pred(&format!("{EV}retainedBytes"))),
+        absent_rev
+    );
+    assert_eq!(
+        struct_err(&rev1, hide_pred(&format!("{EV}contentDigest"))),
+        absent_rev
+    );
+}
+
+#[test]
+fn structured_content_digest_pointer_validation_and_ambiguous_conflicts() {
+    let (s, nonce) = configured_evidence_store();
+    let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
+    let op = iri("urn:op:conflicts");
+    let q =
+        |sub: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(sub.clone(), iri(p), o, sg.clone());
+    let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+    let int_lit =
+        |n: u64| Term::Literal(Literal::new_typed_literal(n.to_string(), iri(XSD_INTEGER)));
+    let auth = |sub: &NamedNode, kind: RecordKind| {
+        vec![
+            q(sub, RDF_TYPE, iri(kind_iri(kind)).into()),
+            q(sub, &format!("{EV}availabilityReceipt"), op.clone().into()),
+            q(
+                sub,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+        ]
+    };
+
+    let json = r#"{"a":1}"#;
+    let good_digest = Sha256Digest::of_bytes(json.as_bytes(), &Control::none()).unwrap();
+    let wrong_digest = Sha256Digest::of_bytes(b"different", &Control::none()).unwrap();
+    let val_digest = Sha256Digest::of_bytes(b"1", &Control::none()).unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+    let text = "hello";
+    let text_digest = Sha256Digest::of_bytes(b"he", &Control::none()).unwrap();
+
+    let rev_ok = iri("urn:rev:ok");
+    let rev_no_digest = iri("urn:rev:no-digest");
+    let rev_wrong_digest = iri("urn:rev:wrong-digest");
+    let rev_bad_b64 = iri("urn:rev:bad-b64");
+    let rev_multi_bytes = iri("urn:rev:multi-bytes");
+    let rend_multi_rev = iri("urn:rend:multi-rev");
+    let rend_multi_text = iri("urn:rend:multi-text");
+    let rend_ok = iri("urn:rend:ok");
+    let pass_multi_rev = iri("urn:pass:multi-rev");
+    let pass_multi_src = iri("urn:pass:multi-src");
+    let sel_mr = iri("urn:pass:multi-rev#sel");
+    let sel_ms = iri("urn:pass:multi-src#sel");
+
+    let mut quads = vec![
+        q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+        q(
+            &op,
+            &format!("{EV}datasetId"),
+            lit(&s.dataset_id().to_string()),
+        ),
+        q(
+            &op,
+            &format!("{EV}branchId"),
+            lit(&s.branch_id().to_string()),
+        ),
+        q(&op, &format!("{EV}commit"), int_lit(1)),
+        q(
+            &op,
+            &format!("{EV}graphProtection"),
+            lit(&nonce.to_string()),
+        ),
+    ];
+    // rev_ok: valid JSON revision
+    quads.extend(auth(&rev_ok, RecordKind::SourceRevision));
+    quads.push(q(
+        &rev_ok,
+        &format!("{EV}contentDigest"),
+        lit(&good_digest.to_string()),
+    ));
+    quads.push(q(
+        &rev_ok,
+        &format!("{EV}retainedBytes"),
+        Term::Literal(Literal::new_typed_literal(&b64, iri(XSD_BASE64_BINARY))),
+    ));
+    // rev_no_digest: retainedBytes without ev:contentDigest
+    quads.extend(auth(&rev_no_digest, RecordKind::SourceRevision));
+    quads.push(q(
+        &rev_no_digest,
+        &format!("{EV}retainedBytes"),
+        Term::Literal(Literal::new_typed_literal(&b64, iri(XSD_BASE64_BINARY))),
+    ));
+    // rev_wrong_digest: present ev:contentDigest disagrees with retainedBytes
+    quads.extend(auth(&rev_wrong_digest, RecordKind::SourceRevision));
+    quads.push(q(
+        &rev_wrong_digest,
+        &format!("{EV}contentDigest"),
+        lit(&wrong_digest.to_string()),
+    ));
+    quads.push(q(
+        &rev_wrong_digest,
+        &format!("{EV}retainedBytes"),
+        Term::Literal(Literal::new_typed_literal(&b64, iri(XSD_BASE64_BINARY))),
+    ));
+    // rev_bad_b64: corrupted base64
+    quads.extend(auth(&rev_bad_b64, RecordKind::SourceRevision));
+    quads.push(q(
+        &rev_bad_b64,
+        &format!("{EV}contentDigest"),
+        lit(&good_digest.to_string()),
+    ));
+    quads.push(q(
+        &rev_bad_b64,
+        &format!("{EV}retainedBytes"),
+        Term::Literal(Literal::new_typed_literal(
+            "!!!not-base64!!!",
+            iri(XSD_BASE64_BINARY),
+        )),
+    ));
+    // rev_multi_bytes: multiple ev:retainedBytes
+    quads.extend(auth(&rev_multi_bytes, RecordKind::SourceRevision));
+    quads.push(q(
+        &rev_multi_bytes,
+        &format!("{EV}contentDigest"),
+        lit(&good_digest.to_string()),
+    ));
+    quads.push(q(
+        &rev_multi_bytes,
+        &format!("{EV}retainedBytes"),
+        Term::Literal(Literal::new_typed_literal(&b64, iri(XSD_BASE64_BINARY))),
+    ));
+    quads.push(q(
+        &rev_multi_bytes,
+        &format!("{EV}retainedBytes"),
+        Term::Literal(Literal::new_typed_literal("e30=", iri(XSD_BASE64_BINARY))),
+    ));
+    // rend_ok
+    quads.extend(auth(&rend_ok, RecordKind::Rendition));
+    quads.push(q(&rend_ok, PROV_WAS_DERIVED_FROM, rev_ok.clone().into()));
+    quads.push(q(&rend_ok, &format!("{EV}normalizedText"), lit(text)));
+    // rend_multi_rev: multiple prov:wasDerivedFrom
+    quads.extend(auth(&rend_multi_rev, RecordKind::Rendition));
+    quads.push(q(
+        &rend_multi_rev,
+        PROV_WAS_DERIVED_FROM,
+        rev_ok.clone().into(),
+    ));
+    quads.push(q(
+        &rend_multi_rev,
+        PROV_WAS_DERIVED_FROM,
+        rev_no_digest.clone().into(),
+    ));
+    quads.push(q(
+        &rend_multi_rev,
+        &format!("{EV}normalizedText"),
+        lit(text),
+    ));
+    // rend_multi_text: multiple ev:normalizedText
+    quads.extend(auth(&rend_multi_text, RecordKind::Rendition));
+    quads.push(q(
+        &rend_multi_text,
+        PROV_WAS_DERIVED_FROM,
+        rev_ok.clone().into(),
+    ));
+    quads.push(q(
+        &rend_multi_text,
+        &format!("{EV}normalizedText"),
+        lit(text),
+    ));
+    quads.push(q(
+        &rend_multi_text,
+        &format!("{EV}normalizedText"),
+        lit("other"),
+    ));
+    // pass_multi_rev: multiple ev:sourceRevision
+    quads.extend(auth(&pass_multi_rev, RecordKind::Passage));
+    quads.push(q(
+        &pass_multi_rev,
+        &format!("{EV}sourceRevision"),
+        rev_ok.clone().into(),
+    ));
+    quads.push(q(
+        &pass_multi_rev,
+        &format!("{EV}sourceRevision"),
+        rev_no_digest.clone().into(),
+    ));
+    quads.push(q(
+        &pass_multi_rev,
+        &format!("{OA}hasSource"),
+        rend_ok.clone().into(),
+    ));
+    quads.push(q(
+        &pass_multi_rev,
+        &format!("{OA}hasSelector"),
+        sel_mr.clone().into(),
+    ));
+    quads.push(q(&sel_mr, &format!("{OA}start"), int_lit(0)));
+    quads.push(q(&sel_mr, &format!("{OA}end"), int_lit(2)));
+    quads.push(q(
+        &pass_multi_rev,
+        &format!("{EV}textDigest"),
+        lit(&text_digest.to_string()),
+    ));
+    // pass_multi_src: multiple oa:hasSource
+    quads.extend(auth(&pass_multi_src, RecordKind::Passage));
+    quads.push(q(
+        &pass_multi_src,
+        &format!("{EV}sourceRevision"),
+        rev_ok.clone().into(),
+    ));
+    quads.push(q(
+        &pass_multi_src,
+        &format!("{OA}hasSource"),
+        rend_ok.clone().into(),
+    ));
+    quads.push(q(
+        &pass_multi_src,
+        &format!("{OA}hasSource"),
+        rend_multi_rev.clone().into(),
+    ));
+    quads.push(q(
+        &pass_multi_src,
+        &format!("{OA}hasSelector"),
+        sel_ms.clone().into(),
+    ));
+    quads.push(q(&sel_ms, &format!("{OA}start"), int_lit(0)));
+    quads.push(q(&sel_ms, &format!("{OA}end"), int_lit(2)));
+    quads.push(q(
+        &pass_multi_src,
+        &format!("{EV}textDigest"),
+        lit(&text_digest.to_string()),
+    ));
+    insert_managed_quads(&s, quads);
+
+    let mut r = resolver();
+    // Missing ev:contentDigest -> evidence-unavailable.
+    assert_eq!(
+        code(r.verify_structured_references(
+            &s,
+            &s,
+            Some(&all()),
+            &rev_no_digest,
+            &[ProposedStructured {
+                key: "s1",
+                pointer: "/a",
+                value_digest: val_digest,
+            }],
+        )),
+        "evidence-unavailable"
+    );
+    // Mismatched ev:contentDigest -> span-mismatch (per C25).
+    assert_eq!(
+        code(r.verify_structured_references(
+            &s,
+            &s,
+            Some(&all()),
+            &rev_wrong_digest,
+            &[ProposedStructured {
+                key: "s1",
+                pointer: "/a",
+                value_digest: val_digest,
+            }],
+        )),
+        "span-mismatch"
+    );
+    // Corrupted base64 -> immutable-record-conflict.
+    assert_eq!(
+        code(r.verify_structured_references(
+            &s,
+            &s,
+            Some(&all()),
+            &rev_bad_b64,
+            &[ProposedStructured {
+                key: "s1",
+                pointer: "/a",
+                value_digest: val_digest,
+            }],
+        )),
+        "immutable-record-conflict"
+    );
+    // Malformed RFC 6901 pointers in direct Rust API -> Error::Invalid (not span-mismatch).
+    for bad_ptr in ["/bad~2", "/bad~", "no-leading-slash"] {
+        let err = r
+            .verify_structured_references(
+                &s,
+                &s,
+                Some(&all()),
+                &rev_ok,
+                &[ProposedStructured {
+                    key: "s1",
+                    pointer: bad_ptr,
+                    value_digest: val_digest,
+                }],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Invalid(_)),
+            "pointer {bad_ptr:?} should return Error::Invalid, got {err:?}"
+        );
+    }
+    // Multi-valued predicates -> immutable-record-conflict.
+    assert_eq!(
+        code(r.verify_structured_references(
+            &s,
+            &s,
+            Some(&all()),
+            &rev_multi_bytes,
+            &[ProposedStructured {
+                key: "s1",
+                pointer: "/a",
+                value_digest: val_digest,
+            }],
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(
+        code(r.verify_proposed_passages(
+            &s,
+            &s,
+            Some(&all()),
+            &rend_multi_rev,
+            &[ProposedPassage {
+                key: "p1",
+                revision: &rev_ok,
+                start: 0,
+                end: 2,
+                text_digest,
+                quote: Some("he"),
+            }],
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(
+        code(r.verify_proposed_passages(
+            &s,
+            &s,
+            Some(&all()),
+            &rend_multi_text,
+            &[ProposedPassage {
+                key: "p1",
+                revision: &rev_ok,
+                start: 0,
+                end: 2,
+                text_digest,
+                quote: Some("he"),
+            }],
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(
+        code(r.verify_passage_reference(
+            "ref1",
+            &s,
+            &s,
+            Some(&all()),
+            &pass_multi_rev,
+            &rev_ok,
+            &rend_ok,
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(
+        code(r.verify_passage_reference(
+            "ref2",
+            &s,
+            &s,
+            Some(&all()),
+            &pass_multi_src,
+            &rev_ok,
+            &rend_ok,
+        )),
+        "immutable-record-conflict"
+    );
+}
+
+#[test]
+fn compacted_large_json_revision_tight_grammar_scratch_and_midstream_cancel() {
+    let (s, nonce) = configured_evidence_store();
+    let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
+    let op = iri("urn:op:large");
+    let rev_large = iri("urn:rev:large");
+    let q =
+        |sub: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(sub.clone(), iri(p), o, sg.clone());
+    let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+    let int_lit =
+        |n: u64| Term::Literal(Literal::new_typed_literal(n.to_string(), iri(XSD_INTEGER)));
+
+    // 13 MiB JSON revision (~17.33 MiB base64) compacted into Vocab: previously
+    // exceeded the 64 MiB allowance when with_typed_literal held ~3x base64 workspace
+    // across JSON selection.
+    let big_json = format!(
+        r#"{{"tail":"ok","blob":"{}"}}"#,
+        "a".repeat(13 * 1024 * 1024)
+    );
+    let big_digest = Sha256Digest::of_bytes(big_json.as_bytes(), &Control::none()).unwrap();
+    let big_b64 = base64::engine::general_purpose::STANDARD.encode(big_json.as_bytes());
+    let ok_digest = Sha256Digest::of_bytes(b"\"ok\"", &Control::none()).unwrap();
+
+    insert_managed_quads(
+        &s,
+        vec![
+            q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+            q(
+                &op,
+                &format!("{EV}datasetId"),
+                lit(&s.dataset_id().to_string()),
+            ),
+            q(
+                &op,
+                &format!("{EV}branchId"),
+                lit(&s.branch_id().to_string()),
+            ),
+            q(&op, &format!("{EV}commit"), int_lit(1)),
+            q(
+                &op,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_large,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(
+                &rev_large,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rev_large,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_large,
+                &format!("{EV}contentDigest"),
+                lit(&big_digest.to_string()),
+            ),
+            q(
+                &rev_large,
+                &format!("{EV}retainedBytes"),
+                Term::Literal(Literal::new_typed_literal(big_b64, iri(XSD_BASE64_BINARY))),
+            ),
+        ],
+    );
+    s.compact().unwrap();
+
+    // 13 MiB compacted JSON revision succeeds under the standard 64 MiB allowance.
+    let mut r = resolver();
+    r.verify_structured_references(
+        &s,
+        &s,
+        Some(&all()),
+        &rev_large,
+        &[ProposedStructured {
+            key: "big",
+            pointer: "/tail",
+            value_digest: ok_digest,
+        }],
+    )
+    .unwrap();
+
+    // Mid-stream cancellation during chunked base64 decoding propagates Error::Cancelled.
+    let mut c = Resolver::new(Control::none(), MEMORY_BYTES).unwrap();
+    CANCEL_BASE64_AT_CHUNK.with(|at| at.set(Some(2)));
+    let cancelled = c.verify_structured_references(
+        &s,
+        &s,
+        Some(&all()),
+        &rev_large,
+        &[ProposedStructured {
+            key: "big",
+            pointer: "/tail",
+            value_digest: ok_digest,
+        }],
+    );
+    CANCEL_BASE64_AT_CHUNK.with(|at| at.set(None));
+    assert!(matches!(cancelled, Err(Error::Cancelled)));
+
+    // Separate store for the shallow JSON grammar-scratch budget test so the 17 MiB
+    // literal above cannot share a front-coded Vocab block with the shallow literal.
+    let (s_shallow, nonce_shallow) = configured_evidence_store();
+    let rev_shallow = iri("urn:rev:shallow");
+    let shallow_json = r#"{"a":1}"#;
+    let shallow_digest = Sha256Digest::of_bytes(shallow_json.as_bytes(), &Control::none()).unwrap();
+    let shallow_b64 = base64::engine::general_purpose::STANDARD.encode(shallow_json.as_bytes());
+    insert_managed_quads(
+        &s_shallow,
+        vec![
+            q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+            q(
+                &op,
+                &format!("{EV}datasetId"),
+                lit(&s_shallow.dataset_id().to_string()),
+            ),
+            q(
+                &op,
+                &format!("{EV}branchId"),
+                lit(&s_shallow.branch_id().to_string()),
+            ),
+            q(&op, &format!("{EV}commit"), int_lit(1)),
+            q(
+                &op,
+                &format!("{EV}graphProtection"),
+                lit(&nonce_shallow.to_string()),
+            ),
+            q(
+                &rev_shallow,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(
+                &rev_shallow,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rev_shallow,
+                &format!("{EV}graphProtection"),
+                lit(&nonce_shallow.to_string()),
+            ),
+            q(
+                &rev_shallow,
+                &format!("{EV}contentDigest"),
+                lit(&shallow_digest.to_string()),
+            ),
+            q(
+                &rev_shallow,
+                &format!("{EV}retainedBytes"),
+                Term::Literal(Literal::new_typed_literal(
+                    shallow_b64,
+                    iri(XSD_BASE64_BINARY),
+                )),
+            ),
+        ],
+    );
+    s_shallow.compact().unwrap();
+
+    // Tight preparation budget that admits record-graph decoding (~66 KiB peak),
+    // record authentication (~10.4 KiB peak), vocabulary reconstruction, decoded bytes,
+    // 256 root pointers (~86.2 KiB), and shallow traversal (< 0.5 KiB), then refuses
+    // strictly at `VALIDATE_SCRATCH_BYTES` (4 KiB) grammar validation scratch.
+    let mut probe = resolver();
+    probe
+        .record(
+            "probe",
+            &s_shallow,
+            &s_shallow,
+            Some(&all()),
+            &RecordRequest {
+                iri: rev_shallow.clone(),
+                kinds: vec![RecordKind::SourceRevision],
+                content_digest: None,
+            },
+        )
+        .unwrap();
+    let baseline = probe.preparation().inner_used();
+    let shallow_refs: Vec<ProposedStructured<'_>> = (0..256)
+        .map(|_| ProposedStructured {
+            key: "shallow",
+            pointer: "",
+            value_digest: shallow_digest,
+        })
+        .collect();
+    let tight_limit = baseline + 88_000;
+    let mut tight = Resolver::new(Control::none(), tight_limit).unwrap();
+    assert_eq!(
+        code(tight.verify_structured_references(
+            &s_shallow,
+            &s_shallow,
+            Some(&all()),
+            &rev_shallow,
+            &shallow_refs,
+        )),
+        "incomplete-evidence"
+    );
+    // Adding room for `VALIDATE_SCRATCH_BYTES` lets the shallow selection succeed.
+    let mut enough = Resolver::new(Control::none(), tight_limit + 4096).unwrap();
+    enough
+        .verify_structured_references(
+            &s_shallow,
+            &s_shallow,
+            Some(&all()),
+            &rev_shallow,
+            &shallow_refs,
+        )
+        .unwrap();
+}
+
+#[test]
+fn repeated_passage_references_scan_rendition_text_once() {
+    let (s, nonce) = configured_evidence_store();
+    let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
+    let op = iri("urn:op:scan");
+    let rev = iri("urn:rev:scan");
+    let rend = iri("urn:rend:scan");
+    let pass = iri("urn:pass:scan");
+    let sel = iri("urn:pass:scan#sel");
+    let text = "abcdefgh".repeat(4096);
+    let tail = &text[text.len() - 4..];
+    let span_digest = Sha256Digest::of_bytes(tail.as_bytes(), &Control::none()).unwrap();
+    let q =
+        |sub: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(sub.clone(), iri(p), o, sg.clone());
+    let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+    let int_lit =
+        |n: u64| Term::Literal(Literal::new_typed_literal(n.to_string(), iri(XSD_INTEGER)));
+    insert_managed_quads(
+        &s,
+        vec![
+            q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+            q(
+                &op,
+                &format!("{EV}datasetId"),
+                lit(&s.dataset_id().to_string()),
+            ),
+            q(
+                &op,
+                &format!("{EV}branchId"),
+                lit(&s.branch_id().to_string()),
+            ),
+            q(&op, &format!("{EV}commit"), int_lit(1)),
+            q(
+                &op,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(&rev, &format!("{EV}availabilityReceipt"), op.clone().into()),
+            q(
+                &rev,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&rend, RDF_TYPE, iri(kind_iri(RecordKind::Rendition)).into()),
+            q(
+                &rend,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rend,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&rend, PROV_WAS_DERIVED_FROM, rev.clone().into()),
+            q(&rend, &format!("{EV}normalizedText"), lit(&text)),
+            q(&pass, RDF_TYPE, iri(kind_iri(RecordKind::Passage)).into()),
+            q(
+                &pass,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &pass,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&pass, &format!("{EV}sourceRevision"), rev.clone().into()),
+            q(&pass, &format!("{OA}hasSource"), rend.clone().into()),
+            q(&pass, &format!("{OA}hasSelector"), sel.clone().into()),
+            q(
+                &sel,
+                &format!("{OA}start"),
+                int_lit((text.len() - 4) as u64),
+            ),
+            q(&sel, &format!("{OA}end"), int_lit(text.len() as u64)),
+            q(
+                &pass,
+                &format!("{EV}textDigest"),
+                lit(&span_digest.to_string()),
+            ),
+        ],
+    );
+
+    PASSAGE_TEXT_SCANS.with(|count| count.set(0));
+    let mut r = resolver();
+    for i in 0..5 {
+        r.record(
+            &format!("rec-{i}"),
+            &s,
+            &s,
+            Some(&all()),
+            &RecordRequest {
+                iri: pass.clone(),
+                kinds: vec![RecordKind::Passage],
+                content_digest: None,
+            },
+        )
+        .unwrap();
+        r.verify_passage_reference(
+            &format!("ref-{i}"),
+            &s,
+            &s,
+            Some(&all()),
+            &pass,
+            &rev,
+            &rend,
+        )
+        .unwrap();
+    }
+    assert_eq!(PASSAGE_TEXT_SCANS.with(std::cell::Cell::get), 1);
+
+    // Re-protecting the graph invalidates the cached passage on the same Resolver.
+    let settings = super::super::Settings {
+        enabled: true,
+        source_records: vec!["urn:ev:sources".into()],
+        proposals: vec!["urn:ev:claims".into()],
+        ..Default::default()
+    };
+    let canonical = settings.canonical(&Control::none()).unwrap();
+    let entry = crate::managed::OwnerEntry::for_settings(
+        settings.profile,
+        settings.managed_graphs(),
+        canonical.bytes(),
+    );
+    let reg_rev = s
+        .detach_managed(OwnerKind::Evidence, "urn:ev:sources")
+        .unwrap()
+        .revision;
+    s.enable_managed_at(OwnerKind::Evidence, entry, canonical.bytes(), reg_rev)
+        .unwrap();
+    assert_eq!(
+        code(r.verify_passage_reference("ref-stale", &s, &s, Some(&all()), &pass, &rev, &rend)),
+        "origin-not-reproduced"
+    );
+}
+
+#[test]
+fn direct_verify_passage_reference_refuses_duplicate_or_malformed_record_digests() {
+    let (s, nonce) = configured_evidence_store();
+    let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
+    let op = iri("urn:op:digest-conflict");
+    let rev = iri("urn:rev:dc");
+    let rend = iri("urn:rend:dc");
+    let pass_dup = iri("urn:pass:dc-dup");
+    let sel_dup = iri("urn:pass:dc-dup#sel");
+    let pass_bad = iri("urn:pass:dc-bad");
+    let sel_bad = iri("urn:pass:dc-bad#sel");
+    let text = "hello world";
+    let span_digest = Sha256Digest::of_bytes(b"hello", &Control::none()).unwrap();
+    let d1 = Sha256Digest::of_bytes(b"rec-1", &Control::none()).unwrap();
+    let d2 = Sha256Digest::of_bytes(b"rec-2", &Control::none()).unwrap();
+    let q =
+        |sub: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(sub.clone(), iri(p), o, sg.clone());
+    let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+    let int_lit =
+        |n: u64| Term::Literal(Literal::new_typed_literal(n.to_string(), iri(XSD_INTEGER)));
+
+    insert_managed_quads(
+        &s,
+        vec![
+            q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+            q(
+                &op,
+                &format!("{EV}datasetId"),
+                lit(&s.dataset_id().to_string()),
+            ),
+            q(
+                &op,
+                &format!("{EV}branchId"),
+                lit(&s.branch_id().to_string()),
+            ),
+            q(&op, &format!("{EV}commit"), int_lit(1)),
+            q(
+                &op,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&rend, RDF_TYPE, iri(kind_iri(RecordKind::Rendition)).into()),
+            q(
+                &rend,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rend,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&rend, PROV_WAS_DERIVED_FROM, rev.clone().into()),
+            q(&rend, &format!("{EV}normalizedText"), lit(text)),
+            // Passage 1: valid span and lineage, but two visible ev:recordDigest values.
+            q(
+                &pass_dup,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::Passage)).into(),
+            ),
+            q(
+                &pass_dup,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &pass_dup,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &pass_dup,
+                &format!("{EV}sourceRevision"),
+                rev.clone().into(),
+            ),
+            q(&pass_dup, &format!("{OA}hasSource"), rend.clone().into()),
+            q(
+                &pass_dup,
+                &format!("{OA}hasSelector"),
+                sel_dup.clone().into(),
+            ),
+            q(&sel_dup, &format!("{OA}start"), int_lit(0)),
+            q(&sel_dup, &format!("{OA}end"), int_lit(5)),
+            q(
+                &pass_dup,
+                &format!("{EV}textDigest"),
+                lit(&span_digest.to_string()),
+            ),
+            q(
+                &pass_dup,
+                &format!("{EV}recordDigest"),
+                lit(&d1.to_string()),
+            ),
+            q(
+                &pass_dup,
+                &format!("{EV}recordDigest"),
+                lit(&d2.to_string()),
+            ),
+            // Passage 2: valid span and lineage, but malformed ev:contentDigest.
+            q(
+                &pass_bad,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::Passage)).into(),
+            ),
+            q(
+                &pass_bad,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &pass_bad,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &pass_bad,
+                &format!("{EV}sourceRevision"),
+                rev.clone().into(),
+            ),
+            q(&pass_bad, &format!("{OA}hasSource"), rend.clone().into()),
+            q(
+                &pass_bad,
+                &format!("{OA}hasSelector"),
+                sel_bad.clone().into(),
+            ),
+            q(&sel_bad, &format!("{OA}start"), int_lit(0)),
+            q(&sel_bad, &format!("{OA}end"), int_lit(5)),
+            q(
+                &pass_bad,
+                &format!("{EV}textDigest"),
+                lit(&span_digest.to_string()),
+            ),
+            q(
+                &pass_bad,
+                &format!("{EV}contentDigest"),
+                lit("not-a-digest"),
+            ),
+        ],
+    );
+
+    // Cold-cache direct calls must reject both passages with immutable-record-conflict.
+    let mut r_dup = resolver();
+    assert_eq!(
+        code(r_dup.verify_passage_reference("dup", &s, &s, Some(&all()), &pass_dup, &rev, &rend,)),
+        "immutable-record-conflict"
+    );
+    let mut r_bad = resolver();
+    assert_eq!(
+        code(r_bad.verify_passage_reference("bad", &s, &s, Some(&all()), &pass_bad, &rev, &rend,)),
+        "immutable-record-conflict"
+    );
+}
+
+#[test]
+fn probe_plus_verify_reads_each_retained_literal_once_on_compacted_store() {
+    let (s, nonce) = configured_evidence_store();
+    let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
+    let op = iri("urn:op:single-read");
+    let rev_ok = iri("urn:rev:single-ok");
+    let rev_meta = iri("urn:rev:single-meta");
+    let rev_bad_shape = iri("urn:rev:single-bad-shape");
+    let rend_ok = iri("urn:rend:single-ok");
+    let rend_meta = iri("urn:rend:single-meta");
+    let rend_bad_shape = iri("urn:rend:single-bad-shape");
+    let json = r#"{"score":42}"#;
+    let json_digest = Sha256Digest::of_bytes(json.as_bytes(), &Control::none()).unwrap();
+    let val_digest = Sha256Digest::of_bytes(b"42", &Control::none()).unwrap();
+    let json_b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+    let text = "single vocabulary read check";
+    let span_digest = Sha256Digest::of_bytes(b"single", &Control::none()).unwrap();
+
+    let q =
+        |sub: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(sub.clone(), iri(p), o, sg.clone());
+    let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+    let int_lit =
+        |n: u64| Term::Literal(Literal::new_typed_literal(n.to_string(), iri(XSD_INTEGER)));
+
+    insert_managed_quads(
+        &s,
+        vec![
+            q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+            q(
+                &op,
+                &format!("{EV}datasetId"),
+                lit(&s.dataset_id().to_string()),
+            ),
+            q(
+                &op,
+                &format!("{EV}branchId"),
+                lit(&s.branch_id().to_string()),
+            ),
+            q(&op, &format!("{EV}commit"), int_lit(1)),
+            q(
+                &op,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            // Retained JSON SourceRevision
+            q(
+                &rev_ok,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(
+                &rev_ok,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rev_ok,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_ok,
+                &format!("{EV}contentDigest"),
+                lit(&json_digest.to_string()),
+            ),
+            q(
+                &rev_ok,
+                &format!("{EV}retainedBytes"),
+                Term::Literal(Literal::new_typed_literal(json_b64, iri(XSD_BASE64_BINARY))),
+            ),
+            // Metadata-only SourceRevision
+            q(
+                &rev_meta,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(
+                &rev_meta,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rev_meta,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_meta,
+                &format!("{EV}contentDigest"),
+                lit(&json_digest.to_string()),
+            ),
+            // SourceRevision whose ev:retainedBytes is a Vocab IRI (wrong literal shape)
+            q(
+                &rev_bad_shape,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(
+                &rev_bad_shape,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rev_bad_shape,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_bad_shape,
+                &format!("{EV}contentDigest"),
+                lit(&json_digest.to_string()),
+            ),
+            q(
+                &rev_bad_shape,
+                &format!("{EV}retainedBytes"),
+                iri("urn:not:base64").into(),
+            ),
+            // Retained Rendition
+            q(
+                &rend_ok,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::Rendition)).into(),
+            ),
+            q(
+                &rend_ok,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rend_ok,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&rend_ok, PROV_WAS_DERIVED_FROM, rev_ok.clone().into()),
+            q(&rend_ok, &format!("{EV}normalizedText"), lit(text)),
+            // Metadata-only Rendition
+            q(
+                &rend_meta,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::Rendition)).into(),
+            ),
+            q(
+                &rend_meta,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rend_meta,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&rend_meta, PROV_WAS_DERIVED_FROM, rev_ok.clone().into()),
+            // Rendition whose ev:normalizedText is a Vocab IRI (wrong literal shape)
+            q(
+                &rend_bad_shape,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::Rendition)).into(),
+            ),
+            q(
+                &rend_bad_shape,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rend_bad_shape,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rend_bad_shape,
+                PROV_WAS_DERIVED_FROM,
+                rev_ok.clone().into(),
+            ),
+            q(
+                &rend_bad_shape,
+                &format!("{EV}normalizedText"),
+                iri("urn:not:simple-literal").into(),
+            ),
+        ],
+    );
+    s.compact().unwrap();
+
+    // 1. Proposed passage on compacted rendition: Phase 1 probe does 0 literal reads,
+    //    Phase 2 verify does 1 literal read -> 1 total read.
+    let mut r = resolver();
+    SIMPLE_LITERAL_READS.with(|c| c.set(0));
+    let probe = r
+        .probe_record_with_selection(
+            rend_ok.as_str(),
+            &s,
+            &s,
+            Some(&all()),
+            &rend_ok,
+            &[RecordKind::Rendition],
+            SelectionRequirements {
+                rendition_content: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(probe, SelectionProbe::DeferredLiteralShape);
+    assert_eq!(SIMPLE_LITERAL_READS.with(std::cell::Cell::get), 0);
+    r.verify_proposed_passages(
+        &s,
+        &s,
+        Some(&all()),
+        &rend_ok,
+        &[ProposedPassage {
+            key: "p0",
+            revision: &rev_ok,
+            start: 0,
+            end: 6,
+            text_digest: span_digest,
+            quote: Some("single"),
+        }],
+    )
+    .unwrap();
+    assert_eq!(SIMPLE_LITERAL_READS.with(std::cell::Cell::get), 1);
+
+    // 2. Structured reference on compacted revision: Phase 1 probe does 0 literal reads,
+    //    Phase 2 verify does 1 literal read -> 1 total read.
+    TYPED_LITERAL_READS.with(|c| c.set(0));
+    let probe = r
+        .probe_record_with_selection(
+            rev_ok.as_str(),
+            &s,
+            &s,
+            Some(&all()),
+            &rev_ok,
+            &[RecordKind::SourceRevision],
+            SelectionRequirements {
+                structured_content: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(probe, SelectionProbe::DeferredLiteralShape);
+    assert_eq!(TYPED_LITERAL_READS.with(std::cell::Cell::get), 0);
+    r.verify_structured_references(
+        &s,
+        &s,
+        Some(&all()),
+        &rev_ok,
+        &[ProposedStructured {
+            key: "s0",
+            pointer: "/score",
+            value_digest: val_digest,
+        }],
+    )
+    .unwrap();
+    assert_eq!(TYPED_LITERAL_READS.with(std::cell::Cell::get), 1);
+
+    // 3. Metadata-only targets fail in Phase 1 with 0 literal reads.
+    SIMPLE_LITERAL_READS.with(|c| c.set(0));
+    TYPED_LITERAL_READS.with(|c| c.set(0));
+    assert_eq!(
+        code(r.probe_record_with_selection(
+            rend_meta.as_str(),
+            &s,
+            &s,
+            Some(&all()),
+            &rend_meta,
+            &[RecordKind::Rendition],
+            SelectionRequirements {
+                rendition_content: true,
+                ..Default::default()
+            },
+        )),
+        "evidence-unavailable"
+    );
+    assert_eq!(
+        code(r.probe_record_with_selection(
+            rev_meta.as_str(),
+            &s,
+            &s,
+            Some(&all()),
+            &rev_meta,
+            &[RecordKind::SourceRevision],
+            SelectionRequirements {
+                structured_content: true,
+                ..Default::default()
+            },
+        )),
+        "evidence-unavailable"
+    );
+    assert_eq!(SIMPLE_LITERAL_READS.with(std::cell::Cell::get), 0);
+    assert_eq!(TYPED_LITERAL_READS.with(std::cell::Cell::get), 0);
+
+    // 4. Incompatible kind constraint on selected target: verifies literal shape once on
+    //    a fresh resolver so wrong-shape targets answer `evidence-unavailable` while
+    //    readable targets preserve `immutable-record-conflict`, and a subsequent fallback
+    //    `verify_selection_literal_shape` reuses the cached outcome with 0 extra reads.
+    let mut r_incompat = resolver();
+    SIMPLE_LITERAL_READS.with(|c| c.set(0));
+    assert_eq!(
+        code(r_incompat.probe_record_with_selection(
+            rend_ok.as_str(),
+            &s,
+            &s,
+            Some(&all()),
+            &rend_ok,
+            &[RecordKind::SourceRevision],
+            SelectionRequirements {
+                rendition_content: true,
+                ..Default::default()
+            },
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(SIMPLE_LITERAL_READS.with(std::cell::Cell::get), 1);
+    r_incompat
+        .verify_selection_literal_shape(
+            rend_ok.as_str(),
+            &s,
+            &s,
+            Some(&all()),
+            &rend_ok,
+            SelectionRequirements {
+                rendition_content: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(SIMPLE_LITERAL_READS.with(std::cell::Cell::get), 1);
+    assert_eq!(
+        code(r_incompat.probe_record_with_selection(
+            rend_bad_shape.as_str(),
+            &s,
+            &s,
+            Some(&all()),
+            &rend_bad_shape,
+            &[RecordKind::SourceRevision],
+            SelectionRequirements {
+                rendition_content: true,
+                ..Default::default()
+            },
+        )),
+        "evidence-unavailable"
+    );
+    assert_eq!(SIMPLE_LITERAL_READS.with(std::cell::Cell::get), 2);
+    assert_eq!(
+        code(r_incompat.verify_selection_literal_shape(
+            rend_bad_shape.as_str(),
+            &s,
+            &s,
+            Some(&all()),
+            &rend_bad_shape,
+            SelectionRequirements {
+                rendition_content: true,
+                ..Default::default()
+            },
+        )),
+        "evidence-unavailable"
+    );
+    assert_eq!(SIMPLE_LITERAL_READS.with(std::cell::Cell::get), 2);
+
+    // 5. Fallback literal-shape verifier catches wrong-shape Vocab targets cleanly.
+    TYPED_LITERAL_READS.with(|c| c.set(0));
+    assert_eq!(
+        code(r.verify_selection_literal_shape(
+            rev_bad_shape.as_str(),
+            &s,
+            &s,
+            Some(&all()),
+            &rev_bad_shape,
+            SelectionRequirements {
+                structured_content: true,
+                ..Default::default()
+            },
+        )),
+        "evidence-unavailable"
+    );
+    assert_eq!(TYPED_LITERAL_READS.with(std::cell::Cell::get), 1);
+}
+
+/// `GraphNodes` returned by `objects_in_graph` and `subjects_in_graph` keep their
+/// preparation memory reservation live until dropped, so simultaneously live nested
+/// results cannot exceed the configured allowance in aggregate.
+#[test]
+fn graph_nodes_retain_memory_charge_and_reject_nested_overflow() {
+    let (_dir, s) = setup();
+    let g = iri("urn:mem-g");
+    let p = iri("urn:mem-p");
+    let s1 = iri("urn:mem-s1");
+    let o_shared = iri("urn:mem-shared");
+    // Insert 40 long IRIs (~1 KiB each, ~42 KiB per result set) shared across lookups
+    // so delta-vocabulary overhead stays small relative to multiple live GraphNodes.
+    let pad = "x".repeat(1000);
+    let mut ins = String::from("INSERT DATA { GRAPH <urn:mem-g> {\n");
+    for i in 0..40 {
+        ins.push_str(&format!(
+            "  <urn:mem-s1> <urn:mem-p> <urn:node:{i:02}:{pad}> .\n\
+             <urn:node:{i:02}:{pad}> <urn:mem-p> <urn:mem-shared> .\n"
+        ));
+    }
+    ins.push_str("} }");
+    upd(&s, &ins);
+
+    // 1. Live GraphNodes hold memory until dropped.
+    let mut r = resolver();
+    let mut scans = 10_000;
+    let first = r
+        .objects_in_graph("k", &s, &s, &all(), &g, &s1, &p, 100, &mut scans)
+        .unwrap();
+    assert_eq!(first.len(), 40);
+    let used_with_first = r.preparation().inner_used();
+    let second = r
+        .subjects_in_graph(
+            "k",
+            &s,
+            &s,
+            &all(),
+            &g,
+            &p,
+            &Term::NamedNode(o_shared.clone()),
+            100,
+            &mut scans,
+        )
+        .unwrap();
+    assert_eq!(second.len(), 40);
+    let used_with_both = r.preparation().inner_used();
+    let one_set = used_with_both.saturating_sub(used_with_first);
+    assert!(
+        one_set > 30_000,
+        "second live GraphNodes must add to preparation usage: {used_with_first} -> {used_with_both}"
+    );
+    drop(second);
+    let used_after_second_drop = r.preparation().inner_used();
+    assert!(
+        used_after_second_drop < used_with_both - 30_000,
+        "dropping second GraphNodes must release its reservation: {used_with_both} -> {used_after_second_drop}"
+    );
+    drop(first);
+    let base_used = r.preparation().inner_used();
+    assert!(
+        base_used < used_with_first - 30_000,
+        "dropping first GraphNodes must release its reservation: {used_with_first} -> {base_used}"
+    );
+
+    // 2. Under an aggregate cap that comfortably fits any single lookup (including
+    //    delta-vocabulary workspace) but cannot hold 6 simultaneous live GraphNodes,
+    //    retaining nested results fails with incomplete-evidence, and dropping them
+    //    frees the allowance so a subsequent lookup succeeds.
+    let cap = base_used + one_set * 5;
+    let mut tight = Resolver::new(Control::none(), cap).unwrap();
+    let mut scans = 10_000;
+    let mut live = Vec::new();
+    let mut overflow = None;
+    for _ in 0..8 {
+        match tight.objects_in_graph("k", &s, &s, &all(), &g, &s1, &p, 100, &mut scans) {
+            Ok(nodes) => {
+                assert_eq!(nodes.len(), 40);
+                live.push(nodes);
+            }
+            Err(e) => {
+                overflow = Some(e);
+                break;
+            }
+        }
+    }
+    assert!(
+        !live.is_empty(),
+        "at least one GraphNodes lookup must fit within cap={cap}"
+    );
+    let err = overflow.expect("holding nested GraphNodes live must exceed aggregate cap");
+    assert_eq!(err.code(), "incomplete-evidence");
+    live.clear();
+    let after_drop = tight
+        .subjects_in_graph(
+            "k",
+            &s,
+            &s,
+            &all(),
+            &g,
+            &p,
+            &Term::NamedNode(o_shared),
+            100,
+            &mut scans,
+        )
+        .unwrap();
+    assert_eq!(after_drop.len(), 40);
+}
+
+/// Rows in a graph denied by `GraphAccess` must not decrement `remaining_scans` or alter
+/// the outcome of `subjects_in_graph` on a readable graph.
+#[test]
+fn subjects_in_graph_ignores_denied_graph_rows_for_scan_budget() {
+    let (_dir, s) = setup();
+    let allowed = iri("urn:allowed");
+    let p = iri("urn:p-shared");
+    let obj = Term::Literal(Literal::new_simple_literal("same-key"));
+    let mut ins = String::from("INSERT DATA {\n");
+    ins.push_str("  GRAPH <urn:allowed> { <urn:ok:1> <urn:p-shared> \"same-key\" . <urn:ok:2> <urn:p-shared> \"same-key\" . }\n");
+    ins.push_str("  GRAPH <urn:denied> {\n");
+    for i in 0..40 {
+        ins.push_str(&format!(
+            "    <urn:hidden:{i:02}> <urn:p-shared> \"same-key\" .\n"
+        ));
+    }
+    ins.push_str("  }\n}");
+    upd(&s, &ins);
+
+    let access = Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(["urn:allowed"], &[])),
+        Graphs::none(),
+    ));
+    let mut r = resolver();
+    let mut scans = 5;
+    let found = r
+        .subjects_in_graph("k", &s, &s, &access, &allowed, &p, &obj, 10, &mut scans)
+        .unwrap();
+    assert_eq!(found.len(), 2);
+    assert!(!found.is_truncated());
+    assert_eq!(
+        scans, 3,
+        "only the 2 quads in the readable graph should consume remaining_scans"
+    );
+}
+
+/// `pin_commit` keeps `has_triple`, `objects_in_graph`, and `subjects_in_graph` on one
+/// historical snapshot even after newer commits advance the live branch head.
+#[test]
+fn pin_commit_keeps_graph_lookups_on_one_snapshot_after_head_advances() {
+    let (_dir, s) = setup();
+    // setup() inserted <urn:a> <urn:p> <urn:b> at commit 1 and deleted it at commit 2.
+    upd(
+        &s,
+        &format!("INSERT DATA {{ GRAPH <{G}> {{ <urn:a> <urn:p> <urn:c> }} }}"),
+    );
+    let g = iri(G);
+    let a = iri("urn:a");
+    let p = iri("urn:p");
+    let b = Term::NamedNode(iri("urn:b"));
+    let c = Term::NamedNode(iri("urn:c"));
+
+    let mut r = resolver();
+    r.pin_commit(&s, &s, 1);
+    assert!(r.has_triple("k", &s, &s, &all(), &g, &a, &p, &b).unwrap());
+    assert!(!r.has_triple("k", &s, &s, &all(), &g, &a, &p, &c).unwrap());
+    let mut scans = 100;
+    let objs = r
+        .objects_in_graph("k", &s, &s, &all(), &g, &a, &p, 10, &mut scans)
+        .unwrap();
+    assert_eq!(objs.nodes(), &[iri("urn:b")]);
+    let subjs = r
+        .subjects_in_graph("k", &s, &s, &all(), &g, &p, &b, 10, &mut scans)
+        .unwrap();
+    assert_eq!(subjs.nodes(), &[iri("urn:a")]);
+}
+
+/// `Lookups::iri` charges every owned memo key to its `Reservation` for the lifetime of
+/// `Lookups`, releases it on drop, and refuses when accumulated memo keys exhaust the
+/// preparation allowance even while individual `lookup_iri` calls fit.
+#[test]
+fn lookups_charges_memoized_iris_and_refuses_when_allowance_exhausted() {
+    let (_dir, s) = setup();
+    let snap = s.snapshot();
+    let prep = Preparation::new(Control::none(), MEMORY_BYTES).unwrap();
+    let view = all().masked_controlled(&snap, &prep).unwrap();
+    let base_used = prep.inner_used();
+
+    let long_iri = format!("urn:memo:{}", "a".repeat(2048));
+    {
+        let mut lookups = Lookups::new(&prep, &view).unwrap();
+        let _ = lookups.iri(&long_iri).unwrap();
+        let after_first = prep.inner_used();
+        assert!(
+            after_first >= base_used + long_iri.len() as u64,
+            "memoized IRI must stay charged while Lookups lives: {base_used} -> {after_first}"
+        );
+        // Repeated lookup hits the memo and adds no further charge.
+        let _ = lookups.iri(&long_iri).unwrap();
+        assert_eq!(prep.inner_used(), after_first);
+    }
+    assert_eq!(
+        prep.inner_used(),
+        base_used,
+        "dropping Lookups must release memo key charges"
+    );
+
+    // Under a tight cap where one `lookup_iri` call (~3.5 KiB for a 1 KiB IRI) fits
+    // comfortably, accumulating 20 distinct 1 KiB memo keys must hit BudgetExceeded.
+    let pad = "b".repeat(1000);
+    let tight_cap = base_used + 12_000;
+    let tight = Preparation::new(Control::none(), tight_cap).unwrap();
+    let tight_view = all().masked_controlled(&snap, &tight).unwrap();
+    let mut lookups = Lookups::new(&tight, &tight_view).unwrap();
+    let mut succeeded = 0usize;
+    let mut overflow = None;
+    for i in 0..20 {
+        let key = format!("urn:memo:{i:02}:{pad}");
+        match lookups.iri(&key) {
+            Ok(_) => succeeded += 1,
+            Err(e) => {
+                overflow = Some(e);
+                break;
+            }
+        }
+    }
+    assert!(
+        succeeded >= 1,
+        "at least one 1 KiB lookup must fit within cap={tight_cap}"
+    );
+    assert!(
+        matches!(overflow, Some(Error::BudgetExceeded(_))),
+        "accumulating memo keys must fail with BudgetExceeded, got {overflow:?}"
+    );
+}
+
+/// `has_any_object_in_graph` and `single_object_in_graph` report exact cardinality under
+/// the caller's access policy, distinguishing absent, unique, and multi-valued objects.
+#[test]
+fn single_object_in_graph_distinguishes_none_one_and_many() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "INSERT DATA { GRAPH <urn:g> { \
+           <urn:s> <urn:one> \"alpha\" . \
+           <urn:s> <urn:two> \"first\" , \"second\" . \
+         } }",
+    );
+    let g = iri("urn:g");
+    let subj = iri("urn:s");
+    let p_none = iri("urn:none");
+    let p_one = iri("urn:one");
+    let p_two = iri("urn:two");
+
+    let mut r = resolver();
+    assert!(
+        !r.has_any_object_in_graph("k", &s, &s, &all(), &g, &subj, &p_none)
+            .unwrap()
+    );
+    assert!(
+        r.has_any_object_in_graph("k", &s, &s, &all(), &g, &subj, &p_one)
+            .unwrap()
+    );
+    let none = r
+        .single_object_in_graph("k", &s, &s, &all(), &g, &subj, &p_none, |t| {
+            Ok(t.map(ToString::to_string))
+        })
+        .unwrap();
+    assert_eq!(none, SingleObject::None);
+    let one = r
+        .single_object_in_graph("k", &s, &s, &all(), &g, &subj, &p_one, |t| {
+            Ok(match t {
+                Some(Term::Literal(l)) => Some(l.value().to_string()),
+                _ => None,
+            })
+        })
+        .unwrap();
+    assert_eq!(one, SingleObject::One(Some("alpha".to_string())));
+    let many = r
+        .single_object_in_graph("k", &s, &s, &all(), &g, &subj, &p_two, |t| {
+            Ok(t.map(ToString::to_string))
+        })
+        .unwrap();
+    assert_eq!(many, SingleObject::Many);
+
+    // A pattern protection hiding one of the two values leaves a unique visible value.
+    let hide_second = Protection {
+        name: "hide_second".into(),
+        predicates: Some(vec!["urn:two".into()]),
+        classes: None,
+        subclasses: false,
+        graphs: None,
+        pattern: Some("?s <urn:two> ?o . FILTER(?o != \"second\")".into()),
+        prefixes: Default::default(),
+        hide_inferences: false,
+    };
+    let masked = Arc::new(GraphAccess::with_triples(
+        Graphs::All,
+        Graphs::All,
+        TripleRules {
+            rules: vec![Rule {
+                protection: Arc::new(hide_second),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Default::default(),
+            limits: Default::default(),
+        },
+    ));
+    let filtered = r
+        .single_object_in_graph("k", &s, &s, &masked, &g, &subj, &p_two, |t| {
+            Ok(match t {
+                Some(Term::Literal(l)) => Some(l.value().to_string()),
+                _ => None,
+            })
+        })
+        .unwrap();
+    assert_eq!(filtered, SingleObject::One(Some("first".to_string())));
+}

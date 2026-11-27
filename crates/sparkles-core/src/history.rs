@@ -15,6 +15,7 @@ use crate::commit::{self, CommitInfo};
 use crate::error::{Error, Result};
 use crate::store::{Generation, Snapshot};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -639,6 +640,22 @@ pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryCo
     decode_file_with(&bytes, dataset_id, &mut crate::budgeted::Unlimited)
 }
 
+/// Read `history.json` under `budget` without opening the store.
+pub(crate) fn read_file_controlled(
+    root: &Path,
+    dataset_id: uuid::Uuid,
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+) -> Result<HistoryConfig> {
+    let bytes = match budget.read_file(&root.join("history.json")) {
+        Ok(b) => b,
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HistoryConfig::default());
+        }
+        Err(e) => return Err(e),
+    };
+    decode_file_with(&bytes, dataset_id, budget)
+}
+
 /// Validate current history metadata without startup writers or recovery cleanup.
 /// A legacy directory without history needs no recorded identity. A present
 /// identity-bearing history requires its own dataset.json, never a fabricated ID.
@@ -1237,19 +1254,36 @@ impl MemHistory {
         seq: u64,
         limit: &C,
     ) -> Result<Option<Arc<Snapshot>>> {
-        if C::ACCOUNTS {
-            limit.check(0)?;
-        }
+        self.get_checked(seq, &|| if C::ACCOUNTS { limit.check(0) } else { Ok(()) })
+    }
+
+    /// Check before the map lookups and before each window or pin entry compared.
+    pub(crate) fn get_checked(
+        &self,
+        seq: u64,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<Option<Arc<Snapshot>>> {
+        check()?;
         if let Some((_, snapshot)) = self.branch_bases.get(&seq) {
             return Ok(Some(snapshot.clone()));
         }
         if let Some((_, snapshot)) = self.held.get(&seq) {
             return Ok(Some(snapshot.clone()));
         }
-        for snapshot in self.window.iter().chain(self.pins.values().map(|(_, s)| s)) {
-            if C::ACCOUNTS {
-                limit.check(0)?;
+        let mut low = 0;
+        let mut high = self.window.len();
+        while low < high {
+            check()?;
+            let mid = low + (high - low) / 2;
+            let snapshot = &self.window[mid];
+            match snapshot.commit.cmp(&seq) {
+                Ordering::Less => low = mid + 1,
+                Ordering::Greater => high = mid,
+                Ordering::Equal => return Ok(Some(snapshot.clone())),
             }
+        }
+        for (_, snapshot) in self.pins.values() {
+            check()?;
             if snapshot.commit == seq {
                 return Ok(Some(snapshot.clone()));
             }

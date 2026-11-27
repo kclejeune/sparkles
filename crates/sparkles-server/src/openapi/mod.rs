@@ -8,7 +8,7 @@
 //! document with its checked-in copy, `docs/openapi.json`.
 
 #[cfg(test)]
-mod contract_tests;
+pub(crate) mod contract_tests;
 mod paths;
 mod schemas;
 #[cfg(test)]

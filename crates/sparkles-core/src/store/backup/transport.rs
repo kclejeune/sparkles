@@ -1522,10 +1522,17 @@ mod tests {
             0o700
         );
         let before = std::fs::read(output.join(&generation).join("wal.log")).unwrap();
-        assert!(matches!(
-            Store::open(output, StoreOptions::default()),
-            Err(Error::Unsupported(_))
-        ));
+        {
+            let opened = Store::open(output, StoreOptions::default()).unwrap();
+            assert_eq!(opened.dataset_id(), new);
+            assert_eq!(
+                opened
+                    .evidence_view(&crate::history::At::Head, &receiving)
+                    .unwrap()
+                    .configuration(),
+                genesis
+            );
+        }
         assert_eq!(
             std::fs::read(output.join(&generation).join("wal.log")).unwrap(),
             before
@@ -2752,10 +2759,18 @@ mod tests {
                     assert!(source_preparation.room() < source_room);
                     assert!(receiving.room() < receiving_room);
                     assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 1);
-                    assert!(matches!(
-                        Store::open(staged.directory.path(), StoreOptions::default()),
-                        Err(Error::Unsupported(_))
-                    ));
+                    {
+                        let opened =
+                            Store::open(staged.directory.path(), StoreOptions::default()).unwrap();
+                        assert_eq!(opened.dataset_id(), new_id);
+                        assert_eq!(
+                            opened
+                                .evidence_view(&crate::history::At::Head, &receiving)
+                                .unwrap()
+                                .configuration(),
+                            staged.genesis.identity
+                        );
+                    }
                     drop(staged);
                 }
                 assert_eq!(child.head_commit(), head);

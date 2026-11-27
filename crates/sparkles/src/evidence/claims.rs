@@ -9,12 +9,12 @@
 //! withdrawal that ends it. Otherwise it answers as missing, so a reader learns nothing
 //! about hidden records, and an older decision never stands in for a hidden current one.
 
-use super::{G, PolicyGraphs, State, caller_view_evidence};
+use super::{G, PolicyGraphs, State, caller_view, caller_view_evidence};
 use crate::access::GraphAccess;
 use crate::evidence::propose::READS_BYTES;
 use crate::managed::{ManagedErrorKind, OwnerKind};
 use crate::task::Control;
-use crate::{Error, Result};
+use crate::{Dataset, Error, Result};
 use oxrdf::{NamedNode, Term, Triple};
 use sparkles_core::evidence::review::{Disposition, MAX_EVIDENCE};
 use sparkles_core::evidence::write::Reads;
@@ -31,7 +31,9 @@ const RDF_REIFIES: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
 /// The class of imported instruction documents, such as `AGENTS.md`.
 pub const MEM_INSTRUCTIONS: &str = "urn:x-sparkles:mem:Instructions";
 
-/// The most quads of one proposal graph that [`PolicyClaims::about`] reads.
+/// The most quads of one proposal graph that [`PolicyClaims::about`] scans when reading
+/// a legacy pre-index generation that lacks `reifiers.bin`. Indexed generations and
+/// deltas look up matching claims directly without scanning the graph.
 pub const MAX_CLAIM_SCAN: usize = 1_000_000;
 /// The most claims one call of [`PolicyClaims::states`] or [`PolicyClaims::about`]
 /// considers.
@@ -267,6 +269,123 @@ pub fn claim_states(
     control: &Control,
 ) -> Result<Vec<Option<ClaimOccurrence>>> {
     with_policy_claims(view, policy, access, control, |c| c.states(claims))
+}
+
+/// The states of `claims` under the review policy `policy` at the live head of `logical`
+/// (with settings and protections from `main`), for datasets whose configuration history
+/// is not activated. Captures settings and graph protection nonces from a single registry
+/// snapshot and verifies that the registry revision remains stable across data snapshot
+/// capture. Returns the read commit sequence alongside one entry per claim.
+pub(crate) fn claim_states_live(
+    main: &Dataset,
+    logical: &crate::store::Store,
+    policy: &str,
+    claims: &[NamedNode],
+    access: Option<Arc<GraphAccess>>,
+    control: &Control,
+) -> Result<(u64, Vec<Option<ClaimOccurrence>>)> {
+    claim_states_live_with_hook(main, logical, policy, claims, access, control, |_| {})
+}
+
+fn claim_states_live_with_hook(
+    main: &Dataset,
+    logical: &crate::store::Store,
+    policy: &str,
+    claims: &[NamedNode],
+    access: Option<Arc<GraphAccess>>,
+    control: &Control,
+    mut between_registry_and_head: impl FnMut(usize),
+) -> Result<(u64, Vec<Option<ClaimOccurrence>>)> {
+    const MAX_ATTEMPTS: usize = 3;
+    control.check()?;
+    if main.store().is_branch() || logical.owner_dataset_id() != main.dataset_id() {
+        return Err(Error::invalid(
+            "an operation names the dataset's main store and one of its branches",
+        ));
+    }
+    let attempts = if access.is_some() { 1 } else { MAX_ATTEMPTS };
+    let mut selected = None;
+    for attempt in 0..attempts {
+        control.check()?;
+        let registry = main.store().managed_snapshot()?;
+        if let Some(reason) = registry.as_ref().and_then(|s| s.unavailable.as_ref()) {
+            return Err(crate::managed::ManagedError::error(
+                ManagedErrorKind::Unavailable,
+                reason.clone(),
+            ));
+        }
+        let rev_before = registry.as_ref().map_or(0, |s| s.graphs.revision);
+        between_registry_and_head(attempt);
+        let head = logical.snapshot();
+        let rev_after = main.store().managed_revision()?;
+        if rev_after == rev_before {
+            selected = Some((registry, head));
+            break;
+        }
+    }
+    let Some((registry, head)) = selected else {
+        return Err(crate::managed::ManagedError::error(
+            ManagedErrorKind::Unavailable,
+            "configuration changed during evidence selection",
+        ));
+    };
+    if let Some(a) = access.as_deref() {
+        a.validate_bound_snapshot(&head)?;
+    }
+    let Some(registry) = registry else {
+        return Err(unknown_policy(policy));
+    };
+    let Some(bytes) = registry.settings.get(&OwnerKind::Evidence) else {
+        return Err(unknown_policy(policy));
+    };
+    let settings = crate::evidence::recorded(bytes)?;
+    let Some(p) = settings.policies.get(policy).filter(|_| settings.enabled) else {
+        return Err(unknown_policy(policy));
+    };
+    for g in [&p.decisions, &p.supports, &p.output] {
+        if !can_read(access.as_ref(), g) {
+            return Err(unknown_policy(policy));
+        }
+    }
+    let nonce = |g: &str| -> Option<Uuid> {
+        registry
+            .graphs
+            .owners
+            .get(&OwnerKind::Evidence)
+            .filter(|e| e.graphs.iter().any(|x| x == g))
+            .and_then(|e| e.protections.get(g).copied())
+    };
+    let graphs = PolicyGraphs::with_nonces(policy, p, &nonce)?;
+    let claim_graphs: Vec<G> = settings
+        .proposals
+        .iter()
+        .map(|g| (NamedNode::new_unchecked(g), nonce(g)))
+        .collect();
+    let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
+    let all = access
+        .clone()
+        .or_else(|| Some(Arc::new(GraphAccess::all())));
+    let seen = caller_view(all.as_ref(), &head, &preparation)?;
+    let state = State {
+        reads: Reads::new(&preparation, &head),
+        seen: seen.as_ref().map(|v| Reads::from_prepared(&preparation, v)),
+        claim_graphs,
+        superseded: BTreeSet::new(),
+        withdrawn: BTreeSet::new(),
+    };
+    let mut policy_claims = PolicyClaims {
+        state,
+        access,
+        graphs,
+        version: p.version,
+        settings,
+        control: control.clone(),
+    };
+    policy_claims
+        .state
+        .check_projection(&policy_claims.graphs, None)?;
+    let occurrences = policy_claims.states(claims)?;
+    Ok((head.commit, occurrences))
 }
 
 impl PolicyClaims<'_> {
@@ -522,9 +641,11 @@ impl PolicyClaims<'_> {
     /// The occurrences the caller may see in the readable proposal graphs of the
     /// policy's boundary whose proposition has one of `entities` as its subject or
     /// object, in claim order. Each candidate passes [`Self::states`]' visibility check
-    /// before it is counted, so a hidden claim takes no place in the bound. Refuses as
-    /// `incomplete-evidence` when a graph holds more than [`MAX_CLAIM_SCAN`] quads or the
-    /// visible occurrences exceed [`MAX_CLAIMS`].
+    /// before it is counted, so a hidden claim takes no place in the bound. Uses the
+    /// reifier proposition-term index to read only matching claims; refuses as
+    /// `incomplete-evidence` when the visible occurrences exceed [`MAX_CLAIMS`] (or on a
+    /// legacy pre-index generation when a proposal graph holds more than
+    /// [`MAX_CLAIM_SCAN`] quads).
     pub fn about(&mut self, entities: &[NamedNode]) -> Result<Vec<ClaimOccurrence>> {
         let wanted: BTreeSet<String> = entities.iter().map(|e| e.as_str().to_string()).collect();
         if wanted.is_empty() {
@@ -716,5 +837,174 @@ mod tests {
             resolve_entities_at(&view, "people", &[], Some(bound_before), &Control::none()),
             Err(Error::Invalid(ref m)) if m.contains("different snapshot")
         ));
+    }
+
+    #[test]
+    fn claim_states_live_rejects_torn_registry_and_head() {
+        use crate::evidence::{Policy, binding, configure, detach};
+
+        let ds = crate::Dataset::memory();
+        let mut settings = Settings {
+            enabled: true,
+            source_records: vec!["urn:ev:sources".into()],
+            proposals: vec!["urn:ev:claims".into()],
+            decisions: vec!["urn:ev:decisions".into(), "urn:ev:decisions2".into()],
+            supports: vec!["urn:ev:supports".into(), "urn:ev:supports2".into()],
+            projections: vec!["urn:ev:accepted".into(), "urn:ev:accepted2".into()],
+            policies: [
+                (
+                    "review-v1".into(),
+                    Policy {
+                        version: 1,
+                        admitted_kinds: vec![ClaimKind::Reported],
+                        required_scope: vec![],
+                        conflicts: super::super::ConflictMode::AdmitLabelled,
+                        boundary: vec!["urn:ev:sources".into(), "urn:ev:claims".into()],
+                        decisions: "urn:ev:decisions".into(),
+                        supports: "urn:ev:supports".into(),
+                        output: "urn:ev:accepted".into(),
+                    },
+                ),
+                (
+                    "review-v2".into(),
+                    Policy {
+                        version: 1,
+                        admitted_kinds: vec![ClaimKind::Reported],
+                        required_scope: vec![],
+                        conflicts: super::super::ConflictMode::AdmitLabelled,
+                        boundary: vec!["urn:ev:sources".into(), "urn:ev:claims".into()],
+                        decisions: "urn:ev:decisions2".into(),
+                        supports: "urn:ev:supports2".into(),
+                        output: "urn:ev:accepted2".into(),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        configure(&ds, &settings, &Control::none()).unwrap();
+
+        // Publish one accepted claim so review-v1 has a live Projection record with nonces.
+        let prop_req = serde_json::to_vec(&serde_json::json!({
+            "revisions": [{
+                "key": "r1",
+                "source": "https://example.org/src/1",
+                "sourceKey": "s1",
+                "content": { "text": "fact" },
+            }],
+            "claims": [{
+                "key": "c1",
+                "occurrenceKey": "o1",
+                "revision": { "key": "r1" },
+                "proposition": "<https://example.org/a> <https://example.org/b> <https://example.org/c>",
+                "kind": "reported",
+                "polarity": "positive",
+                "author": "https://example.org/org/a",
+            }],
+        }))
+        .unwrap();
+        let proposed =
+            binding::propose_bytes(&ds, None, None, None, &prop_req, &Control::none()).unwrap();
+        let claim_rec = proposed["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["key"] == "c1")
+            .unwrap();
+        let claim_iri = NamedNode::new(claim_rec["iri"].as_str().unwrap()).unwrap();
+        let claim_digest = claim_rec["recordDigest"].as_str().unwrap();
+        let rev_req = serde_json::to_vec(&serde_json::json!({
+            "policy": "review-v1",
+            "policyVersion": 1,
+            "ifHead": ds.head_commit().seq,
+            "decisions": [{
+                "key": "d1",
+                "target": claim_iri.as_str(),
+                "targetDigest": claim_digest,
+                "disposition": "accepted",
+            }],
+        }))
+        .unwrap();
+        binding::review_bytes(&ds, None, None, None, &rev_req, &Control::none()).unwrap();
+
+        // Sanity: coherent live read observes the accepted claim.
+        let (_, states) = claim_states_live(
+            &ds,
+            ds.store(),
+            "review-v1",
+            std::slice::from_ref(&claim_iri),
+            None,
+            &Control::none(),
+        )
+        .unwrap();
+        assert_eq!(states[0].as_ref().unwrap().state, ClaimState::Accepted);
+
+        // 1. A one-shot detach between registry snapshot and head capture triggers retry
+        // and observes the coherent post-detach state (projection-unavailable), never
+        // old settings paired with new protections.
+        let mut did_detach = false;
+        let err = claim_states_live_with_hook(
+            &ds,
+            ds.store(),
+            "review-v1",
+            std::slice::from_ref(&claim_iri),
+            None,
+            &Control::none(),
+            |_| {
+                if !did_detach {
+                    did_detach = true;
+                    detach(&ds, "urn:ev:accepted").unwrap();
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "projection-unavailable", "{err:?}");
+
+        // Re-enable protection.
+        configure(&ds, &settings, &Control::none()).unwrap();
+
+        // 2. Persistent registry churn across every attempt fails explicitly with
+        // managed-unavailable rather than pairing an older head with a newer policy.
+        let err = claim_states_live_with_hook(
+            &ds,
+            ds.store(),
+            "review-v1",
+            std::slice::from_ref(&claim_iri),
+            None,
+            &Control::none(),
+            |attempt| {
+                let (d1, s1, o1, d2, s2, o2) = if attempt % 2 == 0 {
+                    (
+                        "urn:ev:decisions2",
+                        "urn:ev:supports2",
+                        "urn:ev:accepted2",
+                        "urn:ev:decisions",
+                        "urn:ev:supports",
+                        "urn:ev:accepted",
+                    )
+                } else {
+                    (
+                        "urn:ev:decisions",
+                        "urn:ev:supports",
+                        "urn:ev:accepted",
+                        "urn:ev:decisions2",
+                        "urn:ev:supports2",
+                        "urn:ev:accepted2",
+                    )
+                };
+                let p1 = settings.policies.get_mut("review-v1").unwrap();
+                p1.decisions = d1.into();
+                p1.supports = s1.into();
+                p1.output = o1.into();
+                let p2 = settings.policies.get_mut("review-v2").unwrap();
+                p2.decisions = d2.into();
+                p2.supports = s2.into();
+                p2.output = o2.into();
+                configure(&ds, &settings, &Control::none()).unwrap();
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "managed-unavailable", "{err:?}");
     }
 }

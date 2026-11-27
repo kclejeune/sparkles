@@ -197,6 +197,24 @@ fn chunk_crc(header: &[u8], payload: &[u8]) -> u32 {
     c.sum()
 }
 
+/// Partition keys as the writer frames them, allowing one oversized key per chunk.
+fn chunk_ranges(keys: &[Arc<[u8]>]) -> impl Iterator<Item = std::ops::Range<usize>> {
+    let mut start = 0usize;
+    std::iter::from_fn(move || {
+        if start == keys.len() {
+            return None;
+        }
+        let (mut end, mut size) = (start, 0usize);
+        while end < keys.len() && (end == start || size + 4 + keys[end].len() <= MAX_CHUNK) {
+            size += 4 + keys[end].len();
+            end += 1;
+        }
+        let range = start..end;
+        start = end;
+        Some(range)
+    })
+}
+
 /// `keys` as chunks of at most [`MAX_CHUNK`] bytes of payload each (one entry when it is
 /// larger), the first numbered `first`, after the file header when `header` is set.
 /// Refuses an entry whose length a chunk cannot record.
@@ -210,17 +228,7 @@ fn encode_chunks(first: u64, keys: &[Arc<[u8]>], header: bool) -> Result<Vec<u8>
             k.len()
         )));
     }
-    let mut chunks = Vec::new();
-    let mut start = 0usize;
-    while start < keys.len() {
-        let (mut end, mut size) = (start, 0usize);
-        while end < keys.len() && (end == start || size + 4 + keys[end].len() <= MAX_CHUNK) {
-            size += 4 + keys[end].len();
-            end += 1;
-        }
-        chunks.push(start..end);
-        start = end;
-    }
+    let chunks: Vec<_> = chunk_ranges(keys).collect();
     let total: usize = keys.iter().map(|k| 4 + k.len()).sum();
     let mut out = Vec::with_capacity(HEADER + total + CHUNK_HEADER * chunks.len());
     for range in chunks {
@@ -266,6 +274,11 @@ impl VocabMark {
     /// The vocabulary's entries when the mark was taken.
     pub(crate) fn entries(&self) -> u64 {
         self.entries
+    }
+
+    /// The logical end of the file when the mark was taken.
+    pub(crate) fn file_end(&self) -> u64 {
+        self.end
     }
 }
 
@@ -792,15 +805,19 @@ impl DeltaVocab {
     }
 
     /// Borrow dictionary bytes under `control`, acquiring the read lock and checking
-    /// controls before and after the callback.
+    /// controls and caller-held bytes before and after the callback.
     pub(crate) fn with_control<C: Control, R>(
         &self,
         control: &C,
+        held: u64,
         f: impl FnOnce(&AppendVocab) -> Result<R>,
     ) -> Result<R> {
+        if C::CHECKS && held != 0 {
+            control.check(held)?;
+        }
         let guard = control.read_lock(&self.inner)?;
         let result = f(&guard)?;
-        control.check(0)?;
+        control.check(held)?;
         Ok(result)
     }
 
@@ -811,7 +828,7 @@ impl DeltaVocab {
         control: &crate::task::Control,
         f: impl FnOnce(&AppendVocab) -> Result<R>,
     ) -> Result<R> {
-        self.with_control(control, f)
+        self.with_control(control, 0, f)
     }
 
     /// Find a key visible to the snapshot with interruptible lock acquisition and search.
@@ -831,12 +848,19 @@ impl DeltaVocab {
         preparation: &crate::access::Preparation,
         f: impl FnOnce(&AppendVocab) -> Result<R>,
     ) -> Result<R> {
-        self.with_control(preparation, f)
+        self.with_control(preparation, 0, f)
     }
 
     #[cfg(test)]
     pub(crate) fn write_guard_for_test(&self) -> parking_lot::RwLockWriteGuard<'_, AppendVocab> {
         self.inner.write()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_write_guard_for_test(
+        &self,
+    ) -> Option<parking_lot::RwLockWriteGuard<'_, AppendVocab>> {
+        self.inner.try_write()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -870,6 +894,20 @@ impl DeltaVocab {
         v.keys
             .get(from as usize..)
             .map_or(0, |k| k.iter().map(|k| 4 + k.len() as u64).sum())
+    }
+
+    /// Framing added when a fence writes the keys from this step. The caller tracks
+    /// whether an earlier simulated fence has already written the file header.
+    pub(crate) fn framing_bytes(&self, from: u64, file_is_empty: bool) -> u64 {
+        if self.file.is_none() {
+            return 0;
+        }
+        let v = self.inner.read();
+        let Some(keys) = v.keys.get(from as usize..).filter(|keys| !keys.is_empty()) else {
+            return 0;
+        };
+        chunk_ranges(keys).count() as u64 * CHUNK_HEADER as u64
+            + u64::from(file_is_empty) * HEADER as u64
     }
 
     /// Where the vocabulary ends now, for a later [`rollback`](Self::rollback).
@@ -1709,7 +1747,7 @@ mod tests {
         assert_eq!(
             controlled
                 .value
-                .with_control(&prep, |v| Ok(v.find(b"<urn:two>")))
+                .with_control(&prep, 0, |v| Ok(v.find(b"<urn:two>")))
                 .unwrap(),
             Some(1)
         );
@@ -1717,7 +1755,7 @@ mod tests {
         assert_eq!(
             controlled
                 .value
-                .with_control(&task_ok, |v| Ok(v.find(b"<urn:three>")))
+                .with_control(&task_ok, 0, |v| Ok(v.find(b"<urn:three>")))
                 .unwrap(),
             Some(2)
         );
@@ -1754,7 +1792,9 @@ mod tests {
         // TaskControl cancellation and timeout on with_control.
         let cancelled_task = TaskControl::with_cancel(cancel);
         assert!(matches!(
-            controlled.value.with_control(&cancelled_task, |_| Ok(())),
+            controlled
+                .value
+                .with_control(&cancelled_task, 0, |_| Ok(())),
             Err(Error::Cancelled)
         ));
         let expired_task = TaskControl {
@@ -1762,7 +1802,7 @@ mod tests {
             ..TaskControl::none()
         };
         assert!(matches!(
-            controlled.value.with_control(&expired_task, |_| Ok(())),
+            controlled.value.with_control(&expired_task, 0, |_| Ok(())),
             Err(Error::Timeout)
         ));
 

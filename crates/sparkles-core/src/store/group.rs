@@ -29,6 +29,16 @@ const MAX_COMMITS: usize = 64;
 /// The most commits a WAL commit record can say may not be durable before it.
 const MAX_UNFENCED: u64 = u8::MAX as u64;
 
+/// The free-space reservation for preallocating a fence's WAL, terms and annotations.
+pub(super) fn preallocation_promise(prealloc: u64, annotations: bool) -> u64 {
+    2 * prealloc.saturating_add(4096)
+        + if annotations {
+            crate::annotations::MAX_PREALLOC + 4096
+        } else {
+            0
+        }
+}
+
 #[derive(Default)]
 pub(super) struct Ticket(AtomicU8);
 
@@ -681,14 +691,8 @@ impl Store {
             crate::annotations::MAX_PREALLOC
         };
         let promise = (last.prealloc > 0).then(|| {
-            self.quota.promise(
-                2 * last.prealloc.saturating_add(4096)
-                    + if ann_prealloc > 0 {
-                        ann_prealloc + 4096
-                    } else {
-                        0
-                    },
-            )
+            self.quota
+                .promise(preallocation_promise(last.prealloc, !anns.is_empty()))
         });
         let promise = promise.filter(|_| self.check_disk(self.quota.unwritten()).is_ok());
         let prealloc = if promise.is_some() { last.prealloc } else { 0 };
@@ -866,18 +870,18 @@ impl WriteTxn<'_> {
             Some(m) => crate::annotations::validate_message(m)?,
             None => None,
         };
-        let generation = self.base.generation.clone();
         let bytes = self.wal_bytes();
         // The commit's new terms stay in memory until its fence writes them with its
         // records, so the quota and the free-space reserve count them with the records
         // until the fence has written both. The commit reserves them before it checks,
         // so that the check of a racing fence's preallocation sees them, or this check
         // sees its promise (see `Quota::unwritten`).
-        let terms = generation.dvocab.key_bytes(self.mark.entries());
-        // So does the commit's annotation record, which its fence writes too.
-        let ann_bytes = crate::annotations::record_len(message.as_deref(), store.commit_digests());
-        let reserved = store.quota.reserve(bytes + terms + ann_bytes);
-        self.check_storage_for(self.net_ins > 0, 0)?;
+        let (vocab, annotation) =
+            self.pending_storage_bytes(self.mark.entries(), message.as_deref());
+        let reserved = store
+            .quota
+            .reserve(bytes.saturating_add(vocab).saturating_add(annotation));
+        self.check_storage_for(self.net_ins > 0, 0, 0)?;
         let c = self.next_commit(validation.as_deref());
         // the control frame the commit carries, which names it (spec C26 §7.1)
         let control = self.control_frame(c.seq, c.timestamp_ms)?;
@@ -926,11 +930,22 @@ impl WriteTxn<'_> {
         let staged = 0;
         // The commit record counts the commits before it that may not be durable yet
         // in one byte, which a full queue keeps far below its limit.
-        if grouped && (group.full(bytes + staged) || self.unfenced(store) >= MAX_UNFENCED) {
-            store.drain_group(&mut self.guard, Some(&self.opts))?;
+        if grouped {
+            let full = if self.idle_group {
+                bytes + staged > MAX_BYTES
+            } else {
+                group.full(bytes + staged) || self.unfenced(store) >= MAX_UNFENCED
+            };
+            if full {
+                self.drain_predecessors()?;
+            }
         }
         // Publication only lowers the count, so reading it early stays conservative.
-        let unfenced = u8::try_from(self.unfenced(store)).expect("drained above");
+        let unfenced = if self.idle_group {
+            0
+        } else {
+            u8::try_from(self.unfenced(store)).expect("drained above")
+        };
         let prealloc = self.wal_prealloc();
         let owned_wal = self
             .guard
@@ -973,10 +988,15 @@ impl WriteTxn<'_> {
             // `merge-recorded` can leave a complete record for `c.seq` on disk, so no
             // later commit may reuse `c.seq` before reopen truncates it.
             self.guard.poisoned = true;
+            let measures = store.quota.measures();
             if let Err(e) = store.branching.merges.lock().append(rec) {
+                store.quota.invalidate();
                 group.fail();
                 return Err(e);
             }
+            store
+                .quota
+                .account_append(branching::MERGE_REC as u64, measures);
             store.failpoint("merge-recorded");
         }
         // The annotation record is queued with the WAL records, and the fence writes both:
@@ -1894,7 +1914,7 @@ mod tests {
         // the transaction is abandoned and its term rolled back, as a dry run or a failed
         // commit does
         let generation = t.base.generation.clone();
-        generation.dvocab.rollback(&t.mark).unwrap();
+        generation.rollback_dvocab(&t.mark).unwrap();
         assert_eq!(
             generation.dvocab.len(),
             t.mark.entries(),
@@ -2008,6 +2028,49 @@ mod tests {
 
     fn synced(s: &Store, path: SyncPath) -> u64 {
         s.commit_metrics().sync[path as usize].count()
+    }
+
+    #[test]
+    fn idle_writes_skip_draining_and_keep_prepublication_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), options()).unwrap();
+        assert_eq!(insert(&s, "seed").unwrap().commit.seq, 1);
+        let drains = Arc::new(AtomicUsize::new(0));
+        s.set_failpoint(
+            "group-draining",
+            Some(Arc::new({
+                let drains = drains.clone();
+                move |_| {
+                    drains.fetch_add(1, Ordering::Relaxed);
+                }
+            })),
+        );
+
+        let t = s.write();
+        assert!(t.idle_group && t.guard.staged.is_none());
+        assert_eq!(t.view().commit, 1);
+        assert!(!t.commit().unwrap().committed);
+
+        let mut t = s
+            .try_write_with(
+                CommitKind::Update,
+                crate::guard::WriteOptions {
+                    before_publish: Some(crate::guard::PublishHook::new(|| Err(Error::Cancelled))),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(t.idle_group);
+        let ids = t
+            .encode_quad(&quad("retry"), &mut Default::default())
+            .unwrap();
+        assert!(t.insert(ids).unwrap());
+        assert!(matches!(t.commit(), Err(Error::Cancelled)));
+        assert_eq!(s.snapshot().commit, 1);
+        assert_eq!(insert(&s, "retry").unwrap().commit.seq, 2);
+        assert_eq!(synced(&s, SyncPath::Group), 2);
+        assert_eq!(drains.load(Ordering::Relaxed), 0);
+        s.set_failpoint("group-draining", None);
     }
 
     #[test]
@@ -2126,6 +2189,7 @@ mod tests {
         hit.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(s.snapshot().commit, 0, "synced but not yet published");
         let held = speculative(&s);
+        assert!(!held.idle_group, "a synchronized fence is still active");
         assert_eq!(held.view().len(), 1, "private writer sees its predecessor");
         go.send(()).unwrap();
         let receipt = received
@@ -2136,6 +2200,9 @@ mod tests {
         assert_eq!(s.snapshot().commit, 1);
         drop(held);
         first.join().unwrap();
+        let next = speculative(&s);
+        assert!(next.idle_group);
+        assert_eq!(next.view().commit, 1);
     }
 
     #[test]
@@ -2360,6 +2427,7 @@ mod tests {
             thread::spawn(move || insert(&s, "one"))
         };
         hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(no_wait_insert(&s, "busy"), Err(Error::WriterBusy)));
         let next = {
             let s = s.clone();
             thread::spawn(move || insert(&s, "two"))
@@ -2372,6 +2440,7 @@ mod tests {
         assert_eq!(s.snapshot().commit, 0);
         assert_eq!(s.head_commit().seq, 0);
         assert!(matches!(insert(&s, "three"), Err(Error::Poisoned)));
+        assert!(matches!(no_wait_insert(&s, "three"), Err(Error::Poisoned)));
         drop(s);
         // As with ordinary failed sync, complete but unacknowledged WAL records
         // may recover. Nothing that returned success can disappear. The failed fence

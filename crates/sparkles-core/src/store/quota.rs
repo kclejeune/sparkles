@@ -9,8 +9,8 @@
 //! commits that only delete are never refused.
 //!
 //! Size is measured by walking the directory, at most once a second while a quota is
-//! set, and after every rebuild. Between walks, small commits add the bytes they append
-//! to the write-ahead log. A rebuild is checked with walks of its own.
+//! set, and after every rebuild. Between walks, small commits account for growth in
+//! their files as they write them. A rebuild is checked with walks of its own.
 
 use super::{Store, dir_size, write_atomic};
 use crate::error::{Budget, BudgetKind, Error, Result};
@@ -297,6 +297,17 @@ impl Quota {
         }
     }
 
+    /// Account for a file append outside the WAL fence. A walk that finished since
+    /// the append began may already include it, so refresh the cache in that case.
+    pub(super) fn account_append(&self, bytes: u64, measures_before: u64) {
+        let mut measured = self.measured.lock();
+        if self.measures() == measures_before {
+            self.add(bytes);
+        } else {
+            *measured = None;
+        }
+    }
+
     fn exceeded(limit: u64, requested: u64) -> Error {
         Error::BudgetExceeded(Budget {
             kind: BudgetKind::DatasetBytes,
@@ -305,12 +316,12 @@ impl Quota {
         })
     }
 
-    /// Before a small commit that inserts quads appends `wal_bytes` to the log.
-    pub(crate) fn check_commit(&self, wal_bytes: u64) -> Result<()> {
+    /// Check the quota before a small commit that inserts quads.
+    pub(crate) fn check_commit(&self, pending_bytes: u64) -> Result<()> {
         let Some(limit) = self.limit() else {
             return Ok(());
         };
-        let projected = self.used().saturating_add(wal_bytes);
+        let projected = self.used().saturating_add(pending_bytes);
         if projected > limit {
             return Err(Self::exceeded(limit, projected));
         }
@@ -342,11 +353,11 @@ impl Quota {
     }
 
     /// For a preview of a small commit: the quota, the bytes used, and the bytes after
-    /// appending `wal_bytes` (`None` without a quota).
-    pub(crate) fn project_commit(&self, wal_bytes: u64) -> Option<(u64, u64, u64)> {
+    /// writing its pending records (`None` without a quota).
+    pub(crate) fn project_commit(&self, pending_bytes: u64) -> Option<(u64, u64, u64)> {
         let limit = self.limit()?;
         let used = self.used();
-        Some((limit, used, used.saturating_add(wal_bytes)))
+        Some((limit, used, used.saturating_add(pending_bytes)))
     }
 
     /// For a preview of a rebuild: the quota, the bytes used before the generation in

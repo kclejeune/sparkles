@@ -450,6 +450,12 @@ impl Store {
             })
             .collect();
         let mut cur = self.prefixes.lock();
+        if self
+            .prefixes_poisoned
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Poisoned);
+        }
         let mut next = cur.clone();
         let (mut set, mut removed) = (0, 0);
         for op in ops {

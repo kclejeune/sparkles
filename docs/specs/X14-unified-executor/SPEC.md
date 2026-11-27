@@ -277,16 +277,75 @@ streaming `str-pair-names` read 1.000 of the base and `str-pair-colleague` 1.118
 that build with one thread, the shared table reads 0.952 on `str-pair-colleague` and
 0.907 on `str-pair-lt` in streaming execution and 0.931 and 0.908 in eager execution,
 while `str-pair-names` takes 5.3% longer in streaming and 9.7% longer in eager execution.
-The names query's table grows from its first 2^16 slots during the query. On wally, a
+The names query's table grew from its first 2^16 slots during the query. On wally, a
 first table as large as the vocabulary's clamp closed that gap but made `str-pair-lt`,
-whose table never grows, 1.5% slower in streaming and 2.2% in eager execution, and item 1140 follows the cost of the growth.
-Item 1140 sizes the first table from a stack-allocated stratified sample of the first
-eligible mask's two columns, clamped to the vocabulary's strings, the cache cap and the
-remaining memory budget, stepping down by halves to 2^10 slots before refusing, so
+whose table never grows, 1.5% slower in streaming and 2.2% in eager execution. Item 1140
+now validates the initial sample of `string_order_mask` in left-to-right order before
+sizing or installing the table, so ineligible base-vocabulary literals fall back without
+reserving memory or locking cache initialization while cursor decode refusals keep their
+order and already-decoded floors seed the cache. For the first eligible mask, it sizes
+the initial table from a stack-allocated stratified sample of the two columns using
+widened arithmetic, clamped to the vocabulary's strings, the cache cap and the remaining
+memory budget and stepping down by halves to 2^10 slots before refusing, so
 small-distinct and one-unique-column inputs stay compact while large repeating inputs
-pre-size without growth. When a table does grow, live entries are copied directly into
-the replacement table before publication so lookups probe only the current table. The
-timing comparison is pending.
+pre-size without growth. When a table does grow, live non-zero entries are copied
+directly into the replacement table before publication and `FloorMap` drops its secondary
+previous-table lookup and caches `first_triple`, so lookups probe only the current table.
+
+On `atlas` at 1.05M triples in twelve alternating ABBA and BAAB rounds of 16 measured
+requests per query and server process, with four processes per round across 12 rounds,
+`329f82f9` against its own base `a643de75` returned byte-identical sorted TSV answers
+across every cell and same-binary control, and `f0240009` only extracted an inline
+stratum-bounds helper and tightened a unit test. Both one-thread A/B cells stayed within
+the 3% spread limit, with A/B spreads of 1.79% in streaming execution and 1.77% in eager
+execution. The separate same-binary A/A controls ran six alternating ABBA and BAAB rounds
+of 12 measured requests per query and server process with four processes per round. The
+`eager-1t` A/A control passed at 1.45% spread, whereas the `streaming-1t` A/A control
+failed the 3% limit at 4.55%. Against `a643de75`, `str-pair-names` improved by 3.0% in
+streaming execution, at 0.970 times the base's execution time, 27.40 against 28.23 ms,
+with a 95% interval of 0.966 to 0.974 and 0.975 times the instructions per request. In
+eager execution it improved by 10.0%, at 0.900 times, 24.95 against 27.68 ms, with a pooled
+ratio of 0.901, a 95% interval of 0.896 to 0.903 and 0.918 times the instructions per
+request, and all twelve rounds were faster in both modes. This Atlas comparison measures
+the gain of `329f82f9` against `a643de75` alone. The earlier Forge gap of 5.3% in
+streaming and 9.7% in eager execution (`174de1f8..3a8b7adb`) stays historical context on a
+different host and revision pair, and claiming recovery against the old per-worker maps
+would need a direct comparison on one host. Eager `str-pair-lt` stayed flat at 1.000
+times, 9.33 against 9.34 ms with a 95% interval of 0.997 to 1.002 and 0.994 times the
+instructions, and streaming `str-filter-two` crossed 1.0 at 1.002 times with an interval
+of 0.993 to 1.008. Both 12-thread cells failed the 3% spread diagnostic without a repeat
+run, with A/B spreads of 7.19% in streaming execution and 40.50% in eager execution
+against 9.37% and 25.30% in their A/A controls. Their ratios are therefore observations
+from cells that failed the spread diagnostic, including eager `str-pair-names` at 0.954
+times with a 95% interval of 0.946 to 0.962 across twelve faster rounds. Six one-thread
+observations kept their 95% interval above 1.0 with more than 0.5 µs of added time despite
+unchanged or lower per-request instruction counts. Added times below use the formula
+`pooled base median × (order-balanced ratio − 1)`, and all six also exceed 0.5 µs on the
+median of the 12 paired round differences, where eager `str-filter-two` reads +15.6 µs
+rather than +20.2 µs. Item 1089 tracks all six for profiling and recovery on Intel
+hardware by the second batch after the one that lands item 1140, with the `streaming-1t`
+A/A failure disclosed above and eager `str-pair-colleague` awaiting confirmation:
+
+* On `atlas`, `a643de75` to `329f82f9`, streaming `str-pair-colleague` reads 1.0049 times
+  with a 95% interval of 1.0006 to 1.0078, +49.1 µs across 9 of 12 slower rounds and
+  0.9979 times the instructions.
+* On `atlas`, `a643de75` to `329f82f9`, streaming `str-pair-lt` reads 1.0021 times with a
+  95% interval of 1.0004 to 1.0029, +24.0 µs across 10 of 12 slower rounds and 0.9939
+  times the instructions.
+* On `atlas`, `a643de75` to `329f82f9`, streaming `lang-filter` reads 1.0047 times with a
+  95% interval of 1.0038 to 1.0060, +6.1 µs across all 12 rounds and 1.0000 times the
+  instructions.
+* On `atlas`, `a643de75` to `329f82f9`, eager `str-pair-colleague` reads 1.0046 times with
+  a 95% interval of 1.0014 to 1.0067, +36.6 µs across 9 of 12 slower rounds and 0.9978
+  times the instructions. In the valid `eager-1t` A/A control it read 1.0028 times with an
+  overlapping 95% interval of 1.0008 to 1.0039 and +22.6 µs, so this cost awaits
+  confirmation.
+* On `atlas`, `a643de75` to `329f82f9`, eager `lang-filter` reads 1.0061 times with a 95%
+  interval of 1.0043 to 1.0073, +7.9 µs across all 12 rounds and 1.0000 times the
+  instructions.
+* On `atlas`, `a643de75` to `329f82f9`, eager `str-filter-two` reads 1.0008 times with a
+  95% interval of 1.00003 to 1.0015, +20.2 µs by the formula (+15.6 µs paired round
+  median) across 9 of 12 slower rounds and 1.0000 times the instructions.
 
 `str-pair-colleague` holds 30,077 and 25,967 distinct names in its 30,077 rows, so its
 floors are nearly all computed once, and in streaming execution they cost more than
@@ -1876,6 +1935,33 @@ included 1.0, as did the eager control's. A streamed answer still took 0.21 to 0
 more wall time than an eager one on those queries, against 0.23 to 0.31 ms in the base,
 because the hand-off between threads that the phase trace measured lies outside the
 writer.
+
+Both thread-handoff changes of item 534 have now landed on top of item 828's batch-source
+writers. Pool-routed cursors, both explicit `execution=streaming` and pool-routed
+`execution=auto` or eager-trial requests, open and serialize in one blocking-pool task
+through `stream::open_and_serialize_controlled`, removing the return wake to the handler
+and the second pool wake while keeping open-phase error responses, concurrency permit
+lifetimes, `StreamControl`, and the execution-to-serialization timing split unchanged.
+When a request targets the current snapshot and an in-place runtime is available, eligible
+`execution=auto` requests open and drain cursors in place through resumable `Send`
+`CursorWriter` sessions in `sparkles-core`. Eligibility covers texts whose quick history
+retains automatic execution and unseen first runs that carry a timeout, arrive after a
+server-idle interval (`FIRST_RUN_QUIET`) and pass a conservative text scan rejecting any
+case-insensitive `service` substring or `\u` or `\U` Unicode escape prefix.
+A cursor whose encoded output finishes within `STREAM_AFTER` returns a whole response with
+`Content-Length` and zero thread hops, and a cursor that would cross `STREAM_AFTER` pauses
+before buffering an oversized row, quad or footer and hands off the cursor, encoder state
+and buffered `SwitchWriter` prefix to a blocking streaming task whose initial chunk stays
+within `STREAM_AFTER + 1` bytes and whose subsequent chunks drain in `CHUNK`-sized
+backpressured frames. Explicit `execution=streaming` keeps the blocking-pool route with
+early first-batch or 64 KiB commit and immediate cancellation on client disconnect, and
+queries that call graph algorithms are never recorded as quick on either route. Core
+session parity tests and HTTP router integration tests cover route selection, format parity
+across all SELECT, ASK and graph formats (including JSON-LD, with decoded statement
+equality for Jena binary formats and native JSON), open errors, memory, result-byte and
+row budgets on both sides of commit, mid-stream timeouts, and client-disconnect
+cancellation. The quiet `atlas` timing comparison against pre-handoff `5369883f` is
+pending.
 
 ### One writer per format and exact row accounting (items 828 and 243)
 

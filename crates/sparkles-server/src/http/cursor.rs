@@ -150,6 +150,7 @@ struct OpenMeta {
     seq: u64,
     resolved: Option<sparkles::history::Resolved>,
     derived: Option<Arc<sparkles::sparql::reasoning::Applied>>,
+    algorithmic: bool,
     fmt: ResolvedFormat,
     t0: Option<std::time::SystemTime>,
     quick_began: Instant,
@@ -367,14 +368,16 @@ fn finish_serialized_response(
     let abort = serialized.abort_handle();
     let body = match serialized {
         stream::Serialized::Whole { body, .. } => {
-            if let Some((key, began)) = quick
-                && *ended.lock() == Some(CursorStatus::Complete)
-            {
-                let ms = began.elapsed().as_secs_f64() * 1000.0;
-                if meta.fmt.kind == QueryKind::Ask {
-                    QUICK.record_ask(key, ms);
-                } else {
-                    QUICK.record_cursor(key, ms);
+            if let Some((key, began)) = quick {
+                if meta.algorithmic {
+                    QUICK.record(key, f64::INFINITY);
+                } else if *ended.lock() == Some(CursorStatus::Complete) {
+                    let ms = began.elapsed().as_secs_f64() * 1000.0;
+                    if meta.fmt.kind == QueryKind::Ask {
+                        QUICK.record_ask(key, ms);
+                    } else {
+                        QUICK.record_cursor(key, ms);
+                    }
                 }
             }
             Body::from(body)
@@ -469,6 +472,7 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
                 ExecutionMode::Streaming,
             )?;
             let derived = cursor.reasoning();
+            let algorithmic = cursor.uses_algorithms();
             let kind = cursor.kind();
             let fmt = ResolvedFormat::resolve(kind, format, thrift, rdf_format, native_graph);
             let control = stream::StreamControl::new(
@@ -489,6 +493,7 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
                     seq,
                     resolved,
                     derived,
+                    algorithmic,
                     fmt: ResolvedFormat::resolve(kind, format, thrift, rdf_format, native_graph),
                     t0,
                     quick_began,
@@ -658,6 +663,7 @@ pub(super) async fn run_auto_pool(
                     #[cfg(test)]
                     route_stats::note_pool_auto(quick_key);
                     let derived = cursor.reasoning();
+                    let algorithmic = cursor.uses_algorithms();
                     let kind = cursor.kind();
                     let fmt =
                         ResolvedFormat::resolve(kind, format, thrift, rdf_format, native_graph);
@@ -679,6 +685,7 @@ pub(super) async fn run_auto_pool(
                             seq,
                             resolved,
                             derived,
+                            algorithmic,
                             fmt: ResolvedFormat::resolve(
                                 kind,
                                 format,
@@ -908,6 +915,7 @@ async fn run_in_place_mode(
             other => other,
         };
         let derived = execution.reasoning();
+        let algorithmic = execution.uses_algorithms();
         let kind = execution.kind();
         let fmt = ResolvedFormat::resolve(kind, format, thrift, rdf_format, native_graph);
         let control = stream::StreamControl::new(
@@ -920,6 +928,7 @@ async fn run_in_place_mode(
             seq,
             resolved,
             derived,
+            algorithmic,
             fmt,
             t0,
             quick_began: t,
@@ -1153,7 +1162,7 @@ async fn run_in_place_mode(
         } => {
             #[cfg(test)]
             route_stats::note_in_place_whole(quick_key);
-            if body.len() > stream::STREAM_AFTER {
+            if meta.algorithmic || body.len() > stream::STREAM_AFTER {
                 QUICK.record(quick_key, f64::INFINITY);
             } else if stats.status == CursorStatus::Complete {
                 let ms = meta.quick_began.elapsed().as_secs_f64() * 1000.0;
@@ -1400,6 +1409,7 @@ pub(super) async fn serve(
     } = serve;
     let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
     let derived = cursor.reasoning();
+    let algorithmic = cursor.uses_algorithms();
     let kind = cursor.kind();
     let fmt = ResolvedFormat::resolve(kind, format, thrift, rdf_format, native_graph);
     let write_fmt = ResolvedFormat::resolve(kind, format, thrift, rdf_format, native_graph);
@@ -1481,6 +1491,7 @@ pub(super) async fn serve(
             seq,
             resolved,
             derived,
+            algorithmic,
             fmt,
             t0,
             quick_began,

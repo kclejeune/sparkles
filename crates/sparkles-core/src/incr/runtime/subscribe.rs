@@ -22,7 +22,12 @@ impl Runtime {
         let budget = o
             .max_memory_bytes
             .unwrap_or(self.opts.read().live_memory_bytes);
-        let shared = Arc::new(Shared::new(budget));
+        let restricted = access.as_ref().is_some_and(|a| !a.reads_everything());
+        let shared = Arc::new(Shared::new(
+            budget,
+            restricted,
+            Some(store.family_managed()),
+        ));
         let mut deferred_reg = DeferredDrops::default();
         let cell = {
             let mut reg = self.reg.lock();
@@ -79,8 +84,10 @@ impl Runtime {
                     .map_or(budget, |cur| cur.max(budget));
                 st.circuit.set_local_limit(Some(next_limit));
                 let status = cell.info.lock().status.clone();
-                if status != Status::Ready
-                    && let Err(e) = self.evaluate_for_live(store, &cell, st, &mut deferred_state)
+                let ev_mismatch = st.evidence_mismatch(&store.snapshot());
+                if (status != Status::Ready || ev_mismatch)
+                    && let Err(e) =
+                        self.evaluate_for_live(store, &cell, st, ev_mismatch, &mut deferred_state)
                 {
                     return Err(e);
                 }
@@ -101,9 +108,10 @@ impl Runtime {
                 // overtakes it
                 if let Some((e, mut lease)) = first {
                     let shared_lease = st.detach_event_lease(&mut lease);
+                    let stamp = Some(st.circuit.evidence_stamp());
                     deferred_state
                         .queued
-                        .extend(shared.push_leased(e, shared_lease));
+                        .extend(shared.push_leased(e, shared_lease, stamp));
                 }
                 let last = st.circuit.applied;
                 st.subs.push(Sub {
@@ -172,43 +180,64 @@ impl Runtime {
         Ok(count)
     }
 
-    /// Evaluate the circuit a live query joins when it is not ready, and send its
-    /// other subscribers the new result as a `reset`.
+    /// Evaluate the circuit a live query joins when it is not ready or its evidence view
+    /// is superseded, and send its other subscribers the new result as a `reset`.
     fn evaluate_for_live(
         &self,
         store: &Store,
         cell: &Cell,
         st: &mut Slot,
+        ev_mismatch: bool,
         deferred: &mut DeferredDrops,
     ) -> Result<()> {
         let snap = store.snapshot();
         let had_snap = st.circuit.snap.is_some();
+        let restricted = st
+            .circuit
+            .access
+            .as_ref()
+            .is_some_and(|a| !a.reads_everything());
+        let prev_stamp = st.circuit.evidence_stamp();
+        let ev_mismatch = ev_mismatch || (had_snap && st.evidence_mismatch(&snap));
         let t0 = Instant::now();
         if let Err(e) = st.evaluate(snap, &self.control()) {
-            if !had_snap {
+            if ev_mismatch {
+                st.clear_history();
+                self.fail(cell, st, &e, deferred);
+            } else if !had_snap {
                 st.circuit.clear_state();
             }
             return Err(e);
         }
         cell.info.lock().status = Status::Ready;
         self.note_pass(cell, st, t0.elapsed(), false);
-        if std::mem::take(&mut st.rebased) {
+        let ev_boundary_crossed =
+            restricted && had_snap && (ev_mismatch || st.circuit.evidence_stamp() != prev_stamp);
+        if std::mem::take(&mut st.rebased) || ev_boundary_crossed {
             st.clear_history();
         }
-        self.live_budgets(st, deferred);
+        self.live_budgets_inner(st, ev_boundary_crossed, deferred);
         st.prune_dead_subs();
         if !st.subs.is_empty() {
             // other subscribers see the new result as a reset
             let applied = st.circuit.applied;
+            let stamp = Some(st.circuit.evidence_stamp());
             match st.event_budgeted(true) {
                 Ok((reset, mut lease)) => {
                     let shared_lease = st.detach_event_lease(&mut lease);
                     for s in &mut st.subs {
                         if let Some(sh) = s.shared.upgrade() {
                             s.last = applied;
-                            deferred
-                                .queued
-                                .extend(sh.push_leased(reset.clone(), shared_lease.clone()));
+                            let displaced = if ev_boundary_crossed {
+                                sh.replace_leased(
+                                    reset.clone(),
+                                    shared_lease.clone(),
+                                    stamp.clone(),
+                                )
+                            } else {
+                                sh.push_leased(reset.clone(), shared_lease.clone(), stamp.clone())
+                            };
+                            deferred.queued.extend(displaced);
                         }
                     }
                     deferred
@@ -242,6 +271,16 @@ impl Runtime {
         // an ordered window keeps no positions for past commits, and a circuit built
         // again since the subscriber's event may order ties otherwise, even at its commit
         if st.circuit.ordered() {
+            return st.event_budgeted(true).map(Some);
+        }
+        // A commit number cannot establish which side of a same-commit evidence
+        // configuration change the subscriber saw; return a fresh reset instead of
+        // skipping, replaying commit-keyed history, or diffing an earlier snapshot.
+        if st.circuit.access.as_ref().is_some_and(|a| {
+            !a.reads_everything()
+                && (st.circuit.evidence_key().is_some()
+                    || store.has_evidence_visibility_for_access(a))
+        }) {
             return st.event_budgeted(true).map(Some);
         }
         if after == applied {

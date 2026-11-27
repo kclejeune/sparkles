@@ -451,13 +451,14 @@ fn slow_responses_time_out() {
     };
     let t = Instant::now();
     let m = failure(service(&s.url("/slow-headers"), false, quick.clone()));
-    assert!(m.contains("no complete response within 1 s"), "{m}");
+    // Dispatch uses the time remaining after request setup.
+    assert!(m.contains("no complete response within "), "{m}");
     let t2 = Instant::now();
     let m = failure(service(&s.url("/trickle"), false, quick.clone()));
-    assert!(m.contains("no complete response within 1 s"), "{m}");
+    assert!(m.contains("no complete response within "), "{m}");
     let t3 = Instant::now();
     let (r, _) = load(&s.url("/trickle"), quick);
-    assert!(failure(r).contains("no complete response within 1 s"));
+    assert!(failure(r).contains("no complete response within "));
     assert!(t2 - t < Duration::from_secs(3), "{:?}", t2 - t);
     assert!(t3 - t2 < Duration::from_secs(3), "{:?}", t3 - t2);
     assert!(t3.elapsed() < Duration::from_secs(3));

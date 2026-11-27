@@ -8,9 +8,17 @@
 //! and says why.
 
 use super::{AskMode, Asking, prompts};
+use crate::mcp::errors::ToolError;
 use crate::models::{OutputSchema, Pair, Prompt, Role};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+/// The most cluster members listed inline per identity line in the map prompt.
+const PROMPT_IDENTITY_MEMBERS: usize = 8;
+/// The most identity lines attached to one finding in the map prompt.
+const PROMPT_IDENTITIES_PER_FINDING: usize = 8;
+/// The most distinct identity links rendered across one report in the map prompt.
+const PROMPT_IDENTITIES_PER_REPORT: usize = 32;
 
 /// The most reports a global answer reads (§7.2).
 pub const MAX_REPORTS: usize = crate::graphrag::read::DEFAULT_MAX_REPORTS;
@@ -103,43 +111,426 @@ pub fn reduce_schema() -> OutputSchema {
     }
 }
 
+fn format_identity_line(id: &Value, max_members: usize) -> Option<String> {
+    let clean = |s: &str| s.replace(['\r', '\n'], " ");
+    let entity = id["entity"].as_str()?;
+    let rep = id["representative"].as_str()?;
+    let members: Vec<String> = id["members"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|m| format!("<{}>", clean(m)))
+        .collect();
+    let truncated = id["membersComplete"] == false;
+    let shown = members.len().min(max_members);
+    if members.len() > 1 || truncated {
+        if shown > 0 {
+            let mut detail = members[..shown].join(", ");
+            if members.len() > shown {
+                detail.push_str(&format!(", +{} more", members.len() - shown));
+            }
+            if truncated {
+                detail.push_str(", truncated");
+            }
+            Some(format!(
+                "Identity: <{}> resolvesTo <{}> (cluster: {detail})",
+                clean(entity),
+                clean(rep),
+            ))
+        } else if truncated {
+            let suffix = if members.len() > 1 {
+                format!(" (cluster: +{} more, truncated)", members.len())
+            } else {
+                " (cluster: truncated)".to_string()
+            };
+            Some(format!(
+                "Identity: <{}> resolvesTo <{}>{suffix}",
+                clean(entity),
+                clean(rep),
+            ))
+        } else {
+            Some(format!(
+                "Identity: <{}> resolvesTo <{}> (cluster: {} members)",
+                clean(entity),
+                clean(rep),
+                members.len(),
+            ))
+        }
+    } else {
+        Some(format!(
+            "Identity: <{}> resolvesTo <{}>",
+            clean(entity),
+            clean(rep)
+        ))
+    }
+}
+
+/// The bare `<entity> resolvesTo <rep>` identity line, never truncated mid-IRI.
+fn bare_identity_line(id: &Value) -> Option<String> {
+    let clean = |s: &str| s.replace(['\r', '\n'], " ");
+    Some(format!(
+        "Identity: <{}> resolvesTo <{}>",
+        clean(id["entity"].as_str()?),
+        clean(id["representative"].as_str()?),
+    ))
+}
+
+fn omission_note(omitted: usize) -> String {
+    format!("Identity: (+{omitted} more identities)")
+}
+
+fn make_head(n: usize, title: &str, continued: bool, max_head_chars: usize) -> String {
+    let prefix = format!("R{n} ");
+    let suffix = if continued { " (continued)\n" } else { "\n" };
+    let overhead = prefix.chars().count() + suffix.chars().count();
+    if max_head_chars <= overhead {
+        return if continued {
+            format!("R{n} (continued)\n")
+        } else {
+            format!("R{n}\n")
+        };
+    }
+    let t = prompts::cut(title, max_head_chars - overhead);
+    format!("{prefix}{t}{suffix}")
+}
+
+struct PackedUnit {
+    finding_line: String,
+    id_lines: Vec<String>,
+    emitted_ents: Vec<String>,
+    /// Chars used by finding text + complete bare links + omission note (without optional
+    /// inline cluster member expansion).
+    core_chars: usize,
+    /// Chars used by minimum finding label/snippet + complete bare links + omission note.
+    must_chars: usize,
+    /// Chars used by admitted complete bare links + omission note.
+    bare_chars: usize,
+    /// Number of complete bare links admitted.
+    admitted_count: usize,
+    /// Number of eligible bare links dropped for lack of space in this allowance.
+    fit_omitted: usize,
+    /// Whether an omission marker was needed but could not fit.
+    note_missing: bool,
+    /// Whether the full finding text fit without truncation.
+    finding_complete: bool,
+}
+
+impl PackedUnit {
+    fn total_chars(&self) -> usize {
+        self.finding_line.chars().count()
+            + 1
+            + self
+                .id_lines
+                .iter()
+                .map(|l| l.chars().count() + 1)
+                .sum::<usize>()
+    }
+}
+
 /// A report as the map step sees it, numbered from 1 in the selection: its title,
 /// summary and numbered findings, in parts that each fit `budget` tokens. A later part
 /// repeats the title, so every finding keeps its label `F{n}.{i}`, and a line longer than
-/// the budget is cut. Each part comes with the indexes of the findings it shows.
+/// the budget is cut. Space is reserved for the finding label, complete bare identity
+/// links and findings that fit in a fresh block before spending space on the title,
+/// summary or inline cluster member lists; an un-fittable link is omitted with an
+/// explicit marker rather than clipped mid-IRI, and no empty-finding block is emitted.
 pub fn report_blocks(n: usize, r: &Value, budget: u64) -> Vec<(String, Vec<usize>)> {
     let max_chars = (budget * CHARS_PER_TOKEN).max(64) as usize;
     let title = r["title"].as_str().unwrap_or("");
-    let mut lines = vec![(
-        None,
-        format!("Summary: {}", r["summary"].as_str().unwrap_or("")),
-    )];
-    for (i, f) in r["findings"].as_array().into_iter().flatten().enumerate() {
-        lines.push((
-            Some(i),
-            format!("F{n}.{} {}", i + 1, f["text"].as_str().unwrap_or("")),
-        ));
+    let findings = r["findings"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+
+    // Map each report identity to the findings that reference it (by `about` and cited
+    // triple terms). Any unmatched identity (e.g. synthetic fixtures omitting `about`)
+    // attaches to the first finding so it stays paired with a finding label.
+    let all_ids: Vec<&Value> = r["identities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|id| id["entity"].is_string() && id["representative"].is_string())
+        .collect();
+    let by_entity: HashMap<&str, &Value> = all_ids
+        .iter()
+        .filter_map(|id| id["entity"].as_str().map(|e| (e, *id)))
+        .collect();
+    let mut finding_ids: Vec<Vec<&Value>> = vec![Vec::new(); findings.len()];
+    let mut assigned: BTreeSet<&str> = BTreeSet::new();
+    for (i, f) in findings.iter().enumerate() {
+        for ent in finding_referenced_entities(f) {
+            if let Some(&id) = by_entity.get(ent.as_str()) {
+                finding_ids[i].push(id);
+                assigned.insert(id["entity"].as_str().unwrap_or(""));
+            }
+        }
     }
-    let mut out: Vec<(String, Vec<usize>)> = Vec::new();
-    let mut cur = format!("R{n} {title}\n");
-    let mut shown: Vec<usize> = Vec::new();
-    let mut has_line = false;
-    for (finding, l) in lines {
-        let head = format!("R{n} {title} (continued)\n");
-        let l = prompts::cut(
-            &l,
-            max_chars.saturating_sub(head.chars().count() + 1).max(32),
+    if !findings.is_empty() {
+        for id in &all_ids {
+            if let Some(ent) = id["entity"].as_str()
+                && !assigned.contains(ent)
+            {
+                finding_ids[0].push(*id);
+                assigned.insert(ent);
+            }
+        }
+    }
+    let mut allowed: BTreeSet<&str> = BTreeSet::new();
+    for ids in &finding_ids {
+        for id in ids {
+            if allowed.len() >= PROMPT_IDENTITIES_PER_REPORT {
+                break;
+            }
+            if let Some(e) = id["entity"].as_str() {
+                allowed.insert(e);
+            }
+        }
+    }
+    let omitted_report = assigned.len().saturating_sub(allowed.len());
+
+    let full_summary = format!("Summary: {}", r["summary"].as_str().unwrap_or(""));
+    if findings.is_empty() {
+        let head0 = make_head(n, title, false, (max_chars / 4).max(32));
+        let summary_cap = max_chars.saturating_sub(head0.chars().count() + 1).max(32);
+        let mut cur = head0;
+        cur.push_str(&prompts::cut(&full_summary, summary_cap));
+        cur.push('\n');
+        return vec![(cur, Vec::new())];
+    }
+
+    let build_unit = |i: usize,
+                      f: &Value,
+                      f_ids: &[&Value],
+                      block_ids: &BTreeSet<String>,
+                      avail: usize,
+                      extra_omitted: usize|
+     -> PackedUnit {
+        let label = format!("F{n}.{} ", i + 1);
+        let label_len = label.chars().count();
+        let full_finding = format!("{label}{}", f["text"].as_str().unwrap_or(""));
+        let full_finding_chars = full_finding.chars().count() + 1;
+        let min_finding_chars = (label_len + 16).min(full_finding_chars);
+
+        let mut eligible: Vec<(&Value, String)> = Vec::new();
+        let mut omitted = extra_omitted;
+        for &id in f_ids {
+            let Some(e) = id["entity"].as_str() else {
+                continue;
+            };
+            if !allowed.contains(e) || block_ids.contains(e) {
+                continue;
+            }
+            let Some(bare) = bare_identity_line(id) else {
+                continue;
+            };
+            if eligible.len() < PROMPT_IDENTITIES_PER_FINDING {
+                eligible.push((id, bare));
+            } else {
+                omitted += 1;
+            }
+        }
+
+        // Pass 1: admit complete bare links without ever cutting an IRI. Reserve at
+        // least `min_finding_chars` for the finding label/snippet; allow subsequent
+        // links to use leftover space beyond the full finding or half the block.
+        let first_cap = avail.saturating_sub(min_finding_chars);
+        let multi_cap = (avail / 2)
+            .max(avail.saturating_sub(full_finding_chars))
+            .min(first_cap);
+        let mut admitted: Vec<(&Value, String)> = Vec::new();
+        let mut bare_chars = 0usize;
+        let mut fit_omitted = 0usize;
+        for (id, bare) in eligible {
+            let bare_len = bare.chars().count() + 1;
+            let cap = if admitted.is_empty() {
+                first_cap
+            } else {
+                multi_cap
+            };
+            let note_reserve = if omitted > 0 {
+                omission_note(omitted).chars().count() + 1
+            } else {
+                0
+            };
+            if bare_chars + bare_len + note_reserve <= cap {
+                bare_chars += bare_len;
+                admitted.push((id, bare));
+            } else {
+                omitted += 1;
+                fit_omitted += 1;
+            }
+        }
+
+        // Keep an explicit omission marker whenever any identity was omitted.
+        let mut note_line: Option<String> = None;
+        if omitted > 0 {
+            loop {
+                let note = omission_note(omitted);
+                let nlen = note.chars().count() + 1;
+                if bare_chars + nlen <= first_cap {
+                    bare_chars += nlen;
+                    note_line = Some(note);
+                    break;
+                }
+                let Some((_, popped)) = admitted.pop() else {
+                    break;
+                };
+                bare_chars = bare_chars.saturating_sub(popped.chars().count() + 1);
+                omitted += 1;
+                fit_omitted += 1;
+            }
+        }
+        let note_missing = omitted > 0 && note_line.is_none();
+
+        // Pass 2: give the finding all remaining space after bare links and any marker.
+        let finding_cap = avail.saturating_sub(bare_chars + 1).max(label_len);
+        let finding_line = prompts::cut(&full_finding, finding_cap);
+        let actual_finding_chars = finding_line.chars().count() + 1;
+        let finding_complete = finding_line == full_finding;
+        let core_chars = actual_finding_chars + bare_chars;
+        let must_chars = min_finding_chars + bare_chars;
+        let admitted_count = admitted.len();
+
+        // Pass 3: spend only remaining slack on inline cluster member lists so members
+        // never steal space from the finding or a complete bare link.
+        let mut slack = avail.saturating_sub(core_chars);
+        for (id, line) in &mut admitted {
+            let cur_len = line.chars().count();
+            for k in (0..=PROMPT_IDENTITY_MEMBERS).rev() {
+                if let Some(cand) = format_identity_line(id, k) {
+                    let cand_len = cand.chars().count();
+                    if cand_len <= cur_len + slack {
+                        slack = (cur_len + slack) - cand_len;
+                        *line = cand;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let emitted_ents: Vec<String> = admitted
+            .iter()
+            .filter_map(|(id, _)| id["entity"].as_str().map(str::to_string))
+            .collect();
+        let mut id_lines: Vec<String> = admitted.into_iter().map(|(_, l)| l).collect();
+        if let Some(note) = note_line {
+            id_lines.push(note);
+        }
+
+        PackedUnit {
+            finding_line,
+            id_lines,
+            emitted_ents,
+            core_chars,
+            must_chars,
+            bare_chars,
+            admitted_count,
+            fit_omitted,
+            note_missing,
+            finding_complete,
+        }
+    };
+
+    let last_idx = findings.len() - 1;
+    let empty_ids: BTreeSet<String> = BTreeSet::new();
+    let min_head0_len = format!("R{n}\n").chars().count();
+    let min_cont_len = format!("R{n} (continued)\n").chars().count();
+    let desired_title_cap = (max_chars / 4).max(32);
+    let start_head = |idx: usize, f: &Value, continued: bool, extra: usize| -> String {
+        let min_len = if continued {
+            min_cont_len
+        } else {
+            min_head0_len
+        };
+        let probe = build_unit(
+            idx,
+            f,
+            &finding_ids[idx],
+            &empty_ids,
+            max_chars.saturating_sub(min_len),
+            extra,
         );
-        if has_line && cur.chars().count() + l.chars().count() + 1 > max_chars {
+        let reserve = if probe.finding_complete {
+            probe.core_chars
+        } else if continued {
+            // Block 0 already carries the title; never let a repeated continuation title
+            // steal space from an already-truncated finding or its bare identity links.
+            max_chars.saturating_sub(min_len)
+        } else if probe.admitted_count >= 2 {
+            probe.must_chars.max(probe.bare_chars.saturating_mul(2))
+        } else {
+            probe.must_chars
+        };
+        let head_cap = desired_title_cap
+            .min(max_chars.saturating_sub(reserve))
+            .max(min_len);
+        make_head(n, title, continued, head_cap)
+    };
+
+    let extra0 = if last_idx == 0 { omitted_report } else { 0 };
+    let head0 = start_head(0, &findings[0], false, extra0);
+
+    let mut out: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut cur = head0;
+    let mut shown: Vec<usize> = Vec::new();
+    let mut cur_ids: BTreeSet<String> = BTreeSet::new();
+
+    // Reserve space for the first finding (and its bare identity links) before spending
+    // block 0 space on the summary.
+    let block0_body = max_chars.saturating_sub(cur.chars().count());
+    let probe_body = build_unit(
+        0,
+        &findings[0],
+        &finding_ids[0],
+        &empty_ids,
+        block0_body,
+        extra0,
+    );
+    let body_reserve = if probe_body.finding_complete {
+        probe_body.core_chars
+    } else if probe_body.admitted_count >= 2 {
+        probe_body
+            .must_chars
+            .max(probe_body.bare_chars.saturating_mul(2))
+    } else {
+        probe_body.must_chars
+    };
+    let summary_avail = if probe_body.finding_complete {
+        block0_body.saturating_sub(body_reserve)
+    } else {
+        (block0_body / 4).min(block0_body.saturating_sub(body_reserve))
+    };
+    if summary_avail >= 16 {
+        let summary_line = prompts::cut(&full_summary, summary_avail - 1);
+        cur.push_str(&summary_line);
+        cur.push('\n');
+    }
+
+    for (i, f) in findings.iter().enumerate() {
+        let extra = if i == last_idx { omitted_report } else { 0 };
+        let avail_now = max_chars.saturating_sub(cur.chars().count());
+        let mut unit = build_unit(i, f, &finding_ids[i], &cur_ids, avail_now, extra);
+        if !shown.is_empty()
+            && (cur.chars().count() + unit.total_chars() > max_chars
+                || !unit.finding_complete
+                || unit.fit_omitted > 0
+                || unit.note_missing)
+        {
+            let cont_head = start_head(i, f, true, extra);
             out.push((
-                std::mem::replace(&mut cur, head),
+                std::mem::replace(&mut cur, cont_head),
                 std::mem::take(&mut shown),
             ));
+            cur_ids.clear();
+            let fresh_avail = max_chars.saturating_sub(cur.chars().count());
+            unit = build_unit(i, f, &finding_ids[i], &cur_ids, fresh_avail, extra);
         }
-        cur.push_str(&l);
+        cur.push_str(&unit.finding_line);
         cur.push('\n');
-        shown.extend(finding);
-        has_line = true;
+        for il in unit.id_lines {
+            cur.push_str(&il);
+            cur.push('\n');
+        }
+        cur_ids.extend(unit.emitted_ents);
+        shown.push(i);
     }
     out.push((cur, shown));
     out
@@ -280,11 +671,55 @@ pub fn uncited_sentences(t: &str) -> Vec<String> {
     out
 }
 
+/// Whether a `community_reports` error is a policy, configuration, projection or
+/// authority refusal that must propagate even during `mode: "auto"` probing.
+fn is_policy_refusal(code: &str) -> bool {
+    matches!(
+        code,
+        "bad-argument"
+            | "configuration-history-inactive"
+            | "evidence-settings-drift"
+            | "projection-unavailable"
+            | "forbidden"
+    )
+}
+
 impl Asking<'_, '_> {
-    /// The reports this ask may answer from, or `None` with a note when there are none
-    /// it may use.
-    pub(super) fn report_selection(&mut self) -> Option<Value> {
+    /// Arguments passed to `community_reports` for this ask.
+    fn report_query_args(&self, findings: bool, with_matching: bool) -> Value {
+        let mut args = json!({
+            "query": self.o.question,
+            "reviewedOnly": self.o.reviewed_only,
+            "limit": MAX_REPORTS,
+            "findings": findings,
+        });
+        if let Some(p) = &self.o.review_policy {
+            args["reviewPolicy"] = p.clone().into();
+        }
+        if with_matching && let Some(p) = &self.o.matching_policy {
+            args["matchingPolicy"] = p.clone().into();
+        }
+        args
+    }
+
+    /// Lightweight availability check for `mode: "auto"` before grounding and drafting.
+    /// Avoids loading findings and eagerly resolving report identities so local questions
+    /// do not pay resolution cost or fail on report-only limits (such as `422
+    /// incomplete-evidence`). Policy/config/projection refusals still propagate.
+    pub(super) fn report_probe(&mut self) -> Result<Option<Value>, ToolError> {
+        self.report_selection_inner(true)
+    }
+
+    /// The reports this ask may answer from, with findings and resolved identities, or
+    /// `Ok(None)` with a note when there are none it may use. Policy or evidence refusals
+    /// propagate as `Err` so they are reported directly rather than hidden by a fallback.
+    pub(super) fn report_selection(&mut self) -> Result<Option<Value>, ToolError> {
+        self.report_selection_inner(false)
+    }
+
+    fn report_selection_inner(&mut self, probe: bool) -> Result<Option<Value>, ToolError> {
         let global = self.o.mode == AskMode::Global;
+        let has_policies = self.o.review_policy.is_some() || self.o.matching_policy.is_some();
         if self.o.at.is_some() || self.o.branch.is_some() {
             if global {
                 self.notes.push(
@@ -292,7 +727,7 @@ impl Asking<'_, '_> {
                         .into(),
                 );
             }
-            return None;
+            return Ok(None);
         }
         if self.pair(Role::Summarize).is_none() {
             if global {
@@ -301,27 +736,25 @@ impl Asking<'_, '_> {
                         .into(),
                 );
             }
-            return None;
+            return Ok(None);
         }
         let v = match self.tool(
             "community_reports",
-            json!({
-                "query": self.o.question,
-                "reviewedOnly": self.o.reviewed_only,
-                "limit": MAX_REPORTS,
-                "findings": true,
-            }),
+            self.report_query_args(!probe, !probe),
             true,
         ) {
             Ok(v) => v,
             Err(e) => {
+                if has_policies && (!probe || is_policy_refusal(&e.code)) {
+                    return Err(e);
+                }
                 if global {
                     self.notes.push(format!(
                         "the community reports could not be read ({}), so the question is answered from the data",
                         e.message
                     ));
                 }
-                return None;
+                return Ok(None);
             }
         };
         if v["available"] != true {
@@ -340,7 +773,7 @@ impl Asking<'_, '_> {
                         .unwrap_or("no community report can be used")
                 ));
             }
-            return None;
+            return Ok(None);
         }
         let n = v["reports"].as_array().map_or(0, Vec::len);
         if n == 0 {
@@ -350,7 +783,7 @@ impl Asking<'_, '_> {
                         .into(),
                 );
             }
-            return None;
+            return Ok(None);
         }
         let stale = v["stale"].as_u64().unwrap_or(0) as f64;
         if stale / n as f64 > MAX_STALE {
@@ -358,25 +791,67 @@ impl Asking<'_, '_> {
                 "more than {}% of the community reports are stale, so the question is answered from the data",
                 (MAX_STALE * 100.0) as u32
             ));
-            return None;
+            return Ok(None);
         }
-        Some(v)
+        Ok(Some(v))
+    }
+
+    /// Re-read the selected reports under the caller's current authority before
+    /// publishing a policy-bound global answer (C25).
+    fn verify_global_evidence(&self, sel: &Value) -> bool {
+        if !self.authority_current() {
+            return false;
+        }
+        let Ok(again) = self.tool(
+            "community_reports",
+            self.report_query_args(true, true),
+            true,
+        ) else {
+            return false;
+        };
+        again["available"] == true
+            && again["reports"] == sel["reports"]
+            && again.get("reviewPolicy") == sel.get("reviewPolicy")
+            && again.get("resolution") == sel.get("resolution")
+            && self.authority_current()
     }
 
     /// Steps 2 to 4 of §7.2 over the selected reports.
     pub(super) fn global(&mut self, sel: Value) -> Value {
+        let fenced = self.o.review_policy.is_some() || self.o.matching_policy.is_some();
+        if fenced && !self.authority_current() {
+            self.withheld = true;
+            return json!({});
+        }
         let reports: Vec<Value> = sel["reports"].as_array().cloned().unwrap_or_default();
-        self.emit(
-            "reports",
-            &json!({
-                "level": sel["level"],
-                "ranking": sel["ranking"],
-                "reports": reports.iter().map(|r| json!({
+        let mut reports_event = json!({
+            "level": sel["level"],
+            "ranking": sel["ranking"],
+            "reports": reports.iter().map(|r| {
+                let mut item = json!({
                     "iri": r["iri"], "title": r["title"], "level": r["level"],
                     "status": r["status"], "rating": r["rating"],
-                })).collect::<Vec<_>>(),
-            }),
-        );
+                });
+                if fenced
+                    && let Some(p) = r.get("reviewPolicy")
+                {
+                    item["reviewPolicy"] = p.clone();
+                }
+                item
+            }).collect::<Vec<_>>(),
+        });
+        if let Some(p) = sel.get("reviewPolicy") {
+            reports_event["reviewPolicy"] = p.clone();
+        }
+        if let Some(res) = sel.get("resolution") {
+            reports_event["resolution"] = json!({
+                "policy": res["policy"],
+                "version": res["version"],
+                "revision": res["revision"],
+                "number": res["number"],
+            });
+        }
+        self.emit("reports", &reports_event);
         let Some(pair) = self.pair(Role::Summarize) else {
             return self.error(
                 "no-model",
@@ -471,6 +946,9 @@ impl Asking<'_, '_> {
             };
             let deadline = self.deadline;
             let models = self.models;
+            let on_abandoned = self.abandoned_usage_cb(&pair);
+            let state = &self.server.state;
+            let principal = self.principal;
             let results: Vec<_> = std::thread::scope(|s| {
                 let hs: Vec<_> = chunk
                     .iter()
@@ -478,16 +956,23 @@ impl Asking<'_, '_> {
                         let user = prompt(&groups[gi]);
                         let pair = pair.clone();
                         let schema = &schema;
+                        let cancel = &self.cancel;
+                        let on_abandoned = on_abandoned.clone();
                         s.spawn(move || {
+                            let fence = super::AuthorityFence { state, principal };
+                            let admission: Option<&dyn crate::models::admission::Admission> =
+                                if fenced { Some(&fence) } else { None };
                             (
                                 gi,
-                                models.call(
+                                models.call_prompt_with_cancel_and_abandoned(
                                     Some(Role::Summarize),
                                     &pair,
-                                    MAP_SYSTEM,
-                                    &user,
+                                    &Prompt::plain(MAP_SYSTEM, &user),
                                     schema,
                                     deadline,
+                                    admission,
+                                    Some(cancel),
+                                    Some(on_abandoned),
                                 ),
                             )
                         })
@@ -500,6 +985,7 @@ impl Asking<'_, '_> {
             // every answer of the chunk is recorded before a terminal error returns, so
             // its tokens are charged (round 2, finding 3)
             let mut terminal: Option<(&'static str, String)> = None;
+            let mut authority_changed = false;
             for (gi, r) in results {
                 match r {
                     Ok(a) => {
@@ -513,8 +999,19 @@ impl Asking<'_, '_> {
                                 terminal.get_or_insert(("budget-exceeded", f.error.message()));
                                 continue;
                             }
+                            crate::models::StepError::Call(
+                                crate::models::CallError::Admission(super::AUTHORITY_CHANGED, ..),
+                            ) => {
+                                authority_changed = true;
+                                continue;
+                            }
                             crate::models::StepError::Deadline => {
                                 terminal.get_or_insert(("timeout", f.error.message()));
+                                continue;
+                            }
+                            crate::models::StepError::Cancelled => {
+                                terminal
+                                    .get_or_insert(("cancelled", "the ask was cancelled".into()));
                                 continue;
                             }
                             _ => {}
@@ -525,6 +1022,10 @@ impl Asking<'_, '_> {
                     }
                 }
             }
+            if authority_changed {
+                self.withheld = true;
+                return json!({});
+            }
             if let Some((code, message)) = terminal {
                 return self.error(code, message);
             }
@@ -532,12 +1033,18 @@ impl Asking<'_, '_> {
             // batches of a chunk run at once on one pair, so a chunk fails once.
             if chunk_failed {
                 self.failed_calls += 1;
-            }
-            if chunk_failed
-                && (self.failed_calls >= super::MAX_FAILED_CALLS
-                    || !self.escalate(Role::Summarize, "provider-failure"))
-            {
-                return self.error("provider-unavailable", last);
+                if self.failed_calls >= super::MAX_FAILED_CALLS
+                    || !self.can_escalate(Role::Summarize)
+                {
+                    return self.error("provider-unavailable", last);
+                }
+                if self.tokens() >= self.o.max_tokens {
+                    return self.error(
+                        "budget-exceeded",
+                        format!("the ask used its {} tokens", self.o.max_tokens),
+                    );
+                }
+                self.escalate(Role::Summarize, "provider-failure");
             }
         }
         // a failed batch runs again on the pair the role moved to
@@ -548,13 +1055,21 @@ impl Asking<'_, '_> {
                     format!("the ask used its {} tokens", self.o.max_tokens),
                 );
             }
-            match self.call(
+            self.fenced = fenced;
+            let called = self.call(
                 Role::Summarize,
                 &Prompt::plain(MAP_SYSTEM, &prompt(&groups[gi])),
                 &schema,
-            ) {
+            );
+            self.fenced = false;
+            match called {
                 Ok((v, _, _)) => answers[gi] = Some(v),
-                Err((code, message)) => return self.error(code, message),
+                Err((code, message)) => {
+                    if self.withheld {
+                        return json!({});
+                    }
+                    return self.error(code, message);
+                }
             }
         }
         for (gi, a) in answers.iter().enumerate() {
@@ -588,6 +1103,7 @@ impl Asking<'_, '_> {
                 format!("a global answer makes at most {limit} model answers"),
             );
         }
+        let has_resolution = sel.get("resolution").is_some();
         let reports_out = |kept: &[Point]| -> Vec<Value> {
             // the reports used, with the findings the points use
             let mut used: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -606,20 +1122,57 @@ impl Asking<'_, '_> {
                 .map(|(r, mut fs)| {
                     fs.sort_unstable();
                     let rep = &reports[r];
+                    let kept_findings: Vec<Value> = fs
+                        .iter()
+                        .filter_map(|f| rep["findings"].get(*f).cloned())
+                        .collect();
                     let mut v = json!({
                         "iri": rep["iri"],
                         "title": rep["title"],
                         "level": rep["level"],
                         "status": rep["status"],
                         "rating": rep["rating"],
-                        "findings": fs.iter().filter_map(|f| rep["findings"].get(*f).cloned()).collect::<Vec<_>>(),
+                        "findings": kept_findings,
                     });
                     if let Some(p) = rep.get("reviewPolicy") {
                         v["reviewPolicy"] = p.clone();
                     }
+                    if has_resolution {
+                        let referenced = referenced_entities(&v["findings"]);
+                        let ids: Vec<Value> = rep["identities"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter(|id| {
+                                id["entity"]
+                                    .as_str()
+                                    .is_some_and(|e| referenced.contains(e))
+                            })
+                            .cloned()
+                            .collect();
+                        v["identities"] = Value::Array(ids);
+                    }
                     v
                 })
                 .collect()
+        };
+        let resolution_out = |out_reports: &[Value]| -> Option<Value> {
+            let res = sel.get("resolution")?;
+            let mut by_entity: BTreeMap<String, Value> = BTreeMap::new();
+            for rep in out_reports {
+                for id in rep["identities"].as_array().into_iter().flatten() {
+                    if let Some(e) = id["entity"].as_str() {
+                        by_entity.entry(e.to_string()).or_insert_with(|| id.clone());
+                    }
+                }
+            }
+            Some(json!({
+                "policy": res["policy"],
+                "version": res["version"],
+                "revision": res["revision"],
+                "number": res["number"],
+                "entities": by_entity.into_values().collect::<Vec<_>>(),
+            }))
         };
         let point_json = |n: usize, p: &Point| {
             json!({
@@ -630,14 +1183,21 @@ impl Asking<'_, '_> {
                 "findings": p.findings.iter().filter_map(|(r, f)| reports[*r]["findings"].get(*f).map(|x| x["iri"].clone())).collect::<Vec<_>>(),
             })
         };
-        let global = json!({
+        let mut global = json!({
             "level": sel["level"],
             "ranking": sel["ranking"],
             "reportsGraph": sel["reportsGraph"],
             "selected": reports.len(),
             "batches": groups.len(),
         });
+        if let Some(p) = sel.get("reviewPolicy") {
+            global["reviewPolicy"] = p.clone();
+        }
         if kept.is_empty() {
+            if fenced && !self.verify_global_evidence(&sel) {
+                self.withheld = true;
+                return json!({});
+            }
             let s = json!({
                 "text": "The community reports do not cover this question.",
                 "citations": [],
@@ -645,12 +1205,8 @@ impl Asking<'_, '_> {
             });
             self.notes
                 .push("no community report bears on the question".into());
-            self.emit(
-                "global",
-                &json!({ "points": [], "reports": [], "global": global.clone() }),
-            );
-            self.emit("summary", &s);
-            return json!({
+            let mut ev = json!({ "points": [], "reports": [], "global": global.clone() });
+            let mut out = json!({
                 "outcome": "answered",
                 "mode": "global",
                 "summary": s,
@@ -658,6 +1214,13 @@ impl Asking<'_, '_> {
                 "reports": [],
                 "global": global,
             });
+            if let Some(res) = resolution_out(&[]) {
+                ev["resolution"] = res.clone();
+                out["resolution"] = res;
+            }
+            self.emit("global", &ev);
+            self.emit("summary", &s);
+            return out;
         }
         let mut lines = String::new();
         for (i, p) in kept.iter().enumerate() {
@@ -668,14 +1231,26 @@ impl Asking<'_, '_> {
             prompts::data_block(&question),
             prompts::data_block(&lines)
         );
-        let (value, pair) = match self.call(
+        self.fenced = fenced;
+        let called = self.call(
             Role::Summarize,
             &Prompt::plain(REDUCE_SYSTEM, &user),
             &reduce_schema(),
-        ) {
+        );
+        self.fenced = false;
+        let (value, pair) = match called {
             Ok((v, _, p)) => (v, p),
-            Err((code, message)) => return self.error(code, message),
+            Err((code, message)) => {
+                if self.withheld {
+                    return json!({});
+                }
+                return self.error(code, message);
+            }
         };
+        if fenced && !self.verify_global_evidence(&sel) {
+            self.withheld = true;
+            return json!({});
+        }
         self.answered_by = Some((Role::Summarize, pair.clone()));
         // §7.2 step 4: every citation resolves through a point
         let n = kept.len() as u64;
@@ -707,23 +1282,63 @@ impl Asking<'_, '_> {
         } else if !uncited.is_empty() {
             s["uncitedSentences"] = json!(uncited);
         }
-        let answer = json!({
+        let out_reports = reports_out(if cited.is_empty() { &kept } else { &cited });
+        let out_resolution = resolution_out(&out_reports);
+        let mut answer = json!({
             "points": kept.iter().enumerate().map(|(i, p)| point_json(i, p)).collect::<Vec<_>>(),
-            "reports": reports_out(if cited.is_empty() { &kept } else { &cited }),
+            "reports": out_reports,
             "global": global,
         });
+        if let Some(res) = &out_resolution {
+            answer["resolution"] = res.clone();
+        }
         // the points and reports first, so that a client can link the summary's markers
         self.emit("global", &answer);
         self.emit("summary", &s);
-        json!({
+        let mut out = json!({
             "outcome": "answered",
             "mode": "global",
             "summary": s,
             "points": answer["points"],
             "reports": answer["reports"],
             "global": answer["global"],
-        })
+        });
+        if let Some(res) = out_resolution {
+            out["resolution"] = res;
+        }
+        out
     }
+}
+
+/// The distinct entity IRIs referenced by one JSON finding's `about` and `cites` lists.
+fn finding_referenced_entities(f: &Value) -> BTreeSet<String> {
+    let about: Vec<String> = f["about"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    let cites: Vec<String> = f["cites"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    crate::graphrag::read::finding_entity_iris(&about, &cites)
+        .into_iter()
+        .map(|n| n.as_str().to_string())
+        .collect()
+}
+
+/// The distinct entity IRIs referenced by JSON findings' `about` and `cites` lists.
+fn referenced_entities(findings: &Value) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for f in findings.as_array().into_iter().flatten() {
+        out.extend(finding_referenced_entities(f));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -848,5 +1463,392 @@ mod tests {
             vec!["Nobody knows why.".to_string()]
         );
         assert!(uncited_sentences("All cited [1].").is_empty());
+    }
+
+    #[test]
+    fn report_blocks_includes_identity_lines_and_keeps_finding_labels() {
+        let members: Vec<String> = (0..10).map(|i| format!("http://ex/m{i}")).collect();
+        let r = json!({
+            "title": "Payments",
+            "summary": "Summary text",
+            "findings": [
+                { "text": "Alice owns ledger" },
+                { "text": "Bob reviews PRs" },
+            ],
+            "identities": [{
+                "entity": "http://ex/m1",
+                "representative": "http://ex/m0",
+                "members": members,
+                "membersComplete": false,
+            }],
+        });
+        let parts = report_blocks(2, &r, 500);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].1, vec![0, 1]);
+        let text = &parts[0].0;
+        assert!(text.contains("F2.1 Alice owns ledger"), "{text}");
+        assert!(text.contains("F2.2 Bob reviews PRs"), "{text}");
+        assert!(
+            text.contains("Identity: <http://ex/m1> resolvesTo <http://ex/m0>"),
+            "{text}"
+        );
+        assert!(text.contains("+2 more, truncated"), "{text}");
+    }
+
+    #[test]
+    fn referenced_entities_collects_about_and_cited_triple_terms() {
+        let findings = json!([
+            {
+                "about": ["http://ex/a"],
+                "cites": [
+                    "<<( <http://ex/a> <http://ex/knows> <http://ex/b> )>>",
+                    "<urn:uuid:11111111-1111-4111-8111-111111111111>",
+                    "<urn:x-sparkles:graphrag:r1#f1>"
+                ]
+            }
+        ]);
+        let got: Vec<String> = referenced_entities(&findings).into_iter().collect();
+        assert_eq!(got, vec!["http://ex/a", "http://ex/b"]);
+    }
+
+    #[test]
+    fn report_blocks_pairs_identity_with_long_finding_under_small_budget() {
+        let budget = 160;
+        let max_chars = (budget * CHARS_PER_TOKEN) as usize;
+        let r = json!({
+            "title": "Payments",
+            "summary": "Short summary.",
+            "findings": [{
+                "text": format!("Alice leads payments {}", "x".repeat(900)),
+                "about": ["http://ex/alice_dup"],
+                "cites": ["<<( <http://ex/alice_dup> <http://ex/leads> <http://ex/pay> )>>"],
+            }],
+            "identities": [{
+                "entity": "http://ex/alice_dup",
+                "representative": "http://ex/alice",
+                "members": ["http://ex/alice", "http://ex/alice_dup"],
+                "membersComplete": true,
+            }],
+        });
+        let parts = report_blocks(1, &r, budget);
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert_eq!(parts[0].1, vec![0], "{parts:?}");
+        let text = &parts[0].0;
+        assert!(
+            text.chars().count() <= max_chars,
+            "{}",
+            text.chars().count()
+        );
+        assert!(text.contains("F1.1 Alice leads payments"), "{text}");
+        assert!(
+            text.contains("Identity: <http://ex/alice_dup> resolvesTo <http://ex/alice>"),
+            "{text}"
+        );
+        // The batch that sees the identity link also shows F1.1, so points_of accepts it.
+        let shown: Vec<(usize, usize)> = parts[0].1.iter().map(|f| (0, *f)).collect();
+        let v = json!({ "points": [{ "text": "Mapped", "score": 90, "reports": ["R1"], "findings": ["F1.1"] }] });
+        assert_eq!(points_of(&v, &[0], &shown).len(), 1);
+    }
+
+    #[test]
+    fn report_blocks_bounds_many_identities_without_empty_finding_blocks() {
+        let about: Vec<String> = (0..100).map(|i| format!("http://ex/e{i}")).collect();
+        let identities: Vec<Value> = (0..100)
+            .map(|i| {
+                json!({
+                    "entity": format!("http://ex/e{i}"),
+                    "representative": "http://ex/rep",
+                    "members": ["http://ex/rep", format!("http://ex/e{i}")],
+                    "membersComplete": true,
+                })
+            })
+            .collect();
+        let r = json!({
+            "title": "Large",
+            "summary": "Many mapped entities.",
+            "findings": [
+                { "text": "First finding", "about": about },
+                { "text": "Second finding", "about": [] },
+            ],
+            "identities": identities,
+        });
+        let parts = report_blocks(1, &r, 256);
+        assert!(!parts.is_empty());
+        let mut identity_lines = 0usize;
+        let mut saw_omitted = false;
+        for (text, shown) in &parts {
+            assert!(
+                !shown.is_empty(),
+                "empty-finding continuation block emitted: {text}"
+            );
+            for line in text.lines() {
+                if line.starts_with("Identity: <") {
+                    identity_lines += 1;
+                }
+                if line.contains("more identities)") {
+                    saw_omitted = true;
+                }
+            }
+        }
+        assert!(
+            identity_lines <= PROMPT_IDENTITIES_PER_REPORT,
+            "too many identity lines: {identity_lines}"
+        );
+        assert!(saw_omitted, "expected truncation note across {parts:?}");
+    }
+
+    #[test]
+    fn report_blocks_preserves_complete_long_bare_link_within_256_token_budget() {
+        let budget = 256;
+        let max_chars = (budget * CHARS_PER_TOKEN) as usize;
+        let ent = format!("http://example.org/entity/{}", "e".repeat(274));
+        let rep = format!("http://example.org/entity/{}", "r".repeat(274));
+        assert_eq!(ent.len(), 300);
+        assert_eq!(rep.len(), 300);
+        let bare = format!("Identity: <{ent}> resolvesTo <{rep}>");
+        let r = json!({
+            "title": "Payments",
+            "summary": "Short summary.",
+            "findings": [{
+                "text": "Alice leads payments.",
+                "about": [ent],
+            }],
+            "identities": [{
+                "entity": ent,
+                "representative": rep,
+                "members": [rep, ent],
+                "membersComplete": true,
+            }],
+        });
+        let parts = report_blocks(1, &r, budget);
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert_eq!(parts[0].1, vec![0], "{parts:?}");
+        let text = &parts[0].0;
+        assert!(
+            text.chars().count() <= max_chars,
+            "exceeded budget: {}",
+            text.chars().count()
+        );
+        assert!(text.contains("F1.1 Alice leads payments."), "{text}");
+        assert!(text.contains(&bare), "complete bare link was cut: {text}");
+    }
+
+    #[test]
+    fn report_blocks_preserves_first_finding_that_fits_before_summary() {
+        let budget = 256;
+        let max_chars = (budget * CHARS_PER_TOKEN) as usize;
+        let summary = "s".repeat(700);
+        let finding = format!("START_{}_END", "f".repeat(790));
+        assert_eq!(finding.len(), 800);
+        let r = json!({
+            "title": "Payments",
+            "summary": summary,
+            "findings": [{ "text": finding }],
+        });
+        let parts = report_blocks(1, &r, budget);
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert_eq!(parts[0].1, vec![0], "{parts:?}");
+        let text = &parts[0].0;
+        assert!(
+            text.chars().count() <= max_chars,
+            "exceeded budget: {}",
+            text.chars().count()
+        );
+        assert!(
+            text.contains(&format!("F1.1 {finding}")),
+            "finding was truncated despite fitting in budget: {text}"
+        );
+    }
+
+    #[test]
+    fn report_blocks_omits_unfittable_bare_link_with_marker_instead_of_clipping() {
+        let budget = 256;
+        let max_chars = (budget * CHARS_PER_TOKEN) as usize;
+        let ent = format!("http://example.org/entity/{}", "e".repeat(574));
+        let rep = format!("http://example.org/entity/{}", "r".repeat(574));
+        let r = json!({
+            "title": "Payments",
+            "summary": "Short summary.",
+            "findings": [{
+                "text": "Alice leads payments.",
+                "about": [ent],
+            }],
+            "identities": [{
+                "entity": ent,
+                "representative": rep,
+                "members": [rep, ent],
+                "membersComplete": true,
+            }],
+        });
+        let parts = report_blocks(1, &r, budget);
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert_eq!(parts[0].1, vec![0], "{parts:?}");
+        let text = &parts[0].0;
+        assert!(
+            text.chars().count() <= max_chars,
+            "exceeded budget: {}",
+            text.chars().count()
+        );
+        assert!(text.contains("F1.1 Alice leads payments."), "{text}");
+        assert!(
+            !text.contains("Identity: <"),
+            "unfittable bare link was emitted clipped: {text}"
+        );
+        assert!(
+            text.contains("Identity: (+1 more identities)"),
+            "expected explicit omission marker: {text}"
+        );
+    }
+
+    #[test]
+    fn report_blocks_shortens_continuation_title_for_long_second_finding() {
+        let budget = 256;
+        let max_chars = (budget * CHARS_PER_TOKEN) as usize;
+        let title = "T".repeat(200);
+        let second = format!("SECOND_START_{}_SECOND_END", "f".repeat(826));
+        assert_eq!(second.len(), 850);
+        let r = json!({
+            "title": title,
+            "summary": "Short summary.",
+            "findings": [
+                { "text": "Short first finding." },
+                { "text": second },
+            ],
+        });
+        let parts = report_blocks(1, &r, budget);
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert_eq!(parts[0].1, vec![0], "{parts:?}");
+        assert_eq!(parts[1].1, vec![1], "{parts:?}");
+        for (text, _) in &parts {
+            assert!(
+                text.chars().count() <= max_chars,
+                "exceeded budget: {}",
+                text.chars().count()
+            );
+        }
+        assert!(
+            parts[1].0.contains(&format!("F1.2 {second}")),
+            "second finding was truncated by repeated continuation title: {}",
+            parts[1].0
+        );
+    }
+
+    #[test]
+    fn report_blocks_shortens_continuation_title_to_keep_complete_identity_link() {
+        let budget = 256;
+        let max_chars = (budget * CHARS_PER_TOKEN) as usize;
+        let title = "T".repeat(200);
+        let ent = format!("http://example.org/entity/{}", "e".repeat(364));
+        let rep = format!("http://example.org/entity/{}", "r".repeat(364));
+        assert_eq!(ent.len(), 390);
+        assert_eq!(rep.len(), 390);
+        let bare = format!("Identity: <{ent}> resolvesTo <{rep}>");
+        assert!(bare.len() > 800, "bare len={}", bare.len());
+        let second_text = "Second finding near the continuation boundary.";
+        let r = json!({
+            "title": title,
+            "summary": "Short summary.",
+            "findings": [
+                { "text": "Short first finding." },
+                { "text": second_text, "about": [ent] },
+            ],
+            "identities": [{
+                "entity": ent,
+                "representative": rep,
+                "members": [rep, ent],
+                "membersComplete": true,
+            }],
+        });
+        let parts = report_blocks(1, &r, budget);
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert_eq!(parts[0].1, vec![0], "{parts:?}");
+        assert_eq!(parts[1].1, vec![1], "{parts:?}");
+        for (text, _) in &parts {
+            assert!(
+                text.chars().count() <= max_chars,
+                "exceeded budget: {}",
+                text.chars().count()
+            );
+        }
+        assert!(
+            parts[1].0.contains(&format!("F1.2 {second_text}")),
+            "second finding was truncated in continuation: {}",
+            parts[1].0
+        );
+        assert!(
+            parts[1].0.contains(&bare),
+            "complete bare link was displaced by repeated continuation title: {}",
+            parts[1].0
+        );
+        assert!(
+            !parts[1].0.contains("more identities)"),
+            "bare link should fit without omission: {}",
+            parts[1].0
+        );
+    }
+
+    #[test]
+    fn report_blocks_first_block_summary_preserves_multiple_complete_identity_links() {
+        let budget = 256;
+        let max_chars = (budget * CHARS_PER_TOKEN) as usize;
+        let title = "T".repeat(200);
+        let summary = "S".repeat(300);
+        let finding = format!("FIRST_START_{}_FIRST_END", "f".repeat(828));
+        assert_eq!(finding.len(), 850);
+
+        // Two complete bare identity lines of exactly 202 chars each including trailing '\n'
+        // ("Identity: <" 11 + ent 88 + "> resolvesTo <" 14 + rep 87 + ">" 1 = 201 chars + '\n').
+        let ent1 = format!("http://example.org/entity/a/{}", "1".repeat(60));
+        let rep1 = format!("http://example.org/entity/r/{}", "1".repeat(59));
+        let ent2 = format!("http://example.org/entity/b/{}", "2".repeat(60));
+        let rep2 = format!("http://example.org/entity/r/{}", "2".repeat(59));
+        let bare1 = format!("Identity: <{ent1}> resolvesTo <{rep1}>");
+        let bare2 = format!("Identity: <{ent2}> resolvesTo <{rep2}>");
+        assert_eq!(bare1.len() + 1, 202);
+        assert_eq!(bare2.len() + 1, 202);
+
+        let r = json!({
+            "title": title,
+            "summary": summary,
+            "findings": [{
+                "text": finding,
+                "about": [ent1, ent2],
+            }],
+            "identities": [
+                {
+                    "entity": ent1,
+                    "representative": rep1,
+                    "members": [rep1, ent1],
+                    "membersComplete": true,
+                },
+                {
+                    "entity": ent2,
+                    "representative": rep2,
+                    "members": [rep2, ent2],
+                    "membersComplete": true,
+                },
+            ],
+        });
+        let parts = report_blocks(1, &r, budget);
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert_eq!(parts[0].1, vec![0], "{parts:?}");
+        let text = &parts[0].0;
+        assert!(
+            text.chars().count() <= max_chars,
+            "exceeded budget: {}",
+            text.chars().count()
+        );
+        assert!(
+            text.contains(&bare1),
+            "first complete bare identity link was dropped: {text}"
+        );
+        assert!(
+            text.contains(&bare2),
+            "second complete bare identity link was displaced by block-0 summary: {text}"
+        );
+        assert!(
+            !text.contains("more identities)"),
+            "both complete bare identity links should fit without omission: {text}"
+        );
     }
 }

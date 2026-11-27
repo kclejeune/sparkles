@@ -284,6 +284,144 @@ pub(in crate::store) fn authenticate_retained_generation(
             "retained primary generation identity differs".into(),
         ));
     }
+    if !store.is_branch() && store.family.has_destination_origin() {
+        let family_root = store.managed_root().ok_or_else(|| {
+            Error::HistoryUnsupported("retained primary root is unavailable".into())
+        })?;
+        let actual = physical
+            .as_ref()
+            .ok_or_else(|| Error::Corrupt("retained generation commit is missing".into()))?;
+        let temporary = budget
+            .owned_limit()?
+            .options
+            .temporary(budget.available())?;
+        let closure = crate::store::configuration_history::load_disk_closure_for_family(
+            &family_root,
+            &store.family,
+            &temporary,
+        )?
+        .ok_or_else(|| {
+            crate::store::managed_history::unavailable(
+                "destination import origin disappeared during retained history read",
+            )
+        })?;
+        let mut native = closure.check_generation_base(
+            &family_root,
+            &entry.dir,
+            &entry.name,
+            &actual.value,
+            &temporary,
+        )?;
+        let closure_bytes = temporary.used();
+        drop(temporary);
+        budget.charge(closure_bytes)?;
+        if let Some(physical) = physical {
+            drop(physical.value);
+            budget.release(physical.charge);
+        }
+        let vocabulary = cold::head_vocabulary_controlled(&entry.dir, &family_root, &mut budget)?;
+        let terms = vocabulary.value.len_with(&budget)?;
+        let annotations =
+            crate::annotations::seqs_controlled(&family_root, store.dataset_id, &mut budget)?;
+        let path = entry.dir.join("wal.log");
+        let loaded = match budget.buffered(&path) {
+            Ok(loaded) => loaded,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                let has_ranges = closure.has_ranges(&entry.name);
+                drop(closure);
+                budget.release(closure_bytes);
+                if has_ranges {
+                    return Err(crate::store::managed_history::unavailable(
+                        "imported WAL is missing its declared source intervals",
+                    ));
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                drop(closure);
+                budget.release(closure_bytes);
+                return Err(error);
+            }
+        };
+        let mut reader = loaded.value;
+        let reader_charge = loaded.charge;
+        let extent = reader.get_ref().metadata()?.len();
+        if closure.has_ranges(&entry.name) {
+            let file = reader.into_inner();
+            budget.release(reader_charge);
+            let result = closure.prove_wal(
+                &family_root,
+                &entry.dir,
+                &entry.name,
+                file,
+                extent,
+                entry.base.seq,
+                through,
+                terms,
+                annotations.value.as_deref(),
+                &path,
+                &mut native,
+                &mut budget,
+            );
+            drop(closure);
+            budget.release(closure_bytes);
+            result?;
+            return budget.check();
+        }
+        drop(closure);
+        budget.release(closure_bytes);
+        let mut configuration_error = None;
+        let mut observe = |observation| {
+            if configuration_error.is_none() {
+                match native.cached_observation(observation) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let result = (|| {
+                            let temporary = budget
+                                .owned_limit()?
+                                .options
+                                .temporary(budget.available())?;
+                            native.observation(&family_root, &temporary, observation)
+                        })();
+                        if let Err(error) = result {
+                            configuration_error = Some(error);
+                        }
+                    }
+                    Err(error) => configuration_error = Some(error),
+                }
+            }
+            Ok(())
+        };
+        if through == u64::MAX {
+            wal::probe::prove_prefix_with(
+                &mut reader,
+                extent,
+                entry.base.seq,
+                u64::MAX,
+                terms,
+                annotations.value.as_deref(),
+                &path,
+                &budget,
+                &mut observe,
+            )?;
+        } else {
+            wal::probe::prove_prefix_through(
+                &mut reader,
+                extent,
+                entry.base.seq,
+                through,
+                terms,
+                annotations.value.as_deref(),
+                &path,
+                &budget,
+                &mut observe,
+            )?;
+        }
+        if let Some(error) = configuration_error {
+            return Err(error);
+        }
+        return budget.check();
+    }
     let generation = Current {
         name: entry.name.clone(),
         number: commit::generation_number(&entry.name),
@@ -483,6 +621,7 @@ fn generation_for(
 pub(in crate::store) enum Purpose {
     Snapshot,
     Configuration,
+    Pin,
     Clock,
     TimeGone(i64),
 }
@@ -498,6 +637,11 @@ pub(in crate::store) enum OriginRead {
     Configuration {
         binding: crate::history::ConfigurationBinding,
         first_bound_own: Option<u64>,
+    },
+    Pin {
+        seq: u64,
+        expires_ms: Option<i64>,
+        configuration: Option<crate::history::PinnedConfiguration>,
     },
     Inherited(CommitRef),
 }
@@ -523,7 +667,15 @@ impl Store {
         limit: &crate::history::ReadLimit<'_>,
     ) -> Result<OriginRead> {
         limit.check(0)?;
-        if !matches!(at, At::Commit(_) | At::Time(_)) {
+        if let At::Snapshot(name) = at
+            && !crate::history::valid_name(name)
+        {
+            return Err(Error::invalid("invalid snapshot name"));
+        }
+        if !matches!(at, At::Commit(_) | At::Time(_) | At::Snapshot(_))
+            || (matches!(at, At::Snapshot(_))
+                && !matches!(purpose, Purpose::Snapshot | Purpose::Pin))
+        {
             return Err(Error::invalid(
                 "cold inherited reads require a resolved commit or original time selector",
             ));
@@ -570,7 +722,24 @@ impl Store {
         let wanted = match at {
             At::Commit(seq) => Some(*seq),
             At::Time(_) => None,
-            _ => unreachable!("validated inherited selector"),
+            At::Snapshot(name) => {
+                let history_cfg = crate::history::read_file_controlled(&root, id, &mut budget)?;
+                let Some(pin) = history_cfg.pins.get(name) else {
+                    return Err(Error::NotFound(format!("no snapshot {name:?}")));
+                };
+                if matches!(purpose, Purpose::Pin) {
+                    return Ok(OriginRead::Pin {
+                        seq: pin.seq,
+                        expires_ms: pin.expires_ms,
+                        configuration: pin.configuration.clone(),
+                    });
+                }
+                if pin.expires_ms.is_some_and(|e| e <= self.now_ms()) {
+                    return Err(Error::NotFound(format!("no snapshot {name:?}")));
+                }
+                Some(pin.seq)
+            }
+            At::Head => unreachable!("validated selector"),
         };
         if let Some(seq) = wanted {
             if seq > head {
@@ -811,17 +980,33 @@ impl Store {
             settings,
             &mut budget,
         )?;
+        let cold_origin = Arc::new(evidence_view::HistoryOrigin::new_cold(
+            set.dataset_id,
+            id,
+            root.clone(),
+            self.managed_root().unwrap_or_else(|| set.root.clone()),
+            self.family.managed.clone(),
+            self.cache.clone(),
+            self.results.clone(),
+            set.opts.union_default_graph,
+            set.opts.aggregate_errors,
+            set.opts.geo_op_vertices,
+            set.opts.history_cache_bytes,
+        ));
         // Ordinary past snapshots deliberately have no live full-text index.
         let snapshot = Arc::new(
             SnapshotBuilder::of_generation(
                 Shared {
                     dataset_id: set.dataset_id,
+                    branch_id: id,
                     cache: &self.cache,
                     results: &self.results,
                     union_default_graph: set.opts.union_default_graph,
                     aggregate_errors: set.opts.aggregate_errors,
                     geo_op_vertices: set.opts.geo_op_vertices,
                     change_log: Some(log.value),
+                    managed: Some(self.family.managed.clone()),
+                    history_origin: Some(evidence_view::HistoryOriginHandle::Cold(cold_origin)),
                 },
                 generation,
                 metadata.seq,
@@ -847,6 +1032,181 @@ impl Store {
             },
         ))
     }
+}
+
+/// Resolve an earlier retained commit `seq` on a cold branch without opening a `Store`
+/// or retaining `Family`, for support-aware `ev:StoredFact` verification.
+pub(in crate::store) fn cold_commit_snapshot_limited(
+    origin: &Arc<evidence_view::HistoryOrigin>,
+    seq: u64,
+    preparation: &crate::access::Preparation,
+) -> Result<Option<(Arc<Snapshot>, crate::access::Reservation)>> {
+    preparation.check()?;
+    let (
+        dataset_id,
+        branch_id,
+        root,
+        cache,
+        results,
+        managed,
+        union_default_graph,
+        aggregate_errors,
+        geo_op_vertices,
+        history_cache_bytes,
+    ) = origin.cold_parts();
+    let options = crate::history::HistoryOptions {
+        cancel: Some(preparation.control().cancel.flag()),
+        deadline: preparation.control().deadline,
+    };
+    let (allowance, mut temp_guard) = preparation.reserve_available()?;
+    let mem_cap = allowance.min(history_cache_bytes.max(history_limited::SHARED_SNAPSHOT_BYTES));
+    let limit = crate::history::ReadLimit {
+        options: &options,
+        memory: Some(mem_cap),
+        held: crate::history::READ_METADATA_BYTES,
+    };
+    let mut budget = ColdBudget::new(limit)?;
+    let current = current_controlled(root, branch_id, &mut budget)?;
+    let head = head_controlled(root, branch_id, &current.value, &mut budget)?;
+    if seq > head {
+        return Ok(None);
+    }
+    let Some(selected) = generation_for(
+        root,
+        branch_id,
+        current.value.number,
+        head,
+        seq,
+        &mut budget,
+    )?
+    else {
+        return Ok(None);
+    };
+    let loaded = match link::read_link_with(&selected.value.dir, &mut budget)? {
+        Some(file) => Generation::open_linked_with(
+            &selected.value.dir,
+            &selected.value.name,
+            root,
+            file,
+            true,
+            cache,
+            &mut budget,
+        )?,
+        None => Generation::open_sealed_with(
+            &selected.value.dir,
+            &selected.value.name,
+            None,
+            &mut budget,
+        )?,
+    };
+    let generation_bytes = loaded.charge;
+    let generation = Arc::new(loaded.value);
+    let terms = generation.dvocab.len_with(&budget)?;
+    let mut wal_config = None;
+    let target = if seq == selected.value.base.seq {
+        wal::WalPoint { seq, offset: 0 }
+    } else {
+        let proof = prove_file_with(
+            root,
+            branch_id,
+            &selected.value,
+            seq,
+            terms,
+            &mut budget,
+            &mut |observation| {
+                if observation.point.seq == seq {
+                    wal_config = observation.configuration;
+                }
+                Ok(())
+            },
+        )?;
+        let Some(target) = proof.selected else {
+            return Ok(None);
+        };
+        target
+    };
+    let seed = generation.link.as_ref().map(|link| &link.base_delta);
+    let seed_bytes = seed.map_or(0, history_limited::preparation_delta_bytes);
+    budget.charge(seed_bytes)?;
+    let mut delta = seed.cloned().unwrap_or_default();
+    budget.release(seed_bytes);
+    if seq > selected.value.base.seq {
+        wal::apply_forward(
+            &selected.value.dir.join("wal.log"),
+            &generation,
+            cache,
+            &mut delta,
+            wal::WalPoint {
+                seq: selected.value.base.seq,
+                offset: 0,
+            },
+            target,
+            &budget.owned_limit()?,
+        )?;
+    }
+    let delta_bytes = history_limited::preparation_delta_bytes(&delta)
+        .max(history_limited::SHARED_SNAPSHOT_BYTES);
+    let total_retained = delta_bytes
+        .checked_add(generation_bytes)
+        .ok_or_else(|| preparation.exhausted())?;
+    if total_retained > allowance {
+        return Err(preparation.exhausted());
+    }
+    let built = Arc::new(
+        SnapshotBuilder::of_generation(
+            Shared {
+                dataset_id,
+                branch_id,
+                cache,
+                results,
+                union_default_graph,
+                aggregate_errors,
+                geo_op_vertices,
+                change_log: None,
+                managed: Some(managed.clone()),
+                history_origin: Some(evidence_view::HistoryOriginHandle::Cold(origin.clone())),
+            },
+            generation,
+            seq,
+        )
+        .delta(delta)
+        .dvocab_len(terms)
+        .historical(true)
+        .build(),
+    );
+    let binding = if seq == selected.value.base.seq {
+        selected.value.configuration
+    } else {
+        match wal_config {
+            None => crate::history::ConfigurationBinding::LegacyUnbound,
+            Some(gen_digest) => {
+                let state = managed.load_full();
+                match state.as_deref() {
+                    Some(crate::managed::ManagedState::Installed(installed))
+                        if installed.configuration_history.is_some() =>
+                    {
+                        let lineage_id = installed
+                            .configuration_history
+                            .as_ref()
+                            .expect("checked")
+                            .lineage_id;
+                        crate::history::ConfigurationBinding::Known {
+                            configuration: crate::history::ConfigurationIdentity {
+                                dataset_id,
+                                lineage_id,
+                                generation: gen_digest,
+                            },
+                        }
+                    }
+                    _ => crate::history::ConfigurationBinding::LegacyUnbound,
+                }
+            }
+        }
+    };
+    temp_guard.release_to(total_retained);
+    let (pinned, pin_held) = origin.pin_commit_binding(binding, built, preparation)?;
+    temp_guard.merge(pin_held);
+    Ok(Some((pinned, temp_guard)))
 }
 
 /// The same physical coverage used by ordinary HistoryState construction. Catalog

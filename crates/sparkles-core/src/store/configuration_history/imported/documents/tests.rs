@@ -56,14 +56,16 @@ impl Candidate {
             store.branch("main").unwrap()
         };
         let capture = branch
-            .materialized_backup_capture(
+            .materialized_configuration_capture(
                 "candidate-documents",
                 &MemoryCaptureOptions {
                     tmp_dir: temporary.path().join("scratch"),
                     ..Default::default()
                 },
+                &preparation,
             )
-            .unwrap();
+            .unwrap()
+            .into_data();
         let logical = capture.dataset_id;
         assert_eq!(standalone_branch, logical != family);
         let mut original = BTreeMap::new();

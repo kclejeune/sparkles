@@ -178,8 +178,9 @@ impl Slot {
     }
 
     /// The fingerprint of the circuit's checkpoints: the cell's key, the inference its
-    /// state was built with and the reading of errors in aggregates its results follow.
-    pub(super) fn fingerprint(&self, key: u64) -> u64 {
+    /// state was built with, the reading of errors in aggregates its results follow, and
+    /// for restricted circuits the active support-aware evidence visibility key.
+    pub(super) fn fingerprint(&self, key: u64, ev_key: Option<&str>) -> u64 {
         let mut h = Sha256::new();
         h.update(key.to_le_bytes());
         if let Some(i) = &self.circuit.inference {
@@ -188,6 +189,16 @@ impl Slot {
         h.update(b"\0aggregate-errors\0");
         let errors = self.circuit.aggregate_errors.unwrap_or_default();
         h.update(errors.as_str().as_bytes());
+        if self
+            .circuit
+            .access
+            .as_ref()
+            .is_some_and(|a| !a.reads_everything())
+            && let Some(ev) = ev_key
+        {
+            h.update(b"\0evidence\0");
+            h.update(ev.as_bytes());
+        }
         u64::from_le_bytes(h.finalize()[..8].try_into().expect("8 bytes"))
     }
 
@@ -265,17 +276,45 @@ impl Slot {
         )))
     }
 
+    /// Whether `snap`'s support-aware evidence visibility configuration or managed
+    /// publication generation differs from what this restricted circuit was built with,
+    /// or is currently unavailable.
+    pub(super) fn evidence_mismatch(&self, snap: &crate::store::Snapshot) -> bool {
+        let restricted = self
+            .circuit
+            .access
+            .as_ref()
+            .is_some_and(|a| !a.reads_everything());
+        if !restricted {
+            return false;
+        }
+        let (snap_gen, snap_ev) = snap.evidence_visibility_stamp();
+        self.circuit.managed_generation() != snap_gen
+            || self.circuit.evidence_key() != snap_ev.as_deref()
+            || snap_ev.as_deref() == Some("unavailable")
+    }
+
+    /// Detach a single live subscriber from this slot, update the active local limit, and
+    /// return any retired memory leases to drop outside locks.
+    pub(crate) fn detach_sub(&mut self, shared: &Arc<Shared>) -> Vec<MemoryLease> {
+        self.subs
+            .retain(|s| !std::ptr::eq(s.shared.as_ptr(), Arc::as_ptr(shared)));
+        self.recompute_local_limit();
+        self.circuit.drain_retired()
+    }
+
     /// End all active live subscribers on this slot with an error event and lower
     /// `local_limit` accordingly without failing co-located named views.
     pub(super) fn fail_live_subs(&mut self, e: &Error, deferred: &mut DeferredDrops) {
         let (code, message) = super::round::failure(e);
         for s in self.subs.drain(..) {
             if let Some(sh) = s.shared.upgrade() {
-                deferred.queued.extend(sh.push_leased(
+                deferred.queued.extend(sh.replace_leased(
                     LiveEvent::Error {
                         code: code.clone(),
                         message: message.clone(),
                     },
+                    None,
                     None,
                 ));
             }
@@ -296,6 +335,27 @@ impl Slot {
         &mut self,
         shared: &Arc<Shared>,
     ) -> (crate::incr::live::QueuedEvent, Vec<MemoryLease>) {
+        if self
+            .circuit
+            .snap
+            .as_ref()
+            .is_some_and(|s| self.evidence_mismatch(s))
+        {
+            self.subs
+                .retain(|s| !std::ptr::eq(s.shared.as_ptr(), Arc::as_ptr(shared)));
+            self.recompute_local_limit();
+            let retired = self.circuit.drain_retired();
+            return (
+                crate::incr::live::QueuedEvent::new(
+                    LiveEvent::Error {
+                        code: "access-changed".into(),
+                        message: "the evidence configuration changed; reconnect to read under the new rules".into(),
+                    },
+                    None,
+                ),
+                retired,
+            );
+        }
         let applied = self.circuit.applied;
         let event = self.event_budgeted(true).and_then(|(event, lease)| {
             if lease.bytes() <= shared.byte_limit() {
@@ -316,8 +376,12 @@ impl Slot {
                     }
                 }
                 let detached = self.detach_event_lease(&mut lease);
+                let stamp = Some(self.circuit.evidence_stamp());
                 let retired = self.circuit.drain_retired();
-                (crate::incr::live::QueuedEvent::new(ev, detached), retired)
+                (
+                    crate::incr::live::QueuedEvent::stamped(ev, detached, stamp),
+                    retired,
+                )
             }
             Err(e) => {
                 self.subs

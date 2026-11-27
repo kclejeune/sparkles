@@ -1015,13 +1015,38 @@ and item 678's pair compared
 The screens against the base ran three rounds and read a geometric mean of 0.980 in
 streaming and 0.970 in automatic execution, with no query 10% slower, and automatic
 `str-pair-colleague` read 0.777. Roadmap item 1088 follows the streaming cost of
-`str-pair-colleague`, whose names rarely repeat, item 1140 the cost of the table's growth
-on `str-pair-names` against the per-worker maps, and item 1089 the 12-thread cost of
-`str-filter-two` and the costs of 0.2% to 2.8% that the screens found in queries the
-floors do not reach, together with item 678's costs
-on `lang-filter`, `str-filter-two` and `distinct-join` of 1.8% to 2.9%. Automatic
-`str-filter-two` spread by 22% to 23% between server processes of one build, which item
-1087 follows.
+`str-pair-colleague`, whose names rarely repeat, and item 1089 follows the 12-thread cost
+of `str-filter-two` and the costs of 0.2% to 2.8% that the screens found in queries the
+floors do not reach, together with item 678's costs on `lang-filter`, `str-filter-two` and
+`distinct-join` of 1.8% to 2.9%. Automatic `str-filter-two` spread by 22% to 23% between
+server processes of one build, which item 1087 follows.
+
+Item 1140 shipped sample-based initial sizing and direct entry migration on growth for
+the shared floor table, leaving the Forge table above as historical evidence for
+`174de1f8..3a8b7adb`. On `atlas` at 1.05M triples in twelve alternating ABBA and BAAB
+rounds of 16 measured requests per query and server process, with four processes per round
+across 12 rounds, `329f82f9` against its own base `a643de75` returned byte-identical
+sorted TSV answers across every cell and control, and `f0240009` only extracted an inline
+stratum-bounds helper and tightened a unit test. Both one-thread A/B cells stayed within
+the 3% spread limit at 1.79% in streaming execution and 1.77% in eager execution, whereas
+the separate six-round, 12-request-per-process `streaming-1t` A/A control failed at 4.55%
+and `eager-1t` A/A passed at 1.45%. Against `a643de75`, `str-pair-names` improved by 3.0%
+in streaming execution at 0.970×, 27.40 against 28.23 ms with a 95% interval of 0.966 to
+0.974 and 0.975× instructions, and by 10.0% in eager execution at 0.900×, 24.95 against
+27.68 ms with a pooled ratio of 0.901×, a 95% interval of 0.896 to 0.903 and 0.918×
+instructions, faster in all twelve rounds in both modes. Eager `str-pair-lt` stayed flat
+at 1.000× and streaming `str-filter-two` crossed 1.0 at 1.002×. That Atlas comparison
+qualifies only `a643de75..329f82f9` on `atlas` and does not establish recovery of the
+separate Forge gap against `174de1f8`. Both 12-thread cells failed the 3% spread
+diagnostic without a repeat run, with A/B spreads of 7.19% in streaming and 40.50% in
+eager execution against 9.37% and 25.30% in their A/A controls, leaving their ratios,
+such as eager `str-pair-names` at 0.954×, as observations from cells that failed the
+diagnostic. Six small one-thread observations whose added time under
+`pooled base median × (order-balanced ratio − 1)` and on paired round medians exceeded
+0.5 µs despite unchanged or lower instruction counts move to item 1089. Eager
+`str-pair-colleague`, at +36.6 µs against its valid A/A control's +22.6 µs with
+overlapping 95% intervals, awaits confirmation, and the
+[X14 Outcome](../../specs/X14-unified-executor/SPEC.md#outcome) lists each line.
 
 ### Forge record at batch 30 against cc94ac7f
 

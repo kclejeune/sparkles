@@ -1869,7 +1869,7 @@
             "type": "boolean"
           },
           "matchingPolicy": {
-            "description": "A matching policy of the dataset's evidence settings, which resolves the linked entities for the claims the summary reads. Not with `mode` `global`.",
+            "description": "A matching policy of the dataset's evidence settings. In local answers, it resolves the linked entities for the claims the summary reads. In global answers, it resolves the entity identities referenced by the selected community reports.",
             "type": "string"
           },
           "maxRows": {
@@ -1897,7 +1897,7 @@
             "type": "boolean"
           },
           "reviewPolicy": {
-            "description": "A review policy of the dataset's evidence settings. The summary reads the claim occurrences about the linked entities with their state under the policy and may cite them in `claimCitations`. Not with `mode` `global`.",
+            "description": "A review policy of the dataset's evidence settings. In local answers, the summary reads the claim occurrences about the linked entities with their state under the policy and may cite them in `claimCitations`. In global answers, only community reports built under that policy are selected.",
             "type": "string"
           },
           "reviewedOnly": {
@@ -1950,7 +1950,7 @@
           },
           "claims": {
             "additionalProperties": true,
-            "description": "With `reviewPolicy`, the claim occurrences the summary read, in the `claims` form of `recall`: `version` 1, `policy`, `occurrences` and `truncated`.",
+            "description": "With `reviewPolicy` in a local answer, the claim occurrences the summary read, in the `claims` form of `recall`: `version` 1, `policy`, `occurrences` and `truncated`.",
             "type": "object"
           },
           "clarify": {
@@ -1978,7 +1978,7 @@
           },
           "global": {
             "additionalProperties": true,
-            "description": "In a global answer, the `level`, `ranking`, `reportsGraph`, the `selected` reports and the map `batches`.",
+            "description": "In a global answer, the `level`, `ranking`, `reportsGraph`, the `selected` reports, the map `batches` and, with `reviewPolicy`, the requested `reviewPolicy`.",
             "type": "object"
           },
           "mode": {
@@ -2052,14 +2052,14 @@
             "description": "In a global answer, the reports it used.",
             "items": {
               "additionalProperties": true,
-              "description": "A report with `iri`, `title`, `level`, `status`, `rating` and the `findings` the answer uses, each with its `cites`.",
+              "description": "A report with `iri`, `title`, `level`, `status`, `rating` and the `findings` the answer uses, each with its `cites` (and `claims`, `decisions`, `about` and report `reviewPolicy` or `identities` when present).",
               "type": "object"
             },
             "type": "array"
           },
           "resolution": {
             "additionalProperties": true,
-            "description": "With `matchingPolicy`, the map revision read, in the `resolution` form of `recall`.",
+            "description": "With `matchingPolicy`, the map revision read (`policy`, `version`, `revision` and `number`), plus `entities` for mapped identities referenced by the returned reports in a global answer.",
             "type": "object"
           },
           "result": {
@@ -8202,7 +8202,7 @@
       },
       "EvidenceDependents": {
         "additionalProperties": false,
-        "description": "Changed evidence records whose dependent assessments to find.",
+        "description": "Changed evidence records whose dependent assessments and community reports to find.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-dependents"
         },
@@ -8217,7 +8217,7 @@
             "type": "array"
           },
           "transitive": {
-            "description": "Also find the assessments that depend on a dependent. Defaults to `false`.",
+            "description": "Also find the assessments and community reports that depend on a dependent. Defaults to `false`.",
             "type": "boolean"
           }
         },
@@ -8228,7 +8228,7 @@
       },
       "EvidenceDependentsResult": {
         "additionalProperties": false,
-        "description": "The assessments that depend on the changed records, each once at its smallest depth.",
+        "description": "The assessments and community reports that depend on the changed records, each once at its smallest depth.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-dependents"
         },
@@ -8254,7 +8254,7 @@
                   "type": "string"
                 },
                 "depth": {
-                  "description": "How many assessments lie between it and a changed record, 0 for a direct dependent.",
+                  "description": "How many intermediate dependents lie between it and a changed record, 0 for a direct dependent.",
                   "type": "integer"
                 },
                 "graph": {
@@ -8276,11 +8276,62 @@
               "type": "object"
             },
             "type": "array"
+          },
+          "reports": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "community": {
+                  "description": "The community the report summarizes, `null` when not recorded.",
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "dependence": {
+                  "enum": [
+                    "used"
+                  ],
+                  "type": "string"
+                },
+                "depth": {
+                  "description": "How many intermediate dependents lie between it and a changed record, 0 for a direct dependent.",
+                  "type": "integer"
+                },
+                "graph": {
+                  "description": "Its guarded reports graph.",
+                  "type": "string"
+                },
+                "on": {
+                  "description": "The changed record its activity used, or for a transitive dependent the assessment or report it depends on.",
+                  "type": "string"
+                },
+                "report": {
+                  "description": "A community report in a guarded reports graph.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "report",
+                "community",
+                "graph",
+                "on",
+                "dependence",
+                "depth"
+              ],
+              "type": "object"
+            },
+            "type": "array"
           }
         },
         "required": [
           "commit",
-          "dependents"
+          "dependents",
+          "reports"
         ],
         "type": "object"
       },
@@ -8491,6 +8542,281 @@
         ],
         "type": "object"
       },
+      "EvidenceIdentitiesRebuild": {
+        "additionalProperties": false,
+        "description": "Administered rebuild of a matching policy's resolution map in its current boundary.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-identities"
+        },
+        "properties": {
+          "dryRun": {
+            "description": "Check and preview the rebuild without committing it.",
+            "type": "boolean"
+          },
+          "idempotencyKey": {
+            "description": "Makes a retry with the same payload answer the first receipt.",
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "ifHead": {
+            "description": "Publish only while this commit is the branch head, else `409 head-changed`.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "message": {
+            "description": "The commit message.",
+            "type": "string"
+          },
+          "policy": {
+            "description": "The name of a matching policy of the evidence settings.",
+            "type": "string"
+          },
+          "policyVersion": {
+            "description": "Optional expected policy version, else `409 policy-changed`.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "policy"
+        ],
+        "type": "object"
+      },
+      "EvidenceIdentitiesRebuildResult": {
+        "additionalProperties": false,
+        "description": "The outcome of rebuilding a matching policy's resolution map.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-identities"
+        },
+        "properties": {
+          "boundary": {
+            "description": "The protected identity graphs of the policy's boundary recorded on the revision, sorted.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "branchId": {
+            "description": "The branch the commit published on.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "changed": {
+            "additionalProperties": false,
+            "description": "The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay.",
+            "properties": {
+              "inserted": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "output": {
+                      "description": "The output graph.",
+                      "type": "string"
+                    },
+                    "triple": {
+                      "description": "The projected triple in N-Triples.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "output",
+                    "triple"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "map": {
+                "additionalProperties": false,
+                "description": "A review under a matching policy that changed which accepted decisions its resolution map follows.",
+                "properties": {
+                  "decisionsAdded": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "decisionsEnded": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "entities": {
+                    "description": "The entities whose selected entity changed.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "number": {
+                    "type": "integer"
+                  },
+                  "policy": {
+                    "description": "The matching policy.",
+                    "type": "string"
+                  },
+                  "previous": {
+                    "description": "The revision it follows, whose consumers may need review.",
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "revision": {
+                    "description": "The resolution map revision the operation published.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "policy",
+                  "revision",
+                  "number",
+                  "previous",
+                  "decisionsAdded",
+                  "decisionsEnded",
+                  "entities"
+                ],
+                "type": "object"
+              },
+              "removed": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "output": {
+                      "description": "The output graph.",
+                      "type": "string"
+                    },
+                    "triple": {
+                      "description": "The projected triple in N-Triples.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "output",
+                    "triple"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "supportsAdded": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "supportsEnded": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "supportsAdded",
+              "supportsEnded",
+              "inserted",
+              "removed"
+            ],
+            "type": "object"
+          },
+          "commit": {
+            "description": "The publishing commit, the first one for a replay, or the head for a dry run.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "committed": {
+            "description": "Whether this request published a commit.",
+            "type": "boolean"
+          },
+          "dryRun": {
+            "additionalProperties": false,
+            "properties": {
+              "deleted": {
+                "type": "integer"
+              },
+              "error": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "inserted": {
+                "type": "integer"
+              },
+              "wouldCommit": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "wouldCommit",
+              "inserted",
+              "deleted",
+              "error"
+            ],
+            "type": "object"
+          },
+          "number": {
+            "description": "The revision number, from 1.",
+            "type": "integer"
+          },
+          "operation": {
+            "description": "The operation, the rebuilt revision's availability receipt.",
+            "type": "string"
+          },
+          "policy": {
+            "description": "The matching policy.",
+            "type": "string"
+          },
+          "policyVersion": {
+            "description": "The matching policy version recorded on the revision.",
+            "type": "integer"
+          },
+          "previous": {
+            "description": "The previous authenticated revision it follows, or `null` when none existed or earlier revisions no longer authenticate.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "replayed": {
+            "description": "Whether the idempotency key had published the same payload, whose receipt this is.",
+            "type": "boolean"
+          },
+          "revision": {
+            "description": "The resolution map revision published by the rebuild, also for a replay.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "committed",
+          "replayed",
+          "commit",
+          "branchId",
+          "policy",
+          "policyVersion",
+          "revision",
+          "number",
+          "previous",
+          "boundary",
+          "changed"
+        ],
+        "type": "object"
+      },
       "EvidenceIdentitiesResult": {
         "additionalProperties": false,
         "description": "What the current resolution map selects for each entity.",
@@ -8569,6 +8895,271 @@
           "number",
           "commit",
           "entities"
+        ],
+        "type": "object"
+      },
+      "EvidenceProjectionReconcile": {
+        "additionalProperties": false,
+        "description": "Reconcile a review policy's accepted projection after a changed protection.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-reviews"
+        },
+        "properties": {
+          "dryRun": {
+            "description": "Check and preview the reconciliation without committing it.",
+            "type": "boolean"
+          },
+          "idempotencyKey": {
+            "description": "Makes a retry with the same payload answer the first receipt.",
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "ifHead": {
+            "description": "Publish only while this commit is the branch head, else `409 head-changed`.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "message": {
+            "description": "The commit message.",
+            "type": "string"
+          },
+          "policy": {
+            "description": "The name of a review policy of the evidence settings.",
+            "type": "string"
+          },
+          "policyVersion": {
+            "description": "Optional expected policy version, else `409 policy-changed`.",
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "policy"
+        ],
+        "type": "object"
+      },
+      "EvidenceProjectionReconcileResult": {
+        "additionalProperties": false,
+        "description": "The outcome of reconciling a review policy's accepted projection.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-reviews"
+        },
+        "properties": {
+          "branchId": {
+            "description": "The branch the commit published on.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "changed": {
+            "additionalProperties": false,
+            "description": "The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay.",
+            "properties": {
+              "inserted": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "output": {
+                      "description": "The output graph.",
+                      "type": "string"
+                    },
+                    "triple": {
+                      "description": "The projected triple in N-Triples.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "output",
+                    "triple"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "map": {
+                "additionalProperties": false,
+                "description": "A review under a matching policy that changed which accepted decisions its resolution map follows.",
+                "properties": {
+                  "decisionsAdded": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "decisionsEnded": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "entities": {
+                    "description": "The entities whose selected entity changed.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "number": {
+                    "type": "integer"
+                  },
+                  "policy": {
+                    "description": "The matching policy.",
+                    "type": "string"
+                  },
+                  "previous": {
+                    "description": "The revision it follows, whose consumers may need review.",
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "revision": {
+                    "description": "The resolution map revision the operation published.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "policy",
+                  "revision",
+                  "number",
+                  "previous",
+                  "decisionsAdded",
+                  "decisionsEnded",
+                  "entities"
+                ],
+                "type": "object"
+              },
+              "removed": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "output": {
+                      "description": "The output graph.",
+                      "type": "string"
+                    },
+                    "triple": {
+                      "description": "The projected triple in N-Triples.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "output",
+                    "triple"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "supportsAdded": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "supportsEnded": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "supportsAdded",
+              "supportsEnded",
+              "inserted",
+              "removed"
+            ],
+            "type": "object"
+          },
+          "commit": {
+            "description": "The publishing commit, the first one for a replay, or the head for a dry run.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "committed": {
+            "description": "Whether this request published a commit.",
+            "type": "boolean"
+          },
+          "dryRun": {
+            "additionalProperties": false,
+            "properties": {
+              "deleted": {
+                "type": "integer"
+              },
+              "error": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "inserted": {
+                "type": "integer"
+              },
+              "wouldCommit": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "wouldCommit",
+              "inserted",
+              "deleted",
+              "error"
+            ],
+            "type": "object"
+          },
+          "operation": {
+            "description": "The reconciliation operation, which is the availability receipt of any fresh projection record it publishes.",
+            "type": "string"
+          },
+          "output": {
+            "description": "The output graph recorded in the projection record.",
+            "type": "string"
+          },
+          "policy": {
+            "description": "The reconciled review policy.",
+            "type": "string"
+          },
+          "policyVersion": {
+            "description": "The policy version recorded in the projection record.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "projection": {
+            "description": "The active projection record carrying the current protections, or the projection record selected by the original operation on a replay.",
+            "type": "string"
+          },
+          "replayed": {
+            "description": "Whether the idempotency key had published the same payload, whose receipt this is.",
+            "type": "boolean"
+          },
+          "vouchedSupports": {
+            "description": "The live authenticated acceptance supports vouched for under the current protections, sorted by IRI. Empty on a replay.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "operation",
+          "committed",
+          "replayed",
+          "commit",
+          "branchId",
+          "policy",
+          "policyVersion",
+          "output",
+          "projection",
+          "vouchedSupports",
+          "changed"
         ],
         "type": "object"
       },
@@ -9696,6 +10287,23 @@
                   "maxLength": 256,
                   "minLength": 1,
                   "type": "string"
+                },
+                "wasRevisionOf": {
+                  "additionalProperties": false,
+                  "description": "The predecessor source revision this revision supersedes, written as `prov:wasRevisionOf`.",
+                  "maxProperties": 1,
+                  "minProperties": 1,
+                  "properties": {
+                    "iri": {
+                      "description": "An existing authenticated record, by its IRI.",
+                      "type": "string"
+                    },
+                    "key": {
+                      "description": "A record of this batch, by its key.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
                 }
               },
               "required": [
@@ -9863,6 +10471,200 @@
           "branchId",
           "firstAvailableAt",
           "hold",
+          "records"
+        ],
+        "type": "object"
+      },
+      "EvidenceReauthenticateRequest": {
+        "additionalProperties": false,
+        "description": "Administered re-authentication request for records of an earlier protection.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-settings"
+        },
+        "properties": {
+          "branch": {
+            "description": "The target branch name. `main` when absent.",
+            "type": "string"
+          },
+          "dryRun": {
+            "description": "Verify and preview the changes without committing.",
+            "type": "boolean"
+          },
+          "graph": {
+            "description": "The protected evidence record graph to reconcile.",
+            "type": "string"
+          },
+          "idempotencyKey": {
+            "description": "Replays the first reconciliation receipt when repeated with the same payload.",
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "ifHead": {
+            "description": "Commit only while the target branch head equals this commit.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "message": {
+            "description": "Optional commit message.",
+            "type": "string"
+          },
+          "records": {
+            "description": "Specific records to verify and re-authenticate. Omit to reconcile every profile record in `graph`.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "iri": {
+                  "description": "The record IRI to verify and vouch for.",
+                  "type": "string"
+                },
+                "recordDigest": {
+                  "description": "Optional expected `ev:recordDigest` that the record must match.",
+                  "pattern": "^sha256:[0-9a-f]{64}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "iri"
+              ],
+              "type": "object"
+            },
+            "maxItems": 10000,
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "graph"
+        ],
+        "type": "object"
+      },
+      "EvidenceReauthenticateResult": {
+        "additionalProperties": false,
+        "description": "Result of an administered evidence re-authentication reconciliation.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-settings"
+        },
+        "properties": {
+          "branchId": {
+            "description": "The reconciled branch's UUID.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "commit": {
+            "description": "The publishing commit, the first commit on a replay, or the branch head on a dry run or no-op.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "committed": {
+            "description": "Whether this call published a commit.",
+            "type": "boolean"
+          },
+          "dryRun": {
+            "additionalProperties": false,
+            "properties": {
+              "deleted": {
+                "type": "integer"
+              },
+              "error": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "inserted": {
+                "type": "integer"
+              },
+              "wouldCommit": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "wouldCommit",
+              "inserted",
+              "deleted",
+              "error"
+            ],
+            "type": "object"
+          },
+          "graph": {
+            "description": "The reconciled evidence record graph.",
+            "type": "string"
+          },
+          "operation": {
+            "description": "The audit `ev:Operation` IRI in the reconciled graph.",
+            "type": "string"
+          },
+          "records": {
+            "description": "Every verified record of the reconciliation.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "alreadyAuthenticated": {
+                  "description": "Whether the record already carried the graph's current protection nonce.",
+                  "type": "boolean"
+                },
+                "iri": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "SourceRevision",
+                    "Rendition",
+                    "Passage",
+                    "EvidenceRef",
+                    "Claim",
+                    "EvidenceLink",
+                    "Assessment",
+                    "Note",
+                    "Decision",
+                    "Task",
+                    "ReviewDecision",
+                    "IdentityProposal",
+                    "AcceptanceSupport",
+                    "Withdrawal",
+                    "Projection",
+                    "ResolutionMap"
+                  ],
+                  "type": "string"
+                },
+                "receipt": {
+                  "description": "The record's preserved `ev:availabilityReceipt` operation IRI.",
+                  "type": "string"
+                },
+                "recordDigest": {
+                  "description": "The verified `ev:recordDigest`.",
+                  "pattern": "^sha256:[0-9a-f]{64}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "iri",
+                "kind",
+                "recordDigest",
+                "receipt",
+                "alreadyAuthenticated"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "replayed": {
+            "description": "Whether an earlier idempotent operation's receipt was returned.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "operation",
+          "graph",
+          "committed",
+          "replayed",
+          "commit",
+          "branchId",
           "records"
         ],
         "type": "object"
@@ -14031,7 +14833,7 @@
           },
           "result": {
             "additionalProperties": true,
-            "description": "The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `already-proposed`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, `redactions` counts by detector when text was redacted, a table's mapping draft and preview, or a workbook's drafts and redaction counts for each sheet. A `claims` ingestion reports the evidence operation, commit, first availability, revision, records and their counts by kind, the claims, failed facts, flagged entities and `factGuard` `not-run`. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted.",
+            "description": "The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `already-proposed`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, `redactions` counts by detector when text was redacted, a table's mapping draft and preview, or a workbook's drafts and redaction counts for each sheet. A `claims` ingestion reports the evidence operation, commit, first availability, revision, records and their counts by kind, the claims, failed facts, flagged entities, `factGuard` `not-run`, and `previousRevision` (the linked prior evidence `SourceRevision` IRI, distinct from the C18 `previousRendition`, omitted when no predecessor evidence revision is linked, when the recorded link is hidden from the caller or on `already-proposed`). A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted.",
             "type": "object"
           },
           "status": {
@@ -35802,6 +36604,276 @@
           }
         ],
         "summary": "Release an evidence hold",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/evidence/{ds}/identities/rebuild": {
+      "post": {
+        "description": "Needs unrestricted `admin` on the dataset or branch. Recomputes the clusters of the matching policy's current authenticated accepted decisions in its current protected identity-graph boundary, rewrites its output graph atomically and records the new protections and boundary in a fresh `ev:ResolutionMap` revision, restoring reviews and reads that answered `503 projection-unavailable`. Refusals write nothing: `400` for a malformed request or unknown matching policy, `403` for a read-only server or missing unrestricted admin grant, `409 policy-changed`, `409 head-changed`, `409 identity-conflict`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 unsupported-profile`, `409 evidence-settings-drift`, `422 incomplete-evidence` and `503 authority-changed`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-identities"
+        },
+        "operationId": "rebuildIdentityMap",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceIdentitiesRebuild"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceIdentitiesRebuildResult"
+                }
+              }
+            },
+            "description": "The rebuilt resolution map revision and what changed."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Rebuild a resolution map",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/evidence/{ds}/projections/reconcile": {
+      "post": {
+        "description": "Needs `admin` on the dataset or selected branch, with update grants on the policy's supports and output graphs and unmasked read grants on its decisions, supports and output graphs and on every configured proposal graph. Rebuilds the review policy's output graph strictly from the live acceptance supports that authenticate under the current protections, or empties it when none vouch, and records the new protection nonces in a fresh `ev:Projection` record that supersedes prior unsuperseded projection records of the policy, or reuses the active projection record when the protections and output are already valid. Restores normal reviews, withdrawals and policy reads after a detach and new protection of the policy's decisions, supports or output graph. Refusals write nothing: `400` for a malformed request, unknown policy or matching policy, `403` for a read-only server or missing or masked grants, `409 evidence-settings-drift`, `409 policy-changed`, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 unsupported-profile` when the profile is disabled or a policy graph is still detached, `422 incomplete-evidence`, `503` for `managed-unavailable`, `projection-unavailable` when the supports, output or conflict mode changed without raising the policy version, `authority-changed`, or temporary query memory pool exhaustion (with `Retry-After`), and `507` when the request exceeds the configured query memory pool.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-reviews"
+        },
+        "operationId": "reconcileEvidenceProjection",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceProjectionReconcile"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceProjectionReconcileResult"
+                }
+              }
+            },
+            "description": "The reconciled projection, vouched supports and output changes."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Reconcile a review policy's accepted projection",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/evidence/{ds}/reauthenticate": {
+      "post": {
+        "description": "Needs `admin` on the dataset and target branch, and requires activated configuration history (`409 configuration-history-inactive` otherwise). Verifies records written under an earlier protection nonce in a protected evidence record graph against their retained, configuration-bound publication views, recorded digests, retained content, passage spans and receipt lineage, and atomically marks the verified records and their receipt operations under the graph's current protection nonce together with an audit operation. Refuses tampered, unretained or mismatched records without writing (`409 immutable-record-conflict`, `409 target-changed`, `422 origin-not-reproduced`, `422 span-mismatch`, `422 evidence-unavailable`, `422 incomplete-evidence`). Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ, `409 head-changed` for a stale `ifHead`, `409 idempotency-conflict` for a reused key with another payload, `409 unsupported-profile` while the graph is detached or the profile is disabled, and `503 authority-changed` when authorization changes before publication.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-settings"
+        },
+        "operationId": "reauthenticateEvidence",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceReauthenticateRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceReauthenticateResult"
+                }
+              }
+            },
+            "description": "The reconciliation receipt and verified records."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Re-authenticate evidence records under a graph's current protection",
         "tags": [
           "Datasets"
         ],
@@ -60237,7 +61309,7 @@
     },
     "/{ds}/claims/dependents": {
       "post": {
-        "description": "Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and with `transitive` the assessments that depend on those, each once at its smallest depth. A graph the caller cannot read is not searched, and an assessment any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.",
+        "description": "Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and the community reports in guarded reports graphs proven for the caller whose activity recorded `prov:used` for one of them (including person-edited reports via `gr:editOf`), and with `transitive` the assessments and reports that depend on those, each once at its smallest depth. A graph the caller cannot read or cannot prove under the disclosure guard is not searched, and a record any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-dependents"
         },
@@ -60267,7 +61339,7 @@
                 }
               }
             },
-            "description": "The dependent assessments."
+            "description": "The dependent assessments and community reports."
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
@@ -60318,7 +61390,7 @@
             "cloudflareAccess": []
           }
         ],
-        "summary": "Find the assessments that depend on changed records",
+        "summary": "Find the assessments and reports that depend on changed records",
         "tags": [
           "SPARQL"
         ],

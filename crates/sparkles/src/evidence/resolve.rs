@@ -12,8 +12,9 @@
 //! capability.
 
 pub use sparkles_core::evidence::resolve::{
-    MAX_REFERENCES, MEMORY_BYTES, Receipt, RecordRequest, VerifiedFact, VerifiedRecord,
-    VerifiedSpan, check_anchor, kind_iri, unavailable,
+    GraphNodes, MAX_REFERENCES, MEMORY_BYTES, Phase2Outcome, ProposedPassage, ProposedStructured,
+    Receipt, RecordRequest, SelectionProbe, SelectionRequirements, SingleObject, VerifiedFact,
+    VerifiedRecord, VerifiedSpan, check_anchor, kind_iri, unavailable,
 };
 pub use sparkles_core::evidence::{BlankAnchor, GraphIdentity, RecordKind, StoredFactRef};
 
@@ -21,6 +22,7 @@ use crate::access::GraphAccess;
 use crate::guard::WriteOptions;
 use crate::task::Control;
 use crate::{Catalog, Dataset, Result};
+use oxrdf::NamedNode;
 use sparkles_core::evidence::resolve::Resolver;
 use std::sync::Arc;
 
@@ -125,6 +127,18 @@ impl Resolution {
         self.resolver.stored_fact(key, main, granted.as_ref(), fact)
     }
 
+    /// The operation's shared preparation context.
+    pub fn preparation(&self) -> &crate::access::Preparation {
+        self.resolver.preparation()
+    }
+
+    /// Pin record and graph lookups on `(main, logical)` to the exact branch commit
+    /// `commit`, so every call in this resolution reads one consistent snapshot.
+    pub fn pin_commit(&mut self, main: &Dataset, logical: &Dataset, commit: u64) {
+        self.resolver
+            .pin_commit(main.store(), logical.store(), commit);
+    }
+
     /// Verify a record reference at the current state of `logical`, which is `main` or
     /// one of its branches, under `access`, what the caller may read there (`None`:
     /// nothing). The record must be an authenticated profile record of the evidence
@@ -139,6 +153,341 @@ impl Resolution {
     ) -> Result<VerifiedRecord> {
         self.resolver
             .record(key, main.store(), logical.store(), access.as_ref(), request)
+    }
+
+    /// Probe a record reference and its selection-target availability without
+    /// reconstructing a compatible retained literal (`ev:normalizedText` or
+    /// `ev:retainedBytes`) when a single `Vocab`/`Delta` object ID is present.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn probe_record_with_selection_at(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: Option<Arc<GraphAccess>>,
+        iri: &NamedNode,
+        kinds: &[RecordKind],
+        selection: SelectionRequirements,
+        req_idx: usize,
+    ) -> Result<SelectionProbe> {
+        self.resolver.probe_record_with_selection_at(
+            key,
+            main.store(),
+            logical.store(),
+            access.as_ref(),
+            iri,
+            kinds,
+            selection,
+            req_idx,
+        )
+    }
+
+    /// Smallest Phase 1 requirement index among deferred existing passages that have not
+    /// yet been verified or consumed.
+    pub(crate) fn next_pending_passage_req_idx(&self) -> Option<usize> {
+        self.resolver.next_pending_passage_req_idx()
+    }
+
+    /// Verify and consume the earliest deferred existing passage.
+    pub(crate) fn verify_next_pending_passage(
+        &mut self,
+        main: &Dataset,
+        logical: &Dataset,
+        access: Option<Arc<GraphAccess>>,
+    ) -> Phase2Outcome {
+        self.resolver
+            .verify_next_pending_passage(main.store(), logical.store(), access.as_ref())
+    }
+
+    /// Verify the exact vocabulary literal shape of a selected target whose single
+    /// `Vocab`/`Delta` object ID was deferred by `probe_record_with_selection_at`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn verify_selection_literal_shape(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: Option<Arc<GraphAccess>>,
+        iri: &NamedNode,
+        selection: SelectionRequirements,
+    ) -> Result<()> {
+        self.resolver.verify_selection_literal_shape(
+            key,
+            main.store(),
+            logical.store(),
+            access.as_ref(),
+            iri,
+            selection,
+        )
+    }
+
+    /// Resolve the caller's read access for `logical` (`main` or one of its listed
+    /// branches) by its current branch name.
+    pub(crate) fn logical_access(
+        &self,
+        main: &Dataset,
+        logical: &Dataset,
+        access: &mut dyn FnMut(&Dataset, &str) -> Option<Arc<GraphAccess>>,
+    ) -> Result<Option<Arc<GraphAccess>>> {
+        let branch = if logical.store().is_branch() {
+            main.store()
+                .listed_branch_name(logical.store().branch_id(), &self.options())?
+        } else {
+            Some(crate::branch::MAIN.to_string())
+        };
+        Ok(branch.as_deref().and_then(|name| access(main, name)))
+    }
+
+    /// Verify one or more proposed passages against an existing authenticated rendition
+    /// at the current state of `logical`.
+    pub fn verify_proposed_passages(
+        &mut self,
+        main: &Dataset,
+        logical: &Dataset,
+        access: Option<Arc<GraphAccess>>,
+        rendition: &NamedNode,
+        passages: &[ProposedPassage<'_>],
+    ) -> Result<()> {
+        self.resolver.verify_proposed_passages(
+            main.store(),
+            logical.store(),
+            access.as_ref(),
+            rendition,
+            passages,
+        )
+    }
+
+    /// Verify proposed passages and any deferred existing passages targeting `rendition`
+    /// in one `ev:normalizedText` scan, returning Phase 2 fallback context.
+    pub(crate) fn verify_proposed_passages_checked(
+        &mut self,
+        main: &Dataset,
+        logical: &Dataset,
+        access: Option<Arc<GraphAccess>>,
+        rendition: &NamedNode,
+        passages: &[ProposedPassage<'_>],
+        group_req_idx: usize,
+    ) -> Phase2Outcome {
+        self.resolver.verify_proposed_passages_checked(
+            main.store(),
+            logical.store(),
+            access.as_ref(),
+            rendition,
+            passages,
+            group_req_idx,
+        )
+    }
+
+    /// Verify that an existing authenticated passage belongs to `expected_revision` and
+    /// `expected_rendition`, and that its own selector verifies against its rendition's
+    /// retained text.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_passage_reference(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: Option<Arc<GraphAccess>>,
+        passage: &NamedNode,
+        expected_revision: &NamedNode,
+        expected_rendition: &NamedNode,
+    ) -> Result<()> {
+        self.resolver.verify_passage_reference(
+            key,
+            main.store(),
+            logical.store(),
+            access.as_ref(),
+            passage,
+            expected_revision,
+            expected_rendition,
+        )
+    }
+
+    /// Verify one or more structured JSON Pointer references (`json-lexical-utf8:1`)
+    /// against an existing authenticated source revision's retained bytes.
+    pub fn verify_structured_references(
+        &mut self,
+        main: &Dataset,
+        logical: &Dataset,
+        access: Option<Arc<GraphAccess>>,
+        revision: &NamedNode,
+        references: &[ProposedStructured<'_>],
+    ) -> Result<()> {
+        self.resolver.verify_structured_references(
+            main.store(),
+            logical.store(),
+            access.as_ref(),
+            revision,
+            references,
+        )
+    }
+
+    /// Verify structured JSON Pointer references against `revision`, returning Phase 2
+    /// fallback context.
+    pub(crate) fn verify_structured_references_checked(
+        &mut self,
+        main: &Dataset,
+        logical: &Dataset,
+        access: Option<Arc<GraphAccess>>,
+        revision: &NamedNode,
+        references: &[ProposedStructured<'_>],
+    ) -> Phase2Outcome {
+        self.resolver.verify_structured_references_checked(
+            main.store(),
+            logical.store(),
+            access.as_ref(),
+            revision,
+            references,
+        )
+    }
+
+    /// Verify a record reference as [`Self::record`], borrowing `iri` and returning a
+    /// [`crate::access::Reservation`] that keeps the variable-sized strings inside
+    /// [`VerifiedRecord`] charged to this resolution's preparation allowance until dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_charged(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: Option<Arc<GraphAccess>>,
+        iri: &oxrdf::NamedNode,
+        kinds: &[RecordKind],
+        expected_content_digest: Option<&sparkles_core::evidence::Sha256Digest>,
+    ) -> Result<(VerifiedRecord, crate::access::Reservation)> {
+        self.resolver.record_charged(
+            key,
+            main.store(),
+            logical.store(),
+            access.as_ref(),
+            iri,
+            kinds,
+            expected_content_digest,
+        )
+    }
+
+    /// Whether `s p o` is visible in `graph` at the resolving state of `logical` under
+    /// `access`, bounded by this resolution's preparation allowance and controls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn has_triple(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: &Arc<GraphAccess>,
+        graph: &oxrdf::NamedNode,
+        s: &oxrdf::NamedNode,
+        p: &oxrdf::NamedNode,
+        o: &oxrdf::Term,
+    ) -> Result<bool> {
+        self.resolver
+            .has_triple(key, main.store(), logical.store(), access, graph, s, p, o)
+    }
+
+    /// Whether at least one triple `s p ?o` is visible in `graph` at the resolving state of
+    /// `logical` under `access`, without decoding any object term.
+    #[allow(clippy::too_many_arguments)]
+    pub fn has_any_object_in_graph(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: &Arc<GraphAccess>,
+        graph: &oxrdf::NamedNode,
+        s: &oxrdf::NamedNode,
+        p: &oxrdf::NamedNode,
+    ) -> Result<bool> {
+        self.resolver.has_any_object_in_graph(
+            key,
+            main.store(),
+            logical.store(),
+            access,
+            graph,
+            s,
+            p,
+        )
+    }
+
+    /// Inspect the object(s) of `s p ?o` visible in `graph` at the resolving state of
+    /// `logical` under `access`, borrowing the single decoded term inside `parse`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn single_object_in_graph<T>(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: &Arc<GraphAccess>,
+        graph: &oxrdf::NamedNode,
+        s: &oxrdf::NamedNode,
+        p: &oxrdf::NamedNode,
+        parse: impl FnOnce(Option<&oxrdf::Term>) -> Result<T>,
+    ) -> Result<SingleObject<T>> {
+        self.resolver.single_object_in_graph(
+            key,
+            main.store(),
+            logical.store(),
+            access,
+            graph,
+            s,
+            p,
+            parse,
+        )
+    }
+
+    /// Named-node objects of `s p ?o` visible in `graph`, collecting at most `limit`
+    /// results and decrementing `remaining_scans` for each scanned quad in `graph`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn objects_in_graph(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: &Arc<GraphAccess>,
+        graph: &oxrdf::NamedNode,
+        s: &oxrdf::NamedNode,
+        p: &oxrdf::NamedNode,
+        limit: usize,
+        remaining_scans: &mut u64,
+    ) -> Result<GraphNodes> {
+        self.resolver.objects_in_graph(
+            key,
+            main.store(),
+            logical.store(),
+            access,
+            graph,
+            s,
+            p,
+            limit,
+            remaining_scans,
+        )
+    }
+
+    /// Named-node subjects of `?s p o` visible in `graph`, collecting at most `limit`
+    /// results and decrementing `remaining_scans` only for quads belonging to `graph`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn subjects_in_graph(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: &Arc<GraphAccess>,
+        graph: &oxrdf::NamedNode,
+        p: &oxrdf::NamedNode,
+        o: &oxrdf::Term,
+        limit: usize,
+        remaining_scans: &mut u64,
+    ) -> Result<GraphNodes> {
+        self.resolver.subjects_in_graph(
+            key,
+            main.store(),
+            logical.store(),
+            access,
+            graph,
+            p,
+            o,
+            limit,
+            remaining_scans,
+        )
     }
 
     /// Verify each reference in order, stopping at the first that does not verify.

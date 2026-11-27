@@ -928,7 +928,7 @@ fn retained_original_header_reauthenticates_its_target_in_each_operation() {
 }
 
 #[test]
-fn a_clone_racing_memory_activation_refuses_under_the_writer() {
+fn a_clone_racing_memory_activation_establishes_an_independent_destination_root() {
     let store = Store::in_memory(StoreOptions::default());
     update(&store, "before");
     store.set_failpoint(
@@ -940,18 +940,27 @@ fn a_clone_racing_memory_activation_refuses_under_the_writer() {
     );
     let temporary = tempfile::tempdir().unwrap();
     let destination = temporary.path().join("clone");
-    let error = store
+    let report = store
         .clone_to(&destination, &Default::default())
-        .expect_err("a clone admitted after activation must refuse");
-    assert_eq!(error.code(), "unsupported", "{error}");
-    assert!(!destination.exists());
+        .expect("a clone admitted after activation establishes a destination root");
+    assert!(destination.join("evidence-history/origin.json").is_file());
+    let cloned = Store::open(&destination, StoreOptions::default()).unwrap();
+    assert_eq!(cloned.dataset_id(), report.dataset_id);
+    assert_ne!(cloned.dataset_id(), store.dataset_id());
+    let src_head = store.evidence_view(&At::Head, &preparation()).unwrap();
+    let dst_head = cloned.evidence_view(&At::Head, &preparation()).unwrap();
+    assert_eq!(dst_head.configuration().dataset_id(), cloned.dataset_id());
+    assert_ne!(dst_head.configuration(), src_head.configuration());
+    drop(cloned);
     store.set_failpoint("clone-admitting", None);
-    let error = store
+    let (memory, mem_report) = store
         .clone_to_memory(&Default::default(), StoreOptions::default())
-        .err()
-        .expect("an activated in-memory store must not clone");
-    assert_eq!(error.code(), "unsupported", "{error}");
+        .expect("an activated in-memory store clones into memory");
+    let mem_head = memory.evidence_view(&At::Head, &preparation()).unwrap();
+    assert_eq!(mem_head.configuration().dataset_id(), mem_report.dataset_id);
+    assert_ne!(mem_head.configuration(), src_head.configuration());
     update(&store, "after");
+    update(&memory, "clone-after");
 }
 
 /// `sparkles check` runs this validation on a live root. Commits that land while it
@@ -1083,4 +1092,1303 @@ fn validation_reads_a_log_trimmed_after_its_length_was_taken() {
         "{result:?}"
     );
     result.unwrap();
+}
+
+#[test]
+fn clone_destination_syncs_intermediate_import_directories_deepest_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+    crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+    let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+    update(&src, "seed");
+    let state = src.managed_state_shared();
+    let installed = match state.as_deref() {
+        Some(crate::managed::ManagedState::Installed(i)) => i,
+        _ => panic!("expected installed"),
+    };
+    let prep = preparation();
+    let mut source_files = Vec::new();
+    for rel in [
+        "dataset.json",
+        "CURRENT",
+        "managed.json",
+        "gen-0001/commit.json",
+        "gen-0001/meta.json",
+    ] {
+        let bytes = read_anchored_local_file(&src_root, rel, false, &prep)
+            .unwrap()
+            .unwrap();
+        if rel == "dataset.json" {
+            source_files.push((
+                "family-dataset.json".into(),
+                managed_history::Bytes::copy_from_slice(&bytes.value, &prep).unwrap(),
+            ));
+        }
+        source_files.push((rel.into(), bytes));
+    }
+    let history = installed.configuration_history.as_ref().unwrap();
+    let lineage = history.lineage_id;
+    let cov_rel = format!("evidence-history/{lineage}/coverage.json");
+    source_files.push((
+        cov_rel.clone(),
+        read_anchored_local_file(&src_root, &cov_rel, false, &prep)
+            .unwrap()
+            .unwrap(),
+    ));
+    let hex = history.current_generation.to_string();
+    let hex = hex.strip_prefix("sha256:").unwrap();
+    let gen_rel = format!("evidence-history/{lineage}/generations/{hex}.json");
+    source_files.push((
+        gen_rel.clone(),
+        read_anchored_local_file(&src_root, &gen_rel, false, &prep)
+            .unwrap()
+            .unwrap(),
+    ));
+
+    let dst_root = dir.path().join("dst");
+    std::fs::create_dir(&dst_root).unwrap();
+    let mut synced: Vec<std::path::PathBuf> = Vec::new();
+    let root_commit = crate::commit::CommitInfo {
+        seq: 0,
+        timestamp_ms: 100,
+        kind: crate::commit::CommitKind::Create,
+        inserted: 1,
+        deleted: 0,
+        quads: 1,
+        generation: 1,
+        bulk: true,
+        exact: true,
+        reconstructed: false,
+        default_graph: true,
+        unvalidated: false,
+    };
+    write_clone_destination_with_sync(
+        &dst_root,
+        uuid::Uuid::new_v4(),
+        &root_commit,
+        installed,
+        src.dataset_id(),
+        src.dataset_id(),
+        src.head_commit().seq,
+        "gen-0001",
+        source_files,
+        &[],
+        Vec::new(),
+        &prep,
+        &mut |path| {
+            assert!(path.is_dir(), "{} must be a directory", path.display());
+            synced.push(path.to_path_buf());
+            crate::store::sync_dir(path)
+        },
+    )
+    .unwrap();
+    let eh = dst_root.join("evidence-history");
+    let imports = eh.join("imports");
+    assert!(
+        synced.iter().any(|p| p == &imports),
+        "evidence-history/imports must be synced: {synced:?}"
+    );
+    assert!(
+        synced.iter().any(|p| p.ends_with("generations")),
+        "nested generations dir must be synced: {synced:?}"
+    );
+    assert_eq!(synced.last().unwrap(), &eh);
+    for (idx, path) in synced.iter().enumerate() {
+        if path != &eh {
+            let parent = path.parent().unwrap();
+            if parent.starts_with(&eh) {
+                let parent_pos = synced.iter().position(|p| p == parent).unwrap_or_else(|| {
+                    panic!(
+                        "parent {} of {} was never synced: {synced:?}",
+                        parent.display(),
+                        path.display()
+                    )
+                });
+                assert!(
+                    parent_pos > idx,
+                    "child {} synced at {idx} after parent {} at {parent_pos}",
+                    path.display(),
+                    parent.display()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn clone_to_with_preparation_accounts_aggregate_metadata_and_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+    crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+    let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+    for i in 0..5 {
+        let settings = crate::evidence::Settings {
+            enabled: true,
+            source_records: vec![format!("urn:src:{i}")],
+            proposals: vec![format!("urn:prop:{i}")],
+            ..Default::default()
+        };
+        let canonical = settings.canonical(&crate::task::Control::none()).unwrap();
+        src.enable_managed(
+            crate::managed::OwnerKind::Evidence,
+            crate::managed::OwnerEntry::for_settings(
+                1,
+                settings.managed_graphs(),
+                canonical.bytes(),
+            ),
+            canonical.bytes(),
+        )
+        .unwrap();
+        update(&src, &format!("gen-{i}"));
+    }
+    // A tiny preparation budget cannot retain all 5 captured generations simultaneously
+    // and must fail with BudgetExceeded and restore its room cleanly.
+    let tight = Preparation::new(crate::task::Control::none(), 8 << 10).unwrap();
+    let before = tight.room();
+    let dst = dir.path().join("tight-clone");
+    let err = src
+        .clone_to_with_preparation(&dst, &Default::default(), &tight)
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(_)),
+        "expected BudgetExceeded, got {err:?}"
+    );
+    assert_eq!(tight.room(), before, "preparation credit must roll back");
+    assert!(!dst.exists(), "failed clone must not leave destination");
+}
+
+#[test]
+fn native_wal_binding_lookup_uses_retained_imports_under_tight_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+    crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+    let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+    // Create several configuration generations so a full DiskClosure::load would be expensive.
+    for i in 0..6 {
+        let settings = crate::evidence::Settings {
+            enabled: true,
+            source_records: vec![format!("urn:s:{i}")],
+            proposals: vec![format!("urn:p:{i}")],
+            ..Default::default()
+        };
+        let canonical = settings.canonical(&crate::task::Control::none()).unwrap();
+        src.enable_managed(
+            crate::managed::OwnerKind::Evidence,
+            crate::managed::OwnerEntry::for_settings(
+                1,
+                settings.managed_graphs(),
+                canonical.bytes(),
+            ),
+            canonical.bytes(),
+        )
+        .unwrap();
+        update(&src, &format!("s-{i}"));
+    }
+    let clone_root = dir.path().join("clone");
+    src.clone_to(&clone_root, &Default::default()).unwrap();
+    let dst = Store::open(&clone_root, StoreOptions::default()).unwrap();
+    update(&dst, "native-own");
+    let seq = dst.head_commit().seq;
+    // A modest 256 KiB budget resolves the native WAL commit cleanly via retained imports
+    // without reloading/re-hashing all 6 source generations.
+    let small = Preparation::new(crate::task::Control::none(), 256 << 10).unwrap();
+    let binding = dst.configuration_binding_at(seq, &small).unwrap();
+    assert!(binding.configuration().is_some());
+}
+
+#[test]
+fn retained_cold_read_charges_closure_and_scopes_wal_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+    crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+    let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+    // Create several configuration generations so DiskClosure retains substantial bytes.
+    // Give the earliest imported WAL generation (`imp-0`) a large settings payload while
+    // keeping later generations small so `imp-0`'s publication decode inside `prove_wal`'s
+    // callback cleanly dominates setup and current-registry verification.
+    for i in 0..8 {
+        let source_records = if i == 0 {
+            (0..400).map(|k| format!("urn:r2src:0:{k:04}")).collect()
+        } else {
+            vec![format!("urn:r2src:{i}")]
+        };
+        let settings = crate::evidence::Settings {
+            enabled: true,
+            source_records,
+            proposals: vec![format!("urn:r2prop:{i}")],
+            ..Default::default()
+        };
+        let canonical = settings.canonical(&crate::task::Control::none()).unwrap();
+        src.enable_managed(
+            crate::managed::OwnerKind::Evidence,
+            crate::managed::OwnerEntry::for_settings(
+                1,
+                settings.managed_graphs(),
+                canonical.bytes(),
+            ),
+            canonical.bytes(),
+        )
+        .unwrap();
+        update(&src, &format!("imp-{i}"));
+    }
+    let imported_seq = src.head_commit().seq;
+    let src_id = src.dataset_id();
+    let cap = src.backup_capture("b-cold-budget").unwrap();
+    drop(src);
+
+    let dst_root = dir.path().join("dst");
+    cap.write_to(&dst_root).unwrap();
+    let new_id = uuid::Uuid::new_v4();
+    reidentify_activated_dir(
+        &dst_root,
+        new_id,
+        crate::commit::ForkedFrom {
+            id: src_id,
+            seq: imported_seq,
+        },
+        &crate::task::Control::none(),
+    )
+    .unwrap();
+
+    let retain_opts = StoreOptions {
+        history_max_generations: 4,
+        ..StoreOptions::default()
+    };
+    {
+        let dst = Store::open(&dst_root, retain_opts.clone()).unwrap();
+        dst.set_retention(crate::history::Retention {
+            keep_commits: Some(100),
+            ..Default::default()
+        })
+        .unwrap();
+        update(&dst, "own-1");
+        update(&dst, "own-2");
+        update(&dst, "own-3");
+        dst.compact().unwrap();
+    }
+    let dst = Store::open(&dst_root, retain_opts).unwrap();
+    let own_1_seq = imported_seq + 1;
+    let own_2_seq = imported_seq + 2;
+    let own_last_seq = dst.head_commit().seq;
+    assert!(own_last_seq > own_2_seq);
+
+    // 1. Verify disjoint live memory accounting in `DiskClosure::prove_wal` across
+    //    BOTH callers (`authenticate_retained_generation` and closed-copy
+    //    `validate_copy_imported`):
+    //    (a) At a fixed full budget, measure every admission boundary and assert that:
+    //        - `actual_commit` stays charged in `budget` during setup and is released
+    //          before `physical::prove_prefix*`,
+    //        - `actual_meta` (`Owned<IndexMeta>`) and `orig` (`DiskOriginalBase`) keep
+    //          their full decoded charges attached inside `setup_prep`,
+    //        - `setup_prep` and `callback_prep` never overlap live `budget` charges
+    //          (`budget_used + sub_limit <= cap`), directly catching any regression
+    //          that passes a pre-proof allowance into the callback.
+    //    (b) At a tight budget derived independently from `DiskClosure::load`'s own peak
+    //        (no binary search over `prove_wal`), verify that BOTH callers reach
+    //        `"callback"` with non-overlapping `sub_limit` and refuse with
+    //        `Error::BudgetExceeded`.
+    let opts = HistoryOptions::default();
+    let entry = {
+        let hist = dst.history.as_ref().unwrap().lock();
+        hist.gens.get(&1).expect("gen-0001 retained").clone()
+    };
+    let meta_len = std::fs::metadata(entry.dir.join("meta.json"))
+        .unwrap()
+        .len();
+
+    let capture_stages = |run: &mut dyn FnMut() -> Result<()>| -> (Result<()>, Vec<ProveWalStage>) {
+        let observed = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<ProveWalStage>::new()));
+        let observed_clone = observed.clone();
+        PROVE_WAL_STAGE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |stage| {
+                observed_clone.lock().push(stage);
+            }));
+        });
+        let res = run();
+        PROVE_WAL_STAGE_HOOK.with(|hook| hook.borrow_mut().take());
+        let stages = observed.lock().clone();
+        (res, stages)
+    };
+
+    let assert_full_disjoint_stages = |label: &str,
+                                       stages: &[ProveWalStage],
+                                       expected_max: u64,
+                                       require_native: bool| {
+        let entered = stages
+            .iter()
+            .find(|s| s.stage == "entered")
+            .unwrap_or_else(|| panic!("{label}: missing entered stage"));
+        let setup_meta = stages
+            .iter()
+            .find(|s| s.stage == "setup_meta")
+            .unwrap_or_else(|| panic!("{label}: missing setup_meta stage"));
+        let setup_source = stages
+            .iter()
+            .find(|s| s.stage == "setup_source")
+            .unwrap_or_else(|| panic!("{label}: missing setup_source stage"));
+        let before_physical = stages
+            .iter()
+            .find(|s| s.stage == "before_physical")
+            .unwrap_or_else(|| panic!("{label}: missing before_physical stage"));
+        let callbacks: Vec<&ProveWalStage> = stages
+            .iter()
+            .filter(|s| s.stage == "callback_imported" || s.stage == "callback_native")
+            .collect();
+        let imported_callbacks = callbacks
+            .iter()
+            .filter(|s| s.stage == "callback_imported")
+            .count();
+        let native_callbacks = callbacks
+            .iter()
+            .filter(|s| s.stage == "callback_native")
+            .count();
+        assert!(
+            imported_callbacks > 0,
+            "{label}: expected at least one callback_imported stage; stages={stages:?}"
+        );
+        if require_native {
+            assert!(
+                native_callbacks > 0,
+                "{label}: expected at least one callback_native stage to exercise the native cache-miss constructor; stages={stages:?}"
+            );
+        }
+        let cap = entered.budget_used + entered.budget_available;
+        assert!(
+            cap <= expected_max,
+            "{label}: budget cap {cap} exceeds caller limit {expected_max}"
+        );
+        assert!(
+            before_physical.budget_used > entered.budget_used,
+            "{label}: prove_wal must charge range/span storage ({} > {})",
+            before_physical.budget_used,
+            entered.budget_used
+        );
+        assert!(
+            setup_meta.budget_used > before_physical.budget_used,
+            "{label}: destination commit must remain charged in budget during setup and release before physical proof ({} > {})",
+            setup_meta.budget_used,
+            before_physical.budget_used
+        );
+        let meta_min_charge = meta_len * 128 + 1024;
+        assert!(
+            setup_meta.sub_used.unwrap() >= meta_min_charge,
+            "{label}: actual_meta must retain its decoded charge in setup_prep ({} >= {meta_min_charge})",
+            setup_meta.sub_used.unwrap()
+        );
+        assert!(
+            setup_source.sub_used.unwrap() > setup_meta.sub_used.unwrap() + meta_len * 128,
+            "{label}: DiskOriginalBase must retain its decoded charge on top of actual_meta ({} > {} + {})",
+            setup_source.sub_used.unwrap(),
+            setup_meta.sub_used.unwrap(),
+            meta_len * 128
+        );
+        assert!(
+            setup_meta.budget_used + setup_meta.sub_limit.unwrap() <= cap,
+            "{label}: setup_prep limit ({}) must not overlap live budget charge ({}) against cap ({cap})",
+            setup_meta.sub_limit.unwrap(),
+            setup_meta.budget_used
+        );
+        for (index, callback) in callbacks.iter().enumerate() {
+            assert!(
+                callback.budget_used > before_physical.budget_used,
+                "{label}: callback[{index}] ({}) must charge physical proof buffer/state ({} > {})",
+                callback.stage,
+                callback.budget_used,
+                before_physical.budget_used
+            );
+            assert_eq!(
+                callback.sub_limit.unwrap(),
+                callback.budget_available,
+                "{label}: callback[{index}] ({}) callback_prep must receive only proof_budget.available()",
+                callback.stage
+            );
+            assert!(
+                callback.budget_used + callback.sub_limit.unwrap() <= cap,
+                "{label}: callback[{index}] ({}) callback_prep limit ({}) must not overlap proof_budget charge ({}) against cap ({cap})",
+                callback.stage,
+                callback.sub_limit.unwrap(),
+                callback.budget_used
+            );
+        }
+        (
+            cap,
+            before_physical.budget_used,
+            setup_source.sub_used.unwrap(),
+        )
+    };
+
+    let full_budget = 64u64 << 20;
+    let full_limit = ReadLimit {
+        options: &opts,
+        memory: Some(full_budget),
+        held: 0,
+    };
+    let (res, retained_stages) = capture_stages(&mut || {
+        super::branching::readonly::authenticate_retained_generation(
+            &dst,
+            &entry,
+            &full_limit,
+            imported_seq,
+        )
+    });
+    res.unwrap();
+    let (retained_cap, retained_before_physical, retained_setup_peak) =
+        assert_full_disjoint_stages("retained_cold_read", &retained_stages, full_budget, false);
+    assert_eq!(retained_cap, full_budget);
+
+    // Also exercise the native cache-miss callback on `authenticate_retained_generation`
+    // by proving through `own_1_seq`.
+    let (res, retained_native_stages) = capture_stages(&mut || {
+        super::branching::readonly::authenticate_retained_generation(
+            &dst,
+            &entry,
+            &full_limit,
+            own_1_seq,
+        )
+    });
+    res.unwrap();
+    let (retained_native_cap, _, _) = assert_full_disjoint_stages(
+        "retained_cold_read_native",
+        &retained_native_stages,
+        full_budget,
+        true,
+    );
+    assert_eq!(retained_native_cap, full_budget);
+
+    let (res, validate_stages) = capture_stages(&mut || {
+        let prep = Preparation::new(crate::task::Control::none(), full_budget)?;
+        validate_copy_imported(&dst_root, &prep)
+    });
+    res.unwrap();
+    let (validate_cap, validate_before_physical, validate_setup_peak) =
+        assert_full_disjoint_stages("closed_copy_validate", &validate_stages, full_budget, true);
+    assert!(
+        validate_cap < full_budget,
+        "closed-copy validation must reserve DiskClosure in Preparation before ColdBudget ({validate_cap} < {full_budget})"
+    );
+
+    // Independently measure the exact publication-walk peak on `src_root` via
+    // `managed_history::resolve` (which makes no whole-room loan and never touches
+    // `prove_wal`). Adding a 16 KiB margin above `before_physical + src_pub_peak` clears
+    // `DiskClosure::load`, base/setup verification, and `physical::prove_prefix`
+    // buffering while leaving `callback_prep` short of `imp-0`'s publication walk by
+    // the ~64 KiB physical proof allowance. A future regression that overlaps
+    // `callback_prep` with the pre-proof allowance would therefore succeed here instead
+    // of failing with `BudgetExceeded`.
+    let src_history = primary::recorded_root(&src_root, &preparation())
+        .unwrap()
+        .expect("source history root");
+    let src_pub_peak = {
+        let probe_prep = Preparation::new(crate::task::Control::none(), full_budget).unwrap();
+        let doc = managed_history::resolve(
+            &src_root,
+            src_id,
+            &src_history,
+            src_history.identity(src_id),
+            &probe_prep,
+        )
+        .unwrap();
+        drop(doc);
+        probe_prep.test_peak()
+    };
+    assert!(
+        src_pub_peak < (4 << 20),
+        "src_pub_peak ({src_pub_peak}) must reflect actual decode peak, not a whole-room loan"
+    );
+    let max_setup_peak = retained_setup_peak.max(validate_setup_peak);
+    assert!(
+        src_pub_peak > max_setup_peak + (64 << 10),
+        "independent src_pub_peak ({src_pub_peak}) must exceed setup peak ({max_setup_peak}) + headroom"
+    );
+    let tight_room = src_pub_peak + (16 << 10);
+
+    // Tight-budget refusal through `authenticate_retained_generation`.
+    let tight_retained = retained_before_physical + tight_room;
+    let tight_limit = ReadLimit {
+        options: &opts,
+        memory: Some(tight_retained),
+        held: 0,
+    };
+    let (res, tight_retained_stages) = capture_stages(&mut || {
+        super::branching::readonly::authenticate_retained_generation(
+            &dst,
+            &entry,
+            &tight_limit,
+            imported_seq,
+        )
+    });
+    let err = res.unwrap_err();
+    let cb = tight_retained_stages
+        .iter()
+        .find(|s| s.stage == "callback_imported")
+        .unwrap_or_else(|| {
+            panic!(
+                "retained tight budget ({tight_retained}) must reach callback_imported before failing; stages={tight_retained_stages:?}, err={err:?}"
+            )
+        });
+    assert!(
+        cb.budget_used > retained_before_physical,
+        "retained tight callback must include physical proof charges ({} > {retained_before_physical})",
+        cb.budget_used
+    );
+    assert!(
+        cb.budget_used + cb.sub_limit.unwrap() <= tight_retained,
+        "retained tight callback must not overlap budget ({} + {} <= {tight_retained})",
+        cb.budget_used,
+        cb.sub_limit.unwrap()
+    );
+    assert!(
+        cb.sub_limit.unwrap() < src_pub_peak,
+        "retained tight callback limit ({}) must be below imp-0 publication walk peak ({src_pub_peak})",
+        cb.sub_limit.unwrap()
+    );
+    assert!(
+        matches!(err, Error::BudgetExceeded(_)),
+        "expected BudgetExceeded at retained proof callback under independent tight limit ({tight_retained}), got {err:?}"
+    );
+
+    // Tight-budget refusal through closed-copy `validate_copy_imported`.
+    let validate_pre_budget = full_budget - validate_cap;
+    let tight_validate = validate_pre_budget + validate_before_physical + tight_room;
+    let (res, tight_validate_stages) = capture_stages(&mut || {
+        let prep = Preparation::new(crate::task::Control::none(), tight_validate)?;
+        validate_copy_imported(&dst_root, &prep)
+    });
+    let err = res.unwrap_err();
+    let v_cb = tight_validate_stages
+        .iter()
+        .find(|s| s.stage == "callback_imported")
+        .unwrap_or_else(|| {
+            panic!(
+                "closed-copy tight budget ({tight_validate}) must reach callback_imported before failing; stages={tight_validate_stages:?}, err={err:?}"
+            )
+        });
+    assert!(
+        v_cb.budget_used > validate_before_physical,
+        "closed-copy tight callback must include physical proof charges ({} > {validate_before_physical})",
+        v_cb.budget_used
+    );
+    assert!(
+        v_cb.budget_used + v_cb.sub_limit.unwrap() <= tight_validate - validate_pre_budget,
+        "closed-copy tight callback must not overlap budget ({} + {} <= {})",
+        v_cb.budget_used,
+        v_cb.sub_limit.unwrap(),
+        tight_validate - validate_pre_budget
+    );
+    assert!(
+        v_cb.sub_limit.unwrap() < src_pub_peak,
+        "closed-copy tight callback limit ({}) must be below imp-0 publication walk peak ({src_pub_peak})",
+        v_cb.sub_limit.unwrap()
+    );
+    assert!(
+        matches!(err, Error::BudgetExceeded(_)),
+        "expected BudgetExceeded at closed-copy proof callback under independent tight limit ({tight_validate}), got {err:?}"
+    );
+
+    // 2. Scoped WAL proof: corrupt `own-1` (strictly between `imported_seq` and
+    //    `own-2`, both owned by retained `gen-0001`) while leaving `own-2` intact so
+    //    `durable_after` proves `own-1` durable. Reading `imported_seq` must still
+    //    succeed while proving through `own_2_seq` or `u64::MAX` (and cold-reading
+    //    `own_2_seq` from retained `gen-0001`) must fail with `Error::Corrupt`.
+    let wal_path = entry.dir.join("wal.log");
+    let own_1_end = {
+        let mut cursor = wal::WalCursor::open(
+            &wal_path,
+            wal::WalPoint {
+                seq: entry.base.seq,
+                offset: 0,
+            },
+        )
+        .unwrap();
+        let mut end = None;
+        while let Some((seq, _)) = cursor.next().unwrap() {
+            if seq == own_1_seq {
+                end = Some(cursor.position().offset);
+                break;
+            }
+        }
+        end.expect("own-1 must be present in retained gen-0001 wal.log")
+    };
+    let mut wal_bytes = std::fs::read(&wal_path).unwrap();
+    assert!(
+        (own_1_end as usize) < wal_bytes.len(),
+        "own-2 must follow own-1 as a later durability witness"
+    );
+    // Flip a byte inside `own-1`'s WAL_COMMIT record while leaving `own-2` intact.
+    wal_bytes[own_1_end as usize - 1] ^= 0xFF;
+    std::fs::write(&wal_path, &wal_bytes).unwrap();
+    super::branching::readonly::authenticate_retained_generation(
+        &dst,
+        &entry,
+        &full_limit,
+        imported_seq,
+    )
+    .expect("scoped prove_wal through imported_seq must not depend on unrelated native suffix");
+    let full_err = super::branching::readonly::authenticate_retained_generation(
+        &dst,
+        &entry,
+        &full_limit,
+        u64::MAX,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(full_err, Error::Corrupt(_)),
+        "unscoped proof must fail with Error::Corrupt on durable damaged own-1, got {full_err:?}"
+    );
+    let own_2_err = super::branching::readonly::authenticate_retained_generation(
+        &dst,
+        &entry,
+        &full_limit,
+        own_2_seq,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(own_2_err, Error::Corrupt(_)),
+        "proof through own-2 must fail with Error::Corrupt on durable damaged own-1, got {own_2_err:?}"
+    );
+    assert!(
+        dst.snapshot_at(&crate::history::At::Commit(own_2_seq), &opts)
+            .is_err(),
+        "cold RDF read of own_2_seq in retained gen-0001 must fail when durable own-1 is corrupted"
+    );
+    let (snap, _) = dst
+        .snapshot_at(&crate::history::At::Commit(imported_seq), &opts)
+        .expect("cold RDF read of imported_seq must succeed despite corrupted native suffix");
+    assert!(snap.len() >= 8);
+}
+
+#[test]
+fn reidentify_streams_multi_chunk_under_tight_budget_and_cancels_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+    crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+    let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+    // Write enough commits and annotations so both `annotations.bin` and `wal.log`
+    // exceed 150 KiB (>2.3 x 64 KiB streaming chunks) within the 1024-byte message
+    // cap, reusing a small vocabulary so `delta.vocab` stays tiny and the tight
+    // streaming budget directly exercises constant-buffer streaming.
+    for i in 0..180 {
+        let mut w = src.write_with(
+            crate::commit::CommitKind::Update,
+            crate::guard::WriteOptions {
+                message: Some(std::sync::Arc::from(format!(
+                    "multi-chunk-{i:03}-{}",
+                    "a".repeat(960)
+                ))),
+                ..Default::default()
+            },
+        );
+        let p = w
+            .intern(&oxrdf::Term::NamedNode(
+                oxrdf::NamedNode::new("urn:p").unwrap(),
+            ))
+            .unwrap();
+        for j in 0..25 {
+            let s = w
+                .intern(&oxrdf::Term::NamedNode(
+                    oxrdf::NamedNode::new(format!("urn:s:{j}")).unwrap(),
+                ))
+                .unwrap();
+            let o = w
+                .intern(&oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
+                    format!("val-{j}"),
+                )))
+                .unwrap();
+            if i % 2 == 0 {
+                w.insert([s, p, o, crate::id::Id::DEFAULT_GRAPH]).unwrap();
+            } else {
+                w.delete([s, p, o, crate::id::Id::DEFAULT_GRAPH]).unwrap();
+            }
+        }
+        w.commit().unwrap();
+    }
+    let src_id = src.dataset_id();
+    let src_seq = src.head_commit().seq;
+    let cap = src.backup_capture("b-stream").unwrap();
+    drop(src);
+
+    // 1. Multi-chunk streaming succeeds under a tight Preparation allowance smaller
+    //    than `annotations.bin.len() + wal.log.len()`.
+    let stream_dir = dir.path().join("stream-ok");
+    cap.write_to(&stream_dir).unwrap();
+    let ann_len = std::fs::metadata(stream_dir.join(crate::annotations::FILE))
+        .unwrap()
+        .len();
+    let cur = std::fs::read_to_string(stream_dir.join("CURRENT"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let wal_len = std::fs::metadata(stream_dir.join(&cur).join("wal.log"))
+        .unwrap()
+        .len();
+    assert!(
+        ann_len > 150_000,
+        "expected multi-chunk annotations.bin > 150 KiB, got {ann_len}"
+    );
+    assert!(
+        wal_len > 150_000,
+        "expected multi-chunk wal.log > 150 KiB, got {wal_len}"
+    );
+    let tight_budget = 256 << 10;
+    assert!(
+        tight_budget < ann_len + wal_len,
+        "tight budget {tight_budget} must be smaller than combined files {}",
+        ann_len + wal_len
+    );
+    let tight_prep = Preparation::new(crate::task::Control::none(), tight_budget).unwrap();
+    let new_id = uuid::Uuid::new_v4();
+    reidentify_activated_dir_with(
+        &stream_dir,
+        new_id,
+        crate::commit::ForkedFrom {
+            id: src_id,
+            seq: src_seq,
+        },
+        &tight_prep,
+    )
+    .expect("multi-chunk streaming reidentification must fit in tight budget");
+    let reopened = Store::open(&stream_dir, StoreOptions::default()).unwrap();
+    assert_eq!(reopened.dataset_id(), new_id);
+    assert_eq!(crate::annotations::read(&stream_dir).unwrap().len(), 180);
+
+    // 2. In-flight cancellation triggered after the first 64 KiB WAL hashing chunk
+    //    must abort before reading chunk 1 (exactly one chunk observed).
+    let cancel_dir = dir.path().join("cancel-inflight");
+    cap.write_to(&cancel_dir).unwrap();
+    let ctl = crate::task::Control::none();
+    let cancel_handle = ctl.cancel.clone();
+    let chunks_seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let chunks_seen_clone = chunks_seen.clone();
+    WAL_HASH_CHUNK_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |chunk_index| {
+            chunks_seen_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if chunk_index == 0 {
+                cancel_handle.cancel();
+            }
+        }));
+    });
+    let res = reidentify_activated_dir(
+        &cancel_dir,
+        uuid::Uuid::new_v4(),
+        crate::commit::ForkedFrom {
+            id: src_id,
+            seq: src_seq,
+        },
+        &ctl,
+    );
+    WAL_HASH_CHUNK_HOOK.with(|hook| hook.borrow_mut().take());
+    assert_eq!(
+        chunks_seen.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "WAL hashing must stop immediately after chunk 0 cancellation rather than hashing remaining chunks"
+    );
+    assert!(
+        matches!(res, Err(Error::Cancelled)),
+        "expected Error::Cancelled on in-flight WAL hash cancellation, got {res:?}"
+    );
+}
+
+#[test]
+fn direct_branch_backup_capture_survives_concurrent_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+    crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+    let src = std::sync::Arc::new(Store::open(&src_root, StoreOptions::default()).unwrap());
+    update(&src, "seed");
+    src.create_branch("concurrent-br", &Default::default())
+        .unwrap();
+    let branch = src.branch("concurrent-br").unwrap();
+    update(&branch, "br-1");
+    branch.compact().unwrap();
+    update(&branch, "br-2");
+
+    // Fire a concurrent compaction right after `capture_once_prepared` releases
+    // the branch writer lock (once), forcing the capture retry loop to handle
+    // the generation advance without producing a mismatched source/CURRENT.
+    let compacted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let compacted_clone = compacted.clone();
+    let src_for_fp = src.clone();
+    branch.set_failpoint(
+        "backup-capture-unlocked",
+        Some(std::sync::Arc::new(move |_| {
+            if !compacted_clone.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                src_for_fp
+                    .branch("concurrent-br")
+                    .unwrap()
+                    .compact()
+                    .unwrap();
+            }
+        })),
+    );
+    let cap = branch.backup_capture("b-concurrent-br").unwrap();
+    branch.set_failpoint("backup-capture-unlocked", None);
+    assert!(
+        compacted.load(std::sync::atomic::Ordering::SeqCst),
+        "concurrent compaction failpoint must have fired"
+    );
+
+    let staged = dir.path().join("staged-br");
+    cap.write_to(&staged).unwrap();
+    validate_copy_imported(&staged, &preparation())
+        .expect("captured branch backup after concurrent compaction must pass imported validation");
+    let opened = Store::open(&staged, StoreOptions::default()).unwrap();
+    assert_eq!(opened.snapshot().len(), branch.snapshot().len());
+}
+
+#[test]
+fn retained_binding_uses_authoritative_proof_observation() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+    crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+    let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+    update(&src, "imp-1");
+    let imported_seq = src.head_commit().seq;
+    let src_id = src.dataset_id();
+    let cap = src.backup_capture("b-ret-obs").unwrap();
+    drop(src);
+
+    let dst_root = dir.path().join("dst");
+    cap.write_to(&dst_root).unwrap();
+    let new_id = uuid::Uuid::new_v4();
+    reidentify_activated_dir(
+        &dst_root,
+        new_id,
+        crate::commit::ForkedFrom {
+            id: src_id,
+            seq: imported_seq,
+        },
+        &crate::task::Control::none(),
+    )
+    .unwrap();
+
+    let retain_opts = StoreOptions {
+        history_max_generations: 4,
+        ..StoreOptions::default()
+    };
+    let own_1_seq = {
+        let dst = Store::open(&dst_root, retain_opts.clone()).unwrap();
+        dst.set_retention(crate::history::Retention {
+            keep_commits: Some(100),
+            ..Default::default()
+        })
+        .unwrap();
+        // Write a final annotated native commit in gen-0001 so WAL_FLAG_ANNOTATED is set.
+        let mut w = dst.write_with(
+            crate::commit::CommitKind::Update,
+            crate::guard::WriteOptions {
+                message: Some(std::sync::Arc::from("annotated-native-tail")),
+                ..Default::default()
+            },
+        );
+        let s = w
+            .intern(&oxrdf::Term::NamedNode(
+                oxrdf::NamedNode::new("urn:own-ann").unwrap(),
+            ))
+            .unwrap();
+        let p = w
+            .intern(&oxrdf::Term::NamedNode(
+                oxrdf::NamedNode::new("urn:p").unwrap(),
+            ))
+            .unwrap();
+        let o = w
+            .intern(&oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
+                "v",
+            )))
+            .unwrap();
+        w.insert([s, p, o, crate::id::Id::DEFAULT_GRAPH]).unwrap();
+        let info = w.commit().unwrap();
+        // Commit one more update before compacting so `gen-0002` starts after `own-1`
+        // and retained `gen-0001` owns `own-1`.
+        update(&dst, "own-after-ann");
+        dst.compact().unwrap();
+        info.commit.seq
+    };
+
+    let dst = Store::open(&dst_root, retain_opts).unwrap();
+    let full_budget = 64u64 << 20;
+    let prep = Preparation::new(crate::task::Control::none(), full_budget).unwrap();
+    let baseline_used = prep.used();
+    let gen1_dir = dst_root.join("gen-0001");
+    let gen1_meta_len = std::fs::metadata(gen1_dir.join("meta.json")).unwrap().len();
+    let gen1_commit_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(gen1_dir.join("commit.json")).unwrap()).unwrap();
+    let origin_len = gen1_commit_json
+        .get("origin")
+        .and_then(|v| v.as_str())
+        .expect("commit.json origin")
+        .len() as u64;
+    let min_commit_charge =
+        std::mem::size_of::<crate::commit::RetainedGenerationCommit>() as u64 + origin_len;
+
+    let capture_binding_stages = |run: &mut dyn FnMut() -> Result<ConfigurationBinding>| -> (
+        Result<ConfigurationBinding>,
+        Vec<RetainedWalBindingStage>,
+    ) {
+        let observed = std::sync::Arc::new(parking_lot::Mutex::new(
+            Vec::<RetainedWalBindingStage>::new(),
+        ));
+        let observed_clone = observed.clone();
+        RETAINED_WAL_BINDING_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |stage| {
+                observed_clone.lock().push(stage);
+            }));
+        });
+        let res = run();
+        RETAINED_WAL_BINDING_HOOK.with(|hook| hook.borrow_mut().take());
+        let stages = observed.lock().clone();
+        (res, stages)
+    };
+    let assert_retained_commit_charged = |label: &str, stages: &[RetainedWalBindingStage]| {
+        let entered = stages
+            .iter()
+            .find(|s| s.stage == "entered")
+            .unwrap_or_else(|| panic!("{label}: missing entered stage"));
+        let setup_meta = stages
+            .iter()
+            .find(|s| s.stage == "setup_meta")
+            .unwrap_or_else(|| panic!("{label}: missing setup_meta stage"));
+        let setup_source = stages
+            .iter()
+            .find(|s| s.stage == "setup_source")
+            .unwrap_or_else(|| panic!("{label}: missing setup_source stage"));
+        let before_proof = stages
+            .iter()
+            .find(|s| s.stage == "before_proof")
+            .unwrap_or_else(|| panic!("{label}: missing before_proof stage"));
+        assert_eq!(entered.limit, full_budget);
+        assert!(
+            entered.used >= baseline_used + min_commit_charge,
+            "{label}: live destination commit charge ({min_commit_charge}) must remain reserved on entry to resolve_retained_wal_binding ({} >= {} + {min_commit_charge})",
+            entered.used,
+            baseline_used
+        );
+        assert_eq!(
+            entered.room,
+            entered.limit - entered.used,
+            "{label}: setup allowance must exclude live destination commit charge"
+        );
+        assert!(
+            entered.room <= full_budget - baseline_used - min_commit_charge,
+            "{label}: setup allowance ({}) must exclude retained commit charge ({min_commit_charge})",
+            entered.room
+        );
+        assert!(
+            setup_meta.used >= entered.used + gen1_meta_len * 128 + 1024,
+            "{label}: destination meta charge must stack on top of held commit charge ({} >= {} + {})",
+            setup_meta.used,
+            entered.used,
+            gen1_meta_len * 128 + 1024
+        );
+        assert!(
+            setup_source.used > setup_meta.used + gen1_meta_len * 128,
+            "{label}: source base charge must stack on top of destination commit and meta charges ({} > {} + {})",
+            setup_source.used,
+            setup_meta.used,
+            gen1_meta_len * 128
+        );
+        assert!(
+            before_proof.used >= entered.used,
+            "{label}: destination commit charge must remain held through proof setup ({} >= {})",
+            before_proof.used,
+            entered.used
+        );
+    };
+
+    // Both the imported commit and the valid annotated native suffix commit in retained
+    // gen-0001 resolve cleanly through the authoritative WAL proof while keeping the
+    // decoded destination commit charged in `prep`.
+    let (imp_res, imp_stages) =
+        capture_binding_stages(&mut || dst.configuration_binding_at(imported_seq, &prep));
+    let imp_binding = imp_res.unwrap();
+    assert_retained_commit_charged("imported_seq", &imp_stages);
+    assert_eq!(prep.used(), baseline_used);
+    assert!(matches!(
+        imp_binding,
+        ConfigurationBinding::ImportedUnbound { .. }
+    ));
+    let (native_res, native_stages) =
+        capture_binding_stages(&mut || dst.configuration_binding_at(own_1_seq, &prep));
+    let native_binding = native_res.unwrap();
+    assert_retained_commit_charged("own_1_seq", &native_stages);
+    assert_eq!(prep.used(), baseline_used);
+    assert!(matches!(native_binding, ConfigurationBinding::Known { .. }));
+
+    // Truncate retained `gen-0001/wal.log` right after `own-1` (so `own-1` is the tail
+    // commit with no later durability witness) and remove `own-1`'s annotation from
+    // `annotations.bin` (leaving only the 32-byte header). `WalCursor` still observes
+    // `own-1`, whereas the authoritative WAL proof treats an annotated tail without its
+    // annotation as incomplete and omits it.
+    let gen1_wal = dst_root.join("gen-0001").join("wal.log");
+    let own_1_end = {
+        let mut cursor =
+            wal::WalCursor::open(&gen1_wal, wal::WalPoint { seq: 0, offset: 0 }).unwrap();
+        let mut end = None;
+        while let Some((seq, _)) = cursor.next().unwrap() {
+            if seq == own_1_seq {
+                end = Some(cursor.position().offset);
+                break;
+            }
+        }
+        end.expect("own-1 must be present in gen-0001/wal.log")
+    };
+    let wal_bytes = std::fs::read(&gen1_wal).unwrap();
+    std::fs::write(&gen1_wal, &wal_bytes[..own_1_end as usize]).unwrap();
+
+    let ann_path = dst_root.join(crate::annotations::FILE);
+    let ann_bytes = std::fs::read(&ann_path).unwrap();
+    assert!(ann_bytes.len() > 32);
+    // Keep only the 32-byte annotations header so `seqs_controlled` returns an empty set.
+    std::fs::write(&ann_path, &ann_bytes[..32]).unwrap();
+
+    assert!(
+        dst.configuration_binding_at(own_1_seq, &prep).is_err(),
+        "retained WAL binding must refuse a commit omitted by the authoritative proof"
+    );
+    assert_eq!(
+        prep.used(),
+        baseline_used,
+        "error path must release the destination commit reservation cleanly"
+    );
+    assert!(
+        matches!(
+            dst.configuration_binding_at(imported_seq, &prep).unwrap(),
+            ConfigurationBinding::ImportedUnbound { .. }
+        ),
+        "earlier imported commit must still resolve via the authoritative proof"
+    );
+    assert_eq!(prep.used(), baseline_used);
+}
+
+#[test]
+fn direct_branch_backup_uses_single_anchored_commit_read() {
+    for (case, write_after_compact) in [("header-only-wal", false), ("nonempty-wal", true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let src_root = dir.path().join("src");
+        drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+        crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+        let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+        update(&src, "seed");
+        src.create_branch("single-read-br", &Default::default())
+            .unwrap();
+        let branch = src.branch("single-read-br").unwrap();
+        update(&branch, "br-1");
+        // Compact once to unlink the branch so `backup_capture` takes the direct capture path.
+        // Without a post-compaction write, `wal.log` is header-only and `check_wal_prefix`
+        // must reuse the anchored base sequence instead of rereading `commit.json`.
+        branch.compact().unwrap();
+        if write_after_compact {
+            update(&branch, "br-2");
+        }
+
+        let br_root = branch.root.clone().expect("persistent branch root");
+        let gen_name = std::fs::read_to_string(br_root.join("CURRENT"))
+            .unwrap()
+            .trim()
+            .to_string();
+        let commit_path = br_root.join(&gen_name).join("commit.json");
+        let orig_commit_bytes = std::fs::read(&commit_path).unwrap();
+
+        // Immediately after the single anchored read of `commit.json`, overwrite it on disk
+        // with garbage; any second open (in `build_branch_standalone_provenance` or
+        // `check_wal_prefix`) would fail or emit mismatched source provenance.
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_clone = fired.clone();
+        let commit_path_clone = commit_path.clone();
+        branch.set_failpoint(
+            "backup-capture-branch-commit-read",
+            Some(std::sync::Arc::new(move |_| {
+                fired_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::fs::write(&commit_path_clone, b"{\"mutated\":true}\n").unwrap();
+            })),
+        );
+        let cap = branch
+            .backup_capture(&format!("b-single-read-{case}"))
+            .unwrap_or_else(|err| panic!("{case}: backup_capture must succeed, got {err:?}"));
+        branch.set_failpoint("backup-capture-branch-commit-read", None);
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "{case}: single-read failpoint must have fired"
+        );
+
+        let staged = dir.path().join("staged");
+        cap.write_to(&staged).unwrap();
+        validate_copy_imported(&staged, &preparation()).unwrap_or_else(|err| {
+            panic!("{case}: direct branch backup must authenticate cleanly, got {err:?}")
+        });
+
+        // Verify the source descriptor embedded the exact original commit.json bytes.
+        let imports_dir = staged.join("evidence-history").join("imports");
+        let mut found_source_commit = None;
+        for entry in std::fs::read_dir(&imports_dir).unwrap() {
+            let candidate = entry
+                .unwrap()
+                .path()
+                .join("source")
+                .join(&gen_name)
+                .join("commit.json");
+            if candidate.exists() {
+                found_source_commit = Some(std::fs::read(&candidate).unwrap());
+            }
+        }
+        assert_eq!(
+            found_source_commit.as_deref(),
+            Some(orig_commit_bytes.as_slice()),
+            "{case}: staged source commit.json must match the single anchored read, not the later mutated file"
+        );
+    }
+}
+
+#[test]
+fn direct_branch_backup_rejects_malformed_canonical_timestamp_with_wal_suffix() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+    crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+    let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+    update(&src, "seed");
+    src.create_branch("bad-ts-br", &Default::default()).unwrap();
+    let branch = src.branch("bad-ts-br").unwrap();
+    update(&branch, "br-1");
+    branch.compact().unwrap();
+    // Append a WAL suffix so `check_wal_prefix` checks the WAL tail rather than `commit.json`.
+    update(&branch, "br-2");
+
+    let br_root = branch.root.clone().expect("persistent branch root");
+    let gen_name = std::fs::read_to_string(br_root.join("CURRENT"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let commit_path = br_root.join(&gen_name).join("commit.json");
+    let orig_text = std::fs::read_to_string(&commit_path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&orig_text).unwrap();
+    let orig_ts = parsed["commit"]["timestamp"]
+        .as_str()
+        .expect("timestamp field")
+        .to_owned();
+    let mutated_text = orig_text.replacen(
+        &format!("\"timestamp\": \"{orig_ts}\""),
+        "\"timestamp\": \"not-a-timestamp\"",
+        1,
+    );
+    assert_ne!(
+        mutated_text, orig_text,
+        "must replace canonical timestamp field"
+    );
+    std::fs::write(&commit_path, mutated_text.as_bytes()).unwrap();
+
+    let err = match branch.backup_capture("b-bad-ts") {
+        Ok(_) => panic!("direct branch capture must reject malformed canonical timestamp"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, Error::Corrupt(_)) && err.to_string().contains("timestamp"),
+        "expected Corrupt timestamp refusal, got {err:?}"
+    );
+}
+
+#[test]
+fn materialized_import_capture_checks_max_files_before_pinning() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+    crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+    let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+    update(&src, "seed");
+    let src_id = src.dataset_id();
+    let src_seq = src.head_commit().seq;
+    let cap = src.backup_capture("b-max-files").unwrap();
+
+    // 1. Imported persistent destination: `capture_materialized_imported_origin` and
+    //    `capture_import_files` must refuse BEFORE staging or pinning handles when
+    //    `existing_files + imported_count >= MAX_FILES`.
+    let dst_root = dir.path().join("dst");
+    cap.write_to(&dst_root).unwrap();
+    reidentify_activated_dir(
+        &dst_root,
+        uuid::Uuid::new_v4(),
+        crate::commit::ForkedFrom {
+            id: src_id,
+            seq: src_seq,
+        },
+        &crate::task::Control::none(),
+    )
+    .unwrap();
+    let dst = Store::open(&dst_root, StoreOptions::default()).unwrap();
+    let prep = preparation();
+    let wopts = crate::guard::WriteOptions::default();
+    let existing = super::managed_history::capture::MAX_FILES - 2;
+
+    let staging_disk = dir.path().join("staging-disk");
+    std::fs::create_dir_all(&staging_disk).unwrap();
+    let err = capture_materialized_imported_origin(
+        &dst_root,
+        &dst.family,
+        &staging_disk,
+        existing,
+        &prep,
+        &wopts,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("backup manifest limits"),
+        "expected manifest limit refusal, got {err:?}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&staging_disk).unwrap().count(),
+        0,
+        "capture_materialized_imported_origin must not stage or open files once limit is exceeded"
+    );
+
+    let err_direct = capture_import_files(&dst_root, existing, &prep, &wopts).unwrap_err();
+    assert!(
+        err_direct.to_string().contains("backup manifest limits"),
+        "expected manifest limit refusal from capture_import_files, got {err_direct:?}"
+    );
+
+    // 2. In-memory clone: `write_memory_clone_origin` must refuse BEFORE staging or
+    //    pinning handles when `existing_files + planned_files >= MAX_FILES`.
+    let (mem_clone, _) = src
+        .clone_to_memory(&CloneOptions::default(), StoreOptions::default())
+        .unwrap();
+    let state = mem_clone.managed_state_shared().unwrap();
+    let crate::managed::ManagedState::Installed(installed) = state.as_ref() else {
+        panic!("expected installed managed state on memory clone");
+    };
+    let history = installed.configuration_history.as_ref().unwrap();
+    let memory = installed.history_memory.as_ref().unwrap();
+    let mem_origin = memory.origin.as_ref().unwrap();
+    let genesis = ConfigurationIdentity {
+        dataset_id: mem_clone.owner_dataset_id(),
+        lineage_id: history.lineage_id,
+        generation: memory.coverage.value.activation_generation,
+    };
+    let staging_mem = dir.path().join("staging-mem");
+    std::fs::create_dir_all(&staging_mem).unwrap();
+    let err_mem = write_memory_clone_origin(
+        &staging_mem,
+        mem_clone.dataset_id(),
+        genesis,
+        history.coverage,
+        mem_origin,
+        existing,
+        &prep,
+        &wopts,
+    )
+    .unwrap_err();
+    assert!(
+        err_mem.to_string().contains("backup manifest limits"),
+        "expected manifest limit refusal from write_memory_clone_origin, got {err_mem:?}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&staging_mem).unwrap().count(),
+        0,
+        "write_memory_clone_origin must not stage or open files once limit is exceeded"
+    );
 }

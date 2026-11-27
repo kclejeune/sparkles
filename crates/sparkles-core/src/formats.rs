@@ -186,7 +186,7 @@ pub const DATASET: FileKind = FileKind {
     marker: "`format` 2, `minimumReader` (the reader capability the database needs) and `writtenBy`",
     class: Class::Primary,
     writes: crate::commit::DATASET_READER,
-    reads: &[5, 6, 7, 8, 9],
+    reads: &[5, 6, 7, 8, 9, 10, 11],
 };
 
 /// A generation's index: `gen-*/meta.json` and the permutation and vocabulary files.
@@ -245,6 +245,19 @@ pub const PATTERNS: FileKind = FileKind {
     marker: "the u32 after the `SPKPATT\\0` magic; another version is not used and is rebuilt at the next full compaction",
     class: Class::Derived,
     writes: crate::patterns::VERSION,
+    reads: &[1],
+};
+
+/// A generation's reifier proposition-term index (roadmap item 766). Derived from the
+/// generation's POS permutation and vocabulary: a version this build does not read is
+/// left unused, claim lookups fall back to scanning, and the next compaction writes the
+/// current version.
+pub const REIFIERS: FileKind = FileKind {
+    id: "reifiers",
+    files: "gen-*/reifiers.bin",
+    marker: "the u32 after the `SPKREIF\\0` magic; another version is not used and is rebuilt at the next compaction",
+    class: Class::Derived,
+    writes: crate::reifiers::VERSION,
     reads: &[1],
 };
 
@@ -323,10 +336,10 @@ pub const GENERATION_COMMIT: FileKind = FileKind {
 pub const CONFIGURATION_GENERATION: FileKind = FileKind {
     id: "configuration-generation",
     files: "evidence-history/LINEAGE/generations/SHA256.json",
-    marker: "format 1 and the digest of the unique canonical document",
+    marker: "format and the digest of the unique canonical document. Format 2 records projectionOnly graphs",
     class: Class::Primary,
-    writes: 1,
-    reads: &[1],
+    writes: crate::store::managed_history::GENERATION_FORMAT,
+    reads: &[1, 2],
 };
 
 pub const CONFIGURATION_COVERAGE: FileKind = FileKind {
@@ -341,10 +354,10 @@ pub const CONFIGURATION_COVERAGE: FileKind = FileKind {
 pub const CONFIGURATION_ORIGIN: FileKind = FileKind {
     id: "configuration-origin",
     files: "evidence-history/origin.json",
-    marker: "format 1 and the exact imported source prefix/identity closure",
+    marker: "format 1 (metadata-only) or 2 (destination publication and imported source prefix/identity closure)",
     class: Class::Primary,
-    writes: 1,
-    reads: &[1],
+    writes: 2,
+    reads: &[1, 2],
 };
 
 /// The commit catalog.
@@ -551,6 +564,7 @@ pub const BACKUP_DEFINITION: FileKind = FileKind {
 pub const BACKUP_MANIFEST_FEATURES: &[&str] = &[
     "definitions",
     "evidence-configuration-history/1",
+    "evidence-configuration-history/2",
     "control/1",
 ];
 
@@ -693,6 +707,7 @@ pub const KINDS: &[&FileKind] = &[
     &VOCAB_FSST,
     &NUMERIC_COLUMN,
     &PATTERNS,
+    &REIFIERS,
     &PLANNER_STATISTICS,
     &DELTA_VOCAB,
     &WAL,
@@ -814,7 +829,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("assistant.json", 1),
     ds("memory.json", 4),
     ds("ingest.json", 1),
-    ds("asks.json", 2),
+    ds("asks.json", 3),
     ds("query-suggestions.json", 1),
     ds("maintenance.json", 1),
     ds("review.json", 1),
@@ -824,7 +839,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     // the import map of the ontology editor (spec U12, import resolution)
     ds("ontology-imports.json", 1),
     // the managed-graph registry and its owners' settings (see `crate::managed`)
-    ds("managed.json", 3),
+    ds("managed.json", crate::managed::FORMAT),
     ds("evidence.json", 1),
     ds("jobs.json", crate::jobs::FORMAT),
     // durable source holds (see `crate::holds`): format 2 adds cross-dataset `forDatasetId`
@@ -991,6 +1006,17 @@ pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
             error => error,
         });
     }
+    // Check any staged prefix recovery sidecar in this root or branch directory before
+    // any startup writer (WAL repair, catalog open, or scratch cleanup) runs.
+    if let Err(error) = crate::store::preflight_staged_prefixes(dir) {
+        out.push(match error {
+            Error::Unsupported(message) => {
+                Error::Unsupported(format!("{}: {message}", dir.display()))
+            }
+            Error::Corrupt(message) => Error::Corrupt(format!("{}: {message}", dir.display())),
+            error => error,
+        });
+    }
     out
 }
 
@@ -1094,8 +1120,9 @@ fn settings_stamp_format(s: &SettingsFile, v: &serde_json::Value) -> u32 {
 /// this build would misread.
 /// Refuse `version` of `what` in a dataset that records `recorded_reader` unless
 /// that is the reader of configuration history. Only activation writes the
-/// versions that need it (logs 2, generation `commit.json` 2, `managed.json` 3,
-/// `history.json` 2 and `branch.json` 2), and it raises the dataset reader first.
+/// versions that need it (logs 2, generation `commit.json` 2, `managed.json` 3
+/// and `managed.json` 4 with `configurationHistory`, `history.json` 2 and
+/// `branch.json` 2), and it raises the dataset reader first.
 /// A dataset that records an older reader holds none of them, so one there is a
 /// newer file that this dataset does not admit, refused as a newer release's is.
 /// Callers pass the reader they already read, and bounded readers do not call it.
@@ -1143,7 +1170,9 @@ fn recorded_reader(dir: &std::path::Path) -> Option<u32> {
 /// record and a generation's small `commit.json`, as open reads them.
 pub(crate) fn check_configuration_versions(dir: &std::path::Path) -> Result<()> {
     use std::io::Read;
-    let Some(reader) = recorded_reader(dir) else {
+    let reader = recorded_reader(dir);
+    check_origin_version(dir, reader)?;
+    let Some(reader) = reader else {
         return Ok(());
     };
     if reader >= crate::store::managed_history::READER {
@@ -1216,6 +1245,42 @@ pub(crate) fn check_configuration_versions(dir: &std::path::Path) -> Result<()> 
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
+    }
+    Ok(())
+}
+
+/// Refuse an `evidence-history/origin.json` with an unknown format version or a
+/// format 2 origin in a dataset whose recorded reader is below
+/// [`crate::commit::IMPORTED_DESTINATION_READER`].
+fn check_origin_version(dir: &std::path::Path, reader: Option<u32>) -> Result<()> {
+    let origin = dir.join("evidence-history").join("origin.json");
+    match read_bounded(&origin, crate::store::managed_history::MAX_BYTES as u64) {
+        Ok(Some(bytes)) => {
+            if let Some(format) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|value| value.get("format").and_then(serde_json::Value::as_u64))
+            {
+                if !matches!(format, 1 | 2) {
+                    return Err(Error::Unsupported(format!(
+                        "{} has format {format}; this codec reads 1 and 2",
+                        origin.display()
+                    )));
+                }
+                if format == 2
+                    && let Some(recorded) = reader
+                    && recorded < crate::commit::IMPORTED_DESTINATION_READER
+                {
+                    return Err(Error::Unsupported(format!(
+                        "{} has format 2, which requires dataset reader {}; this dataset records reader {recorded}",
+                        origin.display(),
+                        crate::commit::IMPORTED_DESTINATION_READER
+                    )));
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     Ok(())
 }
@@ -1363,6 +1428,7 @@ mod tests {
         assert!(INDEX.reads(crate::builder::FORMAT_VERSION));
         assert_eq!(DELTA_VOCAB.writes, crate::vocab::delta::VERSION);
         assert_eq!(PATTERNS.writes, crate::patterns::VERSION);
+        assert_eq!(REIFIERS.writes, crate::reifiers::VERSION);
         assert_eq!(
             PLANNER_STATISTICS.writes,
             crate::builder::correlations::VERSION

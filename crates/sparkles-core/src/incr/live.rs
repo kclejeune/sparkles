@@ -248,18 +248,43 @@ impl QueuedLease {
     }
 }
 
+/// Support-aware evidence configuration stamp (`managed_generation`, `evidence_key`)
+/// observed when a live event was produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EvidenceStamp {
+    pub(crate) managed_gen: u64,
+    pub(crate) key: Option<String>,
+}
+
 /// One queued live event paired with the detached pool lease covering its decoded rows.
 ///
 /// `event` is declared before `lease` so `Arc<[LiveRow]>` payloads drop strictly before
 /// parent credit returns to the pool.
 pub(crate) struct QueuedEvent {
     pub(crate) event: LiveEvent,
+    pub(crate) stamp: Option<EvidenceStamp>,
     lease: Option<Arc<QueuedLease>>,
 }
 
 impl QueuedEvent {
     pub(crate) fn new(event: LiveEvent, lease: Option<Arc<QueuedLease>>) -> Self {
-        Self { event, lease }
+        Self {
+            event,
+            stamp: None,
+            lease,
+        }
+    }
+
+    pub(crate) fn stamped(
+        event: LiveEvent,
+        lease: Option<Arc<QueuedLease>>,
+        stamp: Option<EvidenceStamp>,
+    ) -> Self {
+        Self {
+            event,
+            stamp,
+            lease,
+        }
     }
 }
 
@@ -276,19 +301,48 @@ struct Queue {
 /// What a pass and a subscriber share.
 pub(crate) struct Shared {
     byte_limit: u64,
+    restricted: bool,
+    managed: Option<Arc<crate::store::family::ManagedSlot>>,
     queue: Mutex<Queue>,
     cv: Condvar,
     notify: tokio::sync::Notify,
 }
 
 impl Shared {
-    pub(crate) fn new(byte_limit: u64) -> Self {
+    pub(crate) fn new(
+        byte_limit: u64,
+        restricted: bool,
+        managed: Option<Arc<crate::store::family::ManagedSlot>>,
+    ) -> Self {
         Self {
             byte_limit,
+            restricted,
+            managed,
             queue: Mutex::default(),
             cv: Condvar::new(),
             notify: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Whether a queued data event's evidence stamp still matches the live family
+    /// registry (and the registry is not unavailable). Always true for unrestricted
+    /// subscriptions or unstamped events (such as terminal errors).
+    pub(crate) fn stamp_current(&self, stamp: &Option<EvidenceStamp>) -> bool {
+        if !self.restricted {
+            return true;
+        }
+        let Some(managed) = &self.managed else {
+            return true;
+        };
+        let Some(expected) = stamp else {
+            return true;
+        };
+        let version = managed.load_version();
+        let cfg = crate::store::Snapshot::evidence_config_of_state(version.state.as_deref());
+        let live_key = crate::store::Snapshot::evidence_key_of_config(&cfg);
+        version.generation == expected.managed_gen
+            && live_key.as_deref() != Some("unavailable")
+            && live_key == expected.key
     }
 
     pub(crate) fn byte_limit(&self) -> u64 {
@@ -323,13 +377,15 @@ impl Shared {
         &self,
         e: LiveEvent,
         lease: Option<Arc<QueuedLease>>,
+        stamp: Option<EvidenceStamp>,
     ) -> Vec<QueuedEvent> {
         let mut q = self.queue.lock();
         if q.closed {
-            return vec![QueuedEvent::new(e, lease)];
+            return vec![QueuedEvent::stamped(e, lease, stamp)];
         }
         let mut displaced = Vec::new();
         let end = matches!(e, LiveEvent::Error { .. });
+        let stamp = if end { None } else { stamp };
         if !q.overflow || end {
             let next_rows = q.rows.saturating_add(e.rows());
             let next_bytes = q
@@ -337,17 +393,55 @@ impl Shared {
                 .saturating_add(lease.as_ref().map_or(0, |l| l.bytes));
             if (next_rows > QUEUE_ROWS || next_bytes > self.byte_limit) && !end {
                 displaced.extend(q.events.drain(..));
-                displaced.push(QueuedEvent::new(e, lease));
+                displaced.push(QueuedEvent::stamped(e, lease, stamp));
                 q.rows = 0;
                 q.bytes = 0;
                 q.overflow = true;
             } else {
                 q.rows = next_rows;
                 q.bytes = next_bytes;
-                q.events.push_back(QueuedEvent::new(e, lease));
+                q.events.push_back(QueuedEvent::stamped(e, lease, stamp));
             }
         } else {
-            displaced.push(QueuedEvent::new(e, lease));
+            displaced.push(QueuedEvent::stamped(e, lease, stamp));
+        }
+        if end {
+            q.closed = true;
+        }
+        drop(q);
+        self.cv.notify_all();
+        self.notify.notify_one();
+        displaced
+    }
+
+    /// Replace all queued data events with `e` (a fresh `reset` or terminal `Error`),
+    /// returning displaced events to drop outside locks so a subscriber cannot observe
+    /// superseded pre-change events ahead of the replacement.
+    pub(crate) fn replace_leased(
+        &self,
+        e: LiveEvent,
+        lease: Option<Arc<QueuedLease>>,
+        stamp: Option<EvidenceStamp>,
+    ) -> Vec<QueuedEvent> {
+        let mut q = self.queue.lock();
+        if q.closed {
+            return vec![QueuedEvent::stamped(e, lease, stamp)];
+        }
+        let mut displaced: Vec<QueuedEvent> = q.events.drain(..).collect();
+        q.rows = 0;
+        q.bytes = 0;
+        q.overflow = false;
+        let end = matches!(e, LiveEvent::Error { .. });
+        let stamp = if end { None } else { stamp };
+        let rows = e.rows();
+        let bytes = lease.as_ref().map_or(0, |l| l.bytes);
+        if (rows > QUEUE_ROWS || bytes > self.byte_limit) && !end {
+            displaced.push(QueuedEvent::stamped(e, lease, stamp));
+            q.overflow = true;
+        } else {
+            q.rows = rows;
+            q.bytes = bytes;
+            q.events.push_back(QueuedEvent::stamped(e, lease, stamp));
         }
         if end {
             q.closed = true;
@@ -447,51 +541,133 @@ impl LiveQuery {
     }
 
     fn take(&self, q: &mut MutexGuard<'_, Queue>) -> Option<QueuedEvent> {
-        if q.overflow {
-            // passes hold the circuit's lock while they queue events, so the queue's
-            // lock is let go and taken again after the circuit's
-            let e = MutexGuard::unlocked(q, || {
-                let mut displaced = Vec::new();
-                let (out, retired) = {
-                    let mut slot = self.slot.state.lock();
-                    let mut q = self.shared.queue.lock();
-                    if !q.overflow {
-                        (None, Vec::new())
-                    } else {
-                        q.overflow = false;
-                        q.rows = 0;
-                        q.bytes = 0;
-                        // the reset covers the data events, but not an error that ends the stream
-                        let mut kept = VecDeque::new();
-                        for ev in q.events.drain(..) {
-                            if matches!(ev.event, LiveEvent::Error { .. }) {
-                                kept.push_back(ev);
-                            } else {
-                                displaced.push(ev);
+        loop {
+            if q.overflow {
+                // passes hold the circuit's lock while they queue events, so the queue's
+                // lock is let go and taken again after the circuit's
+                let e = MutexGuard::unlocked(q, || {
+                    #[cfg(test)]
+                    take_hook(TakeHookPhase::OverflowRecheckStart);
+                    let mut displaced = Vec::new();
+                    let (out, retired) = {
+                        let mut slot = self.slot.state.lock();
+                        let mut q = self.shared.queue.lock();
+                        if !q.overflow {
+                            (None, Vec::new())
+                        } else {
+                            q.overflow = false;
+                            q.rows = 0;
+                            q.bytes = 0;
+                            // the reset covers the data events, but not an error that ends the stream
+                            let mut kept = VecDeque::new();
+                            for ev in q.events.drain(..) {
+                                if matches!(ev.event, LiveEvent::Error { .. }) {
+                                    kept.push_back(ev);
+                                } else {
+                                    displaced.push(ev);
+                                }
                             }
+                            q.events = kept;
+                            let (mut event, mut retired) = slot.resync_budgeted(&self.shared);
+                            if !matches!(event.event, LiveEvent::Error { .. })
+                                && !self.shared.stamp_current(&event.stamp)
+                            {
+                                displaced.push(event);
+                                retired.extend(slot.detach_sub(&self.shared));
+                                event = QueuedEvent::new(
+                                    LiveEvent::Error {
+                                        code: "access-changed".into(),
+                                        message: "the evidence configuration changed; reconnect to read under the new rules".into(),
+                                    },
+                                    None,
+                                );
+                            }
+                            if matches!(event.event, LiveEvent::Error { .. }) {
+                                q.closed = true;
+                            }
+                            (Some(event), retired)
                         }
-                        q.events = kept;
-                        let (event, retired) = slot.resync_budgeted(&self.shared);
-                        if matches!(event.event, LiveEvent::Error { .. }) {
-                            q.closed = true;
-                        }
-                        (Some(event), retired)
+                    };
+                    drop(displaced);
+                    drop(retired);
+                    #[cfg(test)]
+                    if out.is_none() {
+                        take_hook(TakeHookPhase::OverflowRecheckNoneBeforeRelock);
                     }
-                };
-                drop(displaced);
-                drop(retired);
-                out
-            });
-            if e.is_some() {
-                return e;
+                    out
+                });
+                if e.is_some() {
+                    return e;
+                }
+                continue;
             }
+            // Consumption-time evidence check: a restricted subscriber must never pop a
+            // queued data event produced under a superseded managed/evidence state.
+            if let Some(front) = q.events.front()
+                && !matches!(front.event, LiveEvent::Error { .. })
+                && !self.shared.stamp_current(&front.stamp)
+            {
+                let e = MutexGuard::unlocked(q, || {
+                    #[cfg(test)]
+                    take_hook(TakeHookPhase::StaleRecheckStart);
+                    let mut displaced = Vec::new();
+                    let (out, retired) = {
+                        let mut slot = self.slot.state.lock();
+                        let mut q = self.shared.queue.lock();
+                        if q.overflow {
+                            (None, Vec::new())
+                        } else if let Some(front) = q.events.front() {
+                            if matches!(front.event, LiveEvent::Error { .. })
+                                || self.shared.stamp_current(&front.stamp)
+                            {
+                                let ev = q.events.pop_front().unwrap();
+                                q.rows = q.rows.saturating_sub(ev.event.rows());
+                                q.bytes = q
+                                    .bytes
+                                    .saturating_sub(ev.lease.as_ref().map_or(0, |l| l.bytes));
+                                (Some(ev), Vec::new())
+                            } else {
+                                q.rows = 0;
+                                q.bytes = 0;
+                                q.overflow = false;
+                                q.closed = true;
+                                displaced.extend(q.events.drain(..));
+                                let retired = slot.detach_sub(&self.shared);
+                                (
+                                    Some(QueuedEvent::new(
+                                        LiveEvent::Error {
+                                            code: "access-changed".into(),
+                                            message: "the evidence configuration changed; reconnect to read under the new rules".into(),
+                                        },
+                                        None,
+                                    )),
+                                    retired,
+                                )
+                            }
+                        } else {
+                            (None, Vec::new())
+                        }
+                    };
+                    drop(displaced);
+                    drop(retired);
+                    #[cfg(test)]
+                    if out.is_none() {
+                        take_hook(TakeHookPhase::StaleRecheckNoneBeforeRelock);
+                    }
+                    out
+                });
+                if e.is_some() {
+                    return e;
+                }
+                continue;
+            }
+            let e = q.events.pop_front()?;
+            q.rows = q.rows.saturating_sub(e.event.rows());
+            q.bytes = q
+                .bytes
+                .saturating_sub(e.lease.as_ref().map_or(0, |l| l.bytes));
+            return Some(e);
         }
-        let e = q.events.pop_front()?;
-        q.rows = q.rows.saturating_sub(e.event.rows());
-        q.bytes = q
-            .bytes
-            .saturating_sub(e.lease.as_ref().map_or(0, |l| l.bytes));
-        Some(e)
     }
 
     /// The next event, waiting until there is one. `None` once the subscription has
@@ -573,5 +749,288 @@ impl LiveQuery {
 impl Drop for LiveQuery {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TakeHookPhase {
+    OverflowRecheckStart,
+    OverflowRecheckNoneBeforeRelock,
+    StaleRecheckStart,
+    StaleRecheckNoneBeforeRelock,
+}
+
+#[cfg(test)]
+type TakeHookFn = Box<dyn FnMut(TakeHookPhase) + 'static>;
+
+#[cfg(test)]
+thread_local! {
+    static TAKE_HOOK: std::cell::RefCell<Option<TakeHookFn>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn take_hook(phase: TakeHookPhase) {
+    TAKE_HOOK.with(|slot| {
+        if let Some(cb) = slot.borrow_mut().as_mut() {
+            cb(phase);
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::access::{GraphAccess, GraphRule, Graphs, Preparation};
+    use crate::evidence::{ClaimKind, ConflictMode, Policy, Settings};
+    use crate::incr::{LiveOptions, Runtime, RuntimeOptions};
+    use crate::managed::{OwnerEntry, OwnerKind};
+    use crate::store::{Store, StoreOptions};
+    use crate::task::Control;
+
+    struct TakeHookGuard;
+
+    impl Drop for TakeHookGuard {
+        fn drop(&mut self) {
+            TAKE_HOOK.with(|slot| {
+                *slot.borrow_mut() = None;
+            });
+        }
+    }
+
+    fn set_take_hook(cb: impl FnMut(TakeHookPhase) + 'static) -> TakeHookGuard {
+        TAKE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(cb));
+        });
+        TakeHookGuard
+    }
+
+    fn enable_evidence_policy(store: &Store, output_iri: &str) {
+        let settings = Settings {
+            enabled: true,
+            source_records: vec!["urn:ev:sources".to_string()],
+            proposals: vec!["urn:ev:proposals".to_string()],
+            decisions: vec!["urn:ev:decisions".to_string()],
+            supports: vec!["urn:ev:supports".to_string()],
+            projections: vec![output_iri.to_string()],
+            policies: [(
+                "p".to_string(),
+                Policy {
+                    version: 1,
+                    admitted_kinds: vec![ClaimKind::Reported],
+                    required_scope: Vec::new(),
+                    conflicts: ConflictMode::AdmitLabelled,
+                    boundary: vec!["urn:ev:sources".to_string(), "urn:ev:proposals".to_string()],
+                    decisions: "urn:ev:decisions".to_string(),
+                    supports: "urn:ev:supports".to_string(),
+                    output: output_iri.to_string(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let canonical = settings.canonical(&Control::none()).unwrap();
+        let bytes = canonical.bytes().to_vec();
+        store
+            .enable_managed(
+                OwnerKind::Evidence,
+                OwnerEntry::for_settings(1, settings.managed_graphs(), &bytes),
+                &bytes,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn take_revalidates_newly_queued_event_after_stale_recheck_returns_none() {
+        const PUBLIC: &str = "urn:public";
+        const OUTPUT: &str = "urn:ev:accepted";
+        let store = Arc::new(Store::in_memory(StoreOptions::default()));
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ GRAPH <{PUBLIC}> {{ <urn:s> <urn:p> 1 }} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        let reader = Arc::new(GraphAccess::graphs(
+            Graphs::Only(GraphRule::new([PUBLIC, OUTPUT], &[])),
+            Graphs::none(),
+        ));
+        let rt = Runtime::open(None, store.dataset_id(), RuntimeOptions::default());
+        let sub = Arc::new(
+            rt.live(
+                &store,
+                &format!("SELECT ?s WHERE {{ GRAPH <{PUBLIC}> {{ ?s <urn:p> 1 }} }}"),
+                Some(reader),
+                &LiveOptions::default(),
+            )
+            .unwrap(),
+        );
+        // Advance managed generation to 1 so the unread initial event (gen 0) is stale.
+        let prep = Preparation::new(Control::none(), 64 << 20).unwrap();
+        store.activate_memory_configuration_history(&prep).unwrap();
+        let gen1 = store.managed_generation();
+        assert!(gen1 > 0);
+        let gen1_stamp = EvidenceStamp {
+            managed_gen: gen1,
+            key: None,
+        };
+        let commit = store.head_commit().seq;
+        let vars: Arc<[String]> = Arc::from(vec!["s".to_string()]);
+
+        let sub_for_hook = Arc::clone(&sub);
+        let store_for_hook = Arc::clone(&store);
+        let mut saw_start = false;
+        let mut saw_before_relock = false;
+        let _guard = set_take_hook(move |phase| match phase {
+            TakeHookPhase::StaleRecheckStart if !saw_start => {
+                saw_start = true;
+                // A concurrent round replaces the stale event with a gen-1 reset, and a
+                // second reader consumes it via `&LiveQuery::try_next`, emptying the queue
+                // before the first reader acquires `(slot.state, shared.queue)`.
+                let sub_reader = Arc::clone(&sub_for_hook);
+                let vars_reader = Arc::clone(&vars);
+                let stamp_reader = gen1_stamp.clone();
+                std::thread::spawn(move || {
+                    let _displaced = sub_reader.shared.replace_leased(
+                        LiveEvent::Snapshot {
+                            commit,
+                            vars: vars_reader,
+                            rows: Arc::from(Vec::new()),
+                            value: None,
+                            reset: true,
+                        },
+                        None,
+                        Some(stamp_reader),
+                    );
+                    let popped = sub_reader.try_next();
+                    assert!(
+                        matches!(popped, Some(LiveEvent::Snapshot { reset: true, .. })),
+                        "concurrent reader must drain replacement reset, got {popped:?}"
+                    );
+                })
+                .join()
+                .unwrap();
+            }
+            TakeHookPhase::StaleRecheckNoneBeforeRelock if !saw_before_relock => {
+                saw_before_relock = true;
+                // Between releasing the inner locks and `MutexGuard::unlocked` reacquiring `q`,
+                // another pass enqueues a gen-1 event and a further managed publication moves
+                // the live configuration to gen 2, making that newly queued event stale.
+                let _displaced = sub_for_hook.shared.replace_leased(
+                    LiveEvent::Snapshot {
+                        commit,
+                        vars: Arc::clone(&vars),
+                        rows: Arc::from(Vec::new()),
+                        value: None,
+                        reset: true,
+                    },
+                    None,
+                    Some(gen1_stamp.clone()),
+                );
+                enable_evidence_policy(&store_for_hook, OUTPUT);
+                assert!(store_for_hook.managed_generation() > gen1);
+            }
+            _ => {}
+        });
+
+        let ev = sub
+            .try_next()
+            .expect("first reader must receive terminal access-changed error");
+        match ev {
+            LiveEvent::Error { code, .. } => assert_eq!(code, "access-changed"),
+            other => panic!(
+                "stale event queued during guard reacquisition must not bypass stamp_current, got {other:?}"
+            ),
+        }
+        assert!(
+            sub.try_next().is_none(),
+            "subscription must close after access-changed"
+        );
+    }
+
+    #[test]
+    fn take_rechecks_overflow_after_overflow_recheck_returns_none() {
+        const PUBLIC: &str = "urn:public";
+        let store = Arc::new(Store::in_memory(StoreOptions::default()));
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ GRAPH <{PUBLIC}> {{ <urn:s> <urn:p> 1 }} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        let reader = Arc::new(GraphAccess::graphs(
+            Graphs::Only(GraphRule::new([PUBLIC], &[])),
+            Graphs::none(),
+        ));
+        let rt = Runtime::open(None, store.dataset_id(), RuntimeOptions::default());
+        let sub = Arc::new(
+            rt.live(
+                &store,
+                &format!("SELECT ?s WHERE {{ GRAPH <{PUBLIC}> {{ ?s <urn:p> 1 }} }}"),
+                Some(reader),
+                &LiveOptions::default(),
+            )
+            .unwrap(),
+        );
+        // Drain initial snapshot, then mark overflow.
+        assert!(matches!(sub.try_next(), Some(LiveEvent::Snapshot { .. })));
+        let _displaced = sub.shared.mark_overflow();
+
+        let commit = store.head_commit().seq;
+        let vars: Arc<[String]> = Arc::from(vec!["s".to_string()]);
+        let cur_stamp = EvidenceStamp {
+            managed_gen: store.managed_generation(),
+            key: None,
+        };
+        let sub_for_hook = Arc::clone(&sub);
+        let mut saw_start = false;
+        let mut saw_before_relock = false;
+        let _guard = set_take_hook(move |phase| match phase {
+            TakeHookPhase::OverflowRecheckStart if !saw_start => {
+                saw_start = true;
+                // Clear overflow via `replace_leased` and have a concurrent reader drain
+                // the replacement so the overflow recheck sees `!q.overflow` and returns None.
+                let sub_reader = Arc::clone(&sub_for_hook);
+                let vars_reader = Arc::clone(&vars);
+                let stamp_reader = cur_stamp.clone();
+                std::thread::spawn(move || {
+                    let _displaced = sub_reader.shared.replace_leased(
+                        LiveEvent::Snapshot {
+                            commit,
+                            vars: vars_reader,
+                            rows: Arc::from(Vec::new()),
+                            value: None,
+                            reset: true,
+                        },
+                        None,
+                        Some(stamp_reader),
+                    );
+                    assert!(matches!(
+                        sub_reader.try_next(),
+                        Some(LiveEvent::Snapshot { reset: true, .. })
+                    ));
+                })
+                .join()
+                .unwrap();
+            }
+            TakeHookPhase::OverflowRecheckNoneBeforeRelock if !saw_before_relock => {
+                saw_before_relock = true;
+                // Mark overflow again before `MutexGuard::unlocked` reacquires `q`.
+                let _displaced = sub_for_hook.shared.mark_overflow();
+            }
+            _ => {}
+        });
+
+        let ev = sub.try_next().expect(
+            "re-overflowed queue during guard reacquisition must resync rather than returning None",
+        );
+        match ev {
+            LiveEvent::Snapshot { reset, rows, .. } => {
+                assert!(reset, "overflow resync must emit a reset snapshot");
+                assert_eq!(rows.len(), 1);
+            }
+            other => panic!("expected resync Snapshot after re-overflow, got {other:?}"),
+        }
     }
 }

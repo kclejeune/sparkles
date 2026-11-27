@@ -10,7 +10,15 @@ pub(crate) fn prepare(
     snap: &Arc<Snapshot>,
     preparation: &Preparation,
 ) -> Result<PreparedView> {
-    prepare_input(Input::Legacy { original, snap }, preparation)
+    prepare_input(Input::Legacy { original, snap }, preparation, true)
+}
+
+pub(crate) fn prepare_read_only(
+    original: &GraphAccess,
+    snap: &Arc<Snapshot>,
+    preparation: &Preparation,
+) -> Result<PreparedView> {
+    prepare_input(Input::Legacy { original, snap }, preparation, false)
 }
 
 pub(crate) fn prepare_rebuild(
@@ -18,14 +26,14 @@ pub(crate) fn prepare_rebuild(
     snap: &Arc<Snapshot>,
     preparation: &Preparation,
 ) -> Result<PreparedView> {
-    prepare_input(Input::Rebuild { original, snap }, preparation)
+    prepare_input(Input::Rebuild { original, snap }, preparation, true)
 }
 
 pub(crate) fn prepare_selected(
     selected: crate::store::bound_read_source::PreparedRead,
     preparation: &Preparation,
 ) -> Result<PreparedView> {
-    prepare_input(Input::Selected(selected), preparation)
+    prepare_input(Input::Selected(selected), preparation, true)
 }
 
 pub(crate) fn prepare_evidence(
@@ -41,6 +49,24 @@ pub(crate) fn prepare_evidence(
             identity,
         },
         preparation,
+        true,
+    )
+}
+
+pub(crate) fn prepare_evidence_read_only(
+    evidence: crate::store::BoundEvidenceView,
+    policy: Arc<GraphAccess>,
+    preparation: &Preparation,
+) -> Result<PreparedView> {
+    let identity = Arc::downgrade(&policy);
+    prepare_input(
+        Input::Evidence {
+            evidence,
+            policy,
+            identity,
+        },
+        preparation,
+        false,
     )
 }
 
@@ -49,7 +75,7 @@ pub(crate) fn prepare_txn(
     original: &GraphAccess,
     preparation: &Preparation,
 ) -> Result<PreparedView> {
-    prepare_input(Input::Transaction { txn, original }, preparation)
+    prepare_input(Input::Transaction { txn, original }, preparation, true)
 }
 
 enum Input<'a> {
@@ -135,7 +161,11 @@ fn finish(
     )
 }
 
-fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<PreparedView> {
+fn prepare_input(
+    input: Input<'_>,
+    preparation: &Preparation,
+    bind_write: bool,
+) -> Result<PreparedView> {
     // Strict Store-minted, BoundEvidenceView and WriteTxn preparations never publish
     // into any base snapshot deduplication table. Controlled raw-snapshot preparations
     // use only the dedicated non-owning controlled weak table, separate from legacy
@@ -174,12 +204,18 @@ fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<Prepared
         }
         held.merge(preparation.reserve(bytes)?);
     }
-    let normalize = original.read.undecided() || original.write.undecided();
+    let normalize = original.read.undecided() || (bind_write && original.write.undecided());
     let bound = crate::access::BoundSnapshot::of(snap);
     let (read, read_held) = bind_graphs(&original.read, snap, preparation, normalize, bound)?;
     held.merge(read_held);
-    let (write, write_held) = bind_graphs(&original.write, snap, preparation, normalize, bound)?;
-    held.merge(write_held);
+    let write = if bind_write {
+        let (write, write_held) =
+            bind_graphs(&original.write, snap, preparation, normalize, bound)?;
+        held.merge(write_held);
+        write
+    } else {
+        Graphs::none()
+    };
     let access = Arc::new(GraphAccess {
         read,
         write,
@@ -195,13 +231,34 @@ fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<Prepared
             }
         }
     }
-    let Some(rules) = access.triples.as_ref().filter(|_| hides) else {
-        // A policy that hides no triples keeps an existing mask, which only hides more.
-        preparation.check()?;
-        return finish(access, snap.clone(), held, preparation, input);
+    let rules = access.triples.as_ref().filter(|_| hides);
+    let ev_config = if access.reads_everything() {
+        evidence::EvidenceConfig::None
+    } else {
+        snap.evidence_projection_config()
     };
-    let (key, key_held) = cache_key(&access, rules, preparation)?;
-    if let Some(mask) = &snap.mask {
+    let ev_cfg = match &ev_config {
+        evidence::EvidenceConfig::None => None,
+        evidence::EvidenceConfig::Active(cfg) => Some(cfg),
+        evidence::EvidenceConfig::Unavailable(reason) => {
+            return Err(evidence::unavailable_error(reason));
+        }
+    };
+    let ev_policy_applicable = match ev_cfg {
+        Some(cfg) => cfg.has_readable_policy_output(&access, preparation)?,
+        None => false,
+    };
+    if let Some(mask) = snap.mask.as_ref() {
+        if rules.is_none() && !ev_policy_applicable {
+            // A policy that hides no triples keeps an existing mask, which only hides more.
+            preparation.check()?;
+            return finish(access, snap.clone(), held, preparation, input);
+        }
+        let ev_fp = ev_policy_applicable
+            .then(|| ev_cfg.map(|c| c.fingerprint.as_str()))
+            .flatten();
+        let (key, key_held) =
+            cache_key_with_evidence(&access, rules.map(Arc::as_ref), ev_fp, preparation)?;
         // A mask left by another policy could show triples this policy hides, so only
         // this exact policy's own mask can be returned as its prepared view.
         if !preparation.compare(&mask.key, &key)?.is_eq() {
@@ -211,6 +268,21 @@ fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<Prepared
         preparation.check()?;
         return finish(access, snap.clone(), held, preparation, input);
     }
+    let ev_active = match ev_cfg {
+        Some(cfg) if ev_policy_applicable => {
+            cfg.has_applicable_output(&access, snap, preparation)?
+        }
+        _ => false,
+    };
+    if rules.is_none() && !ev_active {
+        preparation.check()?;
+        return finish(access, snap.clone(), held, preparation, input);
+    }
+    let ev_fp = ev_policy_applicable
+        .then(|| ev_cfg.map(|c| c.fingerprint.as_str()))
+        .flatten();
+    let (key, key_held) =
+        cache_key_with_evidence(&access, rules.map(Arc::as_ref), ev_fp, preparation)?;
     let existing = if use_controlled_cache {
         snap.counts.prepared_mask_slot(&key, preparation)?
     } else {
@@ -232,7 +304,47 @@ fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<Prepared
     }
     // Build outside the slot lock. User progress and controlled provider helpers
     // never execute while this cache lock is owned. A cold race may build twice.
-    let hidden = hidden(&access, rules, snap, preparation)?;
+    let mut hidden = match rules {
+        Some(rules) => hidden(&access, rules, snap, preparation)?,
+        None => Buffer::new(preparation)?,
+    };
+    if ev_active && let Some(cfg) = ev_cfg {
+        let limits = rules.map_or_else(Limits::default, |r| r.limits);
+        let mut extra = Buffer::new(preparation)?;
+        evidence::append_hidden(
+            &access,
+            &hidden,
+            cfg,
+            snap,
+            &limits,
+            preparation,
+            &mut extra,
+        )?;
+        if !extra.is_empty() {
+            if hidden.len().saturating_add(extra.len()) as u64 > limits.max_hidden {
+                return Err(too_many(
+                    &limits,
+                    hidden.len().saturating_add(extra.len()) as u64,
+                ));
+            }
+            for &k in extra.iter() {
+                preparation.check()?;
+                hidden.push(k)?;
+            }
+            drop(extra);
+            preparation.stage("ordering permission mask")?;
+            crate::access::preparation::sort_keys(&mut hidden, preparation)?;
+            let mut kept = 0;
+            for index in 0..hidden.len() {
+                preparation.check()?;
+                if kept == 0 || hidden[kept - 1] != hidden[index] {
+                    hidden.swap(kept, index);
+                    kept += 1;
+                }
+            }
+            hidden.truncate(kept);
+        }
+    }
     let (snapshot, derived) = apply_controlled(snap, hidden, &key, preparation)?;
     held.merge(derived);
     preparation.check()?;
@@ -251,6 +363,89 @@ fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<Prepared
     drop(key_held);
     preparation.check()?;
     finish(access, snapshot, held, preparation, input)
+}
+
+/// Mask a retained historical snapshot for nested `ev:StoredFact` verification under
+/// `access`, `preparation`, and recursion `depth`. Never populates any shared mask cache.
+pub(super) fn prepare_stored_fact_snapshot(
+    access: &GraphAccess,
+    snap: &Arc<Snapshot>,
+    preparation: &Preparation,
+    depth: u8,
+) -> Result<(Arc<Snapshot>, Reservation)> {
+    preparation.check()?;
+    let mut hides = false;
+    if let Some(rules) = &access.triples {
+        for rule in &rules.rules {
+            preparation.check()?;
+            if !rule.read.is_all() {
+                hides = true;
+                break;
+            }
+        }
+    }
+    let rules = access.triples.as_ref().filter(|_| hides);
+    let ev_config = if access.reads_everything() {
+        evidence::EvidenceConfig::None
+    } else {
+        snap.evidence_projection_config()
+    };
+    let ev_cfg = match &ev_config {
+        evidence::EvidenceConfig::None => None,
+        evidence::EvidenceConfig::Active(cfg) => Some(cfg),
+        evidence::EvidenceConfig::Unavailable(reason) => {
+            return Err(evidence::unavailable_error(reason));
+        }
+    };
+    let ev_active = match ev_cfg {
+        Some(cfg) => cfg.has_applicable_output(access, snap, preparation)?,
+        None => false,
+    };
+    if rules.is_none() && !ev_active {
+        return Ok((snap.clone(), preparation.reserve(0)?));
+    }
+    let mut hid = match rules {
+        Some(rules) => hidden(access, rules, snap, preparation)?,
+        None => Buffer::new(preparation)?,
+    };
+    if ev_active && let Some(cfg) = ev_cfg {
+        let limits = rules.map_or_else(Limits::default, |r| r.limits);
+        let mut extra = Buffer::new(preparation)?;
+        evidence::append_hidden_with_depth(
+            access,
+            &hid,
+            cfg,
+            snap,
+            &limits,
+            preparation,
+            &mut extra,
+            depth,
+        )?;
+        if !extra.is_empty() {
+            if hid.len().saturating_add(extra.len()) as u64 > limits.max_hidden {
+                return Err(too_many(
+                    &limits,
+                    hid.len().saturating_add(extra.len()) as u64,
+                ));
+            }
+            for &k in extra.iter() {
+                preparation.check()?;
+                hid.push(k)?;
+            }
+            drop(extra);
+            crate::access::preparation::sort_keys(&mut hid, preparation)?;
+            let mut kept = 0;
+            for index in 0..hid.len() {
+                preparation.check()?;
+                if kept == 0 || hid[kept - 1] != hid[index] {
+                    hid.swap(kept, index);
+                    kept += 1;
+                }
+            }
+            hid.truncate(kept);
+        }
+    }
+    apply_controlled(snap, hid, "", preparation)
 }
 
 fn already_masked() -> Error {
@@ -489,12 +684,13 @@ fn bind_graphs(
     Ok((Graphs::Only(rule), held))
 }
 
-fn cache_key(
+fn cache_key_with_evidence(
     access: &GraphAccess,
-    rules: &TripleRules,
+    rules: Option<&TripleRules>,
+    evidence_fingerprint: Option<&str>,
     preparation: &Preparation,
 ) -> Result<(String, Reservation)> {
-    key::serialize(access, rules, preparation)
+    key::serialize_with_evidence(access, rules, evidence_fingerprint, preparation)
 }
 
 fn closure(
@@ -583,6 +779,53 @@ fn predicates(
     Ok(Some(ids))
 }
 
+fn allows_blank_nodes(graphs: &Graphs) -> bool {
+    match graphs {
+        Graphs::All => true,
+        Graphs::Only(rule) => rule.blank_nodes,
+    }
+}
+
+fn is_empty_graphs(graphs: &Graphs) -> bool {
+    match graphs {
+        Graphs::All => false,
+        Graphs::Only(rule) => {
+            !rule.default_graph
+                && !rule.blank_nodes
+                && rule.iris.is_empty()
+                && rule.patterns.is_empty()
+        }
+    }
+}
+
+fn exact_named_graph_ids(
+    graphs: &Graphs,
+    snap: &Snapshot,
+    preparation: &Preparation,
+) -> Result<Option<Map<u64, ()>>> {
+    let Graphs::Only(rule) = graphs else {
+        return Ok(None);
+    };
+    if !rule.patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut ids = Map::new(preparation)?;
+    if rule.default_graph
+        && let Some(id) = preparation.lookup_iri(snap, crate::sparql::ctx::DEFAULT_GRAPH_IRI)?
+    {
+        ids.insert(id.0, ())?;
+    }
+    for iri in &rule.iris {
+        preparation.check()?;
+        if preparation.allows_named_graph_iri(graphs, iri)?
+            && let Some(id) = preparation.lookup_iri(snap, iri)?
+        {
+            ids.insert(id.0, ())?;
+        }
+    }
+    Ok(Some(ids))
+}
+
 fn hidden(
     access: &GraphAccess,
     rules: &TripleRules,
@@ -591,6 +834,7 @@ fn hidden(
 ) -> Result<Buffer<Key>> {
     let mut hidden = Buffer::new(preparation)?;
     let mut read = Map::new(preparation)?;
+    let exact_readable = exact_named_graph_ids(&access.read, snap, preparation)?;
     for rule in &rules.rules {
         preparation.check()?;
         if rule.read.is_all() {
@@ -610,53 +854,123 @@ fn hidden(
                 )
             })
             .transpose()?;
-        let pass = match &protection.pattern {
-            Some(pattern) => Some(passes(
-                snap,
-                protection,
-                pattern,
-                &rules.caller,
-                &rules.limits,
-                preparation,
-            )?),
+        let exact_protected = match &protection.graphs {
+            Some(graphs) => exact_named_graph_ids(graphs, snap, preparation)?,
             None => None,
         };
+        let covers_all_named = protection.graphs.as_ref().is_none_or(Graphs::is_all);
+        let rule_allows_none = is_empty_graphs(&rule.read);
         let mut by_graph = Map::new(preparation)?;
+        let mut pass: Option<Pass> = None;
         let mut visit = |quad: [Id; 4]| -> Result<bool> {
             preparation.check()?;
+            #[cfg(test)]
+            tests::record_hidden_visit();
             let graph = quad[3];
             let hide = if let Some(&hide) = by_graph.get(&graph.0) {
                 hide
             } else {
-                let readable = if let Some(&readable) = read.get(&graph.0) {
+                let hide = if graph == Id::DEFAULT_GRAPH {
+                    let readable = if let Some(&readable) = read.get(&graph.0) {
+                        readable
+                    } else {
+                        let readable = access.read.default_graph();
+                        read.insert(graph.0, readable)?;
+                        readable
+                    };
                     readable
+                        && preparation.covers_graph(protection, None)?
+                        && !preparation.allows(&rule.read, None)?
+                } else if graph.tag() == crate::id::Tag::BNode {
+                    let readable = if let Some(&readable) = read.get(&graph.0) {
+                        readable
+                    } else {
+                        let readable = allows_blank_nodes(&access.read);
+                        read.insert(graph.0, readable)?;
+                        readable
+                    };
+                    readable
+                        && protection.graphs.as_ref().is_none_or(allows_blank_nodes)
+                        && !allows_blank_nodes(&rule.read)
+                } else if exact_protected
+                    .as_ref()
+                    .is_some_and(|exact| !exact.contains_key(&graph.0))
+                {
+                    false
                 } else {
-                    let readable = if graph == Id::DEFAULT_GRAPH {
-                        access.read.default_graph()
-                    } else {
-                        preparation.with_term(snap, graph, |term| match term {
-                            Some(term) => preparation.allows(&access.read, Some(term)),
-                            None => Ok(false),
-                        })?
+                    let eval_hide_iri = |iri: Option<&str>| -> Result<bool> {
+                        match iri {
+                            Some(iri) => Ok(preparation.covers_named_graph_iri(protection, iri)?
+                                && !preparation.allows_named_graph_iri(&rule.read, iri)?),
+                            None => Ok(covers_all_named),
+                        }
                     };
-                    read.insert(graph.0, readable)?;
-                    readable
+                    if let Some(&readable) = read.get(&graph.0) {
+                        if !readable {
+                            false
+                        } else if covers_all_named && rule_allows_none {
+                            true
+                        } else {
+                            preparation.with_iri(snap, graph, eval_hide_iri)?
+                        }
+                    } else if let Some(exact) = &exact_readable {
+                        let readable = exact.contains_key(&graph.0);
+                        read.insert(graph.0, readable)?;
+                        if !readable {
+                            false
+                        } else if covers_all_named && rule_allows_none {
+                            true
+                        } else {
+                            preparation.with_iri(snap, graph, eval_hide_iri)?
+                        }
+                    } else if access.read.is_all() {
+                        read.insert(graph.0, true)?;
+                        if covers_all_named && rule_allows_none {
+                            true
+                        } else {
+                            preparation.with_iri(snap, graph, eval_hide_iri)?
+                        }
+                    } else {
+                        let (readable, hide) = preparation.with_iri(snap, graph, |iri| {
+                            let readable = match iri {
+                                Some(iri) => {
+                                    preparation.allows_named_graph_iri(&access.read, iri)?
+                                }
+                                None => false,
+                            };
+                            let hide = if !readable {
+                                false
+                            } else if covers_all_named && rule_allows_none {
+                                true
+                            } else {
+                                eval_hide_iri(iri)?
+                            };
+                            Ok((readable, hide))
+                        })?;
+                        read.insert(graph.0, readable)?;
+                        hide
+                    }
                 };
-                let hide = readable
-                    && if graph == Id::DEFAULT_GRAPH {
-                        preparation.covers_graph(protection, None)?
-                            && !preparation.allows(&rule.read, None)?
-                    } else {
-                        preparation.with_term(snap, graph, |term| match term {
-                            Some(term) => Ok(preparation.covers_graph(protection, Some(term))?
-                                && !preparation.allows(&rule.read, Some(term))?),
-                            None => Ok(false),
-                        })?
-                    };
                 by_graph.insert(graph.0, hide)?;
                 hide
             };
-            if hide && !pass.as_ref().is_some_and(|pass| pass.passes(&quad)) {
+            if hide {
+                if let Some(pattern) = &protection.pattern {
+                    let resolved = match &mut pass {
+                        Some(pass) => pass,
+                        None => pass.insert(passes(
+                            snap,
+                            protection,
+                            pattern,
+                            &rules.caller,
+                            &rules.limits,
+                            preparation,
+                        )?),
+                    };
+                    if resolved.passes(&quad) {
+                        return Ok(!matches!(resolved, Pass::All));
+                    }
+                }
                 if hidden.len() as u64 >= rules.limits.max_hidden {
                     return Err(too_many(
                         &rules.limits,
@@ -670,23 +984,47 @@ fn hidden(
         match (&members, &predicates) {
             (Some(members), predicates) => {
                 for &subject in members.keys() {
+                    #[cfg(test)]
+                    tests::record_hidden_range();
+                    let mut stop = false;
                     preparation.scan(snap, Perm::Spo, &[subject], |quad| {
                         if predicates
                             .as_ref()
                             .is_none_or(|ids| ids.contains_key(&quad[1].0))
+                            && !visit(quad)?
                         {
-                            visit(quad)?;
+                            stop = true;
+                            return Ok(false);
                         }
                         Ok(true)
                     })?;
+                    if stop {
+                        break;
+                    }
                 }
             }
             (None, Some(predicates)) => {
                 for &predicate in predicates.keys() {
-                    preparation.scan(snap, Perm::Pso, &[predicate], &mut visit)?;
+                    #[cfg(test)]
+                    tests::record_hidden_range();
+                    let mut stop = false;
+                    preparation.scan(snap, Perm::Pso, &[predicate], |quad| {
+                        if !visit(quad)? {
+                            stop = true;
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    })?;
+                    if stop {
+                        break;
+                    }
                 }
             }
-            (None, None) => preparation.scan(snap, Perm::Gspo, &[], &mut visit)?,
+            (None, None) => {
+                #[cfg(test)]
+                tests::record_hidden_range();
+                preparation.scan(snap, Perm::Gspo, &[], &mut visit)?;
+            }
         }
     }
     preparation.stage("ordering permission mask")?;
@@ -833,9 +1171,9 @@ fn hex_escape(c: char, out: &mut [u8; 6]) -> &str {
 }
 
 /// Evaluate a protection's pattern as [`super::passes`] does, with every graph merged
-/// into the default graph and `GRAPH` for the named ones. The query text, the list of
-/// named graphs and the pattern's query are charged to `preparation`, and the query
-/// runs under its controls on the unmasked snapshot.
+/// into the default graph by graph ID and `GRAPH` for the named ones. The query text,
+/// the default graph ID set and the pattern's query are charged to `preparation`, and
+/// the query runs under its controls on the unmasked snapshot without copying graph IRIs.
 fn passes(
     snap: &Arc<Snapshot>,
     protection: &Protection,
@@ -850,27 +1188,7 @@ fn passes(
         return Ok(Pass::None);
     };
     let (text, _text_held) = text.finish()?;
-    // The named graphs are merged into the default graph, as the legacy pattern reads
-    // them. Each name's storage is admitted before it is allocated.
-    let mut named = Buffer::new(preparation)?;
-    let mut names_held = preparation.reserve(0)?;
-    snap.for_each_graph_id_with(preparation, |graph| {
-        preparation.with_term(snap, graph, |term| {
-            if let Some(Term::NamedNode(node)) = term {
-                let iri = node.as_str();
-                names_held.merge(preparation.reserve(iri.len() as u64)?);
-                let mut name = String::new();
-                name.try_reserve_exact(iri.len())
-                    .map_err(|_| preparation.exhausted())?;
-                name.push_str(iri);
-                named.push(name)?;
-            }
-            Ok(())
-        })
-    })?;
-    let (named, _named_held) = named.into_parts();
     let opts = crate::sparql::QueryOptions {
-        default_graph_extra: named,
         max_rows: Some(usize::try_from(limits.max_pattern_rows).unwrap_or(usize::MAX)),
         ..preparation.nested_query_options()
     };
@@ -882,8 +1200,8 @@ fn passes(
         })
     };
     let view = GraphAccess::all().masked_controlled(snap, preparation)?;
-    let result = crate::sparql::query_prepared_source(view.read_source(), &text, &opts).map_err(
-        |error| match error {
+    let result = crate::sparql::query_prepared_pattern_source(view.read_source(), &text, &opts)
+        .map_err(|error| match error {
             Error::BudgetExceeded(Budget {
                 kind: BudgetKind::Rows,
                 ..
@@ -893,8 +1211,7 @@ fn passes(
                 protection.name
             )),
             error => error,
-        },
-    )?;
+        })?;
     let table = result.table();
     if table.len() as u64 > limits.max_pattern_rows {
         return Err(rows_refused(table.len() as u64));
@@ -977,6 +1294,36 @@ fn forget_removed(
     check()
 }
 
+/// One extra level covers a root split during a batch.
+fn permutation_mutation_bound(ins: &KeySet, del: &KeySet) -> u64 {
+    ins.mutation_bound()
+        .max(del.mutation_bound())
+        .saturating_add(KeySet::level_bound())
+}
+
+/// The budget observation can become stale before a concurrent reservation.
+fn reserve_mutation_batch(
+    preparation: &Preparation,
+    owned: &Reservation,
+    bound: u64,
+    writers: u64,
+    max_batch: usize,
+) -> Result<(usize, Reservation)> {
+    let room = preparation.available_room();
+    // Size the batch against the retained charge and a fraction of current headroom.
+    let share = (owned.bytes() / 4).max(room / 8 / writers).min(room);
+    let mut batch = usize::try_from(share / bound)
+        .unwrap_or(usize::MAX)
+        .clamp(1, max_batch);
+    loop {
+        match preparation.reserve(bound.saturating_mul(batch as u64)) {
+            Ok(held) => return Ok((batch, held)),
+            Err(Error::BudgetExceeded(_)) if batch > 1 => batch /= 2,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Hide `hidden` in one permutation: remove the keys the delta inserted and add the
 /// others to its deletions. Returns the admission of the nodes the writes allocated.
 fn write_permutation(
@@ -993,20 +1340,14 @@ fn write_permutation(
     // so no other writer can reuse the allowance of nodes that are still alive.
     let mut at = 0;
     while at < hidden.len() {
-        // One more level than either set has now covers a root split in the batch.
-        let bound = ins
-            .mutation_bound()
-            .max(del.mutation_bound())
-            .saturating_add(KeySet::level_bound());
-        // A batch admits at most a quarter of what the writes already own, or an eighth
-        // of the room the cap leaves each of the seven writers, so headroom stays small
-        // next to the charge and the cap while admissions stay few.
-        let share = (owned.bytes() / 4).max(preparation.room() / 8 / Perm::ALL.len() as u64);
-        let batch = usize::try_from(share / bound.max(1))
-            .unwrap_or(usize::MAX)
-            .clamp(1, 4096)
-            .min(hidden.len() - at);
-        let mut headroom = preparation.reserve(bound.saturating_mul(batch as u64))?;
+        let bound = permutation_mutation_bound(ins, del);
+        let (batch, mut headroom) = reserve_mutation_batch(
+            preparation,
+            owned,
+            bound,
+            Perm::ALL.len() as u64,
+            (hidden.len() - at).min(4096),
+        )?;
         let mut allocated = 0u64;
         let written = (at..at + batch).try_for_each(|index| {
             if index.is_multiple_of(64) {
@@ -1031,6 +1372,80 @@ fn write_permutation(
     preparation.check()
 }
 
+/// Remove hidden inserted `rdf:reifies` quads from `delta.reifiers_ins`, admitting
+/// every copied path under `preparation` before mutating the persistent tree.
+fn write_reifiers(
+    generation: &crate::store::Generation,
+    reifiers_ins: &mut KeySet,
+    hidden: &[Key],
+    inserted: &[bool],
+    preparation: &Preparation,
+    owned: &mut Reservation,
+) -> Result<()> {
+    if reifiers_ins.is_empty() {
+        return Ok(());
+    }
+    const MAX_BATCH: usize = 64;
+    let mut pending = [[0u64; 4]; MAX_BATCH];
+    let mut count = 0usize;
+    let flush = |pending: &[Key],
+                 reifiers_ins: &mut KeySet,
+                 preparation: &Preparation,
+                 owned: &mut Reservation|
+     -> Result<()> {
+        let mut at = 0;
+        while at < pending.len() {
+            let bound = reifiers_ins
+                .mutation_bound()
+                .saturating_add(KeySet::level_bound());
+            let (batch, mut headroom) =
+                reserve_mutation_batch(preparation, owned, bound, 1, pending.len() - at)?;
+            let mut allocated = 0u64;
+            for key in &pending[at..at + batch] {
+                reifiers_ins.remove_metered(key, &mut allocated);
+            }
+            let grown = headroom.grow_to(allocated);
+            if grown.is_ok() {
+                headroom.release_to(allocated);
+            }
+            owned.merge(headroom);
+            grown?;
+            at += batch;
+        }
+        Ok(())
+    };
+    for (index, key) in hidden.iter().enumerate() {
+        if index.is_multiple_of(64) {
+            preparation.check()?;
+        }
+        if !inserted[index] {
+            continue;
+        }
+        let quad = Perm::Spo.to_quad(key);
+        let Some((hs, ho)) =
+            generation.is_rdf_reifies_triple_prepared(quad[1], quad[2], preparation)?
+        else {
+            continue;
+        };
+        for h in [hs, ho].into_iter().flatten() {
+            let reifier_key = [quad[3].0, h, quad[0].0, quad[2].0];
+            if !reifiers_ins.contains(&reifier_key) {
+                continue;
+            }
+            pending[count] = reifier_key;
+            count += 1;
+            if count == MAX_BATCH {
+                flush(&pending[..count], reifiers_ins, preparation, owned)?;
+                count = 0;
+            }
+        }
+    }
+    if count > 0 {
+        flush(&pending[..count], reifiers_ins, preparation, owned)?;
+    }
+    preparation.check()
+}
+
 fn apply_controlled(
     snap: &Snapshot,
     hidden: Buffer<Key>,
@@ -1040,10 +1455,9 @@ fn apply_controlled(
     preparation.stage("applying permission mask")?;
     let mut held = preparation.reserve(SNAPSHOT_HEADERS)?;
     // The clone shares every node of the input delta, and hiding quads copies the
-    // nodes on their paths. The seven permutations are written in parallel, as the
-    // legacy path writes them. Each batch of key-set writes is admitted at an upper
-    // bound before it runs and then keeps only the bytes it allocated, so the view is
-    // charged for the nodes it owns and the cap holds at the peak of every batch.
+    // nodes on their paths. Each batch of key-set writes is admitted at an upper bound
+    // before it runs and then keeps only the bytes it allocated, so the view is charged
+    // for the nodes it owns and the cap holds at the peak of every batch.
     let mut inserted = Buffer::new(preparation)?;
     for key in hidden.iter() {
         inserted.push(snap.delta.ins[Perm::Spo.index()].contains(key))?;
@@ -1057,23 +1471,59 @@ fn apply_controlled(
         .iter()
         .map(|_| preparation.reserve(0))
         .collect::<Result<Vec<_>>>()?;
+    let mut reifiers_owned = preparation.reserve(0)?;
     // Declared after the reservations, so an early return drops the copied nodes
     // before it releases their admission.
     let mut delta = snap.delta.clone();
-    let sets: Vec<(Perm, &mut KeySet, &mut KeySet)> = Perm::ALL
-        .into_iter()
-        .zip(delta.ins.iter_mut().zip(delta.del.iter_mut()))
-        .map(|(perm, (ins, del))| (perm, ins, del))
-        .collect();
-    {
-        use rayon::prelude::*;
-        sets.into_par_iter()
-            .zip(copies.par_iter_mut())
-            .map(|((perm, ins, del), owned)| {
-                write_permutation(perm, ins, del, &hidden, &inserted, preparation, owned)
-            })
-            .collect::<Result<()>>()?
+    let parallel_headroom = delta
+        .ins
+        .iter()
+        .zip(&delta.del)
+        .fold(0u64, |sum, (ins, del)| {
+            sum.saturating_add(permutation_mutation_bound(ins, del))
+        });
+    let write = |delta: &mut Delta, copies: &mut [Reservation], parallel| {
+        let write_one = |((perm, (ins, del)), owned)| {
+            write_permutation(perm, ins, del, &hidden, &inserted, preparation, owned)
+        };
+        if parallel {
+            use rayon::prelude::*;
+            Perm::ALL
+                .into_par_iter()
+                .zip(delta.ins.par_iter_mut().zip(delta.del.par_iter_mut()))
+                .zip(copies.par_iter_mut())
+                .map(write_one)
+                .collect::<Result<()>>()
+        } else {
+            Perm::ALL
+                .into_iter()
+                .zip(delta.ins.iter_mut().zip(delta.del.iter_mut()))
+                .zip(copies)
+                .try_for_each(write_one)
+        }
     };
+    // The first batch can fit concurrently even when later batches cannot. Wait for
+    // the parallel writers to stop and drop their copied nodes before releasing their
+    // reservations. Serial writers can then reuse the same transient headroom.
+    let parallel = !hidden.is_empty() && parallel_headroom <= preparation.available_room();
+    match write(&mut delta, &mut copies, parallel) {
+        Err(Error::BudgetExceeded(_)) if parallel => {
+            delta = snap.delta.clone();
+            for copy in &mut copies {
+                copy.release_to(0);
+            }
+            write(&mut delta, &mut copies, false)?;
+        }
+        result => result?,
+    }
+    write_reifiers(
+        &snap.generation,
+        &mut delta.reifiers_ins,
+        &hidden,
+        &inserted,
+        preparation,
+        &mut reifiers_owned,
+    )?;
     forget_removed(&mut delta, &hidden, &inserted, preparation, &mut || {
         preparation.check()
     })?;
@@ -1081,6 +1531,7 @@ fn apply_controlled(
     for copy in copies {
         held.merge(copy);
     }
+    held.merge(reifiers_owned);
     held.merge(predicates);
     let retained = held.bytes().saturating_sub(SNAPSHOT_HEADERS);
     let mut text = Text::new(preparation)?;
@@ -1111,6 +1562,14 @@ mod tests {
     use crate::task::{Control, Progress};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    fn cache_key(
+        access: &GraphAccess,
+        rules: &TripleRules,
+        preparation: &Preparation,
+    ) -> Result<(String, Reservation)> {
+        cache_key_with_evidence(access, Some(rules), None, preparation)
+    }
 
     fn view() -> GraphAccess {
         GraphAccess::with_triples(
@@ -1261,6 +1720,102 @@ mod tests {
         assert!(legacy_mask.retained >= legacy.delta.unshared_bytes(|| Ok(())).unwrap().0);
         drop(prepared);
         assert_eq!(prep.inner_used(), before);
+    }
+
+    fn two_base_quads() -> Arc<Snapshot> {
+        let store = crate::store::Store::in_memory(Default::default());
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:s> <urn:p> 1, 2 }",
+            &Default::default(),
+        )
+        .unwrap();
+        store.compact().unwrap();
+        store.snapshot()
+    }
+
+    fn hide_base_quads(
+        snap: &Snapshot,
+        preparation: &Preparation,
+    ) -> Result<(Arc<Snapshot>, Reservation)> {
+        let mut hidden = Buffer::new(preparation)?;
+        snap.for_each_quad(|quad| hidden.push(Perm::Spo.to_key(quad)))?;
+        assert_eq!(hidden.len(), 2);
+        apply_controlled(snap, hidden, "test", preparation)
+    }
+
+    #[test]
+    fn mask_writes_fit_under_a_tight_backing_grant() {
+        let snap = two_base_quads();
+        let bound = permutation_mutation_bound(
+            &snap.delta.ins[Perm::Spo.index()],
+            &snap.delta.del[Perm::Spo.index()],
+        );
+        // The grant can admit one mutation at a time, even after earlier writers keep
+        // copies, but it cannot admit the first writer's two-mutation batch.
+        let pool = crate::sparql::pool::QueryPool::new(bound * 19 / 10);
+        let grant = Arc::new(pool.empty_grant());
+        let preparation = Preparation::with_grant(Control::none(), 1 << 30, grant.clone()).unwrap();
+        let before = grant.used();
+        let (masked, held) = hide_base_quads(&snap, &preparation).unwrap();
+        assert_eq!(masked.len(), 0);
+        assert!(masked.delta.del.iter().all(|set| set.len() == 2));
+        assert_eq!(grant.used() - before, held.bytes());
+        drop(masked);
+        drop(held);
+        assert_eq!(grant.used(), before);
+    }
+
+    #[test]
+    fn parallel_mask_retries_serially_after_a_later_batch_is_refused() {
+        use sparkles_budget::{MemoryDomain, ParentRefused, Scope};
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+
+        let snap = two_base_quads();
+        let initial_bound = permutation_mutation_bound(&KeySet::new(), &KeySet::new());
+        let later_bound = initial_bound + KeySet::level_bound();
+        let refused = Arc::new(AtomicBool::new(false));
+        let used = Arc::new(AtomicU64::new(0));
+        let admitted = used.clone();
+        let released = used.clone();
+        let hit = refused.clone();
+        // Simulate a transient backing refusal after a parallel writer has kept the
+        // first deletion leaf. The next reservation of the same size can succeed.
+        let parent = MemoryDomain::unpooled().parent(
+            move |bytes| {
+                if bytes == later_bound && !hit.swap(true, Ordering::Relaxed) {
+                    return Err(ParentRefused::Limit {
+                        limit: later_bound - 1,
+                        requested: later_bound,
+                        scope: Scope::Work,
+                    });
+                }
+                admitted.fetch_add(bytes, Ordering::Relaxed);
+                Ok(())
+            },
+            move |bytes| {
+                released.fetch_sub(bytes, Ordering::Relaxed);
+            },
+        );
+        let preparation = Preparation::for_view_rebuild(
+            &crate::sparql::QueryOptions {
+                cancel: Some(Arc::new(AtomicBool::new(false))),
+                max_memory_bytes: Some(8 * initial_bound),
+                ..Default::default()
+            },
+            parent,
+            None,
+        )
+        .unwrap();
+        let before = used.load(Ordering::Relaxed);
+        let (masked, held) = hide_base_quads(&snap, &preparation).unwrap();
+        assert!(refused.load(Ordering::Relaxed));
+        assert_eq!(masked.len(), 0);
+        assert!(masked.delta.del.iter().all(|set| set.len() == 2));
+        assert_eq!(used.load(Ordering::Relaxed) - before, held.bytes());
+        drop(masked);
+        drop(held);
+        assert_eq!(used.load(Ordering::Relaxed), before);
     }
 
     #[test]
@@ -1586,6 +2141,460 @@ mod tests {
     }
 
     #[test]
+    fn pattern_preparation_skips_unreadable_rules_and_uses_graph_ids_for_cross_graph_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let g_readable = "urn:g:readable";
+        let g_empty_ok = "urn:g:empty-ok";
+        let g_meta = "urn:g:meta";
+        {
+            let store = crate::store::Store::open(dir.path(), Default::default()).unwrap();
+            let mut trig = format!(
+                "<urn:d1> <urn:secret:p> \"1\" ; <urn:secret:p2> \"1\" .\n\
+                 <urn:d2> <urn:secret:p> \"2\" .\n\
+                 <urn:r1> <urn:approved> \"alice\" .\n\
+                 GRAPH <{g_readable}> {{\n\
+                     <urn:r1> <urn:secret:p> \"1\" ; <urn:secret:p2> \"1\" .\n\
+                     <urn:r2> <urn:secret:p> \"2\" .\n\
+                 }}\n\
+                 GRAPH <{g_empty_ok}> {{\n\
+                     <urn:e1> <urn:plain:p> \"ok\" .\n\
+                 }}\n\
+                 GRAPH <{g_meta}> {{\n\
+                     <urn:d1> <urn:approved> \"alice\" .\n\
+                     <{g_meta}> <urn:enabled> \"yes\" .\n\
+                 }}\n"
+            );
+            // 16 denied graphs * 64 KiB = ~1 MiB of denied graph IRIs, well above the
+            // 512 KiB preparation budget used below.
+            let pad = "x".repeat(64 * 1024);
+            for i in 0..16 {
+                trig.push_str(&format!(
+                    "GRAPH <urn:g:denied-{i:02}-{pad}> {{\n\
+                         <urn:hidden:{i}> <urn:only-denied:p> \"x\" ; <urn:secret:p> \"x\" .\n\
+                     }}\n"
+                ));
+            }
+            crate::sparql::update::update(
+                &store,
+                &format!("INSERT DATA {{ {trig} }}"),
+                &Default::default(),
+            )
+            .unwrap();
+            store.compact().unwrap();
+        }
+
+        let store = crate::store::Store::open(dir.path(), Default::default()).unwrap();
+        let snap = store.snapshot();
+        assert!(snap.delta.is_empty(), "expected compacted base-only store");
+
+        // 1. No readable covered candidate: pattern evaluation is skipped completely.
+        //    Even with `max_pattern_rows: 0` and ~1 MiB of denied graph IRIs, a narrow
+        //    exact allowlist succeeds under a 512 KiB cap.
+        let skip_access = GraphAccess::with_triples(
+            Graphs::Only(GraphRule::new([g_empty_ok], &[])),
+            Graphs::none(),
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "skip-unreadable".into(),
+                        predicates: Some(vec!["urn:only-denied:p".into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: None,
+                        pattern: Some("FILTER(false)".into()),
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Limits {
+                    max_pattern_rows: 0,
+                    ..Limits::default()
+                },
+            },
+        );
+        let skip_prep = Preparation::new(Control::none(), 512 << 10).unwrap();
+        let skip_view = skip_access.masked_controlled(&snap, &skip_prep).unwrap();
+        assert!(
+            skip_view
+                .snapshot()
+                .mask
+                .as_ref()
+                .unwrap()
+                .hidden
+                .is_empty()
+        );
+
+        // 2. Active cross-graph pattern: default-graph fact unlocks named-graph triple,
+        //    named-graph fact unlocks default-graph triple, and explicit `GRAPH <g_meta>`
+        //    works via graph-ID dataset setup without copying the ~1 MiB of denied IRIs.
+        let mut readable_rule = GraphRule::new([g_readable], &[]);
+        readable_rule.default_graph = true;
+        let active_access = GraphAccess::with_triples(
+            Graphs::Only(readable_rule.clone()),
+            Graphs::none(),
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "cross-graph-pattern".into(),
+                        predicates: Some(vec!["urn:secret:p".into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: None,
+                        pattern: Some(format!(
+                            "?s <urn:approved> ?user . GRAPH <{g_meta}> {{ <{g_meta}> <urn:enabled> \"yes\" }}"
+                        )),
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller {
+                    user: Some("alice".into()),
+                    ..Caller::default()
+                },
+                limits: Limits::default(),
+            },
+        );
+        let active_prep = Preparation::new(Control::none(), 512 << 10).unwrap();
+        let active_view = active_access
+            .masked_controlled(&snap, &active_prep)
+            .unwrap();
+        let legacy = active_access.masked(&snap).unwrap();
+        assert_eq!(quads(active_view.snapshot()), quads(&legacy));
+        // Exactly `<urn:d2>` (default graph) and `<urn:r2>` (`g_readable`) are hidden.
+        assert_eq!(
+            active_view.snapshot().mask.as_ref().unwrap().hidden.len(),
+            2
+        );
+
+        // 3. Zero-variable pattern returning `Pass::All` stops early across multiple
+        //    predicate ranges without scanning remaining candidates and hides nothing.
+        let pass_all_access = GraphAccess::with_triples(
+            Graphs::Only(readable_rule),
+            Graphs::none(),
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "pass-all-pattern".into(),
+                        predicates: Some(vec!["urn:secret:p".into(), "urn:secret:p2".into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: None,
+                        pattern: Some(format!(
+                            "GRAPH <{g_meta}> {{ <{g_meta}> <urn:enabled> \"yes\" }}"
+                        )),
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Limits::default(),
+            },
+        );
+        let pass_all_prep = Preparation::new(Control::none(), 512 << 10).unwrap();
+        let (pass_all_view, ranges, visits) =
+            observe_hidden_scan(|| pass_all_access.masked_controlled(&snap, &pass_all_prep));
+        let pass_all_view = pass_all_view.unwrap();
+        assert!(
+            pass_all_view
+                .snapshot()
+                .mask
+                .as_ref()
+                .unwrap()
+                .hidden
+                .is_empty()
+        );
+        assert!(
+            ranges == 1 && visits == 1,
+            "Pass::All must stop after the first readable candidate range (ranges={ranges}, visits={visits})"
+        );
+    }
+
+    thread_local! {
+        static HIDDEN_SCAN: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn record_hidden_range() {
+        HIDDEN_SCAN.with(|cell| {
+            if let Some((ranges, visits)) = cell.get() {
+                cell.set(Some((ranges + 1, visits)));
+            }
+        });
+    }
+
+    pub(super) fn record_hidden_visit() {
+        HIDDEN_SCAN.with(|cell| {
+            if let Some((ranges, visits)) = cell.get() {
+                cell.set(Some((ranges, visits + 1)));
+            }
+        });
+    }
+
+    fn observe_hidden_scan<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
+        struct Reset(Option<(usize, usize)>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                HIDDEN_SCAN.with(|cell| cell.set(self.0));
+            }
+        }
+        let prev = HIDDEN_SCAN.with(|cell| cell.replace(Some((0, 0))));
+        let _reset = Reset(prev);
+        let out = f();
+        let (ranges, visits) = HIDDEN_SCAN.with(|cell| cell.get()).unwrap();
+        (out, ranges, visits)
+    }
+
+    #[test]
+    fn blank_node_graph_witness_agrees_across_controlled_legacy_and_write_checks() {
+        use crate::io::{RdfFormat, Source};
+        use oxrdf::NamedNode;
+
+        let g_reports = "urn:g:reports";
+        let trig = format!(
+            "<{g_reports}> {{ <urn:report> <urn:secret:p> \"v1\" . }}\n\
+             _:witness {{ <urn:report> <urn:approved> \"alice\" . }}\n"
+        );
+        for union_default_graph in [false, true] {
+            let store = crate::store::Store::in_memory(crate::store::StoreOptions {
+                union_default_graph,
+                ..Default::default()
+            });
+            store
+                .load(&[Source::from_bytes(
+                    trig.as_bytes().to_vec(),
+                    RdfFormat::TriG,
+                    None,
+                )])
+                .unwrap();
+
+            for compacted in [false, true] {
+                if compacted {
+                    store.compact().unwrap();
+                }
+                let snap = store.snapshot();
+                let pred_id = snap.lookup_iri("urn:secret:p").unwrap();
+                let graph_term = Term::NamedNode(NamedNode::new_unchecked(g_reports));
+                let mut protected_quad = None;
+                snap.for_each_quad(|q| {
+                    if q[1] == pred_id {
+                        protected_quad = Some(*q);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                let protected_quad = protected_quad.expect("protected quad present");
+
+                let make_access = |user: &str| {
+                    let read_write = Graphs::Only(GraphRule::new([g_reports], &[]));
+                    GraphAccess::with_triples(
+                        read_write.clone(),
+                        read_write,
+                        TripleRules {
+                            rules: vec![Rule {
+                                protection: Arc::new(Protection {
+                                    name: "approved-report".into(),
+                                    predicates: Some(vec!["urn:secret:p".into()]),
+                                    classes: None,
+                                    subclasses: false,
+                                    graphs: None,
+                                    pattern: Some("?s <urn:approved> ?user".into()),
+                                    prefixes: Default::default(),
+                                    hide_inferences: false,
+                                }),
+                                read: Graphs::none(),
+                                write: Graphs::none(),
+                            }],
+                            caller: Caller {
+                                user: Some(user.into()),
+                                ..Caller::default()
+                            },
+                            limits: Limits::default(),
+                        },
+                    )
+                };
+
+                for (user, allowed) in [("alice", true), ("bob", false)] {
+                    let access = make_access(user);
+                    let prep = Preparation::new(Control::none(), 8 << 20).unwrap();
+                    let controlled = access.masked_controlled(&snap, &prep).unwrap();
+                    let legacy = access.masked(&snap).unwrap();
+                    assert_eq!(
+                        quads(controlled.snapshot()),
+                        quads(&legacy),
+                        "controlled vs legacy parity failed for {user} (union={union_default_graph}, compacted={compacted})"
+                    );
+                    let expected_hidden = if allowed { 0 } else { 1 };
+                    assert_eq!(
+                        controlled.snapshot().mask.as_ref().unwrap().hidden.len(),
+                        expected_hidden,
+                        "unexpected controlled mask for {user} (union={union_default_graph}, compacted={compacted})"
+                    );
+                    assert_eq!(
+                        legacy.mask.as_ref().unwrap().hidden.len(),
+                        expected_hidden,
+                        "unexpected legacy mask for {user} (union={union_default_graph}, compacted={compacted})"
+                    );
+
+                    // Direct WriteCheck verdict on the same snapshot and protection.
+                    let mut write_check =
+                        WriteCheck::new(access.triples.as_ref().unwrap(), snap.clone())
+                            .unwrap()
+                            .expect("protection limits writes");
+                    let check_res =
+                        write_check.check(protected_quad, "urn:secret:p", Some(&graph_term));
+                    if allowed {
+                        check_res.expect("authorized write check should pass");
+                    } else {
+                        assert!(
+                            matches!(check_res, Err(Error::NotPermitted(_))),
+                            "unauthorized write check should be refused, got {check_res:?}"
+                        );
+                    }
+
+                    // End-to-end SPARQL update under the same protection and graph grants.
+                    let update_opts = crate::sparql::QueryOptions {
+                        graphs: Some(Arc::new(access)),
+                        ..Default::default()
+                    };
+                    let update_res = crate::sparql::update::update(
+                        &store,
+                        &format!(
+                            "INSERT DATA {{ GRAPH <{g_reports}> {{ <urn:report> <urn:secret:p> \"v2\" }} }}"
+                        ),
+                        &update_opts,
+                    );
+                    if allowed {
+                        update_res.expect("authorized update should pass");
+                        crate::sparql::update::update(
+                            &store,
+                            &format!(
+                                "DELETE DATA {{ GRAPH <{g_reports}> {{ <urn:report> <urn:secret:p> \"v2\" }} }}"
+                            ),
+                            &Default::default(),
+                        )
+                        .unwrap();
+                    } else {
+                        assert!(
+                            matches!(update_res, Err(Error::NotPermitted(_))),
+                            "unauthorized update should be refused, got {update_res:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pass_all_pattern_stops_inner_scan_and_outer_loops_early() {
+        let g_readable = "urn:g:readable";
+        let g_meta = "urn:g:meta";
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut trig = format!(
+            "GRAPH <{g_meta}> {{ <{g_meta}> <urn:enabled> \"yes\" . }}\n\
+             GRAPH <{g_readable}> {{\n"
+        );
+        for m in 0..3 {
+            trig.push_str(&format!(
+                "  <urn:m{m}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:SecretClass> .\n"
+            ));
+            for p in 0..3 {
+                for v in 0..4 {
+                    trig.push_str(&format!("  <urn:m{m}> <urn:secret:p{p}> \"v{v}\" .\n"));
+                }
+            }
+        }
+        trig.push_str("}\n");
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {trig} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.compact().unwrap();
+        let snap = store.snapshot();
+
+        let pattern = format!("GRAPH <{g_meta}> {{ <{g_meta}> <urn:enabled> \"yes\" }}");
+        let readable_only = Graphs::Only(GraphRule::new([g_readable], &[]));
+
+        let cases = [
+            (
+                "pass-all-predicates",
+                readable_only.clone(),
+                Some(vec![
+                    "urn:secret:p0".into(),
+                    "urn:secret:p1".into(),
+                    "urn:secret:p2".into(),
+                ]),
+                None,
+            ),
+            (
+                "pass-all-class-and-predicates",
+                readable_only.clone(),
+                Some(vec![
+                    "urn:secret:p0".into(),
+                    "urn:secret:p1".into(),
+                    "urn:secret:p2".into(),
+                ]),
+                Some(vec!["urn:SecretClass".into()]),
+            ),
+            (
+                "pass-all-class-only",
+                readable_only,
+                None,
+                Some(vec!["urn:SecretClass".into()]),
+            ),
+            ("pass-all-unscoped", Graphs::All, None, None),
+        ];
+
+        for (name, read_graphs, predicates, classes) in cases {
+            let access = GraphAccess::with_triples(
+                read_graphs,
+                Graphs::none(),
+                TripleRules {
+                    rules: vec![Rule {
+                        protection: Arc::new(Protection {
+                            name: name.into(),
+                            predicates,
+                            classes,
+                            subclasses: false,
+                            graphs: None,
+                            pattern: Some(pattern.clone()),
+                            prefixes: Default::default(),
+                            hide_inferences: false,
+                        }),
+                        read: Graphs::none(),
+                        write: Graphs::none(),
+                    }],
+                    caller: Caller::default(),
+                    limits: Limits::default(),
+                },
+            );
+            let prep = Preparation::new(Control::none(), 8 << 20).unwrap();
+            let (view, ranges, visits) =
+                observe_hidden_scan(|| access.masked_controlled(&snap, &prep));
+            let view = view.unwrap();
+            assert!(
+                view.snapshot().mask.as_ref().unwrap().hidden.is_empty(),
+                "{name}: expected empty mask"
+            );
+            assert_eq!(
+                ranges, 1,
+                "{name}: Pass::All must break out of outer range loop after first range"
+            );
+            assert_eq!(
+                visits, 1,
+                "{name}: Pass::All must stop inner scan after first matching candidate"
+            );
+        }
+    }
+
+    #[test]
     fn count_cache_masks_do_not_outlive_prepared_view_or_legacy_caller() {
         let store = crate::store::Store::in_memory(Default::default());
         crate::sparql::update::update(
@@ -1720,5 +2729,104 @@ mod tests {
         assert_eq!(snap.counts.live_view_count(), 0);
         assert!(snap.counts.view(&access.read_key()).is_none());
         assert_eq!(snap.counts.view_entry_count(), 0);
+    }
+
+    #[test]
+    fn write_reifiers_reserves_nothing_when_mask_touches_no_reifiers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(tmp.path(), Default::default()).unwrap();
+        let reifies = crate::reifiers::RDF_REIFIES;
+        // Base quad in compacted generation.
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { GRAPH <urn:g> { <urn:b1> <urn:secret_base> <urn:v1> } }",
+            &Default::default(),
+        )
+        .unwrap();
+        store.compact().unwrap();
+        // Delta holds both a visible reifier and an ordinary delta quad.
+        crate::sparql::update::update(
+            &store,
+            &format!(
+                "INSERT DATA {{ GRAPH <urn:g> {{\
+                 <urn:c1> <{reifies}> <<( <urn:e1> <urn:p> <urn:o1> )>> .\
+                 <urn:d1> <urn:secret_delta> <urn:v2> . }} }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let snap = store.snapshot();
+        assert!(!snap.delta.reifiers_ins.is_empty());
+
+        let base_pred = snap.lookup_iri("urn:secret_base").unwrap();
+        let delta_pred = snap.lookup_iri("urn:secret_delta").unwrap();
+        let mut base_key = None;
+        let mut delta_key = None;
+        snap.for_each_quad(|q| {
+            if q[1] == base_pred {
+                base_key = Some(Perm::Spo.to_key(q));
+            } else if q[1] == delta_pred {
+                delta_key = Some(Perm::Spo.to_key(q));
+            }
+            Ok(())
+        })
+        .unwrap();
+        let base_key = base_key.unwrap();
+        let delta_key = delta_key.unwrap();
+
+        // A tight 1 KiB preparation is far below `reifiers_ins.mutation_bound()` (~42 KiB),
+        // yet hiding either a base quad or an ordinary delta quad must succeed with zero
+        // reservations and leave `reifiers_ins` structurally shared with the source delta.
+        assert!(1024 < snap.delta.reifiers_ins.mutation_bound());
+        for (hidden_key, is_inserted) in [(base_key, false), (delta_key, true)] {
+            let tight = Preparation::new(Control::none(), 1024).unwrap();
+            let mut owned = tight.reserve(0).unwrap();
+            let mut reifiers = snap.delta.reifiers_ins.clone();
+            write_reifiers(
+                &snap.generation,
+                &mut reifiers,
+                &[hidden_key],
+                &[is_inserted],
+                &tight,
+                &mut owned,
+            )
+            .expect("mask touching no reifiers must not refuse under a tight cap");
+            assert_eq!(owned.bytes(), 0);
+            assert!(reifiers.same(&snap.delta.reifiers_ins));
+        }
+
+        // End-to-end mask hiding only the base quad leaves `reifiers_ins` untouched.
+        let access = GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::none(),
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "hide-base".into(),
+                        predicates: Some(vec!["urn:secret_base".into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: None,
+                        pattern: None,
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Limits::default(),
+            },
+        );
+        let prep = Preparation::new(Control::none(), 16 << 20).unwrap();
+        let prepared = prepare(&access, &snap, &prep).unwrap();
+        assert!(
+            prepared
+                .snapshot()
+                .delta
+                .reifiers_ins
+                .same(&snap.delta.reifiers_ins),
+            "hiding an unrelated base quad must not copy reifiers_ins"
+        );
     }
 }

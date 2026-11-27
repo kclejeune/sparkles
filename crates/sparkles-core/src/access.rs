@@ -219,6 +219,12 @@ impl<'a> GuardSnapshot<'a> {
     ) -> Result<R> {
         preparation.with_term(self.snap, id, f)
     }
+
+    /// Whether `graph_iri` is a review-policy projection output graph on this snapshot
+    /// or the snapshot's managed evidence configuration is unavailable (fail closed).
+    pub fn is_evidence_output_or_unavailable(&self, graph_iri: &str) -> bool {
+        self.snap.is_evidence_output_or_unavailable(graph_iri)
+    }
 }
 
 /// Graphs a guard keeps out of a set, except those it exempts by exact IRI.
@@ -770,6 +776,61 @@ impl GraphAccess {
         self.write.allows_iri(iri) && self.read.allows_iri(iri)
     }
 
+    /// Whether the guarded named graph `iri` is readable: either reads see every graph
+    /// and triple ([`Self::reads_everything`]), or `self.read` allows `iri` and at least
+    /// one snapshot-bound [`GraphGuard`] whose pattern matches `iri` exempts it.
+    pub fn allows_guarded_read_iri(&self, iri: &str) -> bool {
+        if self.reads_everything() {
+            return true;
+        }
+        if iri == DEFAULT_GRAPH_IRI || iri == UNION_GRAPH_IRI {
+            return false;
+        }
+        let Graphs::Only(rule) = &self.read else {
+            return false;
+        };
+        rule.matches_iri(iri)
+            && rule.guards.iter().any(|g| {
+                g.bound_to.is_some()
+                    && g.decide.is_none()
+                    && glob(&g.pattern, iri)
+                    && g.exempt.binary_search_by(|x| x.as_str().cmp(iri)).is_ok()
+            })
+    }
+
+    /// For a restricted policy (`!self.reads_everything()`), visits every graph IRI
+    /// admitted by [`Self::allows_guarded_read_iri`] (may visit an IRI more than once
+    /// if multiple guards exempt it) and returns `Ok(true)`. Returns `Ok(false)` when
+    /// reads are unrestricted (`self.reads_everything()`), meaning any named graph is
+    /// readable.
+    pub fn visit_guarded_read_iris<E>(
+        &self,
+        mut visit: impl FnMut(&str) -> std::result::Result<(), E>,
+    ) -> std::result::Result<bool, E> {
+        if self.reads_everything() {
+            return Ok(false);
+        }
+        let Graphs::Only(rule) = &self.read else {
+            return Ok(true);
+        };
+        for g in &rule.guards {
+            if g.bound_to.is_none() || g.decide.is_some() {
+                continue;
+            }
+            for iri in &g.exempt {
+                let s = iri.as_str();
+                if s != DEFAULT_GRAPH_IRI
+                    && s != UNION_GRAPH_IRI
+                    && glob(&g.pattern, s)
+                    && rule.matches_iri(s)
+                {
+                    visit(s)?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// A stable key of the read rule (for caches).
     pub fn read_key(&self) -> String {
         format!("{:?}", self.read)
@@ -783,9 +844,16 @@ impl GraphAccess {
     /// Prefer [`crate::store::Store::prepare_read`] or [`Self::masked_controlled`] for
     /// budgeted read paths so mask storage stays bound to a [`Preparation`].
     pub fn masked(&self, snap: &Arc<Snapshot>) -> Result<Arc<Snapshot>> {
-        match self.triples.as_ref().filter(|t| t.hides()) {
-            Some(t) if snap.mask.is_none() => triples::masked(self, t, snap),
-            _ => Ok(snap.clone()),
+        if snap.mask.is_some() {
+            return Ok(snap.clone());
+        }
+        let rules = self.triples.as_ref().filter(|t| t.hides());
+        if rules.is_some()
+            || (!self.reads_everything() && snap.has_evidence_projection_or_unavailable())
+        {
+            triples::masked(self, rules.map(Arc::as_ref), snap)
+        } else {
+            Ok(snap.clone())
         }
     }
 
@@ -803,6 +871,18 @@ impl GraphAccess {
         preparation: &Preparation,
     ) -> Result<PreparedView> {
         triples::controlled::prepare(self, snap, preparation)
+    }
+
+    /// Like [`Self::masked_controlled`], but prepares a read-only view without
+    /// binding `self.write` guards or invoking write guard providers. The returned
+    /// view preserves read grants, read guards and triple protections with
+    /// `write: Graphs::none()`.
+    pub fn masked_controlled_read_only(
+        &self,
+        snap: &Arc<Snapshot>,
+        preparation: &Preparation,
+    ) -> Result<PreparedView> {
+        triples::controlled::prepare_read_only(self, snap, preparation)
     }
 
     /// Keep the rebuilt mask and its charge together without installing a raw

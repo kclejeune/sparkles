@@ -4142,11 +4142,11 @@ fn assist(p: &mut Paths) {
             .errors(&[400, 403, 404, 408, 409, 413, 422, 503]),
     );
     p.add(
-        op(POST, "/{ds}/claims/dependents", "listEvidenceDependents", "SPARQL", "Find the assessments that depend on changed records")
-            .doc("Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and with `transitive` the assessments that depend on those, each once at its smallest depth. A graph the caller cannot read is not searched, and an assessment any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.")
+        op(POST, "/{ds}/claims/dependents", "listEvidenceDependents", "SPARQL", "Find the assessments and reports that depend on changed records")
+            .doc("Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and the community reports in guarded reports graphs proven for the caller whose activity recorded `prov:used` for one of them (including person-edited reports via `gr:editOf`), and with `transitive` the assessments and reports that depend on those, each once at its smallest depth. A graph the caller cannot read or cannot prove under the disclosure guard is not searched, and a record any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.")
             .see("evidence-dependents")
             .json_body(true, "EvidenceDependents")
-            .json("200", "The dependent assessments.", "EvidenceDependentsResult")
+            .json("200", "The dependent assessments and community reports.", "EvidenceDependentsResult")
             .errors(&[400, 403, 404, 408, 409, 413, 422, 503]),
     );
     p.add(
@@ -4242,6 +4242,58 @@ fn assist(p: &mut Paths) {
         .json_body(true, "EvidenceDetach")
         .json("200", "The settings and their protection.", "EvidenceSettingsStatus")
         .errors(&[400, 404, 409, 503]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/evidence/{ds}/identities/rebuild",
+            "rebuildIdentityMap",
+            "Datasets",
+            "Rebuild a resolution map",
+        )
+        .doc("Needs unrestricted `admin` on the dataset or branch. Recomputes the clusters of the matching policy's current authenticated accepted decisions in its current protected identity-graph boundary, rewrites its output graph atomically and records the new protections and boundary in a fresh `ev:ResolutionMap` revision, restoring reviews and reads that answered `503 projection-unavailable`. Refusals write nothing: `400` for a malformed request or unknown matching policy, `403` for a read-only server or missing unrestricted admin grant, `409 policy-changed`, `409 head-changed`, `409 identity-conflict`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 unsupported-profile`, `409 evidence-settings-drift`, `422 incomplete-evidence` and `503 authority-changed`.")
+        .see("evidence-identities")
+        .param("branch")
+        .json_body(true, "EvidenceIdentitiesRebuild")
+        .json(
+            "200",
+            "The rebuilt resolution map revision and what changed.",
+            "EvidenceIdentitiesRebuildResult",
+        )
+        .errors(&[400, 403, 404, 409, 422, 503]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/evidence/{ds}/reauthenticate",
+            "reauthenticateEvidence",
+            "Datasets",
+            "Re-authenticate evidence records under a graph's current protection",
+        )
+        .doc("Needs `admin` on the dataset and target branch, and requires activated configuration history (`409 configuration-history-inactive` otherwise). Verifies records written under an earlier protection nonce in a protected evidence record graph against their retained, configuration-bound publication views, recorded digests, retained content, passage spans and receipt lineage, and atomically marks the verified records and their receipt operations under the graph's current protection nonce together with an audit operation. Refuses tampered, unretained or mismatched records without writing (`409 immutable-record-conflict`, `409 target-changed`, `422 origin-not-reproduced`, `422 span-mismatch`, `422 evidence-unavailable`, `422 incomplete-evidence`). Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ, `409 head-changed` for a stale `ifHead`, `409 idempotency-conflict` for a reused key with another payload, `409 unsupported-profile` while the graph is detached or the profile is disabled, and `503 authority-changed` when authorization changes before publication.")
+        .see("evidence-settings")
+        .json_body(true, "EvidenceReauthenticateRequest")
+        .json(
+            "200",
+            "The reconciliation receipt and verified records.",
+            "EvidenceReauthenticateResult",
+        )
+        .errors(&[400, 403, 404, 409, 413, 422, 503]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/evidence/{ds}/projections/reconcile",
+            "reconcileEvidenceProjection",
+            "Datasets",
+            "Reconcile a review policy's accepted projection",
+        )
+        .doc("Needs `admin` on the dataset or selected branch, with update grants on the policy's supports and output graphs and unmasked read grants on its decisions, supports and output graphs and on every configured proposal graph. Rebuilds the review policy's output graph strictly from the live acceptance supports that authenticate under the current protections, or empties it when none vouch, and records the new protection nonces in a fresh `ev:Projection` record that supersedes prior unsuperseded projection records of the policy, or reuses the active projection record when the protections and output are already valid. Restores normal reviews, withdrawals and policy reads after a detach and new protection of the policy's decisions, supports or output graph. Refusals write nothing: `400` for a malformed request, unknown policy or matching policy, `403` for a read-only server or missing or masked grants, `409 evidence-settings-drift`, `409 policy-changed`, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 unsupported-profile` when the profile is disabled or a policy graph is still detached, `422 incomplete-evidence`, `503` for `managed-unavailable`, `projection-unavailable` when the supports, output or conflict mode changed without raising the policy version, `authority-changed`, or temporary query memory pool exhaustion (with `Retry-After`), and `507` when the request exceeds the configured query memory pool.")
+        .see("evidence-reviews")
+        .param("branch")
+        .json_body(true, "EvidenceProjectionReconcile")
+        .json("200", "The reconciled projection, vouched supports and output changes.", "EvidenceProjectionReconcileResult")
+        .errors(&[400, 403, 404, 408, 409, 413, 422, 503, 507]),
     );
     p.add(
         op(

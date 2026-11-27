@@ -51,8 +51,8 @@ use super::{
     Settings, Sha256Digest, SourceContent,
     model::{BoundaryInput, ValidityInput},
 };
-use crate::access::{Preparation, Reservation};
-use crate::id::Id;
+use crate::access::{Preparation, PreparationBuffer as Buffer, Reservation};
+use crate::id::{Id, Tag};
 use crate::index::Perm;
 use crate::store::Snapshot;
 use crate::task::Control;
@@ -60,7 +60,8 @@ use crate::{Error, Result};
 use base64::Engine as _;
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term, Triple};
 use sha1::{Digest as _, Sha1};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
 use uuid::Uuid;
 
 const EV: &str = "urn:x-sparkles:evidence:";
@@ -166,6 +167,33 @@ pub struct PlannedRecord {
     pub digest: Sha256Digest,
     /// The immutable content.
     pub(super) triples: Vec<Triple>,
+}
+
+impl PlannedRecord {
+    /// Whether `recorded` matches this record's digest, including the pre-canonicalization
+    /// legacy digest for stored-fact `EvidenceRef` records whose `ev:expectedTriple`
+    /// carries caller-supplied blank-node labels.
+    pub fn matches_recorded_digest(
+        &self,
+        recorded: Sha256Digest,
+        control: &Control,
+    ) -> Result<bool> {
+        if recorded == self.digest {
+            return Ok(true);
+        }
+        if self.kind != RecordKind::EvidenceRef {
+            return Ok(false);
+        }
+        const EXPECTED_TRIPLE: &str = "urn:x-sparkles:evidence:expectedTriple";
+        let has_blank_expected = self.triples.iter().any(|t| {
+            t.predicate.as_str() == EXPECTED_TRIPLE
+                && matches!(&t.object, Term::Triple(inner) if super::prepare::has_blank(inner))
+        });
+        if !has_blank_expected {
+            return Ok(false);
+        }
+        Ok(legacy_record_digest(self.kind, &self.triples, control)? == recorded)
+    }
 }
 
 /// A stored fact commit that the operation keeps readable.
@@ -415,9 +443,102 @@ impl Record {
     }
 }
 
+/// Deterministically relabel blank nodes inside a single triple (including nested
+/// triple terms) to `b0`, `b1`, … in `subject -> object` encounter order. Ground
+/// triples are returned unchanged. Two triples are isomorphic iff their canonicalized
+/// forms are equal, so `ev:expectedTriple` hashes identically before and after scoped
+/// blank-node allocation in the store.
+pub(super) fn canonicalize_triple_blanks(triple: &Triple) -> Triple {
+    fn relabel_blank(b: &oxrdf::BlankNode, map: &mut BTreeMap<String, String>) -> oxrdf::BlankNode {
+        let next = map.len();
+        let label = map
+            .entry(b.as_str().to_string())
+            .or_insert_with(|| format!("b{next}"));
+        oxrdf::BlankNode::new_unchecked(label.as_str())
+    }
+    fn relabel_term(term: &Term, map: &mut BTreeMap<String, String>) -> Term {
+        match term {
+            Term::BlankNode(b) => Term::BlankNode(relabel_blank(b, map)),
+            Term::Triple(t) => Term::Triple(Box::new(relabel_triple(t, map))),
+            other => other.clone(),
+        }
+    }
+    fn relabel_triple(t: &Triple, map: &mut BTreeMap<String, String>) -> Triple {
+        let subject = match &t.subject {
+            NamedOrBlankNode::BlankNode(b) => NamedOrBlankNode::BlankNode(relabel_blank(b, map)),
+            NamedOrBlankNode::NamedNode(n) => NamedOrBlankNode::NamedNode(n.clone()),
+        };
+        let object = relabel_term(&t.object, map);
+        Triple::new(subject, t.predicate.clone(), object)
+    }
+    if !super::prepare::has_blank(triple) {
+        return triple.clone();
+    }
+    let mut map = BTreeMap::new();
+    relabel_triple(triple, &mut map)
+}
+
 /// The digest of a record's immutable content: the sorted digests of its triples,
 /// framed under the record kind, without the large values listed in [`LARGE`].
-pub(super) fn record_digest(
+/// Blank nodes inside a stored fact's `ev:expectedTriple` are canonicalized in
+/// deterministic traversal order so the digest survives scoped storage allocation.
+/// Exact raw triples are deduplicated before blank-node canonicalization so two
+/// distinct RDF `ev:expectedTriple` values whose blank nodes differ never collapse
+/// to a single digest.
+pub fn record_digest(
+    kind: RecordKind,
+    triples: &[Triple],
+    control: &Control,
+) -> Result<Sha256Digest> {
+    const EXPECTED_TRIPLE: &str = "urn:x-sparkles:evidence:expectedTriple";
+    let mut seen_raw: std::collections::HashSet<&Triple> =
+        std::collections::HashSet::with_capacity(triples.len());
+    let mut seen_large: BTreeSet<&str> = BTreeSet::new();
+    let mut each = Vec::with_capacity(triples.len());
+    for t in triples {
+        if LARGE.contains(&t.predicate.as_str()) {
+            // which form of retained content the record has is part of its identity,
+            // so that a metadata-only rendition never stands for one with text
+            if !seen_large.insert(t.predicate.as_str()) {
+                continue;
+            }
+            let mut frame = FrameHash::new(b"sparkles-evidence-record-retained-v1", control)?;
+            frame.field(1, t.predicate.as_str().as_bytes())?;
+            each.push(frame.finish()?);
+            continue;
+        }
+        if !seen_raw.insert(t) {
+            continue;
+        }
+        let mut frame = FrameHash::new(b"sparkles-evidence-record-triple-v1", control)?;
+        if t.predicate.as_str() == EXPECTED_TRIPLE
+            && let Term::Triple(inner) = &t.object
+            && super::prepare::has_blank(inner)
+        {
+            let canon = Triple::new(
+                t.subject.clone(),
+                t.predicate.clone(),
+                Term::Triple(Box::new(canonicalize_triple_blanks(inner))),
+            );
+            frame.triple(&canon)?;
+        } else {
+            frame.triple(t)?;
+        }
+        each.push(frame.finish()?);
+    }
+    each.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    let mut frame = FrameHash::new(b"sparkles-evidence-record-v1", control)?;
+    frame.field(20, &[kind.tag()])?;
+    for d in &each {
+        frame.field(12, d.as_bytes())?;
+    }
+    frame.finish()
+}
+
+/// Legacy pre-canonicalization record digest that hashes caller blank-node labels
+/// verbatim, used only to recognize existing stored-fact `EvidenceRef` records on
+/// proposal replay and equal-record reuse after upgrade.
+pub fn legacy_record_digest(
     kind: RecordKind,
     triples: &[Triple],
     control: &Control,
@@ -425,8 +546,6 @@ pub(super) fn record_digest(
     let mut each = Vec::with_capacity(triples.len());
     for t in triples {
         if LARGE.contains(&t.predicate.as_str()) {
-            // which form of retained content the record has is part of its identity,
-            // so that a metadata-only rendition never stands for one with text
             let mut frame = FrameHash::new(b"sparkles-evidence-record-retained-v1", control)?;
             frame.field(1, t.predicate.as_str().as_bytes())?;
             each.push(frame.finish()?);
@@ -451,7 +570,8 @@ pub(super) fn record_digest(
 /// passages go to the source-record graph, and evidence references, claims, evidence
 /// links and assessments to the proposal graph. Refuses a batch without records, a
 /// graph the settings do not give the role, blank nodes in record content other than
-/// a stored fact's expected triple, and an assessment cycle.
+/// a stored fact's expected triple, source-revision self-links or cycles, and an
+/// assessment cycle.
 pub fn plan<'i>(
     prepared: &PreparedInput<'i>,
     dataset: Uuid,
@@ -564,6 +684,59 @@ pub fn plan<'i>(
     }
     let sg = source_graph.as_ref();
     let pg = proposal_graph.as_ref();
+    // Reject self-links and cycles across batch revisions after all revision IRIs are
+    // minted, catching local, existing-IRI and mixed references alike.
+    if input.revisions.iter().any(|r| r.was_revision_of.is_some()) {
+        let mut links: BTreeMap<&str, NamedNode> = BTreeMap::new();
+        for source in &input.revisions {
+            let Some(predecessor) = &source.was_revision_of else {
+                continue;
+            };
+            let iri = &b.local[source.key.as_str()];
+            let pred = b.resolve(predecessor)?;
+            if pred == *iri {
+                return Err(Error::invalid(
+                    "revisions.wasRevisionOf: a source revision cannot revise itself",
+                ));
+            }
+            links.insert(iri.as_str(), pred);
+        }
+        let mut state: BTreeMap<&str, u8> = BTreeMap::new();
+        let mut path: Vec<&str> = Vec::new();
+        for &start in links.keys() {
+            if state.get(start).copied().unwrap_or(0) != 0 {
+                continue;
+            }
+            path.clear();
+            let mut cur = start;
+            loop {
+                control.check()?;
+                state.insert(cur, 1);
+                path.push(cur);
+                let Some(next) = links.get(cur) else {
+                    break;
+                };
+                let next = next.as_str();
+                match state.get(next).copied().unwrap_or(0) {
+                    1 => {
+                        return Err(Error::invalid(
+                            "revisions.wasRevisionOf: the batch's source revisions revise each other in a cycle",
+                        ));
+                    }
+                    2 => break,
+                    _ => {
+                        if !links.contains_key(next) {
+                            break;
+                        }
+                        cur = next;
+                    }
+                }
+            }
+            for &node in &path {
+                state.insert(node, 2);
+            }
+        }
+    }
     for source in &input.revisions {
         control.check()?;
         let iri = b.local[source.key.as_str()].clone();
@@ -577,6 +750,9 @@ pub fn plan<'i>(
         r.add(ev("sourceKey"), string(source.source_key.as_str()));
         if let Some(v) = &source.upstream_version {
             r.add(ev("upstreamVersion"), string(v.as_str()));
+        }
+        if let Some(predecessor) = &source.was_revision_of {
+            r.add(prov("wasRevisionOf"), b.resolve(predecessor)?);
         }
         if let SourceContent::Retained { bytes, .. } = &source.content {
             r.add(ev("retainedBytes"), base64_literal(bytes));
@@ -1030,6 +1206,7 @@ impl Plan {
                 payload_digest: self.payload_digest,
                 idempotency_key: self.idempotency_key.as_deref(),
                 hold,
+                used: None,
             },
             &self.graphs,
             &self.records,
@@ -1075,6 +1252,7 @@ pub(super) struct Operation<'a> {
     pub(super) payload_digest: Sha256Digest,
     pub(super) idempotency_key: Option<&'a str>,
     pub(super) hold: Option<Uuid>,
+    pub(super) used: Option<&'a NamedNode>,
 }
 
 /// The operation's description in every graph of `graphs`, each with that graph's
@@ -1124,6 +1302,9 @@ pub(super) fn publish_quads(
         }
         if let Some(h) = op.hold {
             quad(iri, ev("sourceHold"), string(&h.to_string()), g);
+        }
+        if let Some(u) = op.used {
+            quad(iri, prov("used"), u.clone().into(), g);
         }
     }
     for (i, r) in records.iter().enumerate() {
@@ -1228,6 +1409,128 @@ pub enum ExistingRecord {
     Many,
 }
 
+/// Retained scan results paired with the preparation reservation that pays for them.
+/// `items` is declared before `_held`, so its storage drops before its credit releases.
+pub struct AdmittedScan<T> {
+    pub items: Vec<T>,
+    pub more: bool,
+    _held: Reservation,
+}
+
+/// Conservative heap byte charge for a retained [`NamedOrBlankNode`], computed without
+/// allocating.
+fn subject_bytes(subject: &NamedOrBlankNode) -> u64 {
+    match subject {
+        NamedOrBlankNode::NamedNode(n) => (n.as_str().len() as u64).saturating_add(32),
+        NamedOrBlankNode::BlankNode(b) => (b.as_str().len() as u64).saturating_add(32),
+    }
+}
+
+/// Conservative heap byte charge for a retained [`Term`], computed without allocating.
+pub fn term_bytes(term: &Term) -> u64 {
+    match term {
+        Term::NamedNode(n) => (n.as_str().len() as u64).saturating_add(32),
+        Term::BlankNode(b) => (b.as_str().len() as u64).saturating_add(32),
+        Term::Literal(l) => (l.value().len() as u64)
+            .saturating_add(l.datatype().as_str().len() as u64)
+            .saturating_add(l.language().map_or(0, |s| s.len() as u64))
+            .saturating_add(64),
+        Term::Triple(t) => triple_bytes(t).saturating_add(64),
+    }
+}
+
+/// Conservative heap byte charge for a retained [`Triple`], computed without allocating.
+pub fn triple_bytes(triple: &Triple) -> u64 {
+    subject_bytes(&triple.subject)
+        .saturating_add(triple.predicate.as_str().len() as u64)
+        .saturating_add(32)
+        .saturating_add(term_bytes(&triple.object))
+        .saturating_add(std::mem::size_of::<Triple>() as u64)
+}
+
+fn literal_formatted_bytes(literal: &Literal, json_escape: bool) -> u64 {
+    // Opening and closing double quotes (`"` vs `\"`).
+    let mut n: u64 = if json_escape { 4 } else { 2 };
+    for c in literal.value().chars() {
+        n = n.saturating_add(match c {
+            '\u{8}' | '\t' | '\n' | '\u{C}' | '\r' => {
+                if json_escape {
+                    3
+                } else {
+                    2
+                }
+            }
+            '"' | '\\' => {
+                if json_escape {
+                    4
+                } else {
+                    2
+                }
+            }
+            '\0'..='\u{1F}' | '\u{7F}' | '\u{FFFE}' | '\u{FFFF}' => {
+                if json_escape {
+                    7
+                } else {
+                    6
+                }
+            }
+            _ => c.len_utf8() as u64,
+        });
+    }
+    if let Some(lang) = literal.language() {
+        // `@lang` plus optional `--ltr` / `--rtl` base direction suffix.
+        n = n
+            .saturating_add(1)
+            .saturating_add(lang.len() as u64)
+            .saturating_add(6);
+    } else if literal.datatype() != oxrdf::vocab::xsd::STRING {
+        // `^^<datatype>`
+        n = n
+            .saturating_add(4)
+            .saturating_add(literal.datatype().as_str().len() as u64);
+    }
+    n
+}
+
+fn ntriples_subject_bytes(subject: &NamedOrBlankNode) -> u64 {
+    match subject {
+        NamedOrBlankNode::NamedNode(n) => (n.as_str().len() as u64).saturating_add(2),
+        NamedOrBlankNode::BlankNode(b) => (b.as_str().len() as u64).saturating_add(2),
+    }
+}
+
+fn triple_formatted_bytes(triple: &Triple, json_escape: bool) -> u64 {
+    ntriples_subject_bytes(&triple.subject)
+        .saturating_add(1)
+        .saturating_add((triple.predicate.as_str().len() as u64).saturating_add(2))
+        .saturating_add(1)
+        .saturating_add(term_formatted_bytes(&triple.object, json_escape))
+}
+
+fn term_formatted_bytes(term: &Term, json_escape: bool) -> u64 {
+    match term {
+        Term::NamedNode(n) => (n.as_str().len() as u64).saturating_add(2),
+        Term::BlankNode(b) => (b.as_str().len() as u64).saturating_add(2),
+        Term::Literal(l) => literal_formatted_bytes(l, json_escape),
+        // `<<( ... )>>`
+        Term::Triple(t) => triple_formatted_bytes(t, json_escape).saturating_add(8),
+    }
+}
+
+/// Conservative N-Triples byte length of `triple.to_string()`, computed without allocating.
+pub fn ntriples_triple_bytes(triple: &Triple) -> u64 {
+    triple_formatted_bytes(triple, false)
+}
+
+/// Conservative JSON-encoded string byte length of `serde_json::to_string(&triple.to_string())`,
+/// including the surrounding JSON quotes, computed without allocating.
+pub fn json_escaped_ntriples_triple_bytes(triple: &Triple) -> u64 {
+    triple_formatted_bytes(triple, true).saturating_add(2)
+}
+
+/// A graph's stored quad with its physical `[Id; 4]` and decoded triple.
+pub type StoredQuad = ([Id; 4], Triple);
+
 /// Lookups in one unmasked snapshot under one preparation. The writer reads its head
 /// with them, which no caller policy limits: what they find decides only whether the
 /// operation repeats or conflicts with records of the caller's own identities.
@@ -1258,10 +1561,45 @@ const CACHE_START: u64 = 1024;
 /// coexist while the identities move into the set. The charge rounds up.
 const IDENTITY_START: u64 = 512;
 
+/// The result of [`Reads::graph_quads_diff_up_to`].
+pub struct GraphQuadsDiff {
+    /// Non-matching quads `([s, p, o, g], Triple)` not present in `keep`.
+    pub removed: Vec<([Id; 4], Triple)>,
+    /// Subset of `keep` that is already present in the graph.
+    pub present: HashSet<[Id; 3]>,
+    /// Whether the graph holds more than `limit` quads.
+    pub more: bool,
+}
+
+/// Instrumentation returned by [`Reads::has_live_accepted_in_graphs_counted`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BoundaryScanStats {
+    pub outer_rows: usize,
+    pub count_calls: usize,
+    pub metadata_reads: usize,
+    pub edge_decodes: usize,
+}
+
+impl BoundaryScanStats {
+    fn record_count(&mut self, work: crate::index::PreparedCountWork) {
+        self.count_calls += work.count_calls;
+        self.metadata_reads += work.metadata_reads;
+        self.edge_decodes += work.edge_decodes;
+    }
+}
+
+/// Added graphs with at most this many rows under their current protection nonces are
+/// scanned directly without counting or touching global proposal/decision prefixes.
+const SMALL_PROTECTED_LIMIT: u64 = 64;
+
 impl<'a> Reads<'a> {
     /// The preparation the reads are charged to.
     pub fn preparation(&self) -> &'a Preparation {
         self.preparation
+    }
+
+    pub(super) fn snap(&self) -> &'a Snapshot {
+        self.snap
     }
 
     pub fn new(preparation: &'a Preparation, snap: &'a Snapshot) -> Self {
@@ -1298,7 +1636,12 @@ impl<'a> Reads<'a> {
         Self::new(preparation, view.snapshot())
     }
 
-    fn id(&mut self, iri: &str) -> Result<Option<Id>> {
+    /// Resolve an IRI to its snapshot identifier under this reader's cached budget.
+    pub fn iri_id(&mut self, iri: &str) -> Result<Option<Id>> {
+        self.id(iri)
+    }
+
+    pub(super) fn id(&mut self, iri: &str) -> Result<Option<Id>> {
         if let Some(id) = self.ids.get(iri) {
             return Ok(*id);
         }
@@ -1324,16 +1667,68 @@ impl<'a> Reads<'a> {
                 ids.push(q[2]);
                 Ok(ids.len() < 2)
             })?;
+        let mut held = self.preparation.reserve(0)?;
         let mut out = Vec::new();
         for id in ids {
-            if let Some(t) = self
-                .preparation
-                .with_term(self.snap, id, |t| Ok(t.cloned()))?
-            {
+            if let Some(t) = self.preparation.with_term(self.snap, id, |t| match t {
+                Some(term) => {
+                    held.grow_by(term_bytes(term))?;
+                    Ok(Some(term.clone()))
+                }
+                None => Ok(None),
+            })? {
                 out.push(t);
             }
         }
         Ok(out)
+    }
+
+    /// The objects of `s p ?o` in `g`, at most `limit` of them, and whether more exist.
+    /// The scan buffer, output buffer and every retained term are charged to `held`
+    /// before allocation or cloning.
+    pub fn objects_up_to_held(
+        &mut self,
+        s: &str,
+        p: &str,
+        g: &str,
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<Term>, bool)> {
+        let (Some(s), Some(p), Some(g)) = (self.id(s)?, self.id(p)?, self.id(g)?) else {
+            return Ok((Vec::new(), false));
+        };
+        const OUT_ROW: u64 = std::mem::size_of::<Term>() as u64;
+        const OUT_CHUNK: usize = 256;
+        let mut ids: Buffer<Id> = Buffer::new(self.preparation)?;
+        let mut more = false;
+        self.preparation
+            .scan(self.snap, Perm::Gspo, &[g.0, s.0, p.0], |q| {
+                if ids.len() == limit {
+                    more = true;
+                    return Ok(false);
+                }
+                ids.push(q[2])?;
+                Ok(true)
+            })?;
+        let mut out: Vec<Term> = Vec::new();
+        let total = ids.len();
+        for (i, &id) in ids.iter().enumerate() {
+            if out.len() == out.capacity() {
+                let add = total.saturating_sub(i).clamp(1, OUT_CHUNK);
+                held.grow_by((add as u64).saturating_mul(OUT_ROW))?;
+                out.reserve_exact(add);
+            }
+            if let Some(t) = self.preparation.with_term(self.snap, id, |t| match t {
+                Some(term) => {
+                    held.grow_by(term_bytes(term))?;
+                    Ok(Some(term.clone()))
+                }
+                None => Ok(None),
+            })? {
+                out.push(t);
+            }
+        }
+        Ok((out, more))
     }
 
     /// The objects of `s p ?o` in `g`, at most `limit` of them, and whether more exist.
@@ -1344,34 +1739,149 @@ impl<'a> Reads<'a> {
         g: &str,
         limit: usize,
     ) -> Result<(Vec<Term>, bool)> {
-        let (Some(s), Some(p), Some(g)) = (self.id(s)?, self.id(p)?, self.id(g)?) else {
+        let mut held = self.preparation.reserve(0)?;
+        self.objects_up_to_held(s, p, g, limit, &mut held)
+    }
+
+    /// The IRI subjects in `g` that satisfy every `(predicate, object)` clause in
+    /// `clauses`, at most `limit` of them, and whether more exist. Every object must be
+    /// ground. Uses range-seeking leapfrog intersection with `Gspo[g]` so unrelated
+    /// graphs' rows are skipped. The scan buffer, output buffer and every retained IRI
+    /// are charged to `held` before allocation or cloning.
+    pub fn subjects_matching_up_to_held(
+        &mut self,
+        clauses: &[(&str, &Term)],
+        g: &str,
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<NamedNode>, bool)> {
+        if clauses.is_empty() {
+            return Ok((Vec::new(), false));
+        }
+        let Some(g) = self.id(g)? else {
             return Ok((Vec::new(), false));
         };
-        let mut ids = Vec::new();
+        let _clauses = self.preparation.reserve(
+            (clauses.len() as u64).saturating_mul(std::mem::size_of::<(Id, Id)>() as u64),
+        )?;
+        let mut resolved = Vec::with_capacity(clauses.len());
+        for (p, o) in clauses {
+            let Some(p) = self.id(p)? else {
+                return Ok((Vec::new(), false));
+            };
+            let o = match o {
+                Term::NamedNode(n) => self.id(n.as_str())?,
+                t => self.preparation.lookup_term(self.snap, t)?,
+            };
+            let Some(o) = o else {
+                return Ok((Vec::new(), false));
+            };
+            resolved.push((p, o));
+        }
+        const ROW: u64 = std::mem::size_of::<Id>() as u64;
+        const CHUNK: usize = 1024;
+        const OUT_ROW: u64 = std::mem::size_of::<NamedNode>() as u64;
+        const OUT_CHUNK: usize = 256;
+        let mut rows_held = self.preparation.reserve(0)?;
+        let mut ids: Vec<Id> = Vec::new();
         let mut more = false;
-        self.preparation
-            .scan(self.snap, Perm::Gspo, &[g.0, s.0, p.0], |q| {
-                if ids.len() == limit {
-                    more = true;
-                    return Ok(false);
+        self.for_each_pos_intersection_in_graph(g, &resolved, |s| {
+            if !self.is_iri_id(s)? {
+                return Ok(true);
+            }
+            if ids.len() == limit {
+                more = true;
+                return Ok(false);
+            }
+            if ids.len() == ids.capacity() {
+                let add = limit.saturating_sub(ids.len()).clamp(1, CHUNK);
+                rows_held.grow_by((add as u64).saturating_mul(ROW))?;
+                ids.reserve_exact(add);
+            }
+            ids.push(s);
+            Ok(true)
+        })?;
+        let mut out: Vec<NamedNode> = Vec::new();
+        let total = ids.len();
+        for (i, id) in ids.into_iter().enumerate() {
+            if out.len() == out.capacity() {
+                let add = total.saturating_sub(i).clamp(1, OUT_CHUNK);
+                held.grow_by((add as u64).saturating_mul(OUT_ROW))?;
+                out.reserve_exact(add);
+            }
+            if let Some(n) = self.preparation.with_term(self.snap, id, |t| match t {
+                Some(Term::NamedNode(n)) => {
+                    held.grow_by((n.as_str().len() as u64).saturating_add(32))?;
+                    Ok(Some(n.clone()))
                 }
-                ids.push(q[2]);
-                Ok(true)
-            })?;
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(t) = self
-                .preparation
-                .with_term(self.snap, id, |t| Ok(t.cloned()))?
-            {
-                out.push(t);
+                _ => Ok(None),
+            })? {
+                out.push(n);
             }
         }
         Ok((out, more))
     }
 
+    fn is_iri_id(&self, id: Id) -> Result<bool> {
+        match id.tag() {
+            Tag::Vocab => Ok(id.payload() < self.snap.generation.vocab.len()
+                && self.snap.generation.vocab.is_iri(id.payload())),
+            Tag::Delta => self
+                .snap
+                .generation
+                .dvocab
+                .with_prepared(self.preparation, |vocab| {
+                    Ok(id.payload() < self.snap.dvocab_len
+                        && vocab
+                            .get(id.payload())
+                            .is_some_and(|key| key.starts_with(b"<")))
+                }),
+            _ => Ok(false),
+        }
+    }
+
+    fn hides_subject_id_in_graph(&self, s: Id, g: Id) -> Result<bool> {
+        self.preparation.check()?;
+        let Some(mask) = self.snap.mask.as_deref() else {
+            return Ok(false);
+        };
+        if mask.hidden.is_empty() {
+            return Ok(false);
+        }
+        let start = mask.hidden.partition_point(|k| k[0] < s.0);
+        for (index, k) in mask.hidden[start..].iter().enumerate() {
+            if index.is_multiple_of(1024) {
+                self.preparation.check()?;
+            }
+            if k[0] != s.0 {
+                break;
+            }
+            if k[3] == g.0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether this snapshot's triple mask hides at least one quad with subject `s` in
+    /// graph `g`. Always `false` for an unmasked snapshot.
+    pub fn hides_subject_in_graph(&mut self, s: &str, g: &str) -> Result<bool> {
+        self.preparation.check()?;
+        let Some(mask) = self.snap.mask.as_deref() else {
+            return Ok(false);
+        };
+        if mask.hidden.is_empty() {
+            return Ok(false);
+        }
+        let (Some(s), Some(g)) = (self.id(s)?, self.id(g)?) else {
+            return Ok(false);
+        };
+        self.hides_subject_id_in_graph(s, g)
+    }
+
     /// The IRI subjects of `?s p o` in `g`, at most `limit` of them, and whether more
-    /// exist. `o` is a ground term.
+    /// exist. Non-IRI subjects are skipped without counting toward `limit`. `o` is a
+    /// ground term.
     pub fn subjects_up_to(
         &mut self,
         p: &str,
@@ -1379,40 +1889,350 @@ impl<'a> Reads<'a> {
         g: &str,
         limit: usize,
     ) -> Result<(Vec<NamedNode>, bool)> {
+        let scan = self.visible_subjects_up_to(p, o, g, limit, false)?;
+        Ok((scan.items, scan.more))
+    }
+
+    /// Like [`Self::subjects_up_to`], charging every returned IRI into `held` before
+    /// copying it so the caller keeps the copies charged for their full lifetime.
+    pub fn subjects_up_to_held(
+        &mut self,
+        p: &str,
+        o: &Term,
+        g: &str,
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<NamedNode>, bool)> {
+        self.subjects_matching_up_to_held(&[(p, o)], g, limit, held)
+    }
+
+    /// The IRI subjects of `?s p o` in `g`, at most `limit` of them, and whether more
+    /// exist, retaining the preparation reservation that pays for the returned vector
+    /// and its IRI strings. Non-IRI subjects and (when `skip_masked` is set) subjects
+    /// with any triple hidden in `g` by this snapshot's mask are skipped without
+    /// counting toward `limit`. `o` is a ground term.
+    pub fn visible_subjects_up_to(
+        &mut self,
+        p: &str,
+        o: &Term,
+        g: &str,
+        limit: usize,
+        skip_masked: bool,
+    ) -> Result<AdmittedScan<NamedNode>> {
         let (Some(p), Some(g)) = (self.id(p)?, self.id(g)?) else {
-            return Ok((Vec::new(), false));
+            return Ok(AdmittedScan {
+                items: Vec::new(),
+                more: false,
+                _held: self.preparation.reserve(0)?,
+            });
         };
         let o = match o {
             Term::NamedNode(n) => self.id(n.as_str())?,
             t => self.preparation.lookup_term(self.snap, t)?,
         };
         let Some(o) = o else {
-            return Ok((Vec::new(), false));
+            return Ok(AdmittedScan {
+                items: Vec::new(),
+                more: false,
+                _held: self.preparation.reserve(0)?,
+            });
         };
-        let mut ids = Vec::new();
+        let mut ids: Buffer<Id> = Buffer::new(self.preparation)?;
         let mut more = false;
         self.preparation
             .scan(self.snap, Perm::Pos, &[p.0, o.0], |q| {
                 if q[3] != g {
                     return Ok(true);
                 }
+                if !self.is_iri_id(q[0])? {
+                    return Ok(true);
+                }
+                if skip_masked && self.hides_subject_id_in_graph(q[0], g)? {
+                    return Ok(true);
+                }
                 if ids.len() == limit {
                     more = true;
                     return Ok(false);
                 }
-                ids.push(q[0]);
+                ids.push(q[0])?;
                 Ok(true)
             })?;
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(Term::NamedNode(n)) = self
-                .preparation
-                .with_term(self.snap, id, |t| Ok(t.cloned()))?
-            {
+        let mut out_held = self
+            .preparation
+            .reserve((ids.len() as u64).saturating_mul(std::mem::size_of::<NamedNode>() as u64))?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(ids.len())
+            .map_err(|_| self.preparation.exhausted())?;
+        for &id in &*ids {
+            if let Some(n) = self.preparation.with_iri(self.snap, id, |iri| match iri {
+                Some(iri) => {
+                    let owned = self.preparation.copy_string(iri, &mut out_held)?;
+                    Ok(Some(NamedNode::new_unchecked(owned)))
+                }
+                None => Ok(None),
+            })? {
                 out.push(n);
             }
         }
-        Ok((out, more))
+        drop(ids);
+        Ok(AdmittedScan {
+            items: out,
+            more,
+            _held: out_held,
+        })
+    }
+
+    /// The `(subject, graph)` IRI pairs of `?s p o` in named graphs accepted by
+    /// `keep_graph`, at most `limit` of them, and whether more exist. Quads in
+    /// rejected graphs, non-IRI subjects, and (when `skip_masked` is set) subjects
+    /// with any triple hidden in that graph by this snapshot's mask are skipped
+    /// without counting toward `limit`. `o` is a ground term. Returned pairs share
+    /// graph IRI allocations and stay charged to the preparation through the returned
+    /// [`AdmittedScan`].
+    pub fn subjects_in_graphs_up_to(
+        &mut self,
+        p: &str,
+        o: &Term,
+        limit: usize,
+        skip_masked: bool,
+        keep_graph: impl FnMut(&str) -> bool,
+    ) -> Result<AdmittedScan<(NamedNode, Arc<NamedNode>)>> {
+        self.scan_subjects_in_graphs(p, o, None, limit, skip_masked, None, keep_graph)
+    }
+
+    /// Like [`Self::subjects_in_graphs_up_to`], but when `admitted` is `Some(map)`,
+    /// restricts candidate graphs to IDs present in `map` before touching the
+    /// vocabulary or decoding any graph IRI.
+    pub fn subjects_in_admitted_graphs_up_to(
+        &mut self,
+        p: &str,
+        o: &Term,
+        limit: usize,
+        skip_masked: bool,
+        admitted: Option<&BTreeMap<Id, Arc<NamedNode>>>,
+        keep_graph: impl FnMut(&str) -> bool,
+    ) -> Result<AdmittedScan<(NamedNode, Arc<NamedNode>)>> {
+        self.scan_subjects_in_graphs(p, o, None, limit, skip_masked, admitted, keep_graph)
+    }
+
+    /// Like [`Self::subjects_in_admitted_graphs_up_to`], additionally requiring that
+    /// the object `o` itself carries `o rdf_type object_class` in the candidate graph
+    /// (and, when `skip_masked` is set, has no triple hidden in that graph) before
+    /// counting the edge toward `limit`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn subjects_for_typed_object_in_graphs_up_to(
+        &mut self,
+        p: &str,
+        o: &Term,
+        rdf_type: &str,
+        object_class: &str,
+        limit: usize,
+        skip_masked: bool,
+        admitted: Option<&BTreeMap<Id, Arc<NamedNode>>>,
+        keep_graph: impl FnMut(&str) -> bool,
+    ) -> Result<AdmittedScan<(NamedNode, Arc<NamedNode>)>> {
+        self.scan_subjects_in_graphs(
+            p,
+            o,
+            Some((rdf_type, object_class)),
+            limit,
+            skip_masked,
+            admitted,
+            keep_graph,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_subjects_in_graphs(
+        &mut self,
+        p: &str,
+        o: &Term,
+        object_type: Option<(&str, &str)>,
+        limit: usize,
+        skip_masked: bool,
+        admitted: Option<&BTreeMap<Id, Arc<NamedNode>>>,
+        mut keep_graph: impl FnMut(&str) -> bool,
+    ) -> Result<AdmittedScan<(NamedNode, Arc<NamedNode>)>> {
+        if admitted.is_some_and(BTreeMap::is_empty) {
+            return Ok(AdmittedScan {
+                items: Vec::new(),
+                more: false,
+                _held: self.preparation.reserve(0)?,
+            });
+        }
+        let Some(p) = self.id(p)? else {
+            return Ok(AdmittedScan {
+                items: Vec::new(),
+                more: false,
+                _held: self.preparation.reserve(0)?,
+            });
+        };
+        let o = match o {
+            Term::NamedNode(n) => self.id(n.as_str())?,
+            t => self.preparation.lookup_term(self.snap, t)?,
+        };
+        let Some(o) = o else {
+            return Ok(AdmittedScan {
+                items: Vec::new(),
+                more: false,
+                _held: self.preparation.reserve(0)?,
+            });
+        };
+        let object_type_ids = match object_type {
+            Some((rdf_type, class)) => {
+                let (Some(tp), Some(cls)) = (self.id(rdf_type)?, self.id(class)?) else {
+                    return Ok(AdmittedScan {
+                        items: Vec::new(),
+                        more: false,
+                        _held: self.preparation.reserve(0)?,
+                    });
+                };
+                Some((tp, cls))
+            }
+            None => None,
+        };
+        const SKIP_SLOTS: usize = 256;
+        let mut skipped = [None::<Id>; SKIP_SLOTS];
+        let mut out_held = self.preparation.reserve(0)?;
+        let mut scan_held = self.preparation.reserve(0)?;
+        let mut accepted: BTreeMap<Id, Arc<NamedNode>> = BTreeMap::new();
+        let mut accepted_started = false;
+        let mut pairs: Buffer<(Id, Id)> = Buffer::new(self.preparation)?;
+        let mut more = false;
+        self.preparation
+            .scan(self.snap, Perm::Pos, &[p.0, o.0], |q| {
+                let g = q[3];
+                if g == Id::DEFAULT_GRAPH {
+                    return Ok(true);
+                }
+                let slot = (g.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize % SKIP_SLOTS;
+                if skipped[slot] == Some(g) {
+                    return Ok(true);
+                }
+                if let Some(map) = admitted
+                    && !map.contains_key(&g)
+                {
+                    skipped[slot] = Some(g);
+                    return Ok(true);
+                }
+                if !self.is_iri_id(q[0])? {
+                    return Ok(true);
+                }
+                if skip_masked && self.hides_subject_id_in_graph(q[0], g)? {
+                    return Ok(true);
+                }
+                if let std::collections::btree_map::Entry::Vacant(e) = accepted.entry(g) {
+                    if let Some((tp, cls)) = object_type_ids
+                        && ((skip_masked && self.hides_subject_id_in_graph(o, g)?)
+                            || !self.preparation.contains(self.snap, &[o, tp, cls, g])?)
+                    {
+                        skipped[slot] = Some(g);
+                        return Ok(true);
+                    }
+                    let node = if let Some(map) = admitted {
+                        let candidate = map.get(&g).expect("checked admitted graph id");
+                        if keep_graph(candidate.as_str()) {
+                            Some(Arc::clone(candidate))
+                        } else {
+                            None
+                        }
+                    } else {
+                        self.preparation.with_iri(self.snap, g, |iri| match iri {
+                            Some(iri) if keep_graph(iri) => {
+                                let owned = self.preparation.copy_string(iri, &mut out_held)?;
+                                out_held.grow_by(32)?;
+                                Ok(Some(Arc::new(NamedNode::new_unchecked(owned))))
+                            }
+                            _ => Ok(None),
+                        })?
+                    };
+                    let Some(node) = node else {
+                        skipped[slot] = Some(g);
+                        return Ok(true);
+                    };
+                    let start = if accepted_started { 0 } else { CACHE_START };
+                    scan_held.grow_by(start + CACHE_ENTRY)?;
+                    accepted_started = true;
+                    e.insert(node);
+                }
+                if pairs.len() == limit {
+                    more = true;
+                    return Ok(false);
+                }
+                pairs.push((q[0], g))?;
+                Ok(true)
+            })?;
+        let vec_bytes = (pairs.len() as u64)
+            .saturating_mul(std::mem::size_of::<(NamedNode, Arc<NamedNode>)>() as u64);
+        out_held.grow_by(vec_bytes)?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(pairs.len())
+            .map_err(|_| self.preparation.exhausted())?;
+        for &(s_id, g_id) in &*pairs {
+            if let Some(s) = self
+                .preparation
+                .with_iri(self.snap, s_id, |iri| match iri {
+                    Some(iri) => {
+                        let owned = self.preparation.copy_string(iri, &mut out_held)?;
+                        Ok(Some(NamedNode::new_unchecked(owned)))
+                    }
+                    None => Ok(None),
+                })?
+            {
+                let g = Arc::clone(
+                    accepted
+                        .get(&g_id)
+                        .expect("accepted graph id retained for scan"),
+                );
+                out.push((s, g));
+            }
+        }
+        drop(pairs);
+        drop(accepted);
+        drop(scan_held);
+        Ok(AdmittedScan {
+            items: out,
+            more,
+            _held: out_held,
+        })
+    }
+
+    /// The single IRI object of `s p ?o` in `g`, `None` when it has none, several, or
+    /// a non-IRI object. Reserves the IRI string bytes in `held` before copying it.
+    pub fn single_iri_admitted(
+        &mut self,
+        s: &str,
+        p: &str,
+        g: &str,
+        held: &mut Reservation,
+    ) -> Result<Option<NamedNode>> {
+        let (Some(s), Some(p), Some(g)) = (self.id(s)?, self.id(p)?, self.id(g)?) else {
+            return Ok(None);
+        };
+        let mut first: Option<Id> = None;
+        let mut many = false;
+        self.preparation
+            .scan(self.snap, Perm::Gspo, &[g.0, s.0, p.0], |q| {
+                if first.is_some() {
+                    many = true;
+                    return Ok(false);
+                }
+                first = Some(q[2]);
+                Ok(true)
+            })?;
+        if many {
+            return Ok(None);
+        }
+        let Some(id) = first else {
+            return Ok(None);
+        };
+        self.preparation.with_iri(self.snap, id, |iri| match iri {
+            Some(iri) => {
+                let owned = self.preparation.copy_string(iri, held)?;
+                Ok(Some(NamedNode::new_unchecked(owned)))
+            }
+            None => Ok(None),
+        })
     }
 
     /// The number of triples whose subject is `s` in `g`, counting at most `limit`.
@@ -1442,6 +2262,592 @@ impl<'a> Reads<'a> {
         Ok(found)
     }
 
+    /// Whether any protected identity graph in `graphs` holds an authenticated
+    /// `ev:IdentityProposal` with a current authenticated `ev:Accepted` decision under
+    /// `policy` in `decisions`.
+    ///
+    /// Uses `Preparation`-controlled `Perm::Pos` prefix counts (O(log B) block search,
+    /// O(1) interior block sum, at most two prepared edge decodes) to pick the smallest
+    /// selective candidate set without walking unrelated quads in the added graphs or
+    /// populating per-proposal / per-graph entries in `Reads.ids`. When the added graphs
+    /// carry at most `SMALL_PROTECTED_LIMIT` rows under their current protection nonces,
+    /// those rows are scanned directly without touching global proposal/decision ranges.
+    pub fn has_live_accepted_in_graphs(
+        &mut self,
+        graphs: &[ProtectedGraph],
+        decisions: &ProtectedGraph,
+        policy: &NamedNode,
+    ) -> Result<bool> {
+        let (found, _) = self.has_live_accepted_in_graphs_counted(graphs, decisions, policy)?;
+        Ok(found)
+    }
+
+    pub(crate) fn has_live_accepted_in_graphs_counted(
+        &mut self,
+        graphs: &[ProtectedGraph],
+        decisions: &ProtectedGraph,
+        policy: &NamedNode,
+    ) -> Result<(bool, BoundaryScanStats)> {
+        let mut stats = BoundaryScanStats::default();
+        let Some(decisions_nonce) = decisions.1 else {
+            return Ok((false, stats));
+        };
+        let Some(decisions_g) = self.id(decisions.0.as_str())? else {
+            return Ok((false, stats));
+        };
+        let (
+            Some(rdf_type),
+            Some(identity_proposal),
+            Some(review_decision),
+            Some(review_policy),
+            Some(policy_id),
+            Some(target_pred),
+            Some(disposition_pred),
+            Some(accepted_obj),
+            Some(receipt_pred),
+            Some(protection_pred),
+            Some(operation_class),
+            Some(decisions_nonce_id),
+        ) = (
+            self.id(RDF_TYPE)?,
+            self.id(&format!("{EV}IdentityProposal"))?,
+            self.id(&format!("{EV}ReviewDecision"))?,
+            self.id(&format!("{EV}reviewPolicy"))?,
+            self.id(policy.as_str())?,
+            self.id(&format!("{EV}target"))?,
+            self.id(&format!("{EV}disposition"))?,
+            self.id(&format!("{EV}Accepted"))?,
+            self.id(&format!("{EV}availabilityReceipt"))?,
+            self.id(&format!("{EV}graphProtection"))?,
+            self.id(&format!("{EV}Operation"))?,
+            self.preparation
+                .lookup_term(self.snap, &string(&decisions_nonce.to_string()))?,
+        )
+        else {
+            return Ok((false, stats));
+        };
+        let supersedes_pred = self.id(&format!("{EV}supersedes"))?;
+        let prep = self.preparation;
+        let snap = self.snap;
+        let mut active: Vec<(Id, Id)> = Vec::new();
+        for (g, nonce) in graphs {
+            prep.check()?;
+            let Some(nonce) = nonce else {
+                continue;
+            };
+            let (Some(g_id), Some(g_nonce_id)) = (
+                prep.lookup_iri(snap, g.as_str())?,
+                prep.lookup_term(snap, &string(&nonce.to_string()))?,
+            ) else {
+                continue;
+            };
+            active.push((g_id, g_nonce_id));
+        }
+        active.sort_unstable();
+        active.dedup();
+        let mut keep = 0usize;
+        let mut c_protected = 0u64;
+        for i in 0..active.len() {
+            prep.check()?;
+            let (g_id, g_nonce_id) = active[i];
+            let (n, work) =
+                snap.count_prepared_with_work(Perm::Pos, &[protection_pred.0, g_nonce_id.0], prep)?;
+            stats.record_count(work);
+            if n > 0 {
+                c_protected = c_protected.saturating_add(n);
+                active[keep] = (g_id, g_nonce_id);
+                keep += 1;
+            }
+        }
+        active.truncate(keep);
+        if active.is_empty() {
+            return Ok((false, stats));
+        }
+        #[derive(Clone, Copy)]
+        enum CandidatePlan {
+            Protected,
+            Proposals,
+            Accepted,
+            Policy,
+        }
+        let plan = if c_protected <= SMALL_PROTECTED_LIMIT {
+            CandidatePlan::Protected
+        } else {
+            let (c_proposals, work) =
+                snap.count_prepared_with_work(Perm::Pos, &[rdf_type.0, identity_proposal.0], prep)?;
+            stats.record_count(work);
+            if c_proposals == 0 {
+                return Ok((false, stats));
+            }
+            let (c_accepted, work) = snap.count_prepared_with_work(
+                Perm::Pos,
+                &[disposition_pred.0, accepted_obj.0],
+                prep,
+            )?;
+            stats.record_count(work);
+            if c_accepted == 0 {
+                return Ok((false, stats));
+            }
+            let (c_policy, work) =
+                snap.count_prepared_with_work(Perm::Pos, &[review_policy.0, policy_id.0], prep)?;
+            stats.record_count(work);
+            if c_policy == 0 {
+                return Ok((false, stats));
+            }
+            let min_count = c_protected.min(c_proposals).min(c_accepted).min(c_policy);
+            if c_protected == min_count {
+                CandidatePlan::Protected
+            } else if c_proposals == min_count {
+                CandidatePlan::Proposals
+            } else if c_accepted == min_count {
+                CandidatePlan::Accepted
+            } else {
+                CandidatePlan::Policy
+            }
+        };
+        let one_id = |g_id: Id, s_id: Id, p_id: Id| -> Result<Option<Id>> {
+            let mut found = None;
+            let mut count = 0u8;
+            prep.scan(snap, Perm::Gspo, &[g_id.0, s_id.0, p_id.0], |q| {
+                count += 1;
+                if count == 1 {
+                    found = Some(q[2]);
+                    Ok(true)
+                } else {
+                    found = None;
+                    Ok(false)
+                }
+            })?;
+            Ok(found)
+        };
+        let is_named = |id: Id| -> Result<bool> {
+            prep.with_term(snap, id, |t| Ok(matches!(t, Some(Term::NamedNode(_)))))
+        };
+        let id_authenticated = |s_id: Id, g_id: Id, nonce_id: Id| -> Result<bool> {
+            let Some(op_id) = one_id(g_id, s_id, receipt_pred)? else {
+                return Ok(false);
+            };
+            if !snap.contains_prepared(&[op_id, rdf_type, operation_class, g_id], prep)? {
+                return Ok(false);
+            }
+            if one_id(g_id, op_id, protection_pred)? != Some(nonce_id)
+                || one_id(g_id, s_id, protection_pred)? != Some(nonce_id)
+            {
+                return Ok(false);
+            }
+            is_named(op_id)
+        };
+        let is_superseded = |d_id: Id| -> Result<bool> {
+            let Some(sup_pred) = supersedes_pred else {
+                return Ok(false);
+            };
+            let mut superseded = false;
+            prep.scan(snap, Perm::Pos, &[sup_pred.0, d_id.0], |q| {
+                if q[3] != decisions_g {
+                    return Ok(true);
+                }
+                let later = q[0];
+                if snap.contains_prepared(&[later, rdf_type, review_decision, decisions_g], prep)?
+                    && id_authenticated(later, decisions_g, decisions_nonce_id)?
+                    && is_named(later)?
+                {
+                    superseded = true;
+                    return Ok(false);
+                }
+                Ok(true)
+            })?;
+            Ok(superseded)
+        };
+        let proposal_has_live_accepted = |p_id: Id, g_id: Id, g_nonce_id: Id| -> Result<bool> {
+            let mut p_live = false;
+            prep.scan(snap, Perm::Pos, &[target_pred.0, p_id.0], |dq| {
+                if dq[3] != decisions_g {
+                    return Ok(true);
+                }
+                let d_id = dq[0];
+                if !snap.contains_prepared(&[d_id, rdf_type, review_decision, decisions_g], prep)?
+                    || !snap
+                        .contains_prepared(&[d_id, review_policy, policy_id, decisions_g], prep)?
+                    || one_id(decisions_g, d_id, disposition_pred)? != Some(accepted_obj)
+                {
+                    return Ok(true);
+                }
+                if !id_authenticated(d_id, decisions_g, decisions_nonce_id)?
+                    || !is_named(d_id)?
+                    || is_superseded(d_id)?
+                {
+                    return Ok(true);
+                }
+                if id_authenticated(p_id, g_id, g_nonce_id)? && is_named(p_id)? {
+                    p_live = true;
+                    return Ok(false);
+                }
+                Ok(true)
+            })?;
+            Ok(p_live)
+        };
+        let decision_targets_added_proposal = |d_id: Id| -> Result<bool> {
+            if !snap.contains_prepared(&[d_id, rdf_type, review_decision, decisions_g], prep)?
+                || !snap.contains_prepared(&[d_id, review_policy, policy_id, decisions_g], prep)?
+                || one_id(decisions_g, d_id, disposition_pred)? != Some(accepted_obj)
+            {
+                return Ok(false);
+            }
+            let mut targets_added = false;
+            let mut decision_checked = false;
+            let mut decision_ok = false;
+            prep.scan(
+                snap,
+                Perm::Gspo,
+                &[decisions_g.0, d_id.0, target_pred.0],
+                |tq| {
+                    let p_id = tq[2];
+                    prep.scan(
+                        snap,
+                        Perm::Spo,
+                        &[p_id.0, rdf_type.0, identity_proposal.0],
+                        |pq| {
+                            let g_id = pq[3];
+                            let mut idx = active.partition_point(|&(id, _)| id < g_id);
+                            while idx < active.len() && active[idx].0 == g_id {
+                                let g_nonce_id = active[idx].1;
+                                idx += 1;
+                                if !decision_checked {
+                                    decision_checked = true;
+                                    decision_ok =
+                                        id_authenticated(d_id, decisions_g, decisions_nonce_id)?
+                                            && is_named(d_id)?
+                                            && !is_superseded(d_id)?;
+                                }
+                                if !decision_ok {
+                                    return Ok(false);
+                                }
+                                if id_authenticated(p_id, g_id, g_nonce_id)? && is_named(p_id)? {
+                                    targets_added = true;
+                                    return Ok(false);
+                                }
+                            }
+                            Ok(true)
+                        },
+                    )?;
+                    Ok(!targets_added && (!decision_checked || decision_ok))
+                },
+            )?;
+            Ok(targets_added)
+        };
+        let mut found_live = false;
+        match plan {
+            CandidatePlan::Protected => {
+                for &(g_id, g_nonce_id) in &active {
+                    prep.check()?;
+                    prep.scan(snap, Perm::Pos, &[protection_pred.0, g_nonce_id.0], |q| {
+                        stats.outer_rows += 1;
+                        if q[3] != g_id {
+                            return Ok(true);
+                        }
+                        let p_id = q[0];
+                        if !snap
+                            .contains_prepared(&[p_id, rdf_type, identity_proposal, g_id], prep)?
+                        {
+                            return Ok(true);
+                        }
+                        if proposal_has_live_accepted(p_id, g_id, g_nonce_id)? {
+                            found_live = true;
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    })?;
+                    if found_live {
+                        return Ok((true, stats));
+                    }
+                }
+            }
+            CandidatePlan::Proposals => {
+                prep.scan(snap, Perm::Pos, &[rdf_type.0, identity_proposal.0], |q| {
+                    stats.outer_rows += 1;
+                    let g_id = q[3];
+                    let mut idx = active.partition_point(|&(id, _)| id < g_id);
+                    while idx < active.len() && active[idx].0 == g_id {
+                        let g_nonce_id = active[idx].1;
+                        idx += 1;
+                        if proposal_has_live_accepted(q[0], g_id, g_nonce_id)? {
+                            found_live = true;
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                })?;
+            }
+            CandidatePlan::Accepted => {
+                prep.scan(
+                    snap,
+                    Perm::Pos,
+                    &[disposition_pred.0, accepted_obj.0],
+                    |q| {
+                        stats.outer_rows += 1;
+                        if q[3] != decisions_g {
+                            return Ok(true);
+                        }
+                        if decision_targets_added_proposal(q[0])? {
+                            found_live = true;
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    },
+                )?;
+            }
+            CandidatePlan::Policy => {
+                prep.scan(snap, Perm::Pos, &[review_policy.0, policy_id.0], |q| {
+                    stats.outer_rows += 1;
+                    if q[3] != decisions_g {
+                        return Ok(true);
+                    }
+                    if decision_targets_added_proposal(q[0])? {
+                        found_live = true;
+                        return Ok(false);
+                    }
+                    Ok(true)
+                })?;
+            }
+        }
+        Ok((found_live, stats))
+    }
+
+    /// Scan all quads in `g`, up to `limit`, returning:
+    /// - the non-matching quads `([s, p, o, g], Triple)` whose `[s, p, o]` is not in `keep`,
+    /// - the subset of `keep` that is present in `g`, and
+    /// - whether `g` holds more than `limit` quads.
+    ///
+    /// Raw rows are charged to the preparation while the scan runs. Retained entries in
+    /// `present` and each decoded removal (its vector slot and every cloned term) are
+    /// charged to `held` before allocation so the caller keeps them charged for as long
+    /// as it keeps `held`.
+    pub fn graph_quads_diff_up_to(
+        &mut self,
+        g: &str,
+        keep: &HashSet<[Id; 3]>,
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<GraphQuadsDiff> {
+        let Some(g_id) = self.id(g)? else {
+            return Ok(GraphQuadsDiff {
+                removed: Vec::new(),
+                present: HashSet::new(),
+                more: false,
+            });
+        };
+        const ROW: u64 = std::mem::size_of::<[Id; 3]>() as u64;
+        const PRESENT_ENTRY: u64 = (std::mem::size_of::<[Id; 3]>() as u64 + 8) * 2;
+        const OUT_ENTRY: u64 = std::mem::size_of::<([Id; 4], Triple)>() as u64;
+        const CHUNK: usize = 4096;
+        let mut rows_held = self.preparation.reserve(0)?;
+        let mut remove_rows: Vec<[Id; 3]> = Vec::new();
+        let mut present: HashSet<[Id; 3]> = HashSet::new();
+        let mut scanned = 0usize;
+        let mut more = false;
+        self.preparation
+            .scan(self.snap, Perm::Gspo, &[g_id.0], |q| {
+                if scanned == limit {
+                    more = true;
+                    return Ok(false);
+                }
+                scanned += 1;
+                let row = [q[0], q[1], q[2]];
+                if keep.contains(&row) {
+                    if present.len() == present.capacity() {
+                        let grow = present.capacity().clamp(16, CHUNK);
+                        held.grow_by(grow as u64 * PRESENT_ENTRY)?;
+                        present.reserve(grow);
+                    }
+                    present.insert(row);
+                } else {
+                    if remove_rows.len() == remove_rows.capacity() {
+                        let grow = remove_rows.capacity().clamp(16, CHUNK);
+                        rows_held.grow_by(grow as u64 * ROW)?;
+                        remove_rows.reserve_exact(grow);
+                    }
+                    remove_rows.push(row);
+                }
+                Ok(true)
+            })?;
+        fn term_bytes(t: &Term) -> u64 {
+            match t {
+                Term::NamedNode(n) => n.as_str().len() as u64,
+                Term::BlankNode(b) => b.as_str().len() as u64,
+                Term::Literal(l) => {
+                    l.value().len() as u64
+                        + l.datatype().as_str().len() as u64
+                        + l.language().map_or(0, |lang| lang.len() as u64)
+                }
+                Term::Triple(t) => {
+                    let s = match &t.subject {
+                        NamedOrBlankNode::NamedNode(n) => n.as_str().len() as u64,
+                        NamedOrBlankNode::BlankNode(b) => b.as_str().len() as u64,
+                    };
+                    std::mem::size_of::<Triple>() as u64
+                        + s
+                        + t.predicate.as_str().len() as u64
+                        + term_bytes(&t.object)
+                }
+            }
+        }
+        let mut out: Vec<([Id; 4], Triple)> = Vec::new();
+        for [s, p, o] in remove_rows {
+            if out.len() == out.capacity() {
+                let grow = if out.is_empty() {
+                    1
+                } else {
+                    out.capacity().min(256)
+                };
+                held.grow_by(grow as u64 * OUT_ENTRY)?;
+                out.reserve_exact(grow);
+            }
+            let Some(subject) = self.preparation.with_term(self.snap, s, |t| match t {
+                Some(Term::NamedNode(n)) => {
+                    held.grow_by(n.as_str().len() as u64)?;
+                    Ok(Some(NamedOrBlankNode::NamedNode(n.clone())))
+                }
+                Some(Term::BlankNode(b)) => {
+                    held.grow_by(b.as_str().len() as u64)?;
+                    Ok(Some(NamedOrBlankNode::BlankNode(b.clone())))
+                }
+                _ => Ok(None),
+            })?
+            else {
+                continue;
+            };
+            let Some(predicate) = self.preparation.with_term(self.snap, p, |t| match t {
+                Some(Term::NamedNode(n)) => {
+                    held.grow_by(n.as_str().len() as u64)?;
+                    Ok(Some(n.clone()))
+                }
+                _ => Ok(None),
+            })?
+            else {
+                continue;
+            };
+            let Some(object) = self.preparation.with_term(self.snap, o, |t| match t {
+                Some(t) => {
+                    held.grow_by(term_bytes(t))?;
+                    Ok(Some(t.clone()))
+                }
+                None => Ok(None),
+            })?
+            else {
+                continue;
+            };
+            out.push(([s, p, o, g_id], Triple::new(subject, predicate, object)));
+        }
+        drop(rows_held);
+        Ok(GraphQuadsDiff {
+            removed: out,
+            present,
+            more,
+        })
+    }
+
+    /// Up to `limit` quads of graph `g`, returning each quad's physical `[Id; 4]` and
+    /// decoded triple, plus whether more quads exist in `g`. The scan buffer, the
+    /// output buffer and every retained term are charged before allocation.
+    pub fn graph_quads_up_to(
+        &mut self,
+        g: &str,
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<StoredQuad>, bool)> {
+        let Some(gid) = self.id(g)? else {
+            return Ok((Vec::new(), false));
+        };
+        self.quads_by_prefix(&[gid.0], limit, held)
+    }
+
+    /// The bounded, charged quads of one subject in one graph.
+    pub fn subject_quads_up_to(
+        &mut self,
+        s: &str,
+        g: &str,
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<StoredQuad>, bool)> {
+        let (Some(g), Some(s)) = (self.id(g)?, self.id(s)?) else {
+            return Ok((Vec::new(), false));
+        };
+        self.quads_by_prefix(&[g.0, s.0], limit, held)
+    }
+
+    fn quads_by_prefix(
+        &self,
+        prefix: &[u64],
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<StoredQuad>, bool)> {
+        const ROW: u64 = std::mem::size_of::<[Id; 4]>() as u64;
+        const CHUNK: usize = 4096;
+        const OUT_ROW: u64 = std::mem::size_of::<StoredQuad>() as u64;
+        const OUT_CHUNK: usize = 1024;
+        let mut rows_held = self.preparation.reserve(0)?;
+        let mut rows: Vec<[Id; 4]> = Vec::new();
+        let mut more = false;
+        self.preparation.scan(self.snap, Perm::Gspo, prefix, |q| {
+            if rows.len() == limit {
+                more = true;
+                return Ok(false);
+            }
+            if rows.len() == rows.capacity() {
+                let add = limit.saturating_sub(rows.len()).clamp(1, CHUNK);
+                rows_held.grow_by(add as u64 * ROW)?;
+                rows.reserve_exact(add);
+            }
+            rows.push(q);
+            Ok(true)
+        })?;
+        let mut out: Vec<StoredQuad> = Vec::new();
+        let total = rows.len();
+        for q in rows {
+            if out.len() == out.capacity() {
+                let add = total.saturating_sub(out.len()).clamp(1, OUT_CHUNK);
+                held.grow_by(add as u64 * OUT_ROW)?;
+                out.reserve_exact(add);
+            }
+            let subject = self.preparation.with_term(self.snap, q[0], |t| match t {
+                Some(Term::NamedNode(n)) => {
+                    held.grow_by((n.as_str().len() as u64).saturating_add(32))?;
+                    Ok(Some(NamedOrBlankNode::NamedNode(n.clone())))
+                }
+                Some(Term::BlankNode(b)) => {
+                    held.grow_by((b.as_str().len() as u64).saturating_add(32))?;
+                    Ok(Some(NamedOrBlankNode::BlankNode(b.clone())))
+                }
+                _ => Ok(None),
+            })?;
+            let Some(subject) = subject else {
+                continue;
+            };
+            let predicate = self.preparation.with_term(self.snap, q[1], |t| match t {
+                Some(Term::NamedNode(n)) => {
+                    held.grow_by((n.as_str().len() as u64).saturating_add(32))?;
+                    Ok(Some(n.clone()))
+                }
+                _ => Ok(None),
+            })?;
+            let Some(predicate) = predicate else {
+                continue;
+            };
+            let object = self.preparation.with_term(self.snap, q[2], |t| match t {
+                Some(term) => {
+                    held.grow_by(term_bytes(term))?;
+                    Ok(Some(term.clone()))
+                }
+                None => Ok(None),
+            })?;
+            let Some(object) = object else {
+                continue;
+            };
+            out.push((q, Triple::new(subject, predicate, object)));
+        }
+        Ok((out, more))
+    }
+
     /// Whether the quad `s p o g` is in the snapshot. `o` is a ground term.
     pub fn contains(&mut self, s: &str, p: &str, o: &Term, g: &str) -> Result<bool> {
         let (Some(s), Some(p), Some(g)) = (self.id(s)?, self.id(p)?, self.id(g)?) else {
@@ -1454,7 +2860,7 @@ impl<'a> Reads<'a> {
         let Some(o) = o else {
             return Ok(false);
         };
-        self.snap.contains(&[s, p, o, g])
+        self.preparation.contains(self.snap, &[s, p, o, g])
     }
 
     /// Whether `s` is a typed operation's authenticated record in `g`: its single
@@ -1481,7 +2887,7 @@ impl<'a> Reads<'a> {
         Ok(if v.len() == 1 { v.pop() } else { None })
     }
 
-    fn one_string(&mut self, s: &str, p: &str, g: &str) -> Result<Option<String>> {
+    pub(super) fn one_string(&mut self, s: &str, p: &str, g: &str) -> Result<Option<String>> {
         Ok(match self.one(s, p, g)? {
             Some(Term::Literal(l)) if l.datatype().as_str() == format!("{XSD}string") => {
                 Some(l.value().to_string())
@@ -1490,8 +2896,16 @@ impl<'a> Reads<'a> {
         })
     }
 
-    fn has_subject(&mut self, s: &str, g: &str) -> Result<bool> {
-        let (Some(s), Some(g)) = (self.id(s)?, self.id(g)?) else {
+    pub(super) fn has_subject(&mut self, s: &str, g: &str) -> Result<bool> {
+        self.has_subject_in(s, g)
+    }
+
+    /// Whether `s` has any triple in `g`, without caching `s` in `self.ids`.
+    pub fn has_subject_in(&mut self, s: &str, g: &str) -> Result<bool> {
+        let Some(g) = self.id(g)? else {
+            return Ok(false);
+        };
+        let Some(s) = self.preparation.lookup_iri(self.snap, s)? else {
             return Ok(false);
         };
         let mut found = false;
@@ -1503,7 +2917,21 @@ impl<'a> Reads<'a> {
         Ok(found)
     }
 
-    fn is_operation(&mut self, op: &str, g: &str) -> Result<bool> {
+    /// Up to two objects of `s p ?o` in `g`.
+    pub(super) fn pair_objects(&mut self, s: &str, p: &str, g: &str) -> Result<Vec<Term>> {
+        self.objects(s, p, g)
+    }
+
+    pub fn is_operation_in(&mut self, op: &str, g: &str) -> Result<bool> {
+        self.is_operation(op, g)
+    }
+
+    /// Whether `op` is recorded as an `ev:Operation` in graph `g`.
+    pub fn has_operation(&mut self, op: &str, g: &str) -> Result<bool> {
+        self.is_operation(op, g)
+    }
+
+    pub(super) fn is_operation(&mut self, op: &str, g: &str) -> Result<bool> {
         let (Some(s), Some(p), Some(o), Some(g)) = (
             self.id(op)?,
             self.id(RDF_TYPE)?,
@@ -1512,22 +2940,753 @@ impl<'a> Reads<'a> {
         ) else {
             return Ok(false);
         };
-        self.snap.contains(&[s, p, o, g])
+        self.preparation.contains(self.snap, &[s, p, o, g])
     }
 
     /// The single protection nonce that `s` carries in `g`.
-    fn nonce_of(&mut self, s: &str, g: &str) -> Result<Option<Uuid>> {
+    pub(super) fn nonce_of(&mut self, s: &str, g: &str) -> Result<Option<Uuid>> {
         Ok(self
             .one_string(s, &format!("{EV}graphProtection"), g)?
             .and_then(|v| Uuid::parse_str(&v).ok()))
     }
 
     /// Whether `op` is an operation in `g` whose marker is `nonce`.
-    fn marked(&mut self, op: &str, g: &str, nonce: Option<Uuid>) -> Result<bool> {
+    pub(super) fn marked(&mut self, op: &str, g: &str, nonce: Option<Uuid>) -> Result<bool> {
         let Some(nonce) = nonce else {
             return Ok(false);
         };
         Ok(self.is_operation(op, g)? && self.nonce_of(op, g)? == Some(nonce))
+    }
+
+    fn single_object_id(&self, g: Id, s: Id, p: Id) -> Result<Option<Id>> {
+        let mut found: Option<Id> = None;
+        let mut duplicate = false;
+        self.preparation
+            .scan(self.snap, Perm::Gspo, &[g.0, s.0, p.0], |q| {
+                if found.is_some() {
+                    duplicate = true;
+                    return Ok(false);
+                }
+                found = Some(q[2]);
+                Ok(true)
+            })?;
+        Ok(if duplicate { None } else { found })
+    }
+
+    /// Whether any object of this graph-local predicate satisfies `accepts`.
+    fn has_value_matching(
+        &self,
+        graph: Id,
+        subject: Id,
+        predicate: Id,
+        accepts: fn(&Term) -> bool,
+    ) -> Result<bool> {
+        let mut found = false;
+        self.preparation.scan(
+            self.snap,
+            Perm::Gspo,
+            &[graph.0, subject.0, predicate.0],
+            |q| {
+                found = self
+                    .preparation
+                    .with_term(self.snap, q[2], |term| Ok(term.is_some_and(accepts)))?;
+                Ok(!found)
+            },
+        )?;
+        Ok(found)
+    }
+
+    /// Bounded exact quad existence probe via `Perm::Gspo` `[g, s, p, o]` under
+    /// `Preparation` (never bypasses the preparation's reservations or cancellation).
+    fn contains_id(&self, s: Id, p: Id, o: Id, g: Id) -> Result<bool> {
+        let key = [g.0, s.0, p.0, o.0];
+        Ok(self
+            .preparation
+            .first_in_range(self.snap, Perm::Gspo, key, key)?
+            .is_some())
+    }
+
+    /// Bounded exact quad existence probe via `Perm::Pos` `[p, o, s, g]` under
+    /// `Preparation`.
+    fn contains_pos_id(&self, p: Id, o: Id, s: Id, g: Id) -> Result<bool> {
+        let key = [p.0, o.0, s.0, g.0];
+        Ok(self
+            .preparation
+            .first_in_range(self.snap, Perm::Pos, key, key)?
+            .is_some())
+    }
+
+    /// Stream every subject `s` in `g_id` that satisfies every `(predicate, object)`
+    /// clause in `clauses`, using range-seeking leapfrog intersection across `Perm::Pos`
+    /// and `Perm::Gspo[g_id]`. All seeks and exact fallbacks stay inside bounded
+    /// `Preparation`.
+    pub(crate) fn for_each_pos_intersection_in_graph(
+        &self,
+        g_id: Id,
+        clauses: &[(Id, Id)],
+        mut each: impl FnMut(Id) -> Result<bool>,
+    ) -> Result<()> {
+        if clauses.is_empty() {
+            return Ok(());
+        }
+        let total = clauses.len() + 1; // last stream is Gspo[g_id]
+        let mut target_s = 0u64;
+        let mut matched = 0usize;
+        let mut idx = 0usize;
+        let mut steps = 0u64;
+        loop {
+            self.preparation.check()?;
+            steps += 1;
+            if steps.is_multiple_of(1024) {
+                self.preparation.stage("scanning permission rows")?;
+            }
+            if idx < clauses.len() {
+                let (p, o) = clauses[idx];
+                let lo = [p.0, o.0, target_s, g_id.0];
+                let hi = [p.0, o.0, u64::MAX, u64::MAX];
+                let Some(q) = self
+                    .preparation
+                    .first_in_range(self.snap, Perm::Pos, lo, hi)?
+                else {
+                    return Ok(());
+                };
+                let (found_s, found_g) = (q[0].0, q[3].0);
+                if found_s == target_s {
+                    if found_g == g_id.0 {
+                        matched += 1;
+                    } else {
+                        let Some(next) = target_s.checked_add(1) else {
+                            return Ok(());
+                        };
+                        target_s = next;
+                        matched = 0;
+                    }
+                } else if found_g == g_id.0
+                    || (found_g < g_id.0 && self.contains_pos_id(p, o, Id(found_s), g_id)?)
+                {
+                    target_s = found_s;
+                    matched = 1;
+                } else {
+                    let Some(next) = found_s.checked_add(1) else {
+                        return Ok(());
+                    };
+                    target_s = next;
+                    matched = 0;
+                }
+            } else {
+                let lo = [g_id.0, target_s, 0, 0];
+                let hi = [g_id.0, u64::MAX, u64::MAX, u64::MAX];
+                let Some(q) = self
+                    .preparation
+                    .first_in_range(self.snap, Perm::Gspo, lo, hi)?
+                else {
+                    return Ok(());
+                };
+                let found_s = q[0].0;
+                if found_s == target_s {
+                    matched += 1;
+                } else {
+                    target_s = found_s;
+                    matched = 1;
+                }
+            }
+            if matched == total {
+                if !each(Id(target_s))? {
+                    return Ok(());
+                }
+                let Some(next) = target_s.checked_add(1) else {
+                    return Ok(());
+                };
+                target_s = next;
+                matched = 0;
+                idx = 0;
+            } else {
+                idx = (idx + 1) % total;
+            }
+        }
+    }
+
+    /// Whether `s` is authenticated in protected graph `g` under `g_nonce_id` via its
+    /// single `ev:availabilityReceipt` and `ev:graphProtection` markers.
+    #[allow(clippy::too_many_arguments)]
+    fn authenticated_record_id(
+        &self,
+        s: Id,
+        g: Id,
+        g_nonce_id: Id,
+        rdf_type: Id,
+        op_class: Id,
+        graph_prot_pred: Id,
+        avail_receipt: Id,
+    ) -> Result<bool> {
+        let Some(op_id) = self.single_object_id(g, s, avail_receipt)? else {
+            return Ok(false);
+        };
+        let op_is_iri = self.preparation.with_term(self.snap, op_id, |t| {
+            Ok(matches!(t, Some(Term::NamedNode(_))))
+        })?;
+        if !op_is_iri {
+            return Ok(false);
+        }
+        if !self.contains_id(op_id, rdf_type, op_class, g)? {
+            return Ok(false);
+        }
+        if self.single_object_id(g, op_id, graph_prot_pred)? != Some(g_nonce_id) {
+            return Ok(false);
+        }
+        Ok(self.single_object_id(g, s, graph_prot_pred)? == Some(g_nonce_id))
+    }
+
+    /// A record and its publisher can lose a shared quad when an output support
+    /// is withdrawn. Check the surviving writer fields on both ends of the
+    /// link before treating a projected graph as a former record graph.
+    pub fn has_published_operation_in_output(
+        &self,
+        graph: &str,
+        nonce: Option<Uuid>,
+    ) -> Result<bool> {
+        let Some(nonce) = nonce else {
+            return Ok(false);
+        };
+        let iri = |value: &str| self.preparation.lookup_iri(self.snap, value);
+        let (Some(g), Some(protection), Some(nonce)) = (
+            iri(graph)?,
+            iri(&format!("{EV}graphProtection"))?,
+            self.preparation
+                .lookup_term(self.snap, &string(&nonce.to_string()))?,
+        ) else {
+            return Ok(false);
+        };
+        let receipt = iri(&format!("{EV}availabilityReceipt"))?;
+        let generated = iri(&format!("{PROV}wasGeneratedBy"))?;
+        let rdf_type = iri(RDF_TYPE)?;
+        let operation_type = rdf_type.zip(iri(&format!("{EV}Operation"))?);
+        let activity_type = rdf_type.zip(iri(&format!("{PROV}Activity"))?);
+        let digest = iri(&format!("{EV}recordDigest"))?;
+        let is_iri = |id| {
+            self.preparation.with_term(self.snap, id, |term| {
+                Ok(matches!(term, Some(Term::NamedNode(_))))
+            })
+        };
+        let has_record_digest = |record, digest| {
+            self.has_value_matching(g, record, digest, |term| {
+                matches!(term, Term::Literal(l)
+                    if l.datatype() == oxrdf::vocab::xsd::STRING
+                        && l.value().parse::<Sha256Digest>().is_ok())
+            })
+        };
+        let mut found = false;
+        self.for_each_pos_intersection_in_graph(g, &[(protection, nonce)], |subject| {
+            if let Some(receipt) = receipt
+                && is_iri(subject)?
+            {
+                let mut receipt_to_activity = false;
+                self.preparation.scan(
+                    self.snap,
+                    Perm::Gspo,
+                    &[g.0, subject.0, receipt.0],
+                    |quad| {
+                        let op = quad[2];
+                        if op == subject || !is_iri(op)? {
+                            return Ok(true);
+                        }
+                        let is_operation = match operation_type {
+                            Some((p, class)) => self.contains_id(op, p, class, g)?,
+                            None => false,
+                        };
+                        let op_protected = self.contains_id(op, protection, nonce, g)?;
+                        if is_operation && op_protected {
+                            found = true;
+                        } else if (is_operation || op_protected)
+                            && let Some((p, activity)) = activity_type
+                            && self.contains_id(op, p, activity, g)?
+                        {
+                            receipt_to_activity = true;
+                            if let Some(generated) = generated {
+                                found = self.contains_id(subject, generated, op, g)?;
+                            }
+                        }
+                        Ok(!found)
+                    },
+                )?;
+                // The record digest can corroborate the receipt to a surviving
+                // activity when the generation edge has been withdrawn.
+                if !found
+                    && receipt_to_activity
+                    && let Some(digest) = digest
+                {
+                    found = has_record_digest(subject, digest)?;
+                }
+            }
+            if !found
+                && let Some(digest) = digest
+                && let Some((p, class)) = operation_type
+                && self.contains_id(subject, p, class, g)?
+                && is_iri(subject)?
+            {
+                // The record may have lost either link or its nonce. Its
+                // writer digest distinguishes a record from a bare edge.
+                for edge in [receipt, generated].into_iter().flatten() {
+                    self.for_each_pos_intersection_in_graph(g, &[(edge, subject)], |record| {
+                        found = record != subject
+                            && is_iri(record)?
+                            && has_record_digest(record, digest)?;
+                        Ok(!found)
+                    })?;
+                    if found {
+                        break;
+                    }
+                }
+            }
+            Ok(!found)
+        })?;
+        Ok(found)
+    }
+
+    fn described_output_operation(
+        &self,
+        graph: &str,
+        nonce: Option<Uuid>,
+        dataset_id: Uuid,
+        named: &NamedNode,
+    ) -> Result<bool> {
+        let Some(nonce) = nonce else {
+            return Ok(false);
+        };
+        let nonce_term = Term::Literal(Literal::new_simple_literal(nonce.to_string()));
+        let ds_term = Term::Literal(Literal::new_simple_literal(dataset_id.to_string()));
+        let (
+            Some(g_id),
+            Some(rdf_type),
+            Some(op_class),
+            Some(prov_activity),
+            Some(was_assoc),
+            Some(ended_at),
+            Some(dataset_id_pred),
+            Some(expected_dataset_id),
+            Some(branch_id_pred),
+            Some(commit_pred),
+            Some(payload_digest_pred),
+            Some(graph_prot_pred),
+            Some(nonce_id),
+        ) = (
+            self.preparation.lookup_iri(self.snap, graph)?,
+            self.preparation.lookup_iri(self.snap, RDF_TYPE)?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}Operation"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{PROV}Activity"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{PROV}wasAssociatedWith"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{PROV}endedAtTime"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}datasetId"))?,
+            self.preparation.lookup_term(self.snap, &ds_term)?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}branchId"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}commit"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}payloadDigest"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}graphProtection"))?,
+            self.preparation.lookup_term(self.snap, &nonce_term)?,
+        )
+        else {
+            return Ok(false);
+        };
+        let markers = [
+            (graph_prot_pred, nonce_id),
+            (rdf_type, op_class),
+            (rdf_type, prov_activity),
+            (dataset_id_pred, expected_dataset_id),
+        ];
+        let Some(op) = self.preparation.lookup_iri(self.snap, named.as_str())? else {
+            return Ok(false);
+        };
+        for (pred, obj) in markers {
+            if !self.contains_id(op, pred, obj, g_id)? {
+                return Ok(false);
+            }
+        }
+        // A projection can add other values to a genuinely published subject.
+        // Test for the writer's edges even when the subject also carries those values.
+        use oxrdf::vocab::xsd;
+        let has_value = |predicate, accepts| self.has_value_matching(g_id, op, predicate, accepts);
+        Ok(has_value(was_assoc, |t| matches!(t, Term::NamedNode(_)))?
+            && has_value(
+                ended_at,
+                |t| matches!(t, Term::Literal(l) if l.datatype() == xsd::DATE_TIME),
+            )?
+            && has_value(
+                branch_id_pred,
+                |t| matches!(t, Term::Literal(l) if l.datatype() == xsd::STRING && Uuid::parse_str(l.value()).is_ok()),
+            )?
+            && has_value(
+                commit_pred,
+                |t| matches!(t, Term::Literal(l) if l.datatype() == xsd::INTEGER && l.value().parse::<u64>().is_ok()),
+            )?
+            && has_value(
+                payload_digest_pred,
+                |t| matches!(t, Term::Literal(l) if l.datatype() == xsd::STRING && l.value().parse::<Sha256Digest>().is_ok()),
+            )?)
+    }
+
+    /// Whether the named record bears a receipt for an operation in this graph.
+    pub fn has_published_record_in_output(
+        &self,
+        record_iri: &NamedNode,
+        graph: &str,
+        nonce: Option<Uuid>,
+        dataset_id: Uuid,
+    ) -> Result<bool> {
+        let Some(nonce) = nonce else {
+            return Ok(false);
+        };
+        let nonce_term = Term::Literal(Literal::new_simple_literal(nonce.to_string()));
+        let (Some(r_id), Some(g_id), Some(graph_prot_pred), Some(avail_receipt), Some(nonce_id)) = (
+            self.preparation
+                .lookup_iri(self.snap, record_iri.as_str())?,
+            self.preparation.lookup_iri(self.snap, graph)?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}graphProtection"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}availabilityReceipt"))?,
+            self.preparation.lookup_term(self.snap, &nonce_term)?,
+        ) else {
+            return Ok(false);
+        };
+        if self.single_object_id(g_id, r_id, graph_prot_pred)? != Some(nonce_id) {
+            return Ok(false);
+        }
+        let Some(op_id) = self.single_object_id(g_id, r_id, avail_receipt)? else {
+            return Ok(false);
+        };
+        let Some(op_iri) = self.preparation.with_term(self.snap, op_id, |t| match t {
+            Some(Term::NamedNode(n)) => Ok(Some(n.clone())),
+            _ => Ok(None),
+        })?
+        else {
+            return Ok(false);
+        };
+        self.described_output_operation(graph, Some(nonce), dataset_id, &op_iri)
+    }
+
+    /// Whether any continuously protected managed graph holds an active, authenticated
+    /// `ev:Projection` record showing same-version drift for `(policy_name, policy_version)`
+    /// or its output `(output_graph, output_nonce)`.
+    ///
+    /// Operates strictly on `Perm::Gspo` `[g, s, p, o]` using graph-local, nonce-scoped
+    /// projection index subjects plus direct `Perm::Gspo` lookups on deterministic
+    /// `projection_iri` records, so foreign graphs and unrelated policies/outputs/priors
+    /// are never visited even under interleaved subject IDs, and every probe stays
+    /// inside bounded `Preparation`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn has_same_version_projection_drift(
+        &self,
+        dataset_id: Uuid,
+        policy_name: &str,
+        policy_version: u32,
+        supports_graph: &str,
+        output_graph: &str,
+        output_nonce: Option<Uuid>,
+        managed_graphs: &[(&str, Uuid)],
+        rival_policies: &[(&str, u32)],
+        control: &Control,
+    ) -> Result<bool> {
+        let (
+            Some(rdf_type),
+            Some(proj_class),
+            Some(review_policy),
+            Some(policy_version_pred),
+            Some(supports_prot_pred),
+            Some(graph_prot_pred),
+            Some(avail_receipt),
+            Some(op_class),
+        ) = (
+            self.preparation.lookup_iri(self.snap, RDF_TYPE)?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}Projection"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}reviewPolicy"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}policyVersion"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}supportsProtection"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}graphProtection"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}availabilityReceipt"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}Operation"))?,
+        )
+        else {
+            return Ok(false);
+        };
+        let was_revision_of = self
+            .preparation
+            .lookup_iri(self.snap, &format!("{PROV}wasRevisionOf"))?;
+        let indexed_proj_pred = self
+            .preparation
+            .lookup_iri(self.snap, super::review::INDEXED_PROJECTION)?;
+
+        let mut protected: BTreeMap<Id, (Uuid, Id)> = BTreeMap::new();
+        for &(g_iri, g_nonce) in managed_graphs {
+            self.preparation.check()?;
+            let Some(g_id) = self.preparation.lookup_iri(self.snap, g_iri)? else {
+                continue;
+            };
+            let nonce_term = Term::Literal(Literal::new_simple_literal(g_nonce.to_string()));
+            let Some(nonce_id) = self.preparation.lookup_term(self.snap, &nonce_term)? else {
+                continue;
+            };
+            protected.insert(g_id, (g_nonce, nonce_id));
+        }
+        if protected.is_empty() {
+            return Ok(false);
+        }
+
+        let authenticated_id = |s: Id, g: Id, g_nonce_id: Id| -> Result<bool> {
+            self.authenticated_record_id(
+                s,
+                g,
+                g_nonce_id,
+                rdf_type,
+                op_class,
+                graph_prot_pred,
+                avail_receipt,
+            )
+        };
+
+        // Strictly `Perm::Gspo`-scoped supersession lookup: scan only
+        // `Gspo[g, projection_revision_index_iri(g_nonce, r), ev:indexedProjection]` so
+        // foreign-graph `prov:wasRevisionOf` edges and unrelated projections are never
+        // visited regardless of physical subject-ID interleaving.
+        let is_superseded =
+            |r: Id, g: Id, g_nonce: Uuid, g_nonce_id: Id, target_policy_id: Id| -> Result<bool> {
+                let (Some(rev_pred), Some(idx_pred)) = (was_revision_of, indexed_proj_pred) else {
+                    return Ok(false);
+                };
+                let Some(rev_idx) = self.preparation.with_term(self.snap, r, |t| match t {
+                    Some(Term::NamedNode(n)) => Ok(Some(
+                        super::review::projection_revision_index_iri(g_nonce, n.as_str()),
+                    )),
+                    _ => Ok(None),
+                })?
+                else {
+                    return Ok(false);
+                };
+                let Some(rev_idx_id) = self.preparation.lookup_iri(self.snap, rev_idx.as_str())?
+                else {
+                    return Ok(false);
+                };
+                let mut superseded = false;
+                self.preparation.scan(
+                    self.snap,
+                    Perm::Gspo,
+                    &[g.0, rev_idx_id.0, idx_pred.0],
+                    |q| {
+                        let later = q[2];
+                        if self.contains_id(later, rev_pred, r, g)?
+                            && self.contains_id(later, rdf_type, proj_class, g)?
+                            && self.single_object_id(g, later, review_policy)?
+                                == Some(target_policy_id)
+                            && self.single_object_id(g, later, supports_prot_pred)?
+                                == Some(g_nonce_id)
+                            && authenticated_id(later, g, g_nonce_id)?
+                        {
+                            superseded = true;
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    },
+                )?;
+                Ok(superseded)
+            };
+
+        // 1. Policy moved supports out of a continuously protected graph without raising
+        // its version (including when the former supports graph changed managed roles).
+        // Checked strictly via `Perm::Gspo` on both the deterministic `projection_iri`
+        // (for pre-581 records) and the graph-local `projection_policy_index_iri`.
+        let cur_supports_id = self.preparation.lookup_iri(self.snap, supports_graph)?;
+        let policy_iri = super::review::policy_iri(policy_name);
+        let version_term = Term::Literal(Literal::new_simple_literal(policy_version.to_string()));
+        if let (Some(policy_id), Some(version_id)) = (
+            self.preparation
+                .lookup_iri(self.snap, policy_iri.as_str())?,
+            self.preparation.lookup_term(self.snap, &version_term)?,
+        ) {
+            let det_proj_iri =
+                super::review::projection_iri(dataset_id, policy_name, policy_version, control)?;
+            let det_proj_id = self
+                .preparation
+                .lookup_iri(self.snap, det_proj_iri.as_str())?;
+            let check_moved = |r: Id, g_id: Id, g_nonce: Uuid, g_nonce_id: Id| -> Result<bool> {
+                Ok(self.contains_id(r, rdf_type, proj_class, g_id)?
+                    && self.contains_id(r, graph_prot_pred, g_nonce_id, g_id)?
+                    && self.single_object_id(g_id, r, review_policy)? == Some(policy_id)
+                    && self.single_object_id(g_id, r, supports_prot_pred)? == Some(g_nonce_id)
+                    && self.single_object_id(g_id, r, policy_version_pred)? == Some(version_id)
+                    && authenticated_id(r, g_id, g_nonce_id)?
+                    && !is_superseded(r, g_id, g_nonce, g_nonce_id, policy_id)?)
+            };
+            for (&g_id, &(g_nonce, g_nonce_id)) in &protected {
+                if Some(g_id) == cur_supports_id {
+                    continue;
+                }
+                if let Some(det_id) = det_proj_id
+                    && check_moved(det_id, g_id, g_nonce, g_nonce_id)?
+                {
+                    return Ok(true);
+                }
+                let Some(idx_pred) = indexed_proj_pred else {
+                    continue;
+                };
+                let pol_idx = super::review::projection_policy_index_iri(
+                    g_nonce,
+                    policy_iri.as_str(),
+                    policy_version,
+                );
+                let Some(pol_idx_id) = self.preparation.lookup_iri(self.snap, pol_idx.as_str())?
+                else {
+                    continue;
+                };
+                let mut drifted = false;
+                self.preparation.scan(
+                    self.snap,
+                    Perm::Gspo,
+                    &[g_id.0, pol_idx_id.0, idx_pred.0],
+                    |q| {
+                        let r = q[2];
+                        if Some(r) != det_proj_id && check_moved(r, g_id, g_nonce, g_nonce_id)? {
+                            drifted = true;
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    },
+                )?;
+                if drifted {
+                    return Ok(true);
+                }
+            }
+        }
+
+        // 2. Another currently configured review policy at its current version still owns
+        // `output_graph` under its unchanged protection nonce.
+        if let Some(out_nonce) = output_nonce
+            && !rival_policies.is_empty()
+        {
+            let out_nonce_term = Term::Literal(Literal::new_simple_literal(out_nonce.to_string()));
+            if let (
+                Some(output_pred),
+                Some(output_prot_pred),
+                Some(output_id),
+                Some(out_nonce_id),
+            ) = (
+                self.preparation
+                    .lookup_iri(self.snap, &format!("{EV}output"))?,
+                self.preparation
+                    .lookup_iri(self.snap, &format!("{EV}outputProtection"))?,
+                self.preparation.lookup_iri(self.snap, output_graph)?,
+                self.preparation.lookup_term(self.snap, &out_nonce_term)?,
+            ) {
+                let mut rivals: BTreeMap<Id, Id> = BTreeMap::new();
+                let mut rival_det_ids: Vec<Id> = Vec::new();
+                for &(other_name, other_version) in rival_policies {
+                    let other_iri = super::review::policy_iri(other_name);
+                    let Some(other_id) =
+                        self.preparation.lookup_iri(self.snap, other_iri.as_str())?
+                    else {
+                        continue;
+                    };
+                    let other_ver_term =
+                        Term::Literal(Literal::new_simple_literal(other_version.to_string()));
+                    let Some(other_ver_id) =
+                        self.preparation.lookup_term(self.snap, &other_ver_term)?
+                    else {
+                        continue;
+                    };
+                    rivals.insert(other_id, other_ver_id);
+                    let det_iri = super::review::projection_iri(
+                        dataset_id,
+                        other_name,
+                        other_version,
+                        control,
+                    )?;
+                    if let Some(det_id) =
+                        self.preparation.lookup_iri(self.snap, det_iri.as_str())?
+                    {
+                        rival_det_ids.push(det_id);
+                    }
+                }
+                if !rivals.is_empty() {
+                    let check_rival =
+                        |r: Id, g_id: Id, g_nonce: Uuid, g_nonce_id: Id| -> Result<bool> {
+                            if !self.contains_id(r, rdf_type, proj_class, g_id)?
+                                || !self.contains_id(r, graph_prot_pred, g_nonce_id, g_id)?
+                                || self.single_object_id(g_id, r, output_pred)? != Some(output_id)
+                                || self.single_object_id(g_id, r, output_prot_pred)?
+                                    != Some(out_nonce_id)
+                                || self.single_object_id(g_id, r, supports_prot_pred)?
+                                    != Some(g_nonce_id)
+                            {
+                                return Ok(false);
+                            }
+                            let Some(other_id) = self.single_object_id(g_id, r, review_policy)?
+                            else {
+                                return Ok(false);
+                            };
+                            let Some(&other_ver_id) = rivals.get(&other_id) else {
+                                return Ok(false);
+                            };
+                            Ok(self.single_object_id(g_id, r, policy_version_pred)?
+                                == Some(other_ver_id)
+                                && authenticated_id(r, g_id, g_nonce_id)?
+                                && !is_superseded(r, g_id, g_nonce, g_nonce_id, other_id)?)
+                        };
+                    for (&g_id, &(g_nonce, g_nonce_id)) in &protected {
+                        for &det_id in &rival_det_ids {
+                            if check_rival(det_id, g_id, g_nonce, g_nonce_id)? {
+                                return Ok(true);
+                            }
+                        }
+                        let Some(idx_pred) = indexed_proj_pred else {
+                            continue;
+                        };
+                        let out_idx = super::review::projection_output_index_iri(
+                            g_nonce,
+                            out_nonce,
+                            output_graph,
+                        );
+                        let Some(out_idx_id) =
+                            self.preparation.lookup_iri(self.snap, out_idx.as_str())?
+                        else {
+                            continue;
+                        };
+                        let mut drifted = false;
+                        self.preparation.scan(
+                            self.snap,
+                            Perm::Gspo,
+                            &[g_id.0, out_idx_id.0, idx_pred.0],
+                            |q| {
+                                let r = q[2];
+                                if check_rival(r, g_id, g_nonce, g_nonce_id)? {
+                                    drifted = true;
+                                    return Ok(false);
+                                }
+                                Ok(true)
+                            },
+                        )?;
+                        if drifted {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(false)
     }
 
     /// Whether some graph that holds `s p o` satisfies `accept`, which sees each graph's
@@ -1563,12 +3722,19 @@ impl<'a> Reads<'a> {
     }
 
     /// The IRI subjects in `g` that reify, through `p`, a triple term whose subject or
-    /// object is one of `entities`, in subject order. At most `scan` quads of `g` are
-    /// read. The rows read are charged to the preparation while the scan runs, and each
-    /// identity returned is charged to `held` before it is copied, with room for the
-    /// returned vector and one set the caller keeps it in, so the caller keeps it
-    /// charged for as long as it keeps `held`. Returns whether `g` holds more than
-    /// `scan` quads, in which case the list is incomplete.
+    /// object is one of `entities`, in subject order.
+    ///
+    /// When `p` is `rdf:reifies` and the base generation has a reifier proposition-term
+    /// index (including every empty/in-memory generation and every generation written by
+    /// this release), the lookup queries the index by `(g, term_hash(entity))` and reads
+    /// only the matching claims without scanning `g`. Only a legacy pre-index generation
+    /// (or a predicate other than `rdf:reifies`) falls back to scanning at most `scan`
+    /// quads of `g`.
+    ///
+    /// Each identity returned is charged to `held` before it is copied, with room for the
+    /// returned vector and one set the caller keeps it in, so the caller keeps it charged
+    /// for as long as it keeps `held`. Returns whether a fallback scan stopped at `scan`
+    /// quads, in which case the list is incomplete.
     pub fn reifiers_about(
         &mut self,
         p: &str,
@@ -1577,9 +3743,134 @@ impl<'a> Reads<'a> {
         scan: usize,
         held: &mut Reservation,
     ) -> Result<(Vec<NamedNode>, bool)> {
-        let (Some(p), Some(g)) = (self.id(p)?, self.id(g)?) else {
+        if entities.is_empty() {
+            return Ok((Vec::new(), false));
+        }
+        let (Some(p_id), Some(g_id)) = (self.id(p)?, self.id(g)?) else {
             return Ok((Vec::new(), false));
         };
+        if p == RDF_REIFIES && self.snap.generation.reifiers.is_indexed() {
+            return self.reifiers_about_indexed(p_id, g_id, entities, held);
+        }
+        self.reifiers_about_scan(p_id, g_id, entities, scan, held)
+    }
+
+    fn reifiers_about_indexed(
+        &mut self,
+        p: Id,
+        g: Id,
+        entities: &BTreeSet<String>,
+        held: &mut Reservation,
+    ) -> Result<(Vec<NamedNode>, bool)> {
+        const SEEN_START: u64 = 512;
+        const SEEN_ENTRY: u64 = 64;
+        let spo = Perm::Spo.index();
+        let mut ids_held = self.preparation.reserve(0)?;
+        let mut seen: BTreeSet<Id> = BTreeSet::new();
+
+        for entity in entities {
+            self.preparation.check()?;
+            let hash = crate::reifiers::term_hash(entity.as_bytes());
+            if let Some(file) = &self.snap.generation.reifiers.file {
+                for (i, (s, tt)) in file.lookup(g, hash).enumerate() {
+                    if i.is_multiple_of(256) {
+                        self.preparation.check()?;
+                    }
+                    if seen.contains(&s) {
+                        continue;
+                    }
+                    if self.snap.delta.del[spo].contains(&[s.0, p.0, tt.0, g.0]) {
+                        continue;
+                    }
+                    if !self.quad_exists(s, p, tt, g)? {
+                        continue;
+                    }
+                    if self.triple_mentions_entity(tt, entity)? {
+                        let start = if seen.is_empty() { SEEN_START } else { 0 };
+                        ids_held.grow_by(start + SEEN_ENTRY)?;
+                        seen.insert(s);
+                    }
+                }
+            }
+            for (i, key) in self
+                .snap
+                .delta
+                .reifiers_ins
+                .range([g.0, hash, 0, 0]..=[g.0, hash, u64::MAX, u64::MAX])
+                .enumerate()
+            {
+                if i.is_multiple_of(256) {
+                    self.preparation.check()?;
+                }
+                let (s, tt) = (Id(key[2]), Id(key[3]));
+                if seen.contains(&s) {
+                    continue;
+                }
+                if !self.snap.delta.ins[spo].contains(&[s.0, p.0, tt.0, g.0]) {
+                    continue;
+                }
+                if self.triple_mentions_entity(tt, entity)? {
+                    let start = if seen.is_empty() { SEEN_START } else { 0 };
+                    ids_held.grow_by(start + SEEN_ENTRY)?;
+                    seen.insert(s);
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        for s in seen {
+            self.preparation.check()?;
+            if let Some(n) = self.preparation.with_term(self.snap, s, |t| {
+                Ok(match t {
+                    Some(Term::NamedNode(n)) => {
+                        let start = if out.is_empty() { IDENTITY_START } else { 0 };
+                        held.grow_by(start + n.as_str().len() as u64 + IDENTITY_ENTRY)?;
+                        Some(n.as_str().to_string())
+                    }
+                    _ => None,
+                })
+            })? {
+                out.push(NamedNode::new_unchecked(n));
+            }
+        }
+        Ok((out, false))
+    }
+
+    fn quad_exists(&self, s: Id, p: Id, o: Id, g: Id) -> Result<bool> {
+        let mut found = false;
+        self.preparation
+            .scan(self.snap, Perm::Spo, &[s.0, p.0, o.0, g.0], |_| {
+                found = true;
+                Ok(false)
+            })?;
+        Ok(found)
+    }
+
+    fn triple_mentions_entity(&self, tt: Id, entity: &str) -> Result<bool> {
+        self.preparation.with_term(self.snap, tt, |t| {
+            let Some(Term::Triple(t)) = t else {
+                return Ok(false);
+            };
+            let subject = matches!(
+                &t.subject,
+                NamedOrBlankNode::NamedNode(n) if n.as_str() == entity
+            );
+            let object = matches!(
+                &t.object,
+                Term::NamedNode(n) if n.as_str() == entity
+            );
+            Ok(subject || object)
+        })
+    }
+
+    fn reifiers_about_scan(
+        &mut self,
+        p: Id,
+        g: Id,
+        entities: &BTreeSet<String>,
+        scan: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<NamedNode>, bool)> {
         const ROW: u64 = std::mem::size_of::<(Id, Id)>() as u64;
         const CHUNK: usize = 4096;
         let mut rows_held = self.preparation.reserve(0)?;

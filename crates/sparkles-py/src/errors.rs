@@ -65,6 +65,7 @@ pub fn engine(py: Python<'_>, e: sparkles::Error) -> PyErr {
         E::BudgetExceeded(b) => {
             let err = new_err(py, "BudgetExceededError", msg);
             let v = err.value(py);
+            let _ = v.setattr("code", code);
             let _ = v.setattr("kind", b.kind.as_str());
             let _ = v.setattr("limit", b.limit);
             let _ = v.setattr("requested", b.requested);
@@ -93,6 +94,38 @@ pub fn engine(py: Python<'_>, e: sparkles::Error) -> PyErr {
             sparkles::patch::PatchErrorKind::Term => "InvalidInputError",
             sparkles::patch::PatchErrorKind::PrevMismatch => "ConflictError",
         },
+        E::Managed(ref m) => {
+            use sparkles::managed::ManagedErrorKind as K;
+            match m.kind {
+                K::UnsupportedProfile => "UnsupportedError",
+                K::Unavailable | K::HoldsUnavailable => "StorageError",
+                K::EvidenceUnavailable => "NotFoundError",
+                K::IncompleteEvidence
+                | K::UnanchoredEvidence
+                | K::SpanMismatch
+                | K::OriginNotReproduced => "InvalidInputError",
+                K::Protected
+                | K::HoldConflict
+                | K::HoldsLimit
+                | K::ImmutableRecordConflict
+                | K::HeadChanged
+                | K::IdempotencyConflict
+                | K::AuthorityChanged
+                | K::PolicyChanged
+                | K::TargetChanged
+                | K::DecisionSuperseded
+                | K::TargetWithdrawn
+                | K::EvidenceConflict
+                | K::ProjectionUnavailable
+                | K::IdentityConflict
+                | K::ConfigurationHistoryInactive
+                | K::LeaseLost
+                | K::PublicationConflict
+                | K::JobsOverloaded
+                | K::JobsRecovering
+                | K::EvidenceSettingsDrift => "ConflictError",
+            }
+        }
         _ => match code.as_str() {
             "not-found" | "no-such-graph" | "no-such-branch" => "NotFoundError",
             "conflict" | "precondition-failed" | "superseded" => "ConflictError",

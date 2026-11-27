@@ -147,25 +147,7 @@ fn lookup_iri_controlled(
     }
     key.push(b'<');
     key.extend_from_slice(iri.as_bytes());
-    let scratch = std::cell::RefCell::new(Held::new(ctrl.budget));
-    snap.lookup_key_controlled(
-        &key,
-        |old, new| -> anyhow::Result<()> {
-            if let Err(err) = scratch.borrow_mut().try_set(old.saturating_add(new)) {
-                ctrl.check()?;
-                return Err(err.into());
-            }
-            Ok(())
-        },
-        |capacity| -> anyhow::Result<()> {
-            if let Err(err) = scratch.borrow_mut().try_set(capacity) {
-                ctrl.check()?;
-                return Err(err.into());
-            }
-            Ok(())
-        },
-        || ctrl.check(),
-    )
+    snap.lookup_key_controlled(&key, |_, _| Ok(()), |_| Ok(()), || ctrl.check())
 }
 
 enum ImportObject {

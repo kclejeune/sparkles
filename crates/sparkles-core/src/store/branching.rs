@@ -397,7 +397,7 @@ pub(crate) const MERGE_FAST_FORWARD: u32 = 1;
 /// A commit that replays the source commit, in a replayed fast-forward.
 pub(crate) const MERGE_REPLAYED: u32 = 2;
 
-const MERGE_REC: usize = 48;
+pub(super) const MERGE_REC: usize = 48;
 
 impl MergeRec {
     fn encode(&self) -> [u8; MERGE_REC] {
@@ -1012,6 +1012,15 @@ impl BranchSet {
             .filter(|s| !s.branching.retired.load(Ordering::Relaxed))
             .cloned()
             .collect()
+    }
+
+    /// The IDs of all listed branches when none are broken, or `None` if any listed
+    /// branch is broken (fail-safe for family-wide inspections).
+    pub(super) fn listed_branch_ids_if_healthy(&self) -> Option<Vec<uuid::Uuid>> {
+        if !self.broken.lock().is_empty() {
+            return None;
+        }
+        Some(self.table.lock().branches.iter().map(|e| e.id).collect())
     }
 
     /// The nearest listed branch that branch `id` descends from through starting
@@ -1662,6 +1671,27 @@ impl Store {
         Ok(self.owned_set()?.entry(name)?.id)
     }
 
+    /// The name of branch `name`'s nearest listed upstream branch, read from the
+    /// branch table without opening any branch store or taking any writer lock (`None`
+    /// for `main` or when no listed upstream remains).
+    pub fn branch_upstream_name(&self, name: &str) -> Result<Option<String>> {
+        if name == MAIN {
+            return Ok(None);
+        }
+        let set = self.owned_set()?;
+        let t = set.table.lock();
+        let e = t
+            .by_name(name)
+            .ok_or_else(|| branch::no_such_branch(name))?;
+        let Some(upstream_id) = set.upstream_in(&t, e.id) else {
+            return Ok(None);
+        };
+        if upstream_id == set.dataset_id {
+            return Ok(Some(MAIN.to_string()));
+        }
+        Ok(t.by_id(upstream_id).map(|u| u.name.clone()))
+    }
+
     /// The ids of the listed branches, read from the branch table without taking any
     /// writer. Empty for a store without branches.
     pub fn listed_branch_ids(&self) -> Vec<uuid::Uuid> {
@@ -1669,6 +1699,19 @@ impl Store {
             return Vec::new();
         };
         set.table.lock().branches.iter().map(|b| b.id).collect()
+    }
+
+    /// The ids and current names of `main` and every listed branch, read from the
+    /// branch table without opening any branch store or taking any writer lock.
+    pub fn listed_branch_names(&self) -> HashMap<uuid::Uuid, String> {
+        let mut names = HashMap::new();
+        names.insert(self.owner_dataset_id(), MAIN.to_string());
+        if let SetRef::Owner(set) = &self.branching.set {
+            for b in &set.table.lock().branches {
+                names.insert(b.id, b.name.clone());
+            }
+        }
+        names
     }
 
     /// Enumerate the listed branch IDs under reconciliation's lock-wait policy.
@@ -2434,10 +2477,21 @@ impl Store {
             .store(up.guard_required.load(Ordering::Relaxed), Ordering::Relaxed);
         let mut state = (*store.snapshot()).clone();
         state.dataset_id = self.owner_dataset_id();
+        state.branch_id = store.branch_id();
         state.delta = snap.delta.clone();
         state.version = snap.version;
         state.commit = root.seq;
         state.cache = set.cache.clone();
+        store.history_origin = Arc::new(evidence_view::HistoryOrigin::new_memory(
+            self.owner_dataset_id(),
+            store.branch_id(),
+            store.mem_history.clone(),
+            store.family.managed.clone(),
+            Arc::downgrade(&store.current),
+        ));
+        state.history_origin = Some(evidence_view::HistoryOriginHandle::Resident(
+            Arc::downgrade(&store.history_origin),
+        ));
         store.current.store(Arc::new(state));
         self.failpoint("memory-branch-indexes");
         up.configure_indexes(&store)?;
@@ -3149,9 +3203,35 @@ impl Store {
         range: CommitRange,
         limit: usize,
     ) -> Result<Vec<BranchCommit>> {
-        let set = self.owned_set()?;
         let id = self.branch_id_of(name)?;
         let head = self.branch(name)?.head_commit().seq;
+        self.branch_commits_for_id(id, head, range, limit)
+    }
+
+    /// [`branch_commits`](Self::branch_commits) for an already-retained branch store in
+    /// this dataset family, pinned by UUID rather than resolved again by branch name.
+    pub fn branch_commits_pinned(
+        &self,
+        store: &Store,
+        range: CommitRange,
+        limit: usize,
+    ) -> Result<Vec<BranchCommit>> {
+        if self.owner_dataset_id() != store.owner_dataset_id() {
+            return Err(Error::invalid(
+                "the pinned branch belongs to a different dataset family",
+            ));
+        }
+        self.branch_commits_for_id(store.branch_id(), store.head_commit().seq, range, limit)
+    }
+
+    fn branch_commits_for_id(
+        &self,
+        id: uuid::Uuid,
+        head: u64,
+        range: CommitRange,
+        limit: usize,
+    ) -> Result<Vec<BranchCommit>> {
+        let set = self.owned_set()?;
         let chain = set.chain(CommitRef {
             branch_id: id,
             seq: head,
@@ -3205,6 +3285,20 @@ impl Store {
             });
         }
         Ok(out)
+    }
+
+    /// Read `(author, message)` commit metadata for `seqs` from the change log of branch
+    /// `branch_id` (covering `main`, listed branches, and retired ancestor branches).
+    pub fn branch_commit_change_metas(
+        &self,
+        branch_id: uuid::Uuid,
+        seqs: &[u64],
+    ) -> Result<HashMap<u64, super::changelog::CommitChangeMeta>> {
+        if seqs.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let store = self.branch_by_id(branch_id)?;
+        store.commit_change_metas(seqs)
     }
 
     /// The state of branch `name` at `at`, following the branch's history into its
@@ -3269,10 +3363,29 @@ impl Store {
                     }
                     let owner = self.owned_set()?.normalize(commit);
                     let upstream = self.branch_by_id(owner.branch_id)?;
-                    match at {
-                        At::Time(_) => self.snapshot_pinned(&upstream, at, options),
-                        _ => self.snapshot_pinned(&upstream, &At::Commit(commit.seq), options),
-                    }
+                    let (snapshot, resolved, origin) = match at {
+                        At::Time(_) => self.snapshot_pinned(&upstream, at, options)?,
+                        _ => self.snapshot_pinned(&upstream, &At::Commit(commit.seq), options)?,
+                    };
+                    // A historical selector on `store` (named snapshot, commit, or time)
+                    // may carry a semantic configuration distinct from the inherited RDF
+                    // commit's own binding (via `PinnedConfiguration` or `BranchConfigurationOrigin`):
+                    // re-pin it using `store` before returning.
+                    let snapshot = if !matches!(at, At::Head) && self.configuration_activated() {
+                        use crate::history::ReadControl;
+                        let prep = options.temporary(crate::evidence::resolve::MEMORY_BYTES)?;
+                        let (pinned, _held) = self.pin_historical_evidence(
+                            store,
+                            at,
+                            resolved.commit.seq,
+                            snapshot,
+                            &prep,
+                        )?;
+                        pinned
+                    } else {
+                        snapshot
+                    };
+                    Ok((snapshot, resolved, origin))
                 }
                 None => Err(error),
             },

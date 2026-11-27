@@ -661,7 +661,10 @@ impl Tools<'_> {
         if !read::readable(r.snap(), &opts, &graph) {
             return Ok(Vec::new());
         }
-        let filter = read::Filter { reviewed_only };
+        let filter = read::Filter {
+            reviewed_only,
+            ..Default::default()
+        };
         let Some(level) = read::level_counts(r.snap(), &opts, &graph, filter)?
             .keys()
             .next()

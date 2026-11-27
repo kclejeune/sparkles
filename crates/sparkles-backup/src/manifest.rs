@@ -39,13 +39,20 @@ pub fn parse(bytes: &[u8]) -> Result<Manifest> {
     Ok(m)
 }
 
-/// Whether a configuration generation's content-addressed name agrees with its
-/// digest. Other paths have no name-derived digest and always agree.
+/// Whether a configuration generation's or imported source descriptor's
+/// content-addressed name agrees with its digest. Other paths have no
+/// name-derived digest and always agree.
 pub(crate) fn generation_name_matches(path: &str, sha256: &str) -> bool {
-    !crate::layout::configuration_history_path(path)
-        || path
-            .rsplit_once("/generations/")
-            .is_none_or(|(_, file)| file.strip_suffix(".json") == Some(sha256))
+    if !crate::layout::configuration_history_path(path) {
+        return true;
+    }
+    if let Some(rest) = path.strip_prefix("evidence-history/imports/")
+        && let Some((digest, "origin.json")) = rest.split_once('/')
+    {
+        return digest == sha256;
+    }
+    path.rsplit_once("/generations/")
+        .is_none_or(|(_, file)| file.strip_suffix(".json") == Some(sha256))
 }
 
 /// Everything a restore checks before writing (`422 invalid-backup` naming the field;
@@ -203,16 +210,31 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_formats: &[u32]) -> Result
     }
     let mut seen = HashSet::with_capacity(m.files.len());
     let mut total = 0u64;
-    let history_required = m
+    let history_v2 = m
         .requires
         .iter()
-        .any(|feature| feature == "evidence-configuration-history/1");
+        .any(|feature| feature == "evidence-configuration-history/2");
+    let history_required = history_v2
+        || m.requires
+            .iter()
+            .any(|feature| feature == "evidence-configuration-history/1");
     let mut history_files = false;
+    let mut imported_source_files = false;
     for (i, f) in m.files.iter().enumerate() {
         let field = |k: &str| format!("files[{i}].{k}");
         let history = crate::layout::configuration_history_path(&f.path);
+        let imported = crate::layout::imported_configuration_history_path(&f.path);
         if history {
             history_files = true;
+            if f.path.starts_with("evidence-history/imports/") {
+                imported_source_files = true;
+            }
+            if imported && !history_v2 {
+                return bad(
+                    &field("path"),
+                    "imported configuration history needs evidence-configuration-history/2".into(),
+                );
+            }
             if !history_required {
                 return bad(
                     &field("path"),
@@ -289,6 +311,12 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_formats: &[u32]) -> Result
         return bad(
             "files",
             "configuration history needs its primary closure and managed.json".into(),
+        );
+    }
+    if history_v2 && (!seen.contains("evidence-history/origin.json") || !imported_source_files) {
+        return bad(
+            "files",
+            "evidence-configuration-history/2 requires evidence-history/origin.json and evidence-history/imports/".into(),
         );
     }
     // The control closure (spec C26 §7.3): the feature and the jobs settings each need

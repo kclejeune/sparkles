@@ -171,6 +171,7 @@ impl From<StoreOptions> for DatasetOptions {
 pub struct DatasetState {
     pub(crate) branches: Mutex<BTreeMap<String, Dataset>>,
     pub(crate) branch_handles: Mutex<Vec<StateReference>>,
+    pub(crate) owner: Option<StateReference>,
     pub(crate) reference: StateReference,
     pub(crate) closure_cache_triples: usize,
     pub(crate) pool: Option<Arc<crate::sparql::pool::QueryPool>>,
@@ -338,7 +339,14 @@ impl Dataset {
     /// [`from_store`](Self::from_store) with the library's settings of `opts` (its
     /// `store` options are those `store` was opened with and are not read).
     pub fn from_store_with(store: impl Into<StoreHandle>, opts: DatasetOptions) -> Dataset {
-        let store: StoreHandle = store.into();
+        Dataset::from_store_with_owner(store.into(), None, opts)
+    }
+
+    fn from_store_with_owner(
+        store: StoreHandle,
+        owner: Option<StateReference>,
+        opts: DatasetOptions,
+    ) -> Dataset {
         let shown = || {
             opts.name
                 .as_deref()
@@ -420,6 +428,7 @@ impl Dataset {
             views_worker: std::sync::OnceLock::new(),
             branches: Mutex::new(BTreeMap::new()),
             branch_handles: Mutex::new(Vec::new()),
+            owner,
             closure_cache_triples: opts.closure_cache_triples,
             pool: opts.pool,
             name: opts.name,
@@ -458,8 +467,25 @@ impl Dataset {
 
     /// A dataset around a store others share (a branch's, which its dataset keeps open),
     /// with the state the branch's directory configures.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_shared(store: Arc<Store>, opts: DatasetOptions) -> Dataset {
         Dataset::from_store_with(StoreHandle::Branch(store), opts)
+    }
+
+    /// A dataset around a store others share (a branch's, which its dataset keeps open),
+    /// with the state the branch's directory configures and a weak link to its owner.
+    pub(crate) fn from_shared_with_owner(
+        store: Arc<Store>,
+        owner: StateReference,
+        opts: DatasetOptions,
+    ) -> Dataset {
+        Dataset::from_store_with_owner(StoreHandle::Branch(store), Some(owner), opts)
+    }
+
+    /// Upgrade this branch handle's owning dataset state, if it is a branch handle whose
+    /// owner is still open.
+    pub(crate) fn owner_state(&self) -> Option<Arc<DatasetState>> {
+        self.inner.owner.as_ref()?.upgrade()
     }
 
     fn branches_in_use(&self) -> bool {
@@ -1566,6 +1592,11 @@ impl Transaction<'_> {
 
     pub fn insert_triple(&mut self, t: &Triple) -> Result<bool> {
         self.insert(t.as_ref().in_graph(GraphNameRef::DefaultGraph))
+    }
+
+    /// Stage prefixes to be persisted jointly with this transaction's commit.
+    pub(crate) fn stage_prefixes(&mut self, prefixes: BTreeMap<String, String>) {
+        self.txn.stage_prefixes(prefixes);
     }
 
     /// Remove a quad; blank nodes are matched by the labels this store hands out

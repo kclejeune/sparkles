@@ -89,7 +89,10 @@ pub fn profile(version: u32) -> Option<&'static Profile> {
     (version == V1.version).then_some(&V1)
 }
 
+#[doc(hidden)]
+pub mod binding;
 pub mod propose;
+pub mod reauth;
 pub mod resolve;
 pub mod review;
 
@@ -98,30 +101,39 @@ pub use propose::{
     operation_id, operation_iri, operation_recorded, propose, reconcile_operation_holds,
     reconcile_operation_holds_in,
 };
+pub use reauth::{
+    MAX_REAUTHENTICATE_RECORDS, MAX_RECORD_TRIPLES, ReauthenticateOptions, ReauthenticateRecord,
+    Reauthenticated, ReauthenticatedRecord, reauthenticate,
+};
 pub use review::claims::{
     self, ClaimOccurrence, ClaimOrigin, ClaimState, MAX_CLAIM_SCAN, MAX_CLAIMS, MEM_INSTRUCTIONS,
     PolicyClaims, PolicyRef, check_matching_policy, claim_states, recorded_settings,
     with_policy_claims,
 };
 pub use review::dependents::{
-    self, Dependence, Dependent, Dependents, MAX_CHANGED, dependents as find_dependents,
+    self, Dependence, Dependent, Dependents, MAX_CHANGED, ReportDependent,
+    dependents as find_dependents, dependents_at as find_dependents_at,
 };
 pub use review::identity::{
-    self, EntityResolution, MAX_MEMBERS, MAX_RESOLVE, RESOLVES_TO, ResolvedEntity,
-    resolve as resolve_entities, resolve_at as resolve_entities_at,
+    self, EntityResolution, MAX_MEMBERS, MAX_RESOLVE, RESOLVES_TO, RebuiltMap, ResolvedEntity,
+    rebuild as rebuild_resolution_map, resolve as resolve_entities,
+    resolve_at as resolve_entities_at,
 };
 pub use review::{
-    Changed, Decided, MapChange, Options as ReviewOptions, ProjectionChange, Reviewed, Withdrawn,
-    WithdrawnClaim, review, withdraw,
+    Changed, Decided, MapChange, Options as ReviewOptions, ProjectionChange, ReconciledProjection,
+    Reviewed, Withdrawn, WithdrawnClaim, reconcile_projection, reconcile_projection_prepared,
+    review, withdraw,
 };
-pub use sparkles_core::evidence::review::{DecisionInput, Disposition, WithdrawalInput};
+pub use sparkles_core::evidence::review::{
+    DecisionInput, Disposition, MAX_DECISIONS, WithdrawalInput,
+};
 pub use sparkles_core::evidence::{
     ASSESSMENT_INPUT_KINDS, MAX_ASSESSMENT_INPUTS, MAX_CLAIMS as MAX_BATCH_CLAIMS, MAX_IDENTITIES,
-    MAX_IDENTITY_ENTITIES, MIN_IDENTITY_ENTITIES, prepare_input,
+    MAX_IDENTITY_ENTITIES, MAX_LINKS, MIN_IDENTITY_ENTITIES, prepare_input,
 };
 pub use sparkles_core::evidence::{
     AssessmentInput, ClaimInput, Confidence, ConfidenceFacets, EvidenceInput, EvidenceLinkInput,
-    EvidenceRefInput, EvidenceRefTarget, EvidenceRelation, JSON_LEXICAL_UTF8_V1,
+    EvidenceRefInput, EvidenceRefTarget, EvidenceRelation, IdentityNamespace, JSON_LEXICAL_UTF8_V1,
     JSON_LEXICAL_UTF8_VERSION, MethodRef, PassageInput, Polarity, RecordKey, RecordRef,
     RecordVersion, RenditionContent, RenditionInput, Scope, SourceContent, SourceLineage,
     SourceMetadata, SourceRevisionInput, SourceTimes,
@@ -364,8 +376,18 @@ fn configure_recorded(
         OverrideUpdate::Preserve => current.and_then(|entry| entry.evidence_overrides.clone()),
         OverrideUpdate::Replace(patch) => patch.and_then(crate::managed::EvidenceOverrides::new),
     };
-    let graphs =
-        store.enable_managed_at(OwnerKind::Evidence, entry, canonical.bytes(), revision)?;
+    let write_options = crate::guard::WriteOptions {
+        cancel: Some(control.cancel.flag()),
+        deadline: control.deadline,
+        ..Default::default()
+    };
+    let graphs = store.enable_managed_at_with(
+        OwnerKind::Evidence,
+        entry,
+        canonical.bytes(),
+        revision,
+        &write_options,
+    )?;
     status_from(Some(&graphs), Some(canonical.bytes()))
 }
 

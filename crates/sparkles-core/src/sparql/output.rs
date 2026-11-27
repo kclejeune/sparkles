@@ -594,7 +594,13 @@ impl SnapshotOutputRoot {
                 "a validation selector requires a SELECT query",
             ));
         }
-        super::execute_retained_source(self.source.clone(), query, opts, 0.0, Some(&data.sel))
+        super::execute_retained_source(
+            self.source.clone(),
+            query,
+            opts,
+            0.0,
+            Some(super::DefaultDatasetOverride::Selector(&data.sel)),
+        )
     }
 }
 

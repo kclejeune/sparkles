@@ -53,6 +53,12 @@ mod read;
 mod registry;
 mod round;
 #[cfg(test)]
+pub(crate) use catalog::set_wait_built_final_hook;
+#[cfg(test)]
+pub(crate) use internal::set_wait_timeout_hook;
+#[cfg(test)]
+pub(crate) use read::set_open_view_state_hook;
+#[cfg(test)]
 pub(crate) use round::PASS_CANCEL;
 mod stats;
 mod subscribe;

@@ -11,6 +11,7 @@
 
 mod adapter;
 mod algo;
+mod ask;
 pub(crate) mod branches;
 #[cfg(feature = "auth")]
 mod bridge;
@@ -44,7 +45,7 @@ mod notify;
 #[cfg(feature = "ontology")]
 mod ontology;
 mod paths;
-mod pins;
+pub(crate) mod pins;
 pub(crate) mod profiles;
 pub(crate) mod relevance;
 pub(crate) mod render;
@@ -65,6 +66,8 @@ mod update;
 #[cfg(any(feature = "shacl", feature = "shex"))]
 mod validate;
 
+#[cfg(test)]
+mod ask_tests;
 #[cfg(test)]
 mod credit_tests;
 #[cfg(test)]
@@ -133,6 +136,8 @@ pub struct McpArgs {
     pub allow_update: bool,
     #[command(flatten)]
     pub outbound: crate::outbound::OutboundArgs,
+    #[command(flatten)]
+    pub models: crate::models::ModelArgs,
     /// Largest query timeout a call may request, in seconds (calls default to 30)
     #[arg(long, value_name = "SECS", default_value_t = 60.0)]
     pub timeout: f64,
@@ -295,7 +300,7 @@ impl McpConfig {
 /// State shared by every connection (and, later, every transport).
 pub struct Shared {
     pub cfg: McpConfig,
-    pub pins: pins::Pins,
+    pub pins: Arc<pins::Pins>,
     /// one permit per concurrent tool call
     pub slots: Arc<Semaphore>,
     tools: Vec<schemas::ToolDef>,
@@ -303,6 +308,8 @@ pub struct Shared {
     pub tasks: tasks::Tasks,
     /// one permit per open `subscriptions/listen` stream or legacy session watcher
     pub subscriptions: Arc<Semaphore>,
+    /// optional absolute deadline cap inherited by derived child tool calls (never widened)
+    deadline: Option<Instant>,
 }
 
 /// The transport-neutral MCP server.
@@ -367,11 +374,14 @@ pub struct Call {
 impl McpServer {
     fn call_control(&self, call: &Call) -> sparkles::Result<sparkles::task::Control> {
         let mut control = sparkles::task::Control::with_cancel(call.cancel.clone());
-        control.deadline = Some(
-            call.arrived
-                .checked_add(self.cfg().max_timeout)
-                .ok_or_else(|| sparkles::Error::invalid("MCP call deadline overflow"))?,
-        );
+        let mut deadline = call
+            .arrived
+            .checked_add(self.cfg().max_timeout)
+            .ok_or_else(|| sparkles::Error::invalid("MCP call deadline overflow"))?;
+        if let Some(cap) = self.shared.deadline {
+            deadline = deadline.min(cap);
+        }
+        control.deadline = Some(deadline);
         control.check()?;
         Ok(control)
     }
@@ -435,7 +445,13 @@ impl McpServer {
     }
 
     pub fn new(state: Arc<AppState>, cfg: McpConfig) -> McpServer {
-        Self::new_with_tasks(state, cfg, tasks::Tasks::default())
+        Self::new_with_parts(
+            state,
+            cfg,
+            Arc::new(pins::Pins::default()),
+            tasks::Tasks::default(),
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -444,10 +460,38 @@ impl McpServer {
         cfg: McpConfig,
         task_ttl: Duration,
     ) -> McpServer {
-        Self::new_with_tasks(state, cfg, tasks::Tasks::with_ttl(task_ttl))
+        Self::new_with_parts(
+            state,
+            cfg,
+            Arc::new(pins::Pins::default()),
+            tasks::Tasks::with_ttl(task_ttl),
+            None,
+        )
     }
 
-    fn new_with_tasks(state: Arc<AppState>, cfg: McpConfig, tasks: tasks::Tasks) -> McpServer {
+    #[cfg(test)]
+    pub(crate) fn new_with_task_ttl_and_clock(
+        state: Arc<AppState>,
+        cfg: McpConfig,
+        task_ttl: Duration,
+        clock: tasks::ManualClock,
+    ) -> McpServer {
+        Self::new_with_parts(
+            state,
+            cfg,
+            Arc::new(pins::Pins::default()),
+            tasks::Tasks::with_ttl_and_clock(task_ttl, clock),
+            None,
+        )
+    }
+
+    fn new_with_parts(
+        state: Arc<AppState>,
+        cfg: McpConfig,
+        pins: Arc<pins::Pins>,
+        tasks: tasks::Tasks,
+        deadline: Option<Instant>,
+    ) -> McpServer {
         let read_only = state.read_only;
         let tools = schemas::tools(&cfg)
             .into_iter()
@@ -463,13 +507,47 @@ impl McpServer {
             state,
             shared: Arc::new(Shared {
                 slots: Arc::new(Semaphore::new(cfg.max_concurrent.max(1))),
-                pins: pins::Pins::default(),
+                pins,
                 tools,
                 tasks,
                 subscriptions: Arc::new(Semaphore::new(notify::MAX_SUBSCRIPTIONS)),
                 cfg,
+                deadline,
             }),
         }
+    }
+
+    /// Build a derived MCP server with `cfg` that shares this server's snapshot pin table
+    /// and preserves any existing absolute deadline cap.
+    pub(super) fn with_config_shared_pins(&self, cfg: McpConfig) -> McpServer {
+        Self::new_with_parts(
+            self.state.clone(),
+            cfg,
+            self.shared.pins.clone(),
+            tasks::Tasks::default(),
+            self.shared.deadline,
+        )
+    }
+
+    /// Build a derived MCP server whose calls cannot run past `deadline`, sharing this
+    /// server's snapshot pin table. An existing deadline is only tightened, never widened.
+    pub(crate) fn with_deadline(&self, deadline: Instant) -> McpServer {
+        let deadline = match self.shared.deadline {
+            Some(prev) => prev.min(deadline),
+            None => deadline,
+        };
+        Self::new_with_parts(
+            self.state.clone(),
+            self.cfg().clone(),
+            self.shared.pins.clone(),
+            tasks::Tasks::default(),
+            Some(deadline),
+        )
+    }
+
+    /// The absolute deadline cap imposed on calls through this server, if any.
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.shared.deadline
     }
 
     pub fn cfg(&self) -> &McpConfig {
@@ -519,6 +597,7 @@ impl McpServer {
             }
             #[cfg(feature = "graphql")]
             "graphql_query" => self.graphql_available(p),
+            "ask" => self.ask_available(p),
             _ => true,
         }
     }
@@ -662,6 +741,11 @@ impl McpServer {
 pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
     #[cfg(feature = "auth")]
     if let Some(url) = &args.url {
+        if args.models.model_config.is_some() || !args.models.model_secret.is_empty() {
+            bail!(
+                "--model-config and --model-secret apply only with local databases (--loc); a bridged server uses its own model configuration"
+            );
+        }
         return bridge::run(url, args.token.clone(), args.insecure_http);
     }
     if !(args.timeout.is_finite() && args.timeout > 0.0) {
@@ -691,6 +775,9 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
     st.read_only = !args.allow_update;
     st.allow_service = args.allow_service;
     st.outbound = args.outbound.policy()?;
+    if let Some(models) = args.models.load(args.outbound.local_policy()?)? {
+        st.models.store(Some(models));
+    }
     st.schema_max_entries = args.schema_max_entries;
     st.schema_statistics_above = args.schema_statistics_above.0;
     let memory = (args.query_memory_mb > 0).then_some(args.query_memory_mb << 20);

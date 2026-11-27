@@ -58,6 +58,10 @@ pub struct SourceRevisionInput {
     pub metadata: SourceMetadata,
     pub times: SourceTimes,
     pub lineage: SourceLineage,
+    /// The predecessor source revision this revision supersedes, written as
+    /// `prov:wasRevisionOf`. Framed only when present so that earlier record
+    /// and payload digests stay unchanged.
+    pub was_revision_of: Option<RecordRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

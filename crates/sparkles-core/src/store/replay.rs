@@ -4,13 +4,30 @@
 //! source commit it replays as its second parent, flagged as a replay, so the target
 //! descends from every commit replayed so far, also when a replay stops part way.
 
-use super::branching::{BranchSet, MERGE_REPLAYED, MergeRec};
+use super::branching::{BranchSet, MERGE_REC, MERGE_REPLAYED, MergeRec};
 use super::changelog::LogCommit;
 use super::diff::{DiffOp, DiffOptions, QuadKey};
 use super::merge::{INFERRED_GRAPH, quad_ids};
 use super::*;
 use crate::branch::{self, CommitRef, MergeOptions, MergeOutcome, MergeReport, ReplayedCommit};
 use crate::history::At;
+
+struct FileProjection {
+    end: u64,
+    alloc: u64,
+}
+
+impl FileProjection {
+    /// Carry the file's new logical end and tail into the next step, returning its
+    /// growth on disk.
+    fn append(&mut self, bytes: u64, prealloc: u64) -> u64 {
+        self.end += bytes;
+        let alloc = wal::allocation_after_write(self.alloc, self.end, prealloc);
+        let growth = alloc - self.alloc;
+        self.alloc = alloc;
+        growth
+    }
+}
 
 impl Store {
     /// The author the change log recorded for commit `seq` (`None` when it recorded
@@ -147,6 +164,13 @@ impl Store {
                     ),
                 ));
             }
+            // The preceding fence released its reservations and may have grown
+            // files. Sample again at admission while holding the target writer.
+            if i > 0
+                && let (Some(root), Some(_)) = (&tgt.root, tgt.opts.min_free_disk_bytes)
+            {
+                crate::disk::invalidate_free_bytes(root);
+            }
             txn.force = true;
             txn.merge = Some(MergeRec {
                 seq: 0,
@@ -209,6 +233,22 @@ impl Store {
             ));
         }
         let inferred: Arc<[u8]> = crate::id::iri_key(INFERRED_GRAPH).into();
+        let mut terms_from = txn.mark.entries();
+        let mut wal_file = FileProjection {
+            end: txn.guard.wal_len,
+            alloc: txn.guard.tail.alloc(),
+        };
+        let mut vocab_file = FileProjection {
+            end: txn.mark.file_end(),
+            alloc: txn.base.generation.dvocab.allocated(),
+        };
+        let (mut annotation_header, mut annotation_file) = {
+            let annotations = target.annotations.lock();
+            let (end, alloc) = annotations.file_lengths();
+            (annotations.pending_header(), FileProjection { end, alloc })
+        };
+        let mut fenced_quota = 0u64;
+        let mut fenced_disk = 0u64;
         for (index, &(branch_id, seq)) in commits.iter().enumerate() {
             txn.opts.check()?;
             options.progress.report(
@@ -287,11 +327,18 @@ impl Store {
             let inserts = txn.log[start..]
                 .iter()
                 .any(|(operation, _)| *operation == WAL_INSERT);
-            // A real replay appends one marker per source commit, including zero-net steps.
-            let wal_bytes = txn
-                .wal_bytes()
-                .saturating_add((index as u64).saturating_mul(WAL_REC as u64));
-            let storage = txn.preview_storage(inserts, wal_bytes);
+            // Only this step's WAL records plus its own marker, even on a zero-net step.
+            let wal_bytes = txn.wal_bytes() - start as u64 * WAL_REC as u64;
+            let (vocab_bytes, annotation) =
+                txn.pending_storage_bytes(terms_from, txn.opts.message.as_deref());
+            let pending = wal_bytes
+                .saturating_add(vocab_bytes)
+                .saturating_add(annotation);
+            let storage = txn.preview_storage(
+                inserts,
+                fenced_quota.saturating_add(pending),
+                fenced_disk.saturating_add(pending),
+            );
             let refused = precondition
                 .as_ref()
                 .is_some_and(|outcome| outcome.is_err())
@@ -311,9 +358,292 @@ impl Store {
                 }
                 return Err(Error::DryRun(Box::new(preview)));
             }
+            if target.root.is_some() {
+                // The next step sees the metadata records and the framed vocabulary.
+                let vocab = &txn.base.generation.dvocab;
+                let framing = vocab.framing_bytes(terms_from, vocab_file.end == 0);
+                let header = if annotation > 0 {
+                    std::mem::take(&mut annotation_header)
+                } else {
+                    0
+                };
+                let before_fence = MERGE_REC as u64 + header;
+                let metadata = before_fence + commit::REC as u64;
+                fenced_quota = fenced_quota
+                    .saturating_add(pending)
+                    .saturating_add(framing)
+                    .saturating_add(metadata);
+                // The merge record and any annotation header exist before the fence
+                // checks its promise. The promise also covers the earlier WAL-only
+                // preallocation check, and the catalog is appended after the fence.
+                let cap = target.opts.wal_prealloc_bytes;
+                let prealloc = if cap > 0
+                    && target
+                        .check_disk(
+                            fenced_disk
+                                .saturating_add(before_fence)
+                                .saturating_add(pending)
+                                .saturating_add(target.quota.unwritten())
+                                .saturating_add(group::preallocation_promise(cap, annotation > 0)),
+                        )
+                        .is_ok()
+                {
+                    cap
+                } else {
+                    0
+                };
+                let annotation_prealloc = if prealloc > 0 {
+                    crate::annotations::MAX_PREALLOC
+                } else {
+                    0
+                };
+                annotation_file.append(header, 0);
+                fenced_disk = fenced_disk
+                    .saturating_add(metadata)
+                    .saturating_add(wal_file.append(wal_bytes, prealloc))
+                    .saturating_add(vocab_file.append(
+                        vocab_bytes.saturating_add(framing),
+                        prealloc.min(crate::vocab::delta::MAX_PREALLOC),
+                    ))
+                    .saturating_add(annotation_file.append(annotation, annotation_prealloc));
+                terms_from = vocab.len();
+            }
         }
         let mut unchanged = report.clone();
         unchanged.up_to_date = true;
         Ok(MergeOutcome::UpToDate(unchanged))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::preview::{DryRun, Outcome, Preview};
+    use crate::sparql::update::update;
+    use std::fs;
+
+    fn target(root: &Path, opts: StoreOptions) -> Store {
+        let main = Store::open(root, opts).unwrap();
+        update(
+            &main,
+            "INSERT DATA {<urn:base> <urn:p> 0}",
+            &Default::default(),
+        )
+        .unwrap();
+        main.create_branch("dev", &Default::default()).unwrap();
+        main
+    }
+
+    fn replay() -> MergeOptions {
+        MergeOptions {
+            replay: true,
+            ..Default::default()
+        }
+    }
+
+    fn preview(main: &Store) -> Preview {
+        let mut opts = replay();
+        opts.write.dry_run = Some(DryRun::default());
+        crate::preview::catch(main.merge("dev", "main", &opts)).unwrap()
+    }
+
+    #[test]
+    fn replay_preview_quota_matches_a_refresh_between_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = Arc::new(target(
+            dir.path(),
+            StoreOptions {
+                change_log: false,
+                wal_prealloc_bytes: 0,
+                ..Default::default()
+            },
+        ));
+        let dev = main.branch("dev").unwrap();
+        update(
+            &dev,
+            "INSERT DATA {<urn:new> <urn:p> 1}",
+            &crate::sparql::QueryOptions {
+                write: crate::guard::WriteOptions {
+                    message: Some("first replay step".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        main.set_quota(Some(u64::MAX)).unwrap();
+        main.set_quota(Some(preview(&main).storage.projected.unwrap() + 1024))
+            .unwrap();
+        main.quota.remeasure();
+        main.quota.used();
+        let quota_file = dir.path().join(quota::QUOTA_FILE);
+        let quota_file_len = fs::metadata(&quota_file).unwrap().len();
+        let measures = main.quota.measures();
+        // This ordinary source commit appends to the shared catalog after the walk.
+        update(
+            &dev,
+            "INSERT DATA {<urn:base> <urn:p> 2}",
+            &Default::default(),
+        )
+        .unwrap();
+        let limit = preview(&main).storage.projected.unwrap();
+        main.set_quota(Some(limit - 1)).unwrap();
+        assert_eq!(preview(&main).outcome(), Outcome::StorageRefused);
+        main.set_quota(Some(limit)).unwrap();
+        assert_eq!(fs::metadata(quota_file).unwrap().len(), quota_file_len);
+        let candidate = preview(&main);
+        assert_eq!(candidate.storage.projected, Some(limit));
+        assert_eq!(candidate.outcome(), Outcome::Commit);
+        assert_eq!(main.quota.measures(), measures);
+
+        let head = main.snapshot().commit;
+        let refreshed = Arc::new(parking_lot::Mutex::new(None));
+        let opts = MergeOptions {
+            progress: crate::task::Progress::new({
+                let main = main.clone();
+                let refreshed = refreshed.clone();
+                move |fraction, message| {
+                    if fraction == 0.5 && message.starts_with("replaying commit ") {
+                        assert_eq!(main.snapshot().commit, head + 1);
+                        let cached = main.quota.used();
+                        main.quota.remeasure();
+                        *refreshed.lock() = Some((cached, main.quota.used()));
+                    }
+                }
+            }),
+            ..replay()
+        };
+        main.merge("dev", "main", &opts).unwrap();
+        let (cached, measured) = refreshed.lock().unwrap();
+        assert_eq!(cached, measured);
+        assert_eq!(main.snapshot().commit, head + 2);
+    }
+
+    #[test]
+    fn replay_preview_reserve_uses_existing_wal_and_vocabulary_tails() {
+        const RESERVE: u64 = 1 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let main = target(
+            dir.path(),
+            StoreOptions {
+                change_log: false,
+                min_free_disk_bytes: Some(RESERVE),
+                ..Default::default()
+            },
+        );
+        let dev = main.branch("dev").unwrap();
+        update(
+            &dev,
+            "INSERT DATA {<urn:new-vocabulary-term-that-fits-in-the-preallocated-vocabulary-tail> <urn:p> 1}",
+            &Default::default(),
+        )
+        .unwrap();
+        main.set_quota(Some(u64::MAX)).unwrap();
+        let first = preview(&main);
+        let first_pending = first.storage.projected.unwrap() - first.storage.used.unwrap();
+        let wal_before = dev.wal_bytes();
+        update(
+            &dev,
+            "INSERT DATA {<urn:base> <urn:p> 2}",
+            &Default::default(),
+        )
+        .unwrap();
+        let second_pending = dev.wal_bytes() - wal_before;
+        let headroom = first_pending + second_pending;
+        let vocab = &main.snapshot().generation.dvocab;
+        let wal_alloc = main.writer.lock().tail.alloc();
+        let vocab_alloc = vocab.allocated();
+        assert!(wal_alloc - main.wal_bytes() >= headroom);
+        assert!(vocab.preallocated() >= headroom);
+        let _disk =
+            crate::disk::fake::install(dir.path(), dir_size(dir.path()) + RESERVE + headroom);
+
+        let candidate = preview(&main);
+        main.merge("dev", "main", &replay()).unwrap();
+        assert_eq!(main.writer.lock().tail.alloc(), wal_alloc);
+        assert_eq!(vocab.allocated(), vocab_alloc);
+        assert_eq!(
+            candidate.outcome(),
+            Outcome::Commit,
+            "{:?}",
+            candidate.storage.refused
+        );
+    }
+
+    #[test]
+    fn replay_preview_reserve_counts_a_predecessors_new_tail() {
+        replay_reserve_after_tail_growth(false);
+    }
+
+    #[test]
+    fn replay_reserve_refreshes_a_warm_sample_after_tail_growth() {
+        replay_reserve_after_tail_growth(true);
+    }
+
+    fn replay_reserve_after_tail_growth(cached: bool) {
+        const RESERVE: u64 = 1 << 20;
+        const HEADROOM: u64 = 512 << 10;
+        let dir = tempfile::tempdir().unwrap();
+        let main = target(
+            dir.path(),
+            StoreOptions {
+                change_log: false,
+                wal_prealloc_bytes: 16 << 10,
+                min_free_disk_bytes: Some(RESERVE),
+                ..Default::default()
+            },
+        );
+        let dev = main.branch("dev").unwrap();
+        let first = (1..=64)
+            .map(|n| format!("<urn:base> <urn:p> {n} ."))
+            .collect::<Vec<_>>()
+            .join(" ");
+        update(
+            &dev,
+            &format!("INSERT DATA {{ {first} }}"),
+            &crate::sparql::QueryOptions {
+                write: crate::guard::WriteOptions {
+                    message: Some("first replay step".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        update(
+            &dev,
+            &format!(
+                "INSERT DATA {{<urn:base> <urn:p> \"{}\"}}",
+                "x".repeat(511 * 1024 - 128)
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let wal_alloc = main.writer.lock().tail.alloc();
+        assert!(wal_alloc - main.wal_bytes() >= 65 * WAL_REC as u64);
+        assert!(main.annotations.lock().pending_header() > 0);
+        let capacity = dir_size(dir.path()) + RESERVE + HEADROOM;
+        let _disk = if cached {
+            crate::disk::fake::install_cached(dir.path(), capacity)
+        } else {
+            crate::disk::fake::install(dir.path(), capacity)
+        };
+        assert_eq!(
+            crate::disk::free_bytes_cached(dir.path(), std::time::Duration::from_secs(1)).unwrap(),
+            RESERVE + HEADROOM
+        );
+
+        let head = main.snapshot().commit;
+        let candidate = preview(&main);
+        assert_eq!(main.snapshot().commit, head);
+        assert!(matches!(
+            main.merge("dev", "main", &replay()),
+            Err(Error::StorageFull(_))
+        ));
+        assert_eq!(main.snapshot().commit, head + 1);
+        assert_eq!(main.writer.lock().tail.alloc(), wal_alloc);
+        let (annotation_end, annotation_alloc) = main.annotations.lock().file_lengths();
+        assert!(annotation_alloc > annotation_end);
+        assert_eq!(candidate.outcome(), Outcome::StorageRefused);
     }
 }

@@ -31,9 +31,9 @@ impl Dataset {
             return Ok(ds);
         }
         let upstream = if self.store().root().is_none() {
-            self.branch_info(name)?
-                .upstream
-                .filter(|n| n != "main")
+            self.store()
+                .branch_upstream_name(name)?
+                .filter(|n| n != crate::branch::MAIN)
                 .map(|n| self.branch(&n))
                 .transpose()?
         } else {
@@ -50,8 +50,9 @@ impl Dataset {
             .branch(name)?
             .shared()
             .expect("non-main branch");
-        let ds = Dataset::from_shared(
+        let ds = Dataset::from_shared_with_owner(
             store,
+            self.state_reference(),
             crate::DatasetOptions {
                 store: self.store().options().clone(),
                 name: self.name().map(str::to_string),

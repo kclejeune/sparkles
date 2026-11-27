@@ -34,6 +34,140 @@ pub const TTL: Duration = Duration::from_secs(600);
 /// The polling interval suggested to clients.
 const POLL_MS: u64 = 500;
 
+#[cfg(test)]
+fn duration_to_nanos(dur: Duration) -> u64 {
+    u64::try_from(dur.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Deterministic clock for tests that need to control task TTL expiry without racing
+/// real wall-clock execution on loaded runners.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct ManualClock {
+    now_ns: Arc<watch::Sender<u64>>,
+}
+
+#[cfg(test)]
+impl ManualClock {
+    pub(crate) fn new() -> Self {
+        let (tx, _) = watch::channel(0u64);
+        Self {
+            now_ns: Arc::new(tx),
+        }
+    }
+
+    pub(crate) fn advance(&self, delta: Duration) {
+        let delta_ns = duration_to_nanos(delta);
+        self.now_ns
+            .send_modify(|now| *now = now.saturating_add(delta_ns));
+    }
+
+    fn now_ns(&self) -> u64 {
+        *self.now_ns.borrow()
+    }
+
+    async fn sleep_until_ns(&self, target_ns: u64) {
+        let mut rx = self.now_ns.subscribe();
+        while *rx.borrow_and_update() < target_ns {
+            if rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
+struct TaskInstant(Instant);
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum TaskInstant {
+    System(Instant),
+    Manual(u64),
+}
+
+impl TaskInstant {
+    fn saturating_duration_since(self, earlier: Self) -> Duration {
+        #[cfg(not(test))]
+        {
+            self.0.saturating_duration_since(earlier.0)
+        }
+        #[cfg(test)]
+        match (self, earlier) {
+            (Self::System(a), Self::System(b)) => a.saturating_duration_since(b),
+            (Self::Manual(a), Self::Manual(b)) => Duration::from_nanos(a.saturating_sub(b)),
+            _ => unreachable!("mixed task clock instants"),
+        }
+    }
+}
+
+#[cfg(not(test))]
+#[derive(Clone)]
+struct TaskClock;
+
+#[cfg(test)]
+#[derive(Clone)]
+enum TaskClock {
+    System,
+    Manual(ManualClock),
+}
+
+impl TaskClock {
+    fn system() -> Self {
+        #[cfg(not(test))]
+        {
+            Self
+        }
+        #[cfg(test)]
+        {
+            Self::System
+        }
+    }
+
+    fn now(&self) -> TaskInstant {
+        #[cfg(not(test))]
+        {
+            TaskInstant(Instant::now())
+        }
+        #[cfg(test)]
+        match self {
+            Self::System => TaskInstant::System(Instant::now()),
+            Self::Manual(clock) => TaskInstant::Manual(clock.now_ns()),
+        }
+    }
+
+    async fn sleep_until(&self, start: TaskInstant, dur: Duration) {
+        #[cfg(not(test))]
+        {
+            let at = start.0;
+            while let Some(remaining) = dur.checked_sub(at.elapsed()) {
+                if remaining.is_zero() {
+                    break;
+                }
+                tokio::time::sleep(remaining).await;
+            }
+        }
+        #[cfg(test)]
+        match (self, start) {
+            (Self::System, TaskInstant::System(at)) => {
+                while let Some(remaining) = dur.checked_sub(at.elapsed()) {
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    tokio::time::sleep(remaining).await;
+                }
+            }
+            (Self::Manual(clock), TaskInstant::Manual(at)) => {
+                clock
+                    .sleep_until_ns(at.saturating_add(duration_to_nanos(dur)))
+                    .await;
+            }
+            _ => unreachable!("mixed task clock instants"),
+        }
+    }
+}
+
 fn current_timestamp() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -83,16 +217,16 @@ enum TaskState {
     },
     Completed {
         outcome: TaskOutcome,
-        terminal_at: Instant,
+        terminal_at: TaskInstant,
         evict_timer: Option<AbortHandle>,
     },
     Failed {
         error: McpError,
-        terminal_at: Instant,
+        terminal_at: TaskInstant,
         evict_timer: Option<AbortHandle>,
     },
     Cancelled {
-        terminal_at: Instant,
+        terminal_at: TaskInstant,
         evict_timer: Option<AbortHandle>,
     },
 }
@@ -111,7 +245,7 @@ impl TaskState {
         matches!(self, Self::Working { .. })
     }
 
-    fn terminal_at(&self) -> Option<Instant> {
+    fn terminal_at(&self) -> Option<TaskInstant> {
         match self {
             Self::Working { .. } => None,
             Self::Completed { terminal_at, .. }
@@ -147,7 +281,7 @@ struct TaskEntry {
     owner: String,
     task: Task,
     state: TaskState,
-    created: Instant,
+    created: TaskInstant,
     ttl: Duration,
 }
 
@@ -223,6 +357,7 @@ struct Inner {
 pub struct Tasks {
     inner: Arc<Mutex<Inner>>,
     ttl: Duration,
+    clock: TaskClock,
 }
 
 impl Default for Tasks {
@@ -242,6 +377,16 @@ impl Tasks {
         Self {
             inner: Arc::new(Mutex::new(Inner::default())),
             ttl,
+            clock: TaskClock::system(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_ttl_and_clock(ttl: Duration, clock: ManualClock) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner::default())),
+            ttl,
+            clock: TaskClock::Manual(clock),
         }
     }
 
@@ -282,8 +427,8 @@ impl Tasks {
         Self::shutdown_inner(&self.inner);
     }
 
-    fn sweep_expired(inner_arc: &Arc<Mutex<Inner>>, inner: &mut Inner) {
-        let now = Instant::now();
+    fn sweep_expired(inner_arc: &Arc<Mutex<Inner>>, clock: &TaskClock, inner: &mut Inner) {
+        let now = clock.now();
         // Phase 1: fail overdue running tasks, drop their join handles, and schedule
         // their terminal eviction timers so failed entries never linger without new RPCs.
         for (id, entry) in inner.tasks.iter_mut() {
@@ -292,7 +437,9 @@ impl Tasks {
                 entry.state.abort_handles();
                 let evict_timer = Some(Self::schedule_eviction(
                     inner_arc.clone(),
+                    clock.clone(),
                     id.clone(),
+                    now,
                     entry.ttl,
                 ));
                 entry.state = TaskState::Failed {
@@ -315,16 +462,22 @@ impl Tasks {
         });
     }
 
-    fn schedule_eviction(inner: Arc<Mutex<Inner>>, task_id: String, ttl: Duration) -> AbortHandle {
+    fn schedule_eviction(
+        inner: Arc<Mutex<Inner>>,
+        clock: TaskClock,
+        task_id: String,
+        terminal_at: TaskInstant,
+        ttl: Duration,
+    ) -> AbortHandle {
         tokio::spawn(async move {
-            tokio::time::sleep(ttl).await;
+            clock.sleep_until(terminal_at, ttl).await;
             let removed = {
                 let mut guard = inner.lock();
                 if let Some(entry) = guard.tasks.get(&task_id)
                     && entry
                         .state
                         .terminal_at()
-                        .is_some_and(|at| at.elapsed() >= entry.ttl)
+                        .is_some_and(|at| clock.now().saturating_duration_since(at) >= entry.ttl)
                 {
                     guard.tasks.remove(&task_id)
                 } else {
@@ -342,7 +495,7 @@ impl Tasks {
         if inner.shut_down {
             return false;
         }
-        Self::sweep_expired(&self.inner, &mut inner);
+        Self::sweep_expired(&self.inner, &self.clock, &mut inner);
         inner
             .tasks
             .values()
@@ -365,12 +518,13 @@ impl Tasks {
         request_ct: Option<&CancellationToken>,
     ) -> Result<Task, JoinHandle<TaskOutcome>> {
         let ttl = self.ttl;
-        let (task_id, task, mut cancel_rx) = {
+        let clock = self.clock.clone();
+        let (task_id, task, created, mut cancel_rx) = {
             let mut inner = self.inner.lock();
             if inner.shut_down || request_ct.is_some_and(CancellationToken::is_cancelled) {
                 return Err(work);
             }
-            Self::sweep_expired(&self.inner, &mut inner);
+            Self::sweep_expired(&self.inner, &self.clock, &mut inner);
             let running = inner
                 .tasks
                 .values()
@@ -381,6 +535,7 @@ impl Tasks {
             }
             let task_id = uuid::Uuid::new_v4().to_string();
             let now = current_timestamp();
+            let created = self.clock.now();
             let task = Task::new(task_id.clone(), TaskStatus::Working, now.clone(), now)
                 .with_ttl_ms(ttl.as_millis() as u64)
                 .with_poll_interval_ms(POLL_MS)
@@ -394,11 +549,11 @@ impl Tasks {
                     cancel_tx,
                     join_handle: None,
                 },
-                created: Instant::now(),
+                created,
                 ttl,
             };
             inner.tasks.insert(task_id.clone(), entry);
-            (task_id, task, cancel_rx)
+            (task_id, task, created, cancel_rx)
         };
 
         let inner_arc = self.inner.clone();
@@ -418,7 +573,7 @@ impl Tasks {
                     let _ = work.await;
                     Err(None)
                 }
-                () = tokio::time::sleep(ttl) => {
+                () = clock.sleep_until(created, ttl) => {
                     cancel.store(true, Ordering::Relaxed);
                     let _ = work.await;
                     Err(Some(McpError::internal_error(
@@ -454,10 +609,12 @@ impl Tasks {
                     drop(dropped_outcome);
                     return;
                 }
-                let terminal_at = Instant::now();
+                let terminal_at = clock.now();
                 let evict_timer = Some(Self::schedule_eviction(
                     inner_arc.clone(),
+                    clock.clone(),
                     id_for_task.clone(),
+                    terminal_at,
                     entry.ttl,
                 ));
                 // Re-check acknowledged cancellation under the lock so a cancel that raced
@@ -542,7 +699,7 @@ impl Tasks {
     /// `tasks/get` of `owner`, returning a retained snapshot when completed.
     pub(super) fn get_retained(&self, owner: &str, id: &str) -> Result<TaskSnapshot, McpError> {
         let mut inner = self.inner.lock();
-        Self::sweep_expired(&self.inner, &mut inner);
+        Self::sweep_expired(&self.inner, &self.clock, &mut inner);
         let entry = inner
             .tasks
             .get(id)
@@ -555,7 +712,7 @@ impl Tasks {
     #[cfg(test)]
     pub fn get(&self, owner: &str, id: &str) -> Result<DetailedTask, McpError> {
         let mut inner = self.inner.lock();
-        Self::sweep_expired(&self.inner, &mut inner);
+        Self::sweep_expired(&self.inner, &self.clock, &mut inner);
         let entry = inner
             .tasks
             .get(id)
@@ -571,7 +728,7 @@ impl Tasks {
     /// idempotent acknowledgement that leaves its terminal state unchanged.
     pub fn cancel(&self, owner: &str, id: &str) -> Result<(), McpError> {
         let mut inner = self.inner.lock();
-        Self::sweep_expired(&self.inner, &mut inner);
+        Self::sweep_expired(&self.inner, &self.clock, &mut inner);
         let entry = inner
             .tasks
             .get_mut(id)
@@ -591,7 +748,7 @@ impl Tasks {
     /// `tasks/update` of `owner`: no tool asks for input during a task.
     pub fn update(&self, owner: &str, id: &str) -> Result<(), McpError> {
         let mut inner = self.inner.lock();
-        Self::sweep_expired(&self.inner, &mut inner);
+        Self::sweep_expired(&self.inner, &self.clock, &mut inner);
         let _ = inner
             .tasks
             .get(id)

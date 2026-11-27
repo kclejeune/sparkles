@@ -25,8 +25,8 @@
 use super::data::Value;
 use super::index::{BOTTOM, Ex, Halt, Index, Node, Role};
 use super::saturate::{
-    CONCLUSION_BYTES, CONTEXT_BYTES, Concl, Contexts, Dynamic, Sink, State, apply, flatten, init,
-    init_conjunction,
+    CONCLUSION_BYTES, CONTEXT_BYTES, Concl, Contexts, Dynamic, REAL_ROOT, Sink, State, apply,
+    flatten, init, init_conjunction,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
@@ -84,27 +84,383 @@ impl View for GlobalAll<'_> {
     }
 }
 
+/// Maximum number of pre-broadcast grounded `(filler, witness_ctx)` supports kept per
+/// global universal fact for incremental EL invalidation (roadmap item 664).
+const MAX_UNIVERSAL_SUPPORTS: usize = 4;
+
+/// Polling cadence for cooperative cancellation checks in dependency scans.
+const DEP_POLL_STEP: usize = 4096;
+
+/// A global universal fact derived in Phase 2 together with pre-broadcast grounded
+/// `(filler, witness_ctx)` supports that held strictly before `fact` was injected.
+#[derive(Clone, Debug)]
+pub struct UniversalSupport {
+    pub fact: Ex,
+    pub supports: Vec<(Ex, Ex)>,
+}
+
+impl UniversalSupport {
+    pub fn bytes(&self) -> usize {
+        std::mem::size_of::<UniversalSupport>().saturating_add(
+            self.supports
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(Ex, Ex)>()),
+        )
+    }
+}
+
+#[inline]
+fn polled_contains_ex<E>(
+    slice: &[Ex],
+    target: Ex,
+    since_poll: &mut usize,
+    poll: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    for &item in slice {
+        *since_poll = since_poll.saturating_add(1);
+        if *since_poll >= DEP_POLL_STEP {
+            *since_poll = 0;
+            poll()?;
+        }
+        if item == target {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[inline]
+fn polled_find_support_index<E>(
+    supports: &[UniversalSupport],
+    fact: Ex,
+    since_poll: &mut usize,
+    poll: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Option<usize>, E> {
+    for (idx, u) in supports.iter().enumerate() {
+        *since_poll = since_poll.saturating_add(1);
+        if *since_poll >= DEP_POLL_STEP {
+            *since_poll = 0;
+            poll()?;
+        }
+        if u.fact == fact {
+            return Ok(Some(idx));
+        }
+    }
+    Ok(None)
+}
+
+/// Allocation request emitted by [`universal_facts_with_supports_polled`] so mandatory
+/// fact-vector growth and optional support storage share one live memory ledger.
+pub enum UniversalAlloc<'a> {
+    /// Mandatory growth of the returned `facts` vector by `grow` slots while
+    /// `supports_bytes` of optional support storage is live. Implementations must admit
+    /// `(old_cap + new_cap) * size_of::<Ex>() + supports_bytes`, run
+    /// `facts.try_reserve_exact(grow)`, and return `Ok(true)` on success, `Ok(false)`
+    /// only when `can_drop_supports` is true and admission failed, or `Err` on fatal
+    /// refusal / allocation failure.
+    Facts {
+        facts: &'a mut Vec<Ex>,
+        grow: usize,
+        supports_bytes: usize,
+        can_drop_supports: bool,
+    },
+    /// Optional admission of `peak_add` bytes for `supports_out` while `facts_bytes` and
+    /// `supports_bytes` are already live. Returns `Ok(true)` when admitted or `Ok(false)`
+    /// on refusal so optional tracking can be dropped cleanly.
+    Supports {
+        facts_bytes: usize,
+        supports_bytes: usize,
+        peak_add: usize,
+    },
+}
+
 /// The facts of universal roles that `known` lacks and some real context now gives: a
-/// negative `∃u.F` on a universal role u holds everywhere once F has an instance.
-pub fn universal_facts(ix: &Index, view: &dyn View, known: &[Ex]) -> Vec<Ex> {
+/// negative `∃u.F` on a universal role u holds everywhere once F has an instance,
+/// polling `poll` cooperatively across contexts, rules, and membership checks and
+/// pre-admitting every growth of the returned fact buffer via `reserve_facts`.
+pub fn universal_facts_polled<E>(
+    ix: &Index,
+    view: &dyn View,
+    known: &[Ex],
+    poll: &mut impl FnMut() -> Result<(), E>,
+    reserve_facts: &mut impl FnMut(&mut Vec<Ex>, usize) -> Result<(), E>,
+) -> Result<Vec<Ex>, E> {
     let mut out: Vec<Ex> = Vec::new();
     if ix.universal.is_empty() {
-        return out;
+        return Ok(out);
     }
+    let mut since_poll = 0usize;
+    let mut stop_err: Option<E> = None;
     for e in 0..view.len() as Ex {
+        since_poll = since_poll.saturating_add(1);
+        if since_poll >= DEP_POLL_STEP {
+            since_poll = 0;
+            poll()?;
+        }
         view.with(e, &mut |st, real| {
-            if !real {
+            if !real || stop_err.is_some() {
                 return;
             }
             for &(f, x) in &ix.universal {
-                if !known.contains(&x) && !out.contains(&x) && st.subs.contains(&f) {
-                    out.push(x);
+                since_poll = since_poll.saturating_add(1);
+                if since_poll >= DEP_POLL_STEP {
+                    since_poll = 0;
+                    if let Err(err) = poll() {
+                        stop_err = Some(err);
+                        return;
+                    }
+                }
+                #[cfg(test)]
+                super::el_test_hooks::scan_progress(super::el_test_hooks::ScanKind::Universal);
+                if !st.subs.contains(&f) {
+                    continue;
+                }
+                match polled_contains_ex(known, x, &mut since_poll, poll) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(err) => {
+                        stop_err = Some(err);
+                        return;
+                    }
+                }
+                match polled_contains_ex(&out, x, &mut since_poll, poll) {
+                    Ok(true) => continue,
+                    Ok(false) => {
+                        if out.len() == out.capacity() {
+                            let grow = out.capacity().max(4);
+                            if let Err(err) = reserve_facts(&mut out, grow) {
+                                stop_err = Some(err);
+                                return;
+                            }
+                        }
+                        out.push(x);
+                    }
+                    Err(err) => {
+                        stop_err = Some(err);
+                        return;
+                    }
                 }
             }
         });
+        if let Some(err) = stop_err {
+            return Err(err);
+        }
     }
     out.sort_unstable();
-    out
+    #[cfg(test)]
+    super::el_test_hooks::scan_completed(super::el_test_hooks::ScanKind::Universal);
+    Ok(out)
+}
+
+/// Return payload for [`universal_facts_with_supports_polled`]: mandatory universal
+/// facts paired with optional pre-admitted support witnesses and their tracked byte cost.
+pub type UniversalFactsTracked = (Vec<Ex>, Option<(Vec<UniversalSupport>, usize)>);
+
+/// Like [`universal_facts_polled`], recording up to [`MAX_UNIVERSAL_SUPPORTS`]
+/// pre-broadcast `(filler, witness_ctx)` pairs per newly derived universal fact when
+/// `admit` admits both mandatory fact-buffer growth and optional support storage
+/// (including vector reallocation overlap) before each allocation.
+///
+/// If optional support admission is refused, or if mandatory fact-buffer growth needs
+/// the headroom held by optional supports, optional support tracking is dropped cleanly
+/// (`None` in the second tuple element) while mandatory universal facts are still
+/// admitted and returned in full.
+pub fn universal_facts_with_supports_polled<E>(
+    ix: &Index,
+    view: &dyn View,
+    known: &[Ex],
+    poll: &mut impl FnMut() -> Result<(), E>,
+    admit: &mut impl FnMut(UniversalAlloc<'_>) -> Result<bool, E>,
+) -> Result<UniversalFactsTracked, E> {
+    let mut facts: Vec<Ex> = Vec::new();
+    let mut supports_out: Vec<UniversalSupport> = Vec::new();
+    let mut tracking = true;
+    let mut admitted_bytes = 0usize;
+    if ix.universal.is_empty() {
+        return Ok((facts, Some((supports_out, 0))));
+    }
+    let mut since_poll = 0usize;
+    let mut stop_err: Option<E> = None;
+    for e in 0..view.len() as Ex {
+        since_poll = since_poll.saturating_add(1);
+        if since_poll >= DEP_POLL_STEP {
+            since_poll = 0;
+            poll()?;
+        }
+        view.with(e, &mut |st, real| {
+            if !real || stop_err.is_some() {
+                return;
+            }
+            for &(f, x) in &ix.universal {
+                since_poll = since_poll.saturating_add(1);
+                if since_poll >= DEP_POLL_STEP {
+                    since_poll = 0;
+                    if let Err(err) = poll() {
+                        stop_err = Some(err);
+                        return;
+                    }
+                }
+                #[cfg(test)]
+                super::el_test_hooks::scan_progress(super::el_test_hooks::ScanKind::Universal);
+                if !st.subs.contains(&f) {
+                    continue;
+                }
+                match polled_contains_ex(known, x, &mut since_poll, poll) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(err) => {
+                        stop_err = Some(err);
+                        return;
+                    }
+                }
+                match polled_contains_ex(&facts, x, &mut since_poll, poll) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if facts.len() == facts.capacity() {
+                            let grow = facts.capacity().max(4);
+                            let can_drop_supports = tracking && admitted_bytes > 0;
+                            match admit(UniversalAlloc::Facts {
+                                facts: &mut facts,
+                                grow,
+                                supports_bytes: if tracking { admitted_bytes } else { 0 },
+                                can_drop_supports,
+                            }) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    supports_out = Vec::new();
+                                    tracking = false;
+                                    admitted_bytes = 0;
+                                    match admit(UniversalAlloc::Facts {
+                                        facts: &mut facts,
+                                        grow,
+                                        supports_bytes: 0,
+                                        can_drop_supports: false,
+                                    }) {
+                                        Ok(true) => {}
+                                        Ok(false) => return,
+                                        Err(err) => {
+                                            stop_err = Some(err);
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    stop_err = Some(err);
+                                    return;
+                                }
+                            }
+                        }
+                        facts.push(x);
+                    }
+                    Err(err) => {
+                        stop_err = Some(err);
+                        return;
+                    }
+                }
+                if !tracking {
+                    continue;
+                }
+                let found_idx =
+                    match polled_find_support_index(&supports_out, x, &mut since_poll, poll) {
+                        Ok(idx) => idx,
+                        Err(err) => {
+                            stop_err = Some(err);
+                            return;
+                        }
+                    };
+                if let Some(idx) = found_idx {
+                    let entry = &mut supports_out[idx];
+                    if entry.supports.len() < MAX_UNIVERSAL_SUPPORTS
+                        && !entry.supports.contains(&(f, e))
+                    {
+                        entry.supports.push((f, e));
+                    }
+                } else {
+                    let old_cap = supports_out.capacity();
+                    let vec_grow = if supports_out.len() == old_cap {
+                        old_cap.max(4)
+                    } else {
+                        0
+                    };
+                    let elem = std::mem::size_of::<UniversalSupport>();
+                    let sup_buf =
+                        MAX_UNIVERSAL_SUPPORTS.saturating_mul(std::mem::size_of::<(Ex, Ex)>());
+                    let retained_add = vec_grow.saturating_mul(elem).saturating_add(sup_buf);
+                    // During `try_reserve_exact(vec_grow)`, the old and new buffers overlap.
+                    let peak_add = if vec_grow > 0 {
+                        old_cap
+                            .saturating_add(vec_grow)
+                            .saturating_mul(elem)
+                            .saturating_add(sup_buf)
+                    } else {
+                        sup_buf
+                    };
+                    let facts_bytes = facts.capacity().saturating_mul(std::mem::size_of::<Ex>());
+                    match admit(UniversalAlloc::Supports {
+                        facts_bytes,
+                        supports_bytes: admitted_bytes,
+                        peak_add,
+                    }) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            supports_out = Vec::new();
+                            tracking = false;
+                            admitted_bytes = 0;
+                            continue;
+                        }
+                        Err(err) => {
+                            stop_err = Some(err);
+                            return;
+                        }
+                    }
+                    if vec_grow > 0 && supports_out.try_reserve_exact(vec_grow).is_err() {
+                        supports_out = Vec::new();
+                        tracking = false;
+                        admitted_bytes = 0;
+                        continue;
+                    }
+                    let mut supports = Vec::new();
+                    if supports.try_reserve_exact(MAX_UNIVERSAL_SUPPORTS).is_err() {
+                        supports_out = Vec::new();
+                        tracking = false;
+                        admitted_bytes = 0;
+                        continue;
+                    }
+                    supports.push((f, e));
+                    supports_out.push(UniversalSupport { fact: x, supports });
+                    admitted_bytes = admitted_bytes.saturating_add(retained_add);
+                }
+            }
+        });
+        if let Some(err) = stop_err {
+            return Err(err);
+        }
+    }
+    facts.sort_unstable();
+    #[cfg(test)]
+    super::el_test_hooks::scan_completed(super::el_test_hooks::ScanKind::Universal);
+    if tracking {
+        supports_out.sort_unstable_by_key(|u| u.fact);
+        let actual_bytes = supports_out
+            .capacity()
+            .saturating_mul(std::mem::size_of::<UniversalSupport>())
+            .saturating_add(
+                supports_out
+                    .iter()
+                    .map(|u| {
+                        u.supports
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<(Ex, Ex)>())
+                    })
+                    .sum::<usize>(),
+            );
+        Ok((
+            facts,
+            Some((supports_out, actual_bytes.max(admitted_bytes))),
+        ))
+    } else {
+        Ok((facts, None))
+    }
 }
 
 /// Reports live changes. An installed named-domain table gives its worlds direct
@@ -152,6 +508,16 @@ impl Reporter<'_> {
 /// admitted until their owners die; only the returned pair owner outlives this call.
 pub struct KeyMerges<'a> {
     pairs: KeyStorage<'a, (Ex, Ex)>,
+}
+impl KeyMerges<'_> {
+    /// Take ownership of the already-admitted pair storage together with its exact
+    /// admitted byte capacity without copying. The caller must transfer that debit into
+    /// its own live ledger before `self` drops and retires the `KeyStorage` debit.
+    pub fn into_vec(mut self) -> (Vec<(Ex, Ex)>, usize) {
+        let bytes = self.pairs._scratch.bytes;
+        let rows = std::mem::take(&mut self.pairs.rows);
+        (rows, bytes)
+    }
 }
 impl std::ops::Deref for KeyMerges<'_> {
     type Target = [(Ex, Ex)];
@@ -404,12 +770,622 @@ fn key_records(
     Ok(())
 }
 
+/// Exact causal dependency record for a pair `(a, b)` of named individuals merged by a
+/// key in global Phase 2 (roadmap item 664).
+#[derive(Clone, Debug)]
+pub struct KeyMergeDep {
+    pub key: super::index::Key,
+    pub a: Ex,
+    pub b: Ex,
+    /// Contexts that must stay kept and `still_real` (`a`, `b`, and every `src_a`/`src_b`).
+    pub real_deps: Vec<Ex>,
+    /// Contexts that must stay kept (every `t_a`/`t_b` object-property target context).
+    pub ctx_deps: Vec<Ex>,
+}
+
+impl KeyMergeDep {
+    pub fn bytes(&self) -> usize {
+        std::mem::size_of::<KeyMergeDep>()
+            .saturating_add(
+                self.key
+                    .bytes()
+                    .saturating_sub(std::mem::size_of::<super::index::Key>()),
+            )
+            .saturating_add(
+                self.real_deps
+                    .capacity()
+                    .saturating_add(self.ctx_deps.capacity())
+                    .saturating_mul(std::mem::size_of::<Ex>()),
+            )
+    }
+}
+
+/// Whether `e` is a named individual or stands for one in `st`, polling cooperatively.
+pub fn has_named_alias_polled<E>(
+    ix: &Index,
+    e: Ex,
+    st: &State,
+    poll_step: &mut impl FnMut(usize) -> Result<(), E>,
+) -> Result<bool, E> {
+    if ix.named_nominal(e) {
+        return Ok(true);
+    }
+    for &n in st.noms() {
+        poll_step(1)?;
+        if ix.named_nominal(n) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether context `e` (with state `st`) can contribute a member, source, object target,
+/// or data value to `key`, polling `poll_step` cooperatively inside all nested loops.
+pub fn context_touches_key_polled<E>(
+    ix: &Index,
+    e: Ex,
+    st: &State,
+    key: &super::index::Key,
+    poll_step: &mut impl FnMut(usize) -> Result<(), E>,
+) -> Result<bool, E> {
+    if !has_named_alias_polled(ix, e, st, poll_step)? {
+        #[cfg(test)]
+        super::el_test_hooks::scan_completed(super::el_test_hooks::ScanKind::KeyTouch);
+        return Ok(false);
+    }
+    if st.subs.contains(&key.class) {
+        #[cfg(test)]
+        super::el_test_hooks::scan_completed(super::el_test_hooks::ScanKind::KeyTouch);
+        return Ok(true);
+    }
+    for (role, _) in &st.back {
+        poll_step(1)?;
+        for &op in &key.objects {
+            poll_step(1)?;
+            #[cfg(test)]
+            super::el_test_hooks::scan_progress(super::el_test_hooks::ScanKind::KeyTouch);
+            if !ix.is_universal(op) && ix.roles.sub(*role, op) {
+                #[cfg(test)]
+                super::el_test_hooks::scan_completed(super::el_test_hooks::ScanKind::KeyTouch);
+                return Ok(true);
+            }
+        }
+    }
+    if !key.data.is_empty() {
+        for &sub in &st.subs {
+            poll_step(1)?;
+            #[cfg(test)]
+            super::el_test_hooks::scan_progress(super::el_test_hooks::ScanKind::KeyTouch);
+            if let Node::DataSome(role, _) = ix.head(sub).node {
+                for &dp in &key.data {
+                    poll_step(1)?;
+                    #[cfg(test)]
+                    super::el_test_hooks::scan_progress(super::el_test_hooks::ScanKind::KeyTouch);
+                    if !ix.is_universal(dp) && ix.roles.sub(role, dp) {
+                        #[cfg(test)]
+                        super::el_test_hooks::scan_completed(
+                            super::el_test_hooks::ScanKind::KeyTouch,
+                        );
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        if let Some(extra) = &st.extra {
+            for group in &extra.groups {
+                poll_step(1)?;
+                for &r in &group.roles {
+                    poll_step(1)?;
+                    for &dp in &key.data {
+                        poll_step(1)?;
+                        #[cfg(test)]
+                        super::el_test_hooks::scan_progress(
+                            super::el_test_hooks::ScanKind::KeyTouch,
+                        );
+                        if !ix.is_universal(dp) && ix.roles.sub(r, dp) {
+                            #[cfg(test)]
+                            super::el_test_hooks::scan_completed(
+                                super::el_test_hooks::ScanKind::KeyTouch,
+                            );
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(test)]
+    super::el_test_hooks::scan_completed(super::el_test_hooks::ScanKind::KeyTouch);
+    Ok(false)
+}
+
+/// Replays retained non-`FINE` datatype-checker evaluations from a reused conditional
+/// world into the new index's sticky vector while polling `poll_step` cooperatively.
+pub fn replay_world_dt_sticky_polled<E>(
+    ix: &Index,
+    sticky_rows: &[(u32, u8)],
+    poll_step: &mut impl FnMut(usize) -> Result<(), E>,
+) -> Result<(), E> {
+    super::dt_sat::replay_sticky_polled(ix, sticky_rows, DEP_POLL_STEP, poll_step)
+}
+
 pub fn key_merges<'a>(
     ix: &Index,
     view: &dyn View,
     bound: &'a (dyn Fn(isize) -> bool + Sync),
 ) -> Result<KeyMerges<'a>, Halt> {
     key_merges_reported(ix, view, Reporter::Callback(bound))
+}
+
+/// Return payload for [`key_merges_with_deps`]: mandatory key merges paired with
+/// optional pre-admitted dependency witnesses and their tracked byte cost.
+pub(super) type KeyMergesTracked<'a> = (KeyMerges<'a>, Option<(Vec<KeyMergeDep>, usize)>);
+
+/// Like [`key_merges`], also returning one grounded [`KeyMergeDep`] for each distinct
+/// merged pair `(a, b)` when `budget` admits the optional dependency storage.
+///
+/// Optional dependency storage (deduplication set, per-key scratch, and `KeyMergeDep`
+/// records) is pre-admitted non-fatally through `budget.try_admit_optional` before
+/// allocating. On refusal, optional tracking drops cleanly (`None`) while mandatory
+/// `KeyMerges` still complete within budget.
+pub(super) fn key_merges_with_deps<'a>(
+    ix: &Index,
+    view: &dyn View,
+    bound: &'a (dyn Fn(isize) -> bool + Sync),
+    budget: &super::WorldBudget<'a>,
+) -> Result<KeyMergesTracked<'a>, Halt> {
+    let reporter = Reporter::Callback(bound);
+    let mut found = 0;
+    for key in &ix.keys {
+        key_matches(ix, view, key, 0, reporter, |_| key_add(&mut found, 1))?;
+    }
+    let mut pairs = KeyStorage::new(found, reporter)?;
+    let live = pairs._scratch.bytes;
+    let mut tracking = true;
+    // Declare each debit guard BEFORE the heap container it covers so reverse local drop
+    // order always frees the buffer before retiring its ledger charge.
+    let mut deps_debit = super::OptionalDebit::new(budget, 0);
+    let mut deps: Vec<KeyMergeDep> = Vec::new();
+    let mut seen_debit = super::OptionalDebit::new(budget, 0);
+    let mut seen_pairs: FxHashSet<(Ex, Ex)> = FxHashSet::default();
+    if found > 0 {
+        let seen_bound =
+            super::dl_clause::hash_table_grow_bound(0, 0, found, std::mem::size_of::<(Ex, Ex)>())
+                .unwrap_or(usize::MAX);
+        match budget.try_admit_optional(seen_bound) {
+            super::OptionalAdmit::Accepted => {
+                seen_debit.add(seen_bound);
+            }
+            super::OptionalAdmit::Refused => {
+                tracking = false;
+            }
+            super::OptionalAdmit::Stopped => return Err(Halt::Stopped),
+        }
+    }
+    for key in &ix.keys {
+        if !tracking {
+            key_matches(ix, view, key, live, reporter, |pair| pairs.push(pair))?;
+            continue;
+        }
+        let scratch_real_cap = 2usize
+            .saturating_add(key.objects.len().saturating_mul(2))
+            .saturating_add(key.data.len().saturating_mul(2));
+        let scratch_ctx_cap = key.objects.len().saturating_mul(2);
+        let scratch_bytes = scratch_real_cap
+            .saturating_add(scratch_ctx_cap)
+            .saturating_mul(std::mem::size_of::<Ex>());
+        let mut scratch_debit = super::OptionalDebit::new(budget, 0);
+        match budget.try_admit_optional(scratch_bytes) {
+            super::OptionalAdmit::Accepted => {
+                scratch_debit.add(scratch_bytes);
+            }
+            super::OptionalAdmit::Refused => {
+                deps = Vec::new();
+                deps_debit.retire_now();
+                seen_pairs = FxHashSet::default();
+                seen_debit.retire_now();
+                tracking = false;
+                key_matches(ix, view, key, live, reporter, |pair| pairs.push(pair))?;
+                continue;
+            }
+            super::OptionalAdmit::Stopped => return Err(Halt::Stopped),
+        }
+        let mut scratch_real: Vec<Ex> = Vec::new();
+        let mut scratch_ctx: Vec<Ex> = Vec::new();
+        if scratch_real.try_reserve_exact(scratch_real_cap).is_err()
+            || scratch_ctx.try_reserve_exact(scratch_ctx_cap).is_err()
+        {
+            drop(scratch_real);
+            drop(scratch_ctx);
+            scratch_debit.retire_now();
+            deps = Vec::new();
+            deps_debit.retire_now();
+            seen_pairs = FxHashSet::default();
+            seen_debit.retire_now();
+            tracking = false;
+            key_matches(ix, view, key, live, reporter, |pair| pairs.push(pair))?;
+            continue;
+        }
+        key_matches_with_deps(
+            ix,
+            view,
+            key,
+            live,
+            reporter,
+            &mut scratch_real,
+            &mut scratch_ctx,
+            |a, b, real_slice, ctx_slice| {
+                pairs.push((a, b))?;
+                if !tracking || !seen_pairs.insert((a, b)) {
+                    return Ok(());
+                }
+                let old_cap = deps.capacity();
+                let vec_grow = if deps.len() == old_cap {
+                    old_cap.max(4).min(found.saturating_sub(deps.len()).max(1))
+                } else {
+                    0
+                };
+                let elem = std::mem::size_of::<KeyMergeDep>();
+                let key_payload = key
+                    .objects
+                    .len()
+                    .saturating_add(key.data.len())
+                    .saturating_mul(std::mem::size_of::<Role>());
+                let dep_payload = real_slice
+                    .len()
+                    .saturating_add(ctx_slice.len())
+                    .saturating_mul(std::mem::size_of::<Ex>());
+                let retained_delta = vec_grow
+                    .saturating_mul(elem)
+                    .saturating_add(key_payload)
+                    .saturating_add(dep_payload);
+                // When reallocating `deps`, both old and new buffers are live simultaneously.
+                let overlap_old = if vec_grow > 0 {
+                    old_cap.saturating_mul(elem)
+                } else {
+                    0
+                };
+                let peak_delta = retained_delta.saturating_add(overlap_old);
+                let mut step_debit = super::OptionalDebit::new(budget, 0);
+                match budget.try_admit_optional(peak_delta) {
+                    super::OptionalAdmit::Accepted => {
+                        step_debit.add(peak_delta);
+                    }
+                    super::OptionalAdmit::Refused => {
+                        deps = Vec::new();
+                        deps_debit.retire_now();
+                        seen_pairs = FxHashSet::default();
+                        seen_debit.retire_now();
+                        tracking = false;
+                        return Ok(());
+                    }
+                    super::OptionalAdmit::Stopped => return Err(Halt::Stopped),
+                }
+                if vec_grow > 0 && deps.try_reserve_exact(vec_grow).is_err() {
+                    deps = Vec::new();
+                    step_debit.retire_now();
+                    deps_debit.retire_now();
+                    seen_pairs = FxHashSet::default();
+                    seen_debit.retire_now();
+                    tracking = false;
+                    return Ok(());
+                }
+                // Reallocation succeeded and freed the old `deps` backing buffer; retire
+                // the transient overlap while transferring the retained charge.
+                if overlap_old > 0 {
+                    let total = step_debit.disarm();
+                    let ret = total.saturating_sub(overlap_old);
+                    if let Ok(ov) = isize::try_from(overlap_old) {
+                        budget.retire(ov);
+                    }
+                    step_debit.add(ret);
+                }
+                let mut objects = Vec::new();
+                let mut data = Vec::new();
+                let mut real_deps = Vec::new();
+                let mut ctx_deps = Vec::new();
+                if objects.try_reserve_exact(key.objects.len()).is_err()
+                    || data.try_reserve_exact(key.data.len()).is_err()
+                    || real_deps.try_reserve_exact(real_slice.len()).is_err()
+                    || ctx_deps.try_reserve_exact(ctx_slice.len()).is_err()
+                {
+                    drop(objects);
+                    drop(data);
+                    drop(real_deps);
+                    drop(ctx_deps);
+                    deps = Vec::new();
+                    step_debit.retire_now();
+                    deps_debit.retire_now();
+                    seen_pairs = FxHashSet::default();
+                    seen_debit.retire_now();
+                    tracking = false;
+                    return Ok(());
+                }
+                objects.extend_from_slice(&key.objects);
+                data.extend_from_slice(&key.data);
+                real_deps.extend_from_slice(real_slice);
+                ctx_deps.extend_from_slice(ctx_slice);
+                deps.push(KeyMergeDep {
+                    key: super::index::Key {
+                        class: key.class,
+                        objects,
+                        data,
+                    },
+                    a,
+                    b,
+                    real_deps,
+                    ctx_deps,
+                });
+                deps_debit.add(step_debit.disarm());
+                Ok(())
+            },
+        )?;
+        drop(scratch_real);
+        drop(scratch_ctx);
+        scratch_debit.retire_now();
+    }
+    drop(seen_pairs);
+    seen_debit.retire_now();
+    pairs.rows.sort_unstable();
+    pairs.rows.dedup();
+    if tracking {
+        deps.sort_unstable_by_key(|d| (d.a, d.b));
+        let retained_bytes = deps
+            .capacity()
+            .saturating_mul(std::mem::size_of::<KeyMergeDep>())
+            .saturating_add(
+                deps.iter()
+                    .map(|d| d.bytes().saturating_sub(std::mem::size_of::<KeyMergeDep>()))
+                    .sum::<usize>(),
+            );
+        drop(deps_debit);
+        Ok((KeyMerges { pairs }, Some((deps, retained_bytes))))
+    } else {
+        drop(deps_debit);
+        Ok((KeyMerges { pairs }, None))
+    }
+}
+
+fn key_records_with_ctx(
+    ix: &Index,
+    view: &dyn View,
+    key: &super::index::Key,
+    sources: &[(Ex, Ex)],
+    bound: &(dyn Fn(isize) -> bool + Sync),
+    mut object: impl FnMut((Ex, Role, Ex, Ex, Ex)) -> Result<(), Halt>,
+    mut data: impl FnMut(Ex, Role, &Value, Ex) -> Result<(), Halt>,
+) -> Result<(), Halt> {
+    let object_role = |r| {
+        key.objects
+            .iter()
+            .any(|&p| !ix.is_universal(p) && ix.roles.sub(r, p))
+    };
+    let data_role = |r| {
+        key.data
+            .iter()
+            .any(|&p| !ix.is_universal(p) && ix.roles.sub(r, p))
+    };
+    for e in 0..view.len() as Ex {
+        key_poll(bound)?;
+        let mut status = Ok(());
+        view.with(e, &mut |st, real| {
+            status = (|| {
+                for (role, srcs) in &st.back {
+                    key_poll(bound)?;
+                    if !object_role(*role) {
+                        continue;
+                    }
+                    for src in &srcs.list {
+                        key_poll(bound)?;
+                        for &(_, individual) in source_aliases(sources, *src) {
+                            for target in key_aliases(ix, e, st) {
+                                key_poll(bound)?;
+                                object((individual, *role, target, *src, e))?;
+                            }
+                        }
+                    }
+                }
+                if !real {
+                    return Ok(());
+                }
+                for &(_, individual) in source_aliases(sources, e) {
+                    for &sub in &st.subs {
+                        key_poll(bound)?;
+                        let head = ix.head(sub);
+                        if let Node::DataSome(role, _) = head.node
+                            && data_role(role)
+                            && let Some(value) = ix.vals[head.succ as usize].single()
+                        {
+                            data(individual, role, value, e)?;
+                        }
+                    }
+                    if let Some(extra) = &st.extra {
+                        for group in &extra.groups {
+                            key_poll(bound)?;
+                            if let Some(value) = group.val.single() {
+                                for &role in &group.roles {
+                                    key_poll(bound)?;
+                                    if data_role(role) {
+                                        data(individual, role, value, e)?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })();
+        });
+        status?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn key_matches_with_deps(
+    ix: &Index,
+    view: &dyn View,
+    key: &super::index::Key,
+    live: usize,
+    reporter: Reporter<'_>,
+    real_deps: &mut Vec<Ex>,
+    ctx_deps: &mut Vec<Ex>,
+    mut emit: impl FnMut(Ex, Ex, &[Ex], &[Ex]) -> Result<(), Halt>,
+) -> Result<(), Halt> {
+    let report = |delta| reporter.tell(delta);
+    let bound: &(dyn Fn(isize) -> bool + Sync) = match reporter {
+        Reporter::Callback(bound) => bound,
+        Reporter::NamedDomain(_) => &report,
+    };
+    let count = key_member_count(ix, view, key.class, bound)?;
+    if count < 2 {
+        return Ok(());
+    }
+    let mut members = KeyStorage::with_live(count, 0, live, reporter)?;
+    for &individual in &ix.nominals {
+        key_poll(bound)?;
+        if key_member(ix, view, individual, key.class) {
+            members.push(individual)?;
+        }
+    }
+    let mut count = 0;
+    key_sources(ix, view, &members.rows, bound, |_| key_add(&mut count, 1))?;
+    let mut sources = KeyStorage::with_live(
+        count,
+        0,
+        key_live(&[live, members._scratch.bytes])?,
+        reporter,
+    )?;
+    key_sources(ix, view, &members.rows, bound, |row| sources.push(row))?;
+    sources.rows.sort_unstable();
+    let (mut object_count, mut data_count, mut data_payload) = (0, 0, 0);
+    key_records_with_ctx(
+        ix,
+        view,
+        key,
+        &sources.rows,
+        bound,
+        |_| key_add(&mut object_count, 1),
+        |_, _, value, _| {
+            key_add(&mut data_count, 1)?;
+            key_add(&mut data_payload, key_value_copy_bytes(value)?)
+        },
+    )?;
+    let held = key_live(&[live, members._scratch.bytes, sources._scratch.bytes])?;
+    let mut objects = KeyStorage::with_live(object_count, 0, held, reporter)?;
+    let mut data = KeyStorage::with_live(
+        data_count,
+        data_payload,
+        key_live(&[held, objects._scratch.bytes])?,
+        reporter,
+    )?;
+    key_records_with_ctx(
+        ix,
+        view,
+        key,
+        &sources.rows,
+        bound,
+        |row| objects.push(row),
+        |individual, role, value, src| data.push((individual, role, value.clone(), src)),
+    )?;
+    objects.rows.sort_unstable_by_key(|row| row.0);
+    data.rows.sort_unstable_by_key(|row| row.0);
+    for (position, &a) in members.rows.iter().enumerate() {
+        let (a_objects, a_data) = (
+            owned(&objects.rows, a, |row| row.0),
+            owned(&data.rows, a, |row| row.0),
+        );
+        for &b in &members.rows[position + 1..] {
+            key_poll(bound)?;
+            let mut already_merged = false;
+            view.with(a, &mut |st, _| already_merged = st.subs.contains(&b));
+            if already_merged {
+                continue;
+            }
+            let (b_objects, b_data) = (
+                owned(&objects.rows, b, |row| row.0),
+                owned(&data.rows, b, |row| row.0),
+            );
+            let mut matches = true;
+            real_deps.clear();
+            real_deps.push(a);
+            real_deps.push(b);
+            ctx_deps.clear();
+            for &role in &key.objects {
+                key_poll(bound)?;
+                if ix.is_universal(role) {
+                    continue;
+                }
+                let mut found = None;
+                for &(_, r, target, src_a, t_a) in a_objects {
+                    key_poll(bound)?;
+                    if !ix.roles.sub(r, role) {
+                        continue;
+                    }
+                    for &(_, s, shared, src_b, t_b) in b_objects {
+                        key_poll(bound)?;
+                        if shared == target && ix.roles.sub(s, role) {
+                            found = Some((src_a, t_a, src_b, t_b));
+                            break;
+                        }
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+                }
+                if let Some((src_a, t_a, src_b, t_b)) = found {
+                    real_deps.push(src_a);
+                    real_deps.push(src_b);
+                    ctx_deps.push(t_a);
+                    ctx_deps.push(t_b);
+                } else {
+                    matches = false;
+                    break;
+                }
+            }
+            if !matches {
+                continue;
+            }
+            for &role in &key.data {
+                key_poll(bound)?;
+                if ix.is_universal(role) {
+                    continue;
+                }
+                let mut found = None;
+                for (_, r, value, src_a) in a_data {
+                    key_poll(bound)?;
+                    if !ix.roles.sub(*r, role) {
+                        continue;
+                    }
+                    for (_, s, shared, src_b) in b_data {
+                        key_poll(bound)?;
+                        if shared == value && ix.roles.sub(*s, role) {
+                            found = Some((*src_a, *src_b));
+                            break;
+                        }
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+                }
+                if let Some((src_a, src_b)) = found {
+                    real_deps.push(src_a);
+                    real_deps.push(src_b);
+                } else {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                real_deps.sort_unstable();
+                real_deps.dedup();
+                ctx_deps.sort_unstable();
+                ctx_deps.dedup();
+                emit(a, b, real_deps.as_slice(), ctx_deps.as_slice())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn key_merges_reported<'a>(
@@ -1002,7 +1978,7 @@ impl Sink for WorldSink<'_> {
         if self.halted.get() {
             return;
         }
-        if to == self.me && c != Concl::Real {
+        if to == self.me && !matches!(c, Concl::Real(_)) {
             self.local.push(c);
         } else {
             self.out.push((to, c));
@@ -1146,6 +2122,78 @@ impl View for World<'_> {
     fn len(&self) -> usize {
         self.local.base() as usize + self.local.len()
     }
+}
+
+/// Incremental dependency record for a cached conditional world (roadmap item 664).
+#[derive(Clone, Debug, Default)]
+pub struct WorldDep {
+    /// Sorted global contexts that this world read or copied.
+    pub used_contexts: Vec<Ex>,
+    /// Sorted subsumers derived or held in the world's copied slots, checked against
+    /// `changed` on the next run.
+    pub used_exprs: Vec<Ex>,
+    /// Keys in the index that interacted with any slot of this world.
+    pub watched_keys: Vec<super::index::Key>,
+    /// Whether any slot of this world had a named individual alias (so an added key
+    /// could potentially fire in this world).
+    pub touched_named: bool,
+    /// Whether this world derived any world-local universal fact.
+    pub had_world_universal: bool,
+    /// Sorted datatype-checker component ids evaluated in the world's copied slots.
+    pub dt_comps: Vec<u32>,
+    /// Non-`FINE` `(component, status)` pairs to replay into `ix.dt.sticky` when reused.
+    pub dt_sticky: Vec<(u32, u8)>,
+}
+
+impl WorldDep {
+    /// Heap payload bytes owned by this dependency record (excluding inline `size_of::<WorldDep>()`).
+    pub fn heap_bytes(&self) -> usize {
+        self.used_contexts
+            .capacity()
+            .saturating_add(self.used_exprs.capacity())
+            .saturating_mul(std::mem::size_of::<Ex>())
+            .saturating_add(
+                self.watched_keys
+                    .iter()
+                    .map(super::index::Key::bytes)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.watched_keys
+                    .capacity()
+                    .saturating_sub(self.watched_keys.len())
+                    .saturating_mul(std::mem::size_of::<super::index::Key>()),
+            )
+            .saturating_add(
+                self.dt_comps
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(
+                self.dt_sticky
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(u32, u8)>()),
+            )
+    }
+
+    pub fn bytes(&self) -> usize {
+        std::mem::size_of::<WorldDep>().saturating_add(self.heap_bytes())
+    }
+}
+
+/// Optional incremental dependency record returned by a world together with its
+/// live budget debit (covering `dep.heap_bytes()`) so uncommitted or unwound rows retire
+/// automatically strictly after `dep` drops.
+pub(super) struct FoundDep<'r, 'a> {
+    pub dep: WorldDep,
+    pub debit: super::OptionalDebit<'r, 'a>,
+}
+
+/// Mandatory world result paired with its pre-admitted `subs` heap debit so
+/// `found.subs` drops strictly before `debit` retires its bytes.
+pub(super) struct FoundRow<'r, 'a> {
+    pub found: Found,
+    pub debit: Option<super::MandatoryDebit<'r, 'a>>,
 }
 
 /// What a world found of its class: whether it is unsatisfiable, and its subsumers.
@@ -1322,7 +2370,7 @@ impl<'a> World<'a> {
                 self.insert_slot(to, real);
             }
         }
-        if c == Concl::Real {
+        if matches!(c, Concl::Real(_)) {
             self.make_real(to);
             return;
         }
@@ -1353,7 +2401,7 @@ impl<'a> World<'a> {
         }
         slot.real = true;
         if slot.st.is_some() {
-            slot.todo.push(Concl::Real);
+            slot.todo.push(Concl::Real(REAL_ROOT));
             self.waiting += 1;
         } else {
             let ix = self.ix;
@@ -1368,7 +2416,7 @@ impl<'a> World<'a> {
                 init = true;
                 for &s in &st.subs {
                     if let Node::Exist(..) = ix.head(s).node {
-                        out.push((ix.head(s).succ, Concl::Real));
+                        out.push((ix.head(s).succ, Concl::Real(REAL_ROOT)));
                         if horn {
                             out.push((ix.head(s).succ, Concl::RealBack(e)));
                         }
@@ -1381,7 +2429,7 @@ impl<'a> World<'a> {
                     && horn
                 {
                     for &(_, n) in &x.horn.succ.list {
-                        out.push((n, Concl::Real));
+                        out.push((n, Concl::Real(REAL_ROOT)));
                         out.push((n, Concl::RealBack(e)));
                     }
                     for &n in &x.noms {
@@ -1404,7 +2452,7 @@ impl<'a> World<'a> {
             });
             if !init {
                 // a context that the global saturation never reached
-                slot.todo.push(Concl::Real);
+                slot.todo.push(Concl::Real(REAL_ROOT));
                 self.waiting += 1;
             }
             self.pending.extend(out);
@@ -1633,8 +2681,22 @@ impl<'a> World<'a> {
     /// Classifies `class` in its world: the class has an instance, and the world
     /// saturates what follows, with the facts of universal roles and the merges of keys
     /// that hold there.
-    pub fn classify(mut self, class: Ex) -> Result<Found, Halt> {
-        self.pending.push((class, Concl::Real));
+    #[cfg(test)]
+    pub fn classify(self, class: Ex) -> Result<Found, Halt> {
+        self.classify_with_dep(class, None, None)
+            .map(|(row, _)| row.found)
+    }
+
+    /// Like [`World::classify`], pre-admitting `Found::subs` before allocating it and
+    /// optionally capturing a pre-admitted [`FoundDep`] dependency record for incremental
+    /// EL world reuse (roadmap item 664).
+    pub(super) fn classify_with_dep<'r, 'b>(
+        mut self,
+        class: Ex,
+        dep_budget: Option<(&'r super::WorldBudget<'b>, &std::sync::atomic::AtomicBool)>,
+        subs_budget: Option<&'r super::WorldBudget<'b>>,
+    ) -> Result<(FoundRow<'r, 'b>, Option<FoundDep<'r, 'b>>), Halt> {
+        self.pending.push((class, Concl::Real(REAL_ROOT)));
         loop {
             self.drain();
             self.checkpoint(0);
@@ -1647,7 +2709,45 @@ impl<'a> World<'a> {
                 .chain(&self.universal)
                 .copied()
                 .collect();
-            let facts = universal_facts(self.ix, &self, &known);
+            let reporter = self.debit.reporter;
+            // Declare `facts_scratch` BEFORE `facts` so `facts` drops before its ledger
+            // debit is retired, and its buffer remains charged across `key_merges_reported`.
+            let mut facts_scratch = Scratch { reporter, bytes: 0 };
+            let facts = universal_facts_polled(
+                self.ix,
+                &self,
+                &known,
+                &mut || {
+                    if reporter.tell(0) {
+                        Ok(())
+                    } else {
+                        Err(Halt::Stopped)
+                    }
+                },
+                &mut |out, grow| {
+                    let elem = std::mem::size_of::<Ex>();
+                    let old_cap = out.capacity();
+                    let old_bytes = old_cap.saturating_mul(elem);
+                    let new_cap = old_cap.checked_add(grow).ok_or(Halt::Memory(usize::MAX))?;
+                    let new_bytes = new_cap
+                        .checked_mul(elem)
+                        .filter(|&b| b <= isize::MAX as usize)
+                        .ok_or(Halt::Memory(usize::MAX))?;
+                    let accepted = reporter.tell_owned(new_bytes as isize, || {
+                        facts_scratch.bytes = facts_scratch.bytes.saturating_add(new_bytes);
+                    });
+                    if !accepted {
+                        return Err(Halt::Stopped);
+                    }
+                    out.try_reserve_exact(grow)
+                        .map_err(|_| Halt::Memory(usize::MAX))?;
+                    if old_bytes > 0 {
+                        facts_scratch.bytes = facts_scratch.bytes.saturating_sub(old_bytes);
+                        reporter.retire(old_bytes as isize);
+                    }
+                    Ok(())
+                },
+            )?;
             let merges = key_merges_reported(self.ix, &self, self.debit.reporter)?;
             if facts.is_empty() && merges.is_empty() {
                 break;
@@ -1676,27 +2776,84 @@ impl<'a> World<'a> {
             .slots
             .values()
             .any(|s| s.real && s.st.as_ref().is_some_and(|st| st.bottom));
-        let mut found = Found {
-            bottom: clash,
-            subs: Vec::new(),
-        };
+        let mut bottom = clash;
+        let mut subs_len = 0usize;
         self.with(class, &mut |st, _| {
-            found.bottom |= st.bottom;
-            found.subs = st.subs.iter().copied().collect();
+            bottom |= st.bottom;
+            subs_len = st.subs.len();
         });
-        if !found.bottom {
+        if !bottom {
             super::dt_sat::world(self.ix, self.slots.values().filter_map(|s| s.st.as_ref()));
         }
+        // Build optional dependency metadata BEFORE allocating `Found::subs` so optional
+        // admission never observes uncharged result bytes.
+        let dep = if let Some((budget, track_active)) = dep_budget
+            && track_active.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.build_dep(class, bottom, budget, track_active)?
+        } else {
+            None
+        };
+        let subs_bytes = subs_len
+            .checked_mul(std::mem::size_of::<Ex>())
+            .ok_or(Halt::Memory(usize::MAX))?;
+        // Pre-admit `Found::subs` while `self` still holds its private state. Declare
+        // `subs_debit` BEFORE `found` so on any early return or unwind, `found.subs`
+        // drops its heap buffer before `subs_debit` retires its bytes.
+        let mut subs_debit: Option<super::MandatoryDebit<'r, 'b>> = None;
+        let mut found = Found {
+            bottom,
+            subs: Vec::new(),
+        };
+        if subs_bytes > 0 {
+            let subs_isize = isize::try_from(subs_bytes).map_err(|_| Halt::Memory(usize::MAX))?;
+            if let Some(budget) = subs_budget {
+                let prev = budget.post(subs_isize);
+                let guard = super::MandatoryDebit::new(budget, subs_isize);
+                if !budget.check_post(subs_isize, prev) {
+                    return Err(Halt::Stopped);
+                }
+                subs_debit = Some(guard);
+            } else {
+                let next_reported = self
+                    .debit
+                    .reported
+                    .get()
+                    .checked_add(subs_bytes)
+                    .filter(|&n| isize::try_from(n).is_ok())
+                    .ok_or(Halt::Memory(usize::MAX))?;
+                if !self
+                    .debit
+                    .reporter
+                    .tell_owned(subs_isize, || self.debit.reported.set(next_reported))
+                {
+                    return Err(Halt::Stopped);
+                }
+            }
+            if found.subs.try_reserve_exact(subs_len).is_err() {
+                return Err(Halt::Memory(usize::MAX));
+            }
+            self.with(class, &mut |st, _| {
+                found.subs.extend(st.subs.iter().copied());
+            });
+        }
+        #[cfg(test)]
+        let ready_reported = self
+            .debit
+            .reported
+            .get()
+            .saturating_add(subs_debit.as_ref().map_or(0, |d| d.bytes.max(0) as usize));
         #[cfg(test)]
         if let Some(rules) = &self.ix.top_chain {
-            rules.world_ready(class, self.debit.reported.get());
+            rules.world_ready(class, ready_reported);
         }
         #[cfg(test)]
         if let Reporter::NamedDomain(budget) = self.debit.reporter {
             super::world_retirement_mixed_tests::world_ready(
                 budget,
                 class,
-                self.debit.reported.get(),
+                ready_reported,
+                subs_debit.as_ref().map_or(0, |d| d.bytes),
             );
         }
         #[cfg(test)]
@@ -1704,8 +2861,326 @@ impl<'a> World<'a> {
             let state = self.slots[&class].st.as_ref().expect("resident COW slot");
             witness.ready(class, state, &found, self.debit.reported.get());
         }
-        // the world's copies go when it does
-        Ok(found)
+        // the world's copies go when it does; `FoundRow` retains `subs_debit` until
+        // transferred to `FoundWorldChunk` or dropped
+        Ok((
+            FoundRow {
+                found,
+                debit: subs_debit,
+            },
+            dep,
+        ))
+    }
+
+    fn build_dep<'r, 'b>(
+        &self,
+        class: Ex,
+        bottom: bool,
+        budget: &'r super::WorldBudget<'b>,
+        track_active: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<FoundDep<'r, 'b>>, Halt> {
+        let mut since_poll = 0usize;
+        let mut poll_step = |work: usize| -> Result<(), Halt> {
+            since_poll = since_poll.saturating_add(work);
+            if since_poll >= DEP_POLL_STEP {
+                since_poll = 0;
+                #[cfg(test)]
+                super::el_test_hooks::scan_periodic_poll(
+                    super::el_test_hooks::ScanKind::WorldBuildDep,
+                );
+                if !budget.poll_stop() {
+                    return Err(Halt::Stopped);
+                }
+            }
+            Ok(())
+        };
+        if !budget.poll_stop() {
+            return Err(Halt::Stopped);
+        }
+
+        // Track watched keys in a compact bitset so scanning `slots × keys` avoids
+        // quadratic `watched_keys.contains(key)` comparisons. Declare the debit guard
+        // BEFORE `heap_key_bits` so any early return drops the buffer before retiring.
+        let key_count = self.ix.keys.len();
+        let mut inline_key_bits = [0u64; 4];
+        let mut key_bits_debit = super::OptionalDebit::new(budget, 0);
+        let mut heap_key_bits: Vec<u64> = Vec::new();
+        if key_count > inline_key_bits.len() * 64 {
+            let words = key_count.div_ceil(64);
+            let bytes = words.saturating_mul(std::mem::size_of::<u64>());
+            match budget.try_admit_optional(bytes) {
+                super::OptionalAdmit::Accepted => {
+                    key_bits_debit.add(bytes);
+                }
+                super::OptionalAdmit::Refused => {
+                    track_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(None);
+                }
+                super::OptionalAdmit::Stopped => return Err(Halt::Stopped),
+            }
+            if heap_key_bits.try_reserve_exact(words).is_err() {
+                track_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                return Ok(None);
+            }
+            heap_key_bits.resize(words, 0);
+        }
+        let key_bits: &mut [u64] = if heap_key_bits.is_empty() {
+            &mut inline_key_bits
+        } else {
+            heap_key_bits.as_mut_slice()
+        };
+
+        // Pass 1: count exact capacities and mark touched keys while polling stop state.
+        let mut used_contexts_count = 0usize;
+        let mut used_exprs_count = 0usize;
+        let mut dt_comps_count = 0usize;
+        let mut dt_sticky_count = 0usize;
+        let mut touched_named = false;
+        let has_dt = self.ix.dt.is_some();
+        let global = self.global();
+        let mut stop_err = false;
+        for (&e, slot) in &self.slots {
+            poll_step(1)?;
+            #[cfg(test)]
+            super::el_test_hooks::scan_progress(super::el_test_hooks::ScanKind::WorldBuildDep);
+            if (e as usize) < self.ctx.len() {
+                used_contexts_count = used_contexts_count.saturating_add(1);
+            }
+            if let Some(st) = slot.st.as_ref() {
+                used_exprs_count = used_exprs_count.saturating_add(st.subs.len());
+                if has_named_alias_polled(self.ix, e, st, &mut poll_step)? {
+                    touched_named = true;
+                    for (ki, key) in self.ix.keys.iter().enumerate() {
+                        poll_step(1)?;
+                        let word = &mut key_bits[ki >> 6];
+                        let mask = 1u64 << (ki & 63);
+                        if (*word & mask) == 0
+                            && context_touches_key_polled(self.ix, e, st, key, &mut poll_step)?
+                        {
+                            *word |= mask;
+                        }
+                    }
+                }
+                if has_dt && let Some(x) = st.extra.as_ref() {
+                    dt_comps_count = dt_comps_count.saturating_add(x.dt.len());
+                    if !bottom && !st.bottom {
+                        for s in &x.dt {
+                            poll_step(1)?;
+                            if s.last != super::dt_sat::FINE {
+                                dt_sticky_count = dt_sticky_count.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+            } else if slot.real {
+                global.with(e, &mut |st, _| {
+                    if stop_err {
+                        return;
+                    }
+                    match has_named_alias_polled(self.ix, e, st, &mut poll_step) {
+                        Ok(true) => {}
+                        Ok(false) => return,
+                        Err(_) => {
+                            stop_err = true;
+                            return;
+                        }
+                    }
+                    touched_named = true;
+                    for (ki, key) in self.ix.keys.iter().enumerate() {
+                        if poll_step(1).is_err() {
+                            stop_err = true;
+                            return;
+                        }
+                        let word = &mut key_bits[ki >> 6];
+                        let mask = 1u64 << (ki & 63);
+                        if (*word & mask) == 0 {
+                            match context_touches_key_polled(self.ix, e, st, key, &mut poll_step) {
+                                Ok(true) => *word |= mask,
+                                Ok(false) => {}
+                                Err(_) => {
+                                    stop_err = true;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+                if stop_err {
+                    return Err(Halt::Stopped);
+                }
+            }
+        }
+        #[cfg(test)]
+        super::el_test_hooks::scan_pass1_completed(super::el_test_hooks::ScanKind::WorldBuildDep);
+        let add_class_ctx = (class as usize) < self.ctx.len() && !self.slots.contains_key(&class);
+        if add_class_ctx {
+            used_contexts_count = used_contexts_count.saturating_add(1);
+        }
+
+        let mut watched_keys_count = 0usize;
+        let mut watched_keys_payload = 0usize;
+        for (wi, &word) in key_bits.iter().enumerate() {
+            poll_step(1)?;
+            let mut bits = word;
+            while bits != 0 {
+                poll_step(1)?;
+                let tz = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let ki = wi * 64 + tz;
+                if let Some(key) = self.ix.keys.get(ki) {
+                    watched_keys_count = watched_keys_count.saturating_add(1);
+                    watched_keys_payload = watched_keys_payload.saturating_add(
+                        key.objects
+                            .len()
+                            .saturating_add(key.data.len())
+                            .saturating_mul(std::mem::size_of::<Role>()),
+                    );
+                }
+            }
+        }
+
+        // Pre-admit the exact heap buffers owned by `WorldDep` (the inline `WorldDep`
+        // slot inside `FoundWorldChunk::deps` is admitted separately by the chunk).
+        let Some(dep_heap_bytes) = (|| -> Option<usize> {
+            let mut total = used_contexts_count.checked_mul(std::mem::size_of::<Ex>())?;
+            total = total.checked_add(used_exprs_count.checked_mul(std::mem::size_of::<Ex>())?)?;
+            total = total.checked_add(
+                watched_keys_count.checked_mul(std::mem::size_of::<super::index::Key>())?,
+            )?;
+            total = total.checked_add(watched_keys_payload)?;
+            total = total.checked_add(dt_comps_count.checked_mul(std::mem::size_of::<u32>())?)?;
+            total = total
+                .checked_add(dt_sticky_count.checked_mul(std::mem::size_of::<(u32, u8)>())?)?;
+            Some(total)
+        })() else {
+            track_active.store(false, std::sync::atomic::Ordering::Relaxed);
+            return Ok(None);
+        };
+
+        // Pre-admit `WorldDep` heap buffers while `self.slots` are still resident and debited.
+        let mut dep_debit = super::OptionalDebit::new(budget, 0);
+        match budget.try_admit_optional(dep_heap_bytes) {
+            super::OptionalAdmit::Accepted => {
+                dep_debit.add(dep_heap_bytes);
+            }
+            super::OptionalAdmit::Refused => {
+                track_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                return Ok(None);
+            }
+            super::OptionalAdmit::Stopped => return Err(Halt::Stopped),
+        }
+
+        // Pass 2: allocate with exact pre-admitted capacities and populate.
+        let mut used_contexts: Vec<Ex> = Vec::new();
+        let mut used_exprs: Vec<Ex> = Vec::new();
+        let mut watched_keys: Vec<super::index::Key> = Vec::new();
+        let mut dt_comps: Vec<u32> = Vec::new();
+        let mut dt_sticky: Vec<(u32, u8)> = Vec::new();
+        if used_contexts
+            .try_reserve_exact(used_contexts_count)
+            .is_err()
+            || used_exprs.try_reserve_exact(used_exprs_count).is_err()
+            || watched_keys.try_reserve_exact(watched_keys_count).is_err()
+            || dt_comps.try_reserve_exact(dt_comps_count).is_err()
+            || dt_sticky.try_reserve_exact(dt_sticky_count).is_err()
+        {
+            track_active.store(false, std::sync::atomic::Ordering::Relaxed);
+            return Ok(None);
+        }
+
+        for (&e, slot) in &self.slots {
+            poll_step(1)?;
+            #[cfg(test)]
+            super::el_test_hooks::scan_progress(super::el_test_hooks::ScanKind::WorldBuildDep);
+            if (e as usize) < self.ctx.len() {
+                used_contexts.push(e);
+            }
+            if let Some(st) = slot.st.as_ref() {
+                for &s in &st.subs {
+                    poll_step(1)?;
+                    used_exprs.push(s);
+                }
+                if has_dt && let Some(x) = st.extra.as_ref() {
+                    for s in &x.dt {
+                        poll_step(1)?;
+                        dt_comps.push(s.comp);
+                        if !bottom && !st.bottom && s.last != super::dt_sat::FINE {
+                            dt_sticky.push((s.comp, s.last));
+                        }
+                    }
+                }
+            }
+        }
+        if add_class_ctx {
+            used_contexts.push(class);
+        }
+        for (wi, &word) in key_bits.iter().enumerate() {
+            poll_step(1)?;
+            let mut bits = word;
+            while bits != 0 {
+                poll_step(1)?;
+                let tz = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let ki = wi * 64 + tz;
+                if let Some(key) = self.ix.keys.get(ki) {
+                    let mut objects = Vec::new();
+                    let mut data = Vec::new();
+                    if objects.try_reserve_exact(key.objects.len()).is_err()
+                        || data.try_reserve_exact(key.data.len()).is_err()
+                    {
+                        track_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(None);
+                    }
+                    objects.extend_from_slice(&key.objects);
+                    data.extend_from_slice(&key.data);
+                    watched_keys.push(super::index::Key {
+                        class: key.class,
+                        objects,
+                        data,
+                    });
+                }
+            }
+        }
+        drop(heap_key_bits);
+        key_bits_debit.retire_now();
+
+        if !budget.poll_stop() {
+            return Err(Halt::Stopped);
+        }
+        used_contexts.sort_unstable();
+        used_contexts.dedup();
+        used_exprs.sort_unstable();
+        used_exprs.dedup();
+        dt_comps.sort_unstable();
+        dt_comps.dedup();
+        dt_sticky.sort_unstable_by_key(|&(c, _)| c);
+        if dt_sticky.len() > 1 {
+            let mut write = 0usize;
+            for read in 1..dt_sticky.len() {
+                poll_step(1)?;
+                if dt_sticky[read].0 == dt_sticky[write].0 {
+                    dt_sticky[write].1 = dt_sticky[write].1.max(dt_sticky[read].1);
+                } else {
+                    write += 1;
+                    dt_sticky[write] = dt_sticky[read];
+                }
+            }
+            dt_sticky.truncate(write + 1);
+        }
+        #[cfg(test)]
+        super::el_test_hooks::scan_completed(super::el_test_hooks::ScanKind::WorldBuildDep);
+        Ok(Some(FoundDep {
+            dep: WorldDep {
+                used_contexts,
+                used_exprs,
+                watched_keys,
+                touched_named,
+                had_world_universal: !self.universal.is_empty(),
+                dt_comps,
+                dt_sticky,
+            },
+            debit: dep_debit,
+        }))
     }
 }
 

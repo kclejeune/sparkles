@@ -193,7 +193,7 @@ impl Runtime {
                 })
             }
             OpenedView::Rebuild(rebuild) => {
-                let whole = whole_reason(rebuild.access.as_ref())
+                let whole = key::whole_reason_on(rebuild.access.as_ref(), &rebuild.snap)
                     .map(str::to_string)
                     .or_else(|| rebuild.inference.as_ref().map(|i| i.reason().to_string()));
                 let mut c = Circuit::new(
@@ -247,11 +247,23 @@ impl Runtime {
         let until = r.deadline.map_or(wait, |d| d.min(wait));
         loop {
             check()?;
+            if self.is_closed() {
+                return Err(crate::incr::error(
+                    "views-unavailable",
+                    "the dataset is closing",
+                ));
+            }
             let host = self.host.read().clone();
             let mode = host.map(|host| (host.aggregate_errors(), host.inference()));
             let step = (Instant::now() + WAIT_STEP).min(until);
             let entry = if let Some(reg) = self.reg.try_lock_until(step) {
                 check()?;
+                if self.is_closed() {
+                    return Err(crate::incr::error(
+                        "views-unavailable",
+                        "the dataset is closing",
+                    ));
+                }
                 let mode_ready = mode.as_ref().is_none_or(|(errors, inference)| {
                     reg.aggregate_errors == *errors
                         && Inference::same(reg.inference.as_deref(), inference.as_ref())
@@ -296,8 +308,16 @@ impl Runtime {
                     // `building`, so they describe the circuit whose version is returned. A
                     // build holds that lock, so wait in short cooperative steps until `until`.
                     let step = (Instant::now() + WAIT_STEP).min(until);
+                    #[cfg(test)]
+                    fire_open_view_state_hook();
                     if let Some(st) = cell.state.try_lock_until(step) {
                         check()?;
+                        if self.is_closed() {
+                            return Err(crate::incr::error(
+                                "views-unavailable",
+                                "the dataset is closing",
+                            ));
+                        }
                         let held = st.circuit.aggregate_errors.unwrap_or(errors);
                         // another reading of errors than the view's: evaluate the view's query
                         // at the reader's snapshot without touching the view's state
@@ -318,7 +338,34 @@ impl Runtime {
                                 ));
                             }
                             Status::Ready => {
-                                if st.circuit.applied == r.at || r.allow_stale {
+                                let restricted = st
+                                    .circuit
+                                    .access
+                                    .as_ref()
+                                    .is_some_and(|a| !a.reads_everything());
+                                let ev_mismatch = if restricted {
+                                    r.snap.or(st.circuit.snap.as_ref()).is_some_and(|s| {
+                                        let (snap_gen, snap_ev) = s.evidence_visibility_stamp();
+                                        snap_ev.as_deref() != st.circuit.evidence_key()
+                                            || snap_ev.as_deref() == Some("unavailable")
+                                            || (s.pinned_evidence.is_none()
+                                                && snap_gen != st.circuit.managed_generation())
+                                    })
+                                } else {
+                                    false
+                                };
+                                if ev_mismatch {
+                                    // A pinned historical snapshot with a distinct evidence
+                                    // configuration evaluates directly rather than waiting
+                                    // for live head to change; otherwise let a runtime
+                                    // round refresh or fail closed on live head.
+                                    if let Some(snap) = r.snap
+                                        && snap.pinned_evidence.is_some()
+                                    {
+                                        return self
+                                            .prepare_rebuild(&st, open, snap, held, None, admit);
+                                    }
+                                } else if st.circuit.applied == r.at || r.allow_stale {
                                     let version = st.circuit.version.clone().ok_or_else(|| {
                                         crate::incr::error(
                                             "view-failed",
@@ -330,8 +377,7 @@ impl Runtime {
                                     })?;
                                     drop(st);
                                     return Ok(OpenedView::Shared(version));
-                                }
-                                if st.circuit.applied > r.at {
+                                } else if st.circuit.applied > r.at {
                                     return self.open_read_back(st, open, held, check, admit);
                                 }
                             }
@@ -341,18 +387,32 @@ impl Runtime {
                 }
             }
             check()?;
+            if self.is_closed() {
+                return Err(crate::incr::error(
+                    "views-unavailable",
+                    "the dataset is closing",
+                ));
+            }
             self.kick();
             let step = (Instant::now() + WAIT_STEP).min(until);
             let woke = self.wait_round(step);
             check()?;
-            if !woke && Instant::now() >= until {
-                return Err(crate::incr::error(
-                    "view-behind",
-                    format!(
-                        "the view {:?} has not reached commit {} yet; retry, or read it with view:allowStale true",
-                        r.name, r.at
-                    ),
-                ));
+            if !woke {
+                if self.is_closed() {
+                    return Err(crate::incr::error(
+                        "views-unavailable",
+                        "the dataset is closing",
+                    ));
+                }
+                if Instant::now() >= until {
+                    return Err(crate::incr::error(
+                        "view-behind",
+                        format!(
+                            "the view {:?} has not reached commit {} yet; retry, or read it with view:allowStale true",
+                            r.name, r.at
+                        ),
+                    ));
+                }
             }
         }
     }
@@ -368,7 +428,21 @@ impl Runtime {
         admit: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<OpenedView> {
         let r = &open.read;
-        let parts = st.history_rows_since(r.at, check, admit)?;
+        let restricted = st
+            .circuit
+            .access
+            .as_ref()
+            .is_some_and(|a| !a.reads_everything());
+        let ev_active = restricted
+            && (st.circuit.evidence_key().is_some()
+                || r.snap
+                    .or(st.circuit.snap.as_ref())
+                    .is_some_and(|s| s.has_evidence_projection_or_unavailable()));
+        let parts = if ev_active {
+            None
+        } else {
+            st.history_rows_since(r.at, check, admit)?
+        };
         if let Some(parts) = parts {
             let version = st.circuit.version.clone().ok_or_else(|| {
                 crate::incr::error(
@@ -756,5 +830,40 @@ mod tests {
             &mut |_| Ok(()),
         );
         assert!(matches!(outcome, Err(Error::Cancelled)));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static OPEN_VIEW_STATE_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct OpenViewStateHookGuard;
+
+#[cfg(test)]
+impl Drop for OpenViewStateHookGuard {
+    fn drop(&mut self) {
+        OPEN_VIEW_STATE_HOOK.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_open_view_state_hook(f: impl FnMut() + 'static) -> OpenViewStateHookGuard {
+    OPEN_VIEW_STATE_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    OpenViewStateHookGuard
+}
+
+#[cfg(test)]
+fn fire_open_view_state_hook() {
+    let f = OPEN_VIEW_STATE_HOOK.with(|h| h.borrow_mut().take());
+    if let Some(mut f) = f {
+        f();
+        OPEN_VIEW_STATE_HOOK.with(|h| {
+            if h.borrow().is_none() {
+                *h.borrow_mut() = Some(f);
+            }
+        });
     }
 }

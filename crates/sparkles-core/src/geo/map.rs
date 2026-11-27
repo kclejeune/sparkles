@@ -60,14 +60,23 @@ pub fn features_in_box_of(
     graphs: Option<&crate::access::GraphAccess>,
 ) -> Result<Value> {
     let empty = |truncated: bool| json!({"type": "FeatureCollection", "features": [], "truncated": truncated});
-    // a view that hides triples maps the features it sees
+    // a view that hides triples (or is subject to support-aware projection visibility)
+    // maps only the features it sees
+    let bound_access;
     let masked;
-    let snap = match graphs.filter(|a| a.hides_triples()) {
+    let (snap, graphs) = match graphs.filter(|a| !a.reads_everything()) {
         Some(a) => {
-            masked = a.masked(&Arc::new(snap.clone()))?;
-            &*masked
+            let arc = Arc::new(snap.clone());
+            let effective = if a.read.undecided() || a.write.undecided() {
+                bound_access = Arc::new(a.clone()).bound(&arc);
+                bound_access.as_ref()
+            } else {
+                a
+            };
+            masked = effective.masked(&arc)?;
+            (&*masked, Some(effective))
         }
-        None => snap,
+        None => (snap, graphs),
     };
     let cfg = snap
         .geo

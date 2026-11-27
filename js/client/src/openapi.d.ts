@@ -1062,6 +1062,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/evidence/{ds}/identities/rebuild": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rebuild a resolution map
+         * @description Needs unrestricted `admin` on the dataset or branch. Recomputes the clusters of the matching policy's current authenticated accepted decisions in its current protected identity-graph boundary, rewrites its output graph atomically and records the new protections and boundary in a fresh `ev:ResolutionMap` revision, restoring reviews and reads that answered `503 projection-unavailable`. Refusals write nothing: `400` for a malformed request or unknown matching policy, `403` for a read-only server or missing unrestricted admin grant, `409 policy-changed`, `409 head-changed`, `409 identity-conflict`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 unsupported-profile`, `409 evidence-settings-drift`, `422 incomplete-evidence` and `503 authority-changed`.
+         */
+        post: operations["rebuildIdentityMap"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/evidence/{ds}/projections/reconcile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reconcile a review policy's accepted projection
+         * @description Needs `admin` on the dataset or selected branch, with update grants on the policy's supports and output graphs and unmasked read grants on its decisions, supports and output graphs and on every configured proposal graph. Rebuilds the review policy's output graph strictly from the live acceptance supports that authenticate under the current protections, or empties it when none vouch, and records the new protection nonces in a fresh `ev:Projection` record that supersedes prior unsuperseded projection records of the policy, or reuses the active projection record when the protections and output are already valid. Restores normal reviews, withdrawals and policy reads after a detach and new protection of the policy's decisions, supports or output graph. Refusals write nothing: `400` for a malformed request, unknown policy or matching policy, `403` for a read-only server or missing or masked grants, `409 evidence-settings-drift`, `409 policy-changed`, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 unsupported-profile` when the profile is disabled or a policy graph is still detached, `422 incomplete-evidence`, `503` for `managed-unavailable`, `projection-unavailable` when the supports, output or conflict mode changed without raising the policy version, `authority-changed`, or temporary query memory pool exhaustion (with `Retry-After`), and `507` when the request exceeds the configured query memory pool.
+         */
+        post: operations["reconcileEvidenceProjection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/evidence/{ds}/reauthenticate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Re-authenticate evidence records under a graph's current protection
+         * @description Needs `admin` on the dataset and target branch, and requires activated configuration history (`409 configuration-history-inactive` otherwise). Verifies records written under an earlier protection nonce in a protected evidence record graph against their retained, configuration-bound publication views, recorded digests, retained content, passage spans and receipt lineage, and atomically marks the verified records and their receipt operations under the graph's current protection nonce together with an audit operation. Refuses tampered, unretained or mismatched records without writing (`409 immutable-record-conflict`, `409 target-changed`, `422 origin-not-reproduced`, `422 span-mismatch`, `422 evidence-unavailable`, `422 incomplete-evidence`). Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ, `409 head-changed` for a stale `ifHead`, `409 idempotency-conflict` for a reused key with another payload, `409 unsupported-profile` while the graph is detached or the profile is disabled, and `503 authority-changed` when authorization changes before publication.
+         */
+        post: operations["reauthenticateEvidence"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/evidence/{ds}/settings": {
         parameters: {
             query?: never;
@@ -4657,8 +4717,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Find the assessments that depend on changed records
-         * @description Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and with `transitive` the assessments that depend on those, each once at its smallest depth. A graph the caller cannot read is not searched, and an assessment any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.
+         * Find the assessments and reports that depend on changed records
+         * @description Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and the community reports in guarded reports graphs proven for the caller whose activity recorded `prov:used` for one of them (including person-edited reports via `gr:editOf`), and with `transitive` the assessments and reports that depend on those, each once at its smallest depth. A graph the caller cannot read or cannot prove under the disclosure guard is not searched, and a record any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.
          */
         post: operations["listEvidenceDependents"];
         delete?: never;
@@ -5595,7 +5655,7 @@ export interface components {
             drafts?: number;
             /** @description Explore the data once after a draft without a query or with an empty result. Over the dataset's `repairs.explore`. */
             explore?: boolean;
-            /** @description A matching policy of the dataset's evidence settings, which resolves the linked entities for the claims the summary reads. Not with `mode` `global`. */
+            /** @description A matching policy of the dataset's evidence settings. In local answers, it resolves the linked entities for the claims the summary reads. In global answers, it resolves the entity identities referenced by the selected community reports. */
             matchingPolicy?: string;
             /** @description The rows returned in `result`, 1000 by default. */
             maxRows?: number;
@@ -5609,7 +5669,7 @@ export interface components {
             /** @description At most 2000 characters. */
             question: string;
             reasoning?: boolean;
-            /** @description A review policy of the dataset's evidence settings. The summary reads the claim occurrences about the linked entities with their state under the policy and may cite them in `claimCitations`. Not with `mode` `global`. */
+            /** @description A review policy of the dataset's evidence settings. In local answers, the summary reads the claim occurrences about the linked entities with their state under the policy and may cite them in `claimCitations`. In global answers, only community reports built under that policy are selected. */
             reviewPolicy?: string;
             /** @description Hide the agent memory graphs of the dataset from the query, and use only reviewed community reports. */
             reviewedOnly?: boolean;
@@ -5631,7 +5691,7 @@ export interface components {
             attempts?: {
                 [key: string]: unknown;
             }[];
-            /** @description With `reviewPolicy`, the claim occurrences the summary read, in the `claims` form of `recall`: `version` 1, `policy`, `occurrences` and `truncated`. */
+            /** @description With `reviewPolicy` in a local answer, the claim occurrences the summary read, in the `claims` form of `recall`: `version` 1, `policy`, `occurrences` and `truncated`. */
             claims?: {
                 [key: string]: unknown;
             };
@@ -5644,7 +5704,7 @@ export interface components {
                 code: string;
                 message: string;
             };
-            /** @description In a global answer, the `level`, `ranking`, `reportsGraph`, the `selected` reports and the map `batches`. */
+            /** @description In a global answer, the `level`, `ranking`, `reportsGraph`, the `selected` reports, the map `batches` and, with `reviewPolicy`, the requested `reviewPolicy`. */
             global?: {
                 [key: string]: unknown;
             };
@@ -5669,7 +5729,7 @@ export interface components {
             reports?: {
                 [key: string]: unknown;
             }[];
-            /** @description With `matchingPolicy`, the map revision read, in the `resolution` form of `recall`. */
+            /** @description With `matchingPolicy`, the map revision read (`policy`, `version`, `revision` and `number`), plus `entities` for mapped identities referenced by the returned reports in a global answer. */
             resolution?: {
                 [key: string]: unknown;
             };
@@ -7422,14 +7482,14 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** @description Changed evidence records whose dependent assessments to find. */
+        /** @description Changed evidence records whose dependent assessments and community reports to find. */
         EvidenceDependents: {
             /** @description The record identities that changed, such as a withdrawn claim, an ended support or the revision a new map revision follows. */
             changed: string[];
-            /** @description Also find the assessments that depend on a dependent. Defaults to `false`. */
+            /** @description Also find the assessments and community reports that depend on a dependent. Defaults to `false`. */
             transitive?: boolean;
         };
-        /** @description The assessments that depend on the changed records, each once at its smallest depth. */
+        /** @description The assessments and community reports that depend on the changed records, each once at its smallest depth. */
         EvidenceDependentsResult: {
             /** @description The commit the records were read at. */
             commit: number;
@@ -7438,12 +7498,26 @@ export interface components {
                 assessment: string;
                 /** @enum {string} */
                 dependence: "target" | "used";
-                /** @description How many assessments lie between it and a changed record, 0 for a direct dependent. */
+                /** @description How many intermediate dependents lie between it and a changed record, 0 for a direct dependent. */
                 depth: number;
                 /** @description Its proposal graph. */
                 graph: string;
                 /** @description The changed record it depends on, or for a transitive dependent the assessment it depends on. */
                 on: string;
+            }[];
+            reports: {
+                /** @description The community the report summarizes, `null` when not recorded. */
+                community: string | null;
+                /** @enum {string} */
+                dependence: "used";
+                /** @description How many intermediate dependents lie between it and a changed record, 0 for a direct dependent. */
+                depth: number;
+                /** @description Its guarded reports graph. */
+                graph: string;
+                /** @description The changed record its activity used, or for a transitive dependent the assessment or report it depends on. */
+                on: string;
+                /** @description A community report in a guarded reports graph. */
+                report: string;
             }[];
         };
         /** @description The graph to stop protecting. */
@@ -7523,6 +7597,86 @@ export interface components {
             /** @description The name of a matching policy of the evidence settings. */
             policy: string;
         };
+        /** @description Administered rebuild of a matching policy's resolution map in its current boundary. */
+        EvidenceIdentitiesRebuild: {
+            /** @description Check and preview the rebuild without committing it. */
+            dryRun?: boolean;
+            /** @description Makes a retry with the same payload answer the first receipt. */
+            idempotencyKey?: string;
+            /** @description Publish only while this commit is the branch head, else `409 head-changed`. */
+            ifHead?: number;
+            /** @description The commit message. */
+            message?: string;
+            /** @description The name of a matching policy of the evidence settings. */
+            policy: string;
+            /** @description Optional expected policy version, else `409 policy-changed`. */
+            policyVersion?: number;
+        };
+        /** @description The outcome of rebuilding a matching policy's resolution map. */
+        EvidenceIdentitiesRebuildResult: {
+            /** @description The protected identity graphs of the policy's boundary recorded on the revision, sorted. */
+            boundary: string[];
+            /**
+             * Format: uuid
+             * @description The branch the commit published on.
+             */
+            branchId: string;
+            /** @description The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay. */
+            changed: {
+                inserted: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                /** @description A review under a matching policy that changed which accepted decisions its resolution map follows. */
+                map?: {
+                    decisionsAdded: string[];
+                    decisionsEnded: string[];
+                    /** @description The entities whose selected entity changed. */
+                    entities: string[];
+                    number: number;
+                    /** @description The matching policy. */
+                    policy: string;
+                    /** @description The revision it follows, whose consumers may need review. */
+                    previous: string | null;
+                    /** @description The resolution map revision the operation published. */
+                    revision: string;
+                };
+                removed: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                supportsAdded: string[];
+                supportsEnded: string[];
+            };
+            /** @description The publishing commit, the first one for a replay, or the head for a dry run. */
+            commit: number;
+            /** @description Whether this request published a commit. */
+            committed: boolean;
+            dryRun?: {
+                deleted: number;
+                error: string | null;
+                inserted: number;
+                wouldCommit: boolean;
+            };
+            /** @description The revision number, from 1. */
+            number: number;
+            /** @description The operation, the rebuilt revision's availability receipt. */
+            operation: string;
+            /** @description The matching policy. */
+            policy: string;
+            /** @description The matching policy version recorded on the revision. */
+            policyVersion: number;
+            /** @description The previous authenticated revision it follows, or `null` when none existed or earlier revisions no longer authenticate. */
+            previous: string | null;
+            /** @description Whether the idempotency key had published the same payload, whose receipt this is. */
+            replayed: boolean;
+            /** @description The resolution map revision published by the rebuild, also for a replay. */
+            revision: string;
+        };
         /** @description What the current resolution map selects for each entity. */
         EvidenceIdentitiesResult: {
             /** @description The commit the map was read at. */
@@ -7543,6 +7697,84 @@ export interface components {
             policy: string;
             /** @description The latest resolution map revision, `null` before the first. */
             revision: string | null;
+        };
+        /** @description Reconcile a review policy's accepted projection after a changed protection. */
+        EvidenceProjectionReconcile: {
+            /** @description Check and preview the reconciliation without committing it. */
+            dryRun?: boolean;
+            /** @description Makes a retry with the same payload answer the first receipt. */
+            idempotencyKey?: string;
+            /** @description Publish only while this commit is the branch head, else `409 head-changed`. */
+            ifHead?: number;
+            /** @description The commit message. */
+            message?: string;
+            /** @description The name of a review policy of the evidence settings. */
+            policy: string;
+            /** @description Optional expected policy version, else `409 policy-changed`. */
+            policyVersion?: number;
+        };
+        /** @description The outcome of reconciling a review policy's accepted projection. */
+        EvidenceProjectionReconcileResult: {
+            /**
+             * Format: uuid
+             * @description The branch the commit published on.
+             */
+            branchId: string;
+            /** @description The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay. */
+            changed: {
+                inserted: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                /** @description A review under a matching policy that changed which accepted decisions its resolution map follows. */
+                map?: {
+                    decisionsAdded: string[];
+                    decisionsEnded: string[];
+                    /** @description The entities whose selected entity changed. */
+                    entities: string[];
+                    number: number;
+                    /** @description The matching policy. */
+                    policy: string;
+                    /** @description The revision it follows, whose consumers may need review. */
+                    previous: string | null;
+                    /** @description The resolution map revision the operation published. */
+                    revision: string;
+                };
+                removed: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                supportsAdded: string[];
+                supportsEnded: string[];
+            };
+            /** @description The publishing commit, the first one for a replay, or the head for a dry run. */
+            commit: number;
+            /** @description Whether this request published a commit. */
+            committed: boolean;
+            dryRun?: {
+                deleted: number;
+                error: string | null;
+                inserted: number;
+                wouldCommit: boolean;
+            };
+            /** @description The reconciliation operation, which is the availability receipt of any fresh projection record it publishes. */
+            operation: string;
+            /** @description The output graph recorded in the projection record. */
+            output: string;
+            /** @description The reconciled review policy. */
+            policy: string;
+            /** @description The policy version recorded in the projection record. */
+            policyVersion: number;
+            /** @description The active projection record carrying the current protections, or the projection record selected by the original operation on a replay. */
+            projection: string;
+            /** @description Whether the idempotency key had published the same payload, whose receipt this is. */
+            replayed: boolean;
+            /** @description The live authenticated acceptance supports vouched for under the current protections, sorted by IRI. Empty on a replay. */
+            vouchedSupports: string[];
         };
         /** @description One batch of evidence records. At most 1,000 claims, 10,000 links, 1,000 identity proposals and 16 MiB of decoded input. */
         EvidenceProposal: {
@@ -7934,6 +8166,13 @@ export interface components {
                 }[];
                 /** @description The upstream version identifier. */
                 upstreamVersion?: string;
+                /** @description The predecessor source revision this revision supersedes, written as `prov:wasRevisionOf`. */
+                wasRevisionOf?: {
+                    /** @description An existing authenticated record, by its IRI. */
+                    iri?: string;
+                    /** @description A record of this batch, by its key. */
+                    key?: string;
+                };
             }[];
             /** @description The source-record graph, needed when the settings name more than one. */
             sourceGraph?: string;
@@ -7973,6 +8212,64 @@ export interface components {
                 recordDigest: string;
             }[];
             /** @description Whether the idempotency key had published the same payload, whose receipt this is. */
+            replayed: boolean;
+        };
+        /** @description Administered re-authentication request for records of an earlier protection. */
+        EvidenceReauthenticateRequest: {
+            /** @description The target branch name. `main` when absent. */
+            branch?: string;
+            /** @description Verify and preview the changes without committing. */
+            dryRun?: boolean;
+            /** @description The protected evidence record graph to reconcile. */
+            graph: string;
+            /** @description Replays the first reconciliation receipt when repeated with the same payload. */
+            idempotencyKey?: string;
+            /** @description Commit only while the target branch head equals this commit. */
+            ifHead?: number;
+            /** @description Optional commit message. */
+            message?: string;
+            /** @description Specific records to verify and re-authenticate. Omit to reconcile every profile record in `graph`. */
+            records?: {
+                /** @description The record IRI to verify and vouch for. */
+                iri: string;
+                /** @description Optional expected `ev:recordDigest` that the record must match. */
+                recordDigest?: string;
+            }[];
+        };
+        /** @description Result of an administered evidence re-authentication reconciliation. */
+        EvidenceReauthenticateResult: {
+            /**
+             * Format: uuid
+             * @description The reconciled branch's UUID.
+             */
+            branchId: string;
+            /** @description The publishing commit, the first commit on a replay, or the branch head on a dry run or no-op. */
+            commit: number;
+            /** @description Whether this call published a commit. */
+            committed: boolean;
+            dryRun?: {
+                deleted: number;
+                error: string | null;
+                inserted: number;
+                wouldCommit: boolean;
+            };
+            /** @description The reconciled evidence record graph. */
+            graph: string;
+            /** @description The audit `ev:Operation` IRI in the reconciled graph. */
+            operation: string;
+            /** @description Every verified record of the reconciliation. */
+            records: {
+                /** @description Whether the record already carried the graph's current protection nonce. */
+                alreadyAuthenticated: boolean;
+                iri: string;
+                /** @enum {string} */
+                kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection" | "ResolutionMap";
+                /** @description The record's preserved `ev:availabilityReceipt` operation IRI. */
+                receipt: string;
+                /** @description The verified `ev:recordDigest`. */
+                recordDigest: string;
+            }[];
+            /** @description Whether an earlier idempotent operation's receipt was returned. */
             replayed: boolean;
         };
         /** @description Recorded evidence settings, protection state and drift status. */
@@ -9138,7 +9435,7 @@ export interface components {
             message?: string;
             /** @description From 0 to 1. */
             progress: number;
-            /** @description The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `already-proposed`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, `redactions` counts by detector when text was redacted, a table's mapping draft and preview, or a workbook's drafts and redaction counts for each sheet. A `claims` ingestion reports the evidence operation, commit, first availability, revision, records and their counts by kind, the claims, failed facts, flagged entities and `factGuard` `not-run`. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted. */
+            /** @description The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `already-proposed`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, `redactions` counts by detector when text was redacted, a table's mapping draft and preview, or a workbook's drafts and redaction counts for each sheet. A `claims` ingestion reports the evidence operation, commit, first availability, revision, records and their counts by kind, the claims, failed facts, flagged entities, `factGuard` `not-run`, and `previousRevision` (the linked prior evidence `SourceRevision` IRI, distinct from the C18 `previousRendition`, omitted when no predecessor evidence revision is linked, when the recorded link is hidden from the caller or on `already-proposed`). A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted. */
             result?: {
                 [key: string]: unknown;
             };
@@ -17137,6 +17434,121 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    rebuildIdentityMap: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceIdentitiesRebuild"];
+            };
+        };
+        responses: {
+            /** @description The rebuilt resolution map revision and what changed. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceIdentitiesRebuildResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["Unprocessable"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    reconcileEvidenceProjection: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceProjectionReconcile"];
+            };
+        };
+        responses: {
+            /** @description The reconciled projection, vouched supports and output changes. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceProjectionReconcileResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            422: components["responses"]["Unprocessable"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    reauthenticateEvidence: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceReauthenticateRequest"];
+            };
+        };
+        responses: {
+            /** @description The reconciliation receipt and verified records. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceReauthenticateResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            422: components["responses"]["Unprocessable"];
             503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
@@ -27547,7 +27959,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The dependent assessments. */
+            /** @description The dependent assessments and community reports. */
             200: {
                 headers: {
                     [name: string]: unknown;

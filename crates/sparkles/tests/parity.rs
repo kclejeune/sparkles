@@ -447,6 +447,24 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("detachEvidenceGraph", "evidence.detach", |ds| {
             let _ = sparkles::evidence::detach(ds, &any::<String>());
         }),
+        op!("reauthenticateEvidence", "evidence.reauthenticate", |ds| {
+            let _ = sparkles::evidence::reauthenticate(ds, ds, &any(), &any(), &any());
+        }),
+        op!(
+            "reconcileEvidenceProjection",
+            "evidence.reconcile_projection",
+            |ds| {
+                let _ = sparkles::evidence::reconcile_projection(
+                    ds,
+                    ds,
+                    "",
+                    None,
+                    &any(),
+                    None,
+                    &any(),
+                );
+            }
+        ),
         op!("listEvidenceHolds", "evidence.holds", |ds| {
             let _ = sparkles::evidence::holds(ds);
         }),
@@ -520,6 +538,14 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("resolveIdentities", "evidence.resolve_entities", |ds| {
             let _ = sparkles::evidence::resolve_entities(ds, ds, "", &[], None, &any());
         }),
+        op!(
+            "rebuildIdentityMap",
+            "evidence.rebuild_resolution_map",
+            |ds| {
+                let _ =
+                    sparkles::evidence::rebuild_resolution_map(ds, ds, "", None, &any(), &any());
+            }
+        ),
         op!("listEvidenceDependents", "evidence.find_dependents", |ds| {
             let _ = sparkles::evidence::find_dependents(ds, ds, &[], false, None, &any());
         }),
@@ -1299,6 +1325,7 @@ const EXTRA_KEYS: &[&str] = &[
     "dataset.clone_to_memory_with",
     "dataset.branch",
     "dataset.run_mapping",
+    "evidence.claim_states",
     "history.wait_for_commit",
     "history.prune",
     "history.tick",
@@ -1335,6 +1362,7 @@ fn check_library_only_calls(ds: &Dataset, cat: &sparkles::Catalog) {
     ds.run_mapping("", None, &any(), &any(), None);
     ds.clone_to_with("clone", &Default::default(), &Default::default());
     ds.clone_to_memory_with("clone", &Default::default(), &Default::default());
+    let _ = sparkles::evidence::binding::claim_states(ds, None, None, "", &[], &any());
     ds.algorithms().query_text(&any(), false);
     ds.algorithms().stats(&any(), &Default::default());
     ds.algorithms().run_write(

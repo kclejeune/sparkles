@@ -368,6 +368,9 @@ struct Prepared {
     projection_graphs: Vec<String>,
     /// the run's evidence under a review policy
     evidence: Option<Evidence>,
+    /// managed-registry generation and evidence visibility key frozen before reading
+    /// an ordinary (non-review-policy) snapshot view
+    evidence_guard: Option<(u64, Option<String>)>,
     /// the claims behind each entity's label and type lines
     entity_claims: HashMap<String, Vec<u32>>,
     /// the positions in the previous build's pairs of those that have ended
@@ -458,7 +461,7 @@ impl Run<'_> {
     }
 
     fn check(&self) -> Result<(), RunError> {
-        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.cancel.load(std::sync::atomic::Ordering::Acquire) {
             Err(RunError::Cancelled)
         } else {
             Ok(())
@@ -510,6 +513,7 @@ impl Run<'_> {
         footprint: &Footprint,
         graphs: &[String],
         evidence: Option<&EvidenceCheck>,
+        evidence_guard: Option<&(u64, Option<String>)>,
     ) -> Result<(), RunError> {
         let live: GraphragSettings =
             crate::settings::effective(self.st, &self.ds, &crate::settings::GRAPHRAG);
@@ -531,7 +535,16 @@ impl Run<'_> {
                 "the community role's providers changed during the run; start a new run".into(),
             ));
         }
-        if &self.footprint(&principal, footprint.source_commit, graphs)? != footprint {
+        if let Some((start_gen, start_ev_key)) = evidence_guard {
+            let (now_gen, now_ev_key) = self.ds.store.snapshot().evidence_visibility_stamp();
+            if now_gen != *start_gen || now_ev_key != *start_ev_key {
+                return Err(RunError::Refused(
+                    "the principal's view or the access policy changed during the run; start a new run"
+                        .into(),
+                ));
+            }
+        }
+        if &self.footprint(&principal, footprint.source_commit, graphs, None)? != footprint {
             return Err(RunError::Refused(
                 "the principal's view or the access policy changed during the run; start a new run"
                     .into(),
@@ -551,8 +564,17 @@ impl Run<'_> {
         p: &Principal,
         commit: u64,
         graphs: &[String],
+        snap: Option<&sparkles::store::Snapshot>,
     ) -> Result<Footprint, RunError> {
         let view = p.view(&self.ds.name, Endpoint::Query);
+        let live_snap;
+        let snap = match snap {
+            Some(s) => s,
+            None => {
+                live_snap = self.ds.store.snapshot();
+                live_snap.as_ref()
+            }
+        };
         capture(&CaptureInput {
             dataset: &self.ds.name,
             branch: &branch_name(&self.ds),
@@ -563,6 +585,8 @@ impl Run<'_> {
             caller: &p.caller(),
             graphs,
             reports: &[self.graph().to_string()],
+            snap: Some(snap),
+            review_policy: self.settings.review_policy.is_some(),
         })
         .map_err(|e| RunError::Refused(e.to_string()))
     }
@@ -570,7 +594,7 @@ impl Run<'_> {
     fn load_state(&self) -> Result<BuildState, RunError> {
         match self.ds.store.root() {
             Some(db) => BuildState::load(db).map_err(failed),
-            None => Ok(self.st.graphrag.state(&self.ds.name)),
+            None => Ok(self.st.graphrag.state(super::runtime::owner_id(&self.ds))),
         }
     }
 
@@ -578,7 +602,7 @@ impl Run<'_> {
         match self.ds.store.root() {
             Some(db) => s.save(db).map_err(failed),
             None => {
-                self.st.graphrag.set_state(&self.ds.name, s);
+                self.st.graphrag.set_state_if_live(self.st, &self.ds, s);
                 Ok(())
             }
         }
@@ -589,6 +613,7 @@ impl Run<'_> {
     /// reads the evidence view's snapshot throughout (spec C25, "Reports on accepted
     /// evidence").
     fn prepare(&self, p: &Principal, previous: &BuildState) -> Result<Prepared, RunError> {
+        self.check()?;
         let opts = options_of(self.st, &self.ds, p, self.cancel.clone());
         if self.settings.review_policy.is_some() {
             crate::settings::evidence::require_reconciled(self.st, &self.ds)
@@ -602,12 +627,20 @@ impl Run<'_> {
             self.limits,
             &opts,
         )?;
-        let view = match &ev {
-            Some(e) => BuildView::Source {
-                source: e.read_source(),
-                commit: e.commit(),
-            },
-            None => BuildView::Snapshot(self.ds.store.snapshot()),
+        let (view, evidence_guard) = match &ev {
+            Some(e) => (
+                BuildView::Source {
+                    source: e.read_source(),
+                    commit: e.commit(),
+                },
+                None,
+            ),
+            None => {
+                let snap = self.ds.store.snapshot().pin_live_evidence();
+                let managed_gen = snap.managed_generation();
+                let ev_key = snap.evidence_visibility_key();
+                (BuildView::Snapshot(snap), Some((managed_gen, ev_key)))
+            }
         };
         let output: Option<String> = ev.as_ref().map(|e| e.policy.output.clone());
         let ctl = sparkles::algo::Control::new(self.cancel.clone(), None, u64::MAX);
@@ -629,7 +662,13 @@ impl Run<'_> {
                 &ctl,
             ),
         }
-        .map_err(failed)?;
+        .map_err(|e| {
+            if self.cancel.load(std::sync::atomic::Ordering::Acquire) {
+                RunError::Cancelled
+            } else {
+                failed(e)
+            }
+        })?;
         // the footprint lists the evidence graphs whose records the citations name (§6.2)
         let mut footprint_graphs = proj.graphs.clone();
         if let Some(e) = &ev {
@@ -637,7 +676,11 @@ impl Run<'_> {
             footprint_graphs.sort();
             footprint_graphs.dedup();
         }
-        let footprint = self.footprint(p, view.commit(), &footprint_graphs)?;
+        let view_snap = match &view {
+            BuildView::Snapshot(s) => Some(s.as_ref()),
+            BuildView::Source { .. } => None,
+        };
+        let footprint = self.footprint(p, view.commit(), &footprint_graphs, view_snap)?;
         self.progress(0.03, "finding communities");
         let h = hierarchy::compute(
             &proj.graph,
@@ -977,6 +1020,7 @@ impl Run<'_> {
             footprint,
             projection_graphs: footprint_graphs,
             evidence: ev,
+            evidence_guard,
             entity_claims,
             ended,
             revisions,
@@ -1345,15 +1389,15 @@ impl Run<'_> {
         (plans, why)
     }
 
-    /// The private check of the automatic refresh under a review policy (spec C25,
-    /// "Refresh"): a refresh's preparation and plan, read as the principal at the Head
-    /// evidence view, with no estimate, model call, commit, state change or task. It
+    /// A refresh's preparation and plan, read privately as the principal at the head
+    /// with no estimate, model call, commit, state change or task. Under a review
+    /// policy, it reads the Head evidence view (spec C25, "Refresh"). It
     /// answers why the dataset needs a refresh for a change of a report's input, and
     /// `None` when it does not. Pending, failed and stale reports are not such a reason.
     pub(crate) fn private_check(&self) -> Result<Option<String>, RunError> {
         // the check calls no model, so it needs no provider: a refresh it starts without
         // one fails as a visible task, as one the principal's feed starts does
-        if !self.settings.enabled {
+        if !self.settings.enabled || !super::refresh::is_live_dataset(self.st, &self.ds) {
             return Ok(None);
         }
         self.settings.check().map_err(RunError::Refused)?;
@@ -1366,6 +1410,19 @@ impl Run<'_> {
         if b.branch != sparkles::branch::MAIN {
             return Ok(None);
         }
+        #[cfg(test)]
+        fire_build_hook(BuildHookPoint::PrivateAdmit, &self.ds.name);
+        let _active_check = {
+            let _restore = self.st.restore_admission.lock();
+            if !super::refresh::is_live_dataset(self.st, &self.ds) {
+                return Ok(None);
+            }
+            self.st
+                .graphrag
+                .register_private_check(&self.ds.name, self.cancel.clone())
+        };
+        #[cfg(test)]
+        fire_build_hook(BuildHookPoint::PrivatePrepare, &self.ds.name);
         let prep = self.prepare(&principal, &previous)?;
         let (_, why) = self.plan_why(&prep, &previous);
         Ok(input_change(&prep, b, &why))
@@ -1460,8 +1517,10 @@ impl Run<'_> {
                 let dl = DatasetLedger::open(db).map_err(failed)?;
                 let st = self.st.clone();
                 let name = self.ds.name.clone();
+                let owner_id = owner.store.dataset_id();
                 dl.on_anomaly(Box::new(move |a| {
-                    st.graphrag.update(&name, |f| f.anomalies += 1);
+                    st.graphrag
+                        .update_if_live(&st, &name, owner_id, |f| f.anomalies += 1);
                     tracing::warn!(
                         target: "sparkles::graphrag",
                         "dataset {name}: accounting anomaly: provider {} reported {} tokens for a reservation of {}",
@@ -1474,7 +1533,7 @@ impl Run<'_> {
             None => Ledger::new(
                 b.tokens_per_build,
                 b.tokens_per_day,
-                self.st.graphrag.day(&owner.name),
+                self.st.graphrag.day_if_live(self.st, owner),
                 today,
             ),
         }))
@@ -1646,6 +1705,67 @@ fn write_commit(
 /// task and the listing of the new one are one step.
 static ADMISSION: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BuildHookPoint {
+    SpawnPublish,
+    PrivateAdmit,
+    PrivatePrepare,
+    SaveState,
+}
+
+#[cfg(test)]
+type BuildHook = Box<dyn FnMut(BuildHookPoint, &str)>;
+
+#[cfg(test)]
+thread_local! {
+    static BUILD_HOOK: std::cell::RefCell<Option<BuildHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct BuildHookGuard;
+
+#[cfg(test)]
+impl Drop for BuildHookGuard {
+    fn drop(&mut self) {
+        BUILD_HOOK.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_build_hook(f: impl FnMut(BuildHookPoint, &str) + 'static) -> BuildHookGuard {
+    BUILD_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    BuildHookGuard
+}
+
+#[cfg(test)]
+fn fire_build_hook(point: BuildHookPoint, name: &str) {
+    let f = BUILD_HOOK.with(|h| h.borrow_mut().take());
+    if let Some(mut f) = f {
+        f(point, name);
+        BUILD_HOOK.with(|h| {
+            if h.borrow().is_none() {
+                *h.borrow_mut() = Some(f);
+            }
+        });
+    }
+}
+
+struct AutoTaskGuard {
+    st: Arc<AppState>,
+    dataset: String,
+    task_id: String,
+}
+
+impl Drop for AutoTaskGuard {
+    fn drop(&mut self) {
+        self.st
+            .graphrag
+            .clear_auto_task(&self.dataset, &self.task_id);
+    }
+}
+
 /// Start a run as a task of kind [`TASK_KIND`], unless a GraphRAG task of the dataset is
 /// queued or running, whose id the error holds. `trigger` names why an automatic
 /// refresh started (§5), and the task's message says so.
@@ -1657,62 +1777,79 @@ pub fn spawn(
     confirmed: bool,
     trigger: Option<String>,
 ) -> Result<crate::state::Task, String> {
+    let is_auto = trigger.is_some();
+    let _restore = is_auto.then(|| st.restore_admission.lock());
     let _admission = ADMISSION.lock();
+    if is_auto && !super::refresh::is_live_dataset(st, &ds) {
+        return Err(format!("dataset /{} is no longer live", ds.name));
+    }
     if let Some(id) = st.active_task(TASK_KIND, &ds.name) {
         return Err(id);
+    }
+    #[cfg(test)]
+    if is_auto {
+        fire_build_hook(BuildHookPoint::SpawnPublish, &ds.name);
     }
     let id = st.next_task_id();
     let task_id = id.clone();
     let st2 = st.clone();
     let ds_name = ds.name.clone();
-    Ok(
-        st.start_task_opts(id, TASK_KIND, &ds_name, None, true, move |h| {
-            let cancel = h.cancel_flag();
-            let r = Run {
-                st: &st2,
-                ds: ds.clone(),
-                settings,
-                mode,
-                confirmed,
-                task: Some(h),
-                task_id,
-                cancel: cancel.clone(),
-                limits: Limits::default(),
-            };
-            let prefix = match &trigger {
-                Some(t) => format!("automatic refresh ({t}): "),
-                None => String::new(),
-            };
-            match run(&r) {
-                Ok(o) => {
-                    let mut detail = serde_json::to_value(&o).unwrap_or(Value::Null);
-                    if let Some(t) = &trigger {
-                        detail["trigger"] = t.clone().into();
-                    }
-                    h.set_detail(detail);
-                    Ok(match &o.stopped {
-                        Some(why) => format!(
-                            "{prefix}{} reports written, {} pending: {why}",
-                            o.written, o.pending
-                        ),
-                        None => format!(
-                            "{prefix}{} reports written, {} kept, {} failed",
-                            o.written, o.kept, o.failed
-                        ),
-                    })
+    let auto_guard = is_auto.then(|| AutoTaskGuard {
+        st: st.clone(),
+        dataset: ds_name.clone(),
+        task_id: id.clone(),
+    });
+    if is_auto {
+        st.graphrag.set_auto_task(&ds_name, &id);
+    }
+    let task = st.start_task_opts(id, TASK_KIND, &ds_name, None, true, move |h| {
+        let _auto_guard = auto_guard;
+        let cancel = h.cancel_flag();
+        let r = Run {
+            st: &st2,
+            ds: ds.clone(),
+            settings,
+            mode,
+            confirmed,
+            task: Some(h),
+            task_id,
+            cancel: cancel.clone(),
+            limits: Limits::default(),
+        };
+        let prefix = match &trigger {
+            Some(t) => format!("automatic refresh ({t}): "),
+            None => String::new(),
+        };
+        match run(&r) {
+            Ok(o) => {
+                let mut detail = serde_json::to_value(&o).unwrap_or(Value::Null);
+                if let Some(t) = &trigger {
+                    detail["trigger"] = t.clone().into();
                 }
-                Err(RunError::Cancelled) => Err(sparkles::Error::Cancelled.into()),
-                Err(e) => Err(anyhow::anyhow!("{prefix}{e}")),
+                h.set_detail(detail);
+                Ok(match &o.stopped {
+                    Some(why) => format!(
+                        "{prefix}{} reports written, {} pending: {why}",
+                        o.written, o.pending
+                    ),
+                    None => format!(
+                        "{prefix}{} reports written, {} kept, {} failed",
+                        o.written, o.kept, o.failed
+                    ),
+                })
             }
-        }),
-    )
+            Err(RunError::Cancelled) => Err(sparkles::Error::Cancelled.into()),
+            Err(e) => Err(anyhow::anyhow!("{prefix}{e}")),
+        }
+    });
+    Ok(task)
 }
 
 /// The persisted state of a dataset's builds.
 pub fn state_of(st: &AppState, ds: &Dataset) -> Result<BuildState, String> {
     match ds.store.root() {
         Some(db) => BuildState::load(db).map_err(|e| e.to_string()),
-        None => Ok(st.graphrag.state(&ds.name)),
+        None => Ok(st.graphrag.state(super::runtime::owner_id(ds))),
     }
 }
 
@@ -1865,6 +2002,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         &prep.footprint,
         &prep.projection_graphs,
         ev_check.as_ref(),
+        prep.evidence_guard.as_ref(),
     )?;
     let ledger = r.ledger()?;
     let tokenizers = Tokenizers::default();
@@ -1880,6 +2018,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         let mode = r.mode;
         let limits = r.limits;
         let ev_check = ev_check.clone();
+        let evidence_guard = prep.evidence_guard.clone();
         Arc::new(move || {
             let run = Run {
                 st: &st,
@@ -1892,8 +2031,15 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                 cancel: cancel.clone(),
                 limits,
             };
-            run.recheck(&models, &pairs, &footprint, &graphs, ev_check.as_ref())
-                .map_err(|e| e.to_string())
+            run.recheck(
+                &models,
+                &pairs,
+                &footprint,
+                &graphs,
+                ev_check.as_ref(),
+                evidence_guard.as_ref(),
+            )
+            .map_err(|e| e.to_string())
         })
     };
     let admission =
@@ -2088,6 +2234,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                 &prep.footprint,
                 &prep.projection_graphs,
                 ev_check.as_ref(),
+                prep.evidence_guard.as_ref(),
             )?;
             let res = r.write_report(
                 &models,
@@ -2223,6 +2370,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
             &prep.footprint,
             &prep.projection_graphs,
             ev_check.as_ref(),
+            prep.evidence_guard.as_ref(),
         )?;
         // a review or another writer changed a report link since the run read it: the
         // run's plan no longer describes the graph, and committing would undo that change
@@ -2267,7 +2415,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         && r.ds.store.root().is_none()
     {
         // a dataset without a directory keeps its anomalies in the server
-        r.st.graphrag.record_anomaly(&r.ds.name, a.clone());
+        r.st.graphrag.record_anomaly_if_live(r.st, &r.ds, a.clone());
     }
     outcome.stopped = stopped.or_else(|| {
         anomaly.map(|a| {
@@ -2322,6 +2470,8 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
             }
         })
         .collect();
+    #[cfg(test)]
+    fire_build_hook(BuildHookPoint::SaveState, &r.ds.name);
     r.save_state(BuildState {
         last_build: Some(BuildRecord {
             source_commit: prep.source_commit,
@@ -2341,14 +2491,16 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         }),
         ..BuildState::default()
     })?;
+    super::refresh::after_build(r.st, &r.ds, prep.source_commit);
     let phase = r.mode.as_str();
     let tokens = outcome.tokens;
     let stale = pending.len() as u64;
-    r.st.graphrag.update(&r.ds.name, |f| {
-        f.reports = statuses;
-        *f.tokens.entry(phase).or_default() += tokens;
-        f.stale = stale;
-    });
+    r.st.graphrag
+        .update_if_live(r.st, &r.ds.name, super::runtime::owner_id(&r.ds), |f| {
+            f.reports = statuses;
+            *f.tokens.entry(phase).or_default() += tokens;
+            f.stale = stale;
+        });
     Ok(outcome)
 }
 

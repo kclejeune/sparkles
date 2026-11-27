@@ -73,8 +73,20 @@ impl Store {
 
     /// An unresolved time has no honest commit number after catalog pruning.
     pub(super) fn unresolved_time_limited(&self, ms: i64, limit: &ReadLimit<'_>) -> Result<Error> {
-        let writer = limit.lock(&self.writer)?;
-        let head = writer.head.seq;
+        self.unresolved_time_limited_mode(ms, limit, false)
+    }
+
+    pub(super) fn unresolved_time_limited_mode(
+        &self,
+        ms: i64,
+        limit: &ReadLimit<'_>,
+        committed_only: bool,
+    ) -> Result<Error> {
+        let head = if committed_only {
+            self.snapshot().commit
+        } else {
+            limit.lock(&self.writer)?.head.seq
+        };
         let current = commit::generation_number(&self.snapshot().generation.name);
         let reconstructable = if let Some(history) = &self.history {
             limit
@@ -105,15 +117,31 @@ impl Store {
     /// materializes its head just to decide whether time inheritance is legitimate.
     pub(super) fn origin_timestamp_limited(
         &self,
+        commit: crate::branch::CommitRef,
+        limit: &ReadLimit<'_>,
+    ) -> Result<i64> {
+        self.origin_timestamp_limited_mode(commit, limit, false)
+    }
+
+    pub(super) fn origin_timestamp_limited_mode(
+        &self,
         mut commit: crate::branch::CommitRef,
         limit: &ReadLimit<'_>,
+        committed_only: bool,
     ) -> Result<i64> {
         use branching::readonly::{OriginRead, Purpose};
         for _ in 0..1024 {
             limit.check(0)?;
             commit = self.owned_set()?.normalize_with(commit, limit)?;
+            let resolve_store = |s: &Store, seq: u64| {
+                if committed_only {
+                    s.resolve_committed_limited(&At::Commit(seq), s.snapshot().commit, limit)
+                } else {
+                    s.resolve_under(&At::Commit(seq), limit)
+                }
+            };
             let result = if commit.branch_id == self.dataset_id {
-                self.resolve_under(&At::Commit(commit.seq), limit)
+                resolve_store(self, commit.seq)
                     .map(|resolved| OriginRead::Clock(resolved.commit.timestamp_ms))
             } else {
                 match self.readonly_branch_read_limited(
@@ -122,8 +150,7 @@ impl Store {
                     Purpose::Clock,
                     limit,
                 )? {
-                    OriginRead::Resident(store) => store
-                        .resolve_under(&At::Commit(commit.seq), limit)
+                    OriginRead::Resident(store) => resolve_store(store.as_ref(), commit.seq)
                         .map(|resolved| OriginRead::Clock(resolved.commit.timestamp_ms)),
                     value => Ok(value),
                 }
@@ -168,6 +195,22 @@ impl Store {
         // Capture the same writer head as resolve(), but do not wait without control.
         let head = limit.lock(&self.writer)?.head;
         self.resolve_in(at, head, limit)
+    }
+
+    /// [`resolve_under`](Self::resolve_under) against an already-published committed
+    /// snapshot sequence `head_seq`, without locking `self.writer`.
+    pub(super) fn resolve_committed_limited(
+        &self,
+        at: &At,
+        head_seq: u64,
+        limit: &ReadLimit<'_>,
+    ) -> Result<Resolved> {
+        if let At::Snapshot(name) = at
+            && !crate::history::valid_name(name)
+        {
+            return Err(Error::invalid("invalid snapshot name"));
+        }
+        self.resolve_in_seq(at, head_seq, limit)
     }
 
     pub(super) fn cache_limited_snapshot(
@@ -231,8 +274,17 @@ impl Store {
         options: &HistoryOptions,
         max_memory_bytes: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
-        let (snapshot, resolved, origin, _) =
+        let (snapshot, resolved, origin, charge) =
             self.snapshot_at_with_branch_limited_charged(store, at, options, max_memory_bytes)?;
+        let snapshot = if !matches!(at, At::Head) && self.configuration_activated() {
+            let remaining = max_memory_bytes.saturating_sub(charge.total());
+            let prep = options.temporary(remaining)?;
+            let (pinned, _held) =
+                self.pin_historical_evidence(store, at, resolved.commit.seq, snapshot, &prep)?;
+            pinned
+        } else {
+            snapshot
+        };
         Ok((snapshot, resolved, origin))
     }
 
@@ -257,6 +309,23 @@ impl Store {
         options: &HistoryOptions,
         max_memory_bytes: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
+        self.snapshot_at_with_branch_limited_charged_mode(
+            store,
+            at,
+            options,
+            max_memory_bytes,
+            false,
+        )
+    }
+
+    pub(crate) fn snapshot_at_with_branch_limited_charged_mode(
+        &self,
+        store: &Store,
+        at: &At,
+        options: &HistoryOptions,
+        max_memory_bytes: u64,
+        committed_only: bool,
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
         let limit = ReadLimit {
             options,
             memory: Some(max_memory_bytes),
@@ -268,7 +337,7 @@ impl Store {
                 "the pinned branch belongs to a different dataset family",
             ));
         }
-        self.snapshot_pinned_limited(store, at, options, max_memory_bytes)
+        self.snapshot_pinned_limited_mode(store, at, options, max_memory_bytes, committed_only)
     }
 
     pub(super) fn snapshot_at_prepared(
@@ -330,6 +399,57 @@ impl Store {
                 "a branch is resolved through the dataset's main store",
             ));
         }
+        let (snapshot, resolved, origin, mut charge) = if branch == self.dataset_id {
+            self.snapshot_from_limited(
+                PinnedSource::Resident(branching::BranchStore::Main(self)),
+                at,
+                options,
+                max_memory_bytes,
+            )?
+        } else {
+            self.listed_with(branch, &limit)?;
+            let read = self.snapshot_from_limited(
+                PinnedSource::Cold(branch),
+                at,
+                options,
+                max_memory_bytes,
+            )?;
+            // A branch deleted while it was read no longer names this state.
+            self.listed_with(branch, &limit)?;
+            read
+        };
+        let snapshot = if !matches!(at, At::Head) && self.configuration_activated() {
+            let remaining = max_memory_bytes.saturating_sub(charge.total());
+            let prep = options.temporary(remaining)?;
+            let (pinned, held) = self.pin_historical_evidence_for_branch(
+                branch,
+                at,
+                resolved.commit.seq,
+                snapshot,
+                &prep,
+            )?;
+            charge.delta_bytes = charge.delta_bytes.saturating_add(held.bytes());
+            pinned
+        } else {
+            snapshot
+        };
+        Ok((snapshot, resolved, origin, charge))
+    }
+
+    /// Read a commit from a cold or retired ancestor branch already proven to lie in the
+    /// caller's branch lineage.
+    pub(super) fn snapshot_of_origin_branch_limited_charged(
+        &self,
+        branch: uuid::Uuid,
+        at: &At,
+        options: &HistoryOptions,
+        max_memory_bytes: u64,
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
+        if self.is_branch() {
+            return Err(crate::branch::invalid_branch(
+                "a branch is resolved through the dataset's main store",
+            ));
+        }
         if branch == self.dataset_id {
             return self.snapshot_from_limited(
                 PinnedSource::Resident(branching::BranchStore::Main(self)),
@@ -338,12 +458,7 @@ impl Store {
                 max_memory_bytes,
             );
         }
-        self.listed_with(branch, &limit)?;
-        let read =
-            self.snapshot_from_limited(PinnedSource::Cold(branch), at, options, max_memory_bytes)?;
-        // A branch deleted while it was read no longer names this state.
-        self.listed_with(branch, &limit)?;
-        Ok(read)
+        self.snapshot_from_limited(PinnedSource::Cold(branch), at, options, max_memory_bytes)
     }
 
     fn snapshot_pinned_limited(
@@ -353,11 +468,23 @@ impl Store {
         options: &dyn ReadControl,
         memory: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
-        self.snapshot_from_limited(
+        self.snapshot_pinned_limited_mode(store, at, options, memory, false)
+    }
+
+    fn snapshot_pinned_limited_mode(
+        &self,
+        store: &Store,
+        at: &At,
+        options: &dyn ReadControl,
+        memory: u64,
+        committed_only: bool,
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
+        self.snapshot_from_limited_mode(
             PinnedSource::Resident(branching::BranchStore::Main(store)),
             at,
             options,
             memory,
+            committed_only,
         )
     }
 
@@ -367,6 +494,17 @@ impl Store {
         at: &At,
         options: &dyn ReadControl,
         memory: u64,
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
+        self.snapshot_from_limited_mode(start, at, options, memory, false)
+    }
+
+    fn snapshot_from_limited_mode(
+        &self,
+        start: PinnedSource<'_>,
+        at: &At,
+        options: &dyn ReadControl,
+        memory: u64,
+        committed_only: bool,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
         use PinnedSource as Source;
         use branching::readonly::OriginRead;
@@ -398,7 +536,7 @@ impl Store {
                 Source::Resident(store) => (
                     store.branch_id(),
                     store
-                        .snapshot_at_inner(requested, options, Some(memory))
+                        .snapshot_at_inner_mode(requested, options, Some(memory), committed_only)
                         .map(|(snapshot, resolved, charge)| {
                             OriginRead::View(snapshot, resolved, charge)
                         }),
@@ -426,19 +564,21 @@ impl Store {
                 OriginRead::Resident(store) => {
                     selected = Source::Resident(branching::BranchStore::Other(store))
                 }
-                OriginRead::Clock(_) | OriginRead::Configuration { .. } => {
+                OriginRead::Clock(_)
+                | OriginRead::Configuration { .. }
+                | OriginRead::Pin { .. } => {
                     return Err(Error::Corrupt(
                         "snapshot lookup returned only a fork clock".into(),
                     ));
                 }
                 OriginRead::Inherited(commit) => {
                     if let At::Time(ms) = at {
-                        let fork = self.origin_timestamp_limited(commit, &limit)?;
+                        let fork =
+                            self.origin_timestamp_limited_mode(commit, &limit, committed_only)?;
                         if *ms >= fork {
                             return match &selected {
-                                Source::Resident(store) => {
-                                    Err(store.unresolved_time_limited(*ms, &limit)?)
-                                }
+                                Source::Resident(store) => Err(store
+                                    .unresolved_time_limited_mode(*ms, &limit, committed_only)?),
                                 Source::Cold(id) => match self.readonly_branch_read_limited(
                                     *id,
                                     at,
@@ -446,9 +586,12 @@ impl Store {
                                     &limit,
                                 ) {
                                     Err(error) => Err(error),
-                                    Ok(OriginRead::Resident(store)) => {
-                                        Err(store.unresolved_time_limited(*ms, &limit)?)
-                                    }
+                                    Ok(OriginRead::Resident(store)) => Err(store
+                                        .unresolved_time_limited_mode(
+                                            *ms,
+                                            &limit,
+                                            committed_only,
+                                        )?),
                                     _ => Err(Error::Corrupt(
                                         "missing branch time produced a data view".into(),
                                     )),
@@ -503,26 +646,38 @@ impl SnapshotCharge {
 }
 
 // The cache's 448-byte/quad estimate is not an allocation bound: even a one-key
-// KeySet leaf reserves 65 keys. Bounded reads include sparse root capacity and the
-// predicate map as well. Leaves rebalance below 16 keys and branches below eight
-// children; 256 bytes per key plus 8 KiB per tree conservatively covers retained
-// node/vector capacity, Arc headers, and the per-predicate persistent map.
+// KeySet leaf reserves 65 keys. Bounded reads include sparse root capacity, the
+// predicate map, and the eighth `reifiers_ins` tree. Leaves rebalance below 16 keys and
+// branches below eight children; 256 bytes per key plus 8 KiB per tree conservatively
+// covers retained node/vector capacity, Arc headers, and the per-predicate persistent map.
 pub(super) fn preparation_delta_bytes(delta: &Delta) -> u64 {
     let quads = delta.inserts().saturating_add(delta.deletes()) as u64;
-    if quads == 0 {
+    let reifiers = delta.reifiers_ins.len() as u64;
+    if quads == 0 && reifiers == 0 {
         return 0;
     }
-    quads.saturating_mul(2048).saturating_add(128 << 10)
+    let base = quads.saturating_mul(2048).saturating_add(128 << 10);
+    if reifiers == 0 {
+        base
+    } else {
+        base.saturating_add(reifiers.saturating_mul(256))
+            .saturating_add(8 << 10)
+    }
 }
 
-// Mutation may copy/split two paths in each of seven insertion/deletion trees.
-// Count their transient storage while both the seed and working state remain live.
+// Mutation may copy/split paths in the seven insertion/deletion trees plus up to two
+// keys in `reifiers_ins`. Count their transient storage while both the seed and working
+// state remain live.
 pub(super) fn preparation_mutation_bytes(delta: &Delta) -> u64 {
     let quads = (delta.inserts().saturating_add(delta.deletes()) as u64).saturating_add(1);
+    let reifiers = (delta.reifiers_ins.len() as u64).saturating_add(2);
+    let perm_levels = u64::from(quads.ilog2()) / 3 + 2;
+    let reifier_levels = u64::from(reifiers.ilog2()) / 3 + 2;
     preparation_delta_bytes(delta)
-        .saturating_add(2048)
-        .saturating_add((u64::from(quads.ilog2()) / 3 + 2).saturating_mul(64 << 10))
-        .max(128 << 10)
+        .saturating_add(2048 + 512)
+        .saturating_add(perm_levels.saturating_mul(64 << 10))
+        .saturating_add(reifier_levels.saturating_mul(16 << 10))
+        .max(144 << 10)
 }
 
 #[cfg(test)]
@@ -843,5 +998,179 @@ mod tests {
         assert_eq!(history.misses, 1);
         assert_eq!(history.materializations, 0);
         assert!(history.cache.is_empty());
+    }
+
+    #[test]
+    fn historical_reifier_replay_dvocab_wait_observes_cancel_and_no_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(root.path(), StoreOptions::default()).unwrap());
+        let reifies = crate::reifiers::RDF_REIFIES;
+        crate::sparql::update::update(
+            &store,
+            &format!(
+                "INSERT DATA {{ GRAPH <urn:g> {{ <urn:c1> <{reifies}> <<( <urn:e1> <urn:p> <urn:o1> )>> }} }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        crate::sparql::update::update(
+            &store,
+            &format!(
+                "INSERT DATA {{ GRAPH <urn:g> {{ <urn:c2> <{reifies}> <<( <urn:e2> <urn:p> <urn:o2> )>> }} }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let snapshot = store.snapshot();
+        // Hold dvocab write lock and call apply_forward directly with a ReadLimit to ensure
+        // reifier triple-term hashing acquires dvocab through controlled read_lock.
+        let held = snapshot.generation.dvocab.write_guard_for_test();
+        let wal_path = snapshot.generation.dir.as_ref().unwrap().join("wal.log");
+        let end = super::super::wal::WalPoint {
+            seq: snapshot.commit,
+            offset: std::fs::metadata(&wal_path).unwrap().len(),
+        };
+        let start = super::super::wal::WalPoint { seq: 0, offset: 0 };
+        let generation = snapshot.generation.clone();
+        let cache = snapshot.cache.clone();
+
+        // 1. Cancellation while dvocab write lock is held.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = cancel.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let gen_clone = generation.clone();
+        let cache_clone = cache.clone();
+        let wal_clone = wal_path.clone();
+        let task = std::thread::spawn(move || {
+            let options = HistoryOptions {
+                cancel: Some(signal),
+                deadline: None,
+            };
+            let limit = ReadLimit {
+                options: &options,
+                memory: Some(4 << 20),
+                held: 0,
+            };
+            let mut delta = Delta::default();
+            let res = super::super::wal::apply_forward(
+                &wal_clone,
+                &gen_clone,
+                &cache_clone,
+                &mut delta,
+                start,
+                end,
+                &limit,
+            );
+            send.send(res).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        cancel.store(true, Ordering::Relaxed);
+        let result = receive.recv_timeout(Duration::from_secs(1));
+        assert!(matches!(result, Ok(Err(Error::Cancelled))));
+        drop(held);
+        task.join().unwrap();
+
+        // 2. no_wait refuses immediately while dvocab write lock is held.
+        struct NoWaitControl;
+        impl ReadControl for NoWaitControl {
+            fn check_read(&self) -> Result<()> {
+                Ok(())
+            }
+            fn no_wait(&self) -> bool {
+                true
+            }
+            fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+                crate::access::Preparation::new(crate::task::Control::none(), memory_bytes)
+            }
+        }
+        let held = snapshot.generation.dvocab.write_guard_for_test();
+        let control = NoWaitControl;
+        let limit = ReadLimit {
+            options: &control,
+            memory: Some(4 << 20),
+            held: 0,
+        };
+        let mut delta = Delta::default();
+        let err = super::super::wal::apply_forward(
+            &wal_path,
+            &generation,
+            &cache,
+            &mut delta,
+            start,
+            end,
+            &limit,
+        )
+        .unwrap_err();
+        drop(held);
+        assert!(
+            err.to_string().contains("no_wait"),
+            "expected no_wait refusal, got {err}"
+        );
+    }
+
+    #[test]
+    fn preparation_delta_and_mutation_bounds_cover_reifier_tree_splits() {
+        let store = Store::in_memory(StoreOptions::default());
+        let reifies = crate::reifiers::RDF_REIFIES;
+        // Seed one completely full 64-key leaf (32 distinct two-key reifiers) so the next
+        // two-key insert with a live cloned seed deterministically splits the leaf and
+        // grows `reifiers_ins` from depth 1 to depth 2.
+        let mut data = String::from("INSERT DATA { GRAPH <urn:g> {");
+        for i in 0..32u32 {
+            data.push_str(&format!(
+                " <urn:c{i}> <{reifies}> <<( <urn:s{i}> <urn:p> <urn:o{i}> )>> ."
+            ));
+        }
+        data.push_str(" } }");
+        crate::sparql::update::update(&store, &data, &Default::default()).unwrap();
+        let seed = store.snapshot();
+        assert_eq!(seed.delta.reifiers_ins.len(), 64);
+        assert_eq!(seed.delta.reifiers_ins.depth(), 1);
+
+        let before_mutation = preparation_mutation_bytes(&seed.delta);
+        crate::sparql::update::update(
+            &store,
+            &format!(
+                "INSERT DATA {{ GRAPH <urn:g> {{ <urn:c32> <{reifies}> <<( <urn:s32> <urn:p> <urn:o32> )>> }} }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let after = store.snapshot();
+        assert_eq!(after.delta.reifiers_ins.len(), 66);
+        assert_eq!(
+            after.delta.reifiers_ins.depth(),
+            2,
+            "65th key must split the full 64-key leaf into a depth-2 tree"
+        );
+        // Keep `seed` live while measuring unshared nodes copied/split in `after.delta`.
+        let (unshared, _) = after.delta.unshared_bytes(|| Ok(())).unwrap();
+        assert!(
+            unshared <= before_mutation,
+            "unshared={unshared} exceeded preparation_mutation_bytes={before_mutation}"
+        );
+        assert!(
+            preparation_delta_bytes(&after.delta) > preparation_delta_bytes(&seed.delta),
+            "retained delta estimate must grow with reifiers_ins"
+        );
+        // Compare against an identical-quad-count delta with no reifiers.
+        let plain = Store::in_memory(StoreOptions::default());
+        let mut plain_data = String::from("INSERT DATA { GRAPH <urn:g> {");
+        for i in 0..33u32 {
+            plain_data.push_str(&format!(" <urn:c{i}> <urn:plain> <urn:v{i}> ."));
+        }
+        plain_data.push_str(" } }");
+        crate::sparql::update::update(&plain, &plain_data, &Default::default()).unwrap();
+        let plain_snap = plain.snapshot();
+        assert_eq!(after.delta.inserts(), plain_snap.delta.inserts());
+        assert!(
+            preparation_delta_bytes(&after.delta) > preparation_delta_bytes(&plain_snap.delta),
+            "claim delta should charge more than equal-quad non-claim delta"
+        );
+        assert!(
+            super::super::delta_bytes(&after.delta) > super::super::delta_bytes(&plain_snap.delta),
+            "delta_bytes should charge reifiers_ins"
+        );
+        drop(seed);
     }
 }

@@ -1012,6 +1012,37 @@ pub fn world<'s>(ix: &Index, states: impl Iterator<Item = &'s State>) {
     }
 }
 
+/// Replays retained non-`FINE` datatype-checker evaluations from a reused conditional
+/// world into `ix.dt.sticky` so `excluded` matches a fresh run (roadmap item 664),
+/// polling `poll` every `chunk_len` rows without holding the `sticky` mutex across the
+/// poll callback.
+pub fn replay_sticky_polled<E>(
+    ix: &Index,
+    sticky_rows: &[(u32, u8)],
+    chunk_len: usize,
+    poll: &mut impl FnMut(usize) -> Result<(), E>,
+) -> Result<(), E> {
+    if sticky_rows.is_empty() {
+        return Ok(());
+    }
+    let Some(dt) = ix.dt.as_deref() else {
+        return Ok(());
+    };
+    let step = chunk_len.max(1);
+    for chunk in sticky_rows.chunks(step) {
+        poll(chunk.len())?;
+        let mut sticky = dt.sticky.lock();
+        for &(comp, last) in chunk {
+            if let Some(slot) = sticky.get_mut(comp as usize) {
+                *slot = (*slot).max(last);
+            }
+        }
+        #[cfg(test)]
+        super::el_test_hooks::scan_progress(super::el_test_hooks::ScanKind::StickyReplay);
+    }
+    Ok(())
+}
+
 /// The worst last evaluation of each component among the contexts.
 pub fn collect(ix: &Index, ctx: &Contexts, dynamic: Option<&Dynamic>, worst: &mut Vec<u8>) {
     let Some(dt) = ix.dt.as_deref() else {

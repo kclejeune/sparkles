@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) mod controlled;
+pub(crate) mod evidence;
 
 pub use crate::INFERRED_GRAPH;
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -256,16 +257,72 @@ static MASK_IDS: AtomicU64 = AtomicU64::new(1);
 /// without retaining the masked snapshot after its last caller drops.
 pub(super) fn masked(
     access: &GraphAccess,
-    rules: &TripleRules,
+    rules: Option<&TripleRules>,
     snap: &Arc<Snapshot>,
 ) -> Result<Arc<Snapshot>> {
-    let key = format!("{:?}|{}", access.read, rules.read_key());
+    let ev_config = if access.reads_everything() {
+        evidence::EvidenceConfig::None
+    } else {
+        snap.evidence_projection_config()
+    };
+    let ev_cfg = match &ev_config {
+        evidence::EvidenceConfig::None => None,
+        evidence::EvidenceConfig::Active(cfg) => Some(cfg),
+        evidence::EvidenceConfig::Unavailable(reason) => {
+            return Err(evidence::unavailable_error(reason));
+        }
+    };
+    let ev_policy_applicable =
+        ev_cfg.is_some_and(|cfg| cfg.has_readable_policy_output_uncontrolled(access));
+    let ev_active = match ev_cfg {
+        Some(cfg) if ev_policy_applicable => {
+            cfg.has_applicable_output_uncontrolled(access, snap)?
+        }
+        _ => false,
+    };
+    if rules.is_none() && !ev_active {
+        return Ok(snap.clone());
+    }
+    let mut key = match rules {
+        Some(rules) => format!("{:?}|{}", access.read, rules.read_key()),
+        None => format!("{:?}|none", access.read),
+    };
+    if ev_policy_applicable && let Some(cfg) = ev_cfg {
+        key.push_str("|ev:");
+        key.push_str(&cfg.fingerprint);
+    }
     let slot = snap.counts.mask_slot(&key);
     let mut held = slot.lock();
     if let Some(m) = held.upgrade() {
         return Ok(m);
     }
-    let hidden = match hidden_quads(access, rules, snap) {
+    let compute = || -> Result<Vec<Key>> {
+        let mut hidden = match rules {
+            Some(rules) => hidden_quads(access, rules, snap)?,
+            None => Vec::new(),
+        };
+        if ev_active && let Some(cfg) = ev_cfg {
+            let limits = rules.map_or_else(Limits::default, |r| r.limits);
+            let prep = crate::access::Preparation::new(
+                crate::task::Control::none(),
+                crate::evidence::resolve::MEMORY_BYTES,
+            )?;
+            let mut extra = crate::access::preparation::Buffer::new(&prep)?;
+            evidence::append_hidden(access, &hidden, cfg, snap, &limits, &prep, &mut extra)?;
+            if !extra.is_empty() {
+                let total = hidden.len().saturating_add(extra.len()) as u64;
+                if total > limits.max_hidden {
+                    return Err(too_many(&limits, total));
+                }
+                let _merge = prep.reserve((extra.len() as u64).saturating_mul(32))?;
+                hidden.extend_from_slice(&extra);
+                hidden.sort_unstable();
+                hidden.dedup();
+            }
+        }
+        Ok(hidden)
+    };
+    let hidden = match compute() {
         Ok(hidden) => hidden,
         Err(err) => {
             drop(held);
@@ -318,6 +375,19 @@ pub(crate) fn apply(snap: &Snapshot, hidden: Vec<Key>, key: String) -> Snapshot 
         retained = retained
             .saturating_add(delta.remove_inserted_all_metered(&from_ins))
             .saturating_add(delta.predicate_bytes_bound());
+        if !delta.reifiers_ins.is_empty() {
+            let mut reifier_allocated = 0u64;
+            for q in &from_ins {
+                if let Some((hs, ho)) = snap.generation.is_rdf_reifies_triple(q[1], q[2]) {
+                    for h in [hs, ho].into_iter().flatten() {
+                        delta
+                            .reifiers_ins
+                            .remove_metered(&[q[3].0, h, q[0].0, q[2].0], &mut reifier_allocated);
+                    }
+                }
+            }
+            retained = retained.saturating_add(reifier_allocated);
+        }
     }
     Snapshot {
         delta,
@@ -477,20 +547,11 @@ pub(crate) fn passes(
     let Some((q, cols)) = pattern_query(p, pattern, caller) else {
         return Ok(Passes::None);
     };
-    let named: Vec<String> = snap
-        .graph_ids()?
-        .into_iter()
-        .filter_map(|g| match snap.term(g) {
-            Some(Term::NamedNode(n)) => Some(n.into_string()),
-            _ => None,
-        })
-        .collect();
     let opts = crate::sparql::QueryOptions {
-        default_graph_extra: named,
         max_rows: Some(usize::try_from(limits.max_pattern_rows).unwrap_or(usize::MAX)),
         ..Default::default()
     };
-    let r = crate::sparql::query(snap.clone(), &q, &opts).map_err(|e| match e {
+    let r = crate::sparql::query_pattern(snap.clone(), &q, &opts).map_err(|e| match e {
         Error::BudgetExceeded(_) => Error::BudgetExceeded(Budget {
             kind: BudgetKind::Rows,
             limit: limits.max_pattern_rows,

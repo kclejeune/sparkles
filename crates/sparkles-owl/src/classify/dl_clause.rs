@@ -93,10 +93,13 @@ pub(super) fn next_hash_table_bytes(capacity: usize, entry_size: usize) -> Optio
 }
 
 /// Upper bound on peak new-table allocation when inserting `add` new keys into a hashbrown
-/// table with current `len` and `cap`.
-pub(super) fn hash_table_grow_bound(
+/// table with current `len`, usable capacity `usable_cap` (`items + growth_left`), and
+/// physical table capacity `phys_cap` (high-water `capacity()` of the live backing table,
+/// which stays unchanged when in-place `remove`/`retain` leaves tombstones).
+pub(super) fn hash_table_grow_bound_with_phys(
     len: usize,
-    cap: usize,
+    usable_cap: usize,
+    phys_cap: usize,
     add: usize,
     entry_size: usize,
 ) -> Option<usize> {
@@ -104,10 +107,10 @@ pub(super) fn hash_table_grow_bound(
         return Some(0);
     }
     let end = len.checked_add(add)?;
-    if end <= cap {
+    if end <= usable_cap {
         return Some(0);
     }
-    let cur = hash_buckets(cap)?;
+    let cur = hash_buckets(phys_cap.max(usable_cap))?;
     let next = if cur == 0 { 4 } else { cur.checked_mul(2)? };
     let target = hash_buckets(end)?.max(next);
     let full = table_layout_bytes(target, entry_size)?;
@@ -116,6 +119,17 @@ pub(super) fn hash_table_grow_bound(
     } else {
         Some(full)
     }
+}
+
+/// Upper bound on peak new-table allocation when inserting `add` new keys into a hashbrown
+/// table with current `len` and `cap` (when no tombstones lowered `cap` below physical size).
+pub(super) fn hash_table_grow_bound(
+    len: usize,
+    cap: usize,
+    add: usize,
+    entry_size: usize,
+) -> Option<usize> {
+    hash_table_grow_bound_with_phys(len, cap, cap, add, entry_size)
 }
 
 /// Next capacity of a `Vec<T>` when `len == cap` (matching `alloc::raw_vec` growth).

@@ -1984,38 +1984,82 @@ impl Vocab {
         Ok(result)
     }
 
-    pub(crate) fn find_with_controlled(
+    /// Exact controlled search over the base vocabulary whose work and scratch stay
+    /// bounded by `key`: compares directly against `key` using the sorted front-coding
+    /// invariant without allocating a reconstruction buffer for sibling entries.
+    pub(crate) fn find_exact_controlled<E: From<crate::error::Error>>(
         &self,
         key: &[u8],
-        mut reserve: impl FnMut(usize) -> crate::error::Result<()>,
-        checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
-    ) -> crate::error::Result<std::result::Result<u64, u64>> {
-        self.find_with_controlled_growth(key, |_, new| reserve(new), checkpoint)
-    }
-
-    pub(crate) fn find_with_controlled_growth(
-        &self,
-        key: &[u8],
-        grow: impl FnMut(usize, usize) -> crate::error::Result<()>,
-        checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
-    ) -> crate::error::Result<std::result::Result<u64, u64>> {
-        self.find_with_controlled_capacity(key, grow, |_| Ok(()), checkpoint)
-    }
-
-    pub(crate) fn find_with_controlled_capacity<E: From<crate::error::Error>>(
-        &self,
-        key: &[u8],
-        grow: impl FnMut(usize, usize) -> std::result::Result<(), E>,
-        settled: impl FnMut(usize) -> std::result::Result<(), E>,
-        checkpoint: impl FnMut(&'static str) -> std::result::Result<(), E>,
+        mut checkpoint: impl FnMut(&'static str) -> std::result::Result<(), E>,
     ) -> std::result::Result<std::result::Result<u64, u64>, E> {
-        let mut scratch = ControlledScratch {
-            grow,
-            settled,
-            checkpoint,
+        let Some(b) = self.find_block_with::<true, _, _>(
+            key,
+            &mut ControlledScratch {
+                grow: |_, _| Ok(()),
+                settled: |_| Ok(()),
+                checkpoint: &mut checkpoint,
+            },
+        )?
+        else {
+            return Ok(Err(0));
         };
         let _timer = ioacct::timer(Phase::VocabRead);
-        self.find_with::<true, _, E>(key, &mut scratch)
+        let data = self.data.as_slice();
+        let mut position = self.block_offset(b);
+        let count = FC_BLOCK.min(self.len as usize - b * FC_BLOCK);
+        ioacct::vocab_blocks_scanned(1);
+        self.touch_block(b);
+        // For every `at > 0`, the previous key was strictly less than `key` and
+        // `div = LCP(K_{at-1}, key) < key.len()`. Any subsequent entry with
+        // `entry.shared > div` inherits the mismatch byte at `div` (`< key[div]`)
+        // and stays strictly less than `key` with the same `div`.
+        let mut div = 0usize;
+        for at in 0..count {
+            checkpoint("comparing vocabulary entry")?;
+            let entry = if self.fsst.is_some() {
+                self.entry::<true>(data, &mut position, at == 0)
+            } else {
+                self.entry::<false>(data, &mut position, at == 0)
+            };
+            if at == 0 && entry.shared != 0 {
+                return Err(crate::error::Error::Corrupt(
+                    "first vocabulary block entry has non-zero shared prefix".into(),
+                )
+                .into());
+            }
+            if at > 0 && entry.shared > div {
+                continue;
+            }
+            let rem = &key[entry.shared..];
+            let suffix = &data[entry.start..entry.start + entry.len];
+            let (order, matched) = if entry.coded {
+                let id = (b * FC_BLOCK + at) as u64;
+                let table = self
+                    .fsst
+                    .as_ref()
+                    .expect("coded vocabulary metadata")
+                    .table(id);
+                table.compare_controlled(suffix, rem, &mut checkpoint)?
+            } else {
+                compare_prepared_prefix(suffix, rem, &mut checkpoint)?
+            };
+            match order {
+                std::cmp::Ordering::Less => {
+                    div = entry.shared + matched;
+                    debug_assert!(div < key.len());
+                }
+                std::cmp::Ordering::Equal => {
+                    checkpoint("completed vocabulary search")?;
+                    return Ok(Ok((b * FC_BLOCK + at) as u64));
+                }
+                std::cmp::Ordering::Greater => {
+                    checkpoint("completed vocabulary search")?;
+                    return Ok(Err((b * FC_BLOCK + at) as u64));
+                }
+            }
+        }
+        checkpoint("completed vocabulary search")?;
+        Ok(Err(((b + 1) * FC_BLOCK).min(self.len as usize) as u64))
     }
 
     /// A serializer that already prefetched these blocks does not need dense hints
@@ -2447,22 +2491,19 @@ impl Vocab {
         }
     }
 
-    /// Unified binary search over front-coded blocks, generic over [`BlockScratch`].
-    /// Under [`Unlimited`], narrows with the sparse index and uses the zero-rebuild
-    /// LCP in-block scan; under checked or polling controls, admits reconstruction
-    /// scratch and compares cooperatively.
+    /// Select the last block whose first key is at or below the probe.
     #[inline(always)]
-    fn find_with<const P: bool, S: BlockScratch<E>, E>(
+    fn find_block_with<const P: bool, S: BlockScratch<E>, E>(
         &self,
         key: &[u8],
         scratch: &mut S,
-    ) -> std::result::Result<std::result::Result<u64, u64>, E> {
+    ) -> std::result::Result<Option<usize>, E> {
         let nb = self.num_blocks();
         if nb == 0 {
             if S::POLLS {
                 scratch.checkpoint("completed vocabulary search")?;
             }
-            return Ok(Err(0));
+            return Ok(None);
         }
         // last block whose first key <= key
         let (mut lo, mut hi) = (0usize, nb);
@@ -2473,7 +2514,7 @@ impl Vocab {
             // and data are read, each asked for in one request
             let g = partition_point_by(s.len(), |g| s.key(g) <= key);
             if g == 0 {
-                return Ok(Err(0));
+                return Ok(None);
             }
             let g = g - 1;
             lo = g * IDX_BLOCKS;
@@ -2500,13 +2541,24 @@ impl Vocab {
                 hi = mid;
             }
         }
-        if lo == 0 {
-            if S::POLLS {
-                scratch.checkpoint("completed vocabulary search")?;
-            }
-            return Ok(Err(0));
+        if lo == 0 && S::POLLS {
+            scratch.checkpoint("completed vocabulary search")?;
         }
-        let b = lo - 1;
+        Ok(lo.checked_sub(1))
+    }
+
+    /// Unified binary search over front-coded blocks, generic over [`BlockScratch`].
+    /// Under [`Unlimited`], uses the zero-rebuild LCP in-block scan. The checked
+    /// projection path admits its reconstruction scratch.
+    #[inline(always)]
+    fn find_with<const P: bool, S: BlockScratch<E>, E>(
+        &self,
+        key: &[u8],
+        scratch: &mut S,
+    ) -> std::result::Result<std::result::Result<u64, u64>, E> {
+        let Some(b) = self.find_block_with::<P, S, E>(key, scratch)? else {
+            return Ok(Err(0));
+        };
         if !S::CHECKED {
             return Ok(if self.fsst.is_some() {
                 self.find_in_block::<P, true>(b, key)
@@ -3158,6 +3210,32 @@ fn append_vocab_hashtable_bytes<T>(buckets: usize) -> Option<u64> {
     ctrl_offset
         .checked_add(buckets)?
         .checked_add(APPEND_VOCAB_HASH_GROUP_WIDTH as u64)
+}
+
+fn compare_prepared_prefix<E>(
+    left: &[u8],
+    right: &[u8],
+    checkpoint: &mut impl FnMut(&'static str) -> std::result::Result<(), E>,
+) -> std::result::Result<(std::cmp::Ordering, usize), E> {
+    let common = left.len().min(right.len());
+    let mut offset = 0usize;
+    while offset < common {
+        let end = (offset + 1024).min(common);
+        checkpoint("comparing vocabulary bytes")?;
+        let l = &left[offset..end];
+        let r = &right[offset..end];
+        if l != r {
+            let diff = l
+                .iter()
+                .zip(r)
+                .position(|(a, b)| a != b)
+                .expect("chunks differ");
+            return Ok((l[diff].cmp(&r[diff]), offset + diff));
+        }
+        offset = end;
+    }
+    checkpoint("completed vocabulary comparison")?;
+    Ok((left.len().cmp(&right.len()), common))
 }
 
 impl AppendVocab {
@@ -4969,7 +5047,7 @@ mod tests {
                 assert_eq!(actual.as_ref(), Some(key));
                 assert_eq!(
                     vocab
-                        .find_with_controlled(key, |_| Ok(()), |_| Ok(()))
+                        .find_exact_controlled(key, |_| Ok::<_, crate::Error>(()))
                         .unwrap(),
                     vocab.find(key)
                 );
@@ -4977,7 +5055,7 @@ mod tests {
                 absent.push(0);
                 assert_eq!(
                     vocab
-                        .find_with_controlled(&absent, |_| Ok(()), |_| Ok(()))
+                        .find_exact_controlled(&absent, |_| Ok::<_, crate::Error>(()))
                         .unwrap(),
                     vocab.find(&absent)
                 );
@@ -4993,6 +5071,129 @@ mod tests {
                     .unwrap(),
                 None
             );
+        }
+    }
+
+    #[test]
+    fn controlled_vocab_short_hit_and_miss_fit_after_an_oversized_sibling() {
+        use crate::builder::VocabCodec;
+        use crate::error::{Budget, BudgetKind, Error};
+        use crate::store::{Store, StoreOptions};
+
+        for codec in [VocabCodec::Front, VocabCodec::Fsst] {
+            let store = Store::in_memory(StoreOptions {
+                build: crate::builder::BuildOptions {
+                    vocab_codec: Some(codec),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let long = "b".repeat(120 * 1024);
+            crate::sparql::update::update(
+                &store,
+                &format!(r#"INSERT DATA {{ <urn:s> <urn:p> "a", "{long}", "c" }}"#),
+                &Default::default(),
+            )
+            .unwrap();
+            store.compact().unwrap();
+            let snap = store.snapshot();
+            assert_eq!(snap.generation.vocab_codec(), codec);
+            let vocab = &snap.generation.vocab;
+            let long_key = crate::id::term_key(&oxrdf::Literal::new_simple_literal(long).into());
+            let long_id = vocab.find(&long_key).unwrap() as usize;
+            let block = long_id / FC_BLOCK;
+            let mut position = vocab.block_offset(block);
+            let long_entry = (0..=long_id % FC_BLOCK)
+                .map(|at| vocab.entry_controlled(&mut position, at == 0).unwrap())
+                .last()
+                .unwrap();
+            assert_eq!(long_entry.coded, codec == VocabCodec::Fsst);
+            for value in ["c", "bb"] {
+                let key = crate::id::term_key(&oxrdf::Literal::new_simple_literal(value).into());
+                let (Ok(at) | Err(at)) = vocab.find(&key);
+                assert!(at > long_id as u64 && at as usize / FC_BLOCK == block);
+                let limit = (key.len() + 1) as u64;
+                let actual = snap.lookup_key_controlled(
+                    &key,
+                    |old, new| {
+                        let requested = (old + new) as u64;
+                        if requested <= limit {
+                            Ok(())
+                        } else {
+                            Err(Error::BudgetExceeded(Budget {
+                                kind: BudgetKind::Memory,
+                                limit,
+                                requested,
+                            }))
+                        }
+                    },
+                    |_| Ok(()),
+                    || Ok(()),
+                );
+                let expected = snap.lookup_key(&key);
+                assert_eq!(expected.is_some(), value == "c");
+                assert_eq!(actual.unwrap(), expected, "{codec}: {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn find_exact_controlled_skips_oversized_preceding_siblings_for_plain_and_fsst() {
+        let pad_a = "a".repeat(256 * 1024);
+        let pad_b = "a".repeat(256 * 1024) + "b";
+        let mut keys: Vec<Vec<u8>> = vec![
+            b"<urn:g:0".to_vec(),
+            b"<urn:g:a".to_vec(),
+            format!("<urn:g:a-{pad_a}").into_bytes(),
+            format!("<urn:g:a-{pad_b}").into_bytes(),
+            b"<urn:g:b".to_vec(),
+            b"<urn:g:bb".to_vec(),
+            b"<urn:g:c".to_vec(),
+        ];
+        for i in 0..FC_BLOCK * 2 {
+            keys.push(format!("<urn:g:z-{i:03}-{}", "q".repeat(64)).into_bytes());
+        }
+        keys.sort();
+        keys.dedup();
+        for fsst in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            write_codec(dir.path(), &keys, fsst);
+            let vocab = Vocab::open(dir.path()).unwrap();
+            assert_eq!(vocab.is_fsst(), fsst);
+            for key in &keys {
+                let mut checks = 0usize;
+                let got = vocab
+                    .find_exact_controlled(key, |_| {
+                        checks += 1;
+                        Ok::<_, crate::Error>(())
+                    })
+                    .unwrap();
+                assert_eq!(got, vocab.find(key));
+                if key.len() < 64 {
+                    // Searching for a short key must not scan through the 256 KiB sibling.
+                    assert!(
+                        checks < 64,
+                        "short key lookup ran {checks} checkpoints (fsst={fsst})"
+                    );
+                }
+            }
+            for probe in [
+                b"".as_slice(),
+                b"<urn:a",
+                b"<urn:g:a-",
+                b"<urn:g:a-b",
+                b"<urn:g:ba",
+                b"<urn:g:zzz",
+            ] {
+                assert_eq!(
+                    vocab
+                        .find_exact_controlled(probe, |_| Ok::<_, crate::Error>(()))
+                        .unwrap(),
+                    vocab.find(probe),
+                    "probe={:?} fsst={fsst}",
+                    String::from_utf8_lossy(probe)
+                );
+            }
         }
     }
 
@@ -6124,7 +6325,7 @@ mod tests {
                 Err(Error::Timeout)
             ));
             assert!(matches!(
-                v.find_with_controlled(&keys[17], |_| Ok(()), |_| Err(Error::Cancelled)),
+                v.find_exact_controlled(&keys[17], |_| Err(Error::Cancelled)),
                 Err(Error::Cancelled)
             ));
             for &id in &sample_ids {
@@ -6132,7 +6333,7 @@ mod tests {
                 assert_eq!(v.find(k), Ok(id));
                 assert_eq!(v.find_with_checked(k, |_| Ok(())).unwrap(), Ok(id));
                 assert_eq!(
-                    v.find_with_controlled(k, |_| Ok(()), |_| Ok(())).unwrap(),
+                    v.find_exact_controlled(k, |_| Ok::<_, Error>(())).unwrap(),
                     Ok(id)
                 );
                 let fallible = v.get_with_fallible(id, |_| Ok(()), |b| b.to_vec()).unwrap();

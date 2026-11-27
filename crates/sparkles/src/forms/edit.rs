@@ -287,6 +287,7 @@ fn subtree_at(
     let everything = Reader {
         snap: raw.clone(),
         access: None,
+        bound: None,
         masked: false,
         limits: view.limits.clone(),
     };

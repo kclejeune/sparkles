@@ -390,6 +390,47 @@ impl Preparation {
         Ok(preparation)
     }
 
+    /// Prepare a child operation (such as incremental circuit masking) under `control`,
+    /// bounded by `memory_bytes` and charging its parent [`ParentHandle`] directly.
+    pub(crate) fn with_parent(
+        control: Control,
+        memory_bytes: u64,
+        parent: ParentHandle,
+        grant: Option<Arc<crate::sparql::pool::PoolGrant>>,
+    ) -> Result<Self> {
+        control.check()?;
+        let bytes =
+            (std::mem::size_of::<Inner>() + 16 + std::mem::size_of::<Upstream>() + 32) as u64;
+        if bytes > memory_bytes {
+            return Err(memory(memory_bytes));
+        }
+        let held = parent.reserve(bytes).map_err(parent_error)?;
+        let preparation = Self {
+            inner: Shared::new(Inner {
+                control,
+                limit: memory_bytes,
+                used: AtomicU64::new(bytes),
+                peak: AtomicU64::new(bytes),
+                selection: None,
+                grant,
+                context_bytes: bytes,
+                cancellation: None,
+                original_controls: None,
+                inherited_controls: None,
+                upstream: Some(Box::new(Upstream {
+                    parent,
+                    held: Mutex::new(held),
+                    pause: Arc::new(AtomicU64::new(0)),
+                })),
+            }),
+            no_wait: false,
+            query: None,
+            in_selection: false,
+        };
+        preparation.check()?;
+        Ok(preparation)
+    }
+
     /// Shared wait-credit counter for a view rebuild's own ordinary execution deadline.
     /// `None` for ordinary checked sources whose absolute deadlines never extend on pause.
     pub(crate) fn view_rebuild_pause(&self) -> Option<Arc<AtomicU64>> {
@@ -733,6 +774,17 @@ impl Preparation {
         &self.inner.used
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_peak(&self) -> u64 {
+        self.inner.peak.load(Ordering::Relaxed)
+    }
+
+    /// Bytes currently reserved in the active budget.
+    pub(crate) fn used(&self) -> u64 {
+        let (counter, _) = self.active_budget();
+        counter.load(Ordering::Relaxed)
+    }
+
     /// The allowance not yet reserved. Other clones may reserve it at any moment, so
     /// this only sizes work; storage still needs a [`reserve`](Self::reserve).
     pub(crate) fn room(&self) -> u64 {
@@ -1005,6 +1057,34 @@ impl Preparation {
         Ok(false)
     }
 
+    pub(crate) fn allows_named_graph_iri(&self, graphs: &Graphs, iri: &str) -> Result<bool> {
+        self.check()?;
+        let Graphs::Only(rule) = graphs else {
+            return Ok(true);
+        };
+        if iri == crate::sparql::ctx::DEFAULT_GRAPH_IRI {
+            Ok(rule.default_graph)
+        } else if iri == crate::sparql::ctx::UNION_GRAPH_IRI {
+            Ok(false)
+        } else {
+            self.named_rule(rule, iri)
+        }
+    }
+
+    pub(crate) fn covers_named_graph_iri(
+        &self,
+        protection: &Protection,
+        iri: &str,
+    ) -> Result<bool> {
+        match &protection.graphs {
+            Some(graphs) => self.allows_named_graph_iri(graphs, iri),
+            None => {
+                self.check()?;
+                Ok(true)
+            }
+        }
+    }
+
     pub(crate) fn covers_graph(
         &self,
         protection: &Protection,
@@ -1062,6 +1142,29 @@ impl Preparation {
         snap.scan_prepared(perm, prefix, self, each)
     }
 
+    /// Check whether `quad` is present in `snap` under this preparation's controls
+    /// and memory budget.
+    pub fn contains(&self, snap: &Snapshot, quad: &[Id; 4]) -> Result<bool> {
+        snap.contains_prepared(quad, self)
+    }
+
+    /// Return the first live physical quad in `[lo, hi]` under `perm`, seeking
+    /// directly via block, segment, row and delta bounds.
+    pub(crate) fn first_in_range(
+        &self,
+        snap: &Snapshot,
+        perm: Perm,
+        lo: crate::index::Key,
+        hi: crate::index::Key,
+    ) -> Result<Option<[Id; 4]>> {
+        let mut found = None;
+        snap.scan_prepared_range::<Error>(perm, lo, hi, self, |q| {
+            found = Some(q);
+            Ok(false)
+        })?;
+        Ok(found)
+    }
+
     /// Resolve an IRI with controlled reconstruction and delta-vocabulary waiting.
     pub fn lookup_iri(&self, snap: &Snapshot, iri: &str) -> Result<Option<Id>> {
         self.check()?;
@@ -1094,12 +1197,11 @@ impl Preparation {
     }
 
     fn lookup_vocab_key(&self, snap: &Snapshot, key: &[u8]) -> Result<Option<Id>> {
-        let mut workspace = self.reserve(0)?;
-        if let Ok(id) = snap.generation.vocab.find_with_controlled(
-            key,
-            |bytes| workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256)),
-            |phase| self.checkpoint(phase),
-        )? {
+        if let Ok(id) = snap
+            .generation
+            .vocab
+            .find_exact_controlled(key, |phase| self.checkpoint(phase))?
+        {
             self.check()?;
             return Ok(Some(Id::vocab(id)));
         }
@@ -1193,6 +1295,153 @@ impl Preparation {
         };
         let result = match result {
             Some(result) => result?,
+            None => (each.take().expect("not called"))(None)?,
+        };
+        self.check()?;
+        Ok(result)
+    }
+
+    /// The IRI text of a stored named node, borrowed for `each` without full term
+    /// decoding. Only the key's own bytes and the reconstruction workspace are
+    /// charged, so a long rejected IRI does not pay the general term-decoder
+    /// multiplier. `None` for any non-IRI term. Vocabulary locks are released
+    /// before the callback.
+    pub fn with_iri<R>(
+        &self,
+        snap: &Snapshot,
+        id: Id,
+        each: impl FnOnce(Option<&str>) -> Result<R>,
+    ) -> Result<R> {
+        self.check()?;
+        let mut each = Some(each);
+        let mut call = |key: &[u8]| -> Result<R> {
+            let each = each.take().expect("called once");
+            let Some(text) = key.strip_prefix(b"<") else {
+                return each(None);
+            };
+            let _held = self.reserve((key.len() as u64).saturating_add(64))?;
+            each(std::str::from_utf8(text).ok())
+        };
+        let mut workspace = self.reserve(0)?;
+        let result = match id.tag() {
+            Tag::Vocab => {
+                if id.payload() >= snap.generation.vocab.len()
+                    || !snap.generation.vocab.is_iri(id.payload())
+                {
+                    None
+                } else {
+                    snap.generation.vocab.get_with_controlled(
+                        id.payload(),
+                        |bytes| {
+                            workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256))
+                        },
+                        |phase| self.checkpoint(phase),
+                        &mut call,
+                    )?
+                }
+            }
+            Tag::Delta => {
+                // Copy the delta IRI into a budgeted temporary buffer so the delta
+                // vocabulary read lock is released before invoking `each`.
+                let copied: Option<(String, Reservation)> =
+                    snap.generation.dvocab.with_prepared(self, |vocab| {
+                        if id.payload() >= snap.dvocab_len {
+                            return Ok(None);
+                        }
+                        let Some(key) = vocab.get(id.payload()) else {
+                            return Ok(None);
+                        };
+                        let Some(text) = key.strip_prefix(b"<") else {
+                            return Ok(None);
+                        };
+                        let Ok(text) = std::str::from_utf8(text) else {
+                            return Ok(None);
+                        };
+                        let mut held = self.reserve(0)?;
+                        let owned = self.copy_string(text, &mut held)?;
+                        Ok(Some((owned, held)))
+                    })?;
+                let out = (each.take().expect("called once"))(
+                    copied.as_ref().map(|(text, _)| text.as_str()),
+                )?;
+                if let Some((owned, held)) = copied {
+                    drop(owned);
+                    drop(held);
+                }
+                self.check()?;
+                return Ok(out);
+            }
+            _ => None,
+        };
+        let result = match result {
+            Some(result) => result?,
+            None => (each.take().expect("not called"))(None)?,
+        };
+        self.check()?;
+        Ok(result)
+    }
+
+    /// The lexical form of a vocabulary-stored typed literal with `datatype`, borrowed
+    /// for `each` without decoding it as a term. Only literals stored under `Tag::Vocab`
+    /// or `Tag::Delta` as `TextKey::Typed` keys match, including `xsd:base64Binary` and
+    /// any non-inlined lexical form of a datatype that can otherwise be inlined. Literals
+    /// stored under an inline tag, `xsd:string` literals stored as simple literal keys
+    /// for [`with_simple_literal`](Self::with_simple_literal), and any other term or
+    /// mismatched datatype pass `None`. On `Vocab`, reconstruction growth is settled to
+    /// the reconstructed key capacity before `each` runs so large retained literals do
+    /// not over-charge the allowance.
+    pub fn with_typed_literal<R>(
+        &self,
+        snap: &Snapshot,
+        id: Id,
+        datatype: &str,
+        each: impl FnOnce(Option<&str>) -> Result<R>,
+    ) -> Result<R> {
+        self.check()?;
+        let mut each = Some(each);
+        let mut call = |key: &[u8]| -> Result<R> {
+            let each = each.take().expect("called once");
+            let lexical = match crate::id::TextKey::parse(key) {
+                Some(crate::id::TextKey::Typed(text, dt)) if dt == datatype => Some(text),
+                _ => None,
+            };
+            each(lexical)
+        };
+        let workspace = std::cell::RefCell::new(self.reserve(0)?);
+        let result = match id.tag() {
+            Tag::Vocab => snap.generation.vocab.get_with_controlled_capacity_checked(
+                id.payload(),
+                |old, new| {
+                    workspace
+                        .borrow_mut()
+                        .grow_to((old as u64).saturating_add(new as u64).saturating_add(256))
+                },
+                |cap| {
+                    workspace
+                        .borrow_mut()
+                        .release_to((cap as u64).saturating_add(256));
+                    Ok(())
+                },
+                |phase| self.checkpoint(phase),
+                |key| call(key),
+            )?,
+            Tag::Delta => snap.generation.dvocab.with_prepared(self, |vocab| {
+                if id.payload() >= snap.dvocab_len {
+                    return Ok(None);
+                }
+                vocab
+                    .get(id.payload())
+                    .map(|key| {
+                        let _held = self.reserve((key.len() as u64).saturating_add(64))?;
+                        call(key)
+                    })
+                    .transpose()
+            })?,
+            _ => None,
+        };
+        drop(workspace);
+        let result = match result {
+            Some(result) => result,
             None => (each.take().expect("not called"))(None)?,
         };
         self.check()?;
@@ -1765,14 +2014,15 @@ impl Reservation {
         Ok(())
     }
     /// Release the allowance above `bytes` once the owner retains no more than that.
-    pub(crate) fn release_to(&mut self, bytes: u64) {
+    pub fn release_to(&mut self, bytes: u64) {
         if bytes < self.bytes {
             self.preparation.release_bytes(self.bytes - bytes);
             self.bytes = bytes;
         }
     }
 
-    pub(crate) fn bytes(&self) -> u64 {
+    /// Bytes currently reserved by this owner.
+    pub fn bytes(&self) -> u64 {
         self.bytes
     }
 
@@ -2175,6 +2425,11 @@ impl PreparedView {
         &self.inner.snapshot
     }
 
+    /// Cloned `Arc` handle to the physical masked snapshot.
+    pub(crate) fn snapshot_arc(&self) -> Arc<Snapshot> {
+        self.inner.snapshot.clone()
+    }
+
     /// Whether the graph named by `term` (the default graph when `None`) is readable.
     pub fn readable(&self, term: Option<&oxrdf::Term>) -> bool {
         self.inner.access.readable(term)
@@ -2183,6 +2438,21 @@ impl PreparedView {
     /// Whether the graph named by `iri` is readable under this prepared policy.
     pub fn allows_read_iri(&self, iri: &str) -> bool {
         self.inner.access.read.allows_iri(iri)
+    }
+
+    /// Whether the guarded named graph `iri` is readable under this prepared policy:
+    /// either reads are unrestricted, or `iri` is allowed by the read rule and exempted
+    /// by a snapshot-bound guard whose pattern matches `iri`.
+    pub fn allows_guarded_read_iri(&self, iri: &str) -> bool {
+        self.inner.access.allows_guarded_read_iri(iri)
+    }
+
+    /// See [`GraphAccess::visit_guarded_read_iris`].
+    pub fn visit_guarded_read_iris<E>(
+        &self,
+        visit: impl FnMut(&str) -> std::result::Result<(), E>,
+    ) -> std::result::Result<bool, E> {
+        self.inner.access.visit_guarded_read_iris(visit)
     }
 
     /// Whether the graph named by `term` (the default graph when `None`) is writable.

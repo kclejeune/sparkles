@@ -482,6 +482,15 @@ pub(crate) fn open_for_append(path: &Path, version: u32) -> std::io::Result<File
 /// The smallest preallocation step: a small log grows by this much at a time.
 const PREALLOC_MIN: u64 = 64 << 10;
 
+/// The file length after a write ending at `end`, including any new zero tail.
+pub(super) fn allocation_after_write(alloc: u64, end: u64, prealloc: u64) -> u64 {
+    if end <= alloc || prealloc == 0 {
+        return alloc.max(end);
+    }
+    let step = alloc.max(PREALLOC_MIN).min(prealloc);
+    (end + step).next_multiple_of(4096).min(end + prealloc)
+}
+
 /// Write a transaction's records `data` at byte `at` of the log file, its logical end,
 /// without syncing. `alloc` is the file's length. With preallocation (`prealloc` above 0,
 /// the largest step), a write past `alloc` also writes zero bytes after the records, so
@@ -505,8 +514,7 @@ pub(crate) fn write_commit(
         *alloc = end;
         return Ok(());
     }
-    let step = (*alloc).max(PREALLOC_MIN).min(prealloc);
-    let to = (end + step).next_multiple_of(4096).min(end + prealloc);
+    let to = allocation_after_write(*alloc, end, prealloc);
     let zeros = vec![0u8; ((to - end) as usize).min(1 << 20)];
     let mut pos = end;
     while pos < to {
@@ -904,16 +912,60 @@ impl WalIndex {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod cursor_stats {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LIVE: Cell<usize> = const { Cell::new(0) };
+        static PEAK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn reset() {
+        LIVE.with(|l| l.set(0));
+        PEAK.with(|p| p.set(0));
+    }
+
+    pub(crate) fn peak() -> usize {
+        PEAK.with(Cell::get)
+    }
+
+    pub(super) fn on_open() {
+        LIVE.with(|l| {
+            let next = l.get() + 1;
+            l.set(next);
+            PEAK.with(|p| {
+                if next > p.get() {
+                    p.set(next);
+                }
+            });
+        });
+    }
+
+    pub(super) fn on_drop() {
+        LIVE.with(|l| l.set(l.get().saturating_sub(1)));
+    }
+}
+
 /// Reads the transactions of a log forward from a [`WalPoint`].
 pub(crate) struct WalCursor {
     r: BufReader<File>,
     path: PathBuf,
     /// after the last complete transaction read
     at: WalPoint,
+    /// byte offset where the last complete transaction started
+    last_start_offset: u64,
     /// the data records of the transaction last read
     txn: Vec<u8>,
     version: u32,
     configuration: Option<crate::evidence::Sha256Digest>,
+}
+
+#[cfg(test)]
+impl Drop for WalCursor {
+    fn drop(&mut self) {
+        cursor_stats::on_drop();
+    }
 }
 
 impl WalCursor {
@@ -949,10 +1001,13 @@ impl WalCursor {
     fn new_with(mut file: File, path: &Path, from: WalPoint, capacity: usize) -> Result<WalCursor> {
         let version = descriptor_version(&mut file, path)?;
         file.seek(SeekFrom::Start(from.offset))?;
+        #[cfg(test)]
+        cursor_stats::on_open();
         Ok(WalCursor {
             r: BufReader::with_capacity(capacity, file),
             path: path.to_path_buf(),
             at: from,
+            last_start_offset: from.offset,
             txn: Vec::new(),
             version,
             configuration: None,
@@ -980,6 +1035,11 @@ impl WalCursor {
     /// Where the cursor stands: after the last transaction read.
     pub fn position(&self) -> WalPoint {
         self.at
+    }
+
+    /// Byte offset where the last complete transaction read by `next`/`next_with` started.
+    pub(crate) fn last_start_offset(&self) -> u64 {
+        self.last_start_offset
     }
 
     pub(crate) fn configuration(&self) -> Option<crate::evidence::Sha256Digest> {
@@ -1010,6 +1070,7 @@ impl WalCursor {
         self.configuration = None;
         let mut rec = [0u8; WAL_REC];
         let mut offset = self.at.offset;
+        let mut txn_start = offset;
         loop {
             if C::ACCOUNTS {
                 limit.check(held.saturating_add(self.buffer_bytes()))?;
@@ -1047,6 +1108,7 @@ impl WalCursor {
                         ));
                     }
                     self.version = found;
+                    txn_start = offset;
                 }
                 // the log's end: its preallocated space, or a torn last transaction
                 _ if is_zero_record(&rec) => return Ok(None),
@@ -1114,6 +1176,7 @@ impl WalCursor {
                 )));
             }
         };
+        self.last_start_offset = txn_start;
         self.at = WalPoint { seq, offset };
         Ok(Some((seq, &self.txn, self.buffer_bytes())))
     }
@@ -1204,17 +1267,31 @@ pub(crate) fn apply_forward<C: Control>(
                 continue;
             }
             let q = record_quad(rec);
-            let in_base = if C::ACCOUNTS {
-                // Each changed quad can add one key to every permutation. Check before
-                // mutation, while the validated transaction remains in memory.
+            let held = if C::ACCOUNTS {
+                // Each changed quad can add one key to every permutation plus up to two
+                // keys to `reifiers_ins`. Check before mutation, while the validated
+                // transaction remains in memory.
                 let held = super::history_limited::preparation_mutation_bytes(delta)
                     .saturating_add(buffers);
                 limit.check(held)?;
+                held
+            } else {
+                0
+            };
+            let in_base = if C::ACCOUNTS {
                 spo.contains_with(cache, &Perm::Spo.to_key(&q), limit, held)?
             } else {
                 spo.contains(cache, &Perm::Spo.to_key(&q))?
             };
-            apply(delta, &q, rec[0] == WAL_INSERT, in_base);
+            apply_with(
+                generation,
+                delta,
+                &q,
+                rec[0] == WAL_INSERT,
+                in_base,
+                limit,
+                held,
+            )?;
             records += 1;
             if Stride::<0x1_0000>::due::<C>(records) {
                 limit.check_delta(delta)?;
@@ -1345,16 +1422,29 @@ pub(crate) fn apply_backward<C: Control>(
                 continue;
             }
             let q = record_quad(r);
-            let in_base = if C::ACCOUNTS {
+            let held = if C::ACCOUNTS {
                 let held = super::history_limited::preparation_mutation_bytes(delta)
                     .saturating_add(held_buffers)
                     .saturating_add(fwd.capacity() as u64);
                 limit.check(held)?;
+                held
+            } else {
+                0
+            };
+            let in_base = if C::ACCOUNTS {
                 spo.contains_with(cache, &Perm::Spo.to_key(&q), limit, held)?
             } else {
                 spo.contains(cache, &Perm::Spo.to_key(&q))?
             };
-            apply(delta, &q, r[0] != WAL_INSERT, in_base);
+            apply_with(
+                generation,
+                delta,
+                &q,
+                r[0] != WAL_INSERT,
+                in_base,
+                limit,
+                held,
+            )?;
             records += 1;
             if Stride::<0x1_0000>::due::<C>(records) {
                 limit.check_delta(delta)?;

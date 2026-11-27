@@ -127,7 +127,7 @@ every later extension or compatibility goal is built.
 | [C19](C19-layered-settings.md) | Layered dataset and server settings merging defaults, declared files and runtime overrides, with field locks, `/$/settings`, `sparkles settings`, UI controls and provider presets. | implemented |
 | [C20](C20-declared-prefixes.md) | Global and per-dataset declared prefixes managed via settings files, HTTP, CLI and UI, with locks, shadow warnings and editor/LSP completion. | implemented |
 | [C21](C21-outbound-notifications.md) | Outbound notifications over signed webhooks, ntfy and email with retries, deduplication, repeats, test sends and server UI settings. | implemented |
-| [C22](C22-graph-rag-community-summaries.md) | Hierarchical Leiden community summaries written as cited RDF triples, refreshed within a token budget and used by Ask, recall and memory briefs. | implemented in part (Phase 1, parts of Phases 2–3) |
+| [C22](C22-graph-rag-community-summaries.md) | Hierarchical Leiden community summaries written as cited RDF triples, refreshed within a token budget and used by Ask, recall and memory briefs. | implemented in part (Phases 1 and 3, parts of Phase 2) |
 | [C22b](C22b-report-configurations.md) | Named community-report configurations scoped by principal, projection and language with shared budget enforcement. | specified |
 | [C23](C23-batched-updates-and-triggers.md) | Resumable batched updates from SELECT results and commit triggers that run SPARQL updates or webhooks with ordering, recursion limits and a run log. | specified |
 | [C24](C24-json-query-languages.md) | JSON-LD node-pattern queries and JSON-LD 1.1 frames compiled to SPARQL algebra, plus n-ary Datalog queries evaluated via F17 demand transformation. | specified |

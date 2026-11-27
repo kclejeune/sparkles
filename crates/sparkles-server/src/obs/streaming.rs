@@ -34,6 +34,13 @@ impl DeferredReport {
         self.complete();
     }
 
+    #[cfg(test)]
+    pub(crate) fn snapshot_outcome(
+        &self,
+    ) -> Option<(Option<Outcome>, Option<sparkles::BudgetKind>)> {
+        self.0.lock().report.as_ref().map(|r| (r.outcome, r.budget))
+    }
+
     pub(super) fn observe(&self, pending: Pending, status: u16, head: bool) {
         let mut state = self.0.lock();
         state.pending = Some(pending);

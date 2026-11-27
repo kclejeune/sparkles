@@ -207,13 +207,34 @@ impl Runtime {
             let mut loaded = false;
             {
                 let mut st = cell.state.lock();
-                if h.dataset == self.dataset
-                    && h.fingerprint == st.fingerprint(cell.key)
-                    && commit <= snap.commit
+                let restricted = st
+                    .circuit
+                    .access
+                    .as_ref()
+                    .is_some_and(|a| !a.reads_everything());
+                let (snap_gen, snap_ev) = if restricted {
+                    snap.evidence_visibility_stamp()
+                } else {
+                    (snap.managed_generation(), None)
+                };
+                let commit_ok = if restricted && snap_ev.is_some() {
+                    commit == snap.commit
+                } else {
+                    commit <= snap.commit
+                };
+                if snap_ev.as_deref() != Some("unavailable")
+                    && h.dataset == self.dataset
+                    && h.fingerprint == st.fingerprint(cell.key, snap_ev.as_deref())
+                    && commit_ok
                 {
                     match st.circuit.decode_with_input_charged(body, &snap) {
                         Ok(()) => {
                             st.circuit.set_applied(h.commit);
+                            st.circuit
+                                .set_evidence_stamp(crate::incr::live::EvidenceStamp {
+                                    managed_gen: snap_gen,
+                                    key: snap_ev,
+                                });
                             self.seen.fetch_max(h.commit, Ordering::AcqRel);
                             self.counters.loaded.fetch_add(1, Ordering::Relaxed);
                             let mut info = cell.info.lock();
@@ -348,6 +369,7 @@ impl Runtime {
             st.circuit.snap = old.snap.take();
             st.circuit.applied = old.applied;
             st.circuit.version = old.version.take();
+            st.circuit.set_evidence_stamp(old.take_evidence_stamp());
             let (pool, budget) = old.take_budget();
             st.circuit.install_budget(pool, budget);
             st.circuit.shrink_budget_state();

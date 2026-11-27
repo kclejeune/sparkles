@@ -12,35 +12,108 @@ use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+/// A single published version of a family's managed-graph registry, pairing its monotonic
+/// publication generation with the installed state so readers observe both coherently.
+pub(crate) struct ManagedVersion {
+    pub(crate) generation: u64,
+    pub(crate) state: Option<Arc<crate::managed::ManagedState>>,
+}
+
+/// Lock-free reader / serialized writer slot for a family's versioned managed-graph registry.
+/// Keeping the inner `ArcSwap` private guarantees every publication advances `generation`.
+pub(crate) struct ManagedSlot {
+    inner: arc_swap::ArcSwap<ManagedVersion>,
+    write_lock: Mutex<u64>,
+}
+
+impl ManagedSlot {
+    pub(crate) fn empty() -> Self {
+        Self {
+            inner: arc_swap::ArcSwap::from_pointee(ManagedVersion {
+                generation: 0,
+                state: None,
+            }),
+            write_lock: Mutex::new(0),
+        }
+    }
+
+    pub(crate) fn store(&self, state: Option<Arc<crate::managed::ManagedState>>) {
+        let mut generation = self.write_lock.lock();
+        *generation = generation
+            .checked_add(1)
+            .expect("managed generation overflow");
+        self.inner.store(Arc::new(ManagedVersion {
+            generation: *generation,
+            state,
+        }));
+    }
+
+    pub(crate) fn load(&self) -> arc_swap::Guard<Arc<ManagedVersion>> {
+        self.inner.load()
+    }
+
+    pub(crate) fn load_version(&self) -> Arc<ManagedVersion> {
+        self.inner.load_full()
+    }
+
+    pub(crate) fn load_full(&self) -> Option<Arc<crate::managed::ManagedState>> {
+        self.inner.load().state.clone()
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.inner.load().generation
+    }
+}
+
 /// Retained last by each store and branch set, after their owned resources.
 pub(crate) struct Family {
     pub(crate) gate: Arc<FamilyGate>,
     /// The managed-graph registry every member admits its commits against (see
     /// [`crate::managed`]). One registry serves main and every branch, including those
-    /// created before it was enabled, so they cannot diverge.
-    pub(crate) managed: arc_swap::ArcSwapOption<crate::managed::ManagedState>,
+    /// created before it was enabled, so they cannot diverge. Shared with snapshots via
+    /// `Arc` without retaining `Family` or its root process lock.
+    pub(crate) managed: Arc<ManagedSlot>,
+    /// Serializes managed-registry changes end-to-end (including their post-install
+    /// `managed_barrier`) so a subsequent registry change never inspects branches while
+    /// a writer admitted under a superseded registry is still in flight.
+    pub(crate) managed_change: Mutex<()>,
     /// The durable source holds of main and every branch (see [`crate::holds`]).
     pub(crate) holds: crate::holds::FamilyHolds,
     /// Selection made under this opening's actual root process exclusion. This
     /// scalar is not a proof of an imported physical base or WAL interval.
     origin: OnceLock<Option<crate::evidence::Sha256Digest>>,
+    origin_format: OnceLock<Option<u32>>,
     _owner_lock: Option<Arc<super::ProcessLock>>,
 }
 
 impl Family {
     pub(crate) fn new(owner_lock: Option<Arc<super::ProcessLock>>) -> Arc<Self> {
         let origin = OnceLock::new();
+        let origin_format = OnceLock::new();
         if owner_lock.is_none() {
             // Memory families have no imported on-disk namespace.
             origin.set(None).expect("new memory family selection");
+            origin_format
+                .set(None)
+                .expect("new memory family format selection");
         }
         Arc::new(Self {
             gate: Arc::new(FamilyGate::default()),
-            managed: arc_swap::ArcSwapOption::empty(),
+            managed: Arc::new(ManagedSlot::empty()),
+            managed_change: Mutex::new(()),
             holds: Default::default(),
             origin,
+            origin_format,
             _owner_lock: owner_lock,
         })
+    }
+
+    pub(crate) fn store_managed(&self, state: Option<Arc<crate::managed::ManagedState>>) {
+        self.managed.store(state);
+    }
+
+    pub(crate) fn managed_generation(&self) -> u64 {
+        self.managed.generation()
     }
 
     pub(super) fn select_opening_origin(
@@ -61,12 +134,24 @@ impl Family {
             ));
         }
         super::verify_database_lock(root, lock)?;
-        let selected = super::configuration_history::opening_origin_selection(root, preparation)?;
+        let selected = super::configuration_history::opening_origin_info(root, preparation)?;
         super::verify_database_lock(root, lock)?;
         preparation.check()?;
+        let (digest, format) = match selected {
+            Some((digest, format)) => (Some(digest), Some(format)),
+            None => (None, None),
+        };
+        self.origin_format
+            .set(format)
+            .map_err(|_| Error::invalid("family origin format was already installed"))?;
         self.origin
-            .set(selected)
+            .set(digest)
             .map_err(|_| Error::invalid("family origin selection was already installed"))
+    }
+
+    /// Whether this opening has a format 2 destination import origin.
+    pub(super) fn has_destination_origin(&self) -> bool {
+        self.origin_format.get() == Some(&Some(2))
     }
 
     pub(super) fn verify_origin_lock(

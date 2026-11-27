@@ -5366,18 +5366,14 @@ impl Ctx {
         tables.cur = Some(Arc::new(table));
     }
 
-    /// The first base id whose key is not below `key`, searched inside the decoding
-    /// envelope without recording a sticky refusal.
+    /// The first base id whose key is not below `key`, checking the query's controls
+    /// in strict decode mode.
     fn try_vocab_lower_bound(&self, key: &[u8]) -> Result<u64> {
         let v = &self.snap.generation.vocab;
         self.check_memory_failure()?;
         if self.is_strict_decode() {
             self.check()?;
-            let (Ok(i) | Err(i)) = v.find_with_controlled(
-                key,
-                |need| self.reserve_decode_checked(need),
-                |_| self.check(),
-            )?;
+            let (Ok(i) | Err(i)) = v.find_exact_controlled(key, |_| self.check())?;
             return Ok(i);
         }
         let (Ok(i) | Err(i)) =

@@ -103,7 +103,7 @@ use super::*;
 use crate::budgeted::{BudgetControl, Control, FnMutControl, Unlimited};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Weak;
 use std::time::{Duration, Instant};
 
@@ -1971,6 +1971,9 @@ pub struct ChangeLogStatus {
     pub error: Option<String>,
 }
 
+/// `(author, message)` metadata recorded for one commit in the change log.
+pub type CommitChangeMeta = (Option<Arc<str>>, Option<Arc<str>>);
+
 impl ChangeLog {
     pub(super) fn read_only_through(&self) -> Option<u64> {
         self.readonly.as_ref().map(|reader| reader.through)
@@ -3292,6 +3295,67 @@ impl ChangeLog {
         Ok(())
     }
 
+    /// Read only the commit metadata `(author, message)` for the requested commit
+    /// sequence numbers without decoding term tables or quad changes. Flushes pending
+    /// queued entries first so recent commits are visible immediately, and covers both
+    /// change records (including 0-quad commits) and summary-only bulk commits.
+    pub(crate) fn commit_metas(&self, seqs: &[u64]) -> Result<HashMap<u64, CommitChangeMeta>> {
+        let mut out = HashMap::new();
+        if seqs.is_empty() || !self.is_enabled() || self.readonly.is_some() {
+            return Ok(out);
+        }
+        self.flush(false)?;
+        let mut wanted: Vec<u64> = seqs.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+
+        let mut inner = self.inner.lock();
+        let seg_count = inner.segs.len();
+        let mut wi = 0usize;
+        for seg_idx in 0..seg_count {
+            while wi < wanted.len() && wanted[wi] < inner.segs[seg_idx].first {
+                wi += 1;
+            }
+            if wi >= wanted.len() {
+                break;
+            }
+            let seg_last = inner.segs[seg_idx].last;
+            if wanted[wi] > seg_last {
+                continue;
+            }
+            let start_wi = wi;
+            while wi < wanted.len() && wanted[wi] <= seg_last {
+                wi += 1;
+            }
+            let ix = self.index(&mut inner, seg_idx)?;
+            let seg = &inner.segs[seg_idx];
+            let file = match &seg.path {
+                Some(path) => Some(File::open(path)?),
+                None => None,
+            };
+            for &seq in &wanted[start_wi..wi] {
+                let pos = ix.recs.partition_point(|r| r.seq < seq);
+                let Some(rec) = ix.recs.get(pos) else {
+                    continue;
+                };
+                if rec.seq != seq {
+                    continue;
+                }
+                if matches!(rec.hole, Some((_, UnrecordedReason::Gap))) {
+                    continue;
+                }
+                let meta = match (&file, &seg.mem) {
+                    (Some(f), _) => read_record_meta_from_file(f, rec.offset, seq)?,
+                    (None, mem) => read_record_meta_from_mem(mem, rec.offset as usize, seq)?,
+                };
+                if meta.author.is_some() || meta.message.is_some() {
+                    out.insert(seq, (meta.author, meta.message));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The bytes on disk (or in memory).
     pub fn bytes(&self) -> u64 {
         if let Some(reader) = &self.readonly {
@@ -3321,6 +3385,116 @@ impl Inner {
 fn sorted(mut v: Vec<(QuadKey, bool)>) -> Vec<(bool, QuadKey)> {
     v.sort_unstable_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
     v.into_iter().map(|(k, add)| (add, k)).collect()
+}
+
+fn decode_record_meta_prefix(prefix: &[u8], expected_seq: u64) -> Option<ChangeCommit> {
+    let mut c = Cur { b: prefix, i: 0 };
+    let ty = c.u8()?;
+    let seq = c.u64()?;
+    if seq != expected_seq {
+        return None;
+    }
+    match ty {
+        REC_CHANGES | REC_SUMMARY => decode_meta_with(&mut c, seq, &Unlimited)
+            .ok()
+            .flatten()
+            .map(Arc::unwrap_or_clone),
+        _ => None,
+    }
+}
+
+fn read_record_meta_from_mem(mem: &[u8], offset: usize, expected_seq: u64) -> Result<ChangeCommit> {
+    let Some((body, _)) = frame(mem, offset) else {
+        return Err(Error::Corrupt(format!(
+            "corrupt change-log record frame for commit {expected_seq} at offset {offset}"
+        )));
+    };
+    decode_record_meta_prefix(body, expected_seq).ok_or_else(|| {
+        Error::Corrupt(format!(
+            "corrupt change-log record metadata for commit {expected_seq} at offset {offset}"
+        ))
+    })
+}
+
+fn read_record_meta_from_file(f: &File, offset: u64, expected_seq: u64) -> Result<ChangeCommit> {
+    const INITIAL_PREFIX: usize = 4096;
+    const MAX_META_PREFIX: usize = 1 << 20;
+    const CRC_CHUNK: usize = 64 << 10;
+    let map_eof = |e: Error| {
+        if matches!(&e, Error::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
+            Error::Corrupt(format!(
+                "truncated change-log record for commit {expected_seq} at offset {offset}"
+            ))
+        } else {
+            e
+        }
+    };
+    let mut h = [0u8; 8];
+    read_exact_at_with(f, &mut h, offset, &Unlimited).map_err(map_eof)?;
+    let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
+    let expected_crc = u32::from_le_bytes(h[4..8].try_into().unwrap());
+    if len == 0 {
+        return Err(Error::Corrupt(format!(
+            "zero-length change-log record for commit {expected_seq} at offset {offset}"
+        )));
+    }
+    let first_read = len.min(INITIAL_PREFIX);
+    let mut buf = vec![0u8; first_read];
+    read_exact_at_with(f, &mut buf, offset + 8, &Unlimited).map_err(map_eof)?;
+
+    let mut crc = flate2::Crc::new();
+    crc.update(&buf);
+    let mut hashed = first_read;
+
+    let meta = if let Some(meta) = decode_record_meta_prefix(&buf, expected_seq) {
+        meta
+    } else {
+        // Check record header type and seq before expanding the read buffer.
+        let mut header_cur = Cur { b: &buf, i: 0 };
+        let header_ok = matches!(header_cur.u8(), Some(REC_CHANGES | REC_SUMMARY))
+            && header_cur.u64() == Some(expected_seq);
+        if len > first_read && header_ok {
+            let cap = len.min(MAX_META_PREFIX);
+            buf.resize(cap, 0);
+            read_exact_at_with(
+                f,
+                &mut buf[first_read..],
+                offset + 8 + first_read as u64,
+                &Unlimited,
+            )
+            .map_err(map_eof)?;
+            crc.update(&buf[first_read..]);
+            hashed = cap;
+            decode_record_meta_prefix(&buf, expected_seq).ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "corrupt change-log record metadata for commit {expected_seq} at offset {offset}"
+                ))
+            })?
+        } else {
+            return Err(Error::Corrupt(format!(
+                "corrupt change-log record metadata for commit {expected_seq} at offset {offset}"
+            )));
+        }
+    };
+
+    // Stream any remaining record body bytes in bounded chunks to verify the full frame
+    // CRC-32 without loading large change-log records into memory.
+    if hashed < len {
+        let mut chunk = vec![0u8; (len - hashed).min(CRC_CHUNK)];
+        while hashed < len {
+            let n = (len - hashed).min(chunk.len());
+            read_exact_at_with(f, &mut chunk[..n], offset + 8 + hashed as u64, &Unlimited)
+                .map_err(map_eof)?;
+            crc.update(&chunk[..n]);
+            hashed += n;
+        }
+    }
+    if crc.sum() != expected_crc {
+        return Err(Error::Corrupt(format!(
+            "corrupt change-log record CRC for commit {expected_seq} at offset {offset}"
+        )));
+    }
+    Ok(meta)
 }
 
 /// Write a file through a temporary one, durably.
@@ -3670,6 +3844,17 @@ impl Store {
     /// does this on its own shortly after each commit).
     pub fn flush_change_log(&self) -> Result<()> {
         self.sync_change_log()
+    }
+
+    /// Read `(author, message)` commit metadata for the given `seqs` from this store's
+    /// change log without decoding quad changes. Flushes pending queued entries first so
+    /// recent writes are immediately visible.
+    pub fn commit_change_metas(&self, seqs: &[u64]) -> Result<HashMap<u64, CommitChangeMeta>> {
+        crate::sparql::extensions::check_family(self.owner_dataset_id())?;
+        match &self.changelog {
+            Some(log) if log.is_enabled() => log.commit_metas(seqs),
+            _ => Ok(HashMap::new()),
+        }
     }
 
     /// Append what is queued and sync, before the generation whose write-ahead log holds

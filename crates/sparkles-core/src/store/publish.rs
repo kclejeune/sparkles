@@ -115,7 +115,16 @@ impl Store {
         {
             log.push(change);
         }
-        self.catalog.lock().append(c.info);
+        // Persistent WAL commits share their quota across branches. Count catalog
+        // growth before the next commit can check that quota.
+        let measures = c.log_end.map(|_| self.quota.measures());
+        let catalog_growth = self.catalog.lock().append(c.info);
+        if let Some(measures) = measures {
+            match catalog_growth {
+                Some(bytes) => self.quota.account_append(bytes, measures),
+                None => self.quota.invalidate(),
+            }
+        }
         // An in-memory store keeps annotations and past states only for the window its
         // catalog keeps. A store with a log keeps them on disk, so it has neither step.
         if self.root.is_none() {

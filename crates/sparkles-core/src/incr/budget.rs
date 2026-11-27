@@ -476,6 +476,39 @@ impl BudgetHandle {
         );
         Ok(Some((handle, grant)))
     }
+
+    /// Construct a child [`ParentHandle`] backed by this budget's ledger even when the
+    /// circuit has no upstream parent (standalone or unpooled runtime), so a retained
+    /// `Preparation` reservation and concurrent operator initialization share the same
+    /// `local_limit`.
+    pub(crate) fn preparation_parent(
+        &self,
+        pool: Option<&Arc<QueryPool>>,
+    ) -> Result<(ParentHandle, Option<Arc<PoolGrant>>)> {
+        if let Some(pair) = self.child_parent(pool)? {
+            return Ok(pair);
+        }
+        let take = self.inner.clone();
+        let give = self.inner.clone();
+        let handle = MemoryDomain::unpooled().parent(
+            move |bytes| {
+                let mut s = take.lock();
+                s.reserve_child_raw(bytes)
+            },
+            move |bytes| {
+                let mut s = give.lock();
+                s.child_bytes = s
+                    .child_bytes
+                    .checked_sub(bytes)
+                    .expect("nested view preparation release cannot exceed child_bytes");
+                s.release_raw(bytes);
+                if s.total_live() == 0 {
+                    s.trim_raw();
+                }
+            },
+        );
+        Ok((handle, None))
+    }
 }
 
 /// RAII lease for transient scratch bytes reserved on a [`BudgetHandle`].

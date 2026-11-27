@@ -434,6 +434,61 @@ impl Table {
         checkpoint("finishing vocabulary decode")
     }
 
+    /// Stream-decode `codes` and compare the decoded suffix directly against `target`
+    /// without allocating a scratch buffer. Returns the lexicographical ordering and
+    /// the number of leading bytes that matched `target`, stopping as soon as a byte
+    /// differs or the decoded suffix extends past `target`.
+    pub(super) fn compare_controlled<E>(
+        &self,
+        codes: &[u8],
+        target: &[u8],
+        checkpoint: &mut impl FnMut(&'static str) -> Result<(), E>,
+    ) -> Result<(std::cmp::Ordering, usize), E> {
+        let (mut at, mut matched, mut since_check) = (0usize, 0usize, 0usize);
+        while at < codes.len() {
+            let code = codes[at];
+            let (sym, consumed): (&[u8], usize) = if code == ESCAPE {
+                if let Some(slice) = codes.get(at + 1..at + 2) {
+                    (slice, 2)
+                } else {
+                    at += 2;
+                    continue;
+                }
+            } else {
+                let len = self.lens[code as usize] as usize;
+                (&self.syms[code as usize][..len], 1)
+            };
+            let rem = &target[matched..];
+            if rem.is_empty() {
+                if !sym.is_empty() {
+                    checkpoint("completed vocabulary comparison")?;
+                    return Ok((std::cmp::Ordering::Greater, matched));
+                }
+            } else {
+                let n = sym.len().min(rem.len());
+                for (i, (&a, &b)) in sym[..n].iter().zip(&rem[..n]).enumerate() {
+                    if a != b {
+                        checkpoint("completed vocabulary comparison")?;
+                        return Ok((a.cmp(&b), matched + i));
+                    }
+                }
+                matched += n;
+                if sym.len() > n {
+                    checkpoint("completed vocabulary comparison")?;
+                    return Ok((std::cmp::Ordering::Greater, matched));
+                }
+            }
+            at += consumed;
+            since_check += consumed;
+            if since_check >= 1024 {
+                checkpoint("comparing vocabulary suffix")?;
+                since_check = 0;
+            }
+        }
+        checkpoint("completed vocabulary comparison")?;
+        Ok((matched.cmp(&target.len()), matched))
+    }
+
     /// Whether `codes` is a valid code sequence of this table: every code has a symbol
     /// and no escape ends it.
     pub fn valid(&self, codes: &[u8]) -> bool {

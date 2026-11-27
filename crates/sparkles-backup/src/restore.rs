@@ -245,34 +245,39 @@ impl Repository {
         {
             let dir = tmp.to_path_buf();
             let control = o.ctl.control();
-            let configuration_required = m
+            let configuration_v2 = m
                 .requires
                 .iter()
-                .any(|feature| feature == "evidence-configuration-history/1");
+                .any(|feature| feature == "evidence-configuration-history/2");
+            let configuration_required = configuration_v2
+                || m.requires
+                    .iter()
+                    .any(|feature| feature == "evidence-configuration-history/1");
             let control_required = m.requires.iter().any(|feature| feature == "control/1");
             let (source, captured) = (m.dataset.id, m.commit.seq);
             blocking(move || {
                 // Refuse a newer dataset before reidentification or publication,
                 // including restores that request no integrity check.
                 sparkles_core::commit::check_dataset_compatibility(&dir)?;
-                sparkles_core::check::configuration_history(
-                    &dir,
-                    configuration_required,
-                    &control,
-                )?;
+                if configuration_v2 {
+                    sparkles_core::check::imported_configuration_history(&dir, &control)?;
+                } else {
+                    sparkles_core::check::configuration_history(
+                        &dir,
+                        configuration_required,
+                        &control,
+                    )?;
+                }
                 sparkles_core::control::check_restored(&dir, control_required, source, captured)?;
                 if let Some(from) = forked_from {
                     if configuration_required {
-                        // Imported prefix authority needs the versioned source
-                        // proof. Never publish foreign native bindings under a
-                        // fresh identity while that path is unavailable.
-                        return Err(sparkles_core::Error::Unsupported(
-                            "new-identity configuration history requires imported-origin support"
-                                .into(),
-                        )
-                        .into());
+                        sparkles_core::commit::reidentify_configuration_history(
+                            &dir, dataset_id, from, &control,
+                        )?;
+                        sparkles_core::check::imported_configuration_history(&dir, &control)?;
+                    } else {
+                        sparkles_core::commit::reidentify(&dir, dataset_id, from)?;
                     }
-                    sparkles_core::commit::reidentify(&dir, dataset_id, from)?;
                 }
                 if let Some(next) = next_ordinal {
                     sparkles_core::commit::reserve_branch_ordinals(&dir, dataset_id, next as u64)?;

@@ -292,6 +292,8 @@ pub struct Interner {
     /// the signature
     pub met: Vec<bool>,
     pub individuals: Names<NamedIndividual>,
+    /// for each individual, whether the run's normalization met it
+    pub met_individuals: Vec<bool>,
     /// the data ranges, as lattice elements
     pub vals: Vec<DataVal>,
     val_ids: FxHashMap<DataVal, u32>,
@@ -584,6 +586,7 @@ impl Interner {
             + self.class_nodes.capacity() * 4
             + self.individuals.bytes()
             + self.individuals.name_bytes()
+            + self.met_individuals.capacity()
             + self.individual_nodes.capacity() * 4
             + self.roles.capacity() * 48
             + self.role_name_bytes
@@ -671,6 +674,11 @@ impl Interner {
             chunks.iter_mut().map(|c| c.individuals.take()).collect(),
             &mut || poll(before),
         )?;
+        for ids in &individuals {
+            for &id in ids {
+                self.mark_met_individual(id);
+            }
+        }
         // the work since the last poll, over all the chunks
         let mut work = 0usize;
         let mut out = Vec::with_capacity(chunks.len());
@@ -755,9 +763,19 @@ impl Interner {
         self.met[id as usize] = true;
     }
 
+    #[inline]
+    fn mark_met_individual(&mut self, id: u32) {
+        if self.met_individuals.len() <= id as usize {
+            self.met_individuals.resize(id as usize + 1, false);
+        }
+        self.met_individuals[id as usize] = true;
+    }
+
     fn individual_id(&mut self, i: &NamedIndividual) -> u32 {
         let i = self.canon.as_ref().and_then(|m| m.get(i)).unwrap_or(i);
-        self.individuals.id(i)
+        let id = self.individuals.id(i);
+        self.mark_met_individual(id);
+        id
     }
 
     /// The role of a name, if the interner has it.
@@ -866,9 +884,11 @@ impl Interner {
         self.classes.get(c).is_some_and(|id| self.met[id as usize])
     }
 
-    /// Forgets which classes the normalization met, before a run normalizes the axioms.
+    /// Forgets which classes and individuals the normalization met, before a run
+    /// normalizes the axioms.
     pub fn clear_met(&mut self) {
         self.met.iter_mut().for_each(|m| *m = false);
+        self.met_individuals.iter_mut().for_each(|m| *m = false);
     }
 
     /// Takes the classes whose IRIs start with `prefix` out of the signature, which the
@@ -1014,6 +1034,32 @@ impl Interner {
     /// The expressions of the individuals.
     pub fn nominals(&self) -> impl Iterator<Item = Ex> + '_ {
         (0..self.individuals.len() as u32).filter_map(|i| self.get(&Node::Nominal(i)))
+    }
+
+    /// The expressions of the individuals the run's normalization met, sorted.
+    pub fn met_nominals(&self) -> Vec<Ex> {
+        let mut v: Vec<Ex> = self
+            .met_individuals
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| **m)
+            .filter_map(|(i, _)| self.get(&Node::Nominal(i as u32)))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// The expressions of the anonymous individuals the run's normalization met, sorted.
+    pub fn met_anonymous_nominals(&self) -> Vec<Ex> {
+        let mut v: Vec<Ex> = self
+            .met_individuals
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| **m && is_anonymous(&self.individuals[*i]))
+            .filter_map(|(i, _)| self.get(&Node::Nominal(i as u32)))
+            .collect();
+        v.sort_unstable();
+        v
     }
 
     /// The expressions of the anonymous individuals ([`Interner::individual`]), sorted.
@@ -1581,11 +1627,22 @@ pub enum Gap {
 /// A key: the named instances of the class that share a named individual for every
 /// object role and a data value for every data role are one individual (Structural
 /// Specification §9.5, Direct Semantics Table 9).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Key {
     pub class: Ex,
     pub objects: Vec<Role>,
     pub data: Vec<Role>,
+}
+
+impl Key {
+    pub fn bytes(&self) -> usize {
+        std::mem::size_of::<Key>().saturating_add(
+            self.objects
+                .capacity()
+                .saturating_add(self.data.capacity())
+                .saturating_mul(std::mem::size_of::<Role>()),
+        )
+    }
 }
 
 /// The normalized logical content of the EL axioms.
@@ -2771,6 +2828,22 @@ impl Index {
     /// Cooperative polling variant of [`Index::same_tables`]; returns `None` when `stop`
     /// signals cancellation or deadline expiry.
     pub fn same_tables_with_stop(&self, old: &Index, stop: &dyn Fn() -> bool) -> Option<bool> {
+        self.same_tables_inner(old, false, stop)
+    }
+
+    /// Like [`Index::same_tables_with_stop`], for strictly OWL 2 EL runs that track
+    /// individuals, keys, merges, universal roles, and conditional worlds incrementally
+    /// (roadmap item 664).
+    pub fn same_tables_el_with_stop(&self, old: &Index, stop: &dyn Fn() -> bool) -> Option<bool> {
+        self.same_tables_inner(old, true, stop)
+    }
+
+    fn same_tables_inner(
+        &self,
+        old: &Index,
+        el_individuals: bool,
+        stop: &dyn Fn() -> bool,
+    ) -> Option<bool> {
         let (a, b) = (&old.roles, &self.roles);
         let n = a.sup.len();
         if b.sup.len() < n
@@ -2785,7 +2858,24 @@ impl Index {
             || b.inv.len() < a.inv.len()
             || a.clash.len() != b.clash.len()
             || old.selfs.len() != self.selfs.len()
-            || super::saturate::plain(old) != super::saturate::plain(self)
+            || old.horn.as_ref().map(|h| h.dominate) != self.horn.as_ref().map(|h| h.dominate)
+            || old.dt.is_some() != self.dt.is_some()
+        {
+            return Some(false);
+        }
+        if el_individuals {
+            if old.horn.is_some()
+                || self.horn.is_some()
+                || old.dl.is_some()
+                || self.dl.is_some()
+                || old.nominal_selfs != self.nominal_selfs
+                || (old.tops[0].is_some() && old.tops[0] != self.tops[0])
+                || (old.tops[1].is_some() && old.tops[1] != self.tops[1])
+                || (self.dt.is_some() && self.tops[1].is_some())
+            {
+                return Some(false);
+            }
+        } else if super::saturate::plain(old) != super::saturate::plain(self)
             || !old.universal.is_empty()
             || !self.universal.is_empty()
             || !old.keys.is_empty()
@@ -2796,8 +2886,6 @@ impl Index {
             || self.nominal_selfs
             || old.tops != self.tops
             || self.tops[1].is_some()
-            || old.horn.as_ref().map(|h| h.dominate) != self.horn.as_ref().map(|h| h.dominate)
-            || old.dt.is_some() != self.dt.is_some()
         {
             return Some(false);
         }
@@ -3247,8 +3335,21 @@ impl Index {
             + self.universal.capacity() * 8
             + self.nominals.capacity() * 4
             + self.anonymous.capacity() * 4
+            + self
+                .keys
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Key>())
             + self.horn.as_ref().map_or(0, |h| h.bytes())
             + self.dt.as_ref().map_or(0, |d| d.bytes());
+        for k in &self.keys {
+            tick(1)?;
+            total = total.saturating_add(
+                k.objects
+                    .capacity()
+                    .saturating_add(k.data.capacity())
+                    .saturating_mul(std::mem::size_of::<Role>()),
+            );
+        }
         for v in &self.vals {
             tick(1)?;
             total += v.owned_bytes();
@@ -3286,6 +3387,17 @@ impl Index {
             + self.universal.len() * 8
             + self.nominals.len() * 4
             + self.anonymous.len() * 4
+            + self.keys.len().saturating_mul(std::mem::size_of::<Key>())
+            + self
+                .keys
+                .iter()
+                .map(|k| {
+                    k.objects
+                        .len()
+                        .saturating_add(k.data.len())
+                        .saturating_mul(std::mem::size_of::<Role>())
+                })
+                .sum::<usize>()
             + self.roles.logical_bytes()
             + self.horn.as_ref().map_or(0, |h| h.logical_bytes())
             + self.dl.as_ref().map_or(0, |d| d.logical_bytes())
@@ -3552,12 +3664,20 @@ impl Index {
         ix.conj = group_sorted(&b.conj, |h| &mut h.conj, &mut ix.heads);
         ix.exist = group_sorted(&b.exist, |h| &mut h.exist, &mut ix.heads);
         ix.disjoint = group(&disj, |h| &mut h.disj, &mut ix.heads);
-        ix.nominal_selfs = !b.selfs.is_empty() && !it.individuals.is_empty();
         ix.selfs = std::mem::take(&mut b.selfs);
         ix.selfs.sort_unstable();
         ix.keys = ax.keys.clone();
-        ix.nominals = it.nominals().collect();
-        ix.anonymous = it.anonymous_nominals();
+        if ax.horn.is_none() && ax.dl.is_none() {
+            let nominals = it.met_nominals();
+            let anonymous = it.met_anonymous_nominals();
+            ix.nominal_selfs = !ix.selfs.is_empty() && !nominals.is_empty();
+            ix.nominals = nominals;
+            ix.anonymous = anonymous;
+        } else {
+            ix.nominal_selfs = !ix.selfs.is_empty() && !it.individuals.is_empty();
+            ix.nominals = it.nominals().collect();
+            ix.anonymous = it.anonymous_nominals();
+        }
         ix.vals = it.copy_values()?;
         ix.numeric_ledger = it.ranges.ledger.clone();
         if let Some(d) = &ax.dl {

@@ -38,6 +38,7 @@ pub mod patch;
 pub mod patterns;
 pub mod preview;
 pub mod rank;
+pub mod reifiers;
 pub mod schema;
 pub mod sparql;
 pub mod spill;

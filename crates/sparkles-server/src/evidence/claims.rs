@@ -129,6 +129,7 @@ struct RevisionJson {
     upstream_revisions: Vec<RefJson>,
     #[serde(default)]
     families: Vec<String>,
+    was_revision_of: Option<RefJson>,
 }
 
 #[derive(Deserialize)]
@@ -604,6 +605,11 @@ fn input_of(r: ClaimsRequest) -> ApiResult<(EvidenceInput, Request)> {
                 upstream_revisions: upstream,
                 families,
             },
+            was_revision_of: v
+                .was_revision_of
+                .as_ref()
+                .map(|w| reference(&format!("{at}.wasRevisionOf"), w))
+                .transpose()?,
         });
     }
     for (i, v) in r.renditions.iter().enumerate() {

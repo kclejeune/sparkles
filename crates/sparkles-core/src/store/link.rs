@@ -413,24 +413,26 @@ fn apply_overlay_with<C: crate::budgeted::BudgetControl>(
                 ));
             }
             let quad = wal::record_quad(record);
-            let in_base = if C::ACCOUNTS {
+            if C::ACCOUNTS {
                 control.check(0)?;
                 let mutation = history_limited::preparation_mutation_bytes(delta);
                 let extra = mutation.saturating_sub(*delta_charge);
                 control.check(extra)?;
-                generation.perm(Perm::Spo).contains_with(
+                let in_base = generation.perm(Perm::Spo).contains_with(
                     cache,
                     &Perm::Spo.to_key(&quad),
                     &*control,
                     extra,
-                )?
-            } else {
-                generation
-                    .perm(Perm::Spo)
-                    .contains(cache, &Perm::Spo.to_key(&quad))?
-            };
-            apply(delta, &quad, record[0] == WAL_INSERT, in_base);
-            if C::ACCOUNTS {
+                )?;
+                super::apply_with(
+                    generation,
+                    delta,
+                    &quad,
+                    record[0] == WAL_INSERT,
+                    in_base,
+                    &*control,
+                    extra,
+                )?;
                 let next = history_limited::preparation_delta_bytes(delta);
                 if next > *delta_charge {
                     control.charge(next - *delta_charge)?;
@@ -438,6 +440,11 @@ fn apply_overlay_with<C: crate::budgeted::BudgetControl>(
                     control.release(*delta_charge - next);
                 }
                 *delta_charge = next;
+            } else {
+                let in_base = generation
+                    .perm(Perm::Spo)
+                    .contains(cache, &Perm::Spo.to_key(&quad))?;
+                apply(generation, delta, &quad, record[0] == WAL_INSERT, in_base);
             }
         }
         generation.meta.next_bnode = generation.meta.next_bnode.max(overlay.next_bnode);
@@ -920,7 +927,7 @@ mod tests {
         // Nonempty seed delta for overlay parity and error-accounting tests.
         let mut seed_delta = Delta::default();
         let seed_quad = [Id(999_001), Id(999_002), Id(999_003), Id::DEFAULT_GRAPH];
-        apply(&mut seed_delta, &seed_quad, true, false);
+        apply(&plain, &mut seed_delta, &seed_quad, true, false);
         let seed_charge = history_limited::preparation_delta_bytes(&seed_delta);
         assert!(seed_charge > 0);
         let (seed_ins, seed_del) = delta_keys(&seed_delta);

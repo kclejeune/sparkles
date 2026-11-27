@@ -716,18 +716,24 @@ fn an_unframed_delta_vocabulary_is_refused_with_dump_and_reload() {
     assert_eq!(walkdir(&root), before, "the refusal changed a file");
     // the framed file opens again, and a dataset that requires a later reader is
     // refused as newer. Reader 8 is configuration history, which only an activated
-    // dataset records, and reader 9 the job ledger, which only a dataset with jobs
-    // enabled records.
+    // dataset records, reader 9 the job ledger, which only a dataset with jobs
+    // enabled records, reader 10 control-only staged prefix recovery v2, and reader
+    // 11 imported configuration history origins.
     std::fs::write(&vocab, &framed).unwrap();
     assert_eq!(minimum_reader(&root), 5);
     drop(Store::open(&root, StoreOptions::default()).unwrap());
-    assert_eq!(sparkles_core::commit::DATASET_READER, 9);
+    assert_eq!(sparkles_core::commit::DATASET_READER, 11);
     let mut ds: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("dataset.json")).unwrap()).unwrap();
-    ds["minimumReader"] = serde_json::json!(sparkles_core::commit::DATASET_READER + 1);
+    let newer_reader = sparkles_core::commit::DATASET_READER + 1;
+    ds["minimumReader"] = serde_json::json!(newer_reader);
     std::fs::write(root.join("dataset.json"), ds.to_string()).unwrap();
     let e = Store::open(&root, StoreOptions::default()).err().unwrap();
-    assert!(e.to_string().contains("requires reader 10"), "{e}");
+    assert!(
+        e.to_string()
+            .contains(&format!("requires reader {newer_reader}")),
+        "{e}"
+    );
     assert!(e.to_string().contains("newer release"), "{e}");
 }
 

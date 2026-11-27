@@ -36,7 +36,7 @@ use std::fmt;
 use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -384,6 +384,22 @@ impl fmt::Display for LimitError {
 
 impl std::error::Error for LimitError {}
 
+/// Predicate polled before an outbound request is dispatched: `Some(true)` reports
+/// cancellation, `Some(false)` reports abandonment or expiry, and `None` means active.
+pub type AbortCheck = Arc<dyn Fn() -> Option<bool> + Send + Sync>;
+
+/// Why [`post_json_until_cancellable`] did not receive an HTTP response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PostAbort {
+    /// Aborted before dispatching the HTTP request because cancellation was observed.
+    Cancelled,
+    /// Aborted before dispatching the HTTP request because the caller abandoned it or the
+    /// absolute deadline expired during setup.
+    TimedOutBeforeSend,
+    /// Failed during setup or while sending or reading the response.
+    Failed(Failure),
+}
+
 /// Internal classification of [`OutboundPolicy::send_classified`], distinguishing
 /// outbound policy limits (timeouts and over-limit `Content-Length`) from other fetch
 /// failures without changing the public [`Failure`] enum.
@@ -395,6 +411,12 @@ pub(crate) enum SendFailure {
     Failed(String),
 }
 
+enum InnerSendFailure {
+    Send(SendFailure),
+    CancelledBeforeSend,
+    TimedOutBeforeSend(String),
+}
+
 impl From<Failure> for SendFailure {
     fn from(f: Failure) -> Self {
         match f {
@@ -402,6 +424,18 @@ impl From<Failure> for SendFailure {
             Failure::Failed(m) => SendFailure::Failed(m),
             Failure::Budget(b) => SendFailure::Budget(b),
         }
+    }
+}
+
+impl From<Failure> for InnerSendFailure {
+    fn from(f: Failure) -> Self {
+        InnerSendFailure::Send(f.into())
+    }
+}
+
+impl From<SendFailure> for InnerSendFailure {
+    fn from(f: SendFailure) -> Self {
+        InnerSendFailure::Send(f)
     }
 }
 
@@ -624,6 +658,19 @@ impl OutboundPolicy {
             .map_err(SendFailure::into_failure)
     }
 
+    /// Like [`send`](Self::send), bounded by an absolute `deadline` rather than a
+    /// relative duration.
+    pub(crate) fn send_until(
+        &self,
+        budget: &Arc<RequestBudget>,
+        url: &str,
+        deadline: Instant,
+        build: impl FnOnce(&reqwest::blocking::Client, Url) -> reqwest::blocking::RequestBuilder,
+    ) -> Result<Response, Failure> {
+        self.send_classified_until(budget, url, deadline, build)
+            .map_err(SendFailure::into_failure)
+    }
+
     /// [`send`](Self::send) preserving whether a failure was an outbound timeout or
     /// over-limit `Content-Length` rather than a general fetch error.
     pub(crate) fn send_classified(
@@ -633,30 +680,84 @@ impl OutboundPolicy {
         timeout: Duration,
         build: impl FnOnce(&reqwest::blocking::Client, Url) -> reqwest::blocking::RequestBuilder,
     ) -> Result<Response, SendFailure> {
+        let own = timeout.min(self.timeout);
+        self.send_classified_until(budget, url, Instant::now() + own, build)
+    }
+
+    /// [`send_classified`](Self::send_classified) bounded by an absolute `deadline` that
+    /// is checked before URL validation, immediately before sending, and during response
+    /// reads so setup or scheduling delays never extend it.
+    pub(crate) fn send_classified_until(
+        &self,
+        budget: &Arc<RequestBudget>,
+        url: &str,
+        deadline: Instant,
+        build: impl FnOnce(&reqwest::blocking::Client, Url) -> reqwest::blocking::RequestBuilder,
+    ) -> Result<Response, SendFailure> {
+        self.send_classified_until_with_abort(budget, url, deadline, None, build)
+            .map_err(|e| match e {
+                InnerSendFailure::Send(sf) => sf,
+                InnerSendFailure::CancelledBeforeSend => {
+                    SendFailure::Failed("the request was cancelled".into())
+                }
+                InnerSendFailure::TimedOutBeforeSend(m) => {
+                    SendFailure::Limit(LimitError::Timeout(m))
+                }
+            })
+    }
+
+    fn send_classified_until_with_abort(
+        &self,
+        budget: &Arc<RequestBudget>,
+        url: &str,
+        deadline: Instant,
+        abort: Option<AbortCheck>,
+        build: impl FnOnce(&reqwest::blocking::Client, Url) -> reqwest::blocking::RequestBuilder,
+    ) -> Result<Response, InnerSendFailure> {
         #[cfg(any(test, feature = "failpoints"))]
         if probe::intercept(url) {
-            return Err(SendFailure::Failed(
-                "owned test refused outbound send".into(),
-            ));
+            return Err(SendFailure::Failed("owned test refused outbound send".into()).into());
+        }
+        let check_abort = |abort: &Option<AbortCheck>| -> Result<(), InnerSendFailure> {
+            if let Some(cancelled) = abort.as_deref().and_then(|f| f()) {
+                return Err(if cancelled {
+                    InnerSendFailure::CancelledBeforeSend
+                } else {
+                    InnerSendFailure::TimedOutBeforeSend(timed_out(Duration::ZERO))
+                });
+            }
+            Ok(())
+        };
+        check_abort(&abort)?;
+        let own = deadline
+            .saturating_duration_since(Instant::now())
+            .min(self.timeout);
+        if own.is_zero() {
+            return Err(InnerSendFailure::TimedOutBeforeSend(timed_out(
+                Duration::ZERO,
+            )));
         }
         let u = self.check_url(url)?;
-        let own = timeout.min(self.timeout);
+        check_abort(&abort)?;
         let left = budget.remaining_time();
         if left.is_zero() {
-            return Err(SendFailure::Limit(LimitError::Timeout(out_of_time(
+            return Err(InnerSendFailure::TimedOutBeforeSend(out_of_time(
                 budget.max_time,
-            ))));
+            )));
         }
-        let timeout = own.min(left);
-        // the message of a timeout: this request's, or the whole SPARQL request's
-        let late = if left < own {
-            out_of_time(budget.max_time)
-        } else {
-            timed_out(timeout)
-        };
         let failed = Arc::new(Mutex::new(None));
+        let aborted_before_connect = Arc::new(Mutex::new(None));
+        let initial_dns_in_flight = Arc::new(AtomicBool::new(false));
+        let redirected = Arc::new(AtomicBool::new(false));
         let client = self
-            .client(&failed)
+            .client(
+                &failed,
+                aborted_before_connect.clone(),
+                initial_dns_in_flight.clone(),
+                redirected.clone(),
+                abort.clone(),
+                deadline,
+            )
             // a client that cannot be built is a local configuration error (such as an
             // `SSL_CERT_FILE` that names no file), so its cause is safe to show
             .map_err(|e| {
@@ -666,22 +767,65 @@ impl OutboundPolicy {
                     chain(&e)
                 ))
             })?;
+        // Build the request and run the outbound headers hook BEFORE the final dispatch
+        // checks and remaining-timeout calculation so pauses in setup or the hook cannot
+        // slip past cancellation or the absolute deadline.
+        let mut req = apply(build(&client, u))
+            .build()
+            .map_err(|e| SendFailure::Failed(hidden(url, "the request could not be built", &e)))?;
+        #[cfg(any(test, feature = "failpoints"))]
+        probe::pause_before_send(url);
+        check_abort(&abort)?;
         let start = Instant::now();
-        let resp = apply(build(&client, u)).timeout(timeout).send();
+        let own_now = deadline.saturating_duration_since(start).min(self.timeout);
+        let left_now = budget.remaining_time();
+        let remaining_now = own_now.min(left_now);
+        // the message of a timeout: this request's, or the whole SPARQL request's
+        let late = if left_now < own_now {
+            out_of_time(budget.max_time)
+        } else {
+            timed_out(remaining_now)
+        };
+        if remaining_now.is_zero() {
+            return Err(InnerSendFailure::TimedOutBeforeSend(late));
+        }
+        *req.timeout_mut() = Some(remaining_now);
+        let resp = client.execute(req);
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
                 budget.spend_time(start.elapsed());
+                if !redirected.load(Ordering::SeqCst) {
+                    if let Some(cancelled) = aborted_before_connect.lock().take() {
+                        return Err(if cancelled {
+                            InnerSendFailure::CancelledBeforeSend
+                        } else {
+                            InnerSendFailure::TimedOutBeforeSend(late)
+                        });
+                    }
+                    if initial_dns_in_flight.load(Ordering::SeqCst)
+                        && (e.is_timeout()
+                            || start.elapsed() >= remaining_now
+                            || Instant::now() >= deadline)
+                    {
+                        return Err(if abort.as_deref().and_then(|f| f()) == Some(true) {
+                            InnerSendFailure::CancelledBeforeSend
+                        } else {
+                            InnerSendFailure::TimedOutBeforeSend(late)
+                        });
+                    }
+                }
                 // a refused or unresolvable name, in words fit for the caller
                 if let Some(f) = failed.lock().take() {
                     return Err(f.into());
                 }
-                if e.is_timeout() || start.elapsed() >= timeout {
-                    return Err(SendFailure::Limit(LimitError::Timeout(late)));
+                if e.is_timeout() || start.elapsed() >= remaining_now || Instant::now() >= deadline
+                {
+                    return Err(SendFailure::Limit(LimitError::Timeout(late)).into());
                 }
                 // redirect errors are the policy's own words (hops, schemes)
                 if e.is_redirect() {
-                    return Err(SendFailure::Failed(chain(&e)));
+                    return Err(SendFailure::Failed(chain(&e)).into());
                 }
                 let what = if e.is_connect() && chain(&e).contains("invalid peer certificate") {
                     "cannot connect: the server's TLS certificate is not trusted"
@@ -690,7 +834,7 @@ impl OutboundPolicy {
                 } else {
                     "the request failed"
                 };
-                return Err(SendFailure::Failed(hidden(url, what, &e)));
+                return Err(SendFailure::Failed(hidden(url, what, &e)).into());
             }
         };
         let limit = self.max_response_bytes;
@@ -701,17 +845,17 @@ impl OutboundPolicy {
             budget: Some(budget.clone()),
             spent: budget.clone(),
             start,
-            deadline: start + timeout,
+            deadline: (start + remaining_now).min(deadline),
             late,
         };
         if let Some(n) = body.resp.content_length() {
             if n > limit {
-                return Err(SendFailure::Limit(LimitError::ResponseTooLarge(too_large(
-                    limit,
-                ))));
+                return Err(
+                    SendFailure::Limit(LimitError::ResponseTooLarge(too_large(limit))).into(),
+                );
             }
             if n > budget.remaining_bytes() {
-                return Err(SendFailure::Budget(budget.exceeded(budget.bytes() + n)));
+                return Err(SendFailure::Budget(budget.exceeded(budget.bytes() + n)).into());
             }
         }
         let content_type = body
@@ -741,10 +885,19 @@ impl OutboundPolicy {
     fn client(
         &self,
         failed: &Arc<Mutex<Option<Failure>>>,
+        aborted: Arc<Mutex<Option<bool>>>,
+        initial_dns_in_flight: Arc<AtomicBool>,
+        redirected: Arc<AtomicBool>,
+        abort: Option<AbortCheck>,
+        deadline: Instant,
     ) -> reqwest::Result<reqwest::blocking::Client> {
         let (p, slot, max) = (self.clone(), failed.clone(), self.max_redirects);
         let custom = self.tls.is_custom();
+        let redirected_for_policy = redirected.clone();
         let redirect = reqwest::redirect::Policy::custom(move |a| {
+            // Receiving any redirect proves an earlier hop already reached a server,
+            // so later DNS/connect aborts must never be classified as before-send.
+            redirected_for_policy.store(true, Ordering::SeqCst);
             if a.previous().len() > max {
                 return a.error(format!("more than {max} redirects"));
             }
@@ -782,6 +935,11 @@ impl OutboundPolicy {
             .dns_resolver(Arc::new(Pinned {
                 policy: self.clone(),
                 failed: failed.clone(),
+                aborted,
+                initial_dns_in_flight,
+                redirected,
+                abort,
+                deadline,
             }))
             .user_agent(concat!("sparkles/", env!("CARGO_PKG_VERSION")));
         if let Some(pem) = &self.tls.extra_roots_pem {
@@ -801,14 +959,53 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 struct Pinned {
     policy: OutboundPolicy,
     failed: Arc<Mutex<Option<Failure>>>,
+    aborted: Arc<Mutex<Option<bool>>>,
+    initial_dns_in_flight: Arc<AtomicBool>,
+    redirected: Arc<AtomicBool>,
+    abort: Option<AbortCheck>,
+    deadline: Instant,
 }
 
 impl reqwest::dns::Resolve for Pinned {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let (policy, failed) = (self.policy.clone(), self.failed.clone());
+        let (policy, failed, aborted, initial_dns_in_flight, redirected, abort, deadline) = (
+            self.policy.clone(),
+            self.failed.clone(),
+            self.aborted.clone(),
+            self.initial_dns_in_flight.clone(),
+            self.redirected.clone(),
+            self.abort.clone(),
+            self.deadline,
+        );
         let host = name.as_str().to_string();
         Box::pin(async move {
+            let is_initial = !redirected.load(Ordering::SeqCst);
+            if is_initial {
+                initial_dns_in_flight.store(true, Ordering::SeqCst);
+            }
+            let check = || -> Result<(), BoxError> {
+                if let Some(cancelled) = abort.as_deref().and_then(|f| f()) {
+                    if is_initial && !redirected.load(Ordering::SeqCst) {
+                        *aborted.lock() = Some(cancelled);
+                    }
+                    return Err("outbound request aborted before connect".into());
+                }
+                if Instant::now() >= deadline {
+                    if is_initial && !redirected.load(Ordering::SeqCst) {
+                        *aborted.lock() = Some(false);
+                    }
+                    return Err("outbound deadline expired before connect".into());
+                }
+                Ok(())
+            };
+            check()?;
             let checked = tokio::task::spawn_blocking(move || policy.check_host(&host)).await?;
+            check()?;
+            // Initial DNS completed before any deadline/abort: clear before handing
+            // addresses to the connector (or reporting a DNS/policy failure).
+            if is_initial {
+                initial_dns_in_flight.store(false, Ordering::SeqCst);
+            }
             let r: Result<reqwest::dns::Addrs, BoxError> = match checked {
                 Ok(addrs) => Ok(Box::new(addrs.into_iter().map(|ip| SocketAddr::new(ip, 0)))),
                 Err(f) => {
@@ -1008,8 +1205,20 @@ pub fn post_json(
     body: Vec<u8>,
     timeout: Duration,
 ) -> Result<Posted, Failure> {
+    let deadline = Instant::now() + timeout.min(policy.timeout);
+    post_json_until(policy, url, headers, body, deadline)
+}
+
+/// Like [`post_json`], bounded by an absolute `deadline` rather than a relative duration.
+pub fn post_json_until(
+    policy: &OutboundPolicy,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+    deadline: Instant,
+) -> Result<Posted, Failure> {
     let budget = RequestBudget::new(policy);
-    let resp = policy.send(&budget, url, timeout, |client, u| {
+    let resp = policy.send_until(&budget, url, deadline, |client, u| {
         let mut rb = client
             .post(u)
             .header("Content-Type", "application/json")
@@ -1019,6 +1228,42 @@ pub fn post_json(
         }
         rb.body(body)
     })?;
+    read_posted(resp).map_err(Failure::Failed)
+}
+
+/// Like [`post_json_until`], polling `abort` across setup and immediately before
+/// dispatching the HTTP request so cancellation, abandonment, or deadline expiry during
+/// URL validation, TLS client construction, request construction, header hooks, or DNS
+/// resolution aborts cleanly without sending the POST.
+pub fn post_json_until_cancellable(
+    policy: &OutboundPolicy,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+    deadline: Instant,
+    abort: Option<AbortCheck>,
+) -> Result<Posted, PostAbort> {
+    let budget = RequestBudget::new(policy);
+    let resp = policy
+        .send_classified_until_with_abort(&budget, url, deadline, abort, |client, u| {
+            let mut rb = client
+                .post(u)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json");
+            for (k, v) in headers {
+                rb = rb.header(*k, *v);
+            }
+            rb.body(body)
+        })
+        .map_err(|e| match e {
+            InnerSendFailure::CancelledBeforeSend => PostAbort::Cancelled,
+            InnerSendFailure::TimedOutBeforeSend(_) => PostAbort::TimedOutBeforeSend,
+            InnerSendFailure::Send(other) => PostAbort::Failed(other.into_failure()),
+        })?;
+    read_posted(resp).map_err(|e| PostAbort::Failed(Failure::Failed(e)))
+}
+
+fn read_posted(resp: Response) -> Result<Posted, String> {
     let retry_after = resp
         .body
         .resp
@@ -1029,8 +1274,7 @@ pub fn post_json(
     let status = resp.status;
     let mut bytes = Vec::new();
     let mut b = resp.body;
-    b.read_to_end(&mut bytes)
-        .map_err(|e| Failure::Failed(e.to_string()))?;
+    b.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
     Ok(Posted {
         status,
         retry_after,
@@ -1165,7 +1409,10 @@ pub mod probe {
     use super::*;
     use std::collections::BTreeMap;
 
+    type PauseFn = Arc<dyn Fn() + Send + Sync>;
+
     static SENDS: OnceLock<Mutex<BTreeMap<String, Arc<AtomicU64>>>> = OnceLock::new();
+    static BEFORE_SEND: OnceLock<Mutex<BTreeMap<String, PauseFn>>> = OnceLock::new();
 
     pub struct SendProbe {
         url: String,
@@ -1194,6 +1441,29 @@ pub mod probe {
         }
     }
 
+    /// URL-scoped hook invoked after request construction and the outbound headers hook,
+    /// immediately before the final abort/deadline dispatch check and `client.execute`.
+    pub struct BeforeSendHook {
+        url: String,
+    }
+
+    impl BeforeSendHook {
+        pub fn install(url: String, hook: impl Fn() + Send + Sync + 'static) -> Self {
+            let mut map = BEFORE_SEND.get_or_init(Default::default).lock();
+            assert!(!map.contains_key(&url), "duplicate before-send hook URL");
+            map.insert(url.clone(), Arc::new(hook));
+            Self { url }
+        }
+    }
+
+    impl Drop for BeforeSendHook {
+        fn drop(&mut self) {
+            if let Some(map) = BEFORE_SEND.get() {
+                map.lock().remove(&self.url);
+            }
+        }
+    }
+
     pub(super) fn intercept(url: &str) -> bool {
         let Some(sends) = SENDS.get() else {
             return false;
@@ -1204,6 +1474,15 @@ pub mod probe {
         };
         entries.fetch_add(1, Ordering::SeqCst);
         true
+    }
+
+    pub(super) fn pause_before_send(url: &str) {
+        let hook = BEFORE_SEND
+            .get()
+            .and_then(|map| map.lock().get(url).cloned());
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
 
@@ -1591,5 +1870,168 @@ mod tests {
             ..base
         };
         assert!(p.check_host("partner.test").is_ok());
+    }
+
+    #[test]
+    fn dns_deadline_classification_distinguishes_initial_and_redirect_hops() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::AtomicUsize;
+
+        struct RedirectServer {
+            port: u16,
+            hop1_hits: Arc<AtomicUsize>,
+            hop2_hits: Arc<AtomicUsize>,
+            stop: Arc<AtomicBool>,
+        }
+        impl Drop for RedirectServer {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::SeqCst);
+                let _ = TcpStream::connect(("127.0.0.1", self.port));
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirect server");
+        let port = listener.local_addr().unwrap().port();
+        let hop1_hits = Arc::new(AtomicUsize::new(0));
+        let hop2_hits = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let hop1_hits = hop1_hits.clone();
+            let hop2_hits = hop2_hits.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let Ok(mut stream) = conn else {
+                        continue;
+                    };
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut req_line = String::new();
+                    if reader.read_line(&mut req_line).is_err() || req_line.is_empty() {
+                        continue;
+                    }
+                    let mut content_len = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_err()
+                            || line == "\r\n"
+                            || line == "\n"
+                            || line.is_empty()
+                        {
+                            break;
+                        }
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    if content_len > 0 {
+                        let mut body = vec![0u8; content_len];
+                        let _ = reader.read_exact(&mut body);
+                    }
+                    if req_line.contains("/hop2") {
+                        hop2_hits.fetch_add(1, Ordering::SeqCst);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        );
+                    } else {
+                        hop1_hits.fetch_add(1, Ordering::SeqCst);
+                        let resp = format!(
+                            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://redirect.test:{port}/hop2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                    let _ = stream.flush();
+                }
+            });
+        }
+        let server = RedirectServer {
+            port,
+            hop1_hits,
+            hop2_hits,
+            stop,
+        };
+
+        struct ControlledResolver {
+            pause_host: &'static str,
+            deadline: Instant,
+            paused: Arc<AtomicBool>,
+        }
+        impl Resolver for ControlledResolver {
+            fn resolve(&self, host: &str) -> io::Result<Vec<IpAddr>> {
+                if host.eq_ignore_ascii_case(self.pause_host) {
+                    self.paused.store(true, Ordering::SeqCst);
+                    while Instant::now() < self.deadline {
+                        let rem = self.deadline.saturating_duration_since(Instant::now());
+                        std::thread::sleep(rem + Duration::from_millis(15));
+                    }
+                }
+                Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+            }
+        }
+
+        // 1. Expiry during initial DNS must report TimedOutBeforeSend with zero hits.
+        let dl1 = Instant::now() + Duration::from_millis(400);
+        let paused1 = Arc::new(AtomicBool::new(false));
+        let p1 = OutboundPolicy {
+            allow_private: true,
+            resolver: Arc::new(ControlledResolver {
+                pause_host: "initial.test",
+                deadline: dl1,
+                paused: paused1.clone(),
+            }),
+            ..Default::default()
+        };
+        let r1 = post_json_until_cancellable(
+            &p1,
+            &format!("http://initial.test:{}/hop1", server.port),
+            &[],
+            b"{}".to_vec(),
+            dl1,
+            None,
+        );
+        assert!(paused1.load(Ordering::SeqCst), "initial resolver must run");
+        assert!(
+            matches!(r1, Err(PostAbort::TimedOutBeforeSend)),
+            "initial DNS expiry must classify as TimedOutBeforeSend, got: {:?}",
+            r1.err()
+        );
+        assert_eq!(server.hop1_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(server.hop2_hits.load(Ordering::SeqCst), 0);
+
+        // 2. Expiry during redirect DNS must NOT report TimedOutBeforeSend because hop 1
+        // already received the POST.
+        let dl2 = Instant::now() + Duration::from_millis(400);
+        let paused2 = Arc::new(AtomicBool::new(false));
+        let p2 = OutboundPolicy {
+            allow_private: true,
+            resolver: Arc::new(ControlledResolver {
+                pause_host: "redirect.test",
+                deadline: dl2,
+                paused: paused2.clone(),
+            }),
+            ..Default::default()
+        };
+        let r2 = post_json_until_cancellable(
+            &p2,
+            &format!("http://hop1.test:{}/hop1", server.port),
+            &[],
+            b"{}".to_vec(),
+            dl2,
+            None,
+        );
+        assert!(paused2.load(Ordering::SeqCst), "redirect resolver must run");
+        assert!(
+            matches!(r2, Err(PostAbort::Failed(_))),
+            "redirect DNS expiry after sent hop must classify as Failed (unknown), got: {:?}",
+            r2.err()
+        );
+        assert_eq!(server.hop1_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(server.hop2_hits.load(Ordering::SeqCst), 0);
     }
 }

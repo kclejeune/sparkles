@@ -1057,14 +1057,20 @@ knows only format 1 refuses format 2 cleanly, and format 2 reads format 1 record
 threads of one question without an answer.
 
 A stored answer was written from the asker's view of the data, so the server records
-which graphs it read, as a footprint of the guarded and named graphs and the branch. The
-list route returns the answer only to a caller whose current view, under the same grants
-and masking as a query, can read every graph in that footprint, and otherwise returns
-the record with `answerWithheld` set and no answer, the same rule as the cleared global
-text of C22 §6.6. Only the principal sees its own history, through
-`GET /$/asks/{ds}`, which filters by `thread`, and can delete entries. No role can read another principal's
-questions, including dataset and server admins, because a question can contain
-personal or confidential text (§14). Admins see counts and usage only.
+which graphs it read, as a footprint of the guarded and named graphs and the branch.
+Format 3 of `asks.json` also records the grounding `info` endpoint's footprint (or an
+explicit absence of `info` access) so that both the answer and the generated query are
+shown only while the caller's current Query and Info views cover what the ask read, and
+legacy format-1 and format-2 records without a recorded Info footprint require
+unrestricted Info access even after a history rewrite. A reader that knows only format 2
+refuses format 3 cleanly. The list route returns the answer only to a caller whose current
+view, under the same grants and masking as a query, can read every graph in those
+footprints, and otherwise returns the record with `answerWithheld` set and no answer or
+generated query, the same rule as the cleared global text of C22 §6.6. Only the principal
+sees its own history, through `GET /$/asks/{ds}`, which filters by `thread`, and can
+delete entries. No role can read another principal's questions, including dataset and
+server admins, because a question can contain personal or confidential text (§14). Admins
+see counts and usage only.
 
 Retention is set per dataset by `historyDays` in `assistant.json`, which a dataset
 admin changes through `PUT /$/assistant/{ds}`. Without it, the server's default
