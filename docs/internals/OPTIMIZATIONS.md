@@ -175,10 +175,10 @@ earlier implementation and always apply. `EXPLAIN` shows which fast paths ran.
   serial for a cooldown and then retries the pool. The per-query cache caps at 65,536
   entries, charged at about 6 MiB, and dense inline integers cap at 16,384 entries. A
   full cache still answers the keys it holds and evaluates each distinct missed key once
-  for the batch without keeping it. A budget refusal of the cache's memory, including a
-  result that cannot be interned while the cache holds its charges, releases the cache
-  and evaluates the batch the ordinary way, and an operator that ends its input releases
-  the cache too. Identity copies, volatile expressions and application callbacks never
+  for the batch without keeping it. A cache whose growth the budget refuses keeps the
+  entries it holds. A refused batch charge, or an expression result that cannot be
+  interned while the cache holds its charges, releases the cache and evaluates the batch
+  the ordinary way, and an operator that ends its input releases the cache too. Identity copies, volatile expressions and application callbacks never
   enter this cache.
 * **Numeric range scans.** A FILTER comparing a scan's sort column with numeric constants
   reads only matching ID ranges (`IndexRangeScan`). Inline integers and single-scale inline

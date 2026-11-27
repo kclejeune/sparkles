@@ -9865,8 +9865,8 @@ fn directional_string_function_compatibility_and_results() {
 /// Cursor BIND reuse across batches answers what the eager executor answers, whether the
 /// keys repeat only across batches (sparse), within every batch (dense) or never (cheap
 /// and unique), with or without the expression cache. A tight memory budget either gives the
-/// same rows or refuses the query with a memory budget error, and the expression cache,
-/// which BIND reuse needs, never refuses a query that ordinary evaluation fits.
+/// same rows or refuses the query with a memory budget error, and with the expression cache,
+/// which BIND reuse needs, none of these queries is refused when ordinary evaluation fits.
 #[test]
 fn bind_reuse_across_batches_matches_eager_for_sparse_dense_and_unique_keys() {
     const ROWS: usize = 40_960;

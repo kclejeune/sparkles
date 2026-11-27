@@ -1149,10 +1149,10 @@ impl Reuse {
                 MapSplitPolicy::Iri(bucket) => self.iri_split.allow(bucket),
                 MapSplitPolicy::Default => self.allow_map_split(misses.len(), expr),
             };
-            // A result the budget cannot intern while the map and the batch's scratch
-            // hold their charges releases both, and the ordinary evaluation of the batch
-            // interns it instead, so that the optional map never refuses a query that
-            // ordinary evaluation fits.
+            // An expression result that the budget cannot intern while the map and the
+            // batch's scratch hold their charges releases both, and the ordinary
+            // evaluation of the batch interns it instead. Terms that the evaluation
+            // interns on its way to the result still record a refusal for the query.
             let values = match exec::column_rows_split_optional(ctx, &misses, expr, par)
                 .and_then(|values| ctx.check().map(|()| values))
             {
@@ -1697,12 +1697,21 @@ mod tests {
             // Retry: actual production dispatch now passes par = true.
             let mut b3 = make_batch(6000);
             assert!(reuse.apply(&ctx, &mut b3, target, &expr).unwrap());
-            assert!(
-                reuse.last_miss_dispatch.unwrap().0,
-                "cooldown expiry must permit a split retry"
-            );
+            let (par, retried) = reuse.last_miss_dispatch.unwrap();
+            assert!(par, "cooldown expiry must permit a split retry");
+            // The retry's real split decides by its own timing, which a loaded host can
+            // make a loss.
+            let expected = match retried.map(|retried| retried.classify()) {
+                Some(SplitOutcome::ClearWin) => BucketPhase::Active { losses: 0 },
+                Some(SplitOutcome::ClearLoss) => BucketPhase::Cooldown {
+                    remaining: reuse.split.cooldown,
+                },
+                _ => BucketPhase::Retry,
+            };
+            assert_eq!(reuse.split.small, expected);
 
             // Inject synthetic winning observation for deterministic recovery.
+            reuse.split.small = BucketPhase::Retry;
             reuse.observe_map_split(1024, &expr, true, Some(split(100_000, 120_000)));
             assert_eq!(reuse.split.small, BucketPhase::Active { losses: 0 });
         });
@@ -3917,5 +3926,55 @@ mod tests {
                 "every sampled row after the pilot repeats a pilot key"
             );
         });
+    }
+
+    /// Item 293 round 1: the pull that returns a BIND's last rows releases its map, so
+    /// the operators above it have that memory for the rest of their work.
+    #[test]
+    fn the_pull_that_ends_the_input_releases_the_map_with_the_last_rows() {
+        use super::super::{CursorOptions, FallbackPolicy, Operator};
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 16 << 20);
+        let input = ctx.var("input");
+        let target = ctx.var("bound");
+        let mut values = Table::new(vec![input]);
+        values.cols[0] = (0..4096)
+            .map(|row| Id::from_i64((row % 1024) as i64).unwrap())
+            .collect();
+        values.len = 4096;
+        let mut bind = Node::leaf(
+            Kind::Extend(
+                target,
+                Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]),
+            ),
+            vec![input, target],
+            4096.0,
+            String::new(),
+        );
+        bind.children.push(Node::leaf(
+            Kind::Values(values),
+            vec![input],
+            4096.0,
+            String::new(),
+        ));
+        let mut operator =
+            Operator::build(&ctx, bind, FallbackPolicy::RejectMaterialization).unwrap();
+        let options = CursorOptions {
+            batch_rows: 4096,
+            ..Default::default()
+        };
+        let batch = operator.next(&ctx, &options, 4096).unwrap().unwrap();
+        assert_eq!(batch.table.len, 4096);
+        assert!(operator.done, "the input ends with this batch");
+        let reuse = operator.bind_reuse.as_ref().unwrap();
+        assert!(
+            reuse.counters().is_some(),
+            "the batch was answered from the map"
+        );
+        assert!(reuse.charge.is_none());
+        assert!(reuse.values.is_empty());
+        drop(batch);
+        assert!(operator.next(&ctx, &options, 4096).unwrap().is_none());
+        ctx.check().unwrap();
     }
 }
