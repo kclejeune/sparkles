@@ -694,6 +694,64 @@ fn optimizations_can_be_disabled_by_name() {
         Optimizations::NONE
     );
     assert!(Optimizations::ALL.disable("nope").is_err());
+    for name in [
+        "prefetch_blocks",
+        "prefetch_constants",
+        "prefetch_terms",
+        "prefetch_first_scan",
+        "parallel_decode",
+        "decode_ahead",
+    ] {
+        assert!(!Optimizations::NAMES.contains(&name), "{name}");
+        assert!(Optimizations::ALL.disable(name).is_err(), "{name}");
+    }
+    let generic = Optimizations::NONE;
+    assert!(
+        generic.prefetch_blocks
+            && generic.prefetch_constants
+            && generic.prefetch_terms
+            && generic.prefetch_first_scan
+            && generic.parallel_decode
+            && generic.decode_ahead
+    );
+}
+
+#[test]
+fn disabled_optimizations_from_env_survive_unrecognized_names() {
+    const CHILD: &str = "SPARKLES_DISABLE_OPTIMIZATIONS_TEST_CHILD";
+    if let Ok(expected) = std::env::var(CHILD) {
+        assert_eq!(
+            Optimizations::default(),
+            Optimizations::ALL.disable(&expected).unwrap()
+        );
+        return;
+    }
+
+    for (configured, expected) in [
+        (
+            "decode_ahead, text_subject_pushdown, typo, range_pushdown, prefetch_blocks",
+            "text_subject_pushdown, range_pushdown",
+        ),
+        ("typo, all, decode_ahead", "all"),
+    ] {
+        // Each process reads the environment once.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sparql::opt_tests::disabled_optimizations_from_env_survive_unrecognized_names",
+                "--nocapture",
+            ])
+            .env("SPARKLES_DISABLE_OPTIMIZATIONS", configured)
+            .env(CHILD, expected)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{configured}: {stdout}\n{stderr}"
+        );
+    }
 }
 
 // ------------------------------------------------------------ top-k prefilter ------

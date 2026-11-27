@@ -1037,17 +1037,17 @@ impl Optimizations {
         domain_estimates: false,
         fused_star_costs: false,
         #[cfg(test)]
-        prefetch_blocks: false,
+        prefetch_blocks: true,
         text_subject_pushdown: false,
         vector_topk: false,
         topk_heap: false,
         bound_order_keys: false,
         #[cfg(test)]
-        prefetch_constants: false,
+        prefetch_constants: true,
         #[cfg(test)]
-        prefetch_terms: false,
+        prefetch_terms: true,
         #[cfg(test)]
-        prefetch_first_scan: false,
+        prefetch_first_scan: true,
         parallel_decode: true,
         decode_ahead: true,
         grow_input: false,
@@ -1102,32 +1102,56 @@ impl Optimizations {
     /// Switch off optimizations by name (`all` selects [`Self::NONE`]). Unknown names
     /// are returned as an error.
     pub fn disable(mut self, names: &str) -> std::result::Result<Optimizations, String> {
-        for n in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
-            if n == "all" {
-                self = Optimizations::NONE;
-                continue;
-            }
-            *self.flag(n).ok_or_else(|| {
+        for name in Self::split_names(names) {
+            self.disable_name(name)?;
+        }
+        Ok(self)
+    }
+
+    fn split_names(names: &str) -> impl Iterator<Item = &str> {
+        names
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+
+    fn disable_name(&mut self, name: &str) -> std::result::Result<(), String> {
+        if name == "all" {
+            *self = Self::NONE;
+        } else {
+            *self.flag(name).ok_or_else(|| {
                 format!(
-                    "unknown optimization {n:?} (known: {})",
+                    "unknown optimization {name:?} (known: {})",
                     Self::NAMES.join(", ")
                 )
             })? = false;
         }
-        Ok(self)
+        Ok(())
     }
 }
 
 impl Default for Optimizations {
     /// Everything on, except what `SPARKLES_DISABLE_OPTIMIZATIONS` lists.
+    /// Retired names are ignored and unknown names are logged.
     fn default() -> Optimizations {
         static DEFAULT: std::sync::OnceLock<Optimizations> = std::sync::OnceLock::new();
-        *DEFAULT.get_or_init(|| match std::env::var("SPARKLES_DISABLE_OPTIMIZATIONS") {
-            Ok(v) => Optimizations::ALL.disable(&v).unwrap_or_else(|e| {
-                tracing::warn!(target: "sparkles::sparql::ctx", "SPARKLES_DISABLE_OPTIMIZATIONS: {e}");
-                Optimizations::ALL
-            }),
-            Err(_) => Optimizations::ALL,
+        *DEFAULT.get_or_init(|| {
+            let mut optimizations = Self::ALL;
+            if let Ok(names) = std::env::var("SPARKLES_DISABLE_OPTIMIZATIONS") {
+                for name in Self::split_names(&names) {
+                    if matches!(
+                        name,
+                        "prefetch_blocks" | "prefetch_constants" | "prefetch_terms"
+                            | "prefetch_first_scan" | "parallel_decode" | "decode_ahead"
+                    ) {
+                        continue;
+                    }
+                    if let Err(error) = optimizations.disable_name(name) {
+                        tracing::warn!(target: "sparkles::sparql::ctx", "SPARKLES_DISABLE_OPTIMIZATIONS: {error}");
+                    }
+                }
+            }
+            optimizations
         })
     }
 }
