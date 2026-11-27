@@ -2399,15 +2399,21 @@ runs beside a same-binary control. The streamed pairs cover the 166 queries at a
 threads and the cheap and 2,048-row queries at one thread. The eager pair runs
 `execution=eager` on the 2,048-row and string queries at all threads, since the eager
 executor shares the batch evaluation that the split timing changes. A query 10% or more
-slower in the first pass of any arm runs again in that arm with 12 rounds of 16 requests,
-and so does a candidate query that is slower in every round and by more than 0.5 µs. The
-analysis then takes each query's rerun when it has one and computes a 95% bootstrap
-interval of the median of the candidate's per-round ratios. The block exits with an error
-when a summary is invalid, an answer differs, or a candidate or its same-binary control
-stays 10% or more slower, since a control that slow means the host was not quiet. A rerun
-candidate query whose interval lies above 1.0 and which adds more than 0.5 µs is a real
-cost, as the Intel rule defines it. The block writes each one to `costs.txt`, and each
-gets its own line in item 1319 with the host and the two revisions.
+slower in the first pass of any arm runs again in that arm with 12 rounds of 16 requests.
+So does a candidate query that adds more than 0.5 µs and is either slower in every round
+or has a first-pass 95% bootstrap interval of the median of its per-round ratios that lies
+above 1.0. The selection and the verdict compute that interval with the same code and
+seed, so every query that the first pass would book as a cost runs again. The analysis
+then takes each query's rerun when it has one and computes the same interval for every
+candidate query. The block exits with an error when a summary is invalid, an answer
+differs, or a candidate or its same-binary control stays 10% or more slower, since a
+control that slow means the host was not quiet. A candidate query whose interval lies
+above 1.0 and which adds more than 0.5 µs is a real cost, as the Intel rule defines it,
+whether or not it ran again. The block writes each one to `costs.txt`, and each gets its
+own line in item 1319 with the host and the two revisions. This cost classification is a
+separate check from X14's Intel rule for queries under 0.3 ms, which needs an upper 95%
+bound of at most 1.02 or a median added time of at most 0.5 µs. A confirmation used as
+evidence for that rule applies it to those queries on its own.
 
 ```bash
 export BASE_BIN TIP_BIN
@@ -2419,6 +2425,20 @@ runs="$repo/.artifacts/bench-bind-reuse-293/$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$runs"
 python3 scripts/gen-bind-reuse.py data | zstd -q -o "$runs/data.nt.zst"
 python3 scripts/gen-bind-reuse.py queries "$runs/queries"
+# The 95% bootstrap interval of the median of per-round ratios, which both the rerun
+# selection and the verdict use, so that the selection covers every cost the verdict books.
+cat >"$runs/ratio_interval.py" <<'PY'
+import random
+import statistics
+
+
+def interval(ratios, n=10000):
+    if len(ratios) < 2:
+        return float("nan"), float("nan")
+    rng = random.Random(42)
+    boots = sorted(statistics.median(rng.choices(ratios, k=len(ratios))) for _ in range(n))
+    return boots[int(0.025 * n)], boots[int(0.975 * n) - 1]
+PY
 
 # Times the queries staged in $1 with $2 rounds of $3 requests a query and server, for
 # the binaries and settings of the current arm.
@@ -2481,6 +2501,8 @@ for arm in all-control all-candidate one-control one-candidate eager-control eag
     fi
     flagged=$(python3 -c '
 import json, sys
+sys.path.insert(0, sys.argv[3])
+from ratio_interval import interval
 queries = json.load(open(sys.argv[1]))["queries"]
 candidate = sys.argv[2].endswith("-candidate")
 
@@ -2491,11 +2513,13 @@ def flag(stats):
     if stats["ratio"] >= 1.10:
         return True
     added_us = (stats["b"] - stats["a"]) * 1000
-    return candidate and all(r > 1 for r in stats["rounds"]) and added_us > 0.5
+    if not candidate or added_us <= 0.5:
+        return False
+    return all(r > 1 for r in stats["rounds"]) or interval(stats["rounds"])[0] > 1.0
 
 
 print(" ".join(q for q, m in queries.items() if flag(m.get("exec_ms"))))
-' "$out/summary.json" "$arm")
+' "$out/summary.json" "$arm" "$runs")
     if [ -n "$flagged" ]; then
         mkdir -p "$out/rerun/queries"
         for query in $flagged; do
@@ -2508,37 +2532,28 @@ print(" ".join(q for q, m in queries.items() if flag(m.get("exec_ms"))))
 done
 python3 - "$runs" <<'PY' || status=1
 import json
-import random
-import statistics
 import sys
 from pathlib import Path
 
 runs = Path(sys.argv[1])
-
-
-def interval(ratios, n=10000):
-    if len(ratios) < 2:
-        return float("nan"), float("nan")
-    rng = random.Random(42)
-    boots = sorted(statistics.median(rng.choices(ratios, k=len(ratios))) for _ in range(n))
-    return boots[int(0.025 * n)], boots[int(0.975 * n) - 1]
+sys.path.insert(0, str(runs))
+from ratio_interval import interval  # noqa: E402
 
 
 def measured(name):
-    """Each query's execution times in arm `name`, from its rerun when it has one, and
-    the queries that the arm ran again."""
+    """Each query's execution times in arm `name`, from its rerun when it has one."""
     path = runs / name / "summary.json"
     if not path.exists():
-        return None, set()
+        return None
     queries = json.loads(path.read_text())["queries"]
     rerun_path = runs / name / "rerun" / "summary.json"
     rerun = json.loads(rerun_path.read_text())["queries"] if rerun_path.exists() else {}
-    return {query: rerun.get(query, m).get("exec_ms") for query, m in queries.items()}, set(rerun)
+    return {query: rerun.get(query, m).get("exec_ms") for query, m in queries.items()}
 
 
 failures, costs = [], []
 for pair in ("all", "one", "eager"):
-    (control, _), (candidate, reran) = measured(f"{pair}-control"), measured(f"{pair}-candidate")
+    control, candidate = measured(f"{pair}-control"), measured(f"{pair}-candidate")
     if control is None or candidate is None:
         failures.append(f"{pair}: no summary")
         continue
@@ -2558,7 +2573,7 @@ for pair in ("all", "one", "eager"):
             failures.append(f"{line}, the control is 10% or more slower after the rerun")
         elif stats["ratio"] >= 1.10:
             failures.append(f"{line}, 10% or more slower after the rerun")
-        elif query in reran and low > 1.0 and added_us > 0.5:
+        elif low > 1.0 and added_us > 0.5:
             costs.append(line)
 (runs / "costs.txt").write_text("".join(f"{line}\n" for line in costs))
 for line in costs:
