@@ -2304,3 +2304,131 @@ if failures:
 PY
 SH
 ```
+
+### Cursor BIND reuse admission (item 293)
+
+Item 293 settles the admission policy of the cursor's exact-id BIND cache in
+`cursor/bind.rs`, which the query-scoped expression memo of stage 5 takes over. A first
+batch that does not admit the map seeds a sketch of one input key in sixteen, chosen by a
+hash of the id, and later batches keep feeding it until it holds as many keys as a full
+map. The exact distinct count of the expression cache's pass over each batch is a second
+signal, because hot keys can all fall outside the sample. Dense inline integers and the
+snapshot hint admit at once as before, and so does a batch whose exact count repeats half
+its rows. An admitted map evaluates its misses once per distinct key, holds a pending
+entry for a missed key until then, and is released when it answers fewer than one row in
+sixteen. The sketch, the map and each batch's scratch are charged to the query's memory
+budget, a refused charge falls back to ordinary evaluation, and every loop checks
+cancellation.
+
+Weak repetition, from one repeated row in eight up to one in two, admits a
+parallel-capable expression on more than one worker only when it pays for the map. The
+guard keeps the last two timed fallback evaluations of at least 1,024 rows in one size
+bucket and estimates the saving from the lower of their rates. A saving of at least
+100 ns a row admits on one window, at least 50 ns needs two consecutive windows, and less
+declines. Sustained split losses in the bucket count as a pass, because contended
+parallel evaluation is then the cost that the map saves. A single worker and expressions
+that cannot run in parallel keep the plain one-in-eight rule.
+
+Map misses, per-batch distinct columns and the ordinary fallback evaluation share one
+split controller with two size buckets, 768 to 2,047 and 2,048 to 16,384 evaluated rows.
+Two consecutive splits that run at least 20% slower than their timed sample projects put
+the bucket in a serial cooldown of eight eligible evaluations, after which one retry
+decides whether the pool is used again. The controller survives a declined map, so a
+cheap expression that contends on the pool stays serial without disabling parallelism
+for the rest of the query. Map misses that are all stored IRIs under a direct
+`STR(input)` intern their strings and contend sooner, so they keep a separate controller
+in which one split that does not pay starts a cooldown of 16 evaluations. Tables larger
+than 16,384 rows keep the executor's own parallel threshold.
+
+The policy was chosen on forge, an Intel i5-13500, at 13,320,192 triples from
+`scripts/gen-bind-reuse.py`, with 17 query threads, streaming execution and no result
+cache. Each of the A,B,B,A and B,A,A,B orders ran six rounds of four fresh processes with
+eight timed requests a query, and every answer matched. The prototype `b71512f1`, which
+has the policy above, ran against its own build with the 100 ns rule and the IRI cooldown
+turned off. It also ran against the earlier lane state `224caadc`, which kept map misses
+serial after their first unpaid split and admitted at one in eight without a cost guard,
+and against the base `fd47b7ae`. Against the switched-off build it took 0.779 of the time
+on joined SHA256 with random repeats at 65,536 rows, 0.838 and 0.905 on moderate IRI
+repetition and 0.927 to 0.930 on SHA256 with a stride of 8. Against `224caadc` it took
+0.54 to 0.59 on unique and low-repeat IRIs and 0.74 to 0.79 on unique and low-repeat
+SHA256. It removed that state's 1.21 to 1.24 times regressions on dates and strings with a
+stride of 8 and its 1.105 on joined strings with random repeats. It gave up 7.9% to 12.1%
+against `224caadc` on SHA256 with a stride of 8, whose map misses split on every batch.
+Against the base, the three 65,536-row repairs measured 1.018 on dates with an interval
+that reaches 1.0, 1.014 on strings and 1.037 on joined strings with random repeats, which
+add 0.15 ms and 0.25 ms. Item 1319 holds those two costs. The matrix has no paired
+comparison against the base on the cheap inputs, the 2,048-row inputs or the small eager
+and dense-string queries, so item 293 stays open until the landed build is confirmed
+against its base.
+
+The rejected arms are recorded in PERFORMANCE-EXPERIMENTS. A diagnostic arm in `cd5561af`
+gave the map misses of `SHA256(STR(input))` a separate first-unpaid cooldown, to test
+whether split scheduling alone causes the stride-8 SHA256 cost. It was never measured and
+is not part of the policy. The shortcut for the 50M slice and reuse beyond one query
+remain deferred.
+
+The confirmation builds the landed tip and its base `17674a34` as release binaries on one
+build host with the same compiler and profile. The commands below run on forge from the
+candidate checkout in a named terminal with `BASE_BIN` and `TIP_BIN` set. Each pair
+covers the 166 queries at all threads and the cheap and 2,048-row queries at one thread,
+beside a same-binary control. The build passes when every answer matches and no query is
+10% or more slower after the flagged rerun. A ratio whose interval stays above 1.0 and
+adds more than 0.5 µs is a real cost that gets its own line in item 1319.
+
+```bash
+export BASE_BIN TIP_BIN
+flock "$HOME/lanes/.heavy.lock" bash -s <<'SH'
+set -euo pipefail
+: "${BASE_BIN:?}" "${TIP_BIN:?}"
+repo=$PWD
+runs="$repo/.artifacts/bench-bind-reuse-293/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$runs"
+python3 scripts/gen-bind-reuse.py data | zstd -q -o "$runs/data.nt.zst"
+python3 scripts/gen-bind-reuse.py queries "$runs/queries"
+for arm in all-control all-candidate one-control one-candidate; do
+    a=$BASE_BIN b=$TIP_BIN threads=default server_cpu=0-10,12-19 client_cpu=11 spin=0
+    case "$arm" in
+        *-control) b=$BASE_BIN ;;
+    esac
+    out="$runs/$arm"
+    mkdir -p "$out/queries"
+    case "$arm" in
+        all-*) cp "$runs"/queries/*.rq "$out/queries/" ;;
+        one-*)
+            threads=1 server_cpu=2 client_cpu=4 spin=1
+            cp "$runs"/queries/*-2048.rq "$runs"/queries/*-low-repeat-*.rq \
+                "$runs"/queries/*-stride-16-*.rq "$runs"/queries/*-unique-*.rq "$out/queries/"
+            ;;
+    esac
+    install -m 755 "$a" "$out/bin-A"
+    install -m 755 "$b" "$out/bin-B"
+    {
+        printf 'host: %s\nA: %s\nB: %s\n' "$(hostname)" "$a" "$b"
+        sha256sum "$a" "$b" "$runs/data.nt.zst"
+        readelf -p .comment "$a" "$b"
+    } >"$out/manifest.txt"
+    cp "$runs/data.nt.zst" "$out/"
+    cp scripts/nsc-bench-remote.sh "$out/"
+    cat >"$out/run.env" <<ENV
+ROUNDS=6
+REPS=8
+WARMUP=3
+ORDERS="A B B A;B A A B"
+BINARY_OF_A=A
+BINARY_OF_B=B
+EXPECTED_ANSWER_CHANGE=0
+EXPECTED_ANSWER_CHANGE_REASON=""
+RAYON_THREADS=$threads
+SERVER_CPU=$server_cpu
+CLIENT_CPU=$client_cpu
+SPIN=$spin
+EXECUTION=streaming
+PORT=31943
+ENV
+    env -u BINARY_OF_A -u BINARY_OF_B -u EXPECTED_ANSWER_CHANGE -u EXPECTED_ANSWER_CHANGE_REASON \
+        bash "$out/nsc-bench-remote.sh"
+    python3 scripts/nsc-bench-summary.py "$out" >"$out/summary.md"
+    python3 scripts/nsc-bench-summary.py --check "$out/summary.json" first
+done
+SH
+```

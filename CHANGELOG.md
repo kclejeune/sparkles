@@ -1037,8 +1037,13 @@ of its input keys and the exact distinct count of each batch, and admits its map
 results when one row in eight repeats. Before, a first batch without enough repetition
 ended reuse for the query, so an input whose keys repeated only after 65,536 rows
 evaluated every row. A map that stops paying is released, and the sketch and the map are
-charged to the query's memory budget, about 128 KiB and 6 MiB when full. Roadmap item 293
-is complete, and items 1082 and 1083 follow the remaining costs.
+charged to the query's memory budget, about 128 KiB and 6 MiB when full. On more than one
+worker, weak repetition of a parallel-capable expression admits the map only when the
+measured evaluation rate says it pays. The map's misses and the ordinary evaluation share
+one split controller, which keeps a contended expression serial for a cooldown and then
+retries the pool, in place of disabling parallel evaluation for the rest of the query.
+Roadmap item 293 stays open for its confirmation on forge, and items 1082, 1083 and 1319
+follow the remaining costs.
 
 ### One plan in every execution mode
 

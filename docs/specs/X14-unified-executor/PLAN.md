@@ -78,8 +78,9 @@ ranges live in `plan.rs`, not in the ARQ property functions.
 
 Three expression memos keep three admission policies. `exprcache.rs` admits per-value
 reuse from a Chao1 estimate of distinct inputs and a sample of 4,096 rows,
-`cursor/bind.rs` keeps the cursor's own exact id cache behind a pilot over its first
-4,096 rows, and the EXISTS memo of `expr.rs` admits up to 100,000 entries within an
+`cursor/bind.rs` keeps the cursor's own exact id cache, admitted from a pilot over its
+first batch, from repetition it observes across later batches and from a cost guard, and
+the EXISTS memo of `expr.rs` admits up to 100,000 entries within an
 eighth of the budget. The decorrelated EXISTS key sets of `exists.rs` are shared.
 
 The result writers exist twice, and the design's two gaps have narrowed. The eager
