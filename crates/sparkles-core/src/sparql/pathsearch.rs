@@ -1490,38 +1490,68 @@ impl ReverseAlternatives {
         let mut shortest = None;
         let mut second = None;
         let parents = tree.parent;
-        let sole_return =
-            |u, suffix| parents[&(u, suffix)].node == source && !self.branches.contains_key(&u);
+        // A shortest-hop suffix descends one level per step. Only a larger
+        // depth gap needs the ancestry index to tell whether it revisits source.
+        let cheap_certificate = |v, suffix| {
+            if source == VIRT || suffix <= depth {
+                Some(true)
+            } else if suffix - 1 == depth {
+                Some(parents[&(v, suffix)].node != source)
+            } else {
+                None
+            }
+        };
         let mut unresolved_min = None;
-        for &u in &branch.hops {
+        let mut note_unresolved = |len| {
+            unresolved_min = Some(unresolved_min.map_or(len, |old: u32| old.min(len)));
+        };
+        let mut first_deep = None;
+        for (i, &u) in branch.hops.iter().enumerate() {
             poll()?;
             let suffix = tree.dist[&u];
             let len = suffix + 1;
             if len > max_len || second.is_some_and(|best| best <= len) {
                 continue;
             }
-            // A shortest-hop suffix descends one level per step. A neighbor one
-            // level deeper can only revisit the source on its first step.
-            let certified = if source == VIRT || suffix <= depth {
-                true
-            } else if suffix - 1 == depth {
-                let parent = tree.parent[&(u, suffix)].node;
-                if parent == source && !self.branches.contains_key(&u) {
+            match cheap_certificate(u, suffix) {
+                Some(true) => {
+                    if shortest.is_none_or(|best| len < best) {
+                        second = shortest;
+                        shortest = Some(len);
+                    } else {
+                        second = Some(len);
+                    }
+                }
+                Some(false) => {
+                    if self.branches.contains_key(&u) {
+                        note_unresolved(len);
+                    }
+                }
+                None => {
+                    first_deep.get_or_insert(i);
+                }
+            }
+        }
+
+        // Two cheap certificates beat every deferred hop, regardless of hop
+        // order. Otherwise the real source's minimum-hop parent already gives
+        // the shortest route, so a certified deep hop competes for second.
+        if let Some(start) = first_deep.filter(|_| second.is_none()) {
+            for &u in &branch.hops[start..] {
+                poll()?;
+                let suffix = tree.dist[&u];
+                let len = suffix + 1;
+                if suffix.saturating_sub(depth) <= 1
+                    || len > max_len
+                    || second.is_some_and(|best| best <= len)
+                {
                     continue;
                 }
-                parent != source
-            } else {
-                tree.suffix_avoids(ctx, u, source, poll)?
-            };
-            if certified {
-                if shortest.is_none_or(|best| len < best) {
-                    second = shortest;
-                    shortest = Some(len);
+                if tree.suffix_avoids(ctx, u, source, poll)? {
+                    second = Some(len);
                 } else {
-                    second = Some(second.map_or(len, |old: u32| old.min(len)));
+                    note_unresolved(len);
                 }
-            } else {
-                unresolved_min = Some(unresolved_min.map_or(len, |old: u32| old.min(len)));
             }
         }
         let Some(lower_bound) = unresolved_min else {
@@ -1560,19 +1590,22 @@ impl ReverseAlternatives {
                 if lower > max_len || second.is_some_and(|len| len <= lower) {
                     continue;
                 }
-                if suffix <= depth
-                    || tree
-                        .ancestry
-                        .as_ref()
-                        .is_some_and(|index| index.avoids(v, source))
-                {
+                let certified = match cheap_certificate(v, suffix) {
+                    Some(false) if !self.branches.contains_key(&v) => continue,
+                    Some(avoids) => avoids,
+                    // Queued nodes are descendants of the source. Across a
+                    // tree edge a deeper neighbor is in that subtree too.
+                    None if v == parent || parents[&(v, suffix)].node == u => false,
+                    None => tree.suffix_avoids(ctx, v, source, poll)?,
+                };
+                if certified {
                     if u != source {
                         if lower == lower_bound {
                             return Ok(Some(lower));
                         }
                         second = Some(lower);
                     }
-                } else if !sole_return(v, suffix) {
+                } else {
                     let (new, next) = insert_hb_set(&mut seen, v, &mut scratch, base)?;
                     base = next;
                     if new {
@@ -14560,17 +14593,59 @@ mod tree_tests {
     }
 
     #[test]
+    fn reverse_first_row_settles_shallow_hops_before_indexing() {
+        use std::fmt::Write as _;
+
+        // The reverse search records a's hops in cost order: t, then h, then y.
+        // The route through y settles the competing length without indexing h.
+        for n in [1, 1024] {
+            let mut ttl = String::from(
+                "@prefix ex: <http://example.org/> . \
+                 ex:a ex:p ex:t {| ex:w 0.5e0 |} . ex:a ex:p ex:h, ex:y . \
+                 ex:h ex:p ex:z . ex:z ex:p ex:w . ex:w ex:p ex:t . \
+                 ex:y ex:p ex:t {| ex:w 10e0 |} . ",
+            );
+            for i in 0..n {
+                write!(ttl, "ex:b{i} ex:p ex:t {{| ex:w 1e12 |}} . ").unwrap();
+            }
+            let properties = format!(
+                "path:source ?src ; path:target ex:t ; path:predicate ex:p ; \
+                 path:weight ex:w ; path:maxLength 4 ; path:maxVisited {}",
+                n + 8
+            );
+            let rows = reverse_first_rows(ttl, &properties, None);
+            for (first, _) in &rows {
+                assert_eq!(
+                    first,
+                    &Term::NamedNode(oxrdf::NamedNode::new("http://example.org/a").unwrap())
+                );
+            }
+            let steps = rows.map(|(_, steps)| steps);
+            assert!(
+                steps.iter().all(|&count| count <= 8),
+                "eager and cursor suffix steps with {n} unrelated sources: {steps:?}"
+            );
+        }
+    }
+
+    #[test]
     fn reverse_batch_shared_deeper_neighbor_has_linear_suffix_work() {
-        assert_shared_neighbor_batch(0);
+        assert_shared_neighbor_batch(0, false);
     }
 
     #[test]
     fn reverse_batch_shared_distant_neighbor_has_linear_suffix_work() {
-        assert_shared_neighbor_batch(1);
-        assert_shared_neighbor_batch(1024);
+        assert_shared_neighbor_batch(1, false);
+        assert_shared_neighbor_batch(1024, false);
     }
 
-    fn assert_shared_neighbor_batch(extra_depth: usize) {
+    #[test]
+    fn reverse_batch_certifies_shared_hub_after_returning_child() {
+        assert_shared_neighbor_batch(0, true);
+        assert_shared_neighbor_batch(1, true);
+    }
+
+    fn assert_shared_neighbor_batch(extra_depth: usize, returning_child: bool) {
         use std::fmt::Write as _;
 
         let n = 1024;
@@ -14583,9 +14658,19 @@ mod tree_tests {
         }
         let mut expected = Vec::new();
         for i in 0..n {
+            let entry = if returning_child {
+                write!(
+                    ttl,
+                    "ex:u{i} ex:p ex:a{i} . ex:a{i} ex:p ex:u{i} {{| ex:w 2e0 |}} . "
+                )
+                .unwrap();
+                format!("u{i}")
+            } else {
+                format!("a{i}")
+            };
             write!(
                 ttl,
-                "ex:a{i} ex:p ex:t {{| ex:w 0.5e0 |}} . ex:a{i} ex:p ex:h {{| ex:w 2e0 |}} . \
+                "ex:a{i} ex:p ex:t {{| ex:w 0.5e0 |}} . ex:{entry} ex:p ex:h {{| ex:w 2e0 |}} . \
                  ex:h ex:p ex:z{i} . ex:z{i} ex:p ex:{tail} . "
             )
             .unwrap();
@@ -14593,10 +14678,10 @@ mod tree_tests {
         }
         expected.sort_unstable();
 
-        // The reverse search settles 2N + 3 labels plus the extra tail.
+        // Each returning child adds one reverse visit and one edge to the detour.
         // Forward ranking settles only a_i and t per requested one-edge path.
-        let cap = 4 * n + 3 + extra_depth;
-        let max_len = 3 + extra_depth;
+        let cap = (4 + usize::from(returning_child)) * n + 3 + extra_depth;
+        let max_len = 3 + usize::from(returning_child) + extra_depth;
         let batch = |visits| {
             let properties = format!(
                 "path:source ?src ; path:target ex:t ; path:predicate ex:p ; \
@@ -14635,6 +14720,8 @@ mod tree_tests {
         } else {
             16 * (n + extra_depth)
         };
+        // Through a returning child the walk also checks the source and child hops.
+        let bound = bound + if returning_child { 6 * n } else { 0 };
         assert!(
             steps.iter().all(|&count| (n..=bound).contains(&count)),
             "eager and cursor suffix steps for {n} branches and {extra_depth} extra levels: {steps:?}"

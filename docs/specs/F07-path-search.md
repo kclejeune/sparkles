@@ -283,13 +283,17 @@ chain. For each branch it caches the shortest budget admitting two simple suffix
 distinct first edges. A hop to a node at the same or a smaller minimum edge distance can
 follow that node's shortest suffix directly. For a hop one level deeper, the shortest
 suffix also avoids the branch if its first step reaches a different node at the branch's
-depth. For a larger depth gap, the first hop that needs an ancestry check builds a
-preorder interval for each real node in the shortest-hop tree. Later checks take constant
-time. A neighbor outside the branch's interval has a shortest suffix that avoids it.
-The search starts a breadth-first walk only if an unresolved hop could supply a second
-route or improve the certified threshold. It excludes the branch and prunes over-budget
-prefixes. The walk enqueues each node at most once for that branch and stops when it
-attains the lower bound on the unresolved hops. The virtual endpoint represents a
+depth. The search checks these hops first. If two qualify, a hop with a larger depth
+gap cannot improve their threshold. The first deeper hop that still needs an ancestry
+check builds a preorder interval for each real node in the shortest-hop tree. Later
+checks take constant time. A neighbor outside the branch's interval has a shortest
+suffix that avoids it. The search starts a breadth-first walk only if an unresolved hop
+could supply a second route or improve the certified threshold. It excludes the branch
+and prunes over-budget prefixes. At each hop the walk uses the same depth, parent and
+ancestry checks. It enqueues only nodes whose shortest suffix returns to the branch.
+A deeper neighbor joined to a queued node by a shortest-hop tree edge also lies in
+that subtree. The walk visits each queued node at most once and stops when it attains
+the lower bound on the unresolved hops. The virtual endpoint represents a
 completed cycle and can only appear as a source of recorded hops. The query memory
 budget covers retained hops and intervals, the temporary child links used to build the
 intervals, and the walk's queue and visited set. A reverse search skips collecting
