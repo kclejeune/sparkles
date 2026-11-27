@@ -20,7 +20,7 @@ authoritative whenever an operator or its cost model changes.
 | Filters & scans | `count_filter_runs`, `filter_scan_runs`, `expr_cache`, `range_pushdown`, `point_patterns` |
 | Joins & stars | `anti_join`, `merge_left_join`, `merge_pair_conditions`, `probed_optional`, `keyed_join`, `keyed_left_join`, `batched_join`, `gallop_index_join`, `star_fusion`, `fused_star_costs` |
 | Aggregation & top-k | `metadata_counts`, `topk_heap`, `topk_first_key`, `bound_order_keys` |
-| Cold reads & streaming | `prefetch_constants`, `prefetch_first_scan`, `prefetch_terms`, `parallel_decode`, `decode_ahead`, `predicate_patterns`, `grow_input` |
+| Streaming | `predicate_patterns`, `grow_input` |
 
 * [Optimizations adopted from QLever](#optimizations-adopted-from-qlever)
 * [Further scan and filter optimizations](#further-scan-and-filter-optimizations)
@@ -426,12 +426,11 @@ earlier implementation and always apply. `EXPLAIN` shows which fast paths ran.
 
 ## Cold reads
 
-These switches matter on a server whose index and vocabulary files are not in the page
-cache, such as the first queries after a restart. With the files in memory they cost
-little and change nothing. Each one has the same answers with it on and off.
+Read hints and read-ahead overlap reads on a server whose index and vocabulary files
+are outside the page cache, such as on the first queries after a restart.
 [X07](../specs/X07-cold-sparse-reads.md) has the design and the measurements.
 
-* **Constants requested together** (`prefetch_constants`). Before the planner looks up
+* **Constants requested together.** Before the planner looks up
   the constants of a query one by one, it collects the IRIs and literals of the patterns,
   paths, VALUES rows, graph names and the common FILTER comparisons. It asks for the
   sparse-index group of every one of them in one pass (`Vocab::prefetch_keys`), so the
@@ -439,7 +438,7 @@ little and change nothing. Each one has the same answers with it on and off.
   and it does nothing without a sparse index or with the read hints off. A table of
   1,024 key hashes per vocabulary remembers the keys whose group was already asked for,
   so a warm constant costs a hash and a load instead of a search of the sparse index.
-* **Scans requested before they run** (`prefetch_first_scan`). When the plan is built,
+* **Scans requested before they run.** When the plan is built,
   every scan of 64 blocks or fewer asks the kernel for the columns the reader will decode.
   A block inside the key range needs the scan's columns, and a block at an end of the range
   also needs the columns that bound it. A range scan asks for the blocks of its id ranges.
@@ -460,11 +459,10 @@ little and change nothing. Each one has the same answers with it on and off.
   received no advice gets current-block fallback advice in eager and cursor readers.
   Cached and empty spans also have a finite traversal budget, so repeated calls at one
   position do not add another window. Concurrent scans share no coverage state and do
-  not change the mapping's random-access advice. `SPARKLES_READ_WINDOW_KB` sets the
-  target, 4096 KiB by default. This bounds requested bytes, not physical I/O completion.
+  not change the mapping's random-access advice. The target bounds requested bytes.
   A pass consults its window only at a block the cache does not hold, so a warm pass does
-  no read-ahead work. Passes over the vocabulary in id order use the same configured size.
-* **Terms of small inputs** (`prefetch_terms`). A FILTER, BIND or ORDER BY over a table of
+  no read-ahead work. Passes over the vocabulary in id order use the same 4 MiB target.
+* **Terms of small inputs.** A FILTER, BIND or ORDER BY over a table of
   2 to 4,095 rows evaluates the rows one at a time. Before the first row, it asks for the
   vocabulary blocks of the terms it will read. With a numeric column it also asks for the
   pages of the values, and for the pages of the kinds and the rank when the column keeps
@@ -472,7 +470,7 @@ little and change nothing. Each one has the same answers with it on and off.
   mapping, so a warm call makes no system call. It does locate each id, which costs a
   memory read. Larger tables decode their terms in id order as before. The native JSON
   result writer asks for the blocks of the terms it prints, as the other result writers do.
-* **Parallel decode** (`parallel_decode`). An index join that has asked the kernel for
+* **Parallel decode.** An index join that has asked the kernel for
   its blocks decodes their columns on a small thread pool of the block cache's own, before
   the reader reaches them. Scans do not use it. It decodes only columns the reader decodes
   anyway and keeps them in the cache. A request adds at most an eighth of the cache, so a
@@ -498,7 +496,7 @@ little and change nothing. Each one has the same answers with it on and off.
   the resident pages of its other index files, and the next start reads them on a
   background thread after it is ready. [Memory and caches](../USAGE.md#memory-and-caches)
   describes it.
-* **Decoding the next cursor batch ahead** (`decode_ahead`). A result writer that reads
+* **Decoding the next cursor batch ahead.** A result writer that reads
   a cursor decodes the terms of the next batch on another Rayon thread while it writes the
   current one. It writes the first batch before it pulls the second, so the first rows
   wait for one batch only, and it reads ahead only when the memory budget has room for

@@ -74,7 +74,7 @@ spill format.
 
 **Shared format registry and small helpers.** Add one syntax registry for format names, extensions and media types, one INFERRED_GRAPH constant, one `parse_duration` and one durable atomic-write helper, and fix the Turtle string escaping that differs between `mapping/rdf.rs` and `mapping/draft.rs`. About ten format tables, nine INFERRED_GRAPH constants and ten atomic-write helpers exist. The unescaped draft writer could produce invalid Turtle. Roadmap item 477 holds this phase.
 
-**Implementation-selecting switches made test-only.** Make the EnvSwitch statics, implementation-only StoreOptions booleans and measurement switches test-only or remove them after X07 closes. No measured difference has been recorded for I/O hints on bulk loads. Roadmap item 478 holds this phase, and item 513 makes the cold-read switches test-only once item 4 has measured them.
+**Implementation-selecting switches made test-only.** Make the EnvSwitch statics, implementation-only StoreOptions booleans and measurement switches test-only or remove them after X07 closes. No measured difference has been recorded for I/O hints on bulk loads. Roadmap item 478 holds this phase. Item 513 covers the cold-read switches after item 4 measures them, with the I/O hint switch also depending on item 573.
 
 ### Stage 3: policy and plumbing
 
@@ -230,6 +230,12 @@ Stages 1 and 3 have shipped, apart from item 484 of stage 3, which X16 holds wit
 shipped, and the hierarchical budget of item 675 remains. Stage 5's
 join-kernel library has shipped, and its other phases follow the
 [plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks the rest of the work.
+
+Item 513 removed the sparse vocabulary and read-window environment switches and moved
+the query prefetch and decoding switches to test controls. The read-ahead target is
+4 MiB. A budgeted historical reader still looks up terms through the offsets when
+its budget cannot hold the sparse vocabulary index. `SPARKLES_IO_HINTS` remains in use
+for the dense export comparison in item 573.
 
 Items 678 and 1069 have shipped. The string floors of `string_order_mask` read their keys
 and search for a string's first extension inside the decoding envelope, and a refused
@@ -746,10 +752,8 @@ different algorithms for diagnosis. `expr_cache`, `sampled_filters`,
 `decorrelate_exists`, `count_filter_runs`, `filter_scan_runs` and `topk_first_key` are
 switched off at run time for queries that call extensions, so their off paths are live.
 The cost-model switches `sampled_filters`, `characteristic_sets`, `probed_keys` and
-`fused_star_costs` are what the cost calibration harness compares. `grow_input` and
-`decode_ahead` are the memory and latency tradeoffs that the cursor tests measure against
-their off paths, and the sequential writer stays as the path of a single Rayon worker.
-The prefetch and decoding switches of X07 wait for item 4 under item 478. The switches
+`fused_star_costs` are what the cost calibration harness compares. `grow_input` remains a diagnostic switch. Cursor tests still compare decoding ahead
+with sequential decoding, which also serves a single Rayon worker. The switches
 that shipped with their measurements in the current release, `probed_optional` and
 `bound_order_keys`, keep their off paths as the baseline of the forge checks.
 `gallop_index_join` chooses between the galloping reader and the clustered reader, which
@@ -799,9 +803,14 @@ are gone, and the store options they set, `wal_direct_writes` and
 and of the group set. The buffered path still serves a file system that refuses direct
 I/O. The undocumented `SPARKLES_DEBUG_CACHE` printout of result-cache keys is deleted.
 
-The cold-read switches `SPARKLES_IO_HINTS`, `SPARKLES_SPARSE_VOCAB` and
-`SPARKLES_READ_WINDOW_KB`, and the prefetch and decoding switches of `Optimizations`,
-remain until item 4 has measured them, and item 513 makes them test-only then.
+Item 513 removed `SPARKLES_SPARSE_VOCAB` and `SPARKLES_READ_WINDOW_KB`. Vocabulary
+opens use the sparse index when the reader can hold it, and permutation scans and
+vocabulary passes use a fixed 4 MiB read-ahead target. The `prefetch_blocks`,
+`prefetch_constants`, `prefetch_terms` and `prefetch_first_scan` fields of
+`Optimizations` compile only for unit tests. The `parallel_decode` and `decode_ahead`
+fields are hidden controls used by integration tests. The six switches are absent
+from `SPARKLES_DISABLE_OPTIMIZATIONS` and the named diagnostics. Item 513 still tracks
+`SPARKLES_IO_HINTS` after item 573.
 `SPARKLES_NO_IN_PLACE` remains as the method of the published memory benchmark, which
 compares the in-place runner with the blocking pool.
 

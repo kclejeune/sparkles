@@ -1061,16 +1061,13 @@ pages, so `man sparkles-serve` works after `nix profile install`.
 `--format yaml` prints it as YAML. A running server serves the same document at
 `/$/openapi.json` ([API.md](API.md#openapi-description)).
 
-Three environment variables change cold-read paths for comparisons.
 `SPARKLES_IO_HINTS=off` maps the index and vocabulary files without access hints, so
-that a page fault reads the device's whole read-ahead window and blocks are not read
-ahead. `SPARKLES_SPARSE_VOCAB=off` looks terms up without `vocab.idx`.
-`SPARKLES_READ_WINDOW_KB` sets the target compressed bytes requested ahead by one scan,
-4096 KiB by default. A refill includes existing unconsumed advice and coalesced gaps in
-that budget. Whole-block progress can extend it through one next block and its bridged
-gap, which is at most 64 KiB. It bounds requested coverage rather than physical I/O in
-flight. Zero restores per-block hints. Cached columns that are evicted before consumption
-receive fallback advice at the block they need. An index build sends its permutation and
+a page fault uses the device's normal read-ahead policy. With hints enabled, each
+scan targets 4 MiB of compressed bytes requested ahead. A refill counts existing
+unconsumed advice and coalesced gaps in that budget. Whole-block progress can
+extend it through one next block and its bridged gap of at most 64 KiB. The target
+measures requested coverage. Cached columns evicted before consumption receive
+fallback advice at the block they need. An index build sends its permutation and
 vocabulary files to the device as it writes them.
 
 `SPARKLES_UI_DIR=DIR` makes the server read the web UI from a UI build directory, such as

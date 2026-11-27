@@ -73,24 +73,10 @@ pub fn set_io_hints(on: bool) {
     IO_HINTS.set(on);
 }
 
-/// Whether vocabularies opened from now on use their sparse index (`vocab.idx`, see
-/// [`crate::vocab::Vocab`]) when they have one. On by default, `off` in
-/// `SPARKLES_SPARSE_VOCAB` turns it off for a process.
-pub fn sparse_vocab() -> bool {
-    SPARSE_VOCAB.get()
-}
-
-/// Turn the use of [`sparse_vocab`] on or off for vocabularies opened from now on.
-pub fn set_sparse_vocab(on: bool) {
-    SPARSE_VOCAB.set(on);
-}
-
 static IO_HINTS: EnvSwitch = EnvSwitch::new("SPARKLES_IO_HINTS");
-static SPARSE_VOCAB: EnvSwitch = EnvSwitch::new("SPARKLES_SPARSE_VOCAB");
 
 /// A process-wide switch, on unless its environment variable says `off`, `0` or
-/// `false`, and settable for tests and A/B runs. Only the cold-read switches of X07 are
-/// environment switches, until roadmap item 4 has measured them.
+/// `false`, and settable for tests and A/B runs.
 pub(crate) struct EnvSwitch {
     var: &'static str,
     /// 0 = not read from the environment yet, 1 = on, 2 = off
@@ -277,19 +263,8 @@ pub type Key = [u64; 4];
 
 /// Target compressed bytes requested ahead by one [`ReadAhead`] pass. Whole-block
 /// progress may extend it through one next block and its coalesced gap.
-/// `SPARKLES_READ_WINDOW_KB` changes it for experiments, and 0 turns the windows off: every
-/// block then asks for its own columns just before it is decoded, as before the windows.
-pub fn read_window() -> usize {
-    static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *W.get_or_init(|| {
-        std::env::var("SPARKLES_READ_WINDOW_KB")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .map_or(
-                4 << 20,
-                |kb| if kb == 0 { 0 } else { (kb << 10).max(64 << 10) },
-            )
-    })
+pub const fn read_window() -> usize {
+    4 << 20
 }
 
 /// Read-ahead of one pass over consecutive blocks of a permutation (spec X07 §5.3).
@@ -334,8 +309,7 @@ impl ReadAhead {
     ) -> bool {
         #[cfg(test)]
         READ_AHEAD_CALLS.with(|n| n.set(n.get() + 1));
-        let limit = read_window();
-        if !io_hints() || limit == 0 {
+        if !io_hints() {
             return true;
         }
         let Some(data) = idx.data.as_ref() else {
@@ -353,9 +327,9 @@ impl ReadAhead {
         }
         if b >= self.refill_at && self.requested < end {
             self.window = if self.window == 0 {
-                Self::FIRST.min(limit)
+                Self::FIRST
             } else {
-                self.window.saturating_mul(2).min(limit)
+                self.window.saturating_mul(2).min(read_window())
             };
             let mut used = self.covered.iter().map(|&(a, z)| z - a).sum::<usize>();
             let mut examined = 0usize;
@@ -3935,7 +3909,7 @@ mod tests {
         let cache = BlockCache::new(1 << 26);
         assert_eq!(idx.blocks.len(), 6);
         let all = |_: usize| ALL_COLS;
-        let enabled = io_hints() && read_window() != 0;
+        let enabled = io_hints();
         let trace = idx.trace_hints();
         // a short range: the first request covers every block
         let mut ra = ReadAhead::default();
@@ -3947,7 +3921,7 @@ mod tests {
                 .map(|m| m.col_len.iter().map(|&n| n as usize).sum::<usize>())
                 .sum::<usize>();
             assert!(ra.requested > 0 && ra.requested <= 6);
-            if total <= ReadAhead::FIRST.min(read_window()) {
+            if total <= ReadAhead::FIRST {
                 assert_eq!(ra.requested, 6);
                 assert_eq!(ra.refill_at, usize::MAX);
             }
@@ -4463,7 +4437,7 @@ mod tests {
         let mut rows = 0;
         for b in 0..idx.blocks.len() {
             let hint = ahead.before(&idx, &cache, b, idx.blocks.len(), &|_| 1);
-            if b == 0 && io_hints() && read_window() != 0 {
+            if b == 0 && io_hints() {
                 assert_eq!(ahead.requested, 128);
                 assert_eq!(ahead.covered.len(), 64, "many actual future intervals");
                 assert_eq!(trace.spans().len(), 64);
@@ -4482,7 +4456,7 @@ mod tests {
             inspections <= 4 * idx.blocks.len(),
             "coverage lookup exceeds linear pass bound"
         );
-        if !io_hints() || read_window() == 0 {
+        if !io_hints() {
             assert_eq!(inspections, 0);
         }
     }
@@ -4567,7 +4541,7 @@ mod tests {
             let mut ahead = ReadAhead::default();
             let mut max_outstanding = 0;
             let limit = read_window();
-            let enabled = limit > 0 && io_hints();
+            let enabled = io_hints();
             let mut violations = Vec::new();
             for b in 0..idx.blocks.len() {
                 ahead.before(&idx, &cache, b, idx.blocks.len(), &|_| mask);
@@ -4758,7 +4732,7 @@ mod tests {
     #[test]
     fn read_ahead_cached_and_empty_masks_make_bounded_progress() {
         let (_dir, idx) = read_ahead_fixture(8);
-        let enabled = io_hints() && read_window() > 0;
+        let enabled = io_hints();
         let cache = BlockCache::new(64 << 20);
         for b in 0..8 {
             cache.get_cols(&idx, b, 1).unwrap();
@@ -4836,7 +4810,7 @@ mod tests {
             .map(|b| idx.blocks[b].col_len[0] as usize)
             .sum::<usize>();
         let actual = spans.iter().map(|&(a, z)| z - a).sum::<usize>();
-        if io_hints() && read_window() > 0 {
+        if io_hints() {
             assert!(actual > selected);
         } else {
             assert_eq!(actual, 0);

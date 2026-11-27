@@ -1142,13 +1142,17 @@ const PREFETCH_RANGES: usize = 16_384;
 const PREFETCH_CHECK_STEPS: u32 = 1024;
 
 /// Ask the kernel to read the blocks of `ranges` in `perm` that the cache lacks, all
-/// at once, before the reader decodes them one by one (`Optimizations::prefetch_blocks`):
-/// on a cold server their reads then overlap. `cols` are the key columns the reader
+/// at once before the reader decodes them one by one. On a cold server their reads then
+/// overlap. `cols` are the key columns the reader
 /// decodes besides the ones that bound the ranges. `rule` is the reader's, so the graph and
 /// repeated-variable columns are asked for exactly when [`read_ranges`] decodes them.
 fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask, rule: &RowRule) -> Result<()> {
     ctx.check()?;
-    if !ctx.opt.prefetch_blocks || ranges.len() > PREFETCH_RANGES || ranges.len() < 2 {
+    #[cfg(test)]
+    if !ctx.opt.prefetch_blocks {
+        return Ok(());
+    }
+    if !(2..=PREFETCH_RANGES).contains(&ranges.len()) {
         return Ok(());
     }
     let idx = ctx.snap.perm(perm);

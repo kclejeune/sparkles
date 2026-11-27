@@ -2567,7 +2567,7 @@ impl QueryCursor {
     /// rows of `send` left over, which without `send` count down from `usize::MAX`, so that
     /// 0 means the writer stopped at `send`.
     ///
-    /// With `decode_ahead` and more than one Rayon worker, every batch after the first is
+    /// With more than one Rayon worker, every batch after the first can be
     /// pulled before `each` handles the one before it, and its terms are decoded on the pool
     /// while `each` runs. Two batches and their terms are then live at once, both charged.
     /// The first batch goes to `each` before the second is pulled, so the first rows of an
@@ -8127,12 +8127,11 @@ mod tests {
             .build()
             .unwrap();
         let run = |ahead: bool, send: Option<usize>| {
-            let mut opt = crate::sparql::Optimizations::default();
-            if !ahead {
-                opt = opt.disable("decode_ahead").unwrap();
-            }
             let options = QueryOptions {
-                optimizations: Some(opt),
+                optimizations: Some(crate::sparql::Optimizations {
+                    decode_ahead: ahead,
+                    ..Default::default()
+                }),
                 ..Default::default()
             };
             let mut cursor = select_cursor(

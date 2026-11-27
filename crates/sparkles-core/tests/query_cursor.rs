@@ -4537,6 +4537,16 @@ fn without(names: &str) -> QueryOptions {
     }
 }
 
+fn without_decode_ahead() -> QueryOptions {
+    QueryOptions {
+        optimizations: Some(sparkles_core::sparql::Optimizations {
+            decode_ahead: false,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 #[test]
 fn writers_decoding_ahead_match_eager_at_send_limits_across_batches() {
     use sparkles_core::sparql::results::{
@@ -4553,7 +4563,7 @@ fn writers_decoding_ahead_match_eager_at_send_limits_across_batches() {
         for send in [None, Some(0), Some(1), Some(4096), Some(4097), Some(8999)] {
             let mut expected = Vec::new();
             write_solutions(&eager, fmt, &mut expected, send).unwrap();
-            for opts in [QueryOptions::default(), without("decode_ahead")] {
+            for opts in [QueryOptions::default(), without_decode_ahead()] {
                 let mut c = select_cursor(s.snapshot(), q, &opts, &options(1000)).unwrap();
                 let mut output = Vec::new();
                 let stats = pool
@@ -4576,7 +4586,7 @@ fn a_failure_while_decoding_ahead_comes_after_the_rows_before_it() {
         .num_threads(4)
         .build()
         .unwrap();
-    for opts in [QueryOptions::default(), without("decode_ahead")] {
+    for opts in [QueryOptions::default(), without_decode_ahead()] {
         let opts = QueryOptions {
             max_rows_produced: Some(2500),
             ..opts
@@ -4760,7 +4770,7 @@ fn decoding_ahead_under_tight_budgets_and_failing_writers() {
             max_memory_bytes: Some(kb << 10),
             ..opts
         };
-        let serial = write(&budget(without("decode_ahead")));
+        let serial = write(&budget(without_decode_ahead()));
         let ahead = write(&budget(QueryOptions::default()));
         match (serial, ahead) {
             (Ok(a), Ok(b)) => assert_eq!(a, b, "{kb} KiB"),
@@ -4773,7 +4783,7 @@ fn decoding_ahead_under_tight_budgets_and_failing_writers() {
         }
     }
     for after in [0, 10, 40_000, 200_000] {
-        for opts in [QueryOptions::default(), without("decode_ahead")] {
+        for opts in [QueryOptions::default(), without_decode_ahead()] {
             let mut c = select_cursor(s.snapshot(), q, &opts, &options(1000)).unwrap();
             let r = pool.install(|| {
                 write_cursor_solutions(&mut c, SolutionsFormat::Tsv, Failing(after), None)
@@ -4873,7 +4883,7 @@ fn decoding_ahead_with_growing_batches_under_tight_budgets() {
             max_memory_bytes: Some(kb << 10),
             ..opts
         };
-        let serial = write(&budget(without("decode_ahead")));
+        let serial = write(&budget(without_decode_ahead()));
         let ahead = write(&budget(QueryOptions::default()));
         match (serial, ahead) {
             (Ok(a), Ok(b)) => assert_eq!(a, b, "{kb} KiB"),

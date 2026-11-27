@@ -2164,9 +2164,13 @@ mod cold_reads {
         let off = run(
             &s,
             q,
-            Optimizations::ALL
-                .disable("prefetch_constants,prefetch_terms,prefetch_first_scan,parallel_decode")
-                .unwrap(),
+            Optimizations {
+                prefetch_constants: false,
+                prefetch_terms: false,
+                prefetch_first_scan: false,
+                parallel_decode: false,
+                ..Optimizations::ALL
+            },
         );
         assert_eq!(solutions(&on), solutions(&off));
         assert_eq!(on.len(), 600);
@@ -2189,7 +2193,10 @@ mod cold_reads {
         let q = "SELECT ?s WHERE { ?s ex:w ?v FILTER(?v * 2 > 100) }";
         let calls = || crate::vocab::numeric::GET_MANY_CALLS.with(|n| n.get());
         // the expression itself reads the values (once, then from its cache), prefetch or not
-        let off = Optimizations::ALL.disable("prefetch_terms").unwrap();
+        let off = Optimizations {
+            prefetch_terms: false,
+            ..Optimizations::ALL
+        };
         let before = calls();
         assert_eq!(run(&s, q, off).len(), 50);
         let without = calls() - before;
