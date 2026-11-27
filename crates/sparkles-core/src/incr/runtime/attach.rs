@@ -2221,6 +2221,91 @@ mod switch_tests {
         assert_eq!(installed.load(Ordering::Relaxed), 256);
     }
 
+    fn assert_ordered_eager_fallback_stops_window_scan(
+        hook: &'static std::thread::LocalKey<crate::incr::ops::window::ScanHook>,
+        cancel_at: usize,
+    ) {
+        use crate::sparql::AggregateErrors;
+        use std::{cell::Cell, rc::Rc};
+
+        let store = Store::in_memory(StoreOptions::default());
+        let rt = Runtime::open(None, store.dataset_id(), RuntimeOptions::default());
+        rt.set_host(Arc::new(OpenHost));
+        let values = (0..600)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        rt.put(
+            &store,
+            "v",
+            ViewDef::table(format!(
+                "SELECT * WHERE {{ VALUES ?n {{ {values} }} }} ORDER BY ?n LIMIT 1 OFFSET 550"
+            )),
+        )
+        .unwrap();
+        rt.round(&store);
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let steps = Rc::new(Cell::new(0));
+        let visits = steps.clone();
+        hook.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let step = visits.get() + 1;
+                visits.set(step);
+                if step == cancel_at {
+                    flag.store(true, Ordering::Release);
+                }
+            }));
+        });
+        let snap = store.snapshot();
+        let result = rt.read_controlled(
+            &ViewRead {
+                name: "v",
+                at: snap.commit,
+                snap: Some(&snap),
+                allow_stale: true,
+                caller: None,
+                deadline: None,
+                aggregate_errors: Some(AggregateErrors::Sparkles),
+                memory_parent: None,
+                memory_pool: None,
+                max_memory_bytes: None,
+            },
+            &|| Ok(()),
+            &|| crate::task::Cancellation::from_flags([cancelled.clone()]),
+        );
+        hook.with(|slot| *slot.borrow_mut() = None);
+        assert!(matches!(result, Err(Error::Cancelled)));
+        let visited = steps.get();
+        assert!(
+            (cancel_at..=cancel_at + 256).contains(&visited),
+            "visited {visited} entries with cancellation triggered at {cancel_at}"
+        );
+    }
+
+    #[test]
+    fn ordered_eager_fallback_stops_window_output_scan_after_cancellation() {
+        use crate::incr::ops::window::OUTPUT_SCAN_STEP;
+
+        assert_ordered_eager_fallback_stops_window_scan(&OUTPUT_SCAN_STEP, 1);
+    }
+
+    #[test]
+    fn ordered_eager_fallback_stops_window_fill_accounting_after_cancellation() {
+        use crate::incr::ops::window::BYTE_SCAN_STEP;
+
+        assert_ordered_eager_fallback_stops_window_scan(&BYTE_SCAN_STEP, 1);
+    }
+
+    #[test]
+    fn ordered_eager_fallback_stops_window_final_accounting_after_cancellation() {
+        use crate::incr::ops::window::BYTE_SCAN_STEP;
+
+        // The fill accounts for all 600 distinct retained entries before finalization.
+        assert_ordered_eager_fallback_stops_window_scan(&BYTE_SCAN_STEP, 601);
+    }
+
     /// `wait_built` enforces its timeout while the registry is held, and both `open_view`
     /// and `wait_built` terminate when a round advances the epoch after observation
     /// and before the timed wait begins.

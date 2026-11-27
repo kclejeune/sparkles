@@ -847,8 +847,11 @@ impl Circuit {
 
     /// The approximate memory of the state and the result.
     pub fn bytes(&self) -> u64 {
-        self.root.bytes()
-            + self.result.bytes(self.root.schema.len())
+        self.root.bytes() + self.non_operator_bytes()
+    }
+
+    fn non_operator_bytes(&self) -> u64 {
+        self.result.bytes(self.root.schema.len())
             + self.terms.bytes()
             + self.version_bytes()
             + prov::map_bytes(&self.ann, self.root.schema.len())
@@ -1425,12 +1428,19 @@ impl Circuit {
         self.applied = snap.commit;
         self.snap = Some(snap);
         self.last = stats;
-        let finish = if read_checks.is_some() {
-            check()
-        } else {
-            self.publish_fresh_version_budgeted()
-        };
-        if let Err(e) = finish.and_then(|()| self.budget.commit_pass(self.bytes())) {
+        let finish = (|| {
+            let bytes = if read_checks.is_some() {
+                check()?;
+                let bytes = self.root.bytes_checked(&mut check)? + self.non_operator_bytes();
+                check()?;
+                bytes
+            } else {
+                self.publish_fresh_version_budgeted()?;
+                self.bytes()
+            };
+            self.budget.commit_pass(bytes)
+        })();
+        if let Err(e) = finish {
             self.applied = prev_applied;
             self.clear_state();
             return Err(e);

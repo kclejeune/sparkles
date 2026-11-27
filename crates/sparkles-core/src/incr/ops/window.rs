@@ -29,6 +29,7 @@ use crate::error::Result;
 use crate::sparql::sortkey::{SortKey, TopK, cmp_keys};
 use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
+use std::convert::Infallible;
 
 /// The least reserve of a window, in rows.
 pub const MIN_RESERVE: usize = 100;
@@ -36,6 +37,9 @@ pub const MIN_RESERVE: usize = 100;
 /// A test hook: a count of steps and the flag it raises when the count reaches zero.
 #[cfg(test)]
 type Hook = std::cell::RefCell<Option<(u64, std::sync::Arc<std::sync::atomic::AtomicBool>)>>;
+
+#[cfg(test)]
+pub(crate) type ScanHook = std::cell::RefCell<Option<Box<dyn FnMut()>>>;
 
 #[cfg(test)]
 thread_local! {
@@ -51,6 +55,17 @@ thread_local! {
     /// the same for the rows that [`Window::place`] and [`Window::reconcile`] install
     pub(crate) static CANCEL_PLACING: Hook =
         const { std::cell::RefCell::new(None) };
+    pub(crate) static OUTPUT_SCAN_STEP: ScanHook = const { std::cell::RefCell::new(None) };
+    pub(crate) static BYTE_SCAN_STEP: ScanHook = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn scan_step(hook: &'static std::thread::LocalKey<ScanHook>) {
+    hook.with(|slot| {
+        if let Some(step) = slot.borrow_mut().as_mut() {
+            step();
+        }
+    });
 }
 
 /// Count one step of a test hook down and raise its flag at zero.
@@ -298,6 +313,8 @@ impl Window {
             if *at >= end {
                 return None;
             }
+            #[cfg(test)]
+            scan_step(&OUTPUT_SCAN_STEP);
             let lo = (*at).max(start);
             let hi = (*at + e.w).min(end);
             let slice = (lo < hi).then(|| (e, lo - *at, hi - *at, (lo - start) as u64));
@@ -517,7 +534,7 @@ impl Window {
         let mut total = 0i64;
         // the window's rows stay allocated until the new ones replace them
         let per = std::mem::size_of::<(&[crate::id::Id], usize)>() as u64 + 16;
-        let base_state = self.bytes();
+        let base_state = self.build_bytes(p)?;
         let keep_len = if keep { self.kept.len() } else { 0 };
         let est_index_cap = sparkles_budget::sizes::table_capacity(keep_len) as u64;
         let est_index_bytes = est_index_cap.saturating_mul(per);
@@ -611,7 +628,8 @@ impl Window {
         self.total = total;
         self.partial = partial;
         self.trim();
-        p.commit_window_state(self.bytes(), base_state)?;
+        let next_state = self.build_bytes(p)?;
+        p.commit_window_state(next_state, base_state)?;
         Ok(())
     }
 
@@ -761,11 +779,17 @@ impl Window {
         let width = self.inner.schema.len();
         let mut out_lease = p.scratch_lease();
         let mut out = Changes::new();
-        self.for_each_row(|row, w| -> Result<()> {
+        let push = |row: &Row, w| -> Result<()> {
             p.preadmit_changes_push(&out, width, &mut out_lease)?;
             out.push((row.clone(), w));
             Ok(())
-        })?;
+        };
+        if p.build_checks.is_some() {
+            self.for_each_row_checked(|| p.check_control(), push)?;
+            p.check_control()?;
+        } else {
+            self.for_each_row(push)?;
+        }
         p.push_output_lease(out_lease);
         Ok(out)
     }
@@ -938,6 +962,23 @@ impl Window {
     }
 
     pub fn bytes(&self) -> u64 {
+        self.bytes_checked(&mut || Ok::<(), Infallible>(()))
+            .unwrap()
+    }
+
+    fn build_bytes(&self, p: &Pass) -> Result<u64> {
+        if p.build_checks.is_none() {
+            return Ok(self.bytes());
+        }
+        let bytes = self.bytes_checked(&mut || p.check_control())?;
+        p.check_control()?;
+        Ok(bytes)
+    }
+
+    pub(super) fn bytes_checked<E>(
+        &self,
+        check: &mut impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<u64, E> {
         // the vector's slots, whether used or not, then each row's ids and keys,
         // plus any retained ordered-window movement lists.
         let slots = self.kept.capacity() as u64 * std::mem::size_of::<Entry>() as u64;
@@ -946,13 +987,16 @@ impl Window {
             .moves
             .as_ref()
             .map_or(0, |m| m.bytes(self.inner.schema.len()));
-        slots
-            + self
-                .kept
-                .iter()
-                .map(|e| per + e.keys.iter().map(SortKey::payload_bytes).sum::<u64>())
-                .sum::<u64>()
-            + moves
+        let mut bytes = slots + moves;
+        for (i, e) in self.kept.iter().enumerate() {
+            if i.is_multiple_of(256) {
+                check()?;
+            }
+            #[cfg(test)]
+            scan_step(&BYTE_SCAN_STEP);
+            bytes += per + e.keys.iter().map(SortKey::payload_bytes).sum::<u64>();
+        }
+        Ok(bytes)
     }
 
     pub fn clear(&mut self) {

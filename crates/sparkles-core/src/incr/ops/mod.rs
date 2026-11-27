@@ -25,6 +25,7 @@ use crate::error::Result;
 use crate::id::Id;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
+use std::convert::Infallible;
 
 /// Whether a node is maintained from the changes or evaluated again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -292,6 +293,15 @@ impl Node {
 
     /// The approximate memory of the node's state and its children's.
     pub fn bytes(&self) -> u64 {
+        self.bytes_checked(&mut || Ok::<(), Infallible>(()))
+            .unwrap()
+    }
+
+    /// Account for operator state, checking read controls during each window scan.
+    pub(super) fn bytes_checked<E>(
+        &self,
+        check: &mut impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<u64, E> {
         let own = match &self.op {
             Op::Join(o) => o.bytes(),
             Op::Match(o) => o.bytes(),
@@ -301,10 +311,12 @@ impl Node {
             Op::Recompute(o) => o.bytes(self.schema.len()),
             Op::Template(o) => o.bytes(),
             Op::Path(o) => o.bytes(),
-            Op::Window(o) => o.bytes(),
+            Op::Window(o) => o.bytes_checked(check)?,
             _ => 0,
         };
-        own + self.children().iter().map(|c| c.bytes()).sum::<u64>()
+        self.children()
+            .into_iter()
+            .try_fold(own, |bytes, c| Ok(bytes + c.bytes_checked(check)?))
     }
 
     /// Free all operator state in this node and its children while keeping the compiled

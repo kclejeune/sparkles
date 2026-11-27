@@ -1754,9 +1754,12 @@ busy-cell references before garbage collection and checkpointing.
 View reads revalidate the runtime mode inside the circuit lock before accepting a version
 or preparing a fallback. Both streaming and eager reads honor deadlines and cancellation,
 including while waiting for an `allowStale` read and when circuit metadata is busy. An
-eager fallback checks both controls while installing and decoding its results. It does
-not freeze terms or publish a shared version for its private circuit. A missing view returns `view-not-found` when the registry entry is checked. Metadata for a view waiting
-on a mode change reports a build in progress and omits the previous plan and row count.
+eager fallback checks both controls while preparing, installing and decoding its results.
+In an ordered fallback, those checks cover entries skipped by the offset and entries
+scanned for memory accounting. The private circuit keeps its term dictionary and result
+for decoding. A missing view returns `view-not-found` when the registry entry is checked.
+Metadata for a view waiting on a mode change reports a build in progress and omits the
+previous plan and row count.
 `wait_built` uses one metadata snapshot to decide whether the build completed and returns
 current metadata with the commit and row count published by that pass. Its timeout bounds
 the wait and it does not run a build. Garbage collection preserves the live-query switch
@@ -1770,10 +1773,11 @@ and publish a new host revision after a concurrent sample of the old revision. T
 hold circuit metadata past the read deadline and reopen a dataset with a nondefault
 aggregate-error reading before its first plan. They also complete a build between the
 catalog's snapshot and its return decision, check metadata while worker and live builders
-are about to publish, and cancel an eager fallback during result installation. Other
-tests synchronize GC ownership release before checkpointing, change mode after the reader's
-first generation check, advance the epoch at expiration, and cancel eager and streaming
-queries after an incomplete view read has waited.
+are about to publish, and cancel eager fallbacks during result installation, ordered
+output preparation and retained window accounting. Other tests synchronize GC ownership
+release before checkpointing, change mode after the reader's first generation check,
+advance the epoch at expiration, and cancel eager and streaming queries after an
+incomplete view read has waited.
 
 ### Scope changes
 
