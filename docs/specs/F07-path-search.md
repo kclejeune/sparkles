@@ -287,17 +287,20 @@ depth. The search checks these hops first. If two qualify, a hop with a larger d
 gap cannot improve their threshold. The first deeper hop that still needs an ancestry
 check builds a preorder interval for each real node in the shortest-hop tree. Later
 checks take constant time. A neighbor outside the branch's interval has a shortest
-suffix that avoids it. The search starts a breadth-first walk only if an unresolved hop
+suffix that avoids it. The search walks the recorded hops only if an unresolved hop
 could supply a second route or improve the certified threshold. It excludes the branch
-and prunes over-budget prefixes. At each queued node the walk checks shallow exits and
-shortest-hop tree edges before consulting the intervals for deeper hops that can still
-improve the threshold. It enqueues only nodes whose shortest suffix returns to the branch.
-A deeper neighbor joined to a queued node by a shortest-hop tree edge also lies in
-that subtree. The walk visits each queued node at most once and stops when it attains
-the lower bound on the unresolved hops. The virtual endpoint represents a
-completed cycle and can only appear as a source of recorded hops. The query memory
-budget covers retained hops and intervals, the temporary child links used to build the
-intervals, and the walk's queue and visited set. A reverse search skips collecting
+and prunes over-budget prefixes. It orders pending work by the prefix length plus the
+minimum remaining distance. At equal bounds it explores known descendants before
+checking intervals, so a shorter exit at another node can settle the threshold without
+building the index. The deeper children of a node in the shortest-hop tree all have
+the same lower bound. The queue keeps one offset into the node's hop list for these
+children and another for hops that need interval checks. A shorter exit can discard
+a whole group before the walk enqueues its nodes. Each node expands at its shortest
+prefix. The walk stops when the remaining bounds cannot improve the threshold.
+The virtual endpoint represents a completed cycle and can only appear as a source of
+recorded hops. The query memory budget covers retained hops and intervals, the
+temporary child links used to build the intervals, the queue and the shortest known
+prefixes. A reverse search skips collecting
 branch hops when the weights are known to be constant and too small to overflow. A
 source reconstructs directly when its reverse tree path has no competing suffix within
 the remaining edge budget. The other sources run bounded searches in source order, pruned by
@@ -979,7 +982,7 @@ both the eager engine and the streaming cursor reader.
   distances and the recorded hops at branches. Both engines resolve competing suffixes
   when a source is requested and cache the result at each branch on its parent chain.
   The first nonempty reverse path is a single edge from a neighbor of the target, so
-  its suffix check requires at most one breadth-first walk over the recorded topology.
+  its suffix check requires at most one walk over the recorded topology.
   Branch hops remain live while the search emits rows. Each walk releases its scratch
   before path reconstruction or source-order ranking.
   Both engines skip collecting branch hops when the planner knows all weights are

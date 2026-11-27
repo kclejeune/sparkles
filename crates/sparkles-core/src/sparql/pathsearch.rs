@@ -1501,10 +1501,7 @@ impl ReverseAlternatives {
                 None
             }
         };
-        let mut unresolved_min = None;
-        let mut note_unresolved = |len| {
-            unresolved_min = Some(unresolved_min.map_or(len, |old: u32| old.min(len)));
-        };
+        let mut unresolved_min: Option<u32> = None;
         let mut first_deep = None;
         for (i, &u) in branch.hops.iter().enumerate() {
             poll()?;
@@ -1524,7 +1521,8 @@ impl ReverseAlternatives {
                 }
                 Some(false) => {
                     if self.branches.contains_key(&u) {
-                        note_unresolved(len);
+                        // Every returning child is one level below source.
+                        unresolved_min = Some(len);
                     }
                 }
                 None => {
@@ -1536,7 +1534,9 @@ impl ReverseAlternatives {
         // Two cheap certificates beat every deferred hop, regardless of hop
         // order. Otherwise the real source's minimum-hop parent already gives
         // the shortest route, so a certified deep hop competes for second.
-        if let Some(start) = first_deep.filter(|_| second.is_none()) {
+        // A returning child has a smaller lower bound than every deep hop.
+        // When present, let the walk explore it before checking intervals.
+        if let Some(start) = first_deep.filter(|_| second.is_none() && unresolved_min.is_none()) {
             for &u in &branch.hops[start..] {
                 poll()?;
                 let suffix = tree.dist[&u];
@@ -1550,7 +1550,7 @@ impl ReverseAlternatives {
                 if tree.suffix_avoids(ctx, u, source, poll)? {
                     second = Some(len);
                 } else {
-                    note_unresolved(len);
+                    unresolved_min = Some(unresolved_min.map_or(len, |old| old.min(len)));
                 }
             }
         }
@@ -1565,71 +1565,112 @@ impl ReverseAlternatives {
         // edges that can improve the threshold, forbidding the source. Cutting
         // loops from a completed suffix preserves its distinct first edge.
         let mut scratch = ctx.charge(0)?;
-        let mut seen = HbSet::default();
-        let mut queue = Vec::new();
-        let mut base = push_vec(&mut queue, (source, 0u32), &mut scratch, 0)?;
-        let mut i = 0;
-        while let Some(&(u, prefix)) = queue.get(i) {
+        // A prefix plus its minimum suffix is a lower bound for every exit
+        // reachable through it. This bound never decreases along an edge.
+        // On ties, expand known descendants before paying for an interval check.
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        enum Work {
+            Visit,
+            TreeChildren,
+            CheckIntervals,
+        }
+        let mut queue = BinaryHeap::new();
+        let mut prefixes = HbMap::default();
+        let mut base = push_heap(
+            &mut queue,
+            Reverse((depth, Work::Visit, source, 0u32, 0usize)),
+            &mut scratch,
+            0,
+        )?;
+        while let Some(Reverse((bound, work, u, prefix, start))) = queue.pop() {
             poll()?;
-            i += 1;
-            let parent = tree.parent[&(u, tree.dist[&u])].node;
+            if second.is_some_and(|len| len <= bound) {
+                break;
+            }
+            if work == Work::Visit && prefixes.get(&u).is_some_and(|&best| best < prefix) {
+                continue;
+            }
+            let parent = parents[&(u, tree.dist[&u])].node;
             let hops = self
                 .branches
                 .get(&u)
                 .map_or(std::slice::from_ref(&parent), |b| b.hops.as_slice());
             let next_prefix = prefix + 1;
-            // Revisit only the tail starting at the first hop that needs
-            // intervals, after checking the shallow exits at this prefix.
-            let mut deferred: &[u64] = &[];
-            for deep_pass in [false, true] {
-                let pass = if deep_pass { deferred } else { hops };
-                for (j, &v) in pass.iter().enumerate() {
-                    poll()?;
-                    if v == source {
+            // Store a slice offset per group rather than a queue entry for
+            // every child or cross-tree hop. Recheck the bound at dispatch.
+            let mut children = None;
+            let mut deferred = None;
+            for (j, &v) in hops[start..].iter().enumerate() {
+                poll()?;
+                if v == source {
+                    continue;
+                }
+                let suffix = tree.dist[&v];
+                let Some(lower) = next_prefix.checked_add(suffix) else {
+                    continue;
+                };
+                if lower > max_len || second.is_some_and(|len| len <= lower) {
+                    continue;
+                }
+                let cheap = cheap_certificate(v, suffix);
+                let child = cheap.is_none() && parents[&(v, suffix)].node == u;
+                let needs_index = cheap.is_none() && !child && v != parent;
+                let avoids = match work {
+                    Work::TreeChildren if child => false,
+                    Work::CheckIntervals if needs_index => {
+                        tree.suffix_avoids(ctx, v, source, poll)?
+                    }
+                    Work::TreeChildren | Work::CheckIntervals => continue,
+                    Work::Visit if child => {
+                        children.get_or_insert((lower, j));
                         continue;
                     }
-                    let suffix = tree.dist[&v];
-                    let Some(lower) = next_prefix.checked_add(suffix) else {
-                        continue;
-                    };
-                    if lower > max_len || second.is_some_and(|len| len <= lower) {
-                        continue;
-                    }
-                    let cheap = match cheap_certificate(v, suffix) {
-                        Some(false) if !self.branches.contains_key(&v) => continue,
-                        // Queued nodes are descendants of the source. Across a
-                        // tree edge a deeper neighbor is in that subtree too.
-                        None if v == parent || parents[&(v, suffix)].node == u => Some(false),
-                        other => other,
-                    };
-                    let certified = match (deep_pass, cheap) {
-                        (false, Some(avoids)) => avoids,
-                        (true, None) => tree.suffix_avoids(ctx, v, source, poll)?,
-                        (false, None) => {
-                            if deferred.is_empty() {
-                                deferred = &hops[j..];
-                            }
+                    Work::Visit if needs_index => {
+                        if let Some(index) = tree.ancestry.as_ref() {
+                            index.avoids(v, source)
+                        } else {
+                            let (min, _) = deferred.get_or_insert((lower, j));
+                            *min = (*min).min(lower);
                             continue;
                         }
-                        (true, Some(_)) => continue,
-                    };
-                    if certified {
-                        if u != source {
-                            if lower == lower_bound {
-                                return Ok(Some(lower));
-                            }
-                            second = Some(lower);
-                            // At this prefix every deferred suffix is longer
-                            // than a shallow exit, so none can improve it.
-                            deferred = &[];
-                        }
-                    } else {
-                        let (new, next) = insert_hb_set(&mut seen, v, &mut scratch, base)?;
-                        base = next;
-                        if new {
-                            base = push_vec(&mut queue, (v, next_prefix), &mut scratch, base)?;
-                        }
                     }
+                    Work::Visit => cheap.unwrap_or(false),
+                };
+                if avoids {
+                    // Shallow first edges were counted by the initial scan.
+                    if u != source || needs_index {
+                        if lower == bound || lower == lower_bound {
+                            return Ok(Some(lower));
+                        }
+                        second = Some(lower);
+                    }
+                } else if (cheap != Some(false) || self.branches.contains_key(&v))
+                    && prefixes.get(&v).is_none_or(|&best| next_prefix < best)
+                {
+                    #[cfg(test)]
+                    test_hooks::REVERSE_WALK_ENQUEUES.with(|count| count.set(count.get() + 1));
+                    (_, base) = insert_hb_map(&mut prefixes, v, next_prefix, &mut scratch, base)?;
+                    base = push_heap(
+                        &mut queue,
+                        Reverse((lower, Work::Visit, v, next_prefix, 0)),
+                        &mut scratch,
+                        base,
+                    )?;
+                }
+            }
+            for (kind, group) in [
+                (Work::TreeChildren, children),
+                (Work::CheckIntervals, deferred),
+            ] {
+                if let Some((lower, start)) = group
+                    && second.is_none_or(|len| lower < len)
+                {
+                    base = push_heap(
+                        &mut queue,
+                        Reverse((lower, kind, u, prefix, start)),
+                        &mut scratch,
+                        base,
+                    )?;
                 }
             }
         }
@@ -1666,6 +1707,9 @@ impl<C> ReverseHopTree<'_, C> {
         if let Some(index) = self.ancestry.as_ref() {
             return Ok(index.avoids(node, source));
         }
+
+        #[cfg(test)]
+        test_hooks::REVERSE_ANCESTRY_BUILDS.with(|count| count.set(count.get() + 1));
 
         // Thread the real children into sibling lists. The virtual endpoint
         // cannot appear on a suffix. Its label need not be a minimum-hop label.
@@ -12684,6 +12728,10 @@ pub mod test_hooks {
         #[cfg(test)]
         static ON_PRUNE_POLL: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
         #[cfg(test)]
+        pub(super) static REVERSE_WALK_ENQUEUES: Cell<usize> = const { Cell::new(0) };
+        #[cfg(test)]
+        pub(super) static REVERSE_ANCESTRY_BUILDS: Cell<usize> = const { Cell::new(0) };
+        #[cfg(test)]
         pub(super) static REVERSE_SUFFIX_STEPS: Cell<usize> = const { Cell::new(0) };
     }
 
@@ -14640,6 +14688,71 @@ mod tree_tests {
         );
     }
 
+    #[test]
+    fn reverse_walk_sibling_exit_precedes_deep_certificate() {
+        assert_shallow_first_row(
+            "ex:a ex:p ex:t {| ex:w 0.5e0 |} . ex:u1 ex:p ex:a {| ex:w 0.8e0 |} . \
+             ex:u2 ex:p ex:a, ex:z . ex:h ex:p ex:c . ex:c ex:p ex:d . ex:d ex:p ex:t . \
+             ex:a ex:p ex:u1 {| ex:w 2e0 |}, ex:u2 {| ex:w 2e0 |} . \
+             ex:u1 ex:p ex:h {| ex:w 2e0 |} . ex:z ex:p ex:t {| ex:w 10e0 |} . ",
+            5,
+            10,
+            20,
+        );
+    }
+
+    #[test]
+    fn reverse_walk_descendant_exit_precedes_deep_certificate() {
+        assert_shallow_first_row(
+            "ex:a ex:p ex:t {| ex:w 0.5e0 |} . ex:u ex:p ex:a . ex:w ex:p ex:u, ex:z . \
+             ex:h ex:p ex:c1 . ex:c1 ex:p ex:c2 . ex:c2 ex:p ex:c3 . ex:c3 ex:p ex:t . \
+             ex:z ex:p ex:y . ex:a ex:p ex:u {| ex:w 2e0 |} . \
+             ex:u ex:p ex:w {| ex:w 2e0 |}, ex:h {| ex:w 2e0 |} . ex:y ex:p ex:t {| ex:w 10e0 |} . ",
+            6,
+            12,
+            24,
+        );
+    }
+
+    #[test]
+    fn reverse_walk_deep_exit_prunes_dense_descendants() {
+        use std::fmt::Write as _;
+
+        let n = 1024;
+        let mut ttl = String::from(
+            "@prefix ex: <http://example.org/> . ex:a ex:p ex:t {| ex:w 0.5e0 |} . \
+             ex:a ex:p ex:b {| ex:w 2e0 |} . ex:b ex:p ex:a, ex:u . ex:u ex:p ex:b, ex:h . \
+             ex:h ex:p ex:c . ex:c ex:p ex:d . ex:d ex:p ex:t . ex:w ex:p ex:t {| ex:w 1e12 |} . ",
+        );
+        for i in 0..n {
+            write!(ttl, "ex:u ex:p ex:v{i} . ex:v{i} ex:p ex:u").unwrap();
+            for j in 0..n {
+                if i != j {
+                    write!(ttl, ", ex:v{j}").unwrap();
+                }
+            }
+            ttl.push_str(" . ");
+        }
+        let properties = format!(
+            "path:source ?src ; path:target ex:t ; path:predicate ex:p ; \
+             path:weight ex:w ; path:maxLength 7 ; path:maxVisited {}",
+            n + 10
+        );
+        test_hooks::REVERSE_WALK_ENQUEUES.with(|count| count.set(0));
+        for (first, steps) in reverse_first_rows(ttl, &properties, None) {
+            assert_eq!(
+                first,
+                Term::NamedNode(oxrdf::NamedNode::new("http://example.org/a").unwrap())
+            );
+            assert!(
+                steps <= 6 * n + 64,
+                "{steps} suffix steps for {n} descendants"
+            );
+        }
+        // Each engine queues b and u. The exit through h prunes every peer.
+        test_hooks::REVERSE_WALK_ENQUEUES.with(|count| assert_eq!(count.get(), 4));
+    }
+
     fn assert_shallow_first_row(edges: &str, max_len: u32, visits: usize, max_steps: usize) {
         use std::fmt::Write as _;
 
@@ -14663,7 +14776,9 @@ mod tree_tests {
                     "{err}"
                 );
             }
+            test_hooks::REVERSE_ANCESTRY_BUILDS.with(|count| count.set(0));
             let rows = reverse_first_rows(ttl, &properties(cap), None);
+            test_hooks::REVERSE_ANCESTRY_BUILDS.with(|count| assert_eq!(count.get(), 0));
             for (first, _) in &rows {
                 assert_eq!(
                     first,
@@ -14876,9 +14991,8 @@ mod tree_tests {
             ancestry: &mut ancestry,
             charge_index: &|bytes| ctx.charge(bytes),
         };
-        // The deep hop certifies length six. Each leaf's tree suffix returns
-        // to the source, but the first leaf has a length-three exit. Once it
-        // reaches the lower bound the walk need not process the queued leaves.
+        // The deep hop could certify length six. A returning child reaches
+        // the length-three lower bound before the deep hop needs an index.
         let mut steps = 0;
         let threshold = alternatives
             .competing_length(
@@ -14894,6 +15008,7 @@ mod tree_tests {
             )
             .unwrap();
         assert_eq!(threshold, Some(3));
+        assert!(ancestry.is_none());
         assert!(steps < 6 * n + 50, "{steps} steps");
     }
 
