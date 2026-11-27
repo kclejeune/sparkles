@@ -355,6 +355,10 @@ fn memory_redaction_refusal_keeps_an_existing_source_without_a_cache() {
     let before = s.head();
     std::fs::remove_dir_all(f.state()).unwrap();
     f.write_mem("staging-db.md", &"budget-marker ".repeat(32_769));
+    f.write_mem(
+        "other.md",
+        "---\nname: staging-postgres\ndescription: A different memory\n---\nOther text.\n",
+    );
     let again = mem_json(&f, &s, "ana", &args);
     let skipped = report(&again, "staging-db.md");
     assert_eq!(skipped["status"], "skipped", "{again:#}");
@@ -363,6 +367,7 @@ fn memory_redaction_refusal_keeps_an_existing_source_without_a_cache() {
         report(&again, "MEMORY.md")["reason"],
         "linked-redaction-too-large"
     );
+    assert_eq!(report(&again, "other.md")["status"], "skipped", "{again:#}");
     assert!(s.ask(&retained));
     assert_eq!(s.head(), before);
 }
@@ -416,7 +421,7 @@ fn memory_redaction_refusal_keeps_imports_hidden_by_a_refused_instruction_file()
     let s = start_server(&["--mem", DS]);
     let f = Fixture::new();
     let p = f.project();
-    let args = ["import", "claude-code", "--project", p.to_str().unwrap()];
+    let args = ["sync", "claude-code", "--project", p.to_str().unwrap()];
     mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
     let (status, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
     assert_eq!(status, 200);
@@ -432,6 +437,7 @@ fn memory_redaction_refusal_keeps_imports_hidden_by_a_refused_instruction_file()
     );
     assert!(s.ask(&live));
     let head = s.head();
+    std::fs::remove_dir_all(f.state()).unwrap();
     std::fs::write(
         p.join("CLAUDE.md"),
         format!(
@@ -446,9 +452,10 @@ fn memory_redaction_refusal_keeps_imports_hidden_by_a_refused_instruction_file()
     assert_eq!(s.head(), head);
 
     // A subsequent complete scan resumes deletion reconciliation.
-    std::fs::write(p.join("CLAUDE.md"), "# Shop\n").unwrap();
+    std::fs::remove_file(p.join("CLAUDE.md")).unwrap();
     std::fs::remove_file(p.join("docs/testing.md")).unwrap();
     let complete = mem_json(&f, &s, "ana", &args);
+    assert_eq!(report(&complete, "CLAUDE.md")["status"], "deleted");
     assert!(!s.ask(&live), "{complete:#}");
 }
 
@@ -581,6 +588,169 @@ fn check_redacted_project_commands(flag: Option<&str>) {
             .any(|s| s == graph),
         "{forgotten:#}"
     );
+}
+
+#[test]
+fn directory_selectors_include_both_imported_project_keys() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let p = p.to_str().unwrap();
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let policy = f.dir.path().join("values");
+    std::fs::write(&policy, "github.com/acme/shop\n").unwrap();
+    let one_file = |name: &str, redact| {
+        let path = f.memdir().join(name);
+        let mut args = vec![
+            "import",
+            "claude-code",
+            "--project",
+            p,
+            "--only",
+            path.to_str().unwrap(),
+        ];
+        if redact {
+            args.extend(["--redact-known-values", policy.to_str().unwrap()]);
+        }
+        let result = mem_json(&f, &s, "ana", &args);
+        report(&result, name)["graph"].as_str().unwrap().to_owned()
+    };
+    let alias = one_file("staging-db.md", true);
+    f.write_mem(
+        "local.md",
+        "---\nname: local\ndescription: Local development instructions\n---\nRun locally.\n",
+    );
+    let raw = one_file("local.md", false);
+    std::fs::remove_file(policy).unwrap();
+    std::fs::remove_dir_all(f.state()).unwrap();
+
+    let sources = mem_json(&f, &s, "ana", &["sources", "--project", p]);
+    let status = mem_json(&f, &s, "ana", &["status", "--project", p]);
+    let inbox = mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "inbox",
+            "--project",
+            p,
+            "--kind",
+            "import",
+            "--limit",
+            "500",
+        ],
+    );
+    let brief = mem_json(
+        &f,
+        &s,
+        "ana",
+        &["brief", "--project", p, "--include-unreviewed"],
+    );
+    let out = f.dir.path().join("export");
+    let export = mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "export",
+            "--sources",
+            "--to",
+            "claude-code",
+            "--out",
+            out.to_str().unwrap(),
+            "--project",
+            p,
+        ],
+    );
+    let forgotten = mem_json(&f, &s, "ana", &["forget", "--project", p, "--yes"]);
+    for graph in [raw, alias] {
+        assert!(
+            sources["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["source"] == graph),
+            "{sources:#}"
+        );
+        assert!(
+            status["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["source"] == graph && r["status"] == "imported"),
+            "{status:#}"
+        );
+        assert!(
+            inbox["facts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["graph"] == graph),
+            "{inbox:#}"
+        );
+        assert!(
+            forgotten["deleted"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(graph)),
+            "{forgotten:#}"
+        );
+    }
+    for description in ["Local development instructions", "port 5433"] {
+        assert!(
+            brief["text"].as_str().unwrap().contains(description),
+            "{brief:#}"
+        );
+    }
+    assert!(
+        out.join("staging-db.md").is_file() && out.join("local.md").is_file(),
+        "{export:#}"
+    );
+}
+
+#[test]
+fn principal_scoped_commands_use_the_callers_project_identity() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let p = p.to_str().unwrap();
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let policy = f.dir.path().join("values");
+    std::fs::write(&policy, "github.com/acme/shop\n").unwrap();
+    mem_json(
+        &f,
+        &s,
+        "agent-7",
+        &[
+            "import",
+            "claude-code",
+            "--project",
+            p,
+            "--redact-known-values",
+            policy.to_str().unwrap(),
+        ],
+    );
+    mem_json(&f, &s, "ana", &["import", "claude-code", "--project", p]);
+    let status = mem_json(&f, &s, "ana", &["status", "--project", p]);
+    assert_eq!(status["project"], "github.com/acme/shop", "{status:#}");
+    assert_eq!(report(&status, "staging-db.md")["status"], "imported");
+    let out = f.dir.path().join("export");
+    let export = mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "export",
+            "--sources",
+            "--to",
+            "claude-code",
+            "--out",
+            out.to_str().unwrap(),
+            "--project",
+            p,
+        ],
+    );
+    assert!(out.join("staging-db.md").is_file(), "{export:#}");
 }
 
 #[test]

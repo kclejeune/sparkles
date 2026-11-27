@@ -13071,6 +13071,7 @@ scope, as plain text a session start hook can print:
 | Member | Meaning |
 |---|---|
 | `scope` | `project` (with `projectKey`), `entity` (with `entity`, an IRI or a label that must link exactly) or `session` (with `query`). |
+| `includeProjectAliases` | Include readable imports under both the project key and its redacted alias in a project brief. The default is false. |
 | `includeUnreviewed` | Adds unreviewed facts, each marked `(unreviewed)`. By default the brief holds reviewed facts only. |
 | `maxChars`, `maxFacts` | The bounds, 8000 characters and 60 facts by default. The brief stops at whichever comes first. |
 | `halfLifeDays`, `unreviewedWeight` | The ranking: a fact's weight halves every 90 days by default, grows with the number of graphs that assert it, and is multiplied by 0.7 when it is unreviewed. |

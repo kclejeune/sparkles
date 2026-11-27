@@ -735,27 +735,27 @@ fn merge_prefixes(into: &mut Value, from: &Value) {
 
 /// Links the entities of an extraction as it grows, so that each entity is linked once
 /// however often the extraction is linked again.
-pub(super) struct Linker {
+pub(super) struct Linker<'a> {
     by_name: HashMap<(String, String), usize>,
     /// (name as first written, class) of each entity
     entities: Vec<(String, String)>,
     links: Vec<Link>,
     prefixes: Value,
-    resolve_candidates: bool,
+    preview_prefixes: Option<&'a Value>,
 }
 
 fn norm(s: &str) -> String {
     fold_ws(s).to_lowercase()
 }
 
-impl Linker {
-    pub(super) fn new() -> Self {
+impl<'a> Linker<'a> {
+    pub(super) fn new(preview_prefixes: Option<&'a Value>) -> Self {
         Self {
             by_name: HashMap::new(),
             entities: Vec::new(),
             links: Vec::new(),
             prefixes: json!({}),
-            resolve_candidates: false,
+            preview_prefixes,
         }
     }
 
@@ -816,7 +816,9 @@ impl Linker {
                 .iter()
                 .enumerate()
                 .map(|(i, (text, class))| {
-                    let mut m = json!({ "text": text, "types": [class] });
+                    let hint = self.preview_prefixes.map(|p| absolute_iri(class, p));
+                    let mut m =
+                        json!({ "text": text, "types": [hint.as_deref().unwrap_or(class)] });
                     if let Some(c) = context.get(&(base + i)) {
                         m["context"] = c.chars().take(500).collect::<String>().into();
                     }
@@ -839,7 +841,7 @@ impl Linker {
                     .flatten()
                     .filter_map(|c| c["iri"].as_str())
                     .map(|iri| {
-                        if self.resolve_candidates {
+                        if self.preview_prefixes.is_some() {
                             absolute_iri(iri, &out["prefixes"])
                         } else {
                             iri.to_string()
@@ -891,11 +893,10 @@ fn link(
     r: &mut Run,
     ex: &Extraction,
     branch: Option<&str>,
-    preview: bool,
+    preview_prefixes: Option<&Value>,
 ) -> Result<Linked, Failed> {
     r.ctx.progress.status(super::Status::Linking, 0.82, None);
-    let mut linker = Linker::new();
-    linker.resolve_candidates = preview;
+    let mut linker = Linker::new(preview_prefixes);
     linker.update(r, ex, branch)?;
     Ok(linker.linked(ex))
 }
@@ -920,7 +921,12 @@ pub fn propose(
         entity_of,
         links,
         ..
-    } = link(r, ex, if preview { None } else { branch }, preview)?;
+    } = link(
+        r,
+        ex,
+        if preview { None } else { branch },
+        preview.then_some(&v.prefixes),
+    )?;
     let profile_iri = |iri: &str| {
         if preview {
             absolute_iri(iri, &v.prefixes)

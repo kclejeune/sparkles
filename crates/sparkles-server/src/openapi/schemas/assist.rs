@@ -2590,6 +2590,7 @@ fn imports(put: &mut dyn FnMut(&str, J)) {
                 json!({
                     "scope": string_enum(&["project", "entity", "session"]),
                     "projectKey": with_desc(string(), "The project's key, such as `github.com/acme/shop`, with scope project."),
+                    "includeProjectAliases": with_desc(boolean(), "Include readable imports under both the project key and its redacted alias in a project brief."),
                     "entity": with_desc(string(), "An IRI, or a label that must link exactly, with scope entity."),
                     "query": with_desc(string(), "The words to recall, with scope session."),
                     "includeUnreviewed": boolean(),

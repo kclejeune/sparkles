@@ -909,7 +909,7 @@ fn extract_and_link(
     branch: Option<&str>,
     revision_digest: &Sha256Digest,
 ) -> Result<(super::extract::Extraction, Linked), Failed> {
-    let mut linker = super::extract::Linker::new();
+    let mut linker = super::extract::Linker::new(None);
     let mut check = |r: &mut Run, ex: &super::extract::Extraction| -> Result<(), Failed> {
         linker.update(r, ex, branch)?;
         claims_of(

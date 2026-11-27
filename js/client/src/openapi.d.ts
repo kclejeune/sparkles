@@ -6270,6 +6270,8 @@ export interface components {
             entity?: string;
             /** @description The age at which a fact's weight halves, 90 by default. */
             halfLifeDays?: number;
+            /** @description Include readable imports under both the project key and its redacted alias in a project brief. */
+            includeProjectAliases?: boolean;
             includeUnreviewed?: boolean;
             /** @description 500 to 100,000, 8000 by default. */
             maxChars?: number;

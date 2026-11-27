@@ -373,6 +373,18 @@ impl Scanner<'_> {
             .map_or_else(|| "user".to_string(), project::segment_of)
     }
 
+    /// The part of a harness directory included in this listing.
+    fn list_area(&mut self, harness: Harness, project_segment: &str) {
+        let tail = if self.req.instructions_only {
+            "instructions/"
+        } else {
+            ""
+        };
+        self.out
+            .areas
+            .push(self.ctx().graph(harness.segment(), project_segment, tail));
+    }
+
     /// Read a file: the size limit, UTF-8, the generated marker, then redaction.
     fn read(&mut self, path: &Path, graph_prefix: &str) -> Option<Read> {
         let skip = |me: &mut Self, reason: &str| {
@@ -983,9 +995,7 @@ impl Scanner<'_> {
         if let Some(project) = self.req.project.clone() {
             let key = self.project_key().expect("project key").to_string();
             let seg = self.project_segment();
-            self.out
-                .areas
-                .push(self.ctx().area(Harness::ClaudeCode.segment(), &seg));
+            self.list_area(Harness::ClaudeCode, &seg);
             if !self.req.instructions_only
                 && let Some(pdir) = roots.claude_project_dir(&project)
             {
@@ -1040,9 +1050,7 @@ impl Scanner<'_> {
             }
         }
         if self.req.user_scope {
-            self.out
-                .areas
-                .push(self.ctx().area(Harness::ClaudeCode.segment(), "user"));
+            self.list_area(Harness::ClaudeCode, "user");
             let user: Vec<(PathBuf, Scope, PathBuf, &str)> = [(
                 roots.claude.join("CLAUDE.md"),
                 Scope::User,
@@ -1119,9 +1127,7 @@ impl Scanner<'_> {
             }
         }
         if self.req.user_scope {
-            self.out
-                .areas
-                .push(self.ctx().area(Harness::Codex.segment(), "user"));
+            self.list_area(Harness::Codex, "user");
             if let Some(f) = [
                 roots.codex.join("AGENTS.override.md"),
                 roots.codex.join("AGENTS.md"),

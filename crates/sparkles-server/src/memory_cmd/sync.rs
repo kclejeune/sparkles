@@ -104,7 +104,12 @@ const MAX_PER_CALL: usize = 400;
 #[serde(rename_all = "camelCase")]
 pub struct Cache {
     #[serde(default)]
+    version: u64,
+    #[serde(default)]
     pub files: BTreeMap<String, CacheEntry>,
+    /// Only a complete server reconciliation can certify absence in an area.
+    #[serde(default)]
+    reconciled_areas: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sync: Option<String>,
 }
@@ -141,11 +146,35 @@ pub fn state_key(label: &str, dataset: &str, principal: &str) -> String {
 }
 
 impl Cache {
-    pub fn load(path: &Path) -> Cache {
-        std::fs::read(path)
+    /// Revoke any completed listing that overlaps a refusal, even when this run
+    /// scans only one file or the connection fails before reconciliation finishes.
+    pub fn invalidate_incomplete(&mut self, scan: &Scan) -> bool {
+        let previous = self.reconciled_areas.len();
+        self.reconciled_areas.retain(|area| !incomplete(scan, area));
+        self.reconciled_areas.len() != previous
+    }
+
+    pub fn load(path: &Path) -> Result<Cache, CmdError> {
+        const VERSION: u64 = 1;
+        let value = std::fs::read(path)
             .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .unwrap_or(Value::Null);
+        if let Some(version) = value.get("version")
+            && version.as_u64() != Some(VERSION)
+        {
+            return Err(CmdError::error(
+                "unsupported-cache-version",
+                format!(
+                    "unsupported memory cache version {version} in {}",
+                    path.display()
+                ),
+            ));
+        }
+        // Legacy caches have no version or evidence of a complete listing.
+        let mut cache: Cache = serde_json::from_value(value).unwrap_or_default();
+        cache.version = VERSION;
+        Ok(cache)
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
@@ -603,6 +632,12 @@ pub(super) fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+fn incomplete(scan: &Scan, area: &str) -> bool {
+    scan.incomplete_areas
+        .iter()
+        .any(|a| a.starts_with(area) || area.starts_with(a))
+}
+
 /// Run one sync. Returns a report per file, in path order.
 pub fn sync(
     conn: &Conn,
@@ -676,6 +711,23 @@ pub fn sync(
         };
         let stamp = stamp(&f.path);
         let server = listed.get(&f.graph);
+        // Frontmatter names can collide. In an incomplete area, a stored path
+        // identifies this file only if it is unmasked and no refused file shares it.
+        if let Some(l) = server
+            && !l.deleted
+            && scan.incomplete_areas.iter().any(|a| f.graph.starts_with(a))
+            && (l.file_path.as_deref() != Some(f.rel_path.as_str())
+                || f.rel_path.contains("[redacted:")
+                || scan
+                    .skipped
+                    .iter()
+                    .any(|s| s.reason == "redaction-too-large" && s.path.ends_with(&f.rel_path)))
+        {
+            rep.status = "skipped".into();
+            rep.reason = Some("uncertain-source-owner".into());
+            reports.push(rep);
+            continue;
+        }
         let expected = source_digest(f);
         let unchanged = server.is_some_and(|l| {
             !l.deleted
@@ -891,6 +943,21 @@ pub fn sync(
         reports.push(rep);
     }
     if !opts.dry_run {
+        if reports.iter().any(|r| r.status == "failed") {
+            cache.reconciled_areas.retain(|area| {
+                !scan
+                    .areas
+                    .iter()
+                    .any(|a| a.starts_with(area) || area.starts_with(a))
+            });
+        } else if only.is_none() {
+            cache.reconciled_areas.extend(
+                scan.areas
+                    .iter()
+                    .filter(|area| !incomplete(scan, area))
+                    .cloned(),
+            );
+        }
         cache.last_sync = Some(now_rfc3339());
     }
     Ok(reports)
@@ -933,6 +1000,12 @@ fn entry(f: &FileImport, stamp: Option<(i128, u64)>) -> CacheEntry {
 /// skip the server entirely (files only; deletions are found by the listing).
 pub fn unchanged_by_cache(scan: &Scan, cache: &Cache) -> bool {
     scan.incomplete_areas.is_empty()
+        && scan.areas.iter().all(|a| {
+            cache
+                .reconciled_areas
+                .iter()
+                .any(|known| a.starts_with(known))
+        })
         && scan.files.iter().all(|f| {
             cache
                 .files
@@ -1013,6 +1086,22 @@ mod tests {
             o,
             quote: None,
         }
+    }
+
+    #[test]
+    fn cache_migrates_legacy_files_and_refuses_unknown_versions() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("cache.json");
+        std::fs::write(&path, r#"{"files":{},"lastSync":"previous sync"}"#).unwrap();
+        let cache = Cache::load(&path).unwrap();
+        assert_eq!(cache.last_sync.as_deref(), Some("previous sync"));
+        assert!(cache.reconciled_areas.is_empty());
+        cache.save(&path).unwrap();
+        assert_eq!(Cache::load(&path).unwrap().version, 1);
+        let future = r#"{"version":2,"files":"future format"}"#;
+        std::fs::write(&path, future).unwrap();
+        assert!(Cache::load(&path).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), future);
     }
 
     #[test]

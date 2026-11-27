@@ -4171,6 +4171,10 @@
             "description": "The age at which a fact's weight halves, 90 by default.",
             "type": "number"
           },
+          "includeProjectAliases": {
+            "description": "Include readable imports under both the project key and its redacted alias in a project brief.",
+            "type": "boolean"
+          },
           "includeUnreviewed": {
             "type": "boolean"
           },

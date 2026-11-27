@@ -3475,6 +3475,82 @@ async fn preview_approval_keeps_resolved_destinations_and_entities_after_prefix_
 }
 
 #[tokio::test]
+async fn preview_links_with_the_profile_class_seen_by_the_model() {
+    let (started, mut request) = tokio::sync::mpsc::unbounded_channel();
+    let (resume, response) = std::sync::mpsc::channel();
+    let response = std::sync::Mutex::new(response);
+    let model = MockModel::start(move |r, _| {
+        let person = enum_value(r, &MENTION_TYPE[..5], "Person");
+        started.send(person).unwrap();
+        response
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        (200, mock::openai(&extraction(r)))
+    });
+    let (st, app) = app(Some([&model.url(), &model.url()]));
+    enable(&app).await;
+    let (status, v) = send(
+        &app,
+        req(
+            "PATCH",
+            "/$/settings/org/prefixes",
+            json!({"c": "http://schema.org/"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let seed = Request::post("/org/update")
+        .header(header::CONTENT_TYPE, "application/sparql-update")
+        .body(Body::from(r#"INSERT DATA { GRAPH <https://example.org/hr> {
+          <urn:other:ana> a <urn:other:Person> ; <http://www.w3.org/2000/01/rdf-schema#label> "Ana Lima"@en .
+        } }"#)).unwrap();
+    assert!(send(&app, seed).await.0.is_success());
+    let before = head(&st);
+    let (status, task) = send(
+        &app,
+        req(
+            "POST",
+            "/$/ingest/org",
+            json!({
+                "text": NOTES, "mode": "preview", "extract": true, "graph": "urn:test:preview"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let class = tokio::time::timeout(Duration::from_secs(5), request.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let (prefix, local) = class.split_once(':').unwrap();
+    assert_eq!(local, "Person", "{class}");
+    let (status, v) = send(
+        &app,
+        req(
+            "PATCH",
+            "/$/settings/org/prefixes",
+            json!({(prefix): "urn:other:"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(head(&st), before);
+    resume.send(()).unwrap();
+    let id = task["id"].as_str().unwrap();
+    let preview = wait(&app, id).await;
+    assert_eq!(preview["status"], "awaiting-approval", "{preview}");
+    let (status, v) = send(
+        &app,
+        req("POST", &format!("/$/ingest/org/{id}/approve"), Value::Null),
+    )
+    .await;
+    assert!(status.is_success(), "{v}");
+    assert!(ask(&app, &format!("ASK {{ GRAPH <urn:test:preview> {{ <http://example.org/ana> <{MEMBER_OF}> ?team }} }}")).await, "{v}");
+}
+
+#[tokio::test]
 async fn automatic_ingestion_keeps_a_caller_named_branch() {
     let (st, app) = app(None);
     let (status, v) = send(
