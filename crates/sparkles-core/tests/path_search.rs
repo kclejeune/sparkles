@@ -2805,8 +2805,8 @@ fn weighted_bounded_variable_source_wide_weight_unique_routes_visit_budget() {
 }
 
 /// Regression for Sol r4 P2: self-loops, 2-cycle backtracks, and suffixes longer than an
-/// upstream source's remaining length budget must not falsely mark unique simple routes in
-/// `direct_multi` or send them through forward search, while genuine competing routes
+/// upstream source's remaining length budget must preserve direct reconstruction for
+/// unique simple routes, while genuine competing routes
 /// (including a 2-cycle whose child has an alternative exit) still rank in source order.
 #[test]
 fn weighted_bounded_variable_source_self_loop_and_remaining_budget() {
