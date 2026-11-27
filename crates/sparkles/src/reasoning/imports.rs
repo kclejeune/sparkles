@@ -187,7 +187,7 @@ impl Entry {
     }
 
     fn link(name: Arc<PendingName>, pool: Option<&Arc<QueryPool>>) -> Result<Box<Self>> {
-        let bytes = size_of::<Self>() + 4 * size_of::<usize>();
+        let bytes = size_of::<Self>();
         Ok(Box::new(Self {
             #[cfg(feature = "reasoning")]
             loaded_after: 0,
@@ -219,7 +219,7 @@ impl PendingImports {
     #[cfg(any(feature = "reasoning", feature = "backup"))]
     fn snapshot(
         &self,
-        publishing: &[Arc<PendingName>],
+        publishing: &[Arc<Publishing>],
         parent: Option<sparkles_budget::ParentHandle>,
         limit: Option<u64>,
     ) -> Result<NameSnapshot> {
@@ -241,7 +241,7 @@ impl PendingImports {
             .map_err(super::parent_error)?;
         let mut names = Vec::with_capacity(count);
         names.extend(self.entries().map(|e| e.name.clone()));
-        names.extend_from_slice(publishing);
+        names.extend(publishing.iter().map(|intent| intent.name.clone()));
         Ok(NameSnapshot {
             names,
             loaded,
@@ -357,7 +357,11 @@ impl NameSnapshot {
         }
         let (loaded, publishing) = self.names.split_at(self.loaded);
         let mut bytes = Vec::new();
-        write_names(&mut bytes, loaded.iter().map(Arc::as_ref), publishing)?;
+        write_names(
+            &mut bytes,
+            loaded.iter().map(Arc::as_ref),
+            publishing.iter().map(Arc::as_ref),
+        )?;
         Ok(Some(bytes))
     }
 }
@@ -365,7 +369,7 @@ impl NameSnapshot {
 fn write_names<'a>(
     writer: impl Write,
     loaded: impl Iterator<Item = &'a PendingName> + Clone,
-    publishing: &[Arc<PendingName>],
+    publishing: impl Iterator<Item = &'a PendingName> + Clone,
 ) -> std::io::Result<()> {
     struct Names<I>(I);
     impl<I: Iterator + Clone> Serialize for Names<I>
@@ -385,15 +389,42 @@ fn write_names<'a>(
     let saved = Saved {
         format: 1,
         imports: Names(loaded),
-        publishing: Names(publishing.iter().map(Arc::as_ref)),
+        publishing: Names(publishing),
     };
     serde_json::to_writer(writer, &saved).map_err(std::io::Error::from)
+}
+
+struct Publishing {
+    name: Arc<PendingName>,
+    #[cfg(feature = "reasoning")]
+    loaded_after: std::sync::OnceLock<u64>,
+    _credit: Option<MemoryLease>,
+}
+
+#[cfg(feature = "reasoning")]
+impl Publishing {
+    fn new(name: Arc<PendingName>, pool: Option<&Arc<QueryPool>>) -> Result<Arc<Self>> {
+        // Arc counters and the journal vector, which shrinks above four slots per intent.
+        let bytes = size_of::<Self>() + 6 * size_of::<usize>();
+        Ok(Arc::new(Self {
+            name,
+            loaded_after: Default::default(),
+            _credit: RecordedReasoning::reserve(pool, bytes as u64)?,
+        }))
+    }
+
+    fn sequence(&self) -> u64 {
+        *self
+            .loaded_after
+            .get()
+            .expect("intent stamped under the RDF writer")
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct ImportJournal {
     pub(crate) loaded: PendingImports,
-    publishing: Vec<Arc<PendingName>>,
+    publishing: Vec<Arc<Publishing>>,
     #[cfg(feature = "reasoning")]
     next_run: u64,
     /// Each run keeps a reference while its inputs can still change before preparation.
@@ -424,6 +455,19 @@ impl ImportJournal {
     }
 
     fn save_except(&self, store: &Store, recorded: &[String]) -> Result<()> {
+        self.save_selected(
+            store,
+            |e| recorded.binary_search(&e.name.iri).is_err(),
+            |_| true,
+        )
+    }
+
+    fn save_selected(
+        &self,
+        store: &Store,
+        keep_loaded: impl Fn(&Entry) -> bool + Clone,
+        keep_publishing: impl Fn(&Publishing) -> bool + Clone,
+    ) -> Result<()> {
         let Some(root) = store.root() else {
             return Ok(());
         };
@@ -431,9 +475,14 @@ impl ImportJournal {
         let loaded = self
             .loaded
             .entries()
-            .filter(|e| recorded.binary_search(&e.name.iri).is_err())
+            .filter(move |e| keep_loaded(e))
             .map(|entry| entry.name.as_ref());
-        if self.publishing.is_empty() && loaded.clone().next().is_none() {
+        let publishing = self
+            .publishing
+            .iter()
+            .filter(move |i| keep_publishing(i))
+            .map(|i| i.name.as_ref());
+        if publishing.clone().next().is_none() && loaded.clone().next().is_none() {
             return match std::fs::remove_file(path) {
                 Ok(()) => super::sync_dir(root),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -442,7 +491,7 @@ impl ImportJournal {
         }
         Ok(crate::fsutil::write_atomic_with(&path, |file| {
             let mut writer = BufWriter::new(file);
-            write_names(&mut writer, loaded, &self.publishing)?;
+            write_names(&mut writer, loaded, publishing)?;
             writer.flush()
         })?)
     }
@@ -458,48 +507,50 @@ impl crate::Dataset {
     ) -> Result<()> {
         let execute = |opts| crate::sparql::update::update(self.store(), update, opts).map(|_| ());
         let state = self.state();
-        let known = {
-            let journal = state.pending_imports.lock();
-            journal.loaded.contains(iri)
-                || state
-                    .read_reasoning()
-                    .as_ref()
-                    .is_some_and(|r| r.fetched_imports.iter().any(|v| v == iri))
+        // A replacement LOAD needs its own publication intent. Share an existing
+        // IRI allocation, but reserve its link before the writer can commit.
+        let pending_name = state
+            .pending_imports
+            .lock()
+            .loaded
+            .entries()
+            .find(|e| e.name.iri == iri)
+            .map(|e| e.name.clone());
+        let entry = match pending_name {
+            Some(name) => Entry::link(name, state.pool.as_ref())?,
+            None => Entry::prepare(iri, state.pool.as_ref())?,
         };
-        if known {
-            return execute(opts);
-        }
-        let entry = Entry::prepare(iri, state.pool.as_ref())?;
         let mut options = opts.clone();
         let prior = options.write.before_publish.take();
         let dataset = self.clone();
-        let intent = entry.name.clone();
+        let intent = Publishing::new(entry.name.clone(), state.pool.as_ref())?;
+        let publication = intent.clone();
         options.write.before_publish = Some(crate::guard::PublishHook::new(move || {
             if let Some(hook) = &prior {
                 (hook.0)()?;
             }
             let mut journal = dataset.state().pending_imports.lock();
-            if !journal
-                .publishing
-                .iter()
-                .any(|entry| Arc::ptr_eq(entry, &intent))
-            {
-                journal.publishing.push(intent.clone());
+            if publication.loaded_after.get().is_none() {
+                journal.publishing.push(publication.clone());
                 if let Err(error) = journal.save(dataset.store()) {
                     journal.publishing.pop();
                     journal.publishing.shrink_to_fit();
                     return Err(error);
                 }
+                publication
+                    .loaded_after
+                    .set(journal.next_run)
+                    .expect("serialized LOAD hook");
             }
             Ok(())
         }));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(&options)));
-        let settled = (|| -> Result<()> {
+        let settled = QueryPool::with_deferred_release_wakes(|| -> Result<()> {
             let mut journal = state.pending_imports.lock();
             if let Some(index) = journal
                 .publishing
                 .iter()
-                .position(|v| Arc::ptr_eq(v, &entry.name))
+                .position(|v| Arc::ptr_eq(v, &intent))
             {
                 // A WAL fence or generation switch can fail after reaching disk.
                 // Keep the admitted intent until reopen can see the recovered graph.
@@ -528,9 +579,7 @@ impl crate::Dataset {
                     }
                 };
                 if loaded {
-                    if !journal.loaded.contains(iri) {
-                        journal.record_load(entry);
-                    }
+                    journal.record_load(entry, intent.sequence());
                 } else {
                     // Drop the refused intent from the durable list as well. A crash
                     // before this rewrite is reconciled against the recovered graph.
@@ -538,7 +587,7 @@ impl crate::Dataset {
                 }
             }
             Ok(())
-        })();
+        });
         match result {
             Ok(result) => {
                 settled?;
@@ -556,42 +605,68 @@ impl crate::Dataset {
 
 impl ImportJournal {
     pub(crate) fn clear_loaded(&mut self, store: &Store) -> Result<()> {
-        self.clear_loaded_from(store, |_| true)
+        self.clear_before(store, |_| false, |_| true)
     }
 
-    fn clear_loaded_from(&mut self, store: &Store, start: impl Fn(&Entry) -> bool) -> Result<()> {
+    fn clear_before(
+        &mut self,
+        store: &Store,
+        keep_loaded: impl Fn(&Entry) -> bool + Copy,
+        keep_publishing: impl Fn(&Publishing) -> bool + Copy,
+    ) -> Result<()> {
+        if self.loaded.entries().all(keep_loaded)
+            && self.publishing.iter().all(|i| keep_publishing(i))
+        {
+            return Ok(());
+        }
+        // Write the selected membership before releasing any links. On failure
+        // both lists still match the previous journal and can be retried.
+        self.save_selected(store, keep_loaded, keep_publishing)?;
         let mut tail = &mut self.loaded;
-        while let Some(entry) = tail.0.as_ref() {
-            if start(entry) {
-                break;
-            }
+        while tail.0.as_deref().is_some_and(keep_loaded) {
             tail = &mut tail.0.as_mut().expect("current link").older;
         }
-        let Some(removed) = tail.0.take() else {
-            return Ok(());
-        };
-        if let Err(error) = self.save(store) {
-            let mut tail = &mut self.loaded;
-            while let Some(ref mut entry) = tail.0 {
-                tail = &mut entry.older;
-            }
-            tail.0 = Some(removed);
-            return Err(error);
+        tail.0 = None;
+        self.publishing.retain(|i| keep_publishing(i));
+        if self.publishing.capacity() > self.publishing.len().saturating_mul(4) {
+            self.publishing.shrink_to_fit();
         }
         Ok(())
     }
 
     #[cfg(feature = "reasoning")]
-    fn record_load(&mut self, mut entry: Box<Entry>) {
-        entry.loaded_after = self.next_run;
-        self.loaded.push(entry);
+    fn record_load(&mut self, mut entry: Box<Entry>, loaded_after: u64) {
+        // Writers stamp their intents in order, but can settle out of order.
+        let mut link = &mut self.loaded;
+        while let Some(existing) = link.0.as_ref() {
+            if existing.name.iri == entry.name.iri {
+                if existing.loaded_after >= loaded_after {
+                    return;
+                }
+                let mut existing = link.0.take().expect("current link");
+                link.0 = existing.older.0.take();
+                entry = existing;
+                break;
+            }
+            link = &mut link.0.as_mut().expect("current link").older;
+        }
+        entry.loaded_after = loaded_after;
+        let mut link = &mut self.loaded;
+        while link
+            .0
+            .as_ref()
+            .is_some_and(|e| e.loaded_after > loaded_after)
+        {
+            link = &mut link.0.as_mut().expect("current link").older;
+        }
+        link.push(entry);
     }
 
     #[cfg(feature = "reasoning")]
     pub(crate) fn finish_clear(&mut self, store: &Store, run: u64) -> Result<()> {
-        // LOADs prepend under this lock. Retiring individual links between
-        // preparation and publication preserves the order of the survivors.
-        self.clear_loaded_from(store, |entry| entry.loaded_after < run)
+        // A committed writer can still be settling its intent. Retire that
+        // intent at the same boundary so it cannot revive an older load.
+        self.clear_before(store, |e| e.loaded_after >= run, |i| i.sequence() >= run)
     }
 
     #[cfg(feature = "reasoning")]
@@ -651,12 +726,12 @@ mod tests {
         let ds = crate::Dataset::open(dir.path()).unwrap();
         let mut journal = ImportJournal::default();
         for iri in ["old", "also-old"] {
-            journal.record_load(Entry::prepare(iri, None).unwrap());
+            journal.record_load(Entry::prepare(iri, None).unwrap(), journal.next_run);
         }
         let first_clear = journal.prepare_run();
-        journal.record_load(Entry::prepare("between", None).unwrap());
+        journal.record_load(Entry::prepare("between", None).unwrap(), journal.next_run);
         let second_clear = journal.prepare_run();
-        journal.record_load(Entry::prepare("new", None).unwrap());
+        journal.record_load(Entry::prepare("new", None).unwrap(), journal.next_run);
         journal.finish_clear(ds.store(), first_clear).unwrap();
         assert!(journal.loaded.contains("between"));
         assert!(!journal.loaded.contains("old"));
@@ -666,6 +741,36 @@ mod tests {
             assert_eq!(pending.entries().count(), 1);
             assert!(pending.contains("new"));
         }
+    }
+
+    #[test]
+    fn clear_orders_unsettled_intents_and_out_of_order_load_completions() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = crate::Dataset::open(dir.path()).unwrap();
+        let mut journal = ImportJournal::default();
+        let clear = journal.prepare_run();
+        let newer = journal.prepare_run();
+        for (iri, stamp) in [("new", newer), ("old", 0), ("middle", clear), ("new", 0)] {
+            journal.record_load(Entry::prepare(iri, None).unwrap(), stamp);
+        }
+        for (iri, stamp) in [("before", 0), ("after", clear)] {
+            let intent = Publishing::new(Entry::prepare(iri, None).unwrap().name, None).unwrap();
+            intent.loaded_after.set(stamp).unwrap();
+            journal.publishing.push(intent);
+        }
+        // A failed write must leave both lists available to the retry.
+        std::fs::create_dir(dir.path().join("reasoning-imports.tmp")).unwrap();
+        assert!(journal.finish_clear(ds.store(), clear).is_err());
+        assert!(journal.loaded.contains("old"));
+        assert_eq!(journal.publishing.len(), 2);
+        std::fs::remove_dir(dir.path().join("reasoning-imports.tmp")).unwrap();
+        journal.finish_clear(ds.store(), clear).unwrap();
+        assert_eq!(journal.publishing.len(), 1);
+        assert_eq!(journal.publishing[0].name.iri, "after");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(FILE)).unwrap()).unwrap();
+        assert_eq!(saved["imports"], serde_json::json!(["new", "middle"]));
+        assert_eq!(saved["publishing"], serde_json::json!(["after"]));
     }
 
     #[test]

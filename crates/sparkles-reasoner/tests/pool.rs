@@ -408,3 +408,104 @@ fn f16_reentry_from_run_threads_is_refused() {
         assert_eq!(r.unwrap().inferred, 101);
     });
 }
+
+#[test]
+fn nested_done_can_wait_for_an_independent_query_wake() {
+    use sparkles_core::sparql::pool::{GRANULE, QueryPool};
+
+    within(
+        Duration::from_secs(15),
+        "the nested materialization",
+        || {
+            let wait = |pool: &Arc<QueryPool>, wake: Arc<dyn Fn() + Send + Sync>| {
+                let blocker = pool
+                    .work_parent()
+                    .reserve(pool.capacity() - pool.granted() - GRANULE + 1)
+                    .unwrap();
+                let mut ticket = pool.enter(GRANULE, Some(wake));
+                assert!(ticket.poll().is_none());
+                (blocker, ticket)
+            };
+            let outer = Arc::new(store(1));
+            let inner = store(1);
+            let outer_queries = QueryPool::new(4 * GRANULE);
+            let outer_parent = outer_queries.work_parent();
+            let inner_pool = thread_pool(1).unwrap();
+            let outer_pool = thread_pool(1).unwrap();
+            let outer_waiter = Arc::new(Mutex::new(None));
+            let (woke, observed) = mpsc::channel();
+            let progress = {
+                let outer = outer.clone();
+                let outer_pool = outer_pool.clone();
+                let outer_waiter = outer_waiter.clone();
+                Arc::new(move |_: f32, phase: &str| {
+                    if phase != "writing inferred graph" {
+                        return;
+                    }
+                    let outer = outer.clone();
+                    let outer_pool = outer_pool.clone();
+                    let woke = woke.clone();
+                    let (blocker, ticket) = wait(
+                        &outer_queries,
+                        Arc::new(move || {
+                            let writable = outer
+                                .try_write_with(
+                                    sparkles_core::commit::CommitKind::Update,
+                                    sparkles_core::guard::WriteOptions {
+                                        no_wait: true,
+                                        ..Default::default()
+                                    },
+                                )
+                                .is_ok();
+                            let _ = woke.send(writable && outer_pool.admitted_workers() == 0);
+                        }),
+                    );
+                    *outer_waiter.lock().unwrap() = Some(ticket);
+                    let outer_blocker = Mutex::new(Some(blocker));
+                    let (completed, completion) = mpsc::channel();
+                    let opts = ReasonOptions {
+                        pool: Some(inner_pool.clone()),
+                        progress: Some(Arc::new(move |_, phase| {
+                            if phase == "done" {
+                                // Both tickets become eligible inside this callback. Only the
+                                // outer domain must wait for its writer and reasoning permit.
+                                drop(outer_blocker.lock().unwrap().take().unwrap());
+                                let independent = QueryPool::new(GRANULE);
+                                let (wake, signal) = mpsc::channel();
+                                let (blocker, mut ticket) = wait(
+                                    &independent,
+                                    Arc::new(move || {
+                                        let _ = wake.send(());
+                                    }),
+                                );
+                                drop(blocker);
+                                signal
+                                    .recv_timeout(Duration::from_secs(2))
+                                    .expect("outer run deferred the independent wake");
+                                assert!(ticket.poll().is_some());
+                                completed.send(()).unwrap();
+                            }
+                        })),
+                        ..Default::default()
+                    };
+                    materialize_with(&inner, &Profile::RdfsSimple, &Extras::default(), &opts)
+                        .unwrap();
+                    completion.try_recv().expect("missing inner done callback");
+                })
+            };
+            materialize_with(
+                &outer,
+                &Profile::RdfsSimple,
+                &Extras::default(),
+                &ReasonOptions {
+                    pool: Some(outer_pool),
+                    memory_parent: Some(outer_parent),
+                    progress: Some(progress),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(observed.try_recv().expect("outer waiter did not wake"));
+        },
+    );
+}

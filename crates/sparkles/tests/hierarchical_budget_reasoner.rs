@@ -2634,3 +2634,70 @@ fn post_commit_progress_can_wait_for_a_query_wake() {
         "done deferred the query wake"
     );
 }
+
+#[test]
+fn delayed_clear_orders_replacement_loads_of_a_pending_import() {
+    use sparkles::task::{Control, Progress};
+
+    for refuse_load in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let source = dir.path().join("import.ttl");
+        let ds = Dataset::open_with(
+            &root,
+            DatasetOptions {
+                pool: Some(QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap()),
+                closure_cache_triples: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let request = mapped_import(&ds, &source, "urn:reload");
+        leave_import_pending(&ds, &request);
+        let head = mapped_import(&ds, &source, "urn:head");
+        leave_import_pending(&ds, &head);
+
+        run_during_clear(&ds, &without_imports(), false, || {
+            std::fs::write(&source, "<urn:s> <urn:p> <urn:replacement> .").unwrap();
+            let mut reload = request.clone();
+            reload.refresh_imports = true;
+            let mut ctl = Control::none();
+            let cancel = ctl.cancel.clone();
+            if refuse_load {
+                reload.load.write.before_publish =
+                    Some(sparkles::guard::PublishHook::new(move || {
+                        cancel.cancel();
+                        Ok(())
+                    }));
+            } else {
+                ctl.progress = Progress::new(move |_, phase| {
+                    if phase == "loading triples" {
+                        cancel.cancel();
+                    }
+                });
+            }
+            ds.reasoning().run_with(&reload, &ctl).unwrap_err();
+            assert!(ctl.cancel.is_cancelled());
+            assert_eq!(
+                ds.query("ASK { GRAPH <urn:reload> { <urn:s> <urn:p> <urn:replacement> } }")
+                    .unwrap()
+                    .boolean,
+                !refuse_load
+            );
+        });
+        drop(ds);
+        let ds = Dataset::open(&root).unwrap();
+        assert!(ds.reasoning().record().unwrap().fetched_imports.is_empty());
+        if refuse_load {
+            assert!(!root.join("reasoning-imports.json").exists());
+        } else {
+            assert_refreshed(&ds, request, &source, "urn:reload");
+            assert!(
+                !ds.query("ASK { GRAPH <urn:reload> { <urn:s> <urn:p> <urn:replacement> } }")
+                    .unwrap()
+                    .boolean
+            );
+            assert!(!root.join("reasoning-imports.json").exists());
+        }
+    }
+}
