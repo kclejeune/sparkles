@@ -2109,7 +2109,7 @@ for threads in (1, 12):
         if summary["errors"]:
             failures.append(f"{threads}t {comparison}: timed request errors {summary['errors']}")
         for query in queries:
-            answers = summary["queries"].get(query, {}).get("answers")
+            answers = summary.get("answers", {}).get(query)
             if answers != "same":
                 failures.append(f"{threads}t {comparison} {query}: answers {answers!r} != 'same'")
         if result.returncode:
