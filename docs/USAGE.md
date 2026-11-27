@@ -645,9 +645,11 @@ SERVICE entries of one dataset only.
 
 Demand reasoning has a separate process-wide cache of derived tables, set by
 `--derived-table-cache-mb`. Its default is 256 MiB in either profile, and zero disables
-retention. This limit bounds the retained-table estimate, which counts a shared chunk
-for each cached table holding it and is not RSS. Queries may keep tables alive after
-eviction. Operators with the metrics permission see its configured capacity, estimated
+retention. This limit bounds the calibrated retained-table estimate across deduplicated
+shared tables and chunks, spare vector capacity, cache-key strings, hash-table capacity,
+and allocator metadata, and is not RSS. Queries may keep tables alive after eviction,
+which reduces the cache's eviction allowance until those queries finish. Operators with
+the metrics permission see its configured capacity, estimated
 bytes, table count, hits and misses in `/$/stats` and `/$/server/memory`. Other dataset
 readers do not receive those process-wide counters. The host-derived query pool leaves
 out this configured cache beside the storage caches.

@@ -9,6 +9,33 @@ Commands and output formats are in the [harness guide](../../BENCHMARKING.md).
 
 The reasoning gate of the [rewrite gates](../../BENCHMARKING.md#rewrite-gates) records its baseline in [the results](RESULTS.md#query-time-reasoning-latency). A change to the reasoner's query path, derivation on demand or RDFS on read runs `mise run bench:reasoning-latency` on forge and compares the record with that baseline through `scripts/bench-gate.py compare`.
 
+## Derived-table cache calibration
+
+The reasoner's unit-test allocator measures the current thread's live requested heap
+before and after populating an isolated derived-table cache. The test counts live
+allocations separately to compare the estimate with measured bytes plus 16 bytes
+per allocation. It measures shared and unshared tables, spare capacity and hash-table
+growth. A separate case measures hash-table storage after evictions leave tombstones.
+
+The one-university LUBM diagnostic uses the `reasoning_latency` harness to check answers
+against materialization and compare the resulting cache estimates. It uses two rounds,
+two timed runs and eight Rayon threads on one Boat worker. The [report](RESULTS.md#derived-table-cache-calibration)
+records the measured heap and the cache estimates from the diagnostic.
+
+The concurrent-resize diagnostic warms 1,024 tables and keeps a caller handle to
+each. Every table has one eight-fact chunk and a 512-byte demand key. Three reader
+threads look up the newest table while the writer shrinks the cache to 768
+entries. Each implementation uses the capacity that leaves those 768 entries.
+The harness records the resize duration and the slowest overlapping lookup for
+each trial, and verifies that the readers miss zero times. Each binary runs in
+two processes of 24 trials each, in mirrored order on the same five pinned Intel
+cores. The [run record](runs/derived-table-cache-resize-atlas/record.json) records
+the input settings, build identities and samples.
+To reproduce it, use the recorded Cargo manifest and lockfile to make a standalone
+package. Copy the harness to `src/main.rs`, the measured cache source to
+`src/tables.rs` and `sparkles-budget/src/sizes.rs` to `src/sizes.rs`. Build each arm
+with `mbx build --release --offline` and run the binaries in the recorded order.
+
 ## The OWL 2 RL reference
 
 Nemo, the Datalog engine of TU Dresden, is the reference for the correctness and speed of

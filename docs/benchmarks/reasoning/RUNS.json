@@ -411,6 +411,71 @@
         }
       },
       "metadata_note": "A gate record of scripts/bench-gate.py. Read the record for its manifest, settings, metrics and checks."
+    },
+    {
+      "run_id": "sha256-bad30e953a44b2d3df92f3bda724a360df8e95c5b9f52b91cd2666d96f480972",
+      "path": "runs/derived-table-cache-resize-atlas/record.json",
+      "sha256": "bad30e953a44b2d3df92f3bda724a360df8e95c5b9f52b91cd2666d96f480972",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": "derived-table-cache-resize",
+        "scale": "1024 borrowed tables",
+        "manifest": {
+          "host": {
+            "name": "atlas",
+            "cpu": "Intel Core i5-13500",
+            "kernel": "7.3.3",
+            "cpu_set": [
+              2,
+              4,
+              6,
+              8,
+              10
+            ]
+          },
+          "completed": "2026-11-26 20:29:56.631764607 -0500",
+          "build": {
+            "worker": "bx_4utxt2gu",
+            "target": "x86_64-unknown-linux-gnu",
+            "rust": "1.99.1",
+            "mbx": "1.29.1",
+            "profile": "release"
+          },
+          "arms": {
+            "base": {
+              "tables_rs_git_blob": "f17d71534b553b18b1c88971a5f6b569e0217718",
+              "binary_sha256": "cff5e26177e778167c03bc97ca1ed4523f7c42175c3f490c2427196319f16b7b",
+              "revision": "db6a34da1d02aed3e6e58bfa86524e64064557f3"
+            },
+            "reviewed": {
+              "tables_rs_git_blob": "6c79d325dc29fd5f8021b176f5fa79124317df88",
+              "binary_sha256": "14e6d7fb20155da2a5cf96d9a2300c859c2ccc5e4274b9a29132a32e273800b4",
+              "revision": "9fb5223808c7f35a5f6cc947ee4f99d3d29c8b4a"
+            },
+            "fixed": {
+              "tables_rs_git_blob": "bc4bd9736c615ebf64feef66a1a829320009bb39",
+              "binary_sha256": "699b4dfc27a09a9bcd6da01983d81d2b06cdb7366951bb1255b096a07441b93c",
+              "source_tree": "96b5369689c16eb4d0ef6d7165b9887dda17aa35"
+            }
+          },
+          "fixture_sha256": {
+            "harness-Cargo.lock.txt": "a6b07b4caa5dc87555cad0214853cfed30a75dc01bb67f9b541f6a8f920551db",
+            "harness-Cargo.toml.txt": "7fc505d13f1ba795f2e3f918481cbe780b66b27420030028f7a1cf81b1f90e9d",
+            "harness.rs.txt": "5f83d171f1cfc71dcaedbcfb4ff9f7c2052c0ac81aff43bb2a4ecb89cc37feb3"
+          }
+        },
+        "settings": {
+          "warm_tables": 1024,
+          "retained_after_resize": 768,
+          "facts_per_chunk": 8,
+          "demand_key_bytes": 512,
+          "concurrent_readers": 3,
+          "samples_per_process": 24
+        },
+        "durability_classes": [],
+        "legacy_metadata": {}
+      },
+      "metadata_note": "This diagnostic records cache operations from a standalone harness."
     }
   ]
 }

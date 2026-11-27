@@ -338,10 +338,13 @@ cache keys a table by:
 - the adorned predicate and a hash of the sorted seeds.
 
 The tables of the free-adornment strata (§3.4, §3.5) are cached under their predicate
-alone, so every query on the snapshot shares them. The cache is in memory, has a separate
-process-wide retained-table budget, and evicts the table used longest ago. The global
-`--derived-table-cache-mb` flag sets it, with a default of 256 MiB in both memory
-profiles and zero disabling retention. A table with fresh blank nodes is not cached.
+alone, so every query on the snapshot shares them. The in-memory cache has its own
+process-wide retained-table budget. Eviction takes the least recently used unborrowed
+entry first. A capacity reduction can evict borrowed entries when it runs out of
+unborrowed entries. Evicted allocations still owned by callers reduce the remaining
+allowance until those callers release them. The global `--derived-table-cache-mb` flag
+sets the budget. Both memory profiles default to 256 MiB. Zero disables retention.
+A table with fresh blank nodes is not cached.
 The configured capacity and retained-table estimates appear in `/$/stats` and
 `/$/server/memory` for callers with the metrics permission. Dataset-only readers do
 not receive process-wide cache activity.
@@ -707,13 +710,11 @@ capabilities and remaining work are described by the spec status and Outcome.
    capacity, estimated bytes, tables, hits and misses and identifies its process scope.
    The host-derived query pool subtracts this configured cache beside the other
    caches, while explicit pool settings and the small profile's pool remain unchanged.
-   The estimate counts a shared chunk for each cached table that retains it and is
-   neither allocator usage nor RSS. A caller may keep an evicted table alive outside
-   retained-cache occupancy. Its weighting is 24 bytes per fact, 64 bytes per chunk,
-   each local term's byte length plus 40 bytes, and 64 bytes per table. Spare vector
-   capacity, cache-key strings, hash-table capacity and exact allocator metadata are
-   not counted. Item 757 covers measuring and calibrating that estimator, while
-   hierarchical live charging remains item 675.
+   Item 192 originally weighted tables by fact length and local-term byte length and
+   counted shared chunks per retaining table; item 757 subsequently measured and
+   calibrated the estimator and eviction allowances (see
+   [Derived-table retained-estimate calibration](#derived-table-retained-estimate-calibration-item-757)),
+   while hierarchical live charging remains item 675.
 8. Lists that rules derive are complete in a lower stage, which derives every list the
    rules give rather than the lists a query reaches. This costs a derivation of all such
    lists for each query that reads one and keeps the answers equal to a fixpoint. Lists
@@ -1534,6 +1535,22 @@ also leaves out RDFS on read and a query-time default. A page saved with the inf
 box cleared opens with **Off**. The tests are `ui/tests/e2e/query-reasoning.spec.ts`,
 against a real server, the parameter tests in `ui/src/lib/api.test.ts` and
 `stored_query_runs_take_the_query_time_reasoning_parameters` over HTTP.
+
+### Derived-table retained-estimate calibration (item 757)
+
+The calibrated estimate counts each retained table and fact chunk once, including
+spare vector capacity. It also counts local-term buffers, cache-key strings, actual
+hash-table bucket allocations and 16 bytes of allocator metadata per live allocation.
+The [calibration report](../benchmarks/reasoning/RESULTS.md#derived-table-cache-calibration)
+records the measured allocations and the LUBM answer check.
+
+The cache checks whether an incoming entry can fit alongside borrowed entries and any
+evicted allocations still held by callers before it evicts existing entries. It accounts
+for overlap when entries share a table or chunk. A declined insertion preserves caller-held
+charges and existing entries. The cache releases excess tracking capacity as callers
+drop their holds. The retained estimate exposed through `CacheStats` and `/$/stats`
+counts cached entries and is zero when the cache is empty. Hierarchical live charging
+remains item 675.
 
 ### Roadmap follow-ups
 

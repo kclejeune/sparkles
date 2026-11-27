@@ -156,7 +156,7 @@ fn derived_table_cache(put: &mut dyn FnMut(&str, J)) {
                     "scope": string_enum(&["process"]),
                     "enabled": boolean(),
                     "capacityBytes": int(),
-                    "estimatedBytes": { "type": "integer", "description": "The retained-table estimate, counting shared chunks per cached table and excluding caller-held evictions. Neither allocator usage nor RSS." },
+                    "estimatedBytes": { "type": "integer", "description": "The calibrated retained-table estimate across cached tables, deduplicated shared chunks, cache keys, hash-table capacity, and allocator metadata, excluding tables kept alive only by callers. Neither allocator usage nor RSS." },
                     "tables": int(),
                     "hits": int(),
                     "misses": int(),

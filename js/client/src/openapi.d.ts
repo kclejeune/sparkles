@@ -7137,7 +7137,7 @@ export interface components {
         DerivedTableCache: {
             capacityBytes: number;
             enabled: boolean;
-            /** @description The retained-table estimate, counting shared chunks per cached table and excluding caller-held evictions. Neither allocator usage nor RSS. */
+            /** @description The calibrated retained-table estimate across cached tables, deduplicated shared chunks, cache keys, hash-table capacity, and allocator metadata, excluding tables kept alive only by callers. Neither allocator usage nor RSS. */
             estimatedBytes: number;
             hits: number;
             misses: number;

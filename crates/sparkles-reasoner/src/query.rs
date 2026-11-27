@@ -1346,7 +1346,8 @@ impl Session {
             (r + 1, l + t.iter().filter(|x| local(x)).count())
         });
         let bytes = rows.saturating_mul(std::mem::size_of::<[u64; 3]>());
-        if bytes as u64 > tables::capacity() {
+        let cap = tables::capacity();
+        if cap == 0 || bytes as u64 > cap {
             return None;
         }
         // the table's one chunk: its pointer, and the shared vector's counts and header
@@ -2600,14 +2601,18 @@ impl ReasoningSession for Session {
             }
             self.export(&mut out);
             if !self.made_bnodes {
-                let table = Arc::new(Table {
+                let mut table = Some(Arc::new(Table {
                     chunks: self.chunks.clone(),
                     keys: self.local_keys.clone(),
-                });
-                for (_, _, key) in misses {
-                    if let Some(k) = key {
-                        self.publish(k, table.clone());
-                    }
+                }));
+                let mut cache_keys = misses.into_iter().filter_map(|(_, _, key)| key).peekable();
+                while let Some(k) = cache_keys.next() {
+                    let t = if cache_keys.peek().is_some() {
+                        table.as_ref().expect("table present").clone()
+                    } else {
+                        table.take().expect("table present")
+                    };
+                    self.publish(k, t);
                 }
             }
         }

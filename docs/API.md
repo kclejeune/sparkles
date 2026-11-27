@@ -10927,8 +10927,11 @@ caches. With reasoning enabled, `caches.derivedTable` reports the process-wide d
 table cache, and both `/$/stats` routes include it as `derivedTableCache` for callers
 with that permission. Its `capacityBytes` is set by `--derived-table-cache-mb`, which
 defaults to 256 MiB in both memory profiles. `estimatedBytes` and `tables` describe retained entries, `hits` and `misses` count
-lookups over the process lifetime, and `scope` is `process`. A shared chunk counts
-once per cached table retaining it, and a caller may keep an evicted table alive.
+lookups over the process lifetime, and `scope` is `process`. The calibrated estimate
+deduplicates shared tables and chunks across cached entries and includes spare vector
+capacity, local-term buffers, cache-key strings, hash-table bucket capacity, and
+per-allocation allocator metadata. Evicted tables kept alive by running queries are
+excluded from `estimatedBytes` but reduce the cache's eviction allowance until dropped.
 The estimate is neither allocator usage nor RSS. Zero disables retention. The
 host-derived query pool leaves out this configured capacity beside the other caches.
 
