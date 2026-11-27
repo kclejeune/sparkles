@@ -186,7 +186,7 @@ pub const DATASET: FileKind = FileKind {
     marker: "`format` 2, `minimumReader` (the reader capability the database needs) and `writtenBy`",
     class: Class::Primary,
     writes: crate::commit::DATASET_READER,
-    reads: &[5, 6, 7, 8, 9],
+    reads: &[5, 6, 7, 8, 9, 10],
 };
 
 /// A generation's index: `gen-*/meta.json` and the permutation and vocabulary files.
@@ -997,6 +997,17 @@ pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
     // against the recorded reader are checked above first, and a refusal there
     // stands alone.
     if !history_refused && let Err(error) = crate::history::preflight_file(dir) {
+        out.push(match error {
+            Error::Unsupported(message) => {
+                Error::Unsupported(format!("{}: {message}", dir.display()))
+            }
+            Error::Corrupt(message) => Error::Corrupt(format!("{}: {message}", dir.display())),
+            error => error,
+        });
+    }
+    // Check any staged prefix recovery sidecar in this root or branch directory before
+    // any startup writer (WAL repair, catalog open, or scratch cleanup) runs.
+    if let Err(error) = crate::store::preflight_staged_prefixes(dir) {
         out.push(match error {
             Error::Unsupported(message) => {
                 Error::Unsupported(format!("{}: {message}", dir.display()))

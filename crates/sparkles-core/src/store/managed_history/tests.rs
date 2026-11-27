@@ -299,6 +299,11 @@ fn activation_is_recorded_by_the_reader_or_the_history_directory() {
     std::fs::remove_file(root.join(crate::jobs::FILE)).unwrap();
     assert!(!activation_recorded(root).unwrap());
     check_activated_registry(root, None).unwrap();
+    // reader 10 belongs to control-only staged prefix recovery v2, which also does not
+    // require configuration history to be activated
+    dataset(crate::store::STAGED_PREFIXES_V2_READER);
+    assert!(!activation_recorded(root).unwrap());
+    check_activated_registry(root, None).unwrap();
     // the history directory alone records activation too
     dataset(crate::store::wal::HEADER_READER);
     std::fs::create_dir(root.join(DIRECTORY)).unwrap();

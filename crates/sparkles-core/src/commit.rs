@@ -439,11 +439,12 @@ pub const DATASET_FORMAT: u32 = 2;
 /// record, see [`crate::store::wal`], 6: protected managed graphs, `managed.json`, see
 /// [`crate::managed`], 7: durable source holds, `holds.json`, see [`crate::holds`], 8:
 /// configuration history, see [`crate::store::managed_history`], 9: the durable job
-/// ledger, see [`crate::jobs`]). Readers 1 to 4 named the pre-release forms, a dataset
-/// without branches, relinked generations, framed delta vocabularies or log headers, and
-/// [`OLDEST_DATASET_READER`] is the first one this build reads.
+/// ledger, see [`crate::jobs`], 10: version 2 staged prefix recovery with control-only
+/// sequence tracking, see `prefixes.staged.tmp`). Readers 1 to 4 named the pre-release
+/// forms, a dataset without branches, relinked generations, framed delta vocabularies or
+/// log headers, and [`OLDEST_DATASET_READER`] is the first one this build reads.
 /// [`crate::formats::DATASET`] lists them.
-pub const DATASET_READER: u32 = 9;
+pub const DATASET_READER: u32 = 10;
 
 /// The reader an imported destination of the private import transport
 /// ([`reidentified_dataset_bytes`]) requires: one above what this build reads, so that
