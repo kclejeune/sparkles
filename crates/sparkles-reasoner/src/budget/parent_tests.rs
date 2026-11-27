@@ -218,3 +218,74 @@ fn reasoner_shrinks_whole_chunks_and_returns_its_final_reservation() {
     drop(sibling);
     assert_eq!(pool.granted(), 0);
 }
+
+#[test]
+fn sibling_worker_releases_defer_query_wakes_into_the_run() {
+    use sparkles_core::sparql::pool::GRANULE;
+    use std::sync::atomic::AtomicUsize;
+    #[derive(Clone, Copy, Debug)]
+    enum Release {
+        Trim,
+        TrimUnderAnotherScope,
+        LastOwner,
+    }
+    let workers = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    for case in [
+        Release::Trim,
+        Release::TrimUnderAnotherScope,
+        Release::LastOwner,
+    ] {
+        let pool = QueryPool::new(2 * GRANULE);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let released = AtomicUsize::new(0);
+        // The waiter stays queued until the run's drain wakes it.
+        let _ticket = pool.enter(
+            GRANULE,
+            Some({
+                let calls = calls.clone();
+                Arc::new(move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        );
+        QueryPool::with_deferred_release_wakes(|| {
+            let budget = Budget::with_parent(None, Some(pool.work_parent()));
+            let bytes = usize::try_from(2 * GRANULE).unwrap();
+            budget.try_charge(bytes).unwrap();
+            let owner = Mutex::new(Some(budget));
+            workers.install(QueryPool::inherit_release_wakes(|| {
+                let root = rayon::current_thread_index().unwrap();
+                // a parallel task on the sibling worker, which inherits nothing
+                rayon::broadcast(|ctx| {
+                    if ctx.index() == root {
+                        return;
+                    }
+                    assert!(QueryPool::capture_release_wakes().is_none());
+                    let release = || match case {
+                        Release::LastOwner => drop(owner.lock().take()),
+                        _ => owner.lock().as_ref().unwrap().release(bytes),
+                    };
+                    match case {
+                        Release::TrimUnderAnotherScope => {
+                            QueryPool::with_deferred_release_wakes(release)
+                        }
+                        _ => release(),
+                    }
+                    released.fetch_add(1, Ordering::SeqCst);
+                });
+            }));
+            assert_eq!(released.load(Ordering::SeqCst), 1, "{case:?}");
+            assert_eq!(pool.granted(), 0, "{case:?}");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "{case:?} woke inside the run"
+            );
+            drop(owner);
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{case:?} lost its wake");
+    }
+}

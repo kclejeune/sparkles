@@ -2513,3 +2513,126 @@ fn sparql_load_profile() {
         }
     }
 }
+
+/// A tracked LOAD that is refused after its intent was persisted retires the intent
+/// and leaves the writer usable for the same sequence, on the bulk, WAL and in-memory
+/// paths. The bulk path also removes its unpublished generation. A failed retirement
+/// keeps the writer poisoned.
+#[test]
+fn a_refusal_after_the_commit_intent_retires_it_on_every_path() {
+    use crate::error::Error;
+    use crate::guard::CommitIntent;
+    use crate::sparql::{QueryOptions, update::update, update::update_with_commit_hook};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+
+    fn generations(root: &std::path::Path) -> usize {
+        std::fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("gen-"))
+            .count()
+    }
+    struct Intent {
+        root: Option<std::path::PathBuf>,
+        cancel: Arc<AtomicBool>,
+        retire_fails: bool,
+        persisted: AtomicU64,
+        retired: AtomicU64,
+        generations: AtomicU64,
+    }
+    impl CommitIntent for Intent {
+        fn persist(&self, seq: u64) -> crate::Result<()> {
+            self.persisted.store(seq, SeqCst);
+            if let Some(root) = &self.root {
+                self.generations.store(generations(root) as u64, SeqCst);
+            }
+            // the cancellation arrives while the intent is being synced
+            self.cancel.store(true, SeqCst);
+            Ok(())
+        }
+        fn retire(&self, seq: u64) -> crate::Result<()> {
+            self.retired.store(seq, SeqCst);
+            if self.retire_fails {
+                return Err(Error::invalid("the retirement failed"));
+            }
+            Ok(())
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("load.nt");
+    std::fs::write(&source, ntriples(0, E + 1)).unwrap();
+    let load = format!("LOAD <file://{}>", source.display());
+    for (name, persistent, threshold, retire_fails, bulk) in [
+        ("bulk", true, E, false, true),
+        ("wal", true, 1_000, false, false),
+        ("memory", false, 1_000, false, false),
+        ("bulk, retirement fails", true, E, true, true),
+        ("wal, retirement fails", true, 1_000, true, false),
+    ] {
+        let opts = StoreOptions {
+            bulk_threshold: threshold,
+            ..StoreOptions::default()
+        };
+        let root = tmp.path().join(name.replace([',', ' '], "-"));
+        let s = if persistent {
+            Store::open(&root, opts).unwrap()
+        } else {
+            Store::in_memory(opts)
+        };
+        update(
+            &s,
+            "INSERT DATA { <urn:a> <urn:p> <urn:o> }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let head = s.snapshot().commit;
+        let before = persistent.then(|| generations(&root));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let intent = Intent {
+            root: persistent.then(|| root.clone()),
+            cancel: cancel.clone(),
+            retire_fails,
+            persisted: AtomicU64::new(0),
+            retired: AtomicU64::new(0),
+            generations: AtomicU64::new(0),
+        };
+        let mut q = QueryOptions::default();
+        q.write.cancel = Some(cancel);
+        let refused = update_with_commit_hook(&s, &load, &q, &intent);
+        assert!(
+            matches!(refused, Err(Error::Cancelled)),
+            "{name}: {refused:?}"
+        );
+        assert_eq!(intent.persisted.load(SeqCst), head + 1, "{name}");
+        assert_eq!(intent.retired.load(SeqCst), head + 1, "{name}");
+        assert_eq!(s.snapshot().commit, head, "{name}");
+        assert_eq!(s.snapshot().len(), 1, "{name}");
+        if let Some(before) = before {
+            // the candidate generation existed when the intent was persisted
+            assert_eq!(
+                intent.generations.load(SeqCst) as usize,
+                before + usize::from(bulk),
+                "{name}"
+            );
+            assert_eq!(generations(&root), before, "{name}");
+        }
+        let next = update(
+            &s,
+            "INSERT DATA { <urn:b> <urn:p> <urn:o> }",
+            &QueryOptions::default(),
+        );
+        if retire_fails {
+            assert!(matches!(next, Err(Error::Poisoned)), "{name}: {next:?}");
+            continue;
+        }
+        let receipt = next.unwrap().commit.expect("receipt");
+        assert_eq!(receipt.commit.seq, head + 1, "{name}");
+        drop(s);
+        if persistent {
+            let s = Store::open(&root, StoreOptions::default()).unwrap();
+            assert_eq!(s.snapshot().commit, head + 1, "{name}");
+            assert_eq!(s.snapshot().len(), 2, "{name}");
+        }
+    }
+}

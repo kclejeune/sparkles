@@ -1921,22 +1921,37 @@ struct WriterState {
     control_log: Option<control_store::ControlLog>,
 }
 
-impl WriterState {
+impl Store {
+    /// Persist a tracked write's intent for `seq`. The sidecar may name `seq` even if
+    /// its sync reports an error, so subsequent writes are refused until recovery
+    /// can resolve that ambiguity. The intent's sync can outlast a cancellation or
+    /// the deadline, so the controls are checked once more after it. A refusal there
+    /// retires the intent, and only a confirmed retirement makes `seq` available again.
     fn arm_commit_hook(
-        &mut self,
+        &self,
+        w: &mut WriterState,
         hook: Option<crate::guard::CommitHook<'_>>,
         seq: u64,
+        opts: &crate::guard::WriteOptions,
     ) -> Result<bool> {
         let Some(hook) = hook else {
             return Ok(false);
         };
-        // The sidecar may name this sequence even if its sync reports an error.
-        // Refuse subsequent writes until recovery can resolve that ambiguity.
-        self.poisoned = true;
-        hook(seq)?;
+        let poisoned = w.poisoned;
+        w.poisoned = true;
+        hook.persist(seq)?;
+        self.failpoint("commit-intent-persisted");
+        if let Err(refusal) = opts.check() {
+            if hook.retire(seq).is_ok() {
+                w.poisoned = poisoned;
+            }
+            return Err(refusal);
+        }
         Ok(true)
     }
+}
 
+impl WriterState {
     /// Cut the space preallocated after the last commit off the WAL, before the store
     /// closes or moves on to another generation's log: a log that is no longer
     /// written ends at its last commit (an open truncates it as well). Not after a
@@ -6602,9 +6617,16 @@ impl Store {
                 .len();
             sync_dir(&dir).map_err(SparqlLoadError::Store)?;
             sync_dir(root).map_err(SparqlLoadError::Store)?;
-            tracked = w
-                .arm_commit_hook(bulk.hook, head.seq)
-                .map_err(SparqlLoadError::Store)?;
+            tracked = match self.arm_commit_hook(w, bulk.hook, head.seq, o) {
+                Ok(tracked) => tracked,
+                Err(e) => {
+                    // CURRENT still names the old generation
+                    drop(wal);
+                    drop(gen_);
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return Err(SparqlLoadError::Store(e));
+                }
+            };
             // the commit's message is durable before the switch (no digest: its change
             // set is not at hand)
             annotation = self
@@ -6635,8 +6657,8 @@ impl Store {
                 },
             );
         } else {
-            tracked = w
-                .arm_commit_hook(bulk.hook, head.seq)
+            tracked = self
+                .arm_commit_hook(w, bulk.hook, head.seq, o)
                 .map_err(SparqlLoadError::Store)?;
             annotation = self
                 .annotate(&head, message.clone(), || None)
@@ -8171,7 +8193,9 @@ impl WriteTxn<'_> {
         gen_.dvocab.sync()?;
         let c = self.next_commit(validation.as_deref());
         let control = self.control_frame(c.seq, c.timestamp_ms)?;
-        let tracked = self.guard.arm_commit_hook(hook, c.seq)?;
+        let tracked = self
+            .store
+            .arm_commit_hook(&mut self.guard, hook, c.seq, &self.opts)?;
         let annotation = self
             .store
             .annotate(&c, message, || Some(self.change_lines()))?;

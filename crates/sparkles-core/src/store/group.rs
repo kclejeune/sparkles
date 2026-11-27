@@ -966,7 +966,7 @@ impl WriteTxn<'_> {
                 "control_wal_bytes ({bytes}) underestimated encoded records ({data_len})"
             );
         }
-        self.guard.arm_commit_hook(hook, c.seq)?;
+        store.arm_commit_hook(&mut self.guard, hook, c.seq, &self.opts)?;
         // A merge's record is durable before its commit (open drops one above the head).
         if let Some(m) = self.merge.as_mut() {
             m.seq = c.seq;

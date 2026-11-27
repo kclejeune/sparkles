@@ -2636,6 +2636,70 @@ fn post_commit_progress_can_wait_for_a_query_wake() {
 }
 
 #[test]
+fn a_refusal_during_the_intent_sync_retires_the_replacement() {
+    use sparkles::task::Control;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let source = dir.path().join("import.ttl");
+    let ds = Dataset::open_with(
+        &root,
+        DatasetOptions {
+            pool: Some(QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap()),
+            closure_cache_triples: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut request = mapped_import(&ds, &source, "urn:reload");
+    leave_import_pending(&ds, &request);
+    std::fs::write(&source, "<urn:s> <urn:p> <urn:replacement> .").unwrap();
+    let ask = |ds: &Dataset, object| {
+        ds.ask(&format!(
+            "ASK {{ GRAPH <urn:reload> {{ <urn:s> <urn:p> <urn:{object}> }} }}"
+        ))
+        .unwrap()
+    };
+
+    // The cancellation arrives while the intent is being synced, after the write's
+    // last check of its controls before the hook. The core store tests cover the
+    // same refusal on the bulk and in-memory paths.
+    let ctl = Control::none();
+    let cancel = ctl.cancel.clone();
+    let persisted = Arc::new(AtomicUsize::new(0));
+    let seen = persisted.clone();
+    ds.store().set_failpoint(
+        "commit-intent-persisted",
+        Some(Arc::new(move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            cancel.cancel();
+        })),
+    );
+    request.refresh_imports = true;
+    ds.reasoning().run_with(&request, &ctl).unwrap_err();
+    ds.store().set_failpoint("commit-intent-persisted", None);
+    assert_eq!(persisted.load(Ordering::SeqCst), 1);
+    assert!(ask(&ds, "first"));
+    assert!(!ask(&ds, "replacement"));
+    let journal = std::fs::read_to_string(root.join("reasoning-imports.json")).unwrap();
+    assert!(!journal.contains("\"commit\""), "{journal}");
+
+    // The writer takes the retired sequence for an unrelated commit.
+    let head = ds.store().snapshot().commit;
+    ds.update("INSERT DATA { <urn:after> <urn:p> <urn:o> }")
+        .unwrap();
+    assert_eq!(ds.store().snapshot().commit, head + 1);
+    drop(ds);
+
+    let ds = Dataset::open(&root).unwrap();
+    assert!(ask(&ds, "first"));
+    assert!(!ask(&ds, "replacement"));
+    request.refresh_imports = false;
+    assert_refreshed(&ds, request, &source, "urn:reload");
+}
+
+#[test]
 fn delayed_clear_orders_replacement_loads_of_a_pending_import() {
     use sparkles::task::{Control, Progress};
 

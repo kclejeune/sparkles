@@ -539,7 +539,7 @@ impl crate::Dataset {
             None => Entry::prepare(iri, state.pool.as_ref())?,
         };
         let intent = Publishing::new(entry.name.clone(), state.pool.as_ref())?;
-        let before_commit = |commit| {
+        let persist = |commit| {
             let mut journal = state.pending_imports.lock();
             let stamp = PublicationStamp {
                 loaded_after: journal.next_run,
@@ -554,14 +554,25 @@ impl crate::Dataset {
             }
             Ok(())
         };
+        // A refusal after the intent's sync withdraws it from disk first. On failure
+        // both copies stay, and the writer stays poisoned until reopen discards it.
+        let retire = |_: u64| -> Result<()> {
+            let mut journal = state.pending_imports.lock();
+            let Some(index) = journal
+                .publishing
+                .iter()
+                .position(|v| Arc::ptr_eq(v, &intent))
+            else {
+                return Ok(());
+            };
+            journal.save_selected(self.store(), |_| true, |p| !std::ptr::eq(p, &*intent))?;
+            journal.publishing.swap_remove(index);
+            Ok(())
+        };
+        let hooks = CommitHooks { persist, retire };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::sparql::update::update_with_commit_hook(
-                self.store(),
-                update,
-                opts,
-                &before_commit,
-            )
-            .map(|_| ())
+            crate::sparql::update::update_with_commit_hook(self.store(), update, opts, &hooks)
+                .map(|_| ())
         }));
         QueryPool::with_deferred_release_wakes(|| {
             let mut journal = state.pending_imports.lock();
@@ -590,6 +601,26 @@ impl crate::Dataset {
             Ok(result) => result,
             Err(panic) => std::panic::resume_unwind(panic),
         }
+    }
+}
+
+#[cfg(feature = "reasoning")]
+struct CommitHooks<P, R> {
+    persist: P,
+    retire: R,
+}
+
+#[cfg(feature = "reasoning")]
+impl<P, R> crate::guard::CommitIntent for CommitHooks<P, R>
+where
+    P: Fn(u64) -> Result<()> + Sync,
+    R: Fn(u64) -> Result<()> + Sync,
+{
+    fn persist(&self, seq: u64) -> Result<()> {
+        (self.persist)(seq)
+    }
+    fn retire(&self, seq: u64) -> Result<()> {
+        (self.retire)(seq)
     }
 }
 

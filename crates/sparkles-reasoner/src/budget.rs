@@ -25,6 +25,7 @@
 
 use parking_lot::Mutex;
 use sparkles_budget::{DomainId, MemoryLease, ParentHandle, ParentRefused, Scope};
+use sparkles_core::sparql::pool::{QueryPool, ReleaseWakes};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -178,7 +179,31 @@ struct Backing {
     domain: DomainId,
     reserved: AtomicUsize,
     lease: Mutex<MemoryLease>,
+    /// The release-wake deferral open where the run began. A rayon worker does not
+    /// inherit the root thread's deferral, so every parent release goes through it,
+    /// whichever thread runs it. Query wake callbacks then wait for the run's scope
+    /// to leave its writer lock and permit.
+    wakes: Option<ReleaseWakes>,
 }
+
+impl Backing {
+    fn release(wakes: Option<&ReleaseWakes>, retired: impl Sized) {
+        match wakes {
+            Some(wakes) => wakes.run(move || drop(retired)),
+            None => drop(retired),
+        }
+    }
+}
+
+impl Drop for Budget {
+    fn drop(&mut self) {
+        if let Some(backing) = self.parent.take() {
+            let wakes = backing.wakes.clone();
+            Backing::release(wakes.as_ref(), backing);
+        }
+    }
+}
+
 const PARENT_STEP: usize = 64 << 10;
 const PARENT_SLACK: usize = 1 << 20;
 
@@ -210,6 +235,7 @@ impl Budget {
                 // a backend and cannot refuse or allocate reservation credit.
                 lease: Mutex::new(parent.reserve(0).expect("zero reservation")),
                 reserved: AtomicUsize::new(0),
+                wakes: QueryPool::capture_release_wakes(),
                 parent,
             }),
         })
@@ -377,7 +403,7 @@ impl Budget {
             .split(u64::try_from(cur - final_keep).expect("backed credit fits u64"))
             .expect("split only owned parent credit");
         drop(lease);
-        drop(retired);
+        Backing::release(parent.wakes.as_ref(), retired);
     }
     pub fn check(&self) -> Result<(), BudgetFailure> {
         if self.used() > self.limit {
@@ -526,12 +552,17 @@ impl Held {
         debug_assert_eq!(budget.used(), self.bytes + self.credit);
         self.bytes = 0;
         self.credit = 0;
-        let mut lease = budget.parent.take()?.lease.into_inner();
-        (bytes != 0).then(|| {
+        let backing = budget.parent.take()?;
+        let wakes = backing.wakes.clone();
+        let mut lease = backing.lease.into_inner();
+        let published = (bytes != 0).then(|| {
             lease
                 .split(u64::try_from(bytes).expect("backed credit fits u64"))
                 .expect("published bytes are already backed")
-        })
+        });
+        // the remaining reservation goes back through the run's deferral
+        Backing::release(wakes.as_ref(), (lease, backing.parent));
+        published
     }
 
     pub fn bytes(&self) -> usize {
