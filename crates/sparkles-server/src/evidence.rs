@@ -1,8 +1,10 @@
 //! Evidence-profile settings and source holds in the server (spec C25 §3 and §7):
 //! `GET` and `PUT /$/evidence/{ds}/settings` read and record a dataset's evidence
 //! settings, `POST /$/evidence/{ds}/detach` stops protecting one graph of their roles,
-//! and `GET` and `POST /$/evidence/{ds}/holds` and `DELETE
-//! /$/evidence/{ds}/holds/{id}` list, acquire and release durable source holds.
+//! `POST /$/evidence/{ds}/projections/reconcile` rebuilds a review policy's accepted
+//! projection after a changed protection, and `GET` and `POST /$/evidence/{ds}/holds`
+//! and `DELETE /$/evidence/{ds}/holds/{id}` list, acquire and release durable source
+//! holds.
 //! `POST /{ds}/claims/resolve` verifies evidence references at their exact retained
 //! views and records by their publication origin, and `POST /{ds}/claims` publishes
 //! authenticated claim proposals (see [`claims`]).
@@ -43,6 +45,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             post(review::rebuild_identities),
         )
         .route("/$/evidence/{ds}/reauthenticate", post(reauthenticate))
+        .route(
+            "/$/evidence/{ds}/projections/reconcile",
+            post(review::reconcile_projection),
+        )
         .route("/$/evidence/{ds}/holds", get(list_holds).post(acquire_hold))
         .route("/$/evidence/{ds}/holds/{id}", delete(release_hold))
         .route("/{ds}/claims/resolve", post(resolve))

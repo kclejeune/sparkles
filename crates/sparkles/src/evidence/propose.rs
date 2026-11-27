@@ -1479,7 +1479,7 @@ pub fn propose(
     let targets: Vec<ProtectedGraph> = plan
         .graphs
         .iter()
-        .map(|g| (g.clone(), capability.protection(g.as_str())))
+        .map(|g| (g.clone(), capability.record_protection(g.as_str())))
         .collect();
     if let Some((g, _)) = targets.iter().find(|(_, n)| n.is_none()) {
         return Err(managed(
@@ -1762,7 +1762,7 @@ pub fn propose(
                 commit: seq,
                 time_ms,
             },
-            |g| capability.protection(g.as_str()),
+            |g| capability.record_protection(g.as_str()),
             hold,
             &skip,
         )?

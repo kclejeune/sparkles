@@ -468,12 +468,15 @@ pub(super) fn recorded_root_bytes(
     })?;
     let envelope = budget.json::<Envelope>(bytes)?;
     let format = envelope.value.format.unwrap_or(1);
-    if !matches!(format, 1..=3) {
+    if !(1..=u64::from(crate::managed::FORMAT)).contains(&format) {
         return Err(Error::Unsupported(format!(
-            "primary configuration registry has format {format}; this release reads 1 through 3"
+            "primary configuration registry has format {format}; this release reads 1 through {}",
+            crate::managed::FORMAT
         )));
     }
-    if (format == 3) != envelope.value.history.is_some() {
+    if (format < 3 && envelope.value.history.is_some())
+        || (format == 3 && envelope.value.history.is_none())
+    {
         return Err(Error::Unsupported(
             "inconsistent primary configuration root envelope".into(),
         ));

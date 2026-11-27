@@ -1206,6 +1206,7 @@ impl Plan {
                 payload_digest: self.payload_digest,
                 idempotency_key: self.idempotency_key.as_deref(),
                 hold,
+                used: None,
             },
             &self.graphs,
             &self.records,
@@ -1251,6 +1252,7 @@ pub(super) struct Operation<'a> {
     pub(super) payload_digest: Sha256Digest,
     pub(super) idempotency_key: Option<&'a str>,
     pub(super) hold: Option<Uuid>,
+    pub(super) used: Option<&'a NamedNode>,
 }
 
 /// The operation's description in every graph of `graphs`, each with that graph's
@@ -1300,6 +1302,9 @@ pub(super) fn publish_quads(
         }
         if let Some(h) = op.hold {
             quad(iri, ev("sourceHold"), string(&h.to_string()), g);
+        }
+        if let Some(u) = op.used {
+            quad(iri, prov("used"), u.clone().into(), g);
         }
     }
     for (i, r) in records.iter().enumerate() {
@@ -1411,6 +1416,120 @@ pub struct AdmittedScan<T> {
     pub more: bool,
     _held: Reservation,
 }
+
+/// Conservative heap byte charge for a retained [`NamedOrBlankNode`], computed without
+/// allocating.
+fn subject_bytes(subject: &NamedOrBlankNode) -> u64 {
+    match subject {
+        NamedOrBlankNode::NamedNode(n) => (n.as_str().len() as u64).saturating_add(32),
+        NamedOrBlankNode::BlankNode(b) => (b.as_str().len() as u64).saturating_add(32),
+    }
+}
+
+/// Conservative heap byte charge for a retained [`Term`], computed without allocating.
+pub fn term_bytes(term: &Term) -> u64 {
+    match term {
+        Term::NamedNode(n) => (n.as_str().len() as u64).saturating_add(32),
+        Term::BlankNode(b) => (b.as_str().len() as u64).saturating_add(32),
+        Term::Literal(l) => (l.value().len() as u64)
+            .saturating_add(l.datatype().as_str().len() as u64)
+            .saturating_add(l.language().map_or(0, |s| s.len() as u64))
+            .saturating_add(64),
+        Term::Triple(t) => triple_bytes(t).saturating_add(64),
+    }
+}
+
+/// Conservative heap byte charge for a retained [`Triple`], computed without allocating.
+pub fn triple_bytes(triple: &Triple) -> u64 {
+    subject_bytes(&triple.subject)
+        .saturating_add(triple.predicate.as_str().len() as u64)
+        .saturating_add(32)
+        .saturating_add(term_bytes(&triple.object))
+        .saturating_add(std::mem::size_of::<Triple>() as u64)
+}
+
+fn literal_formatted_bytes(literal: &Literal, json_escape: bool) -> u64 {
+    // Opening and closing double quotes (`"` vs `\"`).
+    let mut n: u64 = if json_escape { 4 } else { 2 };
+    for c in literal.value().chars() {
+        n = n.saturating_add(match c {
+            '\u{8}' | '\t' | '\n' | '\u{C}' | '\r' => {
+                if json_escape {
+                    3
+                } else {
+                    2
+                }
+            }
+            '"' | '\\' => {
+                if json_escape {
+                    4
+                } else {
+                    2
+                }
+            }
+            '\0'..='\u{1F}' | '\u{7F}' | '\u{FFFE}' | '\u{FFFF}' => {
+                if json_escape {
+                    7
+                } else {
+                    6
+                }
+            }
+            _ => c.len_utf8() as u64,
+        });
+    }
+    if let Some(lang) = literal.language() {
+        // `@lang` plus optional `--ltr` / `--rtl` base direction suffix.
+        n = n
+            .saturating_add(1)
+            .saturating_add(lang.len() as u64)
+            .saturating_add(6);
+    } else if literal.datatype() != oxrdf::vocab::xsd::STRING {
+        // `^^<datatype>`
+        n = n
+            .saturating_add(4)
+            .saturating_add(literal.datatype().as_str().len() as u64);
+    }
+    n
+}
+
+fn ntriples_subject_bytes(subject: &NamedOrBlankNode) -> u64 {
+    match subject {
+        NamedOrBlankNode::NamedNode(n) => (n.as_str().len() as u64).saturating_add(2),
+        NamedOrBlankNode::BlankNode(b) => (b.as_str().len() as u64).saturating_add(2),
+    }
+}
+
+fn triple_formatted_bytes(triple: &Triple, json_escape: bool) -> u64 {
+    ntriples_subject_bytes(&triple.subject)
+        .saturating_add(1)
+        .saturating_add((triple.predicate.as_str().len() as u64).saturating_add(2))
+        .saturating_add(1)
+        .saturating_add(term_formatted_bytes(&triple.object, json_escape))
+}
+
+fn term_formatted_bytes(term: &Term, json_escape: bool) -> u64 {
+    match term {
+        Term::NamedNode(n) => (n.as_str().len() as u64).saturating_add(2),
+        Term::BlankNode(b) => (b.as_str().len() as u64).saturating_add(2),
+        Term::Literal(l) => literal_formatted_bytes(l, json_escape),
+        // `<<( ... )>>`
+        Term::Triple(t) => triple_formatted_bytes(t, json_escape).saturating_add(8),
+    }
+}
+
+/// Conservative N-Triples byte length of `triple.to_string()`, computed without allocating.
+pub fn ntriples_triple_bytes(triple: &Triple) -> u64 {
+    triple_formatted_bytes(triple, false)
+}
+
+/// Conservative JSON-encoded string byte length of `serde_json::to_string(&triple.to_string())`,
+/// including the surrounding JSON quotes, computed without allocating.
+pub fn json_escaped_ntriples_triple_bytes(triple: &Triple) -> u64 {
+    triple_formatted_bytes(triple, true).saturating_add(2)
+}
+
+/// A graph's stored quad with its physical `[Id; 4]` and decoded triple.
+pub type StoredQuad = ([Id; 4], Triple);
 
 /// Lookups in one unmasked snapshot under one preparation. The writer reads its head
 /// with them, which no caller policy limits: what they find decides only whether the
@@ -1548,16 +1667,76 @@ impl<'a> Reads<'a> {
                 ids.push(q[2]);
                 Ok(ids.len() < 2)
             })?;
+        let mut held = self.preparation.reserve(0)?;
         let mut out = Vec::new();
         for id in ids {
-            if let Some(t) = self
-                .preparation
-                .with_term(self.snap, id, |t| Ok(t.cloned()))?
-            {
+            if let Some(t) = self.preparation.with_term(self.snap, id, |t| match t {
+                Some(term) => {
+                    held.grow_by(term_bytes(term))?;
+                    Ok(Some(term.clone()))
+                }
+                None => Ok(None),
+            })? {
                 out.push(t);
             }
         }
         Ok(out)
+    }
+
+    /// The objects of `s p ?o` in `g`, at most `limit` of them, and whether more exist.
+    /// The scan buffer, output buffer and every retained term are charged to `held`
+    /// before allocation or cloning.
+    pub fn objects_up_to_held(
+        &mut self,
+        s: &str,
+        p: &str,
+        g: &str,
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<Term>, bool)> {
+        let (Some(s), Some(p), Some(g)) = (self.id(s)?, self.id(p)?, self.id(g)?) else {
+            return Ok((Vec::new(), false));
+        };
+        const ROW: u64 = std::mem::size_of::<Id>() as u64;
+        const CHUNK: usize = 1024;
+        const OUT_ROW: u64 = std::mem::size_of::<Term>() as u64;
+        const OUT_CHUNK: usize = 256;
+        let mut rows_held = self.preparation.reserve(0)?;
+        let mut ids: Vec<Id> = Vec::new();
+        let mut more = false;
+        self.preparation
+            .scan(self.snap, Perm::Gspo, &[g.0, s.0, p.0], |q| {
+                if ids.len() == limit {
+                    more = true;
+                    return Ok(false);
+                }
+                if ids.len() == ids.capacity() {
+                    let add = limit.saturating_sub(ids.len()).clamp(1, CHUNK);
+                    rows_held.grow_by((add as u64).saturating_mul(ROW))?;
+                    ids.reserve_exact(add);
+                }
+                ids.push(q[2]);
+                Ok(true)
+            })?;
+        let mut out: Vec<Term> = Vec::new();
+        let total = ids.len();
+        for (i, id) in ids.into_iter().enumerate() {
+            if out.len() == out.capacity() {
+                let add = total.saturating_sub(i).clamp(1, OUT_CHUNK);
+                held.grow_by((add as u64).saturating_mul(OUT_ROW))?;
+                out.reserve_exact(add);
+            }
+            if let Some(t) = self.preparation.with_term(self.snap, id, |t| match t {
+                Some(term) => {
+                    held.grow_by(term_bytes(term))?;
+                    Ok(Some(term.clone()))
+                }
+                None => Ok(None),
+            })? {
+                out.push(t);
+            }
+        }
+        Ok((out, more))
     }
 
     /// The objects of `s p ?o` in `g`, at most `limit` of them, and whether more exist.
@@ -1572,47 +1751,78 @@ impl<'a> Reads<'a> {
         self.objects_up_to_held(s, p, g, limit, &mut held)
     }
 
-    /// Like [`Self::objects_up_to`], charging every returned term into `held` before
-    /// copying it so the caller keeps the copies charged for their full lifetime.
-    pub fn objects_up_to_held(
+    /// The IRI subjects in `g` that satisfy every `(predicate, object)` clause in
+    /// `clauses`, at most `limit` of them, and whether more exist. Every object must be
+    /// ground. Uses range-seeking leapfrog intersection with `Gspo[g]` so unrelated
+    /// graphs' rows are skipped. The scan buffer, output buffer and every retained IRI
+    /// are charged to `held` before allocation or cloning.
+    pub fn subjects_matching_up_to_held(
         &mut self,
-        s: &str,
-        p: &str,
+        clauses: &[(&str, &Term)],
         g: &str,
         limit: usize,
         held: &mut Reservation,
-    ) -> Result<(Vec<Term>, bool)> {
-        let (Some(s), Some(p), Some(g)) = (self.id(s)?, self.id(p)?, self.id(g)?) else {
+    ) -> Result<(Vec<NamedNode>, bool)> {
+        if clauses.is_empty() {
+            return Ok((Vec::new(), false));
+        }
+        let Some(g) = self.id(g)? else {
             return Ok((Vec::new(), false));
         };
-        let mut ids_held = self.preparation.reserve(0)?;
-        let mut ids = Vec::new();
+        let _clauses = self.preparation.reserve((clauses.len() as u64).saturating_mul(std::mem::size_of::<(Id, Id)>() as u64))?;
+        let mut resolved = Vec::with_capacity(clauses.len());
+        for (p, o) in clauses {
+            let Some(p) = self.id(p)? else {
+                return Ok((Vec::new(), false));
+            };
+            let o = match o {
+                Term::NamedNode(n) => self.id(n.as_str())?,
+                t => self.preparation.lookup_term(self.snap, t)?,
+            };
+            let Some(o) = o else {
+                return Ok((Vec::new(), false));
+            };
+            resolved.push((p, o));
+        }
+        const ROW: u64 = std::mem::size_of::<Id>() as u64;
+        const CHUNK: usize = 1024;
+        const OUT_ROW: u64 = std::mem::size_of::<NamedNode>() as u64;
+        const OUT_CHUNK: usize = 256;
+        let mut rows_held = self.preparation.reserve(0)?;
+        let mut ids: Vec<Id> = Vec::new();
         let mut more = false;
-        self.preparation
-            .scan(self.snap, Perm::Gspo, &[g.0, s.0, p.0], |q| {
-                if ids.len() == limit {
-                    more = true;
-                    return Ok(false);
+        self.for_each_pos_intersection_in_graph(g, &resolved, |s| {
+            if !self.is_iri_id(s)? {
+                return Ok(true);
+            }
+            if ids.len() == limit {
+                more = true;
+                return Ok(false);
+            }
+            if ids.len() == ids.capacity() {
+                let add = limit.saturating_sub(ids.len()).clamp(1, CHUNK);
+                rows_held.grow_by((add as u64).saturating_mul(ROW))?;
+                ids.reserve_exact(add);
+            }
+            ids.push(s);
+            Ok(true)
+        })?;
+        let mut out: Vec<NamedNode> = Vec::new();
+        let total = ids.len();
+        for (i, id) in ids.into_iter().enumerate() {
+            if out.len() == out.capacity() {
+                let add = total.saturating_sub(i).clamp(1, OUT_CHUNK);
+                held.grow_by((add as u64).saturating_mul(OUT_ROW))?;
+                out.reserve_exact(add);
+            }
+            if let Some(n) = self.preparation.with_term(self.snap, id, |t| match t {
+                Some(Term::NamedNode(n)) => {
+                    held.grow_by((n.as_str().len() as u64).saturating_add(32))?;
+                    Ok(Some(n.clone()))
                 }
-                if ids.len() == ids.capacity() {
-                    const CHUNK: usize = 256;
-                    ids_held.grow_by((CHUNK * std::mem::size_of::<Id>()) as u64)?;
-                    ids.reserve_exact(CHUNK);
-                }
-                ids.push(q[2]);
-                Ok(true)
-            })?;
-        held.grow_by((ids.len() * std::mem::size_of::<Term>()) as u64)?;
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(t) = self.preparation.with_term(self.snap, id, |t| match t {
-                Some(t) => {
-                    held.grow_by(term_heap_bytes(t))?;
-                    Ok(Some(t.clone()))
-                }
-                None => Ok(None),
+                _ => Ok(None),
             })? {
-                out.push(t);
+                out.push(n);
             }
         }
         Ok((out, more))
@@ -1699,9 +1909,7 @@ impl<'a> Reads<'a> {
         limit: usize,
         held: &mut Reservation,
     ) -> Result<(Vec<NamedNode>, bool)> {
-        let scan = self.visible_subjects_up_to(p, o, g, limit, false)?;
-        held.merge(scan._held);
-        Ok((scan.items, scan.more))
+        self.subjects_matching_up_to_held(&[(p, o)], g, limit, held)
     }
 
     /// The IRI subjects of `?s p o` in `g`, at most `limit` of them, and whether more
@@ -2544,6 +2752,108 @@ impl<'a> Reads<'a> {
         })
     }
 
+    /// Up to `limit` quads of graph `g`, returning each quad's physical `[Id; 4]` and
+    /// decoded triple, plus whether more quads exist in `g`. The scan buffer, the
+    /// output buffer and every retained term are charged before allocation.
+    pub fn graph_quads_up_to(
+        &mut self,
+        g: &str,
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<StoredQuad>, bool)> {
+        let Some(gid) = self.id(g)? else {
+            return Ok((Vec::new(), false));
+        };
+        self.quads_by_prefix(&[gid.0], limit, held)
+    }
+
+    /// The bounded, charged quads of one subject in one graph.
+    pub fn subject_quads_up_to(
+        &mut self,
+        s: &str,
+        g: &str,
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<StoredQuad>, bool)> {
+        let (Some(g), Some(s)) = (self.id(g)?, self.id(s)?) else {
+            return Ok((Vec::new(), false));
+        };
+        self.quads_by_prefix(&[g.0, s.0], limit, held)
+    }
+
+    fn quads_by_prefix(
+        &self,
+        prefix: &[u64],
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<StoredQuad>, bool)> {
+        const ROW: u64 = std::mem::size_of::<[Id; 4]>() as u64;
+        const CHUNK: usize = 4096;
+        const OUT_ROW: u64 = std::mem::size_of::<StoredQuad>() as u64;
+        const OUT_CHUNK: usize = 1024;
+        let mut rows_held = self.preparation.reserve(0)?;
+        let mut rows: Vec<[Id; 4]> = Vec::new();
+        let mut more = false;
+        self.preparation.scan(self.snap, Perm::Gspo, prefix, |q| {
+            if rows.len() == limit {
+                more = true;
+                return Ok(false);
+            }
+            if rows.len() == rows.capacity() {
+                let add = limit.saturating_sub(rows.len()).clamp(1, CHUNK);
+                rows_held.grow_by(add as u64 * ROW)?;
+                rows.reserve_exact(add);
+            }
+            rows.push(q);
+            Ok(true)
+        })?;
+        let mut out: Vec<StoredQuad> = Vec::new();
+        let total = rows.len();
+        for q in rows {
+            if out.len() == out.capacity() {
+                let add = total.saturating_sub(out.len()).clamp(1, OUT_CHUNK);
+                held.grow_by(add as u64 * OUT_ROW)?;
+                out.reserve_exact(add);
+            }
+            let subject = self.preparation.with_term(self.snap, q[0], |t| match t {
+                Some(Term::NamedNode(n)) => {
+                    held.grow_by((n.as_str().len() as u64).saturating_add(32))?;
+                    Ok(Some(NamedOrBlankNode::NamedNode(n.clone())))
+                }
+                Some(Term::BlankNode(b)) => {
+                    held.grow_by((b.as_str().len() as u64).saturating_add(32))?;
+                    Ok(Some(NamedOrBlankNode::BlankNode(b.clone())))
+                }
+                _ => Ok(None),
+            })?;
+            let Some(subject) = subject else {
+                continue;
+            };
+            let predicate = self.preparation.with_term(self.snap, q[1], |t| match t {
+                Some(Term::NamedNode(n)) => {
+                    held.grow_by((n.as_str().len() as u64).saturating_add(32))?;
+                    Ok(Some(n.clone()))
+                }
+                _ => Ok(None),
+            })?;
+            let Some(predicate) = predicate else {
+                continue;
+            };
+            let object = self.preparation.with_term(self.snap, q[2], |t| match t {
+                Some(term) => {
+                    held.grow_by(term_bytes(term))?;
+                    Ok(Some(term.clone()))
+                }
+                None => Ok(None),
+            })?;
+            let Some(object) = object else {
+                continue;
+            };
+            out.push((q, Triple::new(subject, predicate, object)));
+        }
+        Ok((out, more))
+    }
+
     /// Whether the quad `s p o g` is in the snapshot. `o` is a ground term.
     pub fn contains(&mut self, s: &str, p: &str, o: &Term, g: &str) -> Result<bool> {
         let (Some(s), Some(p), Some(g)) = (self.id(s)?, self.id(p)?, self.id(g)?) else {
@@ -2622,6 +2932,11 @@ impl<'a> Reads<'a> {
         self.is_operation(op, g)
     }
 
+    /// Whether `op` is recorded as an `ev:Operation` in graph `g`.
+    pub fn has_operation(&mut self, op: &str, g: &str) -> Result<bool> {
+        self.is_operation(op, g)
+    }
+
     pub(super) fn is_operation(&mut self, op: &str, g: &str) -> Result<bool> {
         let (Some(s), Some(p), Some(o), Some(g)) = (
             self.id(op)?,
@@ -2647,6 +2962,737 @@ impl<'a> Reads<'a> {
             return Ok(false);
         };
         Ok(self.is_operation(op, g)? && self.nonce_of(op, g)? == Some(nonce))
+    }
+
+    fn single_object_id(&self, g: Id, s: Id, p: Id) -> Result<Option<Id>> {
+        let mut found: Option<Id> = None;
+        let mut duplicate = false;
+        self.preparation
+            .scan(self.snap, Perm::Gspo, &[g.0, s.0, p.0], |q| {
+                if found.is_some() {
+                    duplicate = true;
+                    return Ok(false);
+                }
+                found = Some(q[2]);
+                Ok(true)
+            })?;
+        Ok(if duplicate { None } else { found })
+    }
+
+    /// Whether any object of this graph-local predicate satisfies `accepts`.
+    fn has_value_matching(
+        &self,
+        graph: Id,
+        subject: Id,
+        predicate: Id,
+        accepts: fn(&Term) -> bool,
+    ) -> Result<bool> {
+        let mut found = false;
+        self.preparation.scan(
+            self.snap,
+            Perm::Gspo,
+            &[graph.0, subject.0, predicate.0],
+            |q| {
+                found = self
+                    .preparation
+                    .with_term(self.snap, q[2], |term| Ok(term.is_some_and(accepts)))?;
+                Ok(!found)
+            },
+        )?;
+        Ok(found)
+    }
+
+    /// Bounded exact quad existence probe via `Perm::Gspo` `[g, s, p, o]` under
+    /// `Preparation` (never bypasses the preparation's reservations or cancellation).
+    fn contains_id(&self, s: Id, p: Id, o: Id, g: Id) -> Result<bool> {
+        let key = [g.0, s.0, p.0, o.0];
+        Ok(self
+            .preparation
+            .first_in_range(self.snap, Perm::Gspo, key, key)?
+            .is_some())
+    }
+
+    /// Bounded exact quad existence probe via `Perm::Pos` `[p, o, s, g]` under
+    /// `Preparation`.
+    fn contains_pos_id(&self, p: Id, o: Id, s: Id, g: Id) -> Result<bool> {
+        let key = [p.0, o.0, s.0, g.0];
+        Ok(self
+            .preparation
+            .first_in_range(self.snap, Perm::Pos, key, key)?
+            .is_some())
+    }
+
+    /// Stream every subject `s` in `g_id` that satisfies every `(predicate, object)`
+    /// clause in `clauses`, using range-seeking leapfrog intersection across `Perm::Pos`
+    /// and `Perm::Gspo[g_id]`. All seeks and exact fallbacks stay inside bounded
+    /// `Preparation`.
+    fn for_each_pos_intersection_in_graph(
+        &self,
+        g_id: Id,
+        clauses: &[(Id, Id)],
+        mut each: impl FnMut(Id) -> Result<bool>,
+    ) -> Result<()> {
+        if clauses.is_empty() {
+            return Ok(());
+        }
+        let total = clauses.len() + 1; // last stream is Gspo[g_id]
+        let mut target_s = 0u64;
+        let mut matched = 0usize;
+        let mut idx = 0usize;
+        let mut steps = 0u64;
+        loop {
+            self.preparation.check()?;
+            steps += 1;
+            if steps.is_multiple_of(1024) {
+                self.preparation.stage("scanning permission rows")?;
+            }
+            if idx < clauses.len() {
+                let (p, o) = clauses[idx];
+                let lo = [p.0, o.0, target_s, g_id.0];
+                let hi = [p.0, o.0, u64::MAX, u64::MAX];
+                let Some(q) = self
+                    .preparation
+                    .first_in_range(self.snap, Perm::Pos, lo, hi)?
+                else {
+                    return Ok(());
+                };
+                let (found_s, found_g) = (q[0].0, q[3].0);
+                if found_s == target_s {
+                    if found_g == g_id.0 {
+                        matched += 1;
+                    } else {
+                        let Some(next) = target_s.checked_add(1) else {
+                            return Ok(());
+                        };
+                        target_s = next;
+                        matched = 0;
+                    }
+                } else if found_g == g_id.0
+                    || (found_g < g_id.0 && self.contains_pos_id(p, o, Id(found_s), g_id)?)
+                {
+                    target_s = found_s;
+                    matched = 1;
+                } else {
+                    let Some(next) = found_s.checked_add(1) else {
+                        return Ok(());
+                    };
+                    target_s = next;
+                    matched = 0;
+                }
+            } else {
+                let lo = [g_id.0, target_s, 0, 0];
+                let hi = [g_id.0, u64::MAX, u64::MAX, u64::MAX];
+                let Some(q) = self
+                    .preparation
+                    .first_in_range(self.snap, Perm::Gspo, lo, hi)?
+                else {
+                    return Ok(());
+                };
+                let found_s = q[0].0;
+                if found_s == target_s {
+                    matched += 1;
+                } else {
+                    target_s = found_s;
+                    matched = 1;
+                }
+            }
+            if matched == total {
+                if !each(Id(target_s))? {
+                    return Ok(());
+                }
+                let Some(next) = target_s.checked_add(1) else {
+                    return Ok(());
+                };
+                target_s = next;
+                matched = 0;
+                idx = 0;
+            } else {
+                idx = (idx + 1) % total;
+            }
+        }
+    }
+
+    /// Whether `s` is authenticated in protected graph `g` under `g_nonce_id` via its
+    /// single `ev:availabilityReceipt` and `ev:graphProtection` markers.
+    #[allow(clippy::too_many_arguments)]
+    fn authenticated_record_id(
+        &self,
+        s: Id,
+        g: Id,
+        g_nonce_id: Id,
+        rdf_type: Id,
+        op_class: Id,
+        graph_prot_pred: Id,
+        avail_receipt: Id,
+    ) -> Result<bool> {
+        let Some(op_id) = self.single_object_id(g, s, avail_receipt)? else {
+            return Ok(false);
+        };
+        let op_is_iri = self.preparation.with_term(self.snap, op_id, |t| {
+            Ok(matches!(t, Some(Term::NamedNode(_))))
+        })?;
+        if !op_is_iri {
+            return Ok(false);
+        }
+        if !self.contains_id(op_id, rdf_type, op_class, g)? {
+            return Ok(false);
+        }
+        if self.single_object_id(g, op_id, graph_prot_pred)? != Some(g_nonce_id) {
+            return Ok(false);
+        }
+        Ok(self.single_object_id(g, s, graph_prot_pred)? == Some(g_nonce_id))
+    }
+
+    /// A record and its publisher can lose a shared quad when an output support
+    /// is withdrawn. Check the surviving writer fields on both ends of the
+    /// link before treating a projected graph as a former record graph.
+    pub fn has_published_operation_in_output(
+        &self,
+        graph: &str,
+        nonce: Option<Uuid>,
+    ) -> Result<bool> {
+        let Some(nonce) = nonce else {
+            return Ok(false);
+        };
+        let iri = |value: &str| self.preparation.lookup_iri(self.snap, value);
+        let (Some(g), Some(protection), Some(nonce)) = (
+            iri(graph)?,
+            iri(&format!("{EV}graphProtection"))?,
+            self.preparation
+                .lookup_term(self.snap, &string(&nonce.to_string()))?,
+        ) else {
+            return Ok(false);
+        };
+        let receipt = iri(&format!("{EV}availabilityReceipt"))?;
+        let generated = iri(&format!("{PROV}wasGeneratedBy"))?;
+        let rdf_type = iri(RDF_TYPE)?;
+        let operation_type = rdf_type.zip(iri(&format!("{EV}Operation"))?);
+        let activity_type = rdf_type.zip(iri(&format!("{PROV}Activity"))?);
+        let digest = iri(&format!("{EV}recordDigest"))?;
+        let is_iri = |id| {
+            self.preparation.with_term(self.snap, id, |term| {
+                Ok(matches!(term, Some(Term::NamedNode(_))))
+            })
+        };
+        let has_record_digest = |record, digest| {
+            self.has_value_matching(g, record, digest, |term| {
+                matches!(term, Term::Literal(l)
+                    if l.datatype() == oxrdf::vocab::xsd::STRING
+                        && l.value().parse::<Sha256Digest>().is_ok())
+            })
+        };
+        let mut found = false;
+        self.for_each_pos_intersection_in_graph(g, &[(protection, nonce)], |subject| {
+            if let Some(receipt) = receipt
+                && is_iri(subject)?
+            {
+                let mut receipt_to_activity = false;
+                self.preparation.scan(
+                    self.snap,
+                    Perm::Gspo,
+                    &[g.0, subject.0, receipt.0],
+                    |quad| {
+                        let op = quad[2];
+                        if op == subject || !is_iri(op)? {
+                            return Ok(true);
+                        }
+                        let is_operation = match operation_type {
+                            Some((p, class)) => self.contains_id(op, p, class, g)?,
+                            None => false,
+                        };
+                        let op_protected = self.contains_id(op, protection, nonce, g)?;
+                        if is_operation && op_protected {
+                            found = true;
+                        } else if (is_operation || op_protected)
+                            && let Some((p, activity)) = activity_type
+                            && self.contains_id(op, p, activity, g)?
+                        {
+                            receipt_to_activity = true;
+                            if let Some(generated) = generated {
+                                found = self.contains_id(subject, generated, op, g)?;
+                            }
+                        }
+                        Ok(!found)
+                    },
+                )?;
+                // The record digest can corroborate the receipt to a surviving
+                // activity when the generation edge has been withdrawn.
+                if !found
+                    && receipt_to_activity
+                    && let Some(digest) = digest
+                {
+                    found = has_record_digest(subject, digest)?;
+                }
+            }
+            if !found
+                && let Some(digest) = digest
+                && let Some((p, class)) = operation_type
+                && self.contains_id(subject, p, class, g)?
+                && is_iri(subject)?
+            {
+                // The record may have lost either link or its nonce. Its
+                // writer digest distinguishes a record from a bare edge.
+                for edge in [receipt, generated].into_iter().flatten() {
+                    self.for_each_pos_intersection_in_graph(g, &[(edge, subject)], |record| {
+                        found = record != subject
+                            && is_iri(record)?
+                            && has_record_digest(record, digest)?;
+                        Ok(!found)
+                    })?;
+                    if found {
+                        break;
+                    }
+                }
+            }
+            Ok(!found)
+        })?;
+        Ok(found)
+    }
+
+    fn described_output_operation(
+        &self,
+        graph: &str,
+        nonce: Option<Uuid>,
+        dataset_id: Uuid,
+        named: &NamedNode,
+    ) -> Result<bool> {
+        let Some(nonce) = nonce else {
+            return Ok(false);
+        };
+        let nonce_term = Term::Literal(Literal::new_simple_literal(nonce.to_string()));
+        let ds_term = Term::Literal(Literal::new_simple_literal(dataset_id.to_string()));
+        let (
+            Some(g_id),
+            Some(rdf_type),
+            Some(op_class),
+            Some(prov_activity),
+            Some(was_assoc),
+            Some(ended_at),
+            Some(dataset_id_pred),
+            Some(expected_dataset_id),
+            Some(branch_id_pred),
+            Some(commit_pred),
+            Some(payload_digest_pred),
+            Some(graph_prot_pred),
+            Some(nonce_id),
+        ) = (
+            self.preparation.lookup_iri(self.snap, graph)?,
+            self.preparation.lookup_iri(self.snap, RDF_TYPE)?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}Operation"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{PROV}Activity"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{PROV}wasAssociatedWith"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{PROV}endedAtTime"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}datasetId"))?,
+            self.preparation.lookup_term(self.snap, &ds_term)?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}branchId"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}commit"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}payloadDigest"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}graphProtection"))?,
+            self.preparation.lookup_term(self.snap, &nonce_term)?,
+        )
+        else {
+            return Ok(false);
+        };
+        let markers = [
+            (graph_prot_pred, nonce_id),
+            (rdf_type, op_class),
+            (rdf_type, prov_activity),
+            (dataset_id_pred, expected_dataset_id),
+        ];
+        let Some(op) = self.preparation.lookup_iri(self.snap, named.as_str())? else {
+            return Ok(false);
+        };
+        for (pred, obj) in markers {
+            if !self.contains_id(op, pred, obj, g_id)? {
+                return Ok(false);
+            }
+        }
+        // A projection can add other values to a genuinely published subject.
+        // Test for the writer's edges even when the subject also carries those values.
+        use oxrdf::vocab::xsd;
+        let has_value = |predicate, accepts| self.has_value_matching(g_id, op, predicate, accepts);
+        Ok(has_value(was_assoc, |t| matches!(t, Term::NamedNode(_)))?
+            && has_value(
+                ended_at,
+                |t| matches!(t, Term::Literal(l) if l.datatype() == xsd::DATE_TIME),
+            )?
+            && has_value(
+                branch_id_pred,
+                |t| matches!(t, Term::Literal(l) if l.datatype() == xsd::STRING && Uuid::parse_str(l.value()).is_ok()),
+            )?
+            && has_value(
+                commit_pred,
+                |t| matches!(t, Term::Literal(l) if l.datatype() == xsd::INTEGER && l.value().parse::<u64>().is_ok()),
+            )?
+            && has_value(
+                payload_digest_pred,
+                |t| matches!(t, Term::Literal(l) if l.datatype() == xsd::STRING && l.value().parse::<Sha256Digest>().is_ok()),
+            )?)
+    }
+
+    /// Whether the named record bears a receipt for an operation in this graph.
+    pub fn has_published_record_in_output(
+        &self,
+        record_iri: &NamedNode,
+        graph: &str,
+        nonce: Option<Uuid>,
+        dataset_id: Uuid,
+    ) -> Result<bool> {
+        let Some(nonce) = nonce else {
+            return Ok(false);
+        };
+        let nonce_term = Term::Literal(Literal::new_simple_literal(nonce.to_string()));
+        let (Some(r_id), Some(g_id), Some(graph_prot_pred), Some(avail_receipt), Some(nonce_id)) = (
+            self.preparation
+                .lookup_iri(self.snap, record_iri.as_str())?,
+            self.preparation.lookup_iri(self.snap, graph)?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}graphProtection"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}availabilityReceipt"))?,
+            self.preparation.lookup_term(self.snap, &nonce_term)?,
+        ) else {
+            return Ok(false);
+        };
+        if self.single_object_id(g_id, r_id, graph_prot_pred)? != Some(nonce_id) {
+            return Ok(false);
+        }
+        let Some(op_id) = self.single_object_id(g_id, r_id, avail_receipt)? else {
+            return Ok(false);
+        };
+        let Some(op_iri) = self.preparation.with_term(self.snap, op_id, |t| match t {
+            Some(Term::NamedNode(n)) => Ok(Some(n.clone())),
+            _ => Ok(None),
+        })?
+        else {
+            return Ok(false);
+        };
+        self.described_output_operation(graph, Some(nonce), dataset_id, &op_iri)
+    }
+
+    /// Whether any continuously protected managed graph holds an active, authenticated
+    /// `ev:Projection` record showing same-version drift for `(policy_name, policy_version)`
+    /// or its output `(output_graph, output_nonce)`.
+    ///
+    /// Operates strictly on `Perm::Gspo` `[g, s, p, o]` using graph-local, nonce-scoped
+    /// projection index subjects plus direct `Perm::Gspo` lookups on deterministic
+    /// `projection_iri` records, so foreign graphs and unrelated policies/outputs/priors
+    /// are never visited even under interleaved subject IDs, and every probe stays
+    /// inside bounded `Preparation`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn has_same_version_projection_drift(
+        &self,
+        dataset_id: Uuid,
+        policy_name: &str,
+        policy_version: u32,
+        supports_graph: &str,
+        output_graph: &str,
+        output_nonce: Option<Uuid>,
+        managed_graphs: &[(&str, Uuid)],
+        rival_policies: &[(&str, u32)],
+        control: &Control,
+    ) -> Result<bool> {
+        let (
+            Some(rdf_type),
+            Some(proj_class),
+            Some(review_policy),
+            Some(policy_version_pred),
+            Some(supports_prot_pred),
+            Some(graph_prot_pred),
+            Some(avail_receipt),
+            Some(op_class),
+        ) = (
+            self.preparation.lookup_iri(self.snap, RDF_TYPE)?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}Projection"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}reviewPolicy"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}policyVersion"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}supportsProtection"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}graphProtection"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}availabilityReceipt"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}Operation"))?,
+        )
+        else {
+            return Ok(false);
+        };
+        let was_revision_of = self
+            .preparation
+            .lookup_iri(self.snap, &format!("{PROV}wasRevisionOf"))?;
+        let indexed_proj_pred = self
+            .preparation
+            .lookup_iri(self.snap, super::review::INDEXED_PROJECTION)?;
+
+        let mut protected: BTreeMap<Id, (Uuid, Id)> = BTreeMap::new();
+        for &(g_iri, g_nonce) in managed_graphs {
+            self.preparation.check()?;
+            let Some(g_id) = self.preparation.lookup_iri(self.snap, g_iri)? else {
+                continue;
+            };
+            let nonce_term = Term::Literal(Literal::new_simple_literal(g_nonce.to_string()));
+            let Some(nonce_id) = self.preparation.lookup_term(self.snap, &nonce_term)? else {
+                continue;
+            };
+            protected.insert(g_id, (g_nonce, nonce_id));
+        }
+        if protected.is_empty() {
+            return Ok(false);
+        }
+
+        let authenticated_id = |s: Id, g: Id, g_nonce_id: Id| -> Result<bool> {
+            self.authenticated_record_id(
+                s,
+                g,
+                g_nonce_id,
+                rdf_type,
+                op_class,
+                graph_prot_pred,
+                avail_receipt,
+            )
+        };
+
+        // Strictly `Perm::Gspo`-scoped supersession lookup: scan only
+        // `Gspo[g, projection_revision_index_iri(g_nonce, r), ev:indexedProjection]` so
+        // foreign-graph `prov:wasRevisionOf` edges and unrelated projections are never
+        // visited regardless of physical subject-ID interleaving.
+        let is_superseded =
+            |r: Id, g: Id, g_nonce: Uuid, g_nonce_id: Id, target_policy_id: Id| -> Result<bool> {
+                let (Some(rev_pred), Some(idx_pred)) = (was_revision_of, indexed_proj_pred) else {
+                    return Ok(false);
+                };
+                let Some(rev_idx) = self.preparation.with_term(self.snap, r, |t| match t {
+                    Some(Term::NamedNode(n)) => Ok(Some(
+                        super::review::projection_revision_index_iri(g_nonce, n.as_str()),
+                    )),
+                    _ => Ok(None),
+                })?
+                else {
+                    return Ok(false);
+                };
+                let Some(rev_idx_id) = self.preparation.lookup_iri(self.snap, rev_idx.as_str())?
+                else {
+                    return Ok(false);
+                };
+                let mut superseded = false;
+                self.preparation.scan(
+                    self.snap,
+                    Perm::Gspo,
+                    &[g.0, rev_idx_id.0, idx_pred.0],
+                    |q| {
+                        let later = q[2];
+                        if self.contains_id(later, rev_pred, r, g)?
+                            && self.contains_id(later, rdf_type, proj_class, g)?
+                            && self.single_object_id(g, later, review_policy)?
+                                == Some(target_policy_id)
+                            && self.single_object_id(g, later, supports_prot_pred)?
+                                == Some(g_nonce_id)
+                            && authenticated_id(later, g, g_nonce_id)?
+                        {
+                            superseded = true;
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    },
+                )?;
+                Ok(superseded)
+            };
+
+        // 1. Policy moved supports out of a continuously protected graph without raising
+        // its version (including when the former supports graph changed managed roles).
+        // Checked strictly via `Perm::Gspo` on both the deterministic `projection_iri`
+        // (for pre-581 records) and the graph-local `projection_policy_index_iri`.
+        let cur_supports_id = self.preparation.lookup_iri(self.snap, supports_graph)?;
+        let policy_iri = super::review::policy_iri(policy_name);
+        let version_term = Term::Literal(Literal::new_simple_literal(policy_version.to_string()));
+        if let (Some(policy_id), Some(version_id)) = (
+            self.preparation
+                .lookup_iri(self.snap, policy_iri.as_str())?,
+            self.preparation.lookup_term(self.snap, &version_term)?,
+        ) {
+            let det_proj_iri =
+                super::review::projection_iri(dataset_id, policy_name, policy_version, control)?;
+            let det_proj_id = self
+                .preparation
+                .lookup_iri(self.snap, det_proj_iri.as_str())?;
+            let check_moved = |r: Id, g_id: Id, g_nonce: Uuid, g_nonce_id: Id| -> Result<bool> {
+                Ok(self.contains_id(r, rdf_type, proj_class, g_id)?
+                    && self.contains_id(r, graph_prot_pred, g_nonce_id, g_id)?
+                    && self.single_object_id(g_id, r, review_policy)? == Some(policy_id)
+                    && self.single_object_id(g_id, r, supports_prot_pred)? == Some(g_nonce_id)
+                    && self.single_object_id(g_id, r, policy_version_pred)? == Some(version_id)
+                    && authenticated_id(r, g_id, g_nonce_id)?
+                    && !is_superseded(r, g_id, g_nonce, g_nonce_id, policy_id)?)
+            };
+            for (&g_id, &(g_nonce, g_nonce_id)) in &protected {
+                if Some(g_id) == cur_supports_id {
+                    continue;
+                }
+                if let Some(det_id) = det_proj_id
+                    && check_moved(det_id, g_id, g_nonce, g_nonce_id)?
+                {
+                    return Ok(true);
+                }
+                let Some(idx_pred) = indexed_proj_pred else {
+                    continue;
+                };
+                let pol_idx = super::review::projection_policy_index_iri(
+                    g_nonce,
+                    policy_iri.as_str(),
+                    policy_version,
+                );
+                let Some(pol_idx_id) = self.preparation.lookup_iri(self.snap, pol_idx.as_str())?
+                else {
+                    continue;
+                };
+                let mut drifted = false;
+                self.preparation.scan(
+                    self.snap,
+                    Perm::Gspo,
+                    &[g_id.0, pol_idx_id.0, idx_pred.0],
+                    |q| {
+                        let r = q[2];
+                        if Some(r) != det_proj_id && check_moved(r, g_id, g_nonce, g_nonce_id)? {
+                            drifted = true;
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    },
+                )?;
+                if drifted {
+                    return Ok(true);
+                }
+            }
+        }
+
+        // 2. Another currently configured review policy at its current version still owns
+        // `output_graph` under its unchanged protection nonce.
+        if let Some(out_nonce) = output_nonce
+            && !rival_policies.is_empty()
+        {
+            let out_nonce_term = Term::Literal(Literal::new_simple_literal(out_nonce.to_string()));
+            if let (
+                Some(output_pred),
+                Some(output_prot_pred),
+                Some(output_id),
+                Some(out_nonce_id),
+            ) = (
+                self.preparation
+                    .lookup_iri(self.snap, &format!("{EV}output"))?,
+                self.preparation
+                    .lookup_iri(self.snap, &format!("{EV}outputProtection"))?,
+                self.preparation.lookup_iri(self.snap, output_graph)?,
+                self.preparation.lookup_term(self.snap, &out_nonce_term)?,
+            ) {
+                let mut rivals: BTreeMap<Id, Id> = BTreeMap::new();
+                let mut rival_det_ids: Vec<Id> = Vec::new();
+                for &(other_name, other_version) in rival_policies {
+                    let other_iri = super::review::policy_iri(other_name);
+                    let Some(other_id) =
+                        self.preparation.lookup_iri(self.snap, other_iri.as_str())?
+                    else {
+                        continue;
+                    };
+                    let other_ver_term =
+                        Term::Literal(Literal::new_simple_literal(other_version.to_string()));
+                    let Some(other_ver_id) =
+                        self.preparation.lookup_term(self.snap, &other_ver_term)?
+                    else {
+                        continue;
+                    };
+                    rivals.insert(other_id, other_ver_id);
+                    let det_iri = super::review::projection_iri(
+                        dataset_id,
+                        other_name,
+                        other_version,
+                        control,
+                    )?;
+                    if let Some(det_id) =
+                        self.preparation.lookup_iri(self.snap, det_iri.as_str())?
+                    {
+                        rival_det_ids.push(det_id);
+                    }
+                }
+                if !rivals.is_empty() {
+                    let check_rival =
+                        |r: Id, g_id: Id, g_nonce: Uuid, g_nonce_id: Id| -> Result<bool> {
+                            if !self.contains_id(r, rdf_type, proj_class, g_id)?
+                                || !self.contains_id(r, graph_prot_pred, g_nonce_id, g_id)?
+                                || self.single_object_id(g_id, r, output_pred)? != Some(output_id)
+                                || self.single_object_id(g_id, r, output_prot_pred)?
+                                    != Some(out_nonce_id)
+                                || self.single_object_id(g_id, r, supports_prot_pred)?
+                                    != Some(g_nonce_id)
+                            {
+                                return Ok(false);
+                            }
+                            let Some(other_id) = self.single_object_id(g_id, r, review_policy)?
+                            else {
+                                return Ok(false);
+                            };
+                            let Some(&other_ver_id) = rivals.get(&other_id) else {
+                                return Ok(false);
+                            };
+                            Ok(self.single_object_id(g_id, r, policy_version_pred)?
+                                == Some(other_ver_id)
+                                && authenticated_id(r, g_id, g_nonce_id)?
+                                && !is_superseded(r, g_id, g_nonce, g_nonce_id, other_id)?)
+                        };
+                    for (&g_id, &(g_nonce, g_nonce_id)) in &protected {
+                        for &det_id in &rival_det_ids {
+                            if check_rival(det_id, g_id, g_nonce, g_nonce_id)? {
+                                return Ok(true);
+                            }
+                        }
+                        let Some(idx_pred) = indexed_proj_pred else {
+                            continue;
+                        };
+                        let out_idx = super::review::projection_output_index_iri(
+                            g_nonce,
+                            out_nonce,
+                            output_graph,
+                        );
+                        let Some(out_idx_id) =
+                            self.preparation.lookup_iri(self.snap, out_idx.as_str())?
+                        else {
+                            continue;
+                        };
+                        let mut drifted = false;
+                        self.preparation.scan(
+                            self.snap,
+                            Perm::Gspo,
+                            &[g_id.0, out_idx_id.0, idx_pred.0],
+                            |q| {
+                                let r = q[2];
+                                if check_rival(r, g_id, g_nonce, g_nonce_id)? {
+                                    drifted = true;
+                                    return Ok(false);
+                                }
+                                Ok(true)
+                            },
+                        )?;
+                        if drifted {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(false)
     }
 
     /// Whether some graph that holds `s p o` satisfies `accept`, which sees each graph's
@@ -3091,27 +4137,6 @@ impl<'a> Reads<'a> {
             };
         }
         Ok(found)
-    }
-}
-
-/// Estimate heap bytes owned by a cloned `Term` for preparation accounting.
-fn term_heap_bytes(t: &Term) -> u64 {
-    match t {
-        Term::NamedNode(n) => (n.as_str().len() as u64).saturating_add(48),
-        Term::BlankNode(b) => (b.as_str().len() as u64).saturating_add(48),
-        Term::Literal(l) => (l.value().len() as u64)
-            .saturating_add(l.datatype().as_str().len() as u64)
-            .saturating_add(l.language().map_or(0, str::len) as u64)
-            .saturating_add(96),
-        Term::Triple(tr) => {
-            let s = match &tr.subject {
-                NamedOrBlankNode::NamedNode(n) => n.as_str().len() as u64,
-                NamedOrBlankNode::BlankNode(b) => b.as_str().len() as u64,
-            };
-            s.saturating_add(tr.predicate.as_str().len() as u64)
-                .saturating_add(term_heap_bytes(&tr.object))
-                .saturating_add(96)
-        }
     }
 }
 

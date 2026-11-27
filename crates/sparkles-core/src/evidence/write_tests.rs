@@ -2593,3 +2593,342 @@ fn source_revision_predecessor_writes_prov_was_revision_of_and_rejects_cycles() 
     let err = plan_of(&two, &s, None).unwrap_err();
     assert!(err.to_string().contains("cycle"), "{err}");
 }
+
+/// Allocation-free N-Triples and JSON-escaped byte estimates upper-bound actual
+/// serialization, including control characters that expand up to 7x under N-Triples
+/// plus JSON escaping.
+#[test]
+fn ntriples_and_json_escaped_byte_estimates_bound_actual_serialization() {
+    let cases = vec![
+        Triple::new(
+            NamedNode::new_unchecked("urn:s"),
+            NamedNode::new_unchecked("urn:p"),
+            Literal::new_simple_literal("\0\x01\x07\x08\t\n\x0c\r\x1f\"\\\x7f\u{FFFE}\u{FFFF}abc"),
+        ),
+        Triple::new(
+            oxrdf::BlankNode::new_unchecked("b0"),
+            NamedNode::new_unchecked("urn:p"),
+            Literal::new_language_tagged_literal_unchecked("hello\0world", "en-US"),
+        ),
+        Triple::new(
+            NamedNode::new_unchecked("urn:s"),
+            NamedNode::new_unchecked("urn:p"),
+            Literal::new_typed_literal(
+                "[\"\\u0000\"]",
+                NamedNode::new_unchecked("http://example.org/dt"),
+            ),
+        ),
+        Triple::new(
+            NamedNode::new_unchecked("urn:outer"),
+            NamedNode::new_unchecked("urn:reifies"),
+            Term::Triple(Box::new(Triple::new(
+                oxrdf::BlankNode::new_unchecked("inner"),
+                NamedNode::new_unchecked("urn:q"),
+                Literal::new_simple_literal("\0".repeat(256)),
+            ))),
+        ),
+    ];
+    for t in cases {
+        let nt = t.to_string();
+        let json = serde_json::to_string(&nt).unwrap();
+        assert!(
+            ntriples_triple_bytes(&t) >= nt.len() as u64,
+            "ntriples estimate {} < actual {} for {nt}",
+            ntriples_triple_bytes(&t),
+            nt.len()
+        );
+        assert!(
+            json_escaped_ntriples_triple_bytes(&t) >= json.len() as u64,
+            "json estimate {} < actual {} for {json}",
+            json_escaped_ntriples_triple_bytes(&t),
+            json.len()
+        );
+    }
+}
+
+/// `subjects_up_to_held` and `objects_up_to_held` charge retained decoded clones to
+/// the caller's reservation before cloning so long IRIs or literals cannot exceed the
+/// preparation allowance.
+#[test]
+fn subjects_up_to_held_and_objects_up_to_held_charge_before_cloning() {
+    use crate::store::{Store, StoreOptions};
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("INSERT DATA { GRAPH <urn:g> {");
+    for i in 0..80 {
+        data.push_str(&format!(
+            " <urn:subj:{i}:{}> <urn:p> <urn:target> . <urn:head> <urn:rev> <urn:obj:{i}:{}> .",
+            "x".repeat(1024),
+            "y".repeat(1024)
+        ));
+    }
+    data.push_str(" } }");
+    crate::sparql::update::update(&s, &data, &crate::sparql::QueryOptions::default()).unwrap();
+    let snap = s.snapshot();
+    // 80 * ~1 KiB = ~80 KiB of retained IRIs per scan: both scans together fit in
+    // 512 KiB, while a single scan refuses in 64 KiB.
+    let roomy = Preparation::new(crate::task::Control::none(), 512 << 10).unwrap();
+    let mut reads = Reads::new(&roomy, &snap);
+    let mut held = roomy.reserve(0).unwrap();
+    let (subs, more_s) = reads
+        .subjects_up_to_held(
+            "urn:p",
+            &Term::NamedNode(NamedNode::new_unchecked("urn:target")),
+            "urn:g",
+            1000,
+            &mut held,
+        )
+        .unwrap();
+    assert_eq!(subs.len(), 80);
+    assert!(!more_s);
+    let (objs, more_o) = reads
+        .objects_up_to_held("urn:head", "urn:rev", "urn:g", 1000, &mut held)
+        .unwrap();
+    assert_eq!(objs.len(), 80);
+    assert!(!more_o);
+    drop(held);
+
+    let tight = Preparation::new(crate::task::Control::none(), 64 << 10).unwrap();
+    let mut reads = Reads::new(&tight, &snap);
+    let mut held = tight.reserve(0).unwrap();
+    assert!(matches!(
+        reads.subjects_up_to_held(
+            "urn:p",
+            &Term::NamedNode(NamedNode::new_unchecked("urn:target")),
+            "urn:g",
+            1000,
+            &mut held,
+        ),
+        Err(Error::BudgetExceeded(_))
+    ));
+    drop(held);
+    let mut held = tight.reserve(0).unwrap();
+    assert!(matches!(
+        reads.objects_up_to_held("urn:head", "urn:rev", "urn:g", 1000, &mut held),
+        Err(Error::BudgetExceeded(_))
+    ));
+}
+
+/// `ManagedWrite::record_protection` returns `None` for projection-only graphs so
+/// `publish_quads` refuses to publish `ev:Operation` records into them.
+#[test]
+fn publish_quads_refuses_projection_only_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = crate::store::Store::open(
+        &dir.path().join("ds"),
+        crate::store::StoreOptions::default(),
+    )
+    .unwrap();
+    let mut s = settings(&["urn:ev:sources"], &["urn:ev:claims"]);
+    s.decisions.push("urn:ev:decisions".into());
+    s.supports.push("urn:ev:supports".into());
+    s.projections.push("urn:ev:output".into());
+    s.policies.insert(
+        "main".into(),
+        crate::evidence::Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported],
+            required_scope: Vec::new(),
+            conflicts: crate::evidence::ConflictMode::Refuse,
+            boundary: vec!["urn:ev:sources".into(), "urn:ev:claims".into()],
+            decisions: "urn:ev:decisions".into(),
+            supports: "urn:ev:supports".into(),
+            output: "urn:ev:output".into(),
+        },
+    );
+    let canonical = s.canonical(&Control::none()).unwrap();
+    store
+        .enable_managed(
+            crate::managed::OwnerKind::Evidence,
+            crate::managed::OwnerEntry::for_settings(1, s.managed_graphs(), canonical.bytes()),
+            canonical.bytes(),
+        )
+        .unwrap();
+    let cap = store
+        .managed_writer(crate::managed::OwnerKind::Evidence, Uuid::new_v4())
+        .unwrap();
+    assert!(cap.is_projection_only("urn:ev:output"));
+    assert!(cap.protection("urn:ev:output").is_some());
+    assert_eq!(cap.record_protection("urn:ev:output"), None);
+    let err = publish_quads(
+        &Operation {
+            iri: &iri("urn:op:1"),
+            principal: &iri("urn:p"),
+            payload_digest: Sha256Digest::of_bytes(b"p", &Control::none()).unwrap(),
+            idempotency_key: None,
+            hold: None,
+            used: None,
+        },
+        &[iri("urn:ev:output")],
+        &[],
+        &Stamp {
+            dataset: Uuid::new_v4(),
+            branch: Uuid::new_v4(),
+            commit: 1,
+            time_ms: 0,
+        },
+        &|g| cap.record_protection(g.as_str()),
+        &[],
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "unsupported-profile");
+}
+
+/// On a compacted disk-backed snapshot where preceding graphs are ordered before the
+/// requested graph (`id(g_before) < id(g_target)`), `subjects_up_to_held` and
+/// `subjects_matching_up_to_held` must exercise the `found_g < g_id` exact-key fallback
+/// via bounded `Perm::Pos` (`contains_pos_id`) rather than unbudgeted `Snapshot::contains`
+/// (`Perm::Spo`), and the fallback probe itself must enforce `Preparation` memory and
+/// cancellation limits.
+#[test]
+fn subjects_up_to_held_on_compacted_snapshot_with_preceding_graph_stays_bounded() {
+    use crate::index::{ALL_COLS, Perm, SEG_ROWS};
+    use crate::store::{Store, StoreOptions};
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        // Place `<urn:s:0000> <urn:p> <urn:o>` in `SEG_ROWS + 2` preceding graphs
+        // (`<urn:g:0000>..`) ordered before `<urn:z-target>`, plus `<urn:z-target>`
+        // itself. In compacted `Perm::Pos`, `(p, o, s0, g:0000)` lands in segment 0
+        // (2,048 rows) and `(p, o, s0, z-target)` lands in segment 1, so the initial
+        // POS seek decodes only segment 0 while the `found_g < g_id` fallback must
+        // probe segment 1 of `Perm::Pos` (never `Perm::Spo`).
+        let mut data = String::from("INSERT DATA {");
+        for g in 0..(SEG_ROWS + 2) {
+            data.push_str(&format!(
+                " GRAPH <urn:g:{g:04}> {{ <urn:s:0000> <urn:p> <urn:o> . }}"
+            ));
+        }
+        data.push_str(" GRAPH <urn:g:0000> { <urn:s:0000> <urn:p2> <urn:o2> . }");
+        data.push_str(
+            " GRAPH <urn:z-target> { <urn:s:0000> <urn:p> <urn:o> . <urn:s:0000> <urn:p2> <urn:o2> . }",
+        );
+        data.push_str(" }");
+        crate::sparql::update::update(&s, &data, &crate::sparql::QueryOptions::default()).unwrap();
+        s.compact().unwrap();
+    }
+
+    let o = Term::NamedNode(NamedNode::new_unchecked("urn:o"));
+    let o2 = Term::NamedNode(NamedNode::new_unchecked("urn:o2"));
+
+    // 1. Cold reopen with roomy budget: `subjects_up_to_held` and
+    // `subjects_matching_up_to_held` must decode `Perm::Pos` segment 0 (initial seek)
+    // and segment 1 (the `found_g < g_id` `contains_pos_id` fallback), while leaving
+    // `Perm::Spo` completely undecoded (proving `Snapshot::contains` was not used).
+    let (p_id, o_id, s0_id, g_target, seg0_workspace, seg1_workspace) = {
+        let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        let snap = s.snapshot();
+        let roomy = Preparation::new(crate::task::Control::none(), 2 << 20).unwrap();
+        let g_before = roomy.lookup_iri(&snap, "urn:g:0000").unwrap().unwrap();
+        let g_target = roomy.lookup_iri(&snap, "urn:z-target").unwrap().unwrap();
+        let p_id = roomy.lookup_iri(&snap, "urn:p").unwrap().unwrap();
+        let o_id = roomy.lookup_term(&snap, &o).unwrap().unwrap();
+        let s0_id = roomy.lookup_iri(&snap, "urn:s:0000").unwrap().unwrap();
+        assert!(
+            g_before.0 < g_target.0,
+            "compacted vocab must order urn:g:0000 ({}) before urn:z-target ({})",
+            g_before.0,
+            g_target.0
+        );
+        let pos_idx = snap.perm(Perm::Pos);
+        let spo_idx = snap.perm(Perm::Spo);
+        assert!(
+            pos_idx.segmented(),
+            "expected segmented compacted Perm::Pos"
+        );
+        let (r0_start, r0_end) = pos_idx.segment_rows(0, 0);
+        let (r1_start, r1_end) = pos_idx.segment_rows(0, 1);
+        let seg0_workspace = ((r0_end - r0_start) as u64) * 52 + 1024;
+        let seg1_workspace = ((r1_end - r1_start) as u64) * 52 + 1024;
+        assert!(
+            seg1_workspace < seg0_workspace,
+            "expected segment 1 workspace ({seg1_workspace}) < segment 0 workspace ({seg0_workspace})"
+        );
+        assert!(!snap.cache.has_segment(pos_idx, 0, 0, ALL_COLS));
+        assert!(!snap.cache.has_segment(pos_idx, 0, 1, ALL_COLS));
+        assert!(!snap.cache.has_segment(spo_idx, 0, 0, ALL_COLS));
+
+        let mut reads = Reads::new(&roomy, &snap);
+        let mut held = roomy.reserve(0).unwrap();
+        let (subs, more) = reads
+            .subjects_up_to_held("urn:p", &o, "urn:z-target", 1000, &mut held)
+            .unwrap();
+        assert_eq!(subs.len(), 1);
+        assert!(!more);
+        assert_eq!(subs[0].as_str(), "urn:s:0000");
+
+        assert!(
+            snap.cache.has_segment(pos_idx, 0, 0, ALL_COLS),
+            "initial POS seek must decode Perm::Pos segment 0"
+        );
+        assert!(
+            snap.cache.has_segment(pos_idx, 0, 1, ALL_COLS),
+            "found_g < g_id fallback must decode Perm::Pos segment 1 via contains_pos_id"
+        );
+        assert!(
+            !snap.cache.has_segment(spo_idx, 0, 0, ALL_COLS)
+                && !snap.cache.has_segment(spo_idx, 0, 1, ALL_COLS),
+            "found_g < g_id fallback must never touch Perm::Spo (Snapshot::contains)"
+        );
+
+        let (matched, more_m) = reads
+            .subjects_matching_up_to_held(
+                &[("urn:p", &o), ("urn:p2", &o2)],
+                "urn:z-target",
+                1000,
+                &mut held,
+            )
+            .unwrap();
+        assert_eq!(matched, subs);
+        assert!(!more_m);
+        assert!(
+            !snap.cache.has_segment(spo_idx, 0, 0, ALL_COLS)
+                && !snap.cache.has_segment(spo_idx, 0, 1, ALL_COLS),
+            "multi-clause intersection must never touch Perm::Spo"
+        );
+        drop(held);
+        (p_id, o_id, s0_id, g_target, seg0_workspace, seg1_workspace)
+    };
+
+    // 2. Cold reopen: verify the exact `contains_pos_id` fallback probe itself enforces
+    // Preparation's memory budget and cancellation on segment 1 (strictly below segment
+    // 0's workspace, proving it probes segment 1 directly without decoding segment 0 or
+    // Perm::Spo).
+    {
+        let s_cold = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        let snap_cold = s_cold.snapshot();
+        let pos_idx = snap_cold.perm(Perm::Pos);
+        let spo_idx = snap_cold.perm(Perm::Spo);
+
+        let tight = Preparation::new(crate::task::Control::none(), seg1_workspace - 1).unwrap();
+        let reads_tight = Reads::new(&tight, &snap_cold);
+        assert!(matches!(
+            reads_tight.contains_pos_id(p_id, o_id, s0_id, g_target),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert!(!snap_cold.cache.has_segment(pos_idx, 0, 1, ALL_COLS));
+        assert!(!snap_cold.cache.has_segment(spo_idx, 0, 0, ALL_COLS));
+
+        let cancelled_control = crate::task::Control::none();
+        let cancelled = Preparation::new(cancelled_control.clone(), 2 << 20).unwrap();
+        cancelled_control.cancel.cancel();
+        let reads_cancelled = Reads::new(&cancelled, &snap_cold);
+        assert!(matches!(
+            reads_cancelled.contains_pos_id(p_id, o_id, s0_id, g_target),
+            Err(Error::Cancelled)
+        ));
+
+        let seg1_only =
+            Preparation::new(crate::task::Control::none(), seg1_workspace + 1024).unwrap();
+        assert!(seg1_workspace + 1024 < seg0_workspace);
+        let reads_seg1 = Reads::new(&seg1_only, &snap_cold);
+        assert!(
+            reads_seg1
+                .contains_pos_id(p_id, o_id, s0_id, g_target)
+                .unwrap()
+        );
+        assert!(snap_cold.cache.has_segment(pos_idx, 0, 1, ALL_COLS));
+        assert!(!snap_cold.cache.has_segment(pos_idx, 0, 0, ALL_COLS));
+        assert!(!snap_cold.cache.has_segment(spo_idx, 0, 0, ALL_COLS));
+    }
+}

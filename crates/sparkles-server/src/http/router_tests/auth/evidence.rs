@@ -3838,3 +3838,293 @@ level = "read"
         "reconnected SSE stream across same-commit detach must emit empty reset: {reconnect_text}"
     );
 }
+
+#[tokio::test]
+async fn projection_reconciliation_requires_admin_and_respects_drift() {
+    let s = proposal_server();
+    let alice = b("alice");
+    let evw = basic("evw", "evw-pw");
+    let bob = b("bob");
+
+    let settings = serde_json::json!({
+        "format": 1, "profile": 1, "enabled": true,
+        "sourceRecords": ["urn:ev:sources"],
+        "proposals": ["urn:ev:claims"],
+        "decisions": ["urn:ev:decisions"],
+        "supports": ["urn:ev:supports"],
+        "projections": ["urn:ev:accepted"],
+        "policies": {
+            "main": {
+                "version": 1,
+                "admittedKinds": ["reported"],
+                "conflicts": "refuse",
+                "boundary": ["urn:ev:sources", "urn:ev:claims"],
+                "decisions": "urn:ev:decisions",
+                "supports": "urn:ev:supports",
+                "output": "urn:ev:accepted"
+            }
+        }
+    });
+    let r = call(
+        &s.app,
+        "PUT",
+        "/$/evidence/ev/settings",
+        &[
+            ("authorization", &alice),
+            ("content-type", "application/json"),
+        ],
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+
+    let body = serde_json::json!({"policy": "main"}).to_string();
+
+    // Anonymous caller gets 401.
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/projections/reconcile",
+        &[("content-type", "application/json")],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+
+    // Non-admin writer (evw) and unauthorized user (bob) are refused.
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/projections/reconcile",
+        &[
+            ("authorization", &evw),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/projections/reconcile",
+        &[
+            ("authorization", &bob),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert!(
+        matches!(r.status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND),
+        "{}: {}",
+        r.status,
+        r.text()
+    );
+
+    // Introduce declared evidence settings drift and confirm 409 evidence-settings-drift.
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    std::fs::write(
+        &f,
+        serde_json::json!({
+            "datasets": {
+                "ev": {
+                    "evidence": {
+                        "enabled": true,
+                        "sourceRecords": ["urn:ev:sources", "urn:ev:extra-sources"],
+                        "proposals": ["urn:ev:claims"],
+                        "decisions": ["urn:ev:decisions"],
+                        "supports": ["urn:ev:supports"],
+                        "projections": ["urn:ev:accepted"],
+                        "policies": settings["policies"]
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let declared = crate::settings::Settings::load(&f, None)
+        .unwrap()
+        .declared();
+    s.state.settings.replace_declared_for_test(declared);
+
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/projections/reconcile",
+        &[
+            ("authorization", &alice),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(r.json()["code"], "evidence-settings-drift");
+
+    // Reconcile the declared settings, then admin projection reconciliation succeeds.
+    let r = call(
+        &s.app,
+        "DELETE",
+        "/$/settings/ev/evidence",
+        &[("authorization", &alice)],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/projections/reconcile",
+        &[
+            ("authorization", &alice),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["committed"], true);
+    drop(dir);
+}
+
+#[tokio::test]
+async fn projection_reconciliation_branch_admin_and_authority_changed() {
+    let h = |pw: &str| hash_password_with(pw, 8, 1, 1).unwrap();
+    let s = build(Fixture {
+        extra: format!(
+            r#"
+[[users]]
+name = "devadmin"
+password = "{devadmin}"
+[[users.grants]]
+dataset = "ev"
+level = "admin"
+branches = ["dev"]
+"#,
+            devadmin = h("devadmin-pw"),
+        ),
+        ..Default::default()
+    });
+    let ds = s.state.attach("ev", DbType::Persistent, None).unwrap();
+    let alice = b("alice");
+    let devadmin = basic("devadmin", "devadmin-pw");
+
+    let settings = serde_json::json!({
+        "format": 1, "profile": 1, "enabled": true,
+        "sourceRecords": ["urn:ev:sources"],
+        "proposals": ["urn:ev:claims"],
+        "decisions": ["urn:ev:decisions"],
+        "supports": ["urn:ev:supports"],
+        "projections": ["urn:ev:accepted"],
+        "policies": {
+            "main": {
+                "version": 1,
+                "admittedKinds": ["reported"],
+                "conflicts": "refuse",
+                "boundary": ["urn:ev:sources", "urn:ev:claims"],
+                "decisions": "urn:ev:decisions",
+                "supports": "urn:ev:supports",
+                "output": "urn:ev:accepted"
+            }
+        }
+    });
+    let r = call(
+        &s.app,
+        "PUT",
+        "/$/evidence/ev/settings",
+        &[
+            ("authorization", &alice),
+            ("content-type", "application/json"),
+        ],
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+
+    ds.store
+        .create_branch("dev", &sparkles::branch::BranchOptions::default())
+        .unwrap();
+
+    let body = serde_json::json!({"policy": "main"}).to_string();
+
+    // Branch-only admin is refused on main and succeeds on ?branch=dev.
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/projections/reconcile",
+        &[
+            ("authorization", &devadmin),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert!(
+        matches!(r.status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND),
+        "{}: {}",
+        r.status,
+        r.text()
+    );
+
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/projections/reconcile?branch=dev",
+        &[
+            ("authorization", &devadmin),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["committed"], true);
+
+    // Revoking an admin bearer token right before publication returns 503 with
+    // Retry-After: 1 and code "authority-changed", matching run_http.
+    let (cookie, csrf) = password_session(&s, "alice").await;
+    let r = super::tokens::mint_as(
+        &s.app,
+        &[("cookie", &cookie), ("x-sparkles-csrf", &csrf)],
+        r#"{"name":"reconciler","datasets":{"ev":"admin"},"expiresIn":"7d"}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let token = r.json()["token"].as_str().unwrap().to_string();
+    let id = r.json()["id"].as_str().unwrap().to_string();
+
+    let auth = s.auth();
+    let revoked = id.clone();
+    ds.store.set_failpoint(
+        "evidence-reconcile-before-publish",
+        Some(Arc::new(move |_| {
+            assert_eq!(
+                auth.tokens.remove(std::slice::from_ref(&revoked)).unwrap(),
+                1
+            );
+        })),
+    );
+    let head = ds.store.head_commit().seq;
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/projections/reconcile",
+        &[
+            ("authorization", &bearer(&token)),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    ds.store
+        .set_failpoint("evidence-reconcile-before-publish", None);
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
+    assert_eq!(r.json()["code"], "authority-changed");
+    assert_eq!(r.header("retry-after"), "1");
+    assert_eq!(ds.store.head_commit().seq, head);
+}

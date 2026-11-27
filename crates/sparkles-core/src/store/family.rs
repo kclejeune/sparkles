@@ -73,6 +73,10 @@ pub(crate) struct Family {
     /// created before it was enabled, so they cannot diverge. Shared with snapshots via
     /// `Arc` without retaining `Family` or its root process lock.
     pub(crate) managed: Arc<ManagedSlot>,
+    /// Serializes managed-registry changes end-to-end (including their post-install
+    /// `managed_barrier`) so a subsequent registry change never inspects branches while
+    /// a writer admitted under a superseded registry is still in flight.
+    pub(crate) managed_change: Mutex<()>,
     /// The durable source holds of main and every branch (see [`crate::holds`]).
     pub(crate) holds: crate::holds::FamilyHolds,
     /// Selection made under this opening's actual root process exclusion. This
@@ -96,6 +100,7 @@ impl Family {
         Arc::new(Self {
             gate: Arc::new(FamilyGate::default()),
             managed: Arc::new(ManagedSlot::empty()),
+            managed_change: Mutex::new(()),
             holds: Default::default(),
             origin,
             origin_format,

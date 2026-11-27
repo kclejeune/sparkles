@@ -476,6 +476,11 @@ python = "planned: evidence re-authentication in the bindings with the typed evi
 jvm = "planned: evidence re-authentication in the bindings with the typed evidence operations"
 node = "planned: evidence re-authentication in the bindings with the typed evidence operations"
 
+["evidence.reconcile_projection"]
+python = "planned: evidence projection reconciliation in the bindings with the typed evidence operations"
+jvm = "planned: evidence projection reconciliation in the bindings with the typed evidence operations"
+node = "planned: evidence projection reconciliation in the bindings with the typed evidence operations"
+
 ["evidence.release_hold"]
 python = "Dataset.evidence.release_hold"
 jvm = "DatasetGraphSparkles.evidence().releaseHold"

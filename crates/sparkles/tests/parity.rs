@@ -450,6 +450,21 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("reauthenticateEvidence", "evidence.reauthenticate", |ds| {
             let _ = sparkles::evidence::reauthenticate(ds, ds, &any(), &any(), &any());
         }),
+        op!(
+            "reconcileEvidenceProjection",
+            "evidence.reconcile_projection",
+            |ds| {
+                let _ = sparkles::evidence::reconcile_projection(
+                    ds,
+                    ds,
+                    "",
+                    None,
+                    &any(),
+                    None,
+                    &any(),
+                );
+            }
+        ),
         op!("listEvidenceHolds", "evidence.holds", |ds| {
             let _ = sparkles::evidence::holds(ds);
         }),

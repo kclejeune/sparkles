@@ -2399,3 +2399,860 @@ async fn evidence_source_revision_predecessors_over_http() {
         "{j}"
     );
 }
+
+/// Administered projection reconciliation through `POST /$/evidence/{ds}/projections/reconcile`
+/// after detaching and re-protecting a policy's output or supports graph, including dry runs,
+/// idempotent replays, branches and refusals.
+#[tokio::test]
+async fn projection_reconciliation_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    state.attach("d", DbType::Persistent, None).unwrap();
+    let app = router(state.clone());
+    let ds = state.get("d").unwrap();
+    let post = |path: String, body: J| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                &path,
+                Some("application/json"),
+                &body.to_string(),
+            )
+            .await
+        }
+    };
+    let settings = json!({
+        "format": 1, "profile": 1, "enabled": true,
+        "sourceRecords": ["urn:ev:sources"], "proposals": ["urn:ev:claims"],
+        "decisions": ["urn:ev:decisions"], "supports": ["urn:ev:supports"],
+        "projections": ["urn:ev:accepted"],
+        "policies": {
+            "main": {
+                "version": 1,
+                "admittedKinds": ["reported"],
+                "conflicts": "refuse",
+                "boundary": ["urn:ev:sources", "urn:ev:claims"],
+                "decisions": "urn:ev:decisions",
+                "supports": "urn:ev:supports",
+                "output": "urn:ev:accepted"
+            }
+        }
+    });
+    let (status, j) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+
+    let propose_claim = |occ: &str, obj: &str| {
+        post(
+            "/d/claims".into(),
+            json!({
+                "revisions": [{
+                    "key": "rev", "source": "urn:src", "sourceKey": occ,
+                    "content": {"text": occ}
+                }],
+                "claims": [{
+                    "key": "claim", "occurrenceKey": occ, "revision": {"key": "rev"},
+                    "proposition": format!("<urn:release> <urn:affectedBy> <{obj}>"),
+                    "kind": "reported", "polarity": "positive", "author": "urn:publisher"
+                }]
+            }),
+        )
+    };
+    let (status, p1) = propose_claim("c1", "urn:cve1").await;
+    assert_eq!(status, StatusCode::OK, "{p1}");
+    let c1 = p1["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "claim")
+        .unwrap()
+        .clone();
+    let (status, p2) = propose_claim("c2", "urn:cve2").await;
+    assert_eq!(status, StatusCode::OK, "{p2}");
+    let c2 = p2["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "claim")
+        .unwrap()
+        .clone();
+
+    let head = ds.store.head_commit().seq;
+    let (status, r) = post(
+        "/d/claims/review".into(),
+        json!({
+            "policy": "main", "policyVersion": 1, "ifHead": head,
+            "decisions": [{"key": "d1", "target": c1["iri"], "targetDigest": c1["recordDigest"], "disposition": "accepted"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{r}");
+    let support1 = r["decisions"][0]["support"].as_str().unwrap().to_string();
+
+    // Branch dev copies the accepted state before detach.
+    ds.store
+        .create_branch("dev", &sparkles::branch::BranchOptions::default())
+        .unwrap();
+
+    // Detach output, inject bogus triple, delete valid triple, re-protect.
+    let (status, j) = post(
+        "/$/evidence/d/detach".into(),
+        json!({"graph": "urn:ev:accepted"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/d/update",
+        Some(UPDATE),
+        "DELETE DATA { GRAPH <urn:ev:accepted> { <urn:release> <urn:affectedBy> <urn:cve1> } } ; \
+         INSERT DATA { GRAPH <urn:ev:accepted> { <urn:bogus> <urn:p> 1 } }",
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (status, j) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+
+    // Review and withdraw fail with 503 projection-unavailable.
+    let head = ds.store.head_commit().seq;
+    let (status, j) = post(
+        "/d/claims/review".into(),
+        json!({
+            "policy": "main", "policyVersion": 1, "ifHead": head,
+            "decisions": [{"key": "d2", "target": c2["iri"], "targetDigest": c2["recordDigest"], "disposition": "accepted"}]
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, j["code"].as_str()),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("projection-unavailable")
+        ),
+        "{j}"
+    );
+
+    // Dry run previews rebuild without committing.
+    let (status, dry) = post(
+        "/$/evidence/d/projections/reconcile".into(),
+        json!({"policy": "main", "policyVersion": 1, "ifHead": head, "dryRun": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{dry}");
+    assert_eq!(dry["committed"], false);
+    assert_eq!(dry["dryRun"]["wouldCommit"], true);
+    assert_eq!(dry["changed"]["inserted"].as_array().unwrap().len(), 1);
+    assert_eq!(dry["changed"]["removed"].as_array().unwrap().len(), 1);
+    assert_eq!(ds.store.head_commit().seq, head);
+
+    // Real reconciliation rebuilds output from vouched support and replays cleanly.
+    let (status, rec) = post(
+        "/$/evidence/d/projections/reconcile".into(),
+        json!({
+            "policy": "main", "policyVersion": 1, "ifHead": head,
+            "idempotencyKey": "reconcile-http-1", "message": "rebuild output"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rec}");
+    assert_eq!(rec["committed"], true);
+    assert_eq!(rec["replayed"], false);
+    assert_eq!(rec["vouchedSupports"], json!([support1]));
+    assert!(
+        ds.dataset
+            .ask("ASK { GRAPH <urn:ev:accepted> { <urn:release> <urn:affectedBy> <urn:cve1> } }")
+            .unwrap()
+    );
+    assert!(
+        !ds.dataset
+            .ask("ASK { GRAPH <urn:ev:accepted> { <urn:bogus> <urn:p> 1 } }")
+            .unwrap()
+    );
+
+    let (status, replay) = post(
+        "/$/evidence/d/projections/reconcile".into(),
+        json!({
+            "policy": "main", "policyVersion": 1,
+            "idempotencyKey": "reconcile-http-1"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["projection"], rec["projection"]);
+
+    // Subsequent review and withdrawal succeed.
+    let head = ds.store.head_commit().seq;
+    let (status, r2) = post(
+        "/d/claims/review".into(),
+        json!({
+            "policy": "main", "policyVersion": 1, "ifHead": head,
+            "decisions": [{"key": "d2", "target": c2["iri"], "targetDigest": c2["recordDigest"], "disposition": "accepted"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{r2}");
+    let (status, w) = post(
+        "/d/claims/withdraw".into(),
+        json!({"withdrawals": [{"key": "w1", "target": c1["iri"], "targetDigest": c1["recordDigest"]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{w}");
+    assert!(
+        !ds.dataset
+            .ask("ASK { GRAPH <urn:ev:accepted> { <urn:release> <urn:affectedBy> <urn:cve1> } }")
+            .unwrap()
+    );
+    assert!(
+        ds.dataset
+            .ask("ASK { GRAPH <urn:ev:accepted> { <urn:release> <urn:affectedBy> <urn:cve2> } }")
+            .unwrap()
+    );
+
+    // Branch reconciliation works via ?branch=dev.
+    let (status, rec_dev) = post(
+        "/$/evidence/d/projections/reconcile?branch=dev".into(),
+        json!({"policy": "main"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rec_dev}");
+    assert_eq!(rec_dev["committed"], true);
+
+    // Detach & re-protect SUPPORTS -> reconciliation empties output.
+    let (status, _) = post(
+        "/$/evidence/d/detach".into(),
+        json!({"graph": "urn:ev:supports"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, emptied) = post(
+        "/$/evidence/d/projections/reconcile".into(),
+        json!({"policy": "main"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{emptied}");
+    assert_eq!(emptied["vouchedSupports"], json!([]));
+    assert!(
+        !ds.dataset
+            .ask("ASK { GRAPH <urn:ev:accepted> { ?s ?p ?o } }")
+            .unwrap()
+    );
+
+    // Error cases: wrong policyVersion, stale ifHead, unknown policy, unknown field.
+    for (body, want, code) in [
+        (
+            json!({"policy": "main", "policyVersion": 2}),
+            StatusCode::CONFLICT,
+            Some("policy-changed"),
+        ),
+        (
+            json!({"policy": "main", "ifHead": 0}),
+            StatusCode::CONFLICT,
+            Some("head-changed"),
+        ),
+        (json!({"policy": "unknown"}), StatusCode::BAD_REQUEST, None),
+        (
+            json!({"policy": "main", "extra": 1}),
+            StatusCode::BAD_REQUEST,
+            Some("invalid-proposal"),
+        ),
+    ] {
+        let (status, j) = post("/$/evidence/d/projections/reconcile".into(), body.clone()).await;
+        assert_eq!(status, want, "{body}: {j}");
+        if let Some(code) = code {
+            assert_eq!(j["code"], code, "{body}: {j}");
+        }
+    }
+
+    // Read-only server refuses projection reconciliation with 403.
+    let ro_dir = tempfile::tempdir().unwrap();
+    let mut ro_state = AppState::new(
+        ro_dir.path(),
+        StoreOptions::default(),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    ro_state.attach("d", DbType::Persistent, None).unwrap();
+    ro_state.read_only = true;
+    let ro_app = router(Arc::new(ro_state));
+    let (status, j) = call(
+        &ro_app,
+        "POST",
+        "/$/evidence/d/projections/reconcile",
+        Some("application/json"),
+        &json!({"policy": "main"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{j}");
+}
+
+/// `POST /$/evidence/{ds}/projections/reconcile` participates in query memory pool
+/// admission and response lifetime accounting:
+/// - saturating the pool returns `503` with `Retry-After`,
+/// - leaving room only for the initial grant forces `Preparation::with_grant` growth to
+///   refuse with retryable `503` and `Retry-After` (proving the preparation uses the pool),
+/// - normal execution over a multi-MiB escaped-JSON diff near a power-of-two growth
+///   boundary grows the grant past the initial grant, retains the response buffer's pool
+///   charge while the HTTP response remains outstanding, and releases all pool credit once
+///   the response body is consumed and dropped,
+/// - a pool smaller than the operation's preparation requirement returns `507` without
+///   `Retry-After`.
+#[tokio::test]
+async fn projection_reconciliation_participates_in_query_memory_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = AppState::with_memory(
+        dir.path(),
+        StoreOptions::default(),
+        Duration::from_secs(30),
+        Some(32 << 20),
+    )
+    .unwrap();
+    state.admission.wait = Duration::from_millis(25);
+    // Cap initial grant at 4 MiB so a ~5.6 MiB escaped JSON response must grow the
+    // grant past initial admission and cross a 4 MiB vector growth boundary.
+    state.limits.query_memory_bytes = Some(4 << 20);
+    let state = Arc::new(state);
+    state.attach("d", DbType::Memory, None).unwrap();
+    let ds = state.get("d").unwrap();
+    let app = router(state.clone());
+
+    let ev_settings = json!({
+        "format": 1,
+        "profile": 1,
+        "enabled": true,
+        "sourceRecords": ["urn:ev:sources"],
+        "proposals": ["urn:ev:claims"],
+        "decisions": ["urn:ev:decisions"],
+        "supports": ["urn:ev:supports"],
+        "projections": ["urn:ev:accepted"],
+        "policies": {
+            "main": {
+                "version": 1,
+                "admittedKinds": ["reported"],
+                "conflicts": "refuse",
+                "boundary": ["urn:ev:sources", "urn:ev:claims"],
+                "decisions": "urn:ev:decisions",
+                "supports": "urn:ev:supports",
+                "output": "urn:ev:accepted"
+            }
+        }
+    });
+    let (status, j) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &ev_settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+
+    // Detach output, seed 80 stray triples with 10 KiB of `\u0000` (~800 KiB raw,
+    // ~5.6 MiB JSON — past the 4 MiB initial grant and 4 MiB geometric growth boundary),
+    // then re-protect.
+    let (status, j) = call(
+        &app,
+        "POST",
+        "/$/evidence/d/detach",
+        Some("application/json"),
+        &json!({"graph": "urn:ev:accepted"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let escaped = "\\u0000".repeat(10 * 1024);
+    let mut nq = String::with_capacity(80 * (escaped.len() + 64));
+    for i in 0..80 {
+        nq.push_str(&format!(
+            "<urn:stray:{i}> <urn:p> \"{escaped}\" <urn:ev:accepted> .\n"
+        ));
+    }
+    ds.dataset
+        .load_str(&nq, oxrdfio::RdfFormat::NQuads)
+        .unwrap();
+    let (status, j) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &ev_settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+
+    let pool = state.catalog.pool().expect("pool configured");
+    let init_grant = crate::server_memory::initial_grant(&state, pool);
+    assert_eq!(init_grant, 4 << 20);
+    assert_eq!(pool.granted(), 0);
+
+    // 1. Saturate the pool so admission times out with 503 + Retry-After.
+    let hog = pool.try_grant(pool.capacity()).expect("saturate pool");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/$/evidence/d/projections/reconcile")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"policy": "main"}).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(res.headers().contains_key("retry-after"));
+    drop(hog);
+    assert_eq!(pool.granted(), 0);
+
+    // 2. Leave room ONLY for the 4 MiB initial grant: admission succeeds, then
+    // Preparation::with_grant must grow past 4 MiB and fail with retryable 503 + Retry-After.
+    // An unpooled Preparation::new would miss this check and succeed with 200 OK.
+    let tight_hog = pool
+        .try_grant(pool.capacity() - init_grant)
+        .expect("leave only initial grant");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/$/evidence/d/projections/reconcile")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"policy": "main"}).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(res.headers().contains_key("retry-after"));
+    drop(tight_hog);
+    assert_eq!(pool.granted(), 0);
+
+    // 3. Release the hog: reconciliation grows past the 4 MiB initial grant during
+    // execution, keeps the ~5.6 MiB response buffer charged while the HTTP response
+    // remains outstanding, and releases all pool credit once the body is consumed.
+    let observed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let observed_hook = observed.clone();
+    let pool_hook = pool.clone();
+    ds.store.set_failpoint(
+        "evidence-reconcile-before-publish",
+        Some(Arc::new(move |_| {
+            observed_hook.store(pool_hook.granted(), std::sync::atomic::Ordering::SeqCst);
+        })),
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri("/$/evidence/d/projections/reconcile")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"policy": "main"}).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    ds.store
+        .set_failpoint("evidence-reconcile-before-publish", None);
+    assert_eq!(res.status(), StatusCode::OK);
+    let content_len: u64 = res
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .expect("exact content-length header")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        content_len > init_grant,
+        "expected response near >4 MiB growth boundary, got {content_len} bytes"
+    );
+    assert!(
+        observed.load(std::sync::atomic::Ordering::SeqCst) > init_grant,
+        "expected Preparation::with_grant to grow pool charge past initial grant"
+    );
+    // While `res` (and its HeldBody) remains outstanding, the pool retains the charge
+    // for the buffered response allocation.
+    let outstanding = pool.granted();
+    assert!(
+        outstanding >= content_len && outstanding > init_grant,
+        "expected outstanding response to retain pool charge >= {content_len}, got {outstanding}"
+    );
+    let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body_bytes.len() as u64, content_len);
+    let j: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(j["committed"], true);
+    assert_eq!(j["changed"]["removed"].as_array().unwrap().len(), 80);
+    assert_eq!(pool.granted(), 0);
+
+    // 4. A pool smaller than the operation's preparation requirement admits the initial
+    // grant and then refuses with non-retryable 507 Insufficient Storage (no Retry-After).
+    let small_dir = tempfile::tempdir().unwrap();
+    let small_state = Arc::new(
+        AppState::with_memory(
+            small_dir.path(),
+            StoreOptions::default(),
+            Duration::from_secs(30),
+            Some(4 << 20),
+        )
+        .unwrap(),
+    );
+    small_state.attach("d", DbType::Memory, None).unwrap();
+    let small_ds = small_state.get("d").unwrap();
+    let small_app = router(small_state.clone());
+    let (status, j) = call(
+        &small_app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &ev_settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let (status, j) = call(
+        &small_app,
+        "POST",
+        "/$/evidence/d/detach",
+        Some("application/json"),
+        &json!({"graph": "urn:ev:accepted"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    small_ds
+        .dataset
+        .load_str(&nq, oxrdfio::RdfFormat::NQuads)
+        .unwrap();
+    let (status, j) = call(
+        &small_app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &ev_settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/$/evidence/d/projections/reconcile")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"policy": "main"}).to_string()))
+        .unwrap();
+    let res = small_app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::INSUFFICIENT_STORAGE);
+    assert!(!res.headers().contains_key("retry-after"));
+    assert_eq!(small_state.catalog.pool().unwrap().granted(), 0);
+}
+
+/// Emitted frames of a projection reconciliation response share ownership of the backing
+/// JSON allocation and its pool reservation via `Bytes::from_owner`, so dropping the
+/// response body (either early while holding a frame, or after polling the final frame as
+/// Hyper does when queuing it for write) keeps the pool charged until the last frame drops.
+#[tokio::test]
+async fn projection_reconciliation_emitted_frames_retain_pool_charge_after_body_drop() {
+    use http_body_util::BodyExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = AppState::with_memory(
+        dir.path(),
+        StoreOptions::default(),
+        Duration::from_secs(30),
+        Some(32 << 20),
+    )
+    .unwrap();
+    state.limits.query_memory_bytes = Some(4 << 20);
+    let state = Arc::new(state);
+    state.attach("d", DbType::Memory, None).unwrap();
+    let ds = state.get("d").unwrap();
+    let app = router(state.clone());
+
+    let ev_settings = json!({
+        "format": 1,
+        "profile": 1,
+        "enabled": true,
+        "sourceRecords": ["urn:ev:sources"],
+        "proposals": ["urn:ev:claims"],
+        "decisions": ["urn:ev:decisions"],
+        "supports": ["urn:ev:supports"],
+        "projections": ["urn:ev:accepted"],
+        "policies": {
+            "main": {
+                "version": 1,
+                "admittedKinds": ["reported"],
+                "conflicts": "refuse",
+                "boundary": ["urn:ev:sources", "urn:ev:claims"],
+                "decisions": "urn:ev:decisions",
+                "supports": "urn:ev:supports",
+                "output": "urn:ev:accepted"
+            }
+        }
+    });
+    let (status, j) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &ev_settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+
+    let seed_strays = |ds: &Arc<crate::state::Dataset>, n: usize| {
+        let escaped = "\\u0000".repeat(10 * 1024);
+        let mut nq = String::with_capacity(n * (escaped.len() + 64));
+        for i in 0..n {
+            nq.push_str(&format!(
+                "<urn:frame-stray:{i}> <urn:p> \"{escaped}\" <urn:ev:accepted> .\n"
+            ));
+        }
+        ds.dataset
+            .load_str(&nq, oxrdfio::RdfFormat::NQuads)
+            .unwrap();
+    };
+    let pool = state.catalog.pool().expect("pool configured");
+
+    // 1. Hold an early emitted frame, drop the body, check pool stays charged, then drop frame.
+    let (status, j) = call(
+        &app,
+        "POST",
+        "/$/evidence/d/detach",
+        Some("application/json"),
+        &json!({"graph": "urn:ev:accepted"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    seed_strays(&ds, 8);
+    let (status, j) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &ev_settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/$/evidence/d/projections/reconcile")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"policy": "main"}).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let content_len: u64 = res
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        content_len > 64 << 10,
+        "expected multi-frame response, got {content_len} bytes"
+    );
+    let mut body = res.into_body();
+    let first_frame = body
+        .frame()
+        .await
+        .expect("first frame")
+        .expect("ok frame")
+        .into_data()
+        .expect("data frame");
+    assert!(!first_frame.is_empty());
+    // Drop the body while the first emitted frame is still live.
+    drop(body);
+    assert!(
+        pool.granted() >= content_len,
+        "pool must remain charged (>= {content_len}) while emitted frame survives body drop, got {}",
+        pool.granted()
+    );
+    drop(first_frame);
+    assert_eq!(pool.granted(), 0);
+
+    // 2. Poll every frame through end-of-stream and drop the exhausted body while the final
+    // frame remains live (matching Hyper's dispatch write-queue lifecycle).
+    let (status, j) = call(
+        &app,
+        "POST",
+        "/$/evidence/d/detach",
+        Some("application/json"),
+        &json!({"graph": "urn:ev:accepted"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    seed_strays(&ds, 8);
+    let (status, j) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &ev_settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/$/evidence/d/projections/reconcile")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"policy": "main"}).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let content_len: u64 = res
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut body = res.into_body();
+    let mut frames = Vec::new();
+    while let Some(frame) = body.frame().await {
+        frames.push(frame.expect("ok frame").into_data().expect("data frame"));
+    }
+    assert!(frames.len() >= 2, "expected multiple frames");
+    let final_frame = frames.pop().unwrap();
+    drop(frames);
+    drop(body);
+    assert!(
+        pool.granted() >= content_len,
+        "pool must remain charged (>= {content_len}) while final frame survives exhausted body drop, got {}",
+        pool.granted()
+    );
+    drop(final_frame);
+    assert_eq!(pool.granted(), 0);
+}
+
+/// If the request deadline expires after reconciliation has already committed, serializing
+/// the preadmitted receipt must not return `408 Request Timeout`; the caller receives the
+/// committed `200 OK` receipt and pool credit returns once the body drops.
+#[tokio::test]
+async fn projection_reconciliation_delivers_committed_receipt_after_deadline_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let timeout = Duration::from_millis(80);
+    let state = Arc::new(
+        AppState::with_memory(dir.path(), StoreOptions::default(), timeout, Some(32 << 20))
+            .unwrap(),
+    );
+    state.attach("d", DbType::Memory, None).unwrap();
+    let ds = state.get("d").unwrap();
+    let app = router(state.clone());
+
+    let ev_settings = json!({
+        "format": 1,
+        "profile": 1,
+        "enabled": true,
+        "sourceRecords": ["urn:ev:sources"],
+        "proposals": ["urn:ev:claims"],
+        "decisions": ["urn:ev:decisions"],
+        "supports": ["urn:ev:supports"],
+        "projections": ["urn:ev:accepted"],
+        "policies": {
+            "main": {
+                "version": 1,
+                "admittedKinds": ["reported"],
+                "conflicts": "refuse",
+                "boundary": ["urn:ev:sources", "urn:ev:claims"],
+                "decisions": "urn:ev:decisions",
+                "supports": "urn:ev:supports",
+                "output": "urn:ev:accepted"
+            }
+        }
+    });
+    let (status, j) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &ev_settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+
+    let (status, j) = call(
+        &app,
+        "POST",
+        "/$/evidence/d/detach",
+        Some("application/json"),
+        &json!({"graph": "urn:ev:accepted"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    ds.dataset
+        .load_str(
+            "<urn:stray> <urn:p> \"after-publish\" <urn:ev:accepted> .\n",
+            oxrdfio::RdfFormat::NQuads,
+        )
+        .unwrap();
+    let (status, j) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &ev_settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+
+    // Expire the 80 ms request deadline strictly AFTER `publish` commits.
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fired_hook = fired.clone();
+    ds.store.set_failpoint(
+        "evidence-reconcile-after-publish",
+        Some(Arc::new(move |_| {
+            fired_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(120));
+        })),
+    );
+    let started = std::time::Instant::now();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/$/evidence/d/projections/reconcile")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"policy": "main"}).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    ds.store
+        .set_failpoint("evidence-reconcile-after-publish", None);
+    assert!(
+        fired.load(std::sync::atomic::Ordering::SeqCst),
+        "post-publish failpoint must have fired"
+    );
+    assert!(
+        started.elapsed() >= timeout,
+        "request deadline must have expired before serialization completed"
+    );
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "committed reconciliation must deliver 200 OK instead of 408 after deadline expiry"
+    );
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(j["committed"], true);
+    assert_eq!(j["commit"], ds.store.head_commit().seq);
+    assert_eq!(j["changed"]["removed"].as_array().unwrap().len(), 1);
+    // Single-frame responses are returned zero-copy by `to_bytes`, so `body` retains the
+    // backing `HeldBytes` reservation until dropped.
+    assert!(state.catalog.pool().unwrap().granted() > 0);
+    drop(body);
+    assert_eq!(state.catalog.pool().unwrap().granted(), 0);
+}

@@ -45,15 +45,29 @@ pub use sparkles_core::evidence::review::{POLICY_PREFIX, policy_iri};
 pub mod claims;
 #[path = "dependents.rs"]
 pub mod dependents;
+#[path = "legacy_replay.rs"]
+mod legacy_replay;
+use legacy_replay::LegacyPublisher;
+
 #[path = "identity.rs"]
 pub mod identity;
 
 const EV: &str = "urn:x-sparkles:evidence:";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const RDF_REIFIES: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
+const PROV_WAS_REVISION_OF: &str = "http://www.w3.org/ns/prov#wasRevisionOf";
+const PROV_WAS_GENERATED_BY: &str = "http://www.w3.org/ns/prov#wasGeneratedBy";
+const PROV_USED: &str = "http://www.w3.org/ns/prov#used";
 
 fn ev(local: &str) -> String {
     format!("{EV}{local}")
+}
+
+fn conflict_mode_iri(mode: ConflictMode) -> String {
+    ev(match mode {
+        ConflictMode::Refuse => "Refuse",
+        ConflictMode::AdmitLabelled => "AdmitLabelled",
+    })
 }
 
 /// What a review or withdrawal shares with a proposal: the caller and the commit.
@@ -204,6 +218,29 @@ pub struct Withdrawn {
     pub preview: Option<Box<crate::preview::Preview>>,
 }
 
+/// The outcome of [`reconcile_projection`].
+#[derive(Debug)]
+pub struct ReconciledProjection {
+    pub operation: NamedNode,
+    pub committed: bool,
+    pub replayed: bool,
+    pub commit: u64,
+    pub branch: Uuid,
+    pub policy: NamedNode,
+    pub policy_version: u32,
+    /// The output graph recorded in the projection record.
+    pub output: NamedNode,
+    /// The active projection record that carries the policy's current protections, or the
+    /// projection record selected by the original operation on a replay.
+    pub projection: NamedNode,
+    /// The live authenticated acceptance supports vouched for under the current
+    /// protections, sorted by IRI. Empty on a replay.
+    pub vouched_supports: Vec<NamedNode>,
+    /// What changed in the output graph. A replay reports nothing here.
+    pub changed: Changed,
+    pub preview: Option<Box<crate::preview::Preview>>,
+}
+
 // ------------------------------------------------------------------- reads -------
 
 /// A graph and its current protection nonce.
@@ -263,6 +300,23 @@ impl State<'_> {
         let (v, more) = self
             .reads
             .subjects_up_to(p, o, g.0.as_str(), MAX_EVIDENCE)?;
+        if more {
+            return Err(incomplete(what));
+        }
+        Ok(v)
+    }
+
+    fn subjects_held(
+        &mut self,
+        p: &str,
+        o: &Term,
+        g: &G,
+        what: &str,
+        held: &mut crate::access::Reservation,
+    ) -> Result<Vec<NamedNode>> {
+        let (v, more) = self
+            .reads
+            .subjects_up_to_held(p, o, g.0.as_str(), MAX_EVIDENCE, held)?;
         if more {
             return Err(incomplete(what));
         }
@@ -392,7 +446,21 @@ impl State<'_> {
         Ok(false)
     }
 
-    /// Whether the support `s` in `p.supports` is live.
+    /// Whether `claim` authenticates as an `ev:Claim` in one of the configured proposal
+    /// graphs under that graph's current protection.
+    fn claim_authenticated(&mut self, claim: &NamedNode) -> Result<bool> {
+        for g in self.claim_graphs.clone() {
+            if self.typed(claim, &g, RecordKind::Claim)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether the support `s` in `p.supports` is live. Requires the supported claim
+    /// itself to authenticate in a configured proposal graph under its current protection
+    /// so a proposal-graph detach and re-protection cannot invalidate an earlier
+    /// withdrawal and revive a withdrawn claim during ordinary writes or reconciliation.
     fn live(&mut self, s: &NamedNode, p: &PolicyGraphs) -> Result<bool> {
         if !self.typed(s, &p.supports, RecordKind::AcceptanceSupport)? {
             return Ok(false);
@@ -408,6 +476,12 @@ impl State<'_> {
         let Some(claim) = self.iri(s, &ev("claim"), &p.supports)? else {
             return Ok(false);
         };
+        if self.withdrawn.contains(&claim) {
+            return Ok(false);
+        }
+        if !self.claim_authenticated(&claim)? {
+            return Ok(false);
+        }
         Ok(!self.is_withdrawn(&claim)?)
     }
 
@@ -468,69 +542,319 @@ impl State<'_> {
         Ok(false)
     }
 
-    /// Refuse when a projection record of the policy was written under protections
-    /// that are no longer the current ones, so that its supports no longer
+    /// A reconciliation publishes in one graph. Prefer its generating or reuse edge.
+    /// A withdrawn generating edge can leave the created record's receipt intact.
+    fn replay_projection(
+        &mut self,
+        op: &NamedNode,
+        policy: &NamedNode,
+        graphs: &[G],
+        legacy: Option<&LegacyPublisher>,
+    ) -> Result<Option<(NamedNode, G)>> {
+        let receipt = ev("availabilityReceipt");
+        let mut linked = None;
+        for predicate in [PROV_WAS_GENERATED_BY, PROV_USED, &receipt] {
+            if predicate == receipt && linked.is_some() {
+                break;
+            }
+            for g in graphs {
+                let mut held = self.reads.preparation().reserve(0)?;
+                let candidates = if predicate == PROV_USED {
+                    if let Some(publisher) = legacy {
+                        publisher.used.iter().cloned().collect()
+                    } else {
+                        let (mut targets, more) = self.reads.objects_up_to_held(
+                            op.as_str(),
+                            predicate,
+                            g.0.as_str(),
+                            1,
+                            &mut held,
+                        )?;
+                        if more {
+                            return Err(ambiguous_legacy_replay());
+                        }
+                        match targets.pop() {
+                            Some(Term::NamedNode(r)) => vec![r],
+                            _ => Vec::new(),
+                        }
+                    }
+                } else {
+                    self.subjects_held(
+                        predicate,
+                        &Term::NamedNode(op.clone()),
+                        g,
+                        "projections",
+                        &mut held,
+                    )?
+                };
+                for r in candidates {
+                    if let Some(publisher) = legacy {
+                        if !self.legacy_projection_matches(&r, policy, publisher, predicate, op)? {
+                            continue;
+                        }
+                    } else if !self.typed(&r, g, RecordKind::Projection)?
+                        || self.iri(&r, &ev("reviewPolicy"), g)?.as_ref() != Some(policy)
+                        || (predicate == PROV_WAS_GENERATED_BY
+                            && self.reads.receipt_of(&r, &g.0)?.as_ref() != Some(op))
+                    {
+                        continue;
+                    }
+                    if linked
+                        .as_ref()
+                        .is_some_and(|(prior, graph)| prior != &r || graph != g)
+                    {
+                        return Err(ambiguous_legacy_replay());
+                    }
+                    linked = Some((r, g.clone()));
+                }
+            }
+        }
+        Ok(linked)
+    }
+
+    /// All `ev:Projection` records of `p.policy_iri` in `p.supports`, and the subset
+    /// superseded through `prov:wasRevisionOf` by a currently authenticated projection
+    /// record of the same policy. Retained record IRIs are charged to `held`.
+    fn policy_projections_held(
+        &mut self,
+        p: &PolicyGraphs,
+        held: &mut crate::access::Reservation,
+    ) -> Result<(Vec<NamedNode>, BTreeSet<NamedNode>)> {
+        let policy = Term::NamedNode(p.policy_iri.clone());
+        let class = Term::NamedNode(NamedNode::new_unchecked(ev("Projection")));
+        let review_policy = ev("reviewPolicy");
+        let (records, more) = self.reads.subjects_matching_up_to_held(
+            &[(RDF_TYPE, &class), (review_policy.as_str(), &policy)],
+            p.supports.0.as_str(),
+            MAX_EVIDENCE,
+            held,
+        )?;
+        if more {
+            return Err(incomplete("projections"));
+        }
+        let mut superseded = BTreeSet::new();
+        for r in &records {
+            if !self
+                .reads
+                .authenticated(r.as_str(), p.supports.0.as_str(), p.supports.1)?
+            {
+                continue;
+            }
+            let mut priors_held = self.reads.preparation().reserve(0)?;
+            let (priors, more) = self.reads.objects_up_to_held(
+                r.as_str(),
+                PROV_WAS_REVISION_OF,
+                p.supports.0.as_str(),
+                MAX_EVIDENCE,
+                &mut priors_held,
+            )?;
+            if more {
+                return Err(incomplete("projections"));
+            }
+            for prior in priors {
+                if let Term::NamedNode(n) = prior
+                    && !superseded.contains(&n)
+                {
+                    held.grow_by((n.as_str().len() as u64).saturating_add(96))?;
+                    superseded.insert(n);
+                }
+            }
+        }
+        Ok((records, superseded))
+    }
+
+    /// All `ev:Projection` records of `p.policy_iri` in `p.supports`, and the subset
+    /// superseded through `prov:wasRevisionOf` by a currently authenticated projection
+    /// record of the same policy.
+    fn policy_projections(
+        &mut self,
+        p: &PolicyGraphs,
+    ) -> Result<(Vec<NamedNode>, BTreeSet<NamedNode>)> {
+        let mut held = self.reads.preparation().reserve(0)?;
+        self.policy_projections_held(p, &mut held)
+    }
+
+    /// Whether projection record `r` authenticates under `p.supports`'s current
+    /// protection and records the current protection nonces of `p`'s decisions,
+    /// supports and output graphs.
+    fn projection_matches_nonces(&mut self, r: &NamedNode, p: &PolicyGraphs) -> Result<bool> {
+        let Some(now) = p.nonces().map(|n| [n.decisions, n.supports, n.output]) else {
+            return Ok(false);
+        };
+        if !self
+            .reads
+            .authenticated(r.as_str(), p.supports.0.as_str(), p.supports.1)?
+        {
+            return Ok(false);
+        }
+        for (predicate, expected) in rv::NONCE_PREDICATES.iter().zip(now) {
+            let recorded = self
+                .text(r, predicate, &p.supports)?
+                .and_then(|v| Uuid::parse_str(&v).ok());
+            if recorded != Some(expected) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether projection record `r` matches `p`'s output graph and conflict mode.
+    fn projection_matches_policy(&mut self, r: &NamedNode, p: &PolicyGraphs) -> Result<bool> {
+        Ok(
+            self.iri(r, &ev("output"), &p.supports)? == Some(p.output.0.clone())
+                && self
+                    .iri(r, &ev("conflictMode"), &p.supports)?
+                    .is_some_and(|m| m.as_str() == conflict_mode_iri(p.mode)),
+        )
+    }
+
+    /// Whether active projection record `r` authenticates under `p`'s current supports
+    /// protection at `version` while recording a different output graph or conflict mode.
+    /// That signals a same-version policy change (including swapping continuously
+    /// protected outputs or `(decisions, output)` pairs between policies) rather than a
+    /// detach and new protection.
+    fn projection_same_version_drift(
+        &mut self,
+        r: &NamedNode,
+        p: &PolicyGraphs,
+        version: u32,
+    ) -> Result<bool> {
+        let Some(sup_nonce) = p.supports.1 else {
+            return Ok(false);
+        };
+        if !self
+            .reads
+            .authenticated(r.as_str(), p.supports.0.as_str(), p.supports.1)?
+        {
+            return Ok(false);
+        }
+        let recorded_sup = self
+            .text(r, rv::NONCE_PREDICATES[1], &p.supports)?
+            .and_then(|v| Uuid::parse_str(&v).ok());
+        if recorded_sup != Some(sup_nonce) {
+            return Ok(false);
+        }
+        if self.text(r, &ev("policyVersion"), &p.supports)?.as_deref()
+            != Some(version.to_string().as_str())
+        {
+            return Ok(false);
+        }
+        Ok(!self.projection_matches_policy(r, p)?)
+    }
+
+    /// Refuse when any continuously protected managed graph holds an active,
+    /// authenticated `ev:Projection` record showing same-version drift for `p`
+    /// (either `p` moved supports without raising its version, including across
+    /// graph role changes that retain protection, or another currently configured
+    /// review policy at its current version still owns `p.output` under unchanged
+    /// protections).
+    fn check_same_version_drift(
+        &self,
+        dataset_id: Uuid,
+        p: &PolicyGraphs,
+        policy_version: u32,
+        settings: &Settings,
+        managed_graphs: &[(&str, Uuid)],
+        control: &Control,
+    ) -> Result<()> {
+        let rivals: Vec<(&str, u32)> = settings
+            .policies
+            .iter()
+            .filter(|(name, _)| name.as_str() != p.name.as_str())
+            .map(|(name, other)| (name.as_str(), other.version))
+            .collect();
+        if self.reads.has_same_version_projection_drift(
+            dataset_id,
+            p.name.as_str(),
+            policy_version,
+            p.supports.0.as_str(),
+            p.output.0.as_str(),
+            p.output.1,
+            managed_graphs,
+            &rivals,
+            control,
+        )? {
+            return Err(same_version_policy_changed(&p.name));
+        }
+        Ok(())
+    }
+
+    /// Refuse when `p.output` holds continuously authenticated evidence-owner operation
+    /// history under its unchanged protection nonce (as when a former record-role graph
+    /// was reassigned as a dedicated projection output without detaching it first),
+    /// while ignoring ordinary and support-projected RDF assertions in the output.
+    fn check_output_record_history(&self, p: &PolicyGraphs) -> Result<()> {
+        if p.output_projection_only {
+            return Ok(());
+        }
+        if self
+            .reads
+            .has_published_operation_in_output(p.output.0.as_str(), p.output.1)?
+        {
+            return Err(managed(
+                ManagedErrorKind::ImmutableRecordConflict,
+                format!(
+                    "policy {}: output graph <{}> holds continuously authenticated evidence records; detach it before reassigning it as a projection output",
+                    p.name,
+                    p.output.0.as_str()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuse when an active projection record of the policy was written under
+    /// protections that are no longer the current ones, so that its supports no longer
     /// authenticate while its output still holds their triples, or when the output
-    /// holds triples and no projection record of the policy exists. Returns whether the
-    /// record of `p`'s version exists with the content `planned` would give it.
+    /// holds triples and no active projection record of the policy exists. Returns
+    /// whether an active record of `p`'s version already exists with the content
+    /// `planned` would give it.
     fn check_projection(
         &mut self,
         p: &PolicyGraphs,
-        planned: Option<&sparkles_core::evidence::write::PlannedRecord>,
+        planned: Option<(u32, &sparkles_core::evidence::write::PlannedRecord)>,
     ) -> Result<bool> {
-        let policy = Term::NamedNode(p.policy_iri.clone());
-        let class = Term::NamedNode(NamedNode::new_unchecked(ev("Projection")));
-        let records = self.subjects(RDF_TYPE, &class, &p.supports, "projections")?;
-        let current = p.nonces();
+        let (records, superseded) = self.policy_projections(p)?;
+        let active: Vec<NamedNode> = records
+            .iter()
+            .filter(|r| !superseded.contains(*r))
+            .cloned()
+            .collect();
+        if !records.is_empty() && active.is_empty() {
+            return Err(projection_unavailable(&p.name));
+        }
         let mut existing = false;
-        let mut found = false;
-        for r in records {
-            if !self.reads.contains(
-                r.as_str(),
-                &ev("reviewPolicy"),
-                &policy,
-                p.supports.0.as_str(),
-            )? {
-                continue;
-            }
-            found = true;
-            let mut recorded = Vec::new();
-            for predicate in rv::NONCE_PREDICATES {
-                recorded.push(
-                    self.text(&r, predicate, &p.supports)?
-                        .and_then(|v| Uuid::parse_str(&v).ok()),
-                );
-            }
-            let now = current.map(|n| [n.decisions, n.supports, n.output]);
-            let same = now.is_some_and(|n| recorded.iter().zip(n).all(|(a, b)| *a == Some(b)));
-            if !same
-                || !self
-                    .reads
-                    .authenticated(r.as_str(), p.supports.0.as_str(), p.supports.1)?
+        for r in &active {
+            if let Some((version, _)) = planned
+                && self.projection_same_version_drift(r, p, version)?
             {
+                return Err(same_version_policy_changed(&p.name));
+            }
+            if !self.projection_matches_nonces(r, p)? {
                 return Err(projection_unavailable(&p.name));
             }
-            if let Some(planned) = planned
-                && r == planned.iri
-            {
-                let digest = self
-                    .text(&r, &ev("recordDigest"), &p.supports)?
-                    .and_then(|d| d.parse().ok());
-                if digest != Some(planned.digest) {
-                    return Err(managed(
-                        ManagedErrorKind::ProjectionUnavailable,
-                        format!(
-                            "policy {}: its output or conflict mode changed without a new version; raise the policy's version",
-                            p.name
-                        ),
-                    ));
+            if let Some((version, planned_rec)) = planned {
+                if *r == planned_rec.iri {
+                    let digest = self
+                        .text(r, &ev("recordDigest"), &p.supports)?
+                        .and_then(|d| d.parse().ok());
+                    if digest != Some(planned_rec.digest) {
+                        return Err(same_version_policy_changed(&p.name));
+                    }
+                    existing = true;
+                } else if self.text(r, &ev("policyVersion"), &p.supports)?.as_deref()
+                    == Some(version.to_string().as_str())
+                {
+                    if !self.projection_matches_policy(r, p)? {
+                        return Err(same_version_policy_changed(&p.name));
+                    }
+                    existing = true;
                 }
-                existing = true;
             }
         }
         // An output that holds triples without a verifiable projection lost its
         // lineage, as when the supports graph was detached and cleared.
-        if !found && self.reads.graph_nonempty(p.output.0.as_str())? {
+        if active.is_empty() && self.reads.graph_nonempty(p.output.0.as_str())? {
             return Err(projection_unavailable(&p.name));
         }
         Ok(existing)
@@ -546,6 +870,15 @@ fn projection_unavailable(policy: &str) -> Error {
     )
 }
 
+fn same_version_policy_changed(policy: &str) -> Error {
+    managed(
+        ManagedErrorKind::ProjectionUnavailable,
+        format!(
+            "policy {policy}: its supports, output or conflict mode changed without a new version; raise the policy's version"
+        ),
+    )
+}
+
 /// One policy's graphs and their current nonces.
 struct PolicyGraphs {
     name: String,
@@ -554,6 +887,7 @@ struct PolicyGraphs {
     decisions: G,
     supports: G,
     output: G,
+    output_projection_only: bool,
     boundary: Vec<G>,
 }
 
@@ -571,6 +905,7 @@ impl PolicyGraphs {
             decisions: g(&policy.decisions)?,
             supports: g(&policy.supports)?,
             output: g(&policy.output)?,
+            output_projection_only: cap.is_projection_only(&policy.output),
             boundary: policy
                 .boundary
                 .iter()
@@ -597,6 +932,7 @@ impl PolicyGraphs {
             decisions: g(&policy.decisions)?,
             supports: g(&policy.supports)?,
             output: g(&policy.output)?,
+            output_projection_only: false,
             boundary: policy
                 .boundary
                 .iter()
@@ -947,21 +1283,39 @@ fn publish(
                 commit: seq,
                 time_ms,
             },
-            |g| capability.protection(g.as_str()),
+            |g| capability.record_protection(g.as_str()),
             skip,
         )?
     };
     let mut labels = std::collections::HashMap::new();
-    for q in &quads {
+    for (i, q) in quads.iter().enumerate() {
+        control.cancel.check()?;
+        if i & 0xff == 0 {
+            control.check()?;
+        }
         let ids = t.encode_quad(q, &mut labels)?;
         t.insert(ids)?;
     }
     // Physical-ID deletions target exact stored quads from `expected` without re-interning,
     // so blank nodes, triple terms and composite literals containing blank nodes are removed.
-    for ids in raw_deletes {
-        t.delete(*ids)?;
+    for (i, ids) in raw_deletes.iter().enumerate() {
+        control.cancel.check()?;
+        if i & 0xff == 0 {
+            control.check()?;
+        }
+        if !t.delete(*ids)? {
+            return Err(managed(
+                ManagedErrorKind::HeadChanged,
+                "the output graph changed while the operation prepared deletions; retry",
+            ));
+        }
+        store.failpoint("evidence-reconcile-after-delete");
     }
-    for (q, insert) in changes {
+    for (i, (q, insert)) in changes.iter().enumerate() {
+        control.cancel.check()?;
+        if i & 0xff == 0 {
+            control.check()?;
+        }
         let ids = t.encode_quad(q, &mut labels)?;
         if *insert {
             t.insert(ids)?;
@@ -1223,6 +1577,7 @@ pub fn review(
             payload_digest: payload,
             principal: options.principal.clone(),
             idempotency_key: options.idempotency_key.clone(),
+            used: None,
             graphs: Vec::new(),
             records: Vec::new(),
         };
@@ -1601,6 +1956,7 @@ pub fn review(
         payload_digest: payload,
         principal: options.principal.clone(),
         idempotency_key: options.idempotency_key.clone(),
+        used: None,
         graphs: vec![p.decisions.0.clone()],
         records: Vec::new(),
     };
@@ -1696,7 +2052,21 @@ pub fn review(
             &p.supports.0,
             control,
         )?;
-        let existing = state.check_projection(&p, Some(&record))?;
+        let protected_graphs = protected_managed_graphs(&settings, &capability);
+        let protected_refs: Vec<(&str, Uuid)> = protected_graphs
+            .iter()
+            .map(|(g, n)| (g.as_str(), *n))
+            .collect();
+        state.check_same_version_drift(
+            main.dataset_id(),
+            &p,
+            policy_version,
+            &settings,
+            &protected_refs,
+            control,
+        )?;
+        state.check_output_record_history(&p)?;
+        let existing = state.check_projection(&p, Some((policy_version, &record)))?;
         batch.records.push(record);
         skip.push(existing);
         batch.graphs.push(p.supports.0.clone());
@@ -1799,6 +2169,39 @@ fn claim_graphs(settings: &Settings, capability: &ManagedWrite) -> Vec<G> {
             (g, n)
         })
         .collect()
+}
+
+fn protected_managed_graphs(settings: &Settings, capability: &ManagedWrite) -> Vec<(String, Uuid)> {
+    settings
+        .managed_graphs()
+        .into_iter()
+        .filter(|g| !capability.is_projection_only(g))
+        .filter_map(|g| capability.protection(&g).map(|n| (g, n)))
+        .collect()
+}
+
+/// The non-`projection_only` projection graphs of `settings` with their current
+/// protection nonces under `capability` (former record graphs moved into `projections`
+/// without detaching, or legacy pre-format-4 outputs not yet upgraded). Dedicated
+/// `projection_only` outputs never accepted `publish_quads` and are skipped.
+fn projection_graph_nonces(settings: &Settings, capability: &ManagedWrite) -> Vec<G> {
+    settings
+        .projections
+        .iter()
+        .filter(|g| !capability.is_projection_only(g))
+        .filter_map(|g| NamedNode::new(g.as_str()).ok())
+        .map(|g| {
+            let n = capability.protection(g.as_str());
+            (g, n)
+        })
+        .collect()
+}
+
+fn ambiguous_legacy_replay() -> Error {
+    managed(
+        ManagedErrorKind::ImmutableRecordConflict,
+        "the original reconciliation receipt cannot be identified in legacy projection history",
+    )
 }
 
 /// Refuse when a record identity the operation mints already has content in a record
@@ -1991,6 +2394,7 @@ pub fn withdraw(
         payload_digest: payload,
         principal: options.principal.clone(),
         idempotency_key: options.idempotency_key.clone(),
+        used: None,
         graphs: graphs.values().cloned().collect(),
         records: Vec::new(),
     };
@@ -2170,4 +2574,930 @@ pub fn withdraw(
         changed,
         preview: committed.preview,
     })
+}
+
+// ------------------------------------------------------ reconcile projection -----
+
+fn readable_optional(access: Option<&Arc<GraphAccess>>, g: &NamedNode) -> Result<()> {
+    let term = Term::NamedNode(g.clone());
+    match access {
+        Some(a) if !a.readable(Some(&term)) => Err(Error::NotPermitted(format!(
+            "read access to graph {term} required"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn budget_to_incomplete(e: Error) -> Error {
+    match e {
+        Error::BudgetExceeded(b) if b.kind != crate::error::BudgetKind::ServerMemory => managed(
+            ManagedErrorKind::IncompleteEvidence,
+            "the projection's records exceed the memory allowance, so nothing was written",
+        ),
+        other => other,
+    }
+}
+
+fn cmp_subject(a: &NamedOrBlankNode, b: &NamedOrBlankNode) -> std::cmp::Ordering {
+    match (a, b) {
+        (NamedOrBlankNode::NamedNode(a), NamedOrBlankNode::NamedNode(b)) => {
+            a.as_str().cmp(b.as_str())
+        }
+        (NamedOrBlankNode::NamedNode(_), NamedOrBlankNode::BlankNode(_)) => {
+            std::cmp::Ordering::Less
+        }
+        (NamedOrBlankNode::BlankNode(_), NamedOrBlankNode::NamedNode(_)) => {
+            std::cmp::Ordering::Greater
+        }
+        (NamedOrBlankNode::BlankNode(a), NamedOrBlankNode::BlankNode(b)) => {
+            a.as_str().cmp(b.as_str())
+        }
+    }
+}
+
+fn cmp_literal(a: &oxrdf::Literal, b: &oxrdf::Literal) -> std::cmp::Ordering {
+    fn dir_tag(l: &oxrdf::Literal) -> u8 {
+        match l.direction() {
+            None => 0,
+            Some(oxrdf::BaseDirection::Ltr) => 1,
+            Some(oxrdf::BaseDirection::Rtl) => 2,
+        }
+    }
+    a.value()
+        .cmp(b.value())
+        .then_with(|| a.language().cmp(&b.language()))
+        .then_with(|| dir_tag(a).cmp(&dir_tag(b)))
+        .then_with(|| a.datatype().as_str().cmp(b.datatype().as_str()))
+}
+
+fn cmp_term(a: &Term, b: &Term) -> std::cmp::Ordering {
+    fn tag(t: &Term) -> u8 {
+        match t {
+            Term::Literal(_) => 0,
+            Term::NamedNode(_) => 1,
+            Term::Triple(_) => 2,
+            Term::BlankNode(_) => 3,
+        }
+    }
+    tag(a).cmp(&tag(b)).then_with(|| match (a, b) {
+        (Term::Literal(a), Term::Literal(b)) => cmp_literal(a, b),
+        (Term::NamedNode(a), Term::NamedNode(b)) => a.as_str().cmp(b.as_str()),
+        (Term::Triple(a), Term::Triple(b)) => cmp_triple(a, b),
+        (Term::BlankNode(a), Term::BlankNode(b)) => a.as_str().cmp(b.as_str()),
+        _ => std::cmp::Ordering::Equal,
+    })
+}
+
+fn cmp_triple(a: &Triple, b: &Triple) -> std::cmp::Ordering {
+    cmp_subject(&a.subject, &b.subject)
+        .then_with(|| a.predicate.as_str().cmp(b.predicate.as_str()))
+        .then_with(|| cmp_term(&a.object, &b.object))
+}
+
+/// Reconcile a review policy's accepted projection after a detach and new protection of
+/// its decisions, supports or output graph, as one commit of the evidence owner on
+/// `logical` (`main` or one of its branches).
+///
+/// Rebuilds the policy's output graph to hold exactly the triples owned by live
+/// authenticated acceptance supports of the policy whose claims authenticate in a
+/// configured proposal graph and have no authenticated withdrawal, or empties it when
+/// none vouch. Records the current protection nonces in a fresh `ev:Projection` record
+/// in the policy's supports graph that supersedes any prior unsuperseded projection
+/// records of the policy, or reuses the active projection record (linking the operation
+/// through `prov:used` for keyed replays) when the protections and output already match.
+///
+/// `policy_version` is optional; when supplied it must equal the policy's current
+/// version or the operation refuses with `policy-changed`. `options.if_head` is
+/// optional, and the head read must still be the writer's base when committing. The
+/// caller needs update grants on the policy's supports and output graphs and unmasked
+/// read grants on the policy's decisions, supports and output graphs and on every
+/// configured proposal graph.
+///
+/// Refusals, which write nothing: invalid input (including a matching policy), missing
+/// or masked grants, `unsupported-profile` when the profile is disabled or one of the
+/// policy's graphs is still detached, `policy-changed`, `head-changed`,
+/// `idempotency-conflict`, `immutable-record-conflict`, `incomplete-evidence`,
+/// `projection-unavailable` when the policy's output or conflict mode changed without
+/// raising its version under unchanged protections, and `authority-changed`.
+pub fn reconcile_projection(
+    main: &Dataset,
+    logical: &Dataset,
+    policy_name: &str,
+    policy_version: Option<u32>,
+    options: &Options,
+    access: Option<Arc<GraphAccess>>,
+    control: &Control,
+) -> Result<ReconciledProjection> {
+    reconcile_projection_with_budget(
+        main,
+        logical,
+        policy_name,
+        policy_version,
+        options,
+        access,
+        control,
+        super::resolve::MEMORY_BYTES,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_projection_with_budget(
+    main: &Dataset,
+    logical: &Dataset,
+    policy_name: &str,
+    policy_version: Option<u32>,
+    options: &Options,
+    access: Option<Arc<GraphAccess>>,
+    control: &Control,
+    memory_bytes: u64,
+) -> Result<ReconciledProjection> {
+    control.check()?;
+    let preparation = crate::access::Preparation::new(control.clone(), memory_bytes)
+        .map_err(budget_to_incomplete)?;
+    let (reconciled, _response_held) = reconcile_projection_prepared(
+        main,
+        logical,
+        policy_name,
+        policy_version,
+        options,
+        access,
+        &preparation,
+        control,
+    )?;
+    Ok(reconciled)
+}
+
+/// Like [`reconcile_projection`], sharing a caller-owned [`crate::access::Preparation`]
+/// (which may carry a server memory-pool grant) and returning the reservation that covers
+/// the returned outcome and its formatted JSON response so HTTP callers keep it charged
+/// until serialization finishes.
+#[allow(clippy::too_many_arguments)]
+pub fn reconcile_projection_prepared(
+    main: &Dataset,
+    logical: &Dataset,
+    policy_name: &str,
+    policy_version: Option<u32>,
+    options: &Options,
+    access: Option<Arc<GraphAccess>>,
+    preparation: &crate::access::Preparation,
+    control: &Control,
+) -> Result<(ReconciledProjection, crate::access::Reservation)> {
+    control.check()?;
+    check_store(main, logical)?;
+    let (settings, settings_bytes) = settings_of(main)?;
+    if !settings.enabled {
+        return Err(managed(
+            ManagedErrorKind::UnsupportedProfile,
+            "the evidence profile is not enabled in this dataset",
+        ));
+    }
+    if settings.matching_policies.contains_key(policy_name) {
+        return Err(Error::invalid(format!(
+            "policy: {policy_name} is a matching policy, not a review policy"
+        )));
+    }
+    let Some(policy) = settings.policies.get(policy_name) else {
+        return Err(Error::invalid(format!(
+            "policy: the evidence settings name no review policy {policy_name}"
+        )));
+    };
+    if let Some(expected) = policy_version
+        && policy.version != expected
+    {
+        return Err(managed(
+            ManagedErrorKind::PolicyChanged,
+            format!(
+                "policyVersion: policy {policy_name} is at version {}, not {expected}",
+                policy.version
+            ),
+        ));
+    }
+    let operation = operation(main, options)?;
+    let payload = rv::reconcile_payload_digest(policy_name, policy_version, control)?;
+    if access.as_ref().is_some_and(|a| a.hides_triples()) {
+        return Err(Error::NotPermitted(
+            "reconciling a projection requires unmasked access to its graphs".into(),
+        ));
+    }
+    for g in [&policy.supports, &policy.output] {
+        let g = NamedNode::new(g.as_str()).map_err(|e| Error::invalid(e.to_string()))?;
+        writable(options.write.as_ref(), &g)?;
+    }
+    for g in [&policy.decisions, &policy.supports, &policy.output]
+        .into_iter()
+        .chain(settings.proposals.iter())
+    {
+        let g = NamedNode::new(g.as_str()).map_err(|e| Error::invalid(e.to_string()))?;
+        readable_optional(access.as_ref(), &g)?;
+    }
+    let capability = capability(logical, operation, &settings_bytes)?;
+    let p = PolicyGraphs::new(policy_name, policy, &capability)?;
+    let nonces = p.protected()?;
+    let store = logical.store();
+    let branch = store.branch_id();
+    let head = store.snapshot();
+
+    struct ReconcileReady {
+        batch: Batch,
+        projection: NamedNode,
+        vouched_supports: Vec<NamedNode>,
+        changed: Changed,
+        insert_quads: Vec<(Quad, bool)>,
+        delete_ids: Vec<[sparkles_core::id::Id; 4]>,
+        _vouched_held: crate::access::Reservation,
+        _output_held: crate::access::Reservation,
+        _diff_held: crate::access::Reservation,
+        _batch_held: crate::access::Reservation,
+        response_held: crate::access::Reservation,
+    }
+
+    enum ReconcilePlan {
+        Replayed(Box<ReconciledProjection>, crate::access::Reservation),
+        Ready(Box<ReconcileReady>),
+    }
+
+    let plan = (|| -> Result<ReconcilePlan> {
+        let mut state = State {
+            reads: Reads::new(preparation, &head),
+            seen: None,
+            claim_graphs: claim_graphs(&settings, &capability),
+            superseded: BTreeSet::new(),
+            withdrawn: BTreeSet::new(),
+        };
+        let record_graphs = record_graph_nonces(&settings, &capability);
+        let projection_graphs = projection_graph_nonces(&settings, &capability);
+        let op_iri = operation_iri(operation);
+        if let Some(key) = &options.idempotency_key {
+            let probe = Batch {
+                operation,
+                operation_iri: op_iri.clone(),
+                payload_digest: payload,
+                principal: options.principal.clone(),
+                idempotency_key: options.idempotency_key.clone(),
+                used: None,
+                graphs: Vec::new(),
+                records: Vec::new(),
+            };
+            let mut found = state
+                .reads
+                .operation(&probe.operation_iri, &record_graphs)?;
+            // Reconciliation writes its operation only to the supports graph. A
+            // record-role copy settles the key before any mixed-history output is read.
+            let mut legacy_publisher = None;
+            if found.is_none()
+                && let Some((operation, publisher)) = state.legacy_publisher(
+                    &projection_graphs,
+                    &settings,
+                    &capability,
+                    main.dataset_id(),
+                    &probe,
+                    key,
+                )?
+            {
+                found = Some(operation);
+                legacy_publisher = Some(publisher);
+            }
+            if let Some((commit, recorded_branch)) = replayed(found, &probe)? {
+                let mut publishers = Vec::new();
+                if let Some(publisher) = &legacy_publisher {
+                    readable_optional(access.as_ref(), &publisher.graph.0)?;
+                    publishers.push(publisher.graph.clone());
+                } else {
+                    for g in &record_graphs {
+                        if state.reads.has_operation(op_iri.as_str(), g.0.as_str())? {
+                            readable_optional(access.as_ref(), &g.0)?;
+                            publishers.push(g.clone());
+                        }
+                    }
+                }
+                let linked = state.replay_projection(
+                    &op_iri,
+                    &p.policy_iri,
+                    &publishers,
+                    legacy_publisher.as_ref(),
+                )?;
+                let (projection, proj_graph) = match linked {
+                    Some(link) => link,
+                    None if legacy_publisher.is_some() => return Err(ambiguous_legacy_replay()),
+                    None => {
+                        let mut proj_held = preparation.reserve(0)?;
+                        let (all_proj, superseded_proj) =
+                            state.policy_projections_held(&p, &mut proj_held)?;
+                        let active_proj: Vec<NamedNode> = all_proj
+                            .into_iter()
+                            .filter(|r| !superseded_proj.contains(r))
+                            .collect();
+                        let mut chosen = None;
+                        for r in &active_proj {
+                            if state.text(r, &ev("policyVersion"), &p.supports)?.as_deref()
+                                == Some(policy.version.to_string().as_str())
+                            {
+                                chosen = Some(r.clone());
+                                break;
+                            }
+                        }
+                        let proj = chosen.or_else(|| active_proj.into_iter().next()).unwrap_or(
+                            rv::reconciled_projection_iri(
+                                main.dataset_id(),
+                                policy_name,
+                                policy.version,
+                                nonces,
+                                operation,
+                                control,
+                            )?,
+                        );
+                        (proj, p.supports.clone())
+                    }
+                };
+                let (recorded_version, recorded_output) = if let Some(publisher) = &legacy_publisher
+                {
+                    state.legacy_projection_metadata(&projection, publisher)?
+                } else {
+                    let version = state
+                        .text(&projection, &ev("policyVersion"), &proj_graph)?
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(policy.version);
+                    let output = state
+                        .iri(&projection, &ev("output"), &proj_graph)?
+                        .unwrap_or_else(|| p.output.0.clone());
+                    (version, output)
+                };
+                let replay_resp_bytes = (op_iri.as_str().len() as u64)
+                    .saturating_add(p.policy_iri.as_str().len() as u64)
+                    .saturating_add(recorded_output.as_str().len() as u64)
+                    .saturating_add(projection.as_str().len() as u64)
+                    .saturating_mul(2)
+                    .saturating_add(1024);
+                let response_held = preparation.reserve(replay_resp_bytes)?;
+                return Ok(ReconcilePlan::Replayed(
+                    Box::new(ReconciledProjection {
+                        operation: op_iri,
+                        committed: false,
+                        replayed: true,
+                        commit,
+                        branch: recorded_branch.unwrap_or(branch),
+                        policy: p.policy_iri.clone(),
+                        policy_version: recorded_version,
+                        output: recorded_output,
+                        projection,
+                        vouched_supports: Vec::new(),
+                        changed: Changed::default(),
+                        preview: None,
+                    }),
+                    response_held,
+                ));
+            }
+        }
+        if let Some(expected) = options.if_head
+            && head.commit != expected
+        {
+            return Err(managed(
+                ManagedErrorKind::HeadChanged,
+                format!(
+                    "ifHead: the head of the branch is commit {}, not {expected}",
+                    head.commit
+                ),
+            ));
+        }
+        // Catch same-version supports/output swaps and role changes across all
+        // continuously protected managed graphs before scanning or planning changes.
+        let protected_graphs = protected_managed_graphs(&settings, &capability);
+        let protected_refs: Vec<(&str, Uuid)> = protected_graphs
+            .iter()
+            .map(|(g, n)| (g.as_str(), *n))
+            .collect();
+        state.check_same_version_drift(
+            main.dataset_id(),
+            &p,
+            policy.version,
+            &settings,
+            &protected_refs,
+            control,
+        )?;
+        state.check_output_record_history(&p)?;
+        // Existing projection records of this policy, and which remain unsuperseded.
+        let mut proj_held = preparation.reserve(0)?;
+        let (existing_projections, superseded_projections) =
+            state.policy_projections_held(&p, &mut proj_held)?;
+        let mut active_projections: Vec<NamedNode> = existing_projections
+            .into_iter()
+            .filter(|r| !superseded_projections.contains(r))
+            .collect();
+        let version_str = policy.version.to_string();
+        let mut all_active_valid = !active_projections.is_empty();
+        let mut current_for_version = None;
+        for r in &active_projections {
+            if state.projection_same_version_drift(r, &p, policy.version)? {
+                return Err(same_version_policy_changed(&p.name));
+            }
+            if state.projection_matches_nonces(r, &p)? {
+                if state.text(r, &ev("policyVersion"), &p.supports)?.as_deref()
+                    == Some(version_str.as_str())
+                {
+                    current_for_version = Some(r.clone());
+                }
+            } else {
+                all_active_valid = false;
+            }
+        }
+        let already_valid_current = if all_active_valid {
+            current_for_version
+        } else {
+            None
+        };
+
+        // Collect every live authenticated acceptance support for this policy and output.
+        let mut vouched_held = preparation.reserve(0)?;
+        let mut vouched_supports = Vec::new();
+        let mut vouched_triples: Vec<Triple> = Vec::new();
+        let mut vouched_set: HashSet<Triple> = HashSet::new();
+        {
+            let mut candidates_held = preparation.reserve(0)?;
+            let candidates = state.subjects_held(
+                &ev("output"),
+                &Term::NamedNode(p.output.0.clone()),
+                &p.supports,
+                "supports",
+                &mut candidates_held,
+            )?;
+            for s in candidates {
+                control.check()?;
+                if !state.reads.contains(
+                    s.as_str(),
+                    &ev("reviewPolicy"),
+                    &Term::NamedNode(p.policy_iri.clone()),
+                    p.supports.0.as_str(),
+                )? {
+                    continue;
+                }
+                // `State::live` enforces current claim authentication and withdrawal
+                // absence consistently across reconciliation and ordinary writes.
+                if !state.live(&s, &p)? {
+                    continue;
+                }
+                let Some(d) = state.iri(&s, &ev("decision"), &p.supports)? else {
+                    continue;
+                };
+                if !state.reads.contains(
+                    d.as_str(),
+                    &ev("reviewPolicy"),
+                    &Term::NamedNode(p.policy_iri.clone()),
+                    p.decisions.0.as_str(),
+                )? || state.disposition(&d, &p.decisions)? != Some(Disposition::Accepted)
+                {
+                    continue;
+                }
+                let Some(triple) = state.supported(&s, &p)? else {
+                    continue;
+                };
+                if !matches!(triple.subject, NamedOrBlankNode::NamedNode(_)) {
+                    continue;
+                }
+                let triple_est = sparkles_core::evidence::write::triple_bytes(&triple);
+                let bytes = (s.as_str().len() as u64)
+                    .saturating_add(160)
+                    .saturating_add(triple_est.saturating_mul(2));
+                vouched_held.grow_by(bytes)?;
+                vouched_supports.push(s);
+                if vouched_set.insert(triple.clone()) {
+                    vouched_triples.push(triple);
+                }
+            }
+        }
+        vouched_supports.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        vouched_supports.dedup();
+        vouched_triples.sort_by(cmp_triple);
+
+        // Compare the output graph's current quads against the vouched triples.
+        let mut output_held = preparation.reserve(0)?;
+        let (existing_output, more_output) = state.reads.graph_quads_up_to(
+            p.output.0.as_str(),
+            claims::MAX_CLAIM_SCAN,
+            &mut output_held,
+        )?;
+        if more_output {
+            return Err(managed(
+                ManagedErrorKind::IncompleteEvidence,
+                format!(
+                    "the output graph holds more than {} triples, so nothing was written",
+                    claims::MAX_CLAIM_SCAN
+                ),
+            ));
+        }
+        let mut diff_held = preparation.reserve(0)?;
+        let output_len = p.output.0.as_str().len() as u64;
+        let base_resp = (op_iri.as_str().len() as u64)
+            .saturating_add(p.policy_iri.as_str().len() as u64)
+            .saturating_add(output_len)
+            .saturating_mul(2)
+            .saturating_add(2048);
+        let mut response_held = preparation.reserve(base_resp)?;
+        for s in &vouched_supports {
+            // Rust NamedNode plus JSON string entry in `vouchedSupports`.
+            response_held.grow_by(
+                (s.as_str().len() as u64)
+                    .saturating_mul(2)
+                    .saturating_add(64),
+            )?;
+        }
+        let mut max_nt_scratch: u64 = 0;
+        let mut present_vouched: HashSet<Triple> = HashSet::new();
+        let mut to_delete: Vec<([sparkles_core::id::Id; 4], Triple)> = Vec::new();
+        for (ids, triple) in existing_output {
+            control.check()?;
+            if vouched_set.contains(&triple) {
+                diff_held.grow_by(
+                    (std::mem::size_of::<Triple>() as u64)
+                        .saturating_mul(2)
+                        .saturating_add(64),
+                )?;
+                present_vouched.insert(triple);
+            } else {
+                let triple_est = sparkles_core::evidence::write::triple_bytes(&triple);
+                let nt_len = sparkles_core::evidence::write::ntriples_triple_bytes(&triple);
+                let json_len =
+                    sparkles_core::evidence::write::json_escaped_ntriples_triple_bytes(&triple);
+                if nt_len > max_nt_scratch {
+                    response_held.grow_by(nt_len - max_nt_scratch)?;
+                    max_nt_scratch = nt_len;
+                }
+                let staging_bytes = (std::mem::size_of::<([sparkles_core::id::Id; 4], Triple)>()
+                    as u64)
+                    .saturating_mul(2)
+                    .saturating_add(std::mem::size_of::<[sparkles_core::id::Id; 4]>() as u64)
+                    .saturating_add(64);
+                diff_held.grow_by(staging_bytes)?;
+                // Retained `ProjectionChange` plus serialized JSON entry `{"output":"...","triple":"..."}`.
+                let resp_bytes = (std::mem::size_of::<ProjectionChange>() as u64)
+                    .saturating_add(triple_est)
+                    .saturating_add(json_len)
+                    .saturating_add(output_len.saturating_mul(2))
+                    .saturating_add(96);
+                response_held.grow_by(resp_bytes)?;
+                to_delete.push((ids, triple));
+            }
+        }
+        control.check()?;
+        to_delete.sort_by(|a, b| cmp_triple(&a.1, &b.1).then_with(|| a.0.cmp(&b.0)));
+
+        let mut to_insert: Vec<Triple> = Vec::new();
+        for triple in &vouched_triples {
+            control.check()?;
+            if !present_vouched.contains(triple) {
+                let triple_est = sparkles_core::evidence::write::triple_bytes(triple);
+                let nt_len = sparkles_core::evidence::write::ntriples_triple_bytes(triple);
+                let json_len =
+                    sparkles_core::evidence::write::json_escaped_ntriples_triple_bytes(triple);
+                if nt_len > max_nt_scratch {
+                    response_held.grow_by(nt_len - max_nt_scratch)?;
+                    max_nt_scratch = nt_len;
+                }
+                let ins_bytes = (std::mem::size_of::<Triple>() as u64)
+                    .saturating_add(std::mem::size_of::<(Quad, bool)>() as u64)
+                    .saturating_add(triple_est.saturating_mul(2))
+                    .saturating_add(output_len.saturating_mul(2))
+                    .saturating_add(64);
+                diff_held.grow_by(ins_bytes)?;
+                let resp_bytes = (std::mem::size_of::<ProjectionChange>() as u64)
+                    .saturating_add(triple_est)
+                    .saturating_add(json_len)
+                    .saturating_add(output_len.saturating_mul(2))
+                    .saturating_add(96);
+                response_held.grow_by(resp_bytes)?;
+                to_insert.push(triple.clone());
+            }
+        }
+
+        let mut changed = Changed::default();
+        let mut insert_quads = Vec::with_capacity(to_insert.len());
+        for t in to_insert {
+            control.check()?;
+            insert_quads.push((output_quad(&t, &p.output.0), true));
+            changed.inserted.push(ProjectionChange {
+                output: p.output.0.clone(),
+                triple: t,
+            });
+        }
+        let mut delete_ids = Vec::with_capacity(to_delete.len());
+        for (ids, t) in to_delete {
+            control.check()?;
+            delete_ids.push(ids);
+            changed.removed.push(ProjectionChange {
+                output: p.output.0.clone(),
+                triple: t,
+            });
+        }
+
+        let mut batch = Batch {
+            operation,
+            operation_iri: op_iri,
+            payload_digest: payload,
+            principal: options.principal.clone(),
+            idempotency_key: options.idempotency_key.clone(),
+            used: None,
+            graphs: vec![p.supports.0.clone()],
+            records: Vec::new(),
+        };
+        let mut batch_held = preparation.reserve(0)?;
+        let projection = if let Some(existing_proj) = already_valid_current
+            && insert_quads.is_empty()
+            && delete_ids.is_empty()
+        {
+            batch.used = Some(existing_proj.clone());
+            existing_proj
+        } else {
+            active_projections.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            active_projections.dedup();
+            // Charge both the owned `PlannedRecord` triples (plus `record_digest`
+            // scratch) and the duplicate `Vec<Quad>` that `publish` materializes via
+            // `batch.quads(...)` before allocating them.
+            let supports_len = p.supports.0.as_str().len() as u64;
+            batch_held.grow_by(supports_len.saturating_mul(24).saturating_add(8192))?;
+            for pred in &active_projections {
+                let pred_bytes = (pred.as_str().len() as u64)
+                    .saturating_mul(2)
+                    .saturating_add(supports_len.saturating_mul(2))
+                    .saturating_add((std::mem::size_of::<Triple>() as u64).saturating_mul(2))
+                    .saturating_add((std::mem::size_of::<Quad>() as u64).saturating_mul(3))
+                    .saturating_add(768);
+                batch_held.grow_by(pred_bytes)?;
+            }
+            let record = rv::reconciled_projection_record(
+                main.dataset_id(),
+                policy_name,
+                policy.version,
+                &p.output.0,
+                p.mode,
+                nonces,
+                operation,
+                &active_projections,
+                &p.supports.0,
+                control,
+            )?;
+            let iri = record.iri.clone();
+            batch.records.push(record);
+            let skip = [false];
+            check_identities(&mut state, &batch, &record_graphs, &skip)?;
+            for (g, nonce) in &projection_graphs {
+                if state.reads.has_published_record_in_output(
+                    &iri,
+                    g.as_str(),
+                    *nonce,
+                    main.dataset_id(),
+                )? {
+                    return Err(managed(
+                        ManagedErrorKind::ImmutableRecordConflict,
+                        format!(
+                            "projection: <{}> is already recorded with other content",
+                            iri.as_str()
+                        ),
+                    ));
+                }
+            }
+            iri
+        };
+        drop(active_projections);
+        drop(proj_held);
+        // Preadmit the projection IRI's Rust and JSON bytes before publication so
+        // committed responses never need another fallible reservation after publish.
+        response_held.grow_by((projection.as_str().len() as u64).saturating_mul(2))?;
+        Ok(ReconcilePlan::Ready(Box::new(ReconcileReady {
+            batch,
+            projection,
+            vouched_supports,
+            changed,
+            insert_quads,
+            delete_ids,
+            _vouched_held: vouched_held,
+            _output_held: output_held,
+            _diff_held: diff_held,
+            _batch_held: batch_held,
+            response_held,
+        })))
+    })()
+    .map_err(budget_to_incomplete)?;
+
+    let ReconcileReady {
+        batch,
+        projection,
+        vouched_supports,
+        changed,
+        insert_quads,
+        delete_ids,
+        _vouched_held,
+        _output_held,
+        _diff_held,
+        _batch_held,
+        response_held,
+    } = match plan {
+        ReconcilePlan::Ready(ready) => *ready,
+        ReconcilePlan::Replayed(replayed, response_held) => return Ok((*replayed, response_held)),
+    };
+    let skip = vec![false; batch.records.len()];
+    logical
+        .store()
+        .failpoint("evidence-reconcile-before-publish");
+    let committed = publish(
+        main,
+        logical,
+        capability,
+        head.commit,
+        Some(head.generation.uid),
+        &batch,
+        &skip,
+        &delete_ids,
+        &insert_quads,
+        options,
+        control,
+    )?;
+    logical
+        .store()
+        .failpoint("evidence-reconcile-after-publish");
+    drop(_batch_held);
+    drop(_diff_held);
+    drop(_output_held);
+    drop(_vouched_held);
+    Ok((
+        ReconciledProjection {
+            operation: batch.operation_iri,
+            committed: committed.committed,
+            replayed: false,
+            commit: committed.commit,
+            branch,
+            policy: p.policy_iri,
+            policy_version: policy.version,
+            output: p.output.0,
+            projection,
+            vouched_supports,
+            changed,
+            preview: committed.preview,
+        },
+        response_held,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::evidence;
+
+    #[test]
+    fn reconcile_maps_raw_read_budget_exhaustion_to_incomplete_evidence() {
+        let ds = Dataset::memory();
+        let settings = Settings {
+            enabled: true,
+            source_records: vec!["urn:ev:sources".into()],
+            proposals: vec!["urn:ev:claims".into()],
+            decisions: vec!["urn:ev:decisions".into()],
+            supports: vec!["urn:ev:supports".into()],
+            projections: vec!["urn:ev:accepted".into()],
+            policies: [(
+                "main".to_string(),
+                Policy {
+                    version: 1,
+                    admitted_kinds: vec![ClaimKind::Reported],
+                    required_scope: Vec::new(),
+                    conflicts: ConflictMode::Refuse,
+                    boundary: vec!["urn:ev:sources".into(), "urn:ev:claims".into()],
+                    decisions: "urn:ev:decisions".into(),
+                    supports: "urn:ev:supports".into(),
+                    output: "urn:ev:accepted".into(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Settings::default()
+        };
+        evidence::configure(&ds, &settings, &Control::none()).unwrap();
+        // Detach SUPPORTS and insert 80 unauthenticated long-IRI candidate subjects
+        // (~80 KiB total) so candidate scanning exhausts a 48 KiB budget AFTER
+        // Preparation::new succeeds (CONTEXT_BYTES = 256).
+        evidence::detach(&ds, "urn:ev:supports").unwrap();
+        let mut nq = String::new();
+        for i in 0..80 {
+            nq.push_str(&format!(
+                "<urn:sup:{i}:{}> <{EV}output> <urn:ev:accepted> <urn:ev:supports> .\n",
+                "s".repeat(1024)
+            ));
+        }
+        ds.load_str(&nq, oxrdfio::RdfFormat::NQuads).unwrap();
+        evidence::configure(&ds, &settings, &Control::none()).unwrap();
+
+        let budget: u64 = 48 << 10;
+        assert!(
+            crate::access::Preparation::new(Control::none(), budget).is_ok(),
+            "test budget must admit the Preparation constructor so State reads hit it"
+        );
+        let opts = Options::new(NamedNode::new("urn:reviewer").unwrap());
+        let err = reconcile_projection_with_budget(
+            &ds,
+            &ds,
+            "main",
+            Some(1),
+            &opts,
+            None,
+            &Control::none(),
+            budget,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "incomplete-evidence", "{err}");
+    }
+
+    #[test]
+    fn reconcile_charges_supersession_lineage_record_and_publication_copies() {
+        let ds = Dataset::memory();
+        let settings = Settings {
+            enabled: true,
+            source_records: vec!["urn:ev:sources".into()],
+            proposals: vec!["urn:ev:claims".into()],
+            decisions: vec!["urn:ev:decisions".into()],
+            supports: vec!["urn:ev:supports".into()],
+            projections: vec!["urn:ev:accepted".into()],
+            policies: [(
+                "main".to_string(),
+                Policy {
+                    version: 1,
+                    admitted_kinds: vec![ClaimKind::Reported],
+                    required_scope: Vec::new(),
+                    conflicts: ConflictMode::Refuse,
+                    boundary: vec!["urn:ev:sources".into(), "urn:ev:claims".into()],
+                    decisions: "urn:ev:decisions".into(),
+                    supports: "urn:ev:supports".into(),
+                    output: "urn:ev:accepted".into(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Settings::default()
+        };
+        evidence::configure(&ds, &settings, &Control::none()).unwrap();
+        // Detach SUPPORTS and plant 100 unauthenticated long-IRI projection predecessors
+        // (~102 KiB of IRI text) so the initial scan fits in 440 KiB, while building the
+        // `prov:wasRevisionOf` record and reserving its publication `Vec<Quad>` copy
+        // exceeds 440 KiB and refuses cleanly before writing.
+        evidence::detach(&ds, "urn:ev:supports").unwrap();
+        let policy_iri = rv::policy_iri("main");
+        let mut nq = String::new();
+        for i in 0..100 {
+            let pred = format!("urn:proj:{i}:{}", "p".repeat(1024));
+            nq.push_str(&format!(
+                "<{pred}> <{RDF_TYPE}> <{EV}Projection> <urn:ev:supports> .\n\
+                 <{pred}> <{EV}reviewPolicy> <{}> <urn:ev:supports> .\n",
+                policy_iri.as_str()
+            ));
+        }
+        ds.load_str(&nq, oxrdfio::RdfFormat::NQuads).unwrap();
+        evidence::configure(&ds, &settings, &Control::none()).unwrap();
+
+        let tight: u64 = 440 << 10;
+        // Confirm the projection scan alone fits inside `tight`, proving the refusal below
+        // comes from charging the supersession lineage record and publication copies.
+        {
+            let (_, settings_bytes) = settings_of(&ds).unwrap();
+            let cap = capability(&ds, Uuid::new_v4(), &settings_bytes).unwrap();
+            let p = PolicyGraphs::new("main", &settings.policies["main"], &cap).unwrap();
+            let snap = ds.store().snapshot();
+            let prep = crate::access::Preparation::new(Control::none(), tight).unwrap();
+            let mut st = State {
+                reads: Reads::new(&prep, &snap),
+                seen: None,
+                claim_graphs: claim_graphs(&settings, &cap),
+                superseded: BTreeSet::new(),
+                withdrawn: BTreeSet::new(),
+            };
+            let mut proj_held = prep.reserve(0).unwrap();
+            let (recs, _) = st.policy_projections_held(&p, &mut proj_held).unwrap();
+            assert_eq!(recs.len(), 100);
+        }
+
+        let head = ds.store().head_commit().seq;
+        let opts = Options::new(NamedNode::new("urn:reviewer").unwrap());
+        let err = reconcile_projection_with_budget(
+            &ds,
+            &ds,
+            "main",
+            Some(1),
+            &opts,
+            None,
+            &Control::none(),
+            tight,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "incomplete-evidence", "{err}");
+        assert_eq!(ds.store().head_commit().seq, head);
+
+        // With enough allowance, reconciliation succeeds and supersedes all 100 predecessors.
+        let rec = reconcile_projection_with_budget(
+            &ds,
+            &ds,
+            "main",
+            Some(1),
+            &opts,
+            None,
+            &Control::none(),
+            2 << 20,
+        )
+        .unwrap();
+        assert!(rec.committed);
+    }
 }

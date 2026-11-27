@@ -968,11 +968,14 @@ nonce.
 
 The protection nonce is the operation marker that resolution decision 1 required.
 `managed.json` format 2 adds a `protections` map from each protected graph to a random
-UUID. Protecting a graph keeps its nonce while the owner keeps protecting it, detaching
-drops the nonce, and protecting it again chooses a new one. This build reads formats 1
-and 2 and writes format 2, and an older build refuses format 2 as written by a newer
-release. A format 1 registry has no nonces, so its graphs take no typed writes until
-the owner protects them again. Resolution now requires the receipt to be an
+UUID. Detaching a graph drops its nonce, and protecting it again chooses a new one.
+A continuously protected graph keeps its nonce unless it moves from a dedicated
+projection output with no record history into a record role. That transition chooses
+a new nonce. This build reads registry formats 1 through 4. A registry with any
+`projectionOnly` graphs writes format 4 so an older writer refuses the registry.
+Otherwise an unactivated store writes format 2 and an activated store writes format 3.
+A format 1 registry has no nonces, so its graphs take no typed writes until the owner
+protects them again. Resolution now requires the receipt to be an
 `ev:Operation` in the record's graph, and both the record and the receipt to carry that
 graph's current nonce as `ev:graphProtection`, otherwise the answer is
 `origin-not-reproduced`. A record written while its graph was detached cannot carry a
@@ -1222,8 +1225,9 @@ conformance of the written records to the shapes, and the HTTP routes.
    version change records a new projection record and applies to later decisions only.
 4. **Withdrawal rights.** Any caller with the grants may withdraw a claim, as for every
    other typed operation. A withdrawal is final, and a new occurrence must be proposed.
-5. **Reconciliation.** A projection whose protections changed is refused rather than
-   repaired. Roadmap item 581 tracks an administered reconciliation.
+5. **Reconciliation.** A review or withdrawal refuses a projection whose protections
+   changed rather than repairing it silently. An administrator reconciles it explicitly
+   through [Reconciling a projection after a changed protection](#reconciling-a-projection-after-a-changed-protection).
 6. **Identity decisions.** Identity proposals need their own record input, a matching
    policy and resolution-map semantics, so they are a later step of this phase. The
    current review policy is specific to claims.
@@ -1451,20 +1455,20 @@ anchored history or a covered commit cannot fall back to legacy absence when a
 reference, flag, generation or coverage file is missing. Complete accepted seals
 are authenticated before recovery can truncate a log or expose recovered data.
 
-The newer file versions are written only after activation, so a store that never
-activates stays readable by older releases. Such a store writes version 1 logs,
-generation `commit.json` format 1 and `managed.json` format 2, and its dataset
-records reader 5, or the managed-graph reader when it has managed graphs.
-Activation first raises the dataset reader of every branch to 8, the
-configuration-history reader. It then upgrades each current log header in place
-and publishes the registry root. From then on the family writes version 2 logs,
-`commit.json` format 2, `managed.json` format 3, `history.json` format 2 and
-`branch.json` format 2. Branches and captures of an activated family record reader 8
-before they write any of these. An older release refuses an activated dataset by its
-reader before it reads anything else. A dataset's recorded reader also bounds the
-versions this build accepts in it. Open and reidentification check every generation's
-log and `commit.json` and the dataset's settings and registry against it, before they
-read or change them. One of these versions in a dataset that records an older reader
+Before activation the evidence profile uses version 1 logs and generation
+`commit.json` format 1. A plain dataset records reader 5, and managed graphs require
+reader 6. A registry that marks dedicated outputs as `projectionOnly` can therefore
+use format 4 at reader 6.
+Activation raises the dataset reader of every branch to 8, upgrades each current log
+header in place and publishes the registry root. The family then writes version 2
+logs and format 2 for `commit.json`, `history.json` and `branch.json`. Its registry
+uses format 3 or 4. Each immutable configuration generation uses format 2 when its
+owners carry `projectionOnly` and format 1 otherwise. The lineage can contain both
+formats. Branches and captures record reader 8 before publishing an activated
+family's files. An older release refuses an activated dataset by its reader. A dataset's
+recorded reader also bounds the versions this build accepts in it. Open and
+reidentification check every generation's log and `commit.json` and the dataset's
+settings and registry against it before they read or change them. One of these versions in a dataset that records an older reader
 is refused as a newer release's file. Bounded history readers do not repeat the check,
 so it adds no read to their allowance.
 
@@ -2752,6 +2756,101 @@ family-wide active-transaction guards refuse writes before taking the store writ
 lock, while hold listing reads only the branch table without taking writer locks. All
 thirteen `evidence.*` entries in `crates/sparkles/bindings.toml` name their concrete
 binding paths, and the Python parity test no longer defers any evidence operation.
+
+### Reconciling a projection after a changed protection
+
+Roadmap item 581 adds `sparkles::evidence::reconcile_projection` and
+`POST /$/evidence/{ds}/projections/reconcile` for an administrator to reconcile a
+review policy's accepted projection after a detach and new protection of its decisions,
+supports or output graph. The route needs `admin` on the dataset or selected branch,
+update grants on the policy's supports and output graphs and unmasked read grants on its
+decisions, supports and output graphs and on every configured proposal graph. It
+refuses while the server is read-only or while declared and recorded evidence settings
+differ (`409 evidence-settings-drift`), and publishes under the caller's authority
+fence (`503 authority-changed`).
+
+At the branch head (checked against optional `ifHead` and again under the writer), the
+operation collects every live `ev:AcceptanceSupport` of the policy in its supports graph
+that authenticates under the current protections, whose accepted `ev:ReviewDecision`
+authenticates in the decisions graph and is not superseded, and whose claim authenticates
+in a configured proposal graph under its current protection and has no authenticated
+`ev:Withdrawal` in any configured proposal graph. If a proposal graph is detached and
+protected again, prior claims and withdrawals there no longer authenticate, so
+reconciliation cannot establish that those claims were never withdrawn and drops their
+supports rather than reviving withdrawn claims. It scans the output
+graph under the shared 64 MiB memory allowance and 1,000,000-triple bound, removes every
+quad not owned by a vouched support (deleting by physical quad ID so blank nodes
+inserted while detached are removed), and inserts every missing vouched triple. When
+decisions or supports were detached and re-protected, prior records no longer
+authenticate, so the output graph is emptied.
+
+Before item 581, a format 2 registry could keep the same protection nonce while a
+graph served first as a record graph and then as a projection output. A projected
+triple identical to a published triple occupies the same RDF quad. Withdrawing its
+last support can therefore remove a publication link or receipt field. Format 2 records the
+owner and nonce but has no per-triple origin or history of graph roles.
+
+On upgrade, the store checks every branch in the family before marking a dedicated
+output as `projectionOnly`. A record with a SHA-256 `ev:recordDigest` can identify
+its currently protected `ev:Operation` through either `ev:availabilityReceipt` or
+`prov:wasGeneratedBy`. A currently protected record also identifies its publisher
+through a receipt to a distinct `ev:Operation` with the same protection. If the
+publisher has lost its operation type or its protection, the receipt still identifies
+a `prov:Activity` that retains the other marker when the record also has a generation
+link to that activity or a SHA-256 record digest.
+A projected copy of that evidence receives the same protection. A projected operation description alone
+does not establish record history. Format 4 prevents new mixed histories. The writer
+rejects record writes to outputs marked `projectionOnly`. Moving such an output into a
+record role rotates its nonce. A former record graph with surviving receipt evidence
+retains its nonce and reconciliation refuses to replace its contents.
+
+A reconciliation publishes its keyed operation in exactly one supports graph. A retry
+first checks current record-role graphs. When one contains the operation, its payload
+and read-grant checks decide replay. Statements in a legacy output cannot add a
+payload conflict, a read grant or a projection to that receipt.
+
+If the operation is absent from current record-role graphs, replay checks former
+record graphs among the unmarked outputs. In a graph with receipt history under its
+current nonce, a surviving operation field at the deterministic IRI or a protected
+record naming that IRI through a receipt or generation edge reserves the key.
+A protected `ev:Operation` bearing the requested key must also be accounted for.
+If a live support owns the matching key quad, the requested key, dataset and
+surviving principal association can still identify another principal's operation.
+That principal's use of the key is independent. An unrelated record receipt establishes graph history only.
+
+Replay excludes every triple owned by a live support of the output's current review
+policy from the receipt evidence. The remaining operation description must contain
+both activity types, the principal, end time, dataset, branch, commit, payload digest,
+key and current protection nonce. Each required field must have its expected type
+and cardinality. A projected replacement for a missing field cannot supply it.
+Replay requires one candidate graph, a matching payload and read access to that
+graph. It looks for an authenticated projection of the requested policy through
+`prov:wasGeneratedBy` or `prov:used`. The operation can
+name at most one reuse target, and qualifying links must agree on the projection.
+A generating edge must agree with the record's receipt. If neither link identifies
+a projection, replay checks `ev:availabilityReceipt` to recover a created
+projection whose generating edge was withdrawn. After support records have been
+cleared, format 2 cannot distinguish a fully copied publication from the original.
+Both are subject to the same replay checks.
+
+A different payload returns `409 idempotency-conflict`. Ambiguous legacy publishers,
+a missing or ambiguous projection association, or missing or ambiguous receipt
+metadata return `409 immutable-record-conflict`. In particular, a reuse operation
+whose shared `prov:used` edge was withdrawn has no creation receipt to fall back
+on. The refusal preserves the branch head, the old output and the current supports
+graph even if the retry omitted the policy version and the policy has since changed.
+
+In the same atomic commit of the evidence owner, the operation appends a fresh immutable
+`ev:Projection` record to the supports graph, minted from the policy, version, operation
+and three current protection nonces, with `prov:wasRevisionOf` naming every prior
+unsuperseded projection record of the policy. `check_projection` ignores any projection
+record superseded through `prov:wasRevisionOf` by a currently authenticated projection
+record of the same policy, while still refusing a supports, output or conflict-mode
+change made without raising `policy.version` under unchanged protections (including
+swapping protected outputs or supports graphs between policies). Reconciling an already-valid projection whose output matches
+its vouched supports reuses its active projection record and links the operation to it
+through `prov:used` so keyed replays return the original receipt. Normal reviews,
+withdrawals and policy reads resume after reconciliation.
 
 ### Scope changes
 

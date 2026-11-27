@@ -23,6 +23,7 @@ use crate::state::AppState;
 use axum::Extension;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value as J, json};
 use sparkles::evidence::{Changed, DecisionInput, Disposition, ReviewOptions, WithdrawalInput};
@@ -644,6 +645,356 @@ pub(super) fn dependents_now(
             "depth": rep.depth,
         })).collect::<Vec<_>>(),
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReconcileProjectionRequest {
+    policy: String,
+    policy_version: Option<u32>,
+    if_head: Option<u64>,
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+    message: Option<String>,
+}
+
+/// `POST /$/evidence/{ds}/projections/reconcile`: administered reconciliation of a
+/// review policy's accepted projection after a changed protection. Rebuilds the output
+/// graph from the live authenticated supports it vouches for (or empties it when none
+/// vouch) and records the current protections in a fresh `ev:Projection` record, or
+/// reuses the active projection record when protections and output already match. Needs
+/// `admin` on the dataset (or selected branch).
+pub(super) async fn reconcile_projection(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    AdminBody(bytes): AdminBody,
+) -> ApiResult {
+    let request: ReconcileProjectionRequest = body_of(&st, &bytes, "projection reconciliation")?;
+    let (cancel, _cancel_on_drop) = crate::http::cancel_on_drop();
+    let grant = crate::server_memory::acquire(&st).await?.map(Arc::new);
+    let execution = super::Execution {
+        branch: crate::http::branches::current()
+            .unwrap_or_else(|| sparkles::branch::MAIN.to_string()),
+        cancel,
+        deadline: None,
+        grant,
+    };
+    match crate::http::blocking(move || reconcile_projection_now(st, name, p, request, execution))
+        .await
+    {
+        Ok((len, body)) => Ok((
+            [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/json"),
+                ),
+                (
+                    axum::http::header::CONTENT_LENGTH,
+                    axum::http::HeaderValue::from(len),
+                ),
+            ],
+            axum::body::Body::new(body),
+        )
+            .into_response()),
+        Err(error) if error.audit_code() == "authority-changed" => {
+            Ok(crate::auth::routes::authority_changed_response())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Chunk size yielded per frame from [`HeldBody`] so the reservation and underlying pool
+/// grant stay live while the response stream is consumed.
+const RESPONSE_CHUNK_BYTES: usize = 64 << 10;
+
+/// Backing JSON buffer paired with its memory reservation. `buf` is declared before
+/// `_held` so the allocation frees before its pool credit returns, and attaching this
+/// owner via [`axum::body::Bytes::from_owner`] keeps the reservation live until every
+/// emitted frame slice has dropped.
+struct HeldBytes {
+    buf: Vec<u8>,
+    _held: sparkles::access::Reservation,
+}
+
+impl AsRef<[u8]> for HeldBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+/// Buffered JSON response body whose backing [`HeldBytes`] owner keeps the memory
+/// reservation (and underlying pool grant) charged until every emitted frame has dropped.
+struct HeldBody {
+    data: axum::body::Bytes,
+}
+
+impl http_body::Body for HeldBody {
+    type Data = axum::body::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if self.data.is_empty() {
+            return std::task::Poll::Ready(None);
+        }
+        let n = self.data.len().min(RESPONSE_CHUNK_BYTES);
+        let chunk = self.data.split_to(n);
+        std::task::Poll::Ready(Some(Ok(http_body::Frame::data(chunk))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.data.len() as u64)
+    }
+}
+
+struct CountingWriter(usize);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.checked_add(buf.len()).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "response size overflow")
+        })?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct ExactVecWriter {
+    buf: Vec<u8>,
+}
+
+impl ExactVecWriter {
+    fn with_exact_capacity(cap: usize) -> Self {
+        let mut buf = Vec::new();
+        buf.reserve_exact(cap);
+        Self { buf }
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        self.buf
+    }
+}
+
+impl std::io::Write for ExactVecWriter {
+    fn write(&mut self, src: &[u8]) -> std::io::Result<usize> {
+        if src.len() > self.buf.capacity() - self.buf.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "serialized JSON exceeded reserved response capacity",
+            ));
+        }
+        self.buf.extend_from_slice(src);
+        Ok(src.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct NamedNodesRef<'a>(&'a [oxrdf::NamedNode]);
+impl serde::Serialize for NamedNodesRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for n in self.0 {
+            seq.serialize_element(n.as_str())?;
+        }
+        seq.end()
+    }
+}
+
+struct TripleDisplay<'a>(&'a oxrdf::Triple);
+impl serde::Serialize for TripleDisplay<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self.0)
+    }
+}
+
+#[derive(serde::Serialize)]
+struct ProjectionChangeRef<'a> {
+    output: &'a str,
+    triple: TripleDisplay<'a>,
+}
+
+struct ProjectionChangesRef<'a>(&'a [sparkles::evidence::ProjectionChange]);
+impl serde::Serialize for ProjectionChangesRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for c in self.0 {
+            seq.serialize_element(&ProjectionChangeRef {
+                output: c.output.as_str(),
+                triple: TripleDisplay(&c.triple),
+            })?;
+        }
+        seq.end()
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangedRef<'a> {
+    supports_added: NamedNodesRef<'a>,
+    supports_ended: NamedNodesRef<'a>,
+    inserted: ProjectionChangesRef<'a>,
+    removed: ProjectionChangesRef<'a>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DryRunRef {
+    would_commit: bool,
+    inserted: u64,
+    deleted: u64,
+    error: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconcileProjectionResponse<'a> {
+    operation: &'a str,
+    committed: bool,
+    replayed: bool,
+    commit: u64,
+    branch_id: uuid::Uuid,
+    policy: &'a str,
+    policy_version: u32,
+    output: &'a str,
+    projection: &'a str,
+    vouched_supports: NamedNodesRef<'a>,
+    changed: ChangedRef<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_run: Option<DryRunRef>,
+}
+
+fn reconcile_projection_now(
+    st: Arc<AppState>,
+    name: String,
+    p: Principal,
+    r: ReconcileProjectionRequest,
+    execution: super::Execution,
+) -> ApiResult<(usize, HeldBody)> {
+    let branch = execution.branch.clone();
+    let main = crate::http::main_dataset(&st, &name)?;
+    crate::settings::evidence::require_reconciled(&st, &main)?;
+    let prepared = prepare(
+        &st,
+        &name,
+        &p,
+        &branch,
+        &execution,
+        r.idempotency_key,
+        r.if_head,
+        r.dry_run,
+        r.message,
+    )?;
+    use crate::auth::{Endpoint, on_branch};
+    let here = on_branch(&prepared.main.name, &branch);
+    let read_opts = crate::http::caller::CallerContext::for_caller(&st, &prepared.logical, &p)
+        .options_on(&crate::http::Params::empty(), &here, Endpoint::Query);
+    let preparation = match execution.grant {
+        Some(grant) => sparkles::access::Preparation::with_grant(
+            prepared.control.clone(),
+            sparkles::evidence::resolve::MEMORY_BYTES,
+            grant,
+        ),
+        None => sparkles::access::Preparation::new(
+            prepared.control.clone(),
+            sparkles::evidence::resolve::MEMORY_BYTES,
+        ),
+    }?;
+    let (reconciled, mut response_held) = sparkles::evidence::reconcile_projection_prepared(
+        &prepared.main.dataset,
+        &prepared.logical.dataset,
+        &r.policy,
+        r.policy_version,
+        &prepared.options,
+        read_opts.graphs.clone(),
+        &preparation,
+        &prepared.control,
+    )?;
+    prepared.fence.check_uncommitted(reconciled.committed)?;
+    let dry_run = reconciled.preview.as_deref().map(|preview| {
+        let commit = preview.receipt_commit();
+        DryRunRef {
+            would_commit: matches!(preview.outcome(), sparkles::preview::Outcome::Commit),
+            inserted: commit.inserted,
+            deleted: commit.deleted,
+            error: preview.error(),
+        }
+    });
+    if let Some(error) = dry_run.as_ref().and_then(|d| d.error.as_deref()) {
+        response_held.grow_by((error.len() as u64).saturating_mul(6).saturating_add(64))?;
+    }
+    let response = ReconcileProjectionResponse {
+        operation: reconciled.operation.as_str(),
+        committed: reconciled.committed,
+        replayed: reconciled.replayed,
+        commit: reconciled.commit,
+        branch_id: reconciled.branch,
+        policy: reconciled.policy.as_str(),
+        policy_version: reconciled.policy_version,
+        output: reconciled.output.as_str(),
+        projection: reconciled.projection.as_str(),
+        vouched_supports: NamedNodesRef(&reconciled.vouched_supports),
+        changed: ChangedRef {
+            supports_added: NamedNodesRef(&reconciled.changed.supports_added),
+            supports_ended: NamedNodesRef(&reconciled.changed.supports_ended),
+            inserted: ProjectionChangesRef(&reconciled.changed.inserted),
+            removed: ProjectionChangesRef(&reconciled.changed.removed),
+        },
+        dry_run,
+    };
+    let mut counter = CountingWriter(0);
+    serde_json::to_writer(&mut counter, &response)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let exact_len = counter.0;
+    let committed = reconciled.committed;
+    if committed {
+        debug_assert!(
+            exact_len as u64 <= response_held.bytes(),
+            "committed reconciliation response ({exact_len} B) exceeded preadmitted reservation ({} B)",
+            response_held.bytes()
+        );
+    } else if exact_len as u64 > response_held.bytes() {
+        response_held.grow_to(exact_len as u64)?;
+    }
+    let mut writer = ExactVecWriter::with_exact_capacity(exact_len);
+    serde_json::to_writer(&mut writer, &response)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let body = writer.into_vec();
+    let cap = body.capacity() as u64;
+    drop(reconciled);
+    // Committed responses are preadmitted before publication and must never fail with a
+    // post-commit deadline timeout; shrink to the exact retained buffer capacity and attach
+    // the reservation to the backing Bytes owner so emitted frames keep it charged.
+    if !committed && cap > response_held.bytes() {
+        response_held.grow_to(cap)?;
+    }
+    response_held.release_to(cap);
+    drop(preparation);
+    let len = body.len();
+    Ok((
+        len,
+        HeldBody {
+            data: axum::body::Bytes::from_owner(HeldBytes {
+                buf: body,
+                _held: response_held,
+            }),
+        },
+    ))
 }
 
 type Policy = Option<Arc<sparkles::access::GraphAccess>>;

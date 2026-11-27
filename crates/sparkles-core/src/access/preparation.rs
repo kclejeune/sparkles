@@ -1148,6 +1148,23 @@ impl Preparation {
         snap.contains_prepared(quad, self)
     }
 
+    /// Return the first live physical quad in `[lo, hi]` under `perm`, seeking
+    /// directly via block, segment, row and delta bounds.
+    pub(crate) fn first_in_range(
+        &self,
+        snap: &Snapshot,
+        perm: Perm,
+        lo: crate::index::Key,
+        hi: crate::index::Key,
+    ) -> Result<Option<[Id; 4]>> {
+        let mut found = None;
+        snap.scan_prepared_range::<Error>(perm, lo, hi, self, |q| {
+            found = Some(q);
+            Ok(false)
+        })?;
+        Ok(found)
+    }
+
     /// Resolve an IRI with controlled reconstruction and delta-vocabulary waiting.
     pub fn lookup_iri(&self, snap: &Snapshot, iri: &str) -> Result<Option<Id>> {
         self.check()?;
@@ -1997,14 +2014,15 @@ impl Reservation {
         Ok(())
     }
     /// Release the allowance above `bytes` once the owner retains no more than that.
-    pub(crate) fn release_to(&mut self, bytes: u64) {
+    pub fn release_to(&mut self, bytes: u64) {
         if bytes < self.bytes {
             self.preparation.release_bytes(self.bytes - bytes);
             self.bytes = bytes;
         }
     }
 
-    pub(crate) fn bytes(&self) -> u64 {
+    /// Bytes currently reserved by this owner.
+    pub fn bytes(&self) -> u64 {
         self.bytes
     }
 

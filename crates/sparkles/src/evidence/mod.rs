@@ -120,8 +120,9 @@ pub use review::identity::{
     resolve_at as resolve_entities_at,
 };
 pub use review::{
-    Changed, Decided, MapChange, Options as ReviewOptions, ProjectionChange, Reviewed, Withdrawn,
-    WithdrawnClaim, review, withdraw,
+    Changed, Decided, MapChange, Options as ReviewOptions, ProjectionChange, ReconciledProjection,
+    Reviewed, Withdrawn, WithdrawnClaim, reconcile_projection, reconcile_projection_prepared,
+    review, withdraw,
 };
 pub use sparkles_core::evidence::review::{
     DecisionInput, Disposition, MAX_DECISIONS, WithdrawalInput,

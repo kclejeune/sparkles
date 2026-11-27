@@ -168,6 +168,20 @@ pub fn rebuild_map_payload_digest(
     frame.finish()
 }
 
+/// The payload digest of a projection reconciliation request.
+pub fn reconcile_payload_digest(
+    policy: &str,
+    version: Option<u32>,
+    control: &Control,
+) -> Result<Sha256Digest> {
+    let mut frame = FrameHash::new(b"sparkles-evidence-reconcile-projection-v1", control)?;
+    frame.field(1, policy.as_bytes())?;
+    if let Some(v) = version {
+        frame.field(2, &v.to_be_bytes())?;
+    }
+    frame.finish()
+}
+
 fn planned(
     key: &str,
     kind: RecordKind,
@@ -350,6 +364,170 @@ pub fn boundary_protection(graph: &NamedNode, nonce: Uuid) -> String {
     format!("{nonce} {}", graph.as_str())
 }
 
+/// Predicate linking graph-local, nonce-scoped `ev:Projection` index subjects to their
+/// `ev:Projection` record IRI within the same supports graph so drift and supersession
+/// checks run strictly on `Perm::Gspo` without scanning foreign graphs.
+pub const INDEXED_PROJECTION: &str = "urn:x-sparkles:evidence:indexedProjection";
+
+fn projection_index_iri(kind: &str, domain: &[u8], parts: &[&[u8]]) -> NamedNode {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let mut h = Sha256::new();
+    h.update(domain);
+    for part in parts {
+        h.update((part.len() as u64).to_be_bytes());
+        h.update(part);
+    }
+    let digest = h.finalize();
+    let mut iri = String::with_capacity(32 + kind.len() + 64);
+    let _ = write!(iri, "urn:x-sparkles:evidence:index:{kind}:");
+    for b in digest {
+        let _ = write!(iri, "{b:02x}");
+    }
+    NamedNode::new_unchecked(iri)
+}
+
+/// Graph-local `Perm::Gspo` index subject for `ev:Projection` records of
+/// `(policy_iri, policy_version)` under `supports_nonce`.
+pub fn projection_policy_index_iri(
+    supports_nonce: Uuid,
+    policy_iri: &str,
+    policy_version: u32,
+) -> NamedNode {
+    projection_index_iri(
+        "policy",
+        b"sparkles-projection-policy-index-v1\0",
+        &[
+            supports_nonce.as_bytes(),
+            policy_iri.as_bytes(),
+            &policy_version.to_be_bytes(),
+        ],
+    )
+}
+
+/// Graph-local `Perm::Gspo` index subject for `ev:Projection` records targeting
+/// `(output_graph, output_nonce)` under `supports_nonce`.
+pub fn projection_output_index_iri(
+    supports_nonce: Uuid,
+    output_nonce: Uuid,
+    output_graph: &str,
+) -> NamedNode {
+    projection_index_iri(
+        "output",
+        b"sparkles-projection-output-index-v1\0",
+        &[
+            supports_nonce.as_bytes(),
+            output_nonce.as_bytes(),
+            output_graph.as_bytes(),
+        ],
+    )
+}
+
+/// Graph-local `Perm::Gspo` index subject for `ev:Projection` records superseding
+/// `prior` through `prov:wasRevisionOf` under `supports_nonce`.
+pub fn projection_revision_index_iri(supports_nonce: Uuid, prior: &str) -> NamedNode {
+    projection_index_iri(
+        "revision",
+        b"sparkles-projection-revision-index-v1\0",
+        &[supports_nonce.as_bytes(), prior.as_bytes()],
+    )
+}
+
+/// Build the graph-local `Perm::Gspo` index quads for an `ev:Projection` record
+/// `proj_iri` in `graph` under `supports_nonce`, `output_nonce`,
+/// `(policy_iri, policy_version)`, `output_graph`, and its `prov:wasRevisionOf`
+/// predecessors `priors`.
+#[allow(clippy::too_many_arguments)]
+pub fn projection_index_quads(
+    proj_iri: &NamedNode,
+    graph: &NamedNode,
+    supports_nonce: Uuid,
+    output_nonce: Uuid,
+    policy_iri: &str,
+    policy_version: u32,
+    output_graph: &str,
+    priors: &[&str],
+) -> Vec<Quad> {
+    let pred = NamedNode::new_unchecked(INDEXED_PROJECTION);
+    let g = oxrdf::GraphName::NamedNode(graph.clone());
+    let mut out = Vec::with_capacity(2 + priors.len());
+    out.push(Quad::new(
+        projection_policy_index_iri(supports_nonce, policy_iri, policy_version),
+        pred.clone(),
+        proj_iri.clone(),
+        g.clone(),
+    ));
+    out.push(Quad::new(
+        projection_output_index_iri(supports_nonce, output_nonce, output_graph),
+        pred.clone(),
+        proj_iri.clone(),
+        g.clone(),
+    ));
+    for prior in priors {
+        out.push(Quad::new(
+            projection_revision_index_iri(supports_nonce, prior),
+            pred.clone(),
+            proj_iri.clone(),
+            g.clone(),
+        ));
+    }
+    out
+}
+
+fn projection_index_quads_for_record(r: &PlannedRecord) -> Vec<Quad> {
+    if r.kind != RecordKind::Projection {
+        return Vec::new();
+    }
+    let review_policy = ev("reviewPolicy");
+    let policy_version = ev("policyVersion");
+    let output_pred = ev("output");
+    let supports_prot = NamedNode::new_unchecked(NONCE_PREDICATES[1]);
+    let output_prot = NamedNode::new_unchecked(NONCE_PREDICATES[2]);
+    let was_revision_of = prov("wasRevisionOf");
+
+    let mut policy: Option<&str> = None;
+    let mut version: Option<u32> = None;
+    let mut output: Option<&str> = None;
+    let mut sup_nonce: Option<Uuid> = None;
+    let mut out_nonce: Option<Uuid> = None;
+    let mut priors: Vec<&str> = Vec::new();
+    for t in &r.triples {
+        if t.predicate == review_policy
+            && let Term::NamedNode(n) = &t.object
+        {
+            policy = Some(n.as_str());
+        } else if t.predicate == policy_version
+            && let Term::Literal(l) = &t.object
+        {
+            version = l.value().parse().ok();
+        } else if t.predicate == output_pred
+            && let Term::NamedNode(n) = &t.object
+        {
+            output = Some(n.as_str());
+        } else if t.predicate == supports_prot
+            && let Term::Literal(l) = &t.object
+        {
+            sup_nonce = Uuid::parse_str(l.value()).ok();
+        } else if t.predicate == output_prot
+            && let Term::Literal(l) = &t.object
+        {
+            out_nonce = Uuid::parse_str(l.value()).ok();
+        } else if t.predicate == was_revision_of
+            && let Term::NamedNode(n) = &t.object
+        {
+            priors.push(n.as_str());
+        }
+    }
+    let (Some(policy), Some(version), Some(output), Some(sup_nonce), Some(out_nonce)) =
+        (policy, version, output, sup_nonce, out_nonce)
+    else {
+        return Vec::new();
+    };
+    projection_index_quads(
+        &r.iri, &r.graph, sup_nonce, out_nonce, policy, version, output, &priors,
+    )
+}
+
 /// The projection record of `policy` at `version` in its supports graph `graph`. Its
 /// identity is minted in the policy's own namespace from the version, so every
 /// reviewer of that version finds the same record.
@@ -400,6 +578,75 @@ pub fn projection_iri(
         &version.to_string(),
         control,
     )
+}
+
+/// The identity of a reconciled projection record of `policy` at `version` under the
+/// protection nonces `nonces` and `operation`. Including both the three nonces and the
+/// operation keeps it distinct from the initial projection record, from earlier
+/// protection epochs and from repeated repairs under the same version and nonces.
+pub fn reconciled_projection_iri(
+    dataset: Uuid,
+    policy: &str,
+    version: u32,
+    nonces: ProjectionNonces,
+    operation: Uuid,
+    control: &Control,
+) -> Result<NamedNode> {
+    mint(
+        dataset,
+        &policy_iri(policy),
+        RecordKind::Projection,
+        policy,
+        &format!(
+            "{version} {} {} {} {operation}",
+            nonces.decisions, nonces.supports, nonces.output
+        ),
+        control,
+    )
+}
+
+/// A reconciled projection record of `policy` at `version` in its supports graph
+/// `graph`, carrying the current protection `nonces` and superseding `supersedes`
+/// through `prov:wasRevisionOf`.
+#[allow(clippy::too_many_arguments)]
+pub fn reconciled_projection_record(
+    dataset: Uuid,
+    policy: &str,
+    version: u32,
+    output: &NamedNode,
+    mode: ConflictMode,
+    nonces: ProjectionNonces,
+    operation: Uuid,
+    supersedes: &[NamedNode],
+    graph: &NamedNode,
+    control: &Control,
+) -> Result<PlannedRecord> {
+    let iri = reconciled_projection_iri(dataset, policy, version, nonces, operation, control)?;
+    let mut r = Record::new(&iri, RecordKind::Projection);
+    r.add(ev("reviewPolicy"), policy_iri(policy));
+    r.add(ev("policyVersion"), string(&version.to_string()));
+    r.add(ev("output"), output.clone());
+    r.add(
+        ev("conflictMode"),
+        ev(match mode {
+            ConflictMode::Refuse => "Refuse",
+            ConflictMode::AdmitLabelled => "AdmitLabelled",
+        }),
+    );
+    for (p, n) in NONCE_PREDICATES
+        .iter()
+        .zip([nonces.decisions, nonces.supports, nonces.output])
+    {
+        r.add(NamedNode::new_unchecked(*p), string(&n.to_string()));
+    }
+    let mut prior: Vec<&NamedNode> = supersedes.iter().collect();
+    prior.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    prior.dedup();
+    r.triples.reserve(7 + prior.len());
+    for p in prior {
+        r.add(prov("wasRevisionOf"), p.clone());
+    }
+    planned("projection", RecordKind::Projection, r, graph, control)
 }
 
 /// The protection nonces of a matching policy's decisions, maps and output graphs.
@@ -500,6 +747,9 @@ pub struct Batch {
     pub payload_digest: Sha256Digest,
     pub principal: NamedNode,
     pub idempotency_key: Option<String>,
+    /// An existing record this operation reused, written as `prov:used` on the
+    /// operation so keyed replays recover the first receipt.
+    pub used: Option<NamedNode>,
     /// The record graphs that describe the operation, sorted. A projection graph is
     /// never among them.
     pub graphs: Vec<NamedNode>,
@@ -525,19 +775,26 @@ impl Batch {
                 r.key
             )));
         }
-        publish_quads(
+        let mut out = publish_quads(
             &Operation {
                 iri: &self.operation_iri,
                 principal: &self.principal,
                 payload_digest: self.payload_digest,
                 idempotency_key: self.idempotency_key.as_deref(),
                 hold: None,
+                used: self.used.as_ref(),
             },
             &self.graphs,
             &self.records,
             stamp,
             &protection,
             skip,
-        )
+        )?;
+        for (i, r) in self.records.iter().enumerate() {
+            if !skip.get(i).copied().unwrap_or(false) && r.kind == RecordKind::Projection {
+                out.extend(projection_index_quads_for_record(r));
+            }
+        }
+        Ok(out)
     }
 }

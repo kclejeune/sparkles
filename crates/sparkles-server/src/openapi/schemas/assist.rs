@@ -1203,6 +1203,60 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
         ),
     );
     put(
+        "EvidenceProjectionReconcile",
+        doc(
+            closed(
+                &["policy"],
+                json!({
+                    "policy": with_desc(string(), "The name of a review policy of the evidence settings."),
+                    "policyVersion": with_desc(json!({ "type": "integer", "minimum": 1 }), "Optional expected policy version, else `409 policy-changed`."),
+                    "ifHead": commit("Publish only while this commit is the branch head, else `409 head-changed`."),
+                    "idempotencyKey": key("Makes a retry with the same payload answer the first receipt."),
+                    "dryRun": with_desc(boolean(), "Check and preview the reconciliation without committing it."),
+                    "message": with_desc(string(), "The commit message."),
+                }),
+            ),
+            "Reconcile a review policy's accepted projection after a changed protection.",
+            "evidence-reviews",
+        ),
+    );
+    put(
+        "EvidenceProjectionReconcileResult",
+        doc(
+            closed(
+                &[
+                    "operation",
+                    "committed",
+                    "replayed",
+                    "commit",
+                    "branchId",
+                    "policy",
+                    "policyVersion",
+                    "output",
+                    "projection",
+                    "vouchedSupports",
+                    "changed",
+                ],
+                json!({
+                    "operation": iri("The reconciliation operation, which is the availability receipt of any fresh projection record it publishes."),
+                    "committed": with_desc(boolean(), "Whether this request published a commit."),
+                    "replayed": with_desc(boolean(), "Whether the idempotency key had published the same payload, whose receipt this is."),
+                    "commit": commit("The publishing commit, the first one for a replay, or the head for a dry run."),
+                    "branchId": uuid("The branch the commit published on."),
+                    "policy": iri("The reconciled review policy."),
+                    "policyVersion": with_desc(json!({ "type": "integer", "minimum": 1 }), "The policy version recorded in the projection record."),
+                    "output": iri("The output graph recorded in the projection record."),
+                    "projection": iri("The active projection record carrying the current protections, or the projection record selected by the original operation on a replay."),
+                    "vouchedSupports": with_desc(array(string()), "The live authenticated acceptance supports vouched for under the current protections, sorted by IRI. Empty on a replay."),
+                    "changed": changed(),
+                    "dryRun": dry_run(),
+                }),
+            ),
+            "The outcome of reconciling a review policy's accepted projection.",
+            "evidence-reviews",
+        ),
+    );
+    put(
         "EvidenceWithdrawal",
         doc(
             closed(

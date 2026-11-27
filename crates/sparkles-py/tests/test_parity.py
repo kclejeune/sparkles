@@ -51,6 +51,7 @@ def _resolve(tree: ast.Module, name: str) -> None:
 # Keys whose Python binding is deliberately deferred.
 DEFERRED = {
     "evidence.reauthenticate",
+    "evidence.reconcile_projection",
     "evidence.rebuild_resolution_map",
     "jobs.cancel",
     "jobs.claim",

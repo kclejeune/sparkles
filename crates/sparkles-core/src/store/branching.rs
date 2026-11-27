@@ -1014,6 +1014,15 @@ impl BranchSet {
             .collect()
     }
 
+    /// The IDs of all listed branches when none are broken, or `None` if any listed
+    /// branch is broken (fail-safe for family-wide inspections).
+    pub(super) fn listed_branch_ids_if_healthy(&self) -> Option<Vec<uuid::Uuid>> {
+        if !self.broken.lock().is_empty() {
+            return None;
+        }
+        Some(self.table.lock().branches.iter().map(|e| e.id).collect())
+    }
+
     /// The nearest listed branch that branch `id` descends from through starting
     /// points: its upstream, or the upstream of a retired branch it started from (the
     /// dataset id for `main`; `None` for `main` itself and unknown branches).

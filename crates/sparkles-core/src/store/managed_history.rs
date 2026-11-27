@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 pub(crate) const READER: u32 = 8;
 pub(crate) const FORMAT: u32 = 1;
+pub(crate) const GENERATION_FORMAT: u32 = 2;
 
 /// Whether the files at `root` record an activation of configuration history,
 /// whatever its registry says. Activation raises the dataset reader of every
@@ -80,11 +81,10 @@ pub(crate) fn check_activated_registry(
 
 /// Whether a family has activated configuration history. Activation is a
 /// closed-dataset migration that publishes the registry's history root and
-/// raises every branch's dataset reader to [`READER`]. Only then does the store
-/// write version 2 logs, generation `commit.json` format 2 and `managed.json`
-/// format 3, so a store that never activates keeps the versions that older
-/// releases read. A registry that cannot be enforced still records activation in
-/// the family's dataset reader.
+/// raises every branch's dataset reader to [`READER`]. Activation selects
+/// version 2 logs, generation `commit.json` format 2 and branch metadata
+/// format 2. A registry carrying projection-only graphs uses format 4 with
+/// or without activation.
 pub(crate) fn activated(
     state: Option<&crate::managed::ManagedState>,
     family_root: Option<&Path>,
@@ -144,7 +144,7 @@ enum EvidenceState {
     Enabled,
 }
 
-/// Field order and UTF-8 JSON string encoding are part of generation format 1.
+/// Field order and UTF-8 JSON string encoding are part of both generation formats.
 /// ownerSettings stores the exact settings bytes, without normalizing an old file.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -401,9 +401,34 @@ fn version(format: u32) -> Result<()> {
 }
 
 impl Generation {
+    fn format_for(owners: &BTreeMap<OwnerKind, OwnerEntry>) -> u32 {
+        if crate::managed::owners_have_projection_only(owners) {
+            GENERATION_FORMAT
+        } else {
+            FORMAT
+        }
+    }
+
+    fn decode(bytes: &[u8], preparation: &Preparation) -> Result<Owned<Self>> {
+        let document: Owned<Self> = decode_with_version(bytes, preparation, |format| {
+            if !(FORMAT..=GENERATION_FORMAT).contains(&format) {
+                return Err(Error::Unsupported(format!(
+                    "configuration generation has format {format}; this release reads formats {FORMAT} to {GENERATION_FORMAT}"
+                )));
+            }
+            Ok(())
+        })?;
+        document.value.validate(preparation)?;
+        Ok(document)
+    }
+
     fn validate(&self, preparation: &Preparation) -> Result<()> {
         preparation.check()?;
-        version(self.format)?;
+        if self.format != Self::format_for(&self.owners) {
+            return Err(unavailable(
+                "configuration generation format differs from its owners",
+            ));
+        }
         if self.dataset_id.is_nil()
             || self.lineage_id.is_nil()
             || self.ordinal == 0
@@ -438,6 +463,19 @@ impl Generation {
                 if nonce.is_nil() || !entry.graphs.contains(graph) {
                     return Err(unavailable(
                         "configuration protection does not name its graph",
+                    ));
+                }
+            }
+            if *owner != OwnerKind::Evidence && !entry.projection_only.is_empty() {
+                return Err(unavailable(
+                    "only the evidence owner can record projection-only graphs",
+                ));
+            }
+            for graph in &entry.projection_only {
+                preparation.check()?;
+                if !entry.graphs.contains(graph) || !entry.protections.contains_key(graph) {
+                    return Err(unavailable(
+                        "configuration projection-only graph is not a protected graph",
                     ));
                 }
             }
@@ -513,6 +551,11 @@ pub(crate) fn prepare(
                 .checked_add((graph.len() as u64).saturating_mul(4).saturating_add(512))
                 .ok_or_else(|| preparation.exhausted())?;
         }
+        for graph in &entry.projection_only {
+            estimate = estimate
+                .checked_add((graph.len() as u64).saturating_mul(2).saturating_add(64))
+                .ok_or_else(|| preparation.exhausted())?;
+        }
     }
     let held = preparation.reserve(estimate)?;
     let mut owner_settings = BTreeMap::new();
@@ -534,7 +577,7 @@ pub(crate) fn prepare(
     };
     let document = Owned {
         value: Generation {
-            format: FORMAT,
+            format: Generation::format_for(&installed.graphs.owners),
             dataset_id,
             lineage_id,
             ordinal,
@@ -663,7 +706,7 @@ pub(crate) fn decode<T: DeserializeOwned + Serialize>(
 
 /// Keep each document type's version refusal ahead of body decoding. This
 /// factors only the canonical admitted codec; it supplies no publication or
-/// source authority. Existing generation/coverage callers still accept only1.
+/// source authority.
 pub(crate) fn decode_with_version<T: DeserializeOwned + Serialize>(
     bytes: &[u8],
     preparation: &Preparation,
@@ -893,8 +936,7 @@ pub(crate) fn generation_bytes(
     if Sha256Digest::of_bytes(bytes, preparation.control())? != identity.generation {
         return Err(unavailable("configuration generation hash differs"));
     }
-    let document: Owned<Generation> = decode(bytes, preparation)?;
-    document.value.validate(preparation)?;
+    let document = Generation::decode(bytes, preparation)?;
     if document.value.dataset_id != identity.dataset_id
         || document.value.lineage_id != identity.lineage_id
     {
@@ -1124,21 +1166,7 @@ pub(crate) fn resolve_memory(
         let current =
             node.ok_or_else(|| unavailable("configuration was not published in memory"))?;
         if current.prepared.identity == identity {
-            if Sha256Digest::of_bytes(&current.prepared.bytes.value, preparation.control())?
-                != identity.generation
-            {
-                return Err(unavailable("in-memory configuration bytes differ"));
-            }
-            let copied: Owned<Generation> = decode(&current.prepared.bytes.value, preparation)?;
-            copied.value.validate(preparation)?;
-            if copied.value.dataset_id != identity.dataset_id
-                || copied.value.lineage_id != identity.lineage_id
-            {
-                return Err(unavailable(
-                    "in-memory configuration belongs to another lineage",
-                ));
-            }
-            return Ok(copied);
+            return generation_bytes(&current.prepared.bytes.value, identity, preparation);
         }
         node = current.previous.as_deref();
     }
@@ -1153,14 +1181,18 @@ pub(crate) struct ActivationBranch {
     _held: Reservation,
 }
 
-pub(crate) fn activation_needed(root: &Path, preparation: &Preparation) -> Result<bool> {
+pub(crate) fn activation_generation_format(
+    root: &Path,
+    preparation: &Preparation,
+) -> Result<Option<u32>> {
     preparation.check()?;
     match super::managed::load_dir(root) {
-        Some(crate::managed::ManagedState::Installed(installed)) => {
-            Ok(installed.configuration_history.is_none())
-        }
+        Some(crate::managed::ManagedState::Installed(installed)) => Ok(installed
+            .configuration_history
+            .is_none()
+            .then(|| Generation::format_for(&installed.graphs.owners))),
         Some(crate::managed::ManagedState::Unavailable { reason, .. }) => Err(unavailable(reason)),
-        None => Ok(true),
+        None => Ok(Some(FORMAT)),
     }
 }
 

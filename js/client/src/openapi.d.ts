@@ -1082,6 +1082,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/evidence/{ds}/projections/reconcile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reconcile a review policy's accepted projection
+         * @description Needs `admin` on the dataset or selected branch, with update grants on the policy's supports and output graphs and unmasked read grants on its decisions, supports and output graphs and on every configured proposal graph. Rebuilds the review policy's output graph strictly from the live acceptance supports that authenticate under the current protections, or empties it when none vouch, and records the new protection nonces in a fresh `ev:Projection` record that supersedes prior unsuperseded projection records of the policy, or reuses the active projection record when the protections and output are already valid. Restores normal reviews, withdrawals and policy reads after a detach and new protection of the policy's decisions, supports or output graph. Refusals write nothing: `400` for a malformed request, unknown policy or matching policy, `403` for a read-only server or missing or masked grants, `409 evidence-settings-drift`, `409 policy-changed`, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 unsupported-profile` when the profile is disabled or a policy graph is still detached, `422 incomplete-evidence`, `503` for `managed-unavailable`, `projection-unavailable` when the supports, output or conflict mode changed without raising the policy version, `authority-changed`, or temporary query memory pool exhaustion (with `Retry-After`), and `507` when the request exceeds the configured query memory pool.
+         */
+        post: operations["reconcileEvidenceProjection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/evidence/{ds}/reauthenticate": {
         parameters: {
             query?: never;
@@ -7666,6 +7686,84 @@ export interface components {
             policy: string;
             /** @description The latest resolution map revision, `null` before the first. */
             revision: string | null;
+        };
+        /** @description Reconcile a review policy's accepted projection after a changed protection. */
+        EvidenceProjectionReconcile: {
+            /** @description Check and preview the reconciliation without committing it. */
+            dryRun?: boolean;
+            /** @description Makes a retry with the same payload answer the first receipt. */
+            idempotencyKey?: string;
+            /** @description Publish only while this commit is the branch head, else `409 head-changed`. */
+            ifHead?: number;
+            /** @description The commit message. */
+            message?: string;
+            /** @description The name of a review policy of the evidence settings. */
+            policy: string;
+            /** @description Optional expected policy version, else `409 policy-changed`. */
+            policyVersion?: number;
+        };
+        /** @description The outcome of reconciling a review policy's accepted projection. */
+        EvidenceProjectionReconcileResult: {
+            /**
+             * Format: uuid
+             * @description The branch the commit published on.
+             */
+            branchId: string;
+            /** @description The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay. */
+            changed: {
+                inserted: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                /** @description A review under a matching policy that changed which accepted decisions its resolution map follows. */
+                map?: {
+                    decisionsAdded: string[];
+                    decisionsEnded: string[];
+                    /** @description The entities whose selected entity changed. */
+                    entities: string[];
+                    number: number;
+                    /** @description The matching policy. */
+                    policy: string;
+                    /** @description The revision it follows, whose consumers may need review. */
+                    previous: string | null;
+                    /** @description The resolution map revision the operation published. */
+                    revision: string;
+                };
+                removed: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                supportsAdded: string[];
+                supportsEnded: string[];
+            };
+            /** @description The publishing commit, the first one for a replay, or the head for a dry run. */
+            commit: number;
+            /** @description Whether this request published a commit. */
+            committed: boolean;
+            dryRun?: {
+                deleted: number;
+                error: string | null;
+                inserted: number;
+                wouldCommit: boolean;
+            };
+            /** @description The reconciliation operation, which is the availability receipt of any fresh projection record it publishes. */
+            operation: string;
+            /** @description The output graph recorded in the projection record. */
+            output: string;
+            /** @description The reconciled review policy. */
+            policy: string;
+            /** @description The policy version recorded in the projection record. */
+            policyVersion: number;
+            /** @description The active projection record carrying the current protections, or the projection record selected by the original operation on a replay. */
+            projection: string;
+            /** @description Whether the idempotency key had published the same payload, whose receipt this is. */
+            replayed: boolean;
+            /** @description The live authenticated acceptance supports vouched for under the current protections, sorted by IRI. Empty on a replay. */
+            vouchedSupports: string[];
         };
         /** @description One batch of evidence records. At most 1,000 claims, 10,000 links, 1,000 identity proposals and 16 MiB of decoded input. */
         EvidenceProposal: {
@@ -17336,6 +17434,47 @@ export interface operations {
             409: components["responses"]["Conflict"];
             422: components["responses"]["Unprocessable"];
             503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    reconcileEvidenceProjection: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceProjectionReconcile"];
+            };
+        };
+        responses: {
+            /** @description The reconciled projection, vouched supports and output changes. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceProjectionReconcileResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            422: components["responses"]["Unprocessable"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };
