@@ -1570,8 +1570,10 @@ impl ReverseAlternatives {
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
         enum Work {
             Visit,
-            TreeChildren,
+            // At equal bounds, follow surviving cross-tree returns before
+            // expanding the tree children. A return may lead to an exit.
             IndexedReturns,
+            TreeChildren,
             CheckIntervals,
         }
         let mut queue = BinaryHeap::new();
@@ -14780,6 +14782,21 @@ mod tree_tests {
             7,
             11,
             Some(2),
+        );
+    }
+
+    #[test]
+    fn reverse_walk_indexed_return_reaches_exit_before_tied_children() {
+        // At u the shortest suffix through v returns via r, b and a. Visiting
+        // v exposes the exit through z before any tied clique child expands.
+        assert_dense_first_row(
+            "ex:a ex:p ex:u {| ex:w 2e0 |} . ex:u ex:p ex:b, ex:v . ex:b ex:p ex:a . \
+             ex:v ex:p ex:r, ex:z . ex:r ex:p ex:b . ex:z ex:p ex:y . ex:y ex:p ex:x . \
+             ex:x ex:p ex:t {| ex:w 10e0 |} . ",
+            128,
+            6,
+            12,
+            Some(3),
         );
     }
 
