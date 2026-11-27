@@ -312,10 +312,26 @@ fn decode_fact(
     scratch: &mut Memory,
 ) -> Result<[oxrdf::Term; 3]> {
     let mut term = |i| {
-        super::memory::term(snapshot, quad[i], scratch, &mut || control.check())?
+        super::memory::term(snapshot, quad[i], scratch, &mut || control.check())
+            .map_err(share_error)?
             .ok_or_else(|| Error::Corrupt("an entailment fact has an unknown term".into()))
     };
-    Ok([term(0)?, term(1)?, term(2)?])
+    let triple = [term(0)?, term(1)?, term(2)?];
+    scratch
+        .grow(triple.iter().map(crate::explain::term_bytes).sum::<usize>() as u64 * 2)
+        .map_err(share_error)?;
+    Ok(triple)
+}
+
+/// A decoding scratch that passes the limit of its analysis share has passed the
+/// analysis's memory limit. A refusal of the shared server memory stays as it is.
+fn share_error(error: Error) -> Error {
+    match error {
+        Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory => budget(format!(
+            "the entailment analysis passed its memory limit: {b}"
+        )),
+        error => error,
+    }
 }
 
 pub(crate) fn hold(limit: Option<usize>, bytes: &mut usize, additional: usize) -> Result<()> {
@@ -391,7 +407,6 @@ pub(crate) fn stored(
         }
         let mut scratch = Memory::new(share.map(|n| n as u64), parent.clone());
         let triple = decode_fact(snapshot, quad, control, &mut scratch)?;
-        scratch.grow(triple.iter().map(crate::explain::term_bytes).sum::<usize>() as u64 * 2)?;
         let key = fact_key(&triple);
         if input && !asserted.contains_key(&key) {
             hold_state(share, &mut bytes, &mut memory, fact_bytes(&key, &triple))?;
@@ -615,7 +630,6 @@ fn analyze_with_cache_limit(
         control.check()?;
         let mut scratch = Memory::new(share.map(|n| n as u64), parent.clone());
         let triple = decode_fact(&before, quad, control, &mut scratch)?;
-        scratch.grow(triple.iter().map(crate::explain::term_bytes).sum::<usize>() as u64 * 2)?;
         let key = fact_key(&triple);
         if let std::collections::btree_map::Entry::Vacant(entry) = asserted.entry(key) {
             hold_state(
@@ -691,7 +705,6 @@ fn analyze_with_cache_limit(
         control.check()?;
         let mut scratch = Memory::new(share.map(|n| n as u64), parent.clone());
         let triple = decode_fact(&snapshot, quad, control, &mut scratch)?;
-        scratch.grow(triple.iter().map(crate::explain::term_bytes).sum::<usize>() as u64 * 2)?;
         let key = fact_key(&triple);
         if let std::collections::btree_map::Entry::Vacant(entry) = closure.entry(key) {
             hold_state(

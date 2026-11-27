@@ -397,8 +397,11 @@ fn asserted_findings_have_supports_without_a_recorded_or_explicit_program() {
 
 #[test]
 fn classes_all_charges_the_shared_large_facts_in_retained_results() {
+    // Each decoded fact must fit in one analysis share, an eighth of what the grant
+    // has left, so the large fact is small enough for the early class checks to
+    // finish and retain their supports before the grant runs out.
     let mut text = String::from("ex:Root owl:disjointWith ex:Other . ex:source ex:payload \"");
-    text.push_str(&"x".repeat(320 * 1024));
+    text.push_str(&"x".repeat(128 * 1024));
     text.push_str("\" . ");
     for index in 0..64 {
         text.push_str(&format!("ex:C{index} rdfs:subClassOf ex:Root . "));
