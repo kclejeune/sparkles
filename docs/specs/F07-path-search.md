@@ -283,17 +283,19 @@ chain. For each branch it caches the shortest budget admitting two simple suffix
 distinct first edges. A hop to a node at the same or a smaller minimum edge distance can
 follow that node's shortest suffix directly. For a hop one level deeper, the shortest
 suffix also avoids the branch if its first step reaches a different node at the branch's
-depth. The two shortest routes certified by these checks settle the threshold because
-every unresolved hop costs at least two edges more than the branch's minimum distance.
-When a deeper hop still needs checking, one breadth-first walk over the recorded
-topology excludes the branch itself and uses minimum edge distances to prune
-over-budget prefixes. The walk enqueues each node at most once for that branch. The
-virtual endpoint represents a completed cycle and can only appear as a source of recorded
-hops. The query memory budget covers retained hops and the temporary queue and visited
-set. A reverse search skips collecting branch hops when the weights are known to be
-constant and too small to overflow. A source
-reconstructs directly when its reverse tree path has no competing suffix within the
-remaining edge budget. The other sources run bounded searches in source order, pruned by
+depth. For a larger depth gap, the first hop that needs an ancestry check builds a
+preorder interval for each real node in the shortest-hop tree. Later checks take constant
+time. A neighbor outside the branch's interval has a shortest suffix that avoids it.
+The search starts a breadth-first walk only if an unresolved hop could supply a second
+route or improve the certified threshold. It excludes the branch and prunes over-budget
+prefixes. The walk enqueues each node at most once for that branch and stops when it
+attains the lower bound on the unresolved hops. The virtual endpoint represents a
+completed cycle and can only appear as a source of recorded hops. The query memory
+budget covers retained hops and intervals, the temporary child links used to build the
+intervals, and the walk's queue and visited set. A reverse search skips collecting
+branch hops when the weights are known to be constant and too small to overflow. A
+source reconstructs directly when its reverse tree path has no competing suffix within
+the remaining edge budget. The other sources run bounded searches in source order, pruned by
 the minimum backward edge distances. Weighted `path:allShortest`
 with `path:maxLength` requires both ends bound because it enumerates tied short paths through
 Yen's algorithm. Lengths still count edges.
