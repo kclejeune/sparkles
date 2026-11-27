@@ -135,6 +135,13 @@ fn columns_bytes(columns: &[String]) -> u64 {
 }
 
 type WeightedRow = (Vec<Option<Term>>, i64);
+
+/// Decoded fallback rows with the scratch credit that covers them. The rows are
+/// declared first so that they are freed before the credit returns.
+struct ChargedRows {
+    rows: Vec<WeightedRow>,
+    lease: crate::incr::budget::ScratchLease,
+}
 type HistoryOverlay<'a> = (&'a mut FxHashMap<Vec<Option<Term>>, i64>, &'a [WeightedRow]);
 
 fn decode_rows(
@@ -296,6 +303,8 @@ impl Runtime {
                         ..Default::default()
                     },
                 );
+                #[cfg(test)]
+                fire_fallback_hook(FallbackEvent::Evaluating);
                 c.build_for_read(
                     snap,
                     &control,
@@ -304,17 +313,28 @@ impl Runtime {
                         cancellation: &cancellation,
                     },
                 )?;
-                let (rows, mut lease) = c.rows_charged_checked(&check_fallback)?;
-                lease.try_reserve(columns_bytes(&rebuild.columns))?;
-                let lease = c.detach_scratch_lease(&mut lease);
-                check_fallback()?;
-                Ok(ViewRows {
+                #[cfg(test)]
+                fire_fallback_hook(FallbackEvent::Built);
+                // The decoded rows stay with the scratch credit that covers them in an
+                // owner that frees the rows first, and the detached credit goes straight
+                // into the returned rows, so no error return releases the credit while
+                // the rows are still allocated.
+                let mut charged = c
+                    .rows_charged_checked(&check_fallback)
+                    .map(|(rows, lease)| ChargedRows { rows, lease })?;
+                #[cfg(test)]
+                fire_fallback_hook(FallbackEvent::Decoded(&charged.rows));
+                charged.lease.try_reserve(columns_bytes(&rebuild.columns))?;
+                let mut out = ViewRows {
                     columns: rebuild.columns.to_vec(),
-                    rows,
+                    rows: charged.rows,
                     commit: rebuild.commit,
                     evaluated_under: rebuild.evaluated_under,
-                    lease,
-                })
+                    lease: None,
+                };
+                out.lease = c.detach_scratch_lease(&mut charged.lease);
+                check_fallback()?;
+                Ok(out)
             }
         }
     }
@@ -980,6 +1000,56 @@ fn fire_open_view_state_hook() {
     if let Some(mut f) = f {
         f();
         OPEN_VIEW_STATE_HOOK.with(|h| {
+            if h.borrow().is_none() {
+                *h.borrow_mut() = Some(f);
+            }
+        });
+    }
+}
+
+/// A point in an eager fallback rebuild that a unit test observes.
+#[cfg(test)]
+pub(crate) enum FallbackEvent<'a> {
+    /// Evaluation is about to start, after the rebuild's staging was admitted.
+    Evaluating,
+    /// The evaluation pass returned.
+    Built,
+    /// The rows were decoded under their scratch credit.
+    Decoded(&'a [WeightedRow]),
+}
+
+#[cfg(test)]
+type FallbackHook = Box<dyn FnMut(FallbackEvent<'_>)>;
+
+#[cfg(test)]
+thread_local! {
+    static FALLBACK_HOOK: std::cell::RefCell<Option<FallbackHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct FallbackHookGuard;
+
+#[cfg(test)]
+impl Drop for FallbackHookGuard {
+    fn drop(&mut self) {
+        FALLBACK_HOOK.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+/// Observe this thread's eager fallback rebuilds until the guard drops.
+#[cfg(test)]
+pub(crate) fn set_fallback_hook(f: impl FnMut(FallbackEvent<'_>) + 'static) -> FallbackHookGuard {
+    FALLBACK_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    FallbackHookGuard
+}
+
+#[cfg(test)]
+fn fire_fallback_hook(event: FallbackEvent<'_>) {
+    let f = FALLBACK_HOOK.with(|h| h.borrow_mut().take());
+    if let Some(mut f) = f {
+        f(event);
+        FALLBACK_HOOK.with(|h| {
             if h.borrow().is_none() {
                 *h.borrow_mut() = Some(f);
             }

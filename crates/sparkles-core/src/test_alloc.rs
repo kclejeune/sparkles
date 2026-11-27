@@ -66,6 +66,53 @@ impl Drop for Watch {
     }
 }
 
+/// The counter a [`FreeWatch`] gives [`DEALLOCATION`]. It never changes.
+static NO_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A watch for the free of one allocation on this thread, without a Preparation's
+/// counter. While it is armed, [`FreeWatch::live`] reads `true` until the allocation
+/// is freed. It reads only Copy thread-local state, so it is safe in a release callback.
+pub(crate) struct FreeWatch {
+    _thread: PhantomData<Rc<()>>,
+}
+impl FreeWatch {
+    pub(crate) fn new() -> Self {
+        DEALLOCATION.with(|watch| {
+            assert_eq!(
+                watch.get().1,
+                0,
+                "one selected allocation watch per test thread"
+            );
+            watch.set((0, &NO_COUNTER as *const _ as usize, 0, 0));
+        });
+        Self {
+            _thread: PhantomData,
+        }
+    }
+    pub(crate) fn arm(&self, pointer: *const u8) {
+        assert!(!pointer.is_null());
+        DEALLOCATION.with(|watch| {
+            let (old, counter, _, count) = watch.get();
+            assert_eq!((old, count), (0, 0));
+            assert_eq!(counter, &NO_COUNTER as *const _ as usize);
+            watch.set((pointer as usize, counter, 0, 0));
+        });
+    }
+    /// Whether an armed allocation is still live on this thread.
+    pub(crate) fn live() -> bool {
+        DEALLOCATION.with(|watch| watch.get().0 != 0)
+    }
+    /// Whether the armed allocation has been freed on this thread.
+    pub(crate) fn freed() -> bool {
+        DEALLOCATION.with(|watch| watch.get().3 != 0)
+    }
+}
+impl Drop for FreeWatch {
+    fn drop(&mut self) {
+        DEALLOCATION.with(|watch| watch.set((0, 0, 0, 0)));
+    }
+}
+
 thread_local! {
     // Whether this thread records, and the largest allocation it has recorded.
     static LARGEST: Cell<(bool, usize)> = const { Cell::new((false, 0)) };

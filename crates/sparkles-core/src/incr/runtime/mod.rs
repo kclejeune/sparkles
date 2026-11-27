@@ -59,6 +59,8 @@ pub(crate) use internal::set_wait_timeout_hook;
 #[cfg(test)]
 pub(crate) use read::set_open_view_state_hook;
 #[cfg(test)]
+pub(crate) use read::{FallbackEvent, set_fallback_hook};
+#[cfg(test)]
 pub(crate) use round::PASS_CANCEL;
 mod stats;
 mod subscribe;
