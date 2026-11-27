@@ -707,13 +707,11 @@ capabilities and remaining work are described by the spec status and Outcome.
    capacity, estimated bytes, tables, hits and misses and identifies its process scope.
    The host-derived query pool subtracts this configured cache beside the other
    caches, while explicit pool settings and the small profile's pool remain unchanged.
-   The estimate counts a shared chunk for each cached table that retains it and is
-   neither allocator usage nor RSS. A caller may keep an evicted table alive outside
-   retained-cache occupancy. Its weighting is 24 bytes per fact, 64 bytes per chunk,
-   each local term's byte length plus 40 bytes, and 64 bytes per table. Spare vector
-   capacity, cache-key strings, hash-table capacity and exact allocator metadata are
-   not counted. Item 757 covers measuring and calibrating that estimator, while
-   hierarchical live charging remains item 675.
+   Item 192 originally weighted tables by fact length and local-term byte length and
+   counted shared chunks per retaining table; item 757 subsequently measured and
+   calibrated the estimator and eviction allowances (see
+   [Derived-table retained-estimate calibration](#derived-table-retained-estimate-calibration-item-757)),
+   while hierarchical live charging remains item 675.
 8. Lists that rules derive are complete in a lower stage, which derives every list the
    rules give rather than the lists a query reaches. This costs a derivation of all such
    lists for each query that reads one and keeps the answers equal to a fixpoint. Lists
@@ -1534,6 +1532,55 @@ also leaves out RDFS on read and a query-time default. A page saved with the inf
 box cleared opens with **Off**. The tests are `ui/tests/e2e/query-reasoning.spec.ts`,
 against a real server, the parameter tests in `ui/src/lib/api.test.ts` and
 `stored_query_runs_take_the_query_time_reasoning_parameters` over HTTP.
+
+### Derived-table retained-estimate calibration (item 757)
+
+The uncalibrated estimator from item 192 was measured against live heap allocations via
+`sparkles_reasoner::alloc_probe` across five representative cache shapes on Linux x86_64:
+
+| Case | Measured live heap | Live allocs | Calibrated estimate | Legacy estimate |
+|---|--:|--:|--:|--:|
+| Empty table with long key strings | 2,120 B | 5 | 2,200 B | 64 B |
+| Spare fact-vector and local-key capacity | 58,231 B | 26 | 58,647 B | 7,280 B |
+| Hash-table growth across 64 entries | 28,848 B | 387 | 35,040 B | 9,728 B |
+| Shared chunks across 3 progressive session tables | 43,041 B | 21 | 43,377 B | 102,576 B |
+| One shared table across 5 cache keys | 13,272 B | 19 | 13,576 B | 60,960 B |
+
+Because the legacy formula ignored `Vec` and `String` spare capacity, cache-key strings,
+and hash-table buckets while double-counting shared chunks across tables, it undercounted
+key-heavy and spare-capacity tables by 3.0× to 33.1× and overcounted shared-table and
+shared-chunk sessions by 2.4× to 4.6×.
+
+`crates/sparkles-reasoner/src/tables.rs` now tracks retained memory with deduplicated
+pointer-indexed holdings for distinct `Arc<Table>` and `Chunk` allocations, exact
+`ArcInner` sizes, `Vec::capacity()` across fact chunks, chunk lists, local-term tables,
+and key byte vectors, `String::capacity()` for `Key::view` and `Key::demand`, exact
+`hashbrown` bucket allocations via `sparkles_budget::sizes::table_bytes_for` across the
+entry and deduplication maps, and 16 bytes of conservative allocator metadata per
+non-empty heap allocation. Across all five measured cases, the calibrated estimate equals
+measured requested heap bytes plus 16 bytes per live allocation.
+
+Eviction now prefers the oldest unborrowed entry so memory is reclaimed immediately rather
+than pinned by an active reader, shrinks oversized hash-table allocations once when that
+alone restores the budget, resets all maps when empty, and tracks evicted tables or chunks
+still held by external callers via `Weak` handles so their live bytes reduce the cache's
+eviction allowance until those callers drop them. Re-inserting a caller-held table clears
+its weak hold rather than double-counting it, declining a newly inserted borrowed entry
+preserves existing pinned entries when both cannot fit together, and `set_capacity(0)` or
+`clear()` drops all retained state while leaving caller handles valid. `CacheStats` and
+`/$/stats` continue to report retained occupancy in `estimatedBytes` (always bounded by
+`capacityBytes` and zero when empty). Hierarchical live charging remains item 675.
+
+In a diagnostic 1-university LUBM `reasoning_latency` run on Boat worker `bx_4utxt2gu`
+comparing `db6a34da` with the calibrated build (2 rounds, 2 timed runs, 8 threads), both
+builds populated 80 tables with 528 hits and 80 misses and matched materialized answers on
+all 14 queries for both `rdfs` and `owl-rl`. The reported retained cache footprint moved
+from 15,036,648 bytes under the legacy per-table chunk weighting to 8,136,068 bytes under
+the calibrated deduplicated estimator with no observed query slowdown (Boat timings are
+diagnostic only and do not establish benchmark-host claims). Unit and integration coverage
+spans `tables::tests`, `demand_cache_calibration`, `demand`, `demand_lubm`, `demand_reuse`,
+`demand_session_inputs`, `derived_table_cache`, `cli_derived_table_cache`, and
+`openapi::tests::checked_in_copy_is_current`.
 
 ### Roadmap follow-ups
 
