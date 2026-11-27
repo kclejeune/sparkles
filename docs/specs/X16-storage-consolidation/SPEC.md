@@ -940,6 +940,23 @@ addition for overflow. Unit tests cover every overflowing tenth byte from `0x02`
 largest valid 64-bit varint across index column frames, bounded reads, builder run blocks and
 temporary pattern runs.
 
+### Phase 6 outcome
+
+Persistent WAL transactions use one commit path. Each transaction enqueues its WAL
+records, vocabulary changes and optional annotation. A fence leader makes the batch
+durable and publishes its commits in order. Disabling batching or falling back from it
+seals a fence of one under the writer lock. A writer that finds a healthy idle
+coordinator skips speculative admission and predecessor checks under that lock.
+
+The fence uses write-through I/O for the writes that qualify and buffered writes with
+`fdatasync` otherwise. A WAL commit with an annotation carries `WAL_FLAG_ANNOTATED`.
+Recovery drops a torn tail whose required annotation is missing and retains all earlier
+acknowledged commits and their annotations. The crash-image suite exercises this case
+with a single writer on both the buffered and direct I/O paths. The WAL and annotation
+formats are unchanged.
+
+The writes benchmark still needs to verify serial latency on an Intel benchmark worker.
+
 [Item 455](../../ROADMAP.md) tracks the remaining work. The plan above replaced
 the earlier candidate list for the first eight phases on 2026-11-09 after an audit of the
 code, which found about 114 twin readers rather than 80, three publish paths with a
