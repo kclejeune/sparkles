@@ -248,7 +248,7 @@ impl Closing {
             return Err(self.refused(reserved.err()));
         }
         core.commit();
-        let reasoning = state.reasoning.get_mut().value.take();
+        let reasoning = state.reasoning.get_mut().value.clone();
         self.finished = true;
         root.frozen.take().expect("frozen root").close();
         for node in self.nodes.values_mut() {

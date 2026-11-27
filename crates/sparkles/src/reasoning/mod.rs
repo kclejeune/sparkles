@@ -39,7 +39,7 @@ pub use setting::QuerySetting;
 #[cfg(feature = "reasoning")]
 pub use sparkles_reasoner as reasoner;
 
-use crate::error::Result;
+use crate::error::{Budget, BudgetKind, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -264,6 +264,25 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = dir;
     Ok(())
+}
+
+pub(crate) fn parent_error(error: sparkles_budget::ParentRefused) -> Error {
+    match error {
+        sparkles_budget::ParentRefused::Limit {
+            limit,
+            requested,
+            scope,
+        } => Error::BudgetExceeded(Budget {
+            kind: if scope == sparkles_budget::Scope::Local {
+                BudgetKind::Memory
+            } else {
+                BudgetKind::ServerMemory
+            },
+            limit,
+            requested,
+        }),
+        error => Error::invalid(error.to_string()),
+    }
 }
 
 #[cfg(test)]

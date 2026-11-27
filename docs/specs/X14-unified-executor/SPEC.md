@@ -249,10 +249,14 @@ already backing the previous saturation when it applies edits. Shared classifica
 payloads retain their credit, including the incomplete-class list. OWL 2 RL queries
 give nested SELECTs the remaining request allowance while the private store and any
 earlier answer data are live. The private snapshot skips demand cache publication.
-An import fetch reserves its report entry before a LOAD can commit, and the dataset's
-reasoning record keeps the credit for its fetch warnings. Runtime
-checkpoints return scratch credit after their guards are released. WAL replay accounts
-for the overlap of growing tables and the conversion to materialization changes.
+An import fetch reserves its report entry before a LOAD can commit and returns its
+scratch reservation when the report is ready. A dataset's reasoning record admits
+its warnings and fetched import names before the inference commit. It uses the
+retained pool when configured and otherwise draws exact credit from the dataset's
+work pool, if any. In-memory branches share the record and its reservation, and
+reopened datasets admit the saved record before publishing it. Runtime checkpoints
+return scratch credit after their guards are released. WAL replay accounts for the
+overlap of growing tables and the conversion to materialization changes.
 
 In Rust, `Opened::ontology` uses `Arc<SharedOntology>` and `Classified::excluded` uses
 `Arc<ClassifiedExclusions>`. These handles preserve credit through detached clones and

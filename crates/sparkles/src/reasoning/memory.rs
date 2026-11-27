@@ -1,7 +1,8 @@
 //! Admission for facade-owned ontology and analysis payloads.
 
+use super::parent_error;
 use crate::{Budget, BudgetKind, Error, Result};
-use sparkles_budget::{LiveCredit, ParentHandle, ParentRefused, Scope};
+use sparkles_budget::{LiveCredit, ParentHandle, ParentRefused};
 
 pub(crate) struct Memory {
     bytes: u64,
@@ -158,23 +159,4 @@ pub(crate) fn term(
         },
         check,
     )
-}
-
-pub(crate) fn parent_error(error: ParentRefused) -> Error {
-    match error {
-        ParentRefused::Limit {
-            limit,
-            requested,
-            scope,
-        } => Error::BudgetExceeded(Budget {
-            kind: if scope == Scope::Local {
-                BudgetKind::Memory
-            } else {
-                BudgetKind::ServerMemory
-            },
-            limit,
-            requested,
-        }),
-        error => Error::invalid(error.to_string()),
-    }
 }

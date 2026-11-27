@@ -437,7 +437,7 @@ impl Catalog {
             }
             let ds = catalog.open_dataset(&e.name, e.kind, None)?;
             if ds.reasoning_record().is_none() {
-                ds.state().restore_reasoning(e.reasoning);
+                ds.state().restore_reasoning(e.reasoning)?;
             }
             catalog.inner.entries.write().insert(
                 e.name,
@@ -504,17 +504,20 @@ impl Catalog {
         // them. The check above makes this lock infallible, so the dataset always
         // reaches its final state.
         let _g = self.manage_internal();
-        let result = match opened {
-            Ok(ds) => {
+        let opened = opened.and_then(|ds| {
+            if ds.state().read_reasoning().is_none() {
                 let reasoning = self
                     .inner
                     .detached
                     .lock()
                     .get(name)
                     .and_then(|d| d.reasoning.clone());
-                if ds.reasoning_record().is_none() {
-                    ds.state().restore_reasoning(reasoning);
-                }
+                ds.state().restore_reasoning(reasoning)?;
+            }
+            Ok(ds)
+        });
+        let result = match opened {
+            Ok(ds) => {
                 self.publish_reattached(name, ds);
                 Ok(())
             }
@@ -929,7 +932,7 @@ impl Catalog {
             opts.store.shared = Some(caches.scope());
         }
         let store = Store::open_existing(&self.database_dir(name)?, opts.store.clone(), expected)?;
-        Ok(Dataset::from_store_with(store, opts))
+        Dataset::try_from_store_with(store, opts)
     }
     fn require_determinate_registry(&self, name: &str) -> Result<()> {
         if self.inner.pending_registry_commits.lock().contains(name) {
@@ -1628,7 +1631,7 @@ impl Catalog {
             ..self.dataset_options(name)
         };
         let ds = Dataset::from_store_with(store, opts);
-        ds.state().restore_reasoning(reasoning);
+        ds.state().restore_reasoning(reasoning)?;
         self.inner.entries.write().insert(
             name.into(),
             Entry {

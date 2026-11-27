@@ -1665,7 +1665,7 @@ fn push_fetch_warning(
     }
     let mut len = Len::default();
     len.write_fmt(warning)?;
-    // The facade copies the report once into the persisted record.
+    // Cover vector growth and temporary copies while the fetch is active.
     held.try_grow(len.0.saturating_mul(2).saturating_add(128))
         .map_err(|e| crate::query::memory_error(e, "keeping import warnings"))?;
     let mut text = String::with_capacity(len.0);
@@ -1701,30 +1701,35 @@ pub fn fetch_imports(
     fetch_imports_admitted(store, inputs, refresh, opts).map(|(fetched, _)| fetched)
 }
 
-/// Live credit for the strings in a fetch report and one copy for a reasoning record.
+/// Live work credit for the backing of a fetch report.
 #[derive(Debug)]
-pub struct FetchMemory(Held);
+pub struct FetchMemory {
+    bytes: usize,
+    _lease: Option<sparkles_budget::MemoryLease>,
+}
 
 impl FetchMemory {
-    fn new(mut held: Held) -> Self {
-        // Keep only the live report credit and return the holder's unused step.
-        let bytes = held.bytes();
-        Self(held.split(bytes))
+    fn new(fetched: &Fetched, held: Held) -> Self {
+        let bytes = [&fetched.fetched, &fetched.warnings]
+            .into_iter()
+            .map(|strings| {
+                strings.capacity() * size_of::<String>()
+                    + strings.iter().map(String::capacity).sum::<usize>()
+            })
+            .sum();
+        Self {
+            bytes,
+            _lease: held.into_parent_lease(bytes),
+        }
     }
 
     pub fn bytes(&self) -> usize {
-        self.0.bytes()
-    }
-
-    /// Move one copy of the report credit to the dataset record.
-    #[doc(hidden)]
-    pub fn split_copy(&mut self) -> Self {
-        Self(self.0.split(self.0.bytes() / 2))
+        self.bytes
     }
 }
 
-/// Fetch imports and return their report with the credit for its backing.
-/// Hold the credit while using the report or moving its strings into an engine-owned record.
+/// Fetch imports and return their report with the exact credit for its backing.
+/// Hold the credit while using the report in an engine operation.
 pub fn fetch_imports_admitted(
     store: &Store,
     inputs: &Inputs,
@@ -1763,7 +1768,9 @@ fn fetch_imports_with_load(
                 format_args!("imports are fetched only with imports: fetch; nothing was refreshed"),
             )?;
         }
-        return Ok((out, FetchMemory::new(report)));
+        drop(budget);
+        let memory = FetchMemory::new(&out, report);
+        return Ok((out, memory));
     }
     let mut opts = opts.clone();
     opts.outbound_budget = Some(sparkles_core::outbound::RequestBudget::new(&opts.outbound));
@@ -1814,7 +1821,7 @@ fn fetch_imports_with_load(
             return Ok(true);
         }
         // LOAD commits independently. Reserve the successful report entry and
-        // its record copy while failure can still leave the graph untouched.
+        // its vector growth while failure can still leave the graph untouched.
         let success = Held::try_new_exact(&budget, iri.len().saturating_mul(2) + 128)
             .map_err(|e| crate::query::memory_error(e, "keeping fetched imports"))?;
         let u = if replace {
@@ -1902,9 +1909,14 @@ fn fetch_imports_with_load(
             )?;
         }
         if !tried {
-            return Ok((out, FetchMemory::new(report)));
+            break;
         }
     }
+    drop(attempted);
+    drop(held);
+    drop(budget);
+    let memory = FetchMemory::new(&out, report);
+    Ok((out, memory))
 }
 
 fn import_discovery_error(error: anyhow::Error) -> anyhow::Error {
@@ -1918,6 +1930,41 @@ fn import_discovery_error(error: anyhow::Error) -> anyhow::Error {
 mod controlled_budget_tests {
     use super::*;
     use crate::budget::{Budget, BudgetFailure, Held, WorkingWarnings, table_bytes};
+
+    #[test]
+    fn admitted_fetch_returns_discovery_and_load_scratch_before_report_drop() {
+        use sparkles_core::sparql::{QueryOptions, pool::QueryPool};
+        let store = Store::in_memory(Default::default());
+        let iri = format!("urn:import:{}", "x".repeat(8192));
+        let seed = format!(
+            "INSERT DATA {{ <urn:source> <http://www.w3.org/2002/07/owl#imports> <{iri}> }}"
+        );
+        sparkles_core::sparql::update::update(&store, &seed, &QueryOptions::default()).unwrap();
+        let mut inputs = Inputs {
+            imports: ImportMode::Fetch,
+            ..Default::default()
+        };
+        inputs
+            .location_mapping
+            .names
+            .insert(iri, "x".repeat(32 << 10));
+        let pool = QueryPool::with_retained_capacity(16 << 20, 1 << 20).unwrap();
+        let opts = QueryOptions {
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+
+        let (report, memory) = fetch_imports_admitted(&store, &inputs, &[], &opts).unwrap();
+        assert_eq!(report.warnings.len(), 1);
+        let warning_bytes =
+            report.warnings.capacity() * size_of::<String>() + report.warnings[0].capacity();
+        assert_eq!(memory.bytes(), warning_bytes);
+        assert_eq!(pool.domain_stats().work_reserved, warning_bytes as u64);
+        assert_eq!(pool.domain_stats().retained_reserved, 0);
+        drop(report);
+        drop(memory);
+        assert_eq!(pool.domain_stats().work_reserved, 0);
+    }
 
     #[test]
     fn fetched_name_can_refuse_before_load_and_is_available_to_refresh_after_success() {

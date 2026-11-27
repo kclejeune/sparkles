@@ -1146,12 +1146,8 @@ fn invalid_import_warning_text_is_admitted_and_owned_after_fetch() {
     assert_eq!(grant.used(), 0);
 }
 
-#[test]
-fn fetch_warnings_remain_charged_in_the_dataset_reasoning_record() {
-    use sparkles::reasoning::reasoner::{ImportMode, Inputs, fetch_imports};
-    let ds = Dataset::memory();
-    let pool = QueryPool::new(16 * MIB);
-    let grant = Arc::new(pool.empty_grant());
+fn import_warning_request(ds: &Dataset) -> ReasonRequest {
+    use sparkles::reasoning::reasoner::{ImportMode, Inputs};
     ds.update("INSERT DATA { <urn:o> <http://www.w3.org/2002/07/owl#imports> <urn:missing> }")
         .unwrap();
     let mut inputs = Inputs {
@@ -1162,36 +1158,195 @@ fn fetch_warnings_remain_charged_in_the_dataset_reasoning_record() {
         .location_mapping
         .names
         .insert("urn:missing".into(), "x".repeat(32 << 10));
-    let load = QueryOptions {
-        grant: Some(grant.clone()),
+    ReasonRequest {
+        inputs,
         ..Default::default()
-    };
-    let owned = fetch_imports(ds.store(), &inputs, &[], &load).unwrap();
-    assert_eq!(owned.warnings.len(), 1);
-    assert_eq!(
-        grant.used(),
-        0,
-        "the plain fetch result belongs to the application"
-    );
-    let result = ds
-        .reasoning()
-        .run(&ReasonRequest {
-            inputs,
-            load,
-            ..Default::default()
+    }
+}
+
+fn reasoning_record_bytes(ds: &Dataset) -> u64 {
+    let state = ds.state().read_reasoning();
+    let record = state.as_ref().unwrap();
+    [&record.fetched_imports, &record.warnings]
+        .into_iter()
+        .map(|strings| {
+            strings.capacity() * size_of::<String>()
+                + strings.iter().map(String::capacity).sum::<usize>()
         })
-        .unwrap();
-    let warning = &result.record.warnings[0];
-    assert_eq!(warning, &owned.warnings[0]);
-    assert!(grant.used() >= warning.len() as u64);
-    drop(result);
-    assert!(grant.used() > 0);
-    assert_eq!(
-        ds.reasoning_record().unwrap().warnings[0],
-        owned.warnings[0]
-    );
-    ds.reasoning().clear().unwrap();
+        .sum::<usize>() as u64
+}
+
+fn memory_with_reasoning_pool(pool: Arc<QueryPool>) -> Dataset {
+    use sparkles::store::{Store, StoreOptions};
+    Dataset::from_store_with(
+        Store::in_memory(StoreOptions::default()),
+        DatasetOptions {
+            pool: Some(pool),
+            closure_cache_triples: 0,
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+fn fetch_record_uses_retained_credit_and_releases_the_request_grant() {
+    use sparkles::reasoning::reasoner::fetch_imports;
+    use sparkles::sparql::pool::{GRANULE, INITIAL_GRANT};
+
+    let request_pool = QueryPool::new(INITIAL_GRANT);
+    let grant = Arc::new(request_pool.try_grant(INITIAL_GRANT).unwrap());
+    let pool = QueryPool::with_retained_capacity(16 * MIB, MIB).unwrap();
+    let ds = memory_with_reasoning_pool(pool.clone());
+    let mut request = import_warning_request(&ds);
+    request.load.grant = Some(grant.clone());
+    let owned = fetch_imports(ds.store(), &request.inputs, &[], &request.load).unwrap();
+    assert_eq!(owned.warnings.len(), 1);
     assert_eq!(grant.used(), 0);
+
+    let result = ds.reasoning().run(&request).unwrap();
+    assert!(result.record.warnings.contains(&owned.warnings[0]));
+    assert_eq!(grant.used(), 0);
+    drop(result);
+    drop(request);
+    drop(grant);
+    assert_eq!(request_pool.domain_stats().work_reserved, 0);
+    assert!(request_pool.try_grant(GRANULE).is_some());
+    assert_eq!(pool.domain_stats().work_reserved, 0);
+    assert_eq!(
+        pool.domain_stats().retained_reserved,
+        reasoning_record_bytes(&ds)
+    );
+    assert!(pool.domain_stats().retained_reserved > 32 << 10);
+    ds.reasoning().clear().unwrap();
+    assert_eq!(pool.domain_stats().retained_reserved, 0);
+}
+
+#[test]
+fn inherited_fetch_record_keeps_credit_until_its_last_branch_clears() {
+    let pool = QueryPool::with_retained_capacity(16 * MIB, MIB).unwrap();
+    let ds = memory_with_reasoning_pool(pool.clone());
+    let request = import_warning_request(&ds);
+    let outcome = ds.reasoning().run(&request).unwrap();
+    let warnings = outcome.record.warnings;
+    let retained = reasoning_record_bytes(&ds);
+    assert!(retained > 32 << 10);
+    assert_eq!(pool.domain_stats().work_reserved, 0);
+
+    ds.create_branch("one", &Default::default()).unwrap();
+    ds.create_branch("two", &Default::default()).unwrap();
+    let one = ds.branch("one").unwrap();
+    let two = ds.branch("two").unwrap();
+    assert_eq!(pool.domain_stats().retained_reserved, retained);
+    ds.reasoning().clear().unwrap();
+    one.reasoning().clear().unwrap();
+
+    assert_eq!(two.reasoning_record().unwrap().warnings, warnings);
+    assert_eq!(pool.domain_stats().retained_reserved, retained);
+    two.reasoning().clear().unwrap();
+    assert_eq!(pool.domain_stats().retained_reserved, 0);
+}
+
+#[test]
+fn replaced_fetch_record_keeps_previously_fetched_names_when_warnings_change() {
+    let pool = QueryPool::with_retained_capacity(16 * MIB, MIB).unwrap();
+    let ds = memory_with_reasoning_pool(pool.clone());
+    let mut request = import_warning_request(&ds);
+    let iri = format!("urn:import:{}", "x".repeat(16 << 10));
+    ds.update(&format!(
+        "INSERT DATA {{ <urn:o> <http://www.w3.org/2002/07/owl#imports> <{iri}> }}"
+    ))
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("import.ttl");
+    std::fs::write(&source, "<urn:s> <urn:p> <urn:original> .").unwrap();
+    request
+        .inputs
+        .location_mapping
+        .names
+        .insert(iri.clone(), format!("file://{}", source.display()));
+
+    let first = ds.reasoning().run(&request).unwrap();
+    assert_eq!(first.record.fetched_imports, [iri.as_str()]);
+    assert!(!first.record.warnings.is_empty());
+    let first_retained = pool.domain_stats().retained_reserved;
+    assert_eq!(first_retained, reasoning_record_bytes(&ds));
+    ds.update("INSERT DATA { GRAPH <urn:missing> { <urn:s> <urn:p> <urn:present> } }")
+        .unwrap();
+    let next = ds.reasoning().run(&request).unwrap();
+    assert_eq!(next.record.fetched_imports, first.record.fetched_imports);
+    assert!(
+        next.record.warnings.is_empty(),
+        "{:?}",
+        next.record.warnings
+    );
+    let next_retained = pool.domain_stats().retained_reserved;
+    assert!(next_retained < first_retained);
+    assert_eq!(next_retained, (iri.len() + size_of::<String>()) as u64);
+    assert_eq!(pool.domain_stats().work_reserved, 0);
+    ds.reasoning().clear().unwrap();
+    assert_eq!(pool.domain_stats().retained_reserved, 0);
+}
+
+#[test]
+fn persistent_rename_readmits_fetch_record() {
+    use sparkles::catalog::{CatalogOptions, MemoryOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = sparkles::Catalog::open(
+        dir.path(),
+        CatalogOptions {
+            dataset: DatasetOptions {
+                closure_cache_triples: 0,
+                ..Default::default()
+            },
+            memory: MemoryOptions {
+                pool_bytes: Some(16 * MIB),
+                ..Default::default()
+            },
+        },
+    )
+    .unwrap();
+    let ds = catalog.create("before", &Default::default()).unwrap();
+    let pool = ds.pool().unwrap().clone();
+    let request = import_warning_request(&ds);
+    let outcome = ds.reasoning().run(&request).unwrap();
+    assert_eq!(
+        pool.domain_stats().work_reserved,
+        reasoning_record_bytes(&ds)
+    );
+    drop(ds);
+
+    let renamed = catalog.rename("before", "after").unwrap();
+    assert_eq!(
+        renamed.reasoning_record().unwrap().warnings,
+        outcome.record.warnings
+    );
+    assert_eq!(
+        pool.domain_stats().work_reserved,
+        reasoning_record_bytes(&renamed)
+    );
+    renamed.reasoning().clear().unwrap();
+    assert_eq!(pool.domain_stats().work_reserved, 0);
+}
+
+#[test]
+fn refusing_replacement_record_credit_preserves_the_previous_materialization() {
+    let pool = QueryPool::with_retained_capacity(16 * MIB, 1024).unwrap();
+    let ds = memory_with_reasoning_pool(pool.clone());
+    let previous = ds.reasoning().run(&ReasonRequest::default()).unwrap();
+    let request = import_warning_request(&ds);
+    let before = ds.store().snapshot().commit;
+    let error = ds.reasoning().run(&request).unwrap_err();
+    assert!(is_server_memory(&error), "{error}");
+    assert_eq!(ds.store().snapshot().commit, before);
+    assert_eq!(
+        ds.reasoning_record().unwrap().commit,
+        previous.record.commit
+    );
+    assert_eq!(
+        pool.domain_stats().retained_reserved,
+        reasoning_record_bytes(&ds)
+    );
+    assert_eq!(pool.domain_stats().work_reserved, 0);
 }
 
 #[test]

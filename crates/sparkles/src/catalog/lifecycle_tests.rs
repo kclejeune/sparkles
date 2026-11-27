@@ -158,7 +158,7 @@ fn idle_duplicate_cache_edges_and_distinct_states_around_one_store_close() {
         StoreHandle::Branch(store) => store.clone(),
         StoreHandle::Own(_) => unreachable!(),
     };
-    let other = Dataset::from_shared(store, Default::default());
+    let other = Dataset::from_shared(store, Default::default()).unwrap();
     assert!(!Arc::ptr_eq(child.inner_state(), other.inner_state()));
     ds.inner.branches.lock().insert("other-state".into(), other);
     drop(child);

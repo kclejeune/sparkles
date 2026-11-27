@@ -463,6 +463,22 @@ impl Held {
         std::mem::take(&mut self.bytes)
     }
 
+    /// Finish a private budget once its work is gone. Detach only the credit
+    /// for the published payload and return the remaining parent reservation.
+    pub fn into_parent_lease(mut self, bytes: usize) -> Option<MemoryLease> {
+        assert!(bytes <= self.bytes);
+        let budget = Arc::get_mut(&mut self.budget).expect("exclusive finishing budget");
+        debug_assert_eq!(budget.used(), self.bytes + self.credit);
+        self.bytes = 0;
+        self.credit = 0;
+        let mut lease = budget.parent.take()?.lease.into_inner();
+        (bytes != 0).then(|| {
+            lease
+                .split(u64::try_from(bytes).expect("backed credit fits u64"))
+                .expect("published bytes are already backed")
+        })
+    }
+
     pub fn bytes(&self) -> usize {
         self.bytes
     }

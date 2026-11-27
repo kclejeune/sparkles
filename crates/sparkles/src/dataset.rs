@@ -189,7 +189,7 @@ pub struct DatasetState {
     #[cfg(feature = "graphql")]
     pub graphql: sparkles_graphql::Catalog,
     /// the record of the last materialization (`reasoning.json`)
-    reasoning: RwLock<RecordedReasoning>,
+    reasoning: RwLock<Arc<RecordedReasoning>>,
     /// the closure of the last materialization, for the next incremental run
     #[cfg(feature = "reasoning")]
     pub closure: sparkles_reasoner::Cache,
@@ -238,19 +238,58 @@ impl Drop for DatasetState {
     }
 }
 
-struct RecordedReasoning {
-    value: Option<ReasoningRecord>,
-    #[cfg(feature = "reasoning")]
-    fetch_memory: Option<sparkles_reasoner::inputs::FetchMemory>,
+#[derive(Default)]
+pub(crate) struct RecordedReasoning {
+    pub(crate) value: Option<ReasoningRecord>,
+    // Release the reservation after its strings have been dropped.
+    _memory: Option<sparkles_budget::MemoryLease>,
+}
+
+pub(crate) fn reasoning_strings_bytes(capacity: usize, bytes: impl Iterator<Item = usize>) -> u64 {
+    bytes.fold(
+        (capacity as u64).saturating_mul(size_of::<String>() as u64),
+        |total, size| total.saturating_add(size as u64),
+    )
 }
 
 impl RecordedReasoning {
-    fn new(value: Option<ReasoningRecord>) -> Self {
-        Self {
-            value,
-            #[cfg(feature = "reasoning")]
-            fetch_memory: None,
-        }
+    fn admit(
+        record: Option<ReasoningRecord>,
+        pool: Option<&Arc<crate::sparql::pool::QueryPool>>,
+    ) -> Result<Self> {
+        let bytes = record.as_ref().map_or(0, |record| {
+            [&record.warnings, &record.fetched_imports]
+                .into_iter()
+                .map(|strings| {
+                    reasoning_strings_bytes(
+                        strings.capacity(),
+                        strings.iter().map(String::capacity),
+                    )
+                })
+                .fold(0, u64::saturating_add)
+        });
+        Ok(Self {
+            value: record,
+            _memory: Self::reserve(pool, bytes)?,
+        })
+    }
+
+    pub(crate) fn reserve(
+        pool: Option<&Arc<crate::sparql::pool::QueryPool>>,
+        bytes: u64,
+    ) -> Result<Option<sparkles_budget::MemoryLease>> {
+        let Some(pool) = pool.filter(|_| bytes != 0) else {
+            return Ok(None);
+        };
+        let parent = if pool.domain_stats().retained_capacity == 0 {
+            pool.work_parent()
+        } else {
+            pool.retained_parent()
+        };
+        parent
+            .reserve(bytes)
+            .map(Some)
+            .map_err(crate::reasoning::parent_error)
     }
 }
 
@@ -262,57 +301,58 @@ impl DatasetState {
         parking_lot::RwLockReadGuard::map(self.reasoning.read(), |record| &record.value)
     }
 
-    /// Install a record restored or inherited by a newly opened dataset.
-    pub(crate) fn restore_reasoning(&self, record: Option<ReasoningRecord>) {
-        self.replace_reasoning(RecordedReasoning::new(record));
+    pub(crate) fn recorded_reasoning(&self) -> Arc<RecordedReasoning> {
+        self.reasoning.read().clone()
     }
 
-    fn replace_reasoning(&self, record: RecordedReasoning) {
-        let mut current = self.reasoning.write();
-        #[cfg(feature = "reasoning")]
-        let record = {
-            let mut record = record;
-            if record.fetch_memory.is_none()
-                && current
-                    .value
-                    .as_ref()
-                    .zip(record.value.as_ref())
-                    .is_some_and(|(old, new)| {
-                        old.warnings == new.warnings && old.fetched_imports == new.fetched_imports
-                    })
-            {
-                record.fetch_memory = current.fetch_memory.take();
-            }
-            record
-        };
-        let retired = std::mem::replace(&mut *current, record);
-        drop(current);
+    /// Install a record restored by a newly opened dataset.
+    pub(crate) fn restore_reasoning(&self, record: Option<ReasoningRecord>) -> Result<()> {
+        self.replace_reasoning(Arc::new(RecordedReasoning::admit(
+            record,
+            self.pool.as_ref(),
+        )?));
+        Ok(())
+    }
+
+    /// Branches share both the immutable record and the pool that backs it.
+    pub(crate) fn inherit_reasoning(&self, source: &Self) {
+        self.replace_reasoning(source.recorded_reasoning());
+    }
+
+    fn replace_reasoning(&self, record: Arc<RecordedReasoning>) {
+        let retired = std::mem::replace(&mut *self.reasoning.write(), record);
         drop(retired);
     }
 
     /// Update the reasoning record in memory and, for a persistent dataset, in its
     /// directory.
     pub fn set_reasoning(&self, record: Option<ReasoningRecord>) -> Result<()> {
-        self.write_reasoning(RecordedReasoning::new(record))
+        self.write_reasoning(RecordedReasoning::admit(record, self.pool.as_ref())?)
     }
 
     #[cfg(feature = "reasoning")]
     pub(crate) fn set_reasoning_admitted(
         &self,
         record: ReasoningRecord,
-        fetch_memory: Option<sparkles_reasoner::inputs::FetchMemory>,
+        memory: Option<sparkles_budget::MemoryLease>,
     ) -> Result<()> {
         self.write_reasoning(RecordedReasoning {
             value: Some(record),
-            fetch_memory,
+            _memory: memory,
         })
     }
 
     fn write_reasoning(&self, record: RecordedReasoning) -> Result<()> {
-        if let Some(root) = self.store.root() {
-            crate::reasoning::write_record(root, record.value.as_ref())?;
-        }
-        self.replace_reasoning(record);
+        // Save and replace under the same lock so concurrent writes publish in
+        // file order. Release either reservation after unlocking.
+        let retired = {
+            let mut current = self.reasoning.write();
+            if let Some(root) = self.store.root() {
+                crate::reasoning::write_record(root, record.value.as_ref())?;
+            }
+            std::mem::replace(&mut *current, Arc::new(record))
+        };
+        drop(retired);
         // views and live queries switch to the new default graph
         self.views.kick();
         Ok(())
@@ -394,7 +434,7 @@ impl Dataset {
     pub fn open_with(path: impl AsRef<Path>, opts: impl Into<DatasetOptions>) -> Result<Dataset> {
         let opts = opts.into();
         let store = Store::open(path.as_ref(), opts.store.clone())?;
-        Ok(Dataset::from_store_with(store, opts))
+        Dataset::try_from_store_with(store, opts)
     }
 
     /// The dataset of an open store, with the state its directory configures.
@@ -405,7 +445,33 @@ impl Dataset {
     /// [`from_store`](Self::from_store) with the library's settings of `opts` (its
     /// `store` options are those `store` was opened with and are not read).
     pub fn from_store_with(store: impl Into<StoreHandle>, opts: DatasetOptions) -> Dataset {
-        let store: StoreHandle = store.into();
+        let store = store.into();
+        let reasoning = Self::admit_saved_reasoning(&store, &opts).unwrap_or_else(|error| {
+            tracing::warn!(%error, "could not admit the dataset's saved reasoning record");
+            RecordedReasoning::default()
+        });
+        Self::from_store_and_record(store, opts, reasoning)
+    }
+
+    pub(crate) fn try_from_store_with(
+        store: impl Into<StoreHandle>,
+        opts: DatasetOptions,
+    ) -> Result<Dataset> {
+        let store = store.into();
+        let reasoning = Self::admit_saved_reasoning(&store, &opts)?;
+        Ok(Self::from_store_and_record(store, opts, reasoning))
+    }
+
+    fn admit_saved_reasoning(store: &Store, opts: &DatasetOptions) -> Result<RecordedReasoning> {
+        let record = store.root().and_then(crate::reasoning::read_record);
+        RecordedReasoning::admit(record, opts.pool.as_ref())
+    }
+
+    fn from_store_and_record(
+        store: StoreHandle,
+        opts: DatasetOptions,
+        reasoning: RecordedReasoning,
+    ) -> Dataset {
         let shown = || {
             opts.name
                 .as_deref()
@@ -457,7 +523,6 @@ impl Dataset {
                 shown()
             );
         }
-        let reasoning = store.root().and_then(crate::reasoning::read_record);
         let origin = match store.root() {
             Some(root) => read_origin(&root.join(ORIGIN_FILE)),
             None => opts.origin,
@@ -497,7 +562,7 @@ impl Dataset {
             algo,
             #[cfg(feature = "graphql")]
             graphql,
-            reasoning: RwLock::new(RecordedReasoning::new(reasoning)),
+            reasoning: RwLock::new(Arc::new(reasoning)),
             #[cfg(feature = "reasoning")]
             closure: sparkles_reasoner::Cache::new(opts.closure_cache_triples)
                 .with_retained_parent(retained_parent),
@@ -528,8 +593,8 @@ impl Dataset {
 
     /// A dataset around a store others share (a branch's, which its dataset keeps open),
     /// with the state the branch's directory configures.
-    pub(crate) fn from_shared(store: Arc<Store>, opts: DatasetOptions) -> Dataset {
-        Dataset::from_store_with(StoreHandle::Branch(store), opts)
+    pub(crate) fn from_shared(store: Arc<Store>, opts: DatasetOptions) -> Result<Dataset> {
+        Dataset::try_from_store_with(StoreHandle::Branch(store), opts)
     }
 
     fn branches_in_use(&self) -> bool {

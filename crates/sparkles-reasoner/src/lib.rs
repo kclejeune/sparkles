@@ -1294,12 +1294,25 @@ pub fn materialize_incremental(
     inc: Incremental<'_>,
     opts: &ReasonOptions,
 ) -> anyhow::Result<ReasonReport> {
+    materialize_incremental_prepared(store, profile, extras, inc, opts, |_, _| Ok(()))
+}
+
+/// Admit the facade's reasoning record while the materialization can still roll back.
+#[doc(hidden)]
+pub fn materialize_incremental_prepared(
+    store: &Store,
+    profile: &Profile,
+    extras: &Extras,
+    inc: Incremental<'_>,
+    opts: &ReasonOptions,
+    prepare: impl FnOnce(&Resolved, &[String]) -> anyhow::Result<()> + Send,
+) -> anyhow::Result<ReasonReport> {
     extras.validate()?;
     opts.inputs.validate()?;
     refuse_query_only(profile)?;
     let t0 = Instant::now();
     admitted(opts, |exec| {
-        materialize_admitted(exec, store, profile, extras, inc, opts, t0)
+        materialize_admitted(exec, store, profile, extras, inc, opts, t0, prepare)
     })
 }
 
@@ -1312,6 +1325,7 @@ fn materialize_admitted(
     inc: Incremental<'_>,
     opts: &ReasonOptions,
     t0: Instant,
+    prepare: impl FnOnce(&Resolved, &[String]) -> anyhow::Result<()>,
 ) -> anyhow::Result<ReasonReport> {
     let mut laps = Laps::new(t0);
     let staging = Budget::with_parent(opts.max_memory, opts.memory_parent.clone());
@@ -1406,7 +1420,7 @@ fn materialize_admitted(
             changes: None,
         };
         return finish(
-            store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done, laps,
+            store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done, laps, prepare,
         );
     }
     if let (Some(since), Some(raw)) = (inc.since, raw) {
@@ -1418,6 +1432,7 @@ fn materialize_admitted(
                 done.warnings.extend_borrowed(&inspected)?;
                 return finish(
                     store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done, laps,
+                    prepare,
                 );
             }
             Err(e) => {
@@ -1482,7 +1497,7 @@ fn materialize_admitted(
         changes: None,
     };
     finish(
-        store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done, laps,
+        store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done, laps, prepare,
     )
 }
 
@@ -1689,6 +1704,7 @@ fn finish(
     t0: Instant,
     done: Done,
     mut laps: Laps,
+    prepare: impl FnOnce(&Resolved, &[String]) -> anyhow::Result<()>,
 ) -> anyhow::Result<ReasonReport> {
     let mut txn = txn;
     let checked = (|| -> anyhow::Result<WorkingWarnings> {
@@ -1717,6 +1733,7 @@ fn finish(
         let mut warnings = WorkingWarnings::try_clone_from(&resolved.warnings, &done.budget)?;
         warnings.extend_borrowed(done.warnings.as_slice())?;
         done.budget.check_peak()?;
+        prepare(resolved, warnings.as_slice())?;
         Ok(warnings)
     })();
     let warnings = match checked {
