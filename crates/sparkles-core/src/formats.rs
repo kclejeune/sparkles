@@ -186,7 +186,7 @@ pub const DATASET: FileKind = FileKind {
     marker: "`format` 2, `minimumReader` (the reader capability the database needs) and `writtenBy`",
     class: Class::Primary,
     writes: crate::commit::DATASET_READER,
-    reads: &[5, 6, 7, 8, 9, 10],
+    reads: &[5, 6, 7, 8, 9, 10, 11],
 };
 
 /// A generation's index: `gen-*/meta.json` and the permutation and vocabulary files.
@@ -354,10 +354,10 @@ pub const CONFIGURATION_COVERAGE: FileKind = FileKind {
 pub const CONFIGURATION_ORIGIN: FileKind = FileKind {
     id: "configuration-origin",
     files: "evidence-history/origin.json",
-    marker: "format 1 and the exact imported source prefix/identity closure",
+    marker: "format 1 (metadata-only) or 2 (destination publication and imported source prefix/identity closure)",
     class: Class::Primary,
-    writes: 1,
-    reads: &[1],
+    writes: 2,
+    reads: &[1, 2],
 };
 
 /// The commit catalog.
@@ -564,6 +564,7 @@ pub const BACKUP_DEFINITION: FileKind = FileKind {
 pub const BACKUP_MANIFEST_FEATURES: &[&str] = &[
     "definitions",
     "evidence-configuration-history/1",
+    "evidence-configuration-history/2",
     "control/1",
 ];
 
@@ -1163,7 +1164,9 @@ fn recorded_reader(dir: &std::path::Path) -> Option<u32> {
 /// record and a generation's small `commit.json`, as open reads them.
 pub(crate) fn check_configuration_versions(dir: &std::path::Path) -> Result<()> {
     use std::io::Read;
-    let Some(reader) = recorded_reader(dir) else {
+    let reader = recorded_reader(dir);
+    check_origin_version(dir, reader)?;
+    let Some(reader) = reader else {
         return Ok(());
     };
     if reader >= crate::store::managed_history::READER {
@@ -1236,6 +1239,42 @@ pub(crate) fn check_configuration_versions(dir: &std::path::Path) -> Result<()> 
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
+    }
+    Ok(())
+}
+
+/// Refuse an `evidence-history/origin.json` with an unknown format version or a
+/// format 2 origin in a dataset whose recorded reader is below
+/// [`crate::commit::IMPORTED_DESTINATION_READER`].
+fn check_origin_version(dir: &std::path::Path, reader: Option<u32>) -> Result<()> {
+    let origin = dir.join("evidence-history").join("origin.json");
+    match read_bounded(&origin, crate::store::managed_history::MAX_BYTES as u64) {
+        Ok(Some(bytes)) => {
+            if let Some(format) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|value| value.get("format").and_then(serde_json::Value::as_u64))
+            {
+                if !matches!(format, 1 | 2) {
+                    return Err(Error::Unsupported(format!(
+                        "{} has format {format}; this codec reads 1 and 2",
+                        origin.display()
+                    )));
+                }
+                if format == 2
+                    && let Some(recorded) = reader
+                    && recorded < crate::commit::IMPORTED_DESTINATION_READER
+                {
+                    return Err(Error::Unsupported(format!(
+                        "{} has format 2, which requires dataset reader {}; this dataset records reader {recorded}",
+                        origin.display(),
+                        crate::commit::IMPORTED_DESTINATION_READER
+                    )));
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     Ok(())
 }

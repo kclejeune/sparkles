@@ -2,10 +2,11 @@
 //! never permission to replay a foreign seal. Physical/source proofs are separate.
 
 mod closure;
-mod context;
-mod destination;
+pub(in crate::store) mod context;
+pub(in crate::store) mod destination;
 mod documents;
 mod identities;
+pub(in crate::store) mod reidentify;
 
 /// Only the fixed original history member is exposed to the genuine capture.
 /// Opened retains the established anchored, no-follow component semantics.
@@ -61,6 +62,16 @@ pub(in crate::store) fn opening_origin_selection(
     root: &Path,
     preparation: &Preparation,
 ) -> Result<Option<Sha256Digest>> {
+    Ok(opening_origin_info(root, preparation)?.map(|(digest, _)| digest))
+}
+
+/// Select the small origin root and its format version (`1` or `2`). Format 2
+/// requires [`crate::commit::IMPORTED_DESTINATION_READER`] in `dataset.json`,
+/// and a dataset advertising that reader requires a format 2 origin root.
+pub(in crate::store) fn opening_origin_info(
+    root: &Path,
+    preparation: &Preparation,
+) -> Result<Option<(Sha256Digest, u32)>> {
     preparation.check()?;
     let _paths = preparation.reserve(
         (root.as_os_str().len() as u64)
@@ -69,36 +80,66 @@ pub(in crate::store) fn opening_origin_selection(
             .ok_or_else(|| preparation.exhausted())?,
     )?;
     let history = root.join("evidence-history");
-    match std::fs::symlink_metadata(&history) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            preparation.check()?;
-            return Ok(None);
-        }
+    let has_history_dir = match std::fs::symlink_metadata(&history) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => return Err(error.into()),
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
         Ok(_) => {
             return Err(managed_history::unavailable(
                 "import history is not an ordinary directory",
             ));
         }
-    }
-    // Ordinary native/legacy stores need no imported platform reader. If an
-    // origin exists, its bytes and identity below come from anchored handles.
-    match std::fs::symlink_metadata(history.join("origin.json")) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return match std::fs::symlink_metadata(history.join("imports")) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    preparation.check()?;
-                    Ok(None)
+    };
+    let has_origin_file = if has_history_dir {
+        match std::fs::symlink_metadata(history.join("origin.json")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(history.join("imports")) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error.into()),
+                    Ok(_) => {
+                        return Err(managed_history::unavailable(
+                            "prior imports survive without their origin root",
+                        ));
+                    }
                 }
-                Err(error) => Err(error.into()),
-                Ok(_) => Err(managed_history::unavailable(
-                    "prior imports survive without their origin root",
-                )),
-            };
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => true,
         }
-        Err(error) => return Err(error.into()),
-        Ok(_) => {}
+    } else {
+        false
+    };
+    if !has_origin_file {
+        // Check if dataset.json advertises IMPORTED_DESTINATION_READER (11), which
+        // requires a format 2 origin.json even if both origin.json and imports/ were
+        // removed. Ordinary native/legacy datasets return Ok(None) without anchored
+        // reads on non-Unix platforms.
+        let ds_path = root.join("dataset.json");
+        match std::fs::symlink_metadata(&ds_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                preparation.check()?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        let reader = if cfg!(unix) {
+            let family = documents::Opened::root(root, preparation)?;
+            let identity = family
+                .child("dataset.json", false, preparation)?
+                .bytes(None, preparation)?;
+            documents::dataset_id_and_reader(&identity.value, preparation)?.1
+        } else {
+            let identity = managed_history::read_bytes(&ds_path, preparation)?;
+            documents::dataset_id_and_reader(&identity.value, preparation)?.1
+        };
+        if reader >= crate::commit::IMPORTED_DESTINATION_READER {
+            return Err(managed_history::unavailable(format!(
+                "dataset reader {reader} requires a format 2 evidence-history/origin.json"
+            )));
+        }
+        preparation.check()?;
+        return Ok(None);
     }
     let family = documents::Opened::root(root, preparation)?;
     let encoded = family
@@ -106,25 +147,30 @@ pub(in crate::store) fn opening_origin_selection(
         .child("origin.json", false, preparation)?
         .bytes(None, preparation)?;
     let origin = Origin::decode(&encoded.value, preparation)?;
-    if origin.value.format != FORMAT {
-        // The v2 codec is still private source work. Keep the real opening gate
-        // closed until its producer and every physical consumer are wired and
-        // the required dataset/backup reader boundary is enabled together.
-        return Err(Error::Unsupported(
-            "destination import publication is not enabled by this reader".into(),
-        ));
-    }
     let identity = family
         .child("dataset.json", false, preparation)?
         .bytes(None, preparation)?;
-    if origin.value.dataset_id != documents::dataset_id(&identity.value, preparation)? {
+    let (dataset_id, reader) = documents::dataset_id_and_reader(&identity.value, preparation)?;
+    if origin.value.dataset_id != dataset_id {
         return Err(managed_history::unavailable(
             "opening origin belongs to another family",
         ));
     }
+    if origin.value.format == 2 && reader < crate::commit::IMPORTED_DESTINATION_READER {
+        return Err(Error::Unsupported(format!(
+            "evidence-history/origin.json has format 2, which requires dataset reader {}; this dataset records reader {reader}",
+            crate::commit::IMPORTED_DESTINATION_READER
+        )));
+    }
+    if origin.value.format != 2 && reader >= crate::commit::IMPORTED_DESTINATION_READER {
+        return Err(managed_history::unavailable(format!(
+            "dataset reader {reader} requires a format 2 evidence-history/origin.json, not format {}",
+            origin.value.format
+        )));
+    }
     let digest = Sha256Digest::of_bytes(&encoded.value, preparation.control())?;
     preparation.check()?;
-    Ok(Some(digest))
+    Ok(Some((digest, origin.value.format)))
 }
 
 /// Physical storage is independent of the family's mutable identity. Main stays
@@ -320,7 +366,7 @@ fn version(format: u32) -> Result<()> {
 fn origin_version(format: u32) -> Result<()> {
     if !matches!(format, 1 | 2) {
         return Err(Error::Unsupported(format!(
-            "configuration import origin format {format}; this codec reads1 and2"
+            "configuration import origin format {format}; this codec reads 1 and 2"
         )));
     }
     Ok(())
@@ -399,7 +445,7 @@ pub(in crate::store) fn source_member(path: &str) -> bool {
         || lineage_file(path)
 }
 
-fn imported_path(path: &str) -> bool {
+pub(in crate::store) fn imported_path(path: &str) -> bool {
     if path == ROOT_FILE {
         return true;
     }

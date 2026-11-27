@@ -284,6 +284,144 @@ pub(in crate::store) fn authenticate_retained_generation(
             "retained primary generation identity differs".into(),
         ));
     }
+    if !store.is_branch() && store.family.has_destination_origin() {
+        let family_root = store.managed_root().ok_or_else(|| {
+            Error::HistoryUnsupported("retained primary root is unavailable".into())
+        })?;
+        let actual = physical
+            .as_ref()
+            .ok_or_else(|| Error::Corrupt("retained generation commit is missing".into()))?;
+        let temporary = budget
+            .owned_limit()?
+            .options
+            .temporary(budget.available())?;
+        let closure = crate::store::configuration_history::load_disk_closure_for_family(
+            &family_root,
+            &store.family,
+            &temporary,
+        )?
+        .ok_or_else(|| {
+            crate::store::managed_history::unavailable(
+                "destination import origin disappeared during retained history read",
+            )
+        })?;
+        let mut native = closure.check_generation_base(
+            &family_root,
+            &entry.dir,
+            &entry.name,
+            &actual.value,
+            &temporary,
+        )?;
+        let closure_bytes = temporary.used();
+        drop(temporary);
+        budget.charge(closure_bytes)?;
+        if let Some(physical) = physical {
+            drop(physical.value);
+            budget.release(physical.charge);
+        }
+        let vocabulary = cold::head_vocabulary_controlled(&entry.dir, &family_root, &mut budget)?;
+        let terms = vocabulary.value.len_limited(&budget.owned_limit()?)?;
+        let annotations =
+            crate::annotations::seqs_controlled(&family_root, store.dataset_id, &mut budget)?;
+        let path = entry.dir.join("wal.log");
+        let loaded = match budget.buffered(&path) {
+            Ok(loaded) => loaded,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                let has_ranges = closure.has_ranges(&entry.name);
+                drop(closure);
+                budget.release(closure_bytes);
+                if has_ranges {
+                    return Err(crate::store::managed_history::unavailable(
+                        "imported WAL is missing its declared source intervals",
+                    ));
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                drop(closure);
+                budget.release(closure_bytes);
+                return Err(error);
+            }
+        };
+        let mut reader = loaded.value;
+        let reader_charge = loaded.charge;
+        let extent = reader.get_ref().metadata()?.len();
+        if closure.has_ranges(&entry.name) {
+            let file = reader.into_inner();
+            budget.release(reader_charge);
+            let result = closure.prove_wal(
+                &family_root,
+                &entry.dir,
+                &entry.name,
+                file,
+                extent,
+                entry.base.seq,
+                through,
+                terms,
+                annotations.value.as_deref(),
+                &path,
+                &mut native,
+                &mut budget,
+            );
+            drop(closure);
+            budget.release(closure_bytes);
+            result?;
+            return budget.check();
+        }
+        drop(closure);
+        budget.release(closure_bytes);
+        let mut configuration_error = None;
+        let mut observe = |observation| {
+            if configuration_error.is_none() {
+                match native.cached_observation(observation) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let result = (|| {
+                            let temporary = budget
+                                .owned_limit()?
+                                .options
+                                .temporary(budget.available())?;
+                            native.observation(&family_root, &temporary, observation)
+                        })();
+                        if let Err(error) = result {
+                            configuration_error = Some(error);
+                        }
+                    }
+                    Err(error) => configuration_error = Some(error),
+                }
+            }
+            Ok(())
+        };
+        if through == u64::MAX {
+            wal::probe::prove_prefix_with(
+                &mut reader,
+                extent,
+                entry.base.seq,
+                u64::MAX,
+                terms,
+                annotations.value.as_deref(),
+                &path,
+                &budget,
+                &mut observe,
+            )?;
+        } else {
+            wal::probe::prove_prefix_through(
+                &mut reader,
+                extent,
+                entry.base.seq,
+                through,
+                terms,
+                annotations.value.as_deref(),
+                &path,
+                &budget,
+                &mut observe,
+            )?;
+        }
+        if let Some(error) = configuration_error {
+            return Err(error);
+        }
+        return budget.check();
+    }
     let generation = Current {
         name: entry.name.clone(),
         number: commit::generation_number(&entry.name),

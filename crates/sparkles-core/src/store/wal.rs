@@ -918,6 +918,8 @@ pub(crate) struct WalCursor {
     path: PathBuf,
     /// after the last complete transaction read
     at: WalPoint,
+    /// byte offset where the last complete transaction started
+    last_start_offset: u64,
     /// the data records of the transaction last read
     txn: Vec<u8>,
     version: u32,
@@ -961,6 +963,7 @@ impl WalCursor {
             r: BufReader::with_capacity(capacity, file),
             path: path.to_path_buf(),
             at: from,
+            last_start_offset: from.offset,
             txn: Vec::new(),
             version,
             configuration: None,
@@ -988,6 +991,11 @@ impl WalCursor {
     /// Where the cursor stands: after the last transaction read.
     pub fn position(&self) -> WalPoint {
         self.at
+    }
+
+    /// Byte offset where the last complete transaction read by `next`/`next_with` started.
+    pub(crate) fn last_start_offset(&self) -> u64 {
+        self.last_start_offset
     }
 
     pub(crate) fn configuration(&self) -> Option<crate::evidence::Sha256Digest> {
@@ -1018,6 +1026,7 @@ impl WalCursor {
         self.configuration = None;
         let mut rec = [0u8; WAL_REC];
         let mut offset = self.at.offset;
+        let mut txn_start = offset;
         loop {
             if C::ACCOUNTS {
                 limit.check(held.saturating_add(self.buffer_bytes()))?;
@@ -1055,6 +1064,7 @@ impl WalCursor {
                         ));
                     }
                     self.version = found;
+                    txn_start = offset;
                 }
                 // the log's end: its preallocated space, or a torn last transaction
                 _ if is_zero_record(&rec) => return Ok(None),
@@ -1122,6 +1132,7 @@ impl WalCursor {
                 )));
             }
         };
+        self.last_start_offset = txn_start;
         self.at = WalPoint { seq, offset };
         Ok(Some((seq, &self.txn, self.buffer_bytes())))
     }

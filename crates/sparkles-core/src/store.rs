@@ -2521,6 +2521,9 @@ pub struct Store {
     control_refusal: Mutex<Option<fn() -> Error>>,
     /// the published control state (spec C26 §2.1), when the keyspace is enabled
     control: arc_swap::ArcSwapOption<crate::control::ControlState>,
+    /// Verified imported-origin closure and proven WAL intervals retained from the
+    /// opening proof of an imported destination (drops before `_lock` and `family`).
+    imported_opening: Option<Arc<configuration_history::ImportedRetained>>,
     /// Keep exclusion through Drop and every other owned field's destructor.
     /// Fields drop in declaration order. Only the family root lease follows this.
     _lock: Option<Arc<ProcessLock>>,
@@ -2839,6 +2842,7 @@ impl Store {
             prefixes_poisoned: AtomicBool::new(false),
             removed_prefixes: Mutex::new(BTreeSet::new()),
             prefix_filter: Mutex::new(None),
+            imported_opening: None,
             _lock: None,
             family: family.clone(),
             _close_complete: Arc::new(()),
@@ -3096,22 +3100,15 @@ impl Store {
             )));
         };
         let catalog_path = root.join("commits.bin");
-        let (base, base_configuration) = match commit::read_gen_commit_full(&root.join(&name))? {
+        let physical_commit = match commit::read_gen_commit_full(&root.join(&name))? {
             Some(physical) => {
-                let commit::RetainedGenerationCommit {
-                    dataset_id: id,
-                    commit: c,
-                    origin,
-                    configuration: binding,
-                    ..
-                } = physical;
-                if id != dataset_id {
+                if physical.dataset_id != dataset_id {
                     return Err(Error::Corrupt(format!(
-                        "{name}/commit.json belongs to dataset {id}, not {dataset_id}"
+                        "{name}/commit.json belongs to dataset {}, not {dataset_id}",
+                        physical.dataset_id
                     )));
                 }
-                let _ = origin;
-                (c, binding)
+                physical
             }
             // Only a pre-release build left a current generation without its
             // commit.json, and the cutoff refuses it instead of giving it a
@@ -3124,31 +3121,64 @@ impl Store {
                 )));
             }
         };
+        let base = physical_commit.commit;
+        let base_configuration = physical_commit.configuration;
         let configuration_root = if ctx.is_some() {
             link::dataset_root_of(root)?
         } else {
             root.to_path_buf()
         };
         let configuration_state = family.managed.load_full();
-        let mut configuration_references = configuration_history::primary::References::new(
-            &configuration_root,
-            ctx.as_ref().map_or(dataset_id, |ctx| ctx.ident.dataset_id),
-            dataset_id,
-            ctx.as_ref().and_then(|ctx| {
-                ctx.ident
-                    .configuration_origin
-                    .as_ref()
-                    .map(|origin| (ctx.ident.from.seq, origin))
-            }),
-            configuration_state.as_deref(),
-            &configuration_preparation,
-        )?;
-        configuration_references.generation(base.seq, base_configuration)?;
+        let gen_ = Arc::new(gen_);
+        let (mut configuration_references, imported_opening) = if ctx.is_none()
+            && family.has_destination_origin()
+        {
+            let pending = configuration_history::ImportedOpening::opening(
+                root,
+                &family,
+                &lock,
+                &gen_,
+                &physical_commit,
+                &configuration_preparation,
+            )?
+            .ok_or_else(|| {
+                managed_history::unavailable("destination import origin disappeared during open")
+            })?;
+            (None, Some(pending))
+        } else {
+            let mut refs = configuration_history::primary::References::new(
+                &configuration_root,
+                ctx.as_ref().map_or(dataset_id, |ctx| ctx.ident.dataset_id),
+                dataset_id,
+                ctx.as_ref().and_then(|ctx| {
+                    ctx.ident
+                        .configuration_origin
+                        .as_ref()
+                        .map(|origin| (ctx.ident.from.seq, origin))
+                }),
+                configuration_state.as_deref(),
+                &configuration_preparation,
+            )?;
+            if ctx.is_some()
+                && let crate::history::ConfigurationBinding::ImportedUnbound { source } =
+                    base_configuration
+            {
+                refs.check_imported_unbound_base(base.seq, base_configuration)?;
+                configuration_history::verify_imported_identity_for_family(
+                    &configuration_root,
+                    &family,
+                    source,
+                    &configuration_preparation,
+                )?;
+            } else {
+                refs.generation(base.seq, base_configuration)?;
+            }
+            (Some(refs), None)
+        };
         // replay the WAL (a linked generation's onto the delta of its starting commit)
         let wal_path = root.join(&name).join("wal.log");
         let mut delta = gen_.base_delta();
         let mut version = 0;
-        let gen_ = Arc::new(gen_);
         let mut replayed: Vec<CommitInfo> = Vec::new();
         // the quads each replayed commit changed, for catching up the full-text index
         let text_on = cfg!(feature = "text") && root.join("text.json").exists();
@@ -3160,6 +3190,7 @@ impl Store {
         let mut wal_control = Vec::new();
         // the repair of the log's tail, made only once the control keyspace recovered
         let mut wal_repair = None;
+        let mut imported_retained: Option<Arc<configuration_history::ImportedRetained>> = None;
         if wal_path.exists() {
             let mut buf = Vec::new();
             File::open(&wal_path)?.read_to_end(&mut buf)?;
@@ -3175,9 +3206,18 @@ impl Store {
                 start: gen_.base_delta(),
                 annotated: annotated.as_ref(),
             };
-            let r = replay_wal(&from, &buf, &mut |_, _| Ok(()), &mut |observation| {
-                configuration_references.observation(observation)
-            })?;
+            let r = if let Some(pending) = imported_opening {
+                let completed = pending.replay(&from, &buf, &configuration_preparation)?;
+                imported_retained = Some(Arc::new(completed.imports));
+                completed.replay
+            } else {
+                let refs = configuration_references
+                    .as_mut()
+                    .expect("primary references");
+                replay_wal(&from, &buf, &mut |_, _| Ok(()), &mut |observation| {
+                    refs.observation(observation)
+                })?
+            };
             wal_len = r.good as u64;
             if r.good == 0 || r.good != buf.len() {
                 wal_repair = Some(r.good as u64);
@@ -3189,6 +3229,8 @@ impl Store {
             next_bnode = r.next_bnode.max(bnode_floor);
             wal_text = r.touched;
             wal_control = r.control;
+        } else if let Some(pending) = imported_opening {
+            imported_retained = Some(Arc::new(pending.verify_no_wal()?));
         }
         drop(configuration_references);
         drop(configuration_state);
@@ -3399,6 +3441,7 @@ impl Store {
             prefixes_poisoned: AtomicBool::new(false),
             removed_prefixes: Mutex::new(removed_prefixes),
             prefix_filter: Mutex::new(None),
+            imported_opening: imported_retained,
             _lock: Some(lock.clone()),
             family: family.clone(),
             _close_complete: Arc::new(()),

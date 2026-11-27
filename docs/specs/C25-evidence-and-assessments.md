@@ -1491,24 +1491,31 @@ integrity check and encrypted restores.
 
 Keeping a dataset identity preserves native bindings. A new identity preserves
 old generation bytes and original small identity and base documents as source
-provenance. Its versioned origin descriptor identifies the source family and
-logical branch and authenticates disjoint exact imported WAL intervals. Only those
-verified intervals permit imported RDF replay. Foreign references outside them
-refuse. Later own publications use a genuine destination generation, while old
-explicit revisions remain unavailable as native historical evidence of the new
-identity. Repeated identity changes retain earlier imported origins and add only
-new imported suffixes, without duplicating large WAL files. Rebuild clones have no
-old WAL history and establish their own destination root explicitly. The public
-restore keeps the identity of a dataset whose configuration history is activated. It
-refuses a new identity for such a dataset as `unsupported`, and roadmap item 764 adds
-that path.
+provenance under `evidence-history/imports/<digest>/`. Its format 2
+`evidence-history/origin.json` descriptor raises `minimumReader` to 11,
+identifies the source family and logical branch, establishes a fresh destination
+configuration-history root, and authenticates disjoint exact imported WAL
+intervals. Only those verified intervals permit imported RDF replay, and foreign
+references outside them refuse. Later own publications use a genuine destination
+generation, while old explicit revisions remain unavailable as native historical
+evidence of the new identity. Repeated identity changes retain earlier imported
+origins and add only new imported suffixes, without duplicating large WAL files.
+New-identity backup restores of activated stores run this reidentification and
+verification before publication, preserve paused view definitions and durable
+job recovery state, and emit `evidence-configuration-history/2` when backed up
+again.
 
-A clone of a dataset whose configuration history is activated is refused with an
-`unsupported` error before anything is captured or written, because a clone copies
-the registry's history root without the evidence-history closure and native
-generations that the root names. Such a dataset is copied by a backup and a restore
-that keeps its identity. Roadmap item 764 adds clones that carry or rebuild the
-closure.
+Clones of datasets with activated configuration history establish a fresh
+destination configuration-history root at sequence 0, pinned by `creationCommit`
+in format 2 `evidence-history/origin.json`, and carry source provenance under
+`evidence-history/imports/<digest>/`. Persistent clones across auto, link, copy,
+rebuild, past-state, graph-subset and branch modes write `minimumReader` 11,
+pause copied view definitions with reason `cloned`, start with an empty control
+keyspace, and stay independent of later source mutations. In-memory clones
+establish an independent in-memory history root at sequence 0. Incomplete
+clones, missing or corrupted closures, tampered imported WAL intervals or origin
+descriptors, lowered `minimumReader` values and unknown origin format versions
+refuse before opening or publication.
 
 Historical configuration supplies semantics, never current access. Source
 retention, current graph protections, caller grants and provider admission remain
@@ -2444,6 +2451,23 @@ graph, the state, the head commit, the model requests and the task list unchange
 also covers a withdrawal behind a cited claim and a state left behind the reports graph
 at the next server start, each of which starts one refresh. A hidden superseding decision
 under a triple protection has no test of the check.
+
+### Cloning and restoring activated configuration history
+
+Clones and new-identity backup restores of datasets with activated configuration
+history now publish a fresh destination configuration-history lineage and a format 2
+`evidence-history/origin.json` closure under dataset reader 11, while backup manifests
+carrying imported provenance declare `evidence-configuration-history/2`. Persistent
+clones across auto, link, copy, rebuild, past-state, graph-subset and branch modes pin
+their sequence-zero root with `creationCommit`, carry source provenance under
+`evidence-history/imports/<digest>/`, pause copied view definitions with reason
+`cloned` and start with an empty control keyspace. In-memory clones establish an
+independent in-memory lineage with retained origin provenance so materialized backups
+and restores remain valid from sequence zero onward. New-identity restores verify
+copied closures before publication, preserve paused definitions and durable job
+recovery across WAL header upgrades, authenticate disjoint imported WAL intervals
+without duplicating logs across repeated identity changes, and keep retained cold
+history and branch reads consistent with destination cutoffs.
 
 Roadmap item 810 extends `sparkles::evidence::find_dependents`,
 `POST /{ds}/claims/dependents` and the MCP tool `find_evidence_dependents` to search

@@ -512,6 +512,11 @@ impl Repository {
         }
         if entries
             .iter()
+            .any(|entry| layout::imported_configuration_history_path(&entry.path))
+        {
+            requires.push("evidence-configuration-history/2".to_string());
+        } else if entries
+            .iter()
             .any(|entry| layout::configuration_history_path(&entry.path))
         {
             requires.push("evidence-configuration-history/1".to_string());

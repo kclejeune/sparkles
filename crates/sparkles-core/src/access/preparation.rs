@@ -733,6 +733,17 @@ impl Preparation {
         &self.inner.used
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_peak(&self) -> u64 {
+        self.inner.peak.load(Ordering::Relaxed)
+    }
+
+    /// Bytes currently reserved in the active budget.
+    pub(crate) fn used(&self) -> u64 {
+        let (counter, _) = self.active_budget();
+        counter.load(Ordering::Relaxed)
+    }
+
     /// The allowance not yet reserved. Other clones may reserve it at any moment, so
     /// this only sizes work; storage still needs a [`reserve`](Self::reserve).
     pub(crate) fn room(&self) -> u64 {

@@ -13,18 +13,48 @@ pub(super) mod primary;
 mod validation;
 
 pub(super) use imported::Identities as OriginalIdentities;
+pub(super) use imported::context::{Pending as ImportedOpening, Retained as ImportedRetained};
+#[cfg(test)]
+pub(super) use imported::context::{RETAINED_WAL_BINDING_HOOK, RetainedWalBindingStage};
+pub(crate) use imported::reidentify::reidentify_activated_dir;
+pub(super) use imported::reidentify::{
+    BranchProvenanceCapture, DirectBranchWalInput, DiskClosure, PriorImportFiles,
+    build_branch_standalone_provenance, capture_import_files, capture_materialized_imported_origin,
+    clone_creation_digest, materialize_memory_origin_imports, read_anchored_local_file,
+    read_prior_imports_for_clone, verify_imported_identity, verify_imported_identity_for_family,
+    write_clone_destination, write_memory_clone_origin,
+};
+#[cfg(test)]
+pub(super) use imported::reidentify::{
+    PROVE_WAL_STAGE_HOOK, ProveWalStage, WAL_HASH_CHUNK_HOOK, reidentify_activated_dir_with,
+    write_clone_destination_with_sync,
+};
 pub(super) use imported::{
     MAX_MEMBERS as SOURCE_MEMBER_LIMIT, SourceFile as SourceFilePin, SourceManifest,
     Sources as OriginalSources, encode_first_destination_origin, encode_native_descriptor,
-    opening_origin_selection, original_branch_table_document, original_history_document,
+    opening_origin_info, original_branch_table_document, original_history_document,
     source_member as source_metadata_member, verify_staged_native_source,
 };
+
+pub(super) fn load_disk_closure_for_family(
+    root: &Path,
+    family: &crate::store::family::Family,
+    preparation: &Preparation,
+) -> Result<Option<DiskClosure>> {
+    DiskClosure::load_for_family(root, family, preparation)
+}
 
 /// Authenticate copied primary configuration references without opening a writer,
 /// recovering a WAL or publishing the directory. Backup restores call this even
 /// when the caller disabled optional index integrity checking.
 pub(crate) fn validate_copy(root: &Path, required: bool, preparation: &Preparation) -> Result<()> {
-    validation::validate(root, required, preparation)
+    validation::validate(root, required, false, preparation)
+}
+
+/// Like [`validate_copy`], additionally requiring an authenticated format 2
+/// imported origin closure (`evidence-configuration-history/2`).
+pub(crate) fn validate_copy_imported(root: &Path, preparation: &Preparation) -> Result<()> {
+    validation::validate(root, true, true, preparation)
 }
 
 #[cfg(test)]
@@ -235,7 +265,7 @@ impl Store {
         } else {
             // Hold the available temporary decoder allowance before using the existing
             // cold reader. Its buffers are gone before this reservation returns.
-            let (allowance, _held) = preparation.reserve_available()?;
+            let (allowance, mut held) = preparation.reserve_available()?;
             let options = HistoryOptions {
                 cancel: Some(preparation.control().cancel.flag()),
                 deadline: preparation.control().deadline,
@@ -267,13 +297,12 @@ impl Store {
                 .ok_or_else(|| managed_history::unavailable("retained generation is missing"))?;
             let mut budget = cold::ColdBudget::new(limit)?;
             // Paths remain borrowed while history keeps this generation alive.
-            budget.charge(
-                (entry.dir.as_os_str().len() as u64)
-                    .saturating_mul(4)
-                    .saturating_add(4096),
-            )?;
-            let physical =
-                commit::read_gen_commit_with(&entry.dir, &mut budget)?.ok_or_else(|| {
+            let path_charge = (entry.dir.as_os_str().len() as u64)
+                .saturating_mul(4)
+                .saturating_add(4096);
+            budget.charge(path_charge)?;
+            let physical = commit::read_gen_commit_with(&entry.dir, &mut budget)?
+                .ok_or_else(|| {
                     managed_history::unavailable("retained generation has no commit identity")
                 })?;
             if physical.value.dataset_id != self.dataset_id
@@ -285,7 +314,38 @@ impl Store {
             }
             if physical.value.commit.seq == seq {
                 physical.value.configuration
+            } else if !self.is_branch()
+                && let Some(retained) = &self.imported_opening
+                && entry.name != retained.generation_name()
+                && retained.has_ranges_for(&entry.name)
+            {
+                let physical_charge = physical.charge;
+                let physical_commit = physical.value;
+                budget.release(path_charge);
+                debug_assert_eq!(budget.used(), physical_charge);
+                let _ = budget;
+                // Keep the decoded destination commit's charge reserved while the
+                // callee compares and reads from it; drop the commit before releasing
+                // its reservation. Borrow `entry.dir` and `entry.name` under `history`.
+                held.release_to(physical_charge);
+                // Keep `history` locked so `entry.dir` cannot be collected while the
+                // retained generation's WAL prefix is proved in a single open.
+                let resolved = retained.resolve_retained_wal_binding(
+                    &self.family,
+                    &entry.dir,
+                    &entry.name,
+                    &physical_commit,
+                    seq,
+                    preparation,
+                );
+                drop(physical_commit);
+                drop(held);
+                drop(history);
+                resolved?
             } else {
+                let physical_charge = physical.charge;
+                drop(physical.value);
+                budget.release(physical_charge);
                 let from = wal::WalPoint {
                     seq: entry.base.seq,
                     offset: 0,
@@ -308,7 +368,36 @@ impl Store {
                         ));
                     }
                     if found == seq {
-                        break match cursor.configuration() {
+                        let wal_start = cursor.last_start_offset();
+                        let wal_offset = cursor.position().offset;
+                        let wal_config = cursor.configuration();
+                        let gen_name = entry.name.clone();
+                        drop(cursor);
+                        let _ = budget;
+                        drop(held);
+                        drop(history);
+                        if !self.is_branch()
+                            && let Some(retained) = &self.imported_opening
+                        {
+                            let imported = if gen_name == retained.generation_name() {
+                                retained.resolve_wal_binding(
+                                    &self.family,
+                                    &gen_name,
+                                    wal_start,
+                                    wal_offset,
+                                    seq,
+                                    wal_config,
+                                    preparation,
+                                )?
+                            } else {
+                                retained.check_live_origin(&self.family, preparation)?;
+                                None
+                            };
+                            if let Some(imported) = imported {
+                                break imported;
+                            }
+                        }
+                        break match wal_config {
                             Some(generation) => {
                                 let history = installed
                                     .and_then(|i| i.configuration_history.as_ref())
@@ -389,6 +478,9 @@ impl Store {
                     "covered commit is missing its configuration binding",
                 ));
             }
+            if let Some(retained) = &self.imported_opening {
+                retained.check_live_origin(&self.family, preparation)?;
+            }
             if let Some(identity) = binding.configuration() {
                 managed_history::resolve(
                     &root,
@@ -397,6 +489,12 @@ impl Store {
                     identity,
                     preparation,
                 )?;
+            } else if let ConfigurationBinding::ImportedUnbound { source } = binding {
+                if let Some(retained) = &self.imported_opening {
+                    retained.verify_identity(&self.family, source, preparation)?;
+                } else {
+                    verify_imported_identity_for_family(&root, &self.family, source, preparation)?;
+                }
             }
         } else {
             let memory = installed

@@ -24,21 +24,27 @@ pub(crate) struct Family {
     /// Selection made under this opening's actual root process exclusion. This
     /// scalar is not a proof of an imported physical base or WAL interval.
     origin: OnceLock<Option<crate::evidence::Sha256Digest>>,
+    origin_format: OnceLock<Option<u32>>,
     _owner_lock: Option<Arc<super::ProcessLock>>,
 }
 
 impl Family {
     pub(crate) fn new(owner_lock: Option<Arc<super::ProcessLock>>) -> Arc<Self> {
         let origin = OnceLock::new();
+        let origin_format = OnceLock::new();
         if owner_lock.is_none() {
             // Memory families have no imported on-disk namespace.
             origin.set(None).expect("new memory family selection");
+            origin_format
+                .set(None)
+                .expect("new memory family format selection");
         }
         Arc::new(Self {
             gate: Arc::new(FamilyGate::default()),
             managed: arc_swap::ArcSwapOption::empty(),
             holds: Default::default(),
             origin,
+            origin_format,
             _owner_lock: owner_lock,
         })
     }
@@ -61,12 +67,24 @@ impl Family {
             ));
         }
         super::verify_database_lock(root, lock)?;
-        let selected = super::configuration_history::opening_origin_selection(root, preparation)?;
+        let selected = super::configuration_history::opening_origin_info(root, preparation)?;
         super::verify_database_lock(root, lock)?;
         preparation.check()?;
+        let (digest, format) = match selected {
+            Some((digest, format)) => (Some(digest), Some(format)),
+            None => (None, None),
+        };
+        self.origin_format
+            .set(format)
+            .map_err(|_| Error::invalid("family origin format was already installed"))?;
         self.origin
-            .set(selected)
+            .set(digest)
             .map_err(|_| Error::invalid("family origin selection was already installed"))
+    }
+
+    /// Whether this opening has a format 2 destination import origin.
+    pub(super) fn has_destination_origin(&self) -> bool {
+        self.origin_format.get() == Some(&Some(2))
     }
 
     pub(super) fn verify_origin_lock(

@@ -736,6 +736,39 @@ pub(crate) fn prove_prefix_recording<
     )
 }
 
+/// Like [`prove_prefix_recording`], stopping once commit `target` (and every record
+/// up through its `WAL_COMMIT` record) has been observed and recorded.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_prefix_recording_through<
+    R: Read + Seek,
+    F: FnMut(u64, &[u8; WAL_REC]) -> Result<()>,
+>(
+    reader: &mut BufReader<R>,
+    extent: u64,
+    base: u64,
+    target: u64,
+    dvocab_len: u64,
+    annotated: Option<&[u64]>,
+    path: &Path,
+    budget: &ColdBudget<'_>,
+    visit: &mut dyn FnMut(WalCommitObservation) -> Result<()>,
+    record_used: &mut F,
+) -> Result<ProvenWal> {
+    prove_prefix_bounded(
+        reader,
+        extent,
+        base,
+        target,
+        dvocab_len,
+        annotated,
+        path,
+        budget,
+        visit,
+        record_used,
+        true,
+    )
+}
+
 /// Prove the log only through commit `target`, as a past-state read of `target`
 /// replays it. Damage to a later commit, durable or not, belongs to the reads of
 /// that commit, so it cannot refuse an earlier one. Observations end at `target`.
@@ -867,6 +900,7 @@ fn prove_prefix_bounded<R: Read + Seek, F: FnMut(u64, &[u8; WAL_REC]) -> Result<
                 })?;
                 budget.check()?;
                 if stop_at_target && selected.is_some() {
+                    record_used(index as u64 * WAL_REC as u64, &record)?;
                     return Ok(ProvenWal { head, selected });
                 }
                 crc = flate2::Crc::new();

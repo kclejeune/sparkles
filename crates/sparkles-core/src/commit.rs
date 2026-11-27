@@ -440,17 +440,17 @@ pub const DATASET_FORMAT: u32 = 2;
 /// [`crate::managed`], 7: durable source holds, `holds.json`, see [`crate::holds`], 8:
 /// configuration history, see [`crate::store::managed_history`], 9: the durable job
 /// ledger, see [`crate::jobs`], 10: version 2 staged prefix recovery with control-only
-/// sequence tracking, see `prefixes.staged.tmp`). Readers 1 to 4 named the pre-release
+/// sequence tracking, see `prefixes.staged.tmp`, and 11: imported configuration history
+/// origins, see [`crate::store::configuration_history`]). Readers 1 to 4 named the pre-release
 /// forms, a dataset without branches, relinked generations, framed delta vocabularies or
 /// log headers, and [`OLDEST_DATASET_READER`] is the first one this build reads.
 /// [`crate::formats::DATASET`] lists them.
-pub const DATASET_READER: u32 = 10;
+pub const DATASET_READER: u32 = 11;
 
-/// The reader an imported destination of the private import transport
-/// ([`reidentified_dataset_bytes`]) requires: one above what this build reads, so that
-/// no build accepts an imported destination before the lane that wires the import
-/// (roadmap item 61) raises [`DATASET_READER`] and the registry together.
-pub(crate) const IMPORTED_DESTINATION_READER: u32 = DATASET_READER + 1;
+/// The reader an imported destination (clones and new-identity restores of stores with
+/// activated configuration history) requires: reader 11, so releases before format 2
+/// origin descriptors refuse the dataset before opening it.
+pub(crate) const IMPORTED_DESTINATION_READER: u32 = 11;
 
 /// The oldest dataset reader this build reads: every store of the first release writes
 /// a log with a header record, so a `format` 2 dataset requires at least this reader.
@@ -565,7 +565,7 @@ pub(crate) fn read_dataset_file_with<C: crate::budgeted::BudgetControl>(
             }
             Err(error) => return Err(error),
         };
-        let id = dataset_id_bytes_with(&bytes, control)?;
+        let (id, _) = dataset_identity_and_reader_bytes_with(&bytes, control)?;
         control.drop_vec(bytes);
         control.check(0)?;
         Ok(Some(id))
@@ -579,18 +579,18 @@ pub(crate) fn read_dataset_file_with<C: crate::budgeted::BudgetControl>(
     })
 }
 
-/// Decode an already admitted original dataset document under `control`, returning only
-/// its scalar identity.
-pub(crate) fn dataset_id_bytes_with<C: crate::budgeted::BudgetControl>(
+pub(crate) fn dataset_identity_and_reader_bytes_with<C: crate::budgeted::BudgetControl>(
     bytes: &[u8],
     control: &mut C,
-) -> Result<uuid::Uuid> {
+) -> Result<(uuid::Uuid, u32)> {
     let (parsed, charge) = parse_dataset_with::<_, true>(bytes, control)?;
-    let id = parsed.id;
+    let identity = (parsed.id, parsed.minimum_reader);
     drop(parsed);
     control.release(charge);
     control.check(0)?;
-    Ok(id)
+    Ok(identity)
+}
+
 }
 
 /// Exercise the actual closed scalar reader with caller-attributed allocation
@@ -747,6 +747,11 @@ pub struct RestoredFrom {
 pub fn reidentify(root: &Path, new_id: uuid::Uuid, forked_from: ForkedFrom) -> Result<()> {
     // a generation version that this dataset does not admit refuses before any rewrite
     crate::formats::check_configuration_versions(root)?;
+    if crate::store::managed_history::activation_recorded(root)? {
+        return Err(Error::Invalid(
+            "activated configuration history requires reidentify_configuration_history".into(),
+        ));
+    }
     let mut ds = read_dataset(root)?
         .ok_or_else(|| Error::Invalid(format!("{} has no dataset.json", root.display())))?;
     let old_id = ds.id;
@@ -804,6 +809,26 @@ pub fn reidentify(root: &Path, new_id: uuid::Uuid, forked_from: ForkedFrom) -> R
     crate::store::sync_dir(root)
 }
 
+/// Reidentify a closed, already-validated, single-generation standalone restored
+/// database directory whose configuration history is activated: preserve the
+/// source's provenance under `evidence-history/imports/`, establish a new
+/// destination configuration-history root and format 2
+/// `evidence-history/origin.json`, and rewrite its primary identity files under
+/// `new_id`. Refuses directories with extra generations or branch-table state.
+pub fn reidentify_configuration_history(
+    root: &Path,
+    new_id: uuid::Uuid,
+    forked_from: ForkedFrom,
+    control: &crate::task::Control,
+) -> Result<()> {
+    crate::store::configuration_history::reidentify_activated_dir(
+        root,
+        new_id,
+        forked_from,
+        control,
+    )
+}
+
 /// Preserve the blank-node ordinal space of a standalone branch restore.
 pub fn reserve_branch_ordinals(root: &Path, id: uuid::Uuid, next: u64) -> Result<()> {
     crate::store::write_initial_table(root, id, next)
@@ -841,8 +866,8 @@ fn write_dataset(root: &Path, ds: &DatasetFile) -> Result<()> {
 /// Pure receiving-owned metadata for an unpublished imported destination. The
 /// closed producer separately supplies its genuine old owner and selected data
 /// sequence. These bytes grant no Store/source/replay or current permission.
-/// [`IMPORTED_DESTINATION_READER`] is emitted explicitly; this build still refuses that
-/// destination until the complete physical producer/consumer feature is enabled together.
+/// The destination records [`IMPORTED_DESTINATION_READER`] to require support for
+/// its published origin descriptor and imported history closure.
 pub(crate) fn reidentified_dataset_bytes(
     bytes: &[u8],
     old: uuid::Uuid,
@@ -1193,6 +1218,17 @@ pub(crate) fn reidentified_generation_bytes(
     new: uuid::Uuid,
     preparation: &crate::access::Preparation,
 ) -> Result<crate::store::managed_history::Bytes> {
+    Ok(reidentified_generation_bytes_with_base(bytes, old, new, preparation)?.1)
+}
+
+/// Like [`reidentified_generation_bytes`], additionally returning the parsed
+/// base commit sequence from the same single controlled parse.
+pub(crate) fn reidentified_generation_bytes_with_base(
+    bytes: &[u8],
+    old: uuid::Uuid,
+    new: uuid::Uuid,
+    preparation: &crate::access::Preparation,
+) -> Result<(u64, crate::store::managed_history::Bytes)> {
     use crate::store::{cold::ColdBudget, managed_history};
     preparation.check()?;
     if old.is_nil() || new.is_nil() {
@@ -1227,6 +1263,7 @@ pub(crate) fn reidentified_generation_bytes(
             "original generation belongs to another physical source".into(),
         ));
     }
+    let base_seq = file.commit.seq;
     if let Some(binding) = &mut file.configuration_binding {
         let publisher = binding
             .configuration()
@@ -1241,7 +1278,10 @@ pub(crate) fn reidentified_generation_bytes(
     file.dataset_id = new;
     held.release_to(budget.used());
     preparation.check()?;
-    managed_history::encode_pretty(&file, preparation)
+    Ok((
+        base_seq,
+        managed_history::encode_pretty(&file, preparation)?,
+    ))
 }
 
 /// Rewrite only an already validated captured catalog header. The producer
@@ -2733,6 +2773,13 @@ mod tests {
         let mut noncanonical = raw.clone();
         noncanonical.push(b'\n');
         assert!(reidentified_generation_bytes(&noncanonical, old, new, &preparation).is_err());
+        let mut bad_ts: GenCommitFile = serde_json::from_slice(&raw).unwrap();
+        bad_ts.commit.timestamp = "not-a-timestamp".to_owned();
+        let bad_ts_canonical = serde_json::to_vec_pretty(&bad_ts).unwrap();
+        assert!(matches!(
+            reidentified_generation_bytes_with_base(&bad_ts_canonical, old, new, &preparation),
+            Err(Error::Corrupt(_))
+        ));
         assert_eq!(preparation.room(), room);
         let control = Control::none();
         let cancelled = Preparation::new(control.clone(), 4 << 20).unwrap();
@@ -2776,16 +2823,13 @@ mod tests {
             let output =
                 reidentified_dataset_bytes(&raw, old, destination, 42, 2000, &preparation).unwrap();
             let value: serde_json::Value = serde_json::from_slice(&output.value).unwrap();
-            // this build never accepts an imported destination it cannot read
-            const { assert!(IMPORTED_DESTINATION_READER > DATASET_READER) };
+            // readers before 11 refuse an imported destination; this build accepts it
+            const { assert!(IMPORTED_DESTINATION_READER == DATASET_READER) };
             assert!(matches!(
-                check_dataset_value_as(&value, DATASET_READER),
+                check_dataset_value_as(&value, IMPORTED_DESTINATION_READER - 1),
                 Err(Error::Unsupported(_))
             ));
-            assert!(matches!(
-                parse_dataset(&output.value),
-                Err(Error::Unsupported(_))
-            ));
+            parse_dataset(&output.value).unwrap();
             check_dataset_value_as(&value, IMPORTED_DESTINATION_READER).unwrap();
             let found: DatasetFile = serde_json::from_slice(&output.value).unwrap();
             assert_eq!(found.id, destination);

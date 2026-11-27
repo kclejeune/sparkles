@@ -717,11 +717,12 @@ fn an_unframed_delta_vocabulary_is_refused_with_dump_and_reload() {
     // the framed file opens again, and a dataset that requires a later reader is
     // refused as newer. Reader 8 is configuration history, which only an activated
     // dataset records, reader 9 the job ledger, which only a dataset with jobs
-    // enabled records, and reader 10 control-only staged prefix recovery v2.
+    // enabled records, reader 10 control-only staged prefix recovery v2, and reader
+    // 11 imported configuration history origins.
     std::fs::write(&vocab, &framed).unwrap();
     assert_eq!(minimum_reader(&root), 5);
     drop(Store::open(&root, StoreOptions::default()).unwrap());
-    assert_eq!(sparkles_core::commit::DATASET_READER, 10);
+    assert_eq!(sparkles_core::commit::DATASET_READER, 11);
     let mut ds: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("dataset.json")).unwrap()).unwrap();
     ds["minimumReader"] = serde_json::json!(sparkles_core::commit::DATASET_READER + 1);
